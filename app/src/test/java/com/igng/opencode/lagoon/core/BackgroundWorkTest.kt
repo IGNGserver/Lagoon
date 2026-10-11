@@ -53,6 +53,45 @@ class BackgroundWorkTest {
     assertTrue(folded.getValue("root").background)
   }
 
+  @Test fun multipleActiveChildrenKeepTheSameRootBackgroundUntilTheLastOneStops() {
+    val parents = mapOf("child_a" to "root", "child_b" to "root")
+    val tasks = mapOf(
+      "root" to TaskState("root", TaskPhase.COMPLETED),
+      "child_a" to TaskState("child_a", TaskPhase.THINKING),
+      "child_b" to TaskState("child_b", TaskPhase.SUBAGENT)
+    )
+    assertTrue(BackgroundWork.hasBackgroundWork("root", tasks, emptyMap(), parents))
+    val folded = BackgroundWork.fold(tasks, emptyMap(), parents)
+    assertTrue(folded.getValue("root").background)
+    assertEquals(setOf("root"), TaskSummary.backgroundRoots(folded, parents))
+
+    val afterFirstChild = folded - "child_a"
+    assertTrue(BackgroundWork.hasBackgroundWork("root", afterFirstChild, emptyMap(), parents))
+    assertTrue(afterFirstChild.getValue("root").background)
+    assertEquals(setOf("root"), TaskSummary.backgroundRoots(afterFirstChild, parents))
+  }
+
+  @Test fun backgroundToolMetadataKeepsMultipleSubagentsAndSyntheticResultsClearThem() {
+    val parsed = JSONObject("""{"type":"tool","name":"task","state":{"status":"completed","metadata":{"status":"running","sessionID":"child_a"}}}""").toAssistantPart("call_a")
+    assertTrue(parsed.background)
+    assertEquals("child_a", parsed.target)
+    val first = JSONObject("""{"name":"task","metadata":{"status":"running","sessionID":"child_a"}}""")
+    val second = JSONObject("""{"name":"subagent","metadata":{"status":"running","sessionID":"child_b"}}""")
+    assertEquals("child_a", BackgroundWork.backgroundSubagentId("session.tool.success", first))
+    assertEquals("child_b", BackgroundWork.backgroundSubagentId("session.tool.success", second))
+    assertNull(BackgroundWork.backgroundSubagentId("session.tool.success", JSONObject("""{"name":"task","metadata":{"status":"completed","sessionID":"child_a"}}""")))
+
+    val messages = listOf(Message("m", "assistant", 20, listOf(
+      MessagePart("a", "tool", tool = "task", target = "child_a", background = true),
+      MessagePart("b", "tool", tool = "subagent", target = "child_b", background = true)
+    )))
+    assertEquals(mapOf("child_a" to 20L, "child_b" to 20L), BackgroundWork.messageSubagents("root", messages))
+    val completed = messages + Message("n", "notice", 30, emptyList(), notice = Notice("已完成", target = "child_a"))
+    assertEquals(mapOf("child_b" to 20L), BackgroundWork.messageSubagents("root", completed))
+    assertEquals("child_a", BackgroundWork.completedSubagentId("session.synthetic",
+      JSONObject("""{"metadata":{"source":"subagent","childID":"child_a"}}""")))
+  }
+
   @Test fun foldedTasksAreKeptWhenWorkDisappearsForTheGraceWindow() {
     val folded = mapOf("root" to TaskState("root", TaskPhase.THINKING, TaskState.BACKGROUND_DETAIL, background = true))
     assertSame(folded, BackgroundWork.fold(folded, emptyMap(), emptyMap()))

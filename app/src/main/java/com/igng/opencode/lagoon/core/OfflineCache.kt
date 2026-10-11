@@ -157,6 +157,7 @@ class OfflineCache internal constructor(
               .put("tool", part.tool).put("title", part.title).put("status", part.status).put("input", part.input.take(4_000))
               .put("output", part.output.take(4_000)).put("path", url(part.path)).put("error", part.error.take(4_000))
               .put("patch", part.patch.take(20_000)).put("files", JSONArray(part.files)).put("mime", part.mime).put("target", part.target)
+              .put("background", part.background)
               .put("attachments", JSONArray().apply { part.attachments.filterNot { it.url.startsWith("data:") }.forEach { put(JSONObject().put("uri", it.url).put("mime", it.mime).put("name", it.name)) } }))
           } }))
       } }
@@ -172,7 +173,7 @@ class OfflineCache internal constructor(
       val role = item.str("role")
       Message(item.str("id"), role, item.optLong("created"), item.arr("parts").objects().map { part ->
         MessagePart(part.str("id"), part.str("type"), part.str("text"), part.str("tool"), part.str("title"), part.str("status"), part.str("input"), part.str("output"), part.str("path"), part.str("error"), part.str("patch"),
-          part.arr("files").strings(), part.str("mime"), part.arr("attachments").toAttachments(), part.str("target").ifBlank { null })
+          part.arr("files").strings(), part.str("mime"), part.arr("attachments").toAttachments(), part.str("target").ifBlank { null }, part.optBoolean("background"))
       }, item.str("error").ifBlank { null }, item.str("agent").ifBlank { null }, item.obj("model").toModelChoice(),
         item.optLong("completedAt").takeIf { it > 0 }, item.str("finish").ifBlank { null }, item.str("errorType").ifBlank { null },
         notice = notice, type = item.str("type").ifBlank { role })

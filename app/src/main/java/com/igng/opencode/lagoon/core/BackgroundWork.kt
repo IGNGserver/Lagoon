@@ -1,5 +1,7 @@
 package com.igng.opencode.lagoon.core
 
+import org.json.JSONObject
+
 /**
  * 后台工作派生，对齐官方客户端的 `packages/app/src/session/requests/background.ts`：
  * 一次会话执行（execution）settle 之后，仍在运行的后台任务 = 仍在执行的子会话（子代理）
@@ -10,6 +12,38 @@ package com.igng.opencode.lagoon.core
  * [TaskState]，让首页、详情、灵动岛、系统通知与前台服务用同一份口径显示“后台运行中”。
  */
 object BackgroundWork {
+  /** A completed tool call whose metadata says the child work is still running. */
+  fun backgroundSubagentId(type: String, properties: JSONObject): String? {
+    if (type !in setOf("session.tool.success", "session.tool.failed")) return null
+    val metadata = properties.obj("metadata")
+    if (metadata.str("status") != "running" && !metadata.optBoolean("background")) return null
+    val tool = properties.str("name").ifBlank { properties.str("tool") }.ifBlank { metadata.str("tool") }
+    if (tool !in SUBAGENT_TOOLS) return null
+    return metadata.str("sessionID").ifBlank { properties.obj("input").str("sessionID") }
+      .takeIf(String::isNotBlank)
+  }
+
+  /** Synthetic completion notices carry the child id even when the child execution event was missed. */
+  fun completedSubagentId(type: String, properties: JSONObject): String? {
+    if (type != "session.synthetic") return null
+    val metadata = properties.obj("metadata")
+    return metadata.str("childID").takeIf { metadata.str("source") == "subagent" && it.isNotBlank() }
+  }
+
+  /** Background subagents recoverable from the currently loaded parent transcript. */
+  fun messageSubagents(parentId: String?, messages: List<Message>): Map<String, Long> {
+    if (parentId.isNullOrBlank()) return emptyMap()
+    val completed = messages.mapNotNull { it.notice?.target }.toSet()
+    val running = linkedMapOf<String, Long>()
+    messages.forEach { message ->
+      message.parts.filter { it.type == "tool" && it.tool in SUBAGENT_TOOLS && it.background }
+        .mapNotNull { it.target?.takeIf(String::isNotBlank) }
+        .filterNot { it in completed }
+        .forEach { child -> running[child] = message.created }
+    }
+    return running
+  }
+
   /** 从 [id] 沿父链找到根会话；父链缺失时 [id] 自己就是根。 */
   fun rootOf(id: String, parents: Map<String, String>): String {
     var current = id

@@ -183,6 +183,36 @@ class ControllerRegressionTest {
     }
   }
 
+  @Test fun reconciliationRecoversAnActiveChildFromTheRootListingAndDoesNotTrustAStaleRootRun() = runBlocking {
+    MockWebServer().use { server ->
+      server.dispatcher = object : Dispatcher() {
+        override fun dispatch(request: RecordedRequest): MockResponse {
+          val url = request.requestUrl!!
+          return when (url.encodedPath) {
+            "/openapi.json" -> MockResponse().setResponseCode(404)
+            "/api/info" -> MockResponse().setBody("""{"version":"2.0.22"}""")
+            "/api/session/active" -> MockResponse().setBody("""{"data":{"child":{"type":"running"}}}""")
+            "/api/session/child" -> MockResponse().setResponseCode(404)
+            "/api/session" -> if (url.queryParameter("parentID") == "root")
+              MockResponse().setBody("""{"data":[{"id":"child","parentID":"root","location":{"directory":"/repo"},"time":{"created":1,"updated":20}}],"cursor":{}}""")
+            else MockResponse().setBody("""{"data":[{"id":"root","location":{"directory":"/repo"},"time":{"created":1,"updated":20}}],"cursor":{}}""")
+            else -> MockResponse().setBody("""{"data":[]}""")
+          }
+        }
+      }
+      val root = Session("root", "/repo", "Root", 20)
+      val (controller, state) = controller(api(server), LagoonState(serverId = "server", connected = true,
+        projects = listOf(Project("p", "/repo", "Repo")), sessions = listOf(root),
+        tasks = mapOf("root" to TaskState("root", TaskPhase.THINKING, since = 10, activeAt = -1))))
+      refresh(controller, controlOnly = true)
+
+      assertEquals("root", state.value.parents["child"])
+      assertTrue(state.value.tasks["child"]?.active == true)
+      assertTrue(state.value.tasks["root"]?.background == true)
+      assertEquals(SessionStatus.BACKGROUND_RUNNING, state.value.sessionStatus(root))
+    }
+  }
+
   @Test fun nativeCatalogIncludesWorktreesWithoutNarrowingToTheSelectedProject() = runBlocking {
     MockWebServer().use { server ->
       val paths = java.util.Collections.synchronizedList(mutableListOf<String>())

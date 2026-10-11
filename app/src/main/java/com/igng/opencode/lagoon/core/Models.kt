@@ -67,7 +67,9 @@ data class MessagePart(
   val files: List<String> = emptyList(),
   val mime: String = "", val attachments: List<Attachment> = emptyList(),
   /** Child session a subagent tool runs in, when the server reports it. */
-  val target: String? = null
+  val target: String? = null,
+  /** Official background metadata: the tool returned while its child work remains running. */
+  val background: Boolean = false
 )
 data class PermissionRequest(
   val id: String,
@@ -164,6 +166,18 @@ internal fun JSONObject.arr(key: String): JSONArray = optJSONArray(key) ?: JSONA
 internal fun JSONArray.objects(): List<JSONObject> = (0 until length()).mapNotNull { optJSONObject(it) }
 internal fun JSONArray.strings(): List<String> = (0 until length()).mapNotNull { optString(it).takeIf(String::isNotBlank) }
 internal fun JSONObject.longPath(parent: String, child: String): Long = obj(parent).optLong(child, 0)
+
+/** `session.created` has appeared both as a direct Session.Info and as `{info: Session.Info}`. */
+internal fun JSONObject.sessionInfo(): JSONObject = obj("info").takeIf { it.length() > 0 } ?: this
+
+/** Extracts the session carrying an event without treating an unrelated event `id` as a session id. */
+internal fun JSONObject.sessionEventId(type: String): String {
+  val direct = str("sessionID").ifBlank { obj("form").str("sessionID") }
+  if (direct.isNotBlank()) return direct
+  if (type != "session.created") return ""
+  return sessionInfo().str("id").ifBlank { str("id") }
+}
+
 internal fun JSONObject.errorMessage(key: String = "error"): String {
   val direct = str("message")
   if (direct.isNotBlank()) return direct
@@ -190,17 +204,18 @@ internal fun JSONObject.toProject(): Project {
   return Project(str("id"), directory, str("name").ifBlank { directory.replace('\\', '/').trimEnd('/').substringAfterLast('/').ifBlank { directory } }, sandboxes)
 }
 internal fun JSONObject.toSession(): Session {
-  val root = obj("location").str("directory").let { path -> str("subpath").takeIf { it.isNotBlank() }?.let { "${path.trimEnd('/')}/${it.trim('/')}" } ?: path }
-    .ifBlank { str("directory") }
+  val info = sessionInfo()
+  val root = info.obj("location").str("directory").let { path -> info.str("subpath").takeIf { it.isNotBlank() }?.let { "${path.trimEnd('/')}/${it.trim('/')}" } ?: path }
+    .ifBlank { info.str("directory") }
   return Session(
-    str("id"), root,
-    str("title"), longPath("time", "updated"), str("parentID").ifBlank { null },
-    str("projectID").ifBlank { obj("location").obj("project").str("id") }.ifBlank { null },
-    longPath("time", "created"), obj("time").opt("archived") is Number,
-    str("agent").ifBlank { null }, obj("model").toModelChoice(),
-    longPath("time", "viewed"), longPath("time", "idle"),
-    str("outcome").ifBlank { null },
-    obj("revert").str("messageID").ifBlank { null }
+    info.str("id"), root,
+    info.str("title"), info.longPath("time", "updated"), info.str("parentID").ifBlank { null },
+    info.str("projectID").ifBlank { info.obj("location").obj("project").str("id") }.ifBlank { null },
+    info.longPath("time", "created"), info.obj("time").opt("archived") is Number,
+    info.str("agent").ifBlank { null }, info.obj("model").toModelChoice(),
+    info.longPath("time", "viewed"), info.longPath("time", "idle"),
+    info.str("outcome").ifBlank { null },
+    info.obj("revert").str("messageID").ifBlank { null }
   )
 }
 /** `Model.Ref` (`{providerID, id, variant?}`); `modelID` is accepted for metadata written by older clients. */
@@ -336,6 +351,7 @@ internal fun JSONObject.toAssistantPart(id: String): MessagePart {
   val inputObject = input as? JSONObject
   val diffs = metadata.arr("files").objects()
   var status = state.str("status")
+  val background = status == "completed" && metadata.str("status") == "running"
   // Shell completion reports the process outcome in metadata, not the tool status (official `shellResultFailed`).
   val shellFailed = name in SHELL_TOOLS && status == "completed" && (metadata.optBoolean("timeout") || (metadata.opt("exit") as? Number)?.toInt()?.let { it != 0 } == true)
   if (shellFailed) status = "error"
@@ -351,7 +367,8 @@ internal fun JSONObject.toAssistantPart(id: String): MessagePart {
     patch = diffs.joinToString("\n") { it.str("patch") }.trim(),
     files = diffs.map { it.str("file") }.filter(String::isNotBlank),
     attachments = content.objects().filter { it.str("type") == "file" }.let { JSONArray(it) }.toAttachments(),
-    target = (metadata.str("sessionID").ifBlank { inputObject?.str("sessionID").orEmpty() }).takeIf { name in SUBAGENT_TOOLS && it.isNotBlank() }
+    target = (metadata.str("sessionID").ifBlank { inputObject?.str("sessionID").orEmpty() }).takeIf { name in SUBAGENT_TOOLS && it.isNotBlank() },
+    background = background
   )
 }
 
