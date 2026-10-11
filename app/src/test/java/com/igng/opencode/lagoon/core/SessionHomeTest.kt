@@ -81,6 +81,18 @@ class SessionHomeTest {
     assertNull(event.copy(type = "session.created").resultNotice(root))
   }
 
+  @Test fun sessionCreatedAcceptsNestedInfoAndKeepsTheChildParentChain() {
+    val event = """{"type":"session.created","created":123,"location":{"directory":"/repo"},"data":{"info":{"id":"child","parentID":"root","title":"Child","location":{"directory":"/repo"},"time":{"created":100,"updated":110}}}}""".toServerEvent("")
+    assertEquals("child", event.properties.sessionEventId(event.type))
+    val session = event.properties.toSession()
+    assertEquals("child", session.id)
+    assertEquals("root", session.parentId)
+    assertEquals("Child", session.title)
+    assertEquals(110L, session.updated)
+    assertEquals(100L, session.created)
+    assertEquals("direct", JSONObject("""{"id":"direct","parentID":"root"}""").sessionEventId("session.created"))
+  }
+
   @Test fun persistedUnreadLedgerDeduplicatesReplayAndOnlyReadsTheObservedResult() {
     val prefs = memoryPreferences()
     fun store() = ServerStore(prefs, memoryPreferences(), { it }, { it })

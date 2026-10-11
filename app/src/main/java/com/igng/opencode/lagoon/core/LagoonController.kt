@@ -135,6 +135,10 @@ class LagoonController private constructor(private val appContext: Context) {
     private const val MAX_SHELL_DIRECTORIES = 8
     /** shell 归属会话不在目录页时，最多补读多少个会话身份来解析父链。 */
     private const val MAX_SHELL_SESSIONS = 12
+    /** 对账时为仍活跃的根会话补拉后代，避免事件丢失后只剩根而丢掉父子关系。 */
+    private const val MAX_BACKGROUND_CHILD_ROOTS = 24
+    private const val MAX_BACKGROUND_CHILD_SESSIONS = 100
+    private const val MAX_BACKGROUND_CHILD_DEPTH = 8
     /** 后台工作结束后等待服务端唤醒的宽限期；超时仍无新执行才按会话结局收尾。 */
     private const val BACKGROUND_SETTLE_MILLIS = 10_000L
     /** 目录读取失败时旧 shell 条目的最长保留时间，避免事件丢失后“后台运行中”僵死。 */
@@ -145,12 +149,25 @@ class LagoonController private constructor(private val appContext: Context) {
    * what lets a later refresh — even after the process was frozen or killed — notice that a run this device
    * saw has ended and record it as an unread result.
    *
-   * 后台 shell / 子代理折算成根会话的活跃任务（[BackgroundWork.fold]）后，首页、灵动岛、通知与前台
+    * 后台 shell / 子代理折算成根会话的活跃任务（[BackgroundWork.fold]）后，首页、灵动岛、通知与前台
    * 服务用同一份 [tasks] 口径显示“后台运行中”；折算态若已无后台工作，安排一次宽限收尾。
    */
   private fun withSummary(state: LagoonState): LagoonState {
-    val folded = BackgroundWork.fold(state.tasks, state.shells, state.parents)
-    val next = if (folded === state.tasks) state else state.copy(tasks = folded)
+    // A tool can settle in the parent session while its metadata still says that a `task`/`subagent`
+    // child is running. Reconstruct those children from the loaded transcript as the official client
+    // does; this also preserves more than one concurrent background child instead of one boolean.
+    val transcriptParent = state.sessionId
+    val transcriptChildren = BackgroundWork.messageSubagents(transcriptParent, state.messages)
+    val observed = if (transcriptChildren.isEmpty() || transcriptParent == null) state else {
+      val tasks = LinkedHashMap(state.tasks)
+      transcriptChildren.forEach { (child, created) ->
+        if (tasks[child]?.active != true) tasks[child] = TaskState(child, TaskPhase.SUBAGENT, TaskState.RUNNING_DETAIL,
+          since = created.takeIf { it > 0 } ?: System.currentTimeMillis(), activeAt = -1L)
+      }
+      state.copy(tasks = tasks, knownParents = state.knownParents + transcriptChildren.keys.associateWith { transcriptParent })
+    }
+    val folded = BackgroundWork.fold(observed.tasks, observed.shells, observed.parents)
+    val next = if (folded === observed.tasks) observed else observed.copy(tasks = folded)
     next.serverId?.let { server -> next.tasks.values.forEach { store.rememberTask(server, it, next.parents[it.sessionId]) } }
     val work = BackgroundWork.workRoots(next.tasks, next.shells, next.parents)
     next.tasks.values.filter { it.active && it.background && it.sessionId !in work }.forEach { scheduleBackgroundSettle(it.sessionId) }
@@ -407,7 +424,7 @@ class LagoonController private constructor(private val appContext: Context) {
         sessionId = sessionId, messages = emptyList(), catalogComplete = cache.catalogComplete(id)) }
       if (sessionId != null) {
         val messages = kotlinx.coroutines.withContext(Dispatchers.IO) { cache.messages(id, sessionId) }
-        if (token == generation && state.value.serverId == id && state.value.sessionId == sessionId) mutable.update { it.copy(messages = messages, cacheComplete = cache.messagesComplete(id, sessionId), resources = mapOf("messages" to ResourceStatus(ResourceState.STALE, "离线缓存"))) }
+        if (token == generation && state.value.serverId == id && state.value.sessionId == sessionId) mutable.update { withSummary(it.copy(messages = messages, cacheComplete = cache.messagesComplete(id, sessionId), resources = mapOf("messages" to ResourceStatus(ResourceState.STALE, "离线缓存")))) }
       }
     }
   }
@@ -448,15 +465,48 @@ class LagoonController private constructor(private val appContext: Context) {
     // pending requests and running indicators roll up to that root instead of leaking child rows.
     val identities = (state.value.sessions + sessions + extraSessions).associateBy { it.id }.toMutableMap()
     val attempted = mutableSetOf<String>()
-    repeat(32) {
-      val parents = identities.values.mapNotNull { it.parentId }.filter { it !in identities && attempted.add(it) }.distinct().take(100)
-      if (parents.isEmpty()) return@repeat
-      parents.chunked(4).forEach { batch ->
-        val fetched = coroutineScope { batch.map { id -> async { attempt { findSession(client, id) }.getOrNull() } }.awaitAll().filterNotNull() }
-        fetched.forEach { identities[it.id] = it }; extraSessions += fetched
-        if (token != generation || requestSequence != catalogSequence) return
+    suspend fun fetchMissingParents(): Boolean {
+      var rounds = 0
+      while (rounds++ < 32) {
+        val parents = identities.values.mapNotNull { it.parentId }.filter { it !in identities && attempted.add(it) }.distinct().take(100)
+        if (parents.isEmpty()) return true
+        for (batch in parents.chunked(4)) {
+          val fetched = coroutineScope { batch.map { id -> async { attempt { findSession(client, id) }.getOrNull() } }.awaitAll().filterNotNull() }
+          fetched.forEach { identities[it.id] = it }; extraSessions += fetched
+          if (token != generation || requestSequence != catalogSequence) return false
+        }
       }
+      return true
     }
+    if (!fetchMissingParents()) return
+
+    // `/api/session/active` and the event stream can both omit a child identity after a reconnect.
+    // A persisted live root is enough to discover its descendants through the authoritative child
+    // listing; those identities then supply the parent map used by the task reducer below.
+    val knownParents = store.taskParents(serverId) + identities.values.mapNotNull { session ->
+      session.parentId?.let { session.id to it }
+    }
+    val candidateIds = previousActiveIds + active.orEmpty() + state.value.backgroundRunning
+    val candidateRoots = candidateIds.map { BackgroundWork.rootOf(it, knownParents) }.toSet()
+    // A root present in the authoritative foreground set is already running itself; querying its
+    // children would only add catalog traffic and cannot change the background classification.
+    var childFrontier = identities.values.filter { it.id in candidateRoots && it.parentId == null && active?.contains(it.id) != true }
+    val inspectedChildren = mutableSetOf<String>()
+    var childBudget = MAX_BACKGROUND_CHILD_SESSIONS
+    var childDepth = 0
+    while (childFrontier.isNotEmpty() && childDepth++ < MAX_BACKGROUND_CHILD_DEPTH && childBudget > 0) {
+      val batch = childFrontier.filter { inspectedChildren.add(it.id) }.take(MAX_BACKGROUND_CHILD_ROOTS)
+      if (batch.isEmpty()) break
+      val listed = coroutineScope { batch.map { session -> async { attempt { client.children(session) } } }.awaitAll() }
+        .flatMap { it.getOrDefault(emptyList()) }.distinctBy { it.id }
+      if (token != generation || requestSequence != catalogSequence) return
+      val additions = listed.filter { it.id.isNotBlank() && it.id !in identities }.take(childBudget)
+      additions.forEach { identities[it.id] = it }
+      extraSessions += additions
+      childBudget -= additions.size
+      childFrontier = listed.filter { it.id !in inspectedChildren }
+    }
+    if (!fetchMissingParents()) return
     // 运行中的 shell 作业：后台 shell 不是会话，不在 /api/session/active 里，冷启动/断线后只能从
     // `GET /api/shell` 读到。目录列表以本机项目优先，其次是最新活跃会话的执行目录（上限防请求风暴）。
     val shellDirectories = (projects.map { it.directory } +
@@ -483,6 +533,9 @@ class LagoonController private constructor(private val appContext: Context) {
         if (token != generation || requestSequence != catalogSequence) return
       }
     }
+    // A shell owner may itself be a grandchild outside the catalog. Resolve its complete ancestry
+    // after the shell-specific identity fetch as well as before it.
+    if (!fetchMissingParents()) return
     // Pending requests, read like the official client: permissions per session, forms per location.
     // Only a running session can be waiting on the user.
     val waitingCandidates = active.orEmpty().mapNotNull { identities[it] }.take(MAX_REQUEST_SESSIONS)
@@ -533,6 +586,12 @@ class LagoonController private constructor(private val appContext: Context) {
           // “后台运行中”。SSE 路径的折算态不在这里收尾，交给宽限任务等唤醒（settleBackgroundRun）。
           task?.active == true && task.background == true && !hasWork ->
             TaskReducer.terminal(session.id, session.outcome, task)
+          // 根执行可能因事件丢失仍保留旧的前台 active 状态；只要权威 active 列表已排除它、
+          // 且同一子树仍有后台工作，就必须先转成折算态，不能让旧根状态遮住后台任务。
+          task?.active == true && !task.background && session.id !in active && hasWork &&
+            task.phase in TaskState.RUNNING_PHASES ->
+            TaskState(session.id, TaskPhase.THINKING, TaskState.BACKGROUND_DETAIL, task.since,
+              activeAt = task.activeAt, background = true)
           // 不在前台活跃集合（/api/session/active）不等于本轮结束：转入后台的阻塞工具/子代理会让会话
           // 继续存活。只有服务端持久化的 time.idle 越过本轮基线、且自身子树没有后台工作时才权威收尾。
           task?.active == true && task.background != true && task.activeAt >= 0 && session.idle > 0 && session.idle > task.activeAt && !hasWork ->
@@ -771,9 +830,9 @@ class LagoonController private constructor(private val appContext: Context) {
    */
   private fun handleEvent(event: ServerEvent) {
     val props = event.properties
-    val sessionId = props.str("sessionID").ifBlank { props.obj("form").str("sessionID") }
+    val sessionId = props.sessionEventId(event.type)
     val known = mutable.value.sessions.firstOrNull { it.id == sessionId }
-    val directory = known?.directory ?: event.directory
+    val directory = known?.directory ?: event.directory.ifBlank { props.sessionInfo().toSession().directory }
     if (sessionId.isNotBlank()) {
       val before = mutable.value.tasks[sessionId]
       // 事件会话自身子树里是否还有会唤醒它的后台工作（后台 shell / 仍在执行的子代理）。
@@ -823,11 +882,23 @@ class LagoonController private constructor(private val appContext: Context) {
         cancelAttention(sessionId)
       }
       "session.created" -> {
-        val created = JSONObject(props.toString()).put("id", sessionId)
-          .put("time", JSONObject().put("created", event.created).put("updated", event.created)).toSession()
+        val info = JSONObject(props.sessionInfo().toString()).put("id", sessionId)
+        if (event.created > 0) {
+          val time = info.obj("time")
+          if (time.optLong("created", 0) <= 0) time.put("created", event.created)
+          if (time.optLong("updated", 0) <= 0) time.put("updated", event.created)
+          info.put("time", time)
+        }
+        val created = info.toSession()
         if (created.id.isNotBlank()) {
-          created.parentId?.let { parent -> state.value.serverId?.let { store.rememberParents(it, listOf(created)) }; mutable.update { it.copy(knownParents = it.knownParents + (created.id to parent)) } }
-          mutable.update { it.copy(sessions = (listOf(created) + it.sessions).distinctBy { item -> item.id }.sortedWith(sessionActivityOrder)) }
+          state.value.serverId?.let { store.rememberParents(it, listOf(created)) }
+          mutable.update { current ->
+            val parent = created.parentId
+            val parents = if (parent == null) current.knownParents - created.id
+            else current.knownParents + (created.id to parent)
+            current.copy(knownParents = parents,
+              sessions = (listOf(created) + current.sessions).distinctBy { item -> item.id }.sortedWith(sessionActivityOrder))
+          }
         }
       }
       "session.renamed" -> updateSession(sessionId) { it.copy(title = props.str("title")) }
@@ -872,15 +943,34 @@ class LagoonController private constructor(private val appContext: Context) {
       // A run started or ended: official `session.sync` of that one session (outcome, idle, updated).
       "session.execution.started", "session.execution.succeeded", "session.execution.failed", "session.execution.interrupted" -> refreshSession(sessionId)
     }
+    // The parent tool may settle before the child session emits a useful execution event. Official
+    // metadata still identifies that child as running; keep every such child separately so sibling
+    // background tasks are not collapsed into one last-seen boolean.
+    val backgroundChild = BackgroundWork.backgroundSubagentId(event.type, props)
+    if (sessionId.isNotBlank() && backgroundChild != null) {
+      mutable.update { current ->
+        val previous = current.tasks[backgroundChild]
+        val child = if (previous?.active == true) previous else TaskState(backgroundChild, TaskPhase.SUBAGENT,
+          TaskState.RUNNING_DETAIL, since = event.created.takeIf { it > 0 } ?: System.currentTimeMillis(), activeAt = -1L)
+        withSummary(current.copy(tasks = current.tasks + (backgroundChild to child),
+          knownParents = current.knownParents + (backgroundChild to sessionId)))
+      }
+    }
     if (event.type in setOf("session.execution.succeeded", "session.execution.failed") && !familyActive(sessionId)) recordResultNotice(event, sessionId)
     if (sessionId.isNotBlank() && sessionId == mutable.value.sessionId) {
-      val projected = TranscriptProjection.apply(mutable.value.messages, event) ?: return
-      if (projected.messages !== mutable.value.messages) mutable.update { it.copy(messages = projected.messages, resources = it.resources + ("messages" to ResourceStatus(ResourceState.READY))) }
-      if (projected.reconcile && messageRefresh?.isActive != true) {
-        val session = mutable.value.session ?: return
-        val token = generation
-        messageRefresh = scope.launch { delay(refreshMode.messageDebounceMs); loadSession(session, ancillary = false, token = token) }
+      val projected = TranscriptProjection.apply(mutable.value.messages, event)
+      if (projected != null && projected.messages !== mutable.value.messages) mutable.update { it.copy(messages = projected.messages, resources = it.resources + ("messages" to ResourceStatus(ResourceState.READY))) }
+       if (projected?.reconcile == true && messageRefresh?.isActive != true) {
+         mutable.value.session?.let { session ->
+           val token = generation
+           messageRefresh = scope.launch { delay(refreshMode.messageDebounceMs); loadSession(session, ancillary = false, token = token) }
+         }
       }
+    }
+    // Apply this after transcript projection so the completion notice prevents the history-derived
+    // fallback above from immediately recreating the child task.
+    BackgroundWork.completedSubagentId(event.type, props)?.let { child ->
+      mutable.update { current -> withSummary(current.copy(tasks = current.tasks - child)) }
     }
   }
 
@@ -1164,7 +1254,7 @@ class LagoonController private constructor(private val appContext: Context) {
     if (result.isSuccess) store.rememberPreview(serverId, session.id, preview)
     val latestAgent = messages.asReversed().firstNotNullOfOrNull { it.agent } ?: session.agent
     val latestModel = messages.asReversed().firstNotNullOfOrNull { it.model } ?: session.model
-    mutable.update { it.copy(messages = messages, cached = result.isFailure, messagesCursor = if (it.loadedOlderMessages) it.messagesCursor else nextCursor, cacheComplete = result.isSuccess || cache.messagesComplete(serverId, session.id),
+    mutable.update { withSummary(it.copy(messages = messages, cached = result.isFailure, messagesCursor = if (it.loadedOlderMessages) it.messagesCursor else nextCursor, cacheComplete = result.isSuccess || cache.messagesComplete(serverId, session.id),
       previews = it.previews + (session.id to preview),
       agent = if (it.agentChanged) it.agent else latestAgent,
       model = if (it.modelChanged) it.model else latestModel?.let { candidate ->
@@ -1172,7 +1262,7 @@ class LagoonController private constructor(private val appContext: Context) {
       },
       modelChanged = it.modelChanged || (!it.modelChanged && latestModel != null && it.modelCatalog.isNotEmpty() &&
         normalizeModelVariant(serverId, latestModel, it.modelCatalog).variant != latestModel.variant),
-      resources = it.resources + ("messages" to ResourceStatus(if (result.isSuccess) { if (messages.none { message -> message.isDisplayable }) ResourceState.EMPTY else ResourceState.READY } else ResourceState.STALE))) }
+       resources = it.resources + ("messages" to ResourceStatus(if (result.isSuccess) { if (messages.none { message -> message.isDisplayable }) ResourceState.EMPTY else ResourceState.READY } else ResourceState.STALE))) ) }
     // Opening a session never infers a result from its history: “已完成” exists only in the ledger.
     if (ancillary) {
       // Children and diff are independent; fetch in parallel (one round trip when connected).
