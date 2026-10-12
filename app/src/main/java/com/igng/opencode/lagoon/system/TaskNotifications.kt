@@ -15,7 +15,6 @@ import android.os.Build
 import android.provider.Settings
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
-import androidx.core.graphics.drawable.IconCompat
 import com.igng.opencode.lagoon.R
 import com.igng.opencode.lagoon.core.LiveUpdateContent
 import com.igng.opencode.lagoon.core.LiveUpdateBucket
@@ -169,7 +168,7 @@ class TaskNotifications(private val context: Context) {
 
   /**
    * A categorical status rail, not a fake completion percentage. Segment lengths represent the
-   * current task mix; the tracker icon marks the most important active bucket (waiting first).
+   * current task mix without adding an icon to the center of the rail.
    */
   private fun progressStyle(content: LiveUpdateContent): NotificationCompat.ProgressStyle {
     val style = NotificationCompat.ProgressStyle()
@@ -178,9 +177,6 @@ class TaskNotifications(private val context: Context) {
       .setProgressSegments(content.progress.segments.map { segment ->
         NotificationCompat.ProgressStyle.Segment(segment.length).setColor(progressColor(segment.bucket))
       })
-    if (content.progress.focus != null) {
-      style.setProgressTrackerIcon(IconCompat.createWithResource(context, R.drawable.ic_notification))
-    }
     return style
   }
 
