@@ -29,6 +29,7 @@ class SingleIslandOwnerTest {
     assertTrue(text.contains("NotificationCompat.ProgressStyle"))
     assertTrue(text.contains("setProgressSegments"))
     assertTrue(text.contains("setStyledByProgress(false)"))
+    assertFalse(text.contains("setProgressTrackerIcon"))
   }
 
   @Test fun inAppFakeIslandIsGone() {
