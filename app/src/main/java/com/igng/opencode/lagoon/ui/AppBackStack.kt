@@ -28,6 +28,10 @@ internal data class SessionNavigation(val page: RootPage = RootPage.HOME, val se
   fun back() = if (sessions.isNotEmpty()) copy(sessions = sessions.dropLast(1)) else SessionNavigation()
 }
 
+/** True when a back navigation leaves the outermost conversation for its originating page. */
+internal fun leavesSession(from: SessionNavigation, to: SessionNavigation): Boolean =
+  from.sessions.isNotEmpty() && to.sessions.isEmpty()
+
 /** Route id of the blank "新会话" page; it becomes the real session id after the first send. */
 internal const val DRAFT_SESSION = "\u0000draft"
 

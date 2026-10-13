@@ -31,6 +31,12 @@ class SessionNavigationTest {
     assertEquals(SessionNavigation(), nav.back().back().back().back())
     assertFalse(nav.back().back().back().back().canGoBack)
   }
+  @Test fun leavingTheOutermostSessionReturnsToItsOriginPage() {
+    val chat = SessionNavigation(RootPage.ARCHIVED).open("session")
+    assertTrue(leavesSession(chat, chat.back()))
+    assertFalse(leavesSession(chat.open("child", child = true), chat))
+    assertFalse(leavesSession(SessionNavigation(RootPage.ARCHIVED), SessionNavigation()))
+  }
   @Test fun unrelatedSessionDoesNotInheritAnotherSessionsBackChain() {
     val nav = SessionNavigation().open("parent").open("child", true).open("other")
     assertEquals(listOf("other"), nav.sessions)

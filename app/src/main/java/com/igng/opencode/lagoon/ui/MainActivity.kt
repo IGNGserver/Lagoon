@@ -84,10 +84,11 @@ class MainActivity : ComponentActivity() {
       var chatModal by remember { mutableStateOf(false) }
       var globalMessage by remember { mutableStateOf<String?>(null) }
       var globalMessageType by remember { mutableStateOf(MiuixToastType.INFO) }
-      val holder = rememberSaveableStateHolder()
-       val snapshots = remember { mutableMapOf<String, LagoonState>() }
-       var pendingOpen by remember { mutableStateOf<SessionTarget?>(null) }
-      val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
+       val holder = rememberSaveableStateHolder()
+        val snapshots = remember { mutableMapOf<String, LagoonState>() }
+        var pendingOpen by remember { mutableStateOf<SessionTarget?>(null) }
+       var restoreAllServersOnBack by rememberSaveable { mutableStateOf(false) }
+       val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
       val focusManager = LocalFocusManager.current
       val density = LocalDensity.current
       val keyboardOpen = WindowInsets.ime.getBottom(density) > 0
@@ -110,11 +111,12 @@ class MainActivity : ComponentActivity() {
           }
          }
        }
-       fun openSession(target: SessionTarget, child: Boolean = false) {
-         if (state.allServers || state.serverId != target.serverId) {
-           pendingOpen = target
-           controller.connect(target.serverId)
-           return
+        fun openSession(target: SessionTarget, child: Boolean = false) {
+          if (state.allServers || state.serverId != target.serverId) {
+            if (state.allServers) restoreAllServersOnBack = true
+            pendingOpen = target
+            controller.connect(target.serverId)
+            return
          }
          openSessionLocal(target.sessionId, child)
        }
@@ -129,12 +131,17 @@ class MainActivity : ComponentActivity() {
        }
       fun openPage(page: RootPage) { focusManager.clearFocus(); val next = SessionNavigation(currentPage, sessionStack).push(page); currentPage = next.page; sessionStack = next.sessions }
       fun editServer(profile: ServerProfile?) { editingServerId = profile?.id; showingServerForm = true }
-      fun goBack() {
-        focusManager.clearFocus()
-        val next = SessionNavigation(currentPage, sessionStack).back()
-        sessionStack = next.sessions; currentPage = next.page
-        next.sessions.lastOrNull()?.let(controller::selectSession)
-      }
+       fun goBack() {
+         focusManager.clearFocus()
+         val current = SessionNavigation(currentPage, sessionStack)
+         val next = current.back()
+         sessionStack = next.sessions; currentPage = next.page
+         next.sessions.lastOrNull()?.let(controller::selectSession)
+         if (restoreAllServersOnBack && leavesSession(current, next)) {
+           restoreAllServersOnBack = false
+           controller.setAllServers(true)
+         }
+       }
       LaunchedEffect(state.serverId) {
         if (navigationServer != state.serverId) { sessionStack = emptyList(); snapshots.clear(); navigationServer = state.serverId }
       }
@@ -179,10 +186,13 @@ class MainActivity : ComponentActivity() {
       LaunchedEffect(state.message) { state.message?.let { globalMessage = it; globalMessageType = MiuixToastType.SUCCESS; controller.clearMessage() } }
        LaunchedEffect(deepLink, state.serverId, state.connected, state.allServers) {
          val (server, session) = deepLink ?: return@LaunchedEffect
-         if (state.profiles.none { it.id == server }) { globalMessage = "这个服务器已移除"; globalMessageType = MiuixToastType.ERROR; deepLink = null }
-         else if (state.connected && !state.allServers && state.serverId == server) {
-           currentPage = RootPage.HOME; openSession(SessionTarget(server, session)); deepLink = null
-         } else if (state.allServers || state.serverId != server) controller.connect(server)
+          if (state.profiles.none { it.id == server }) { globalMessage = "这个服务器已移除"; globalMessageType = MiuixToastType.ERROR; deepLink = null }
+          else if (state.connected && !state.allServers && state.serverId == server) {
+            currentPage = RootPage.HOME; openSession(SessionTarget(server, session)); deepLink = null
+          } else if (state.allServers || state.serverId != server) {
+            if (state.allServers) restoreAllServersOnBack = true
+            controller.connect(server)
+          }
        }
       val backProgress = remember { Animatable(0f) }
       var gestureActive by remember { mutableStateOf(false) }
@@ -231,7 +241,11 @@ class MainActivity : ComponentActivity() {
                    else startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, packageName))
                  }, ::editServer, onManageModels = { showingModelManagement = true }, onBack = { goBack() })
                  else -> HomeScreen(state, controller, onOpen = { openSession(it) }, onNewSession = { openDraft() }, onProjects = { showingProjects = true },
-                   onSelectServer = { profile -> if (profile == null) controller.setAllServers(true) else if (profile.id != state.serverId || !state.connected || state.allServers) controller.connect(profile.id) },
+                    onSelectServer = { profile ->
+                      restoreAllServersOnBack = false
+                      if (profile == null) controller.setAllServers(true)
+                      else if (profile.id != state.serverId || !state.connected || state.allServers) controller.connect(profile.id)
+                    },
                    onEditServer = ::editServer, onPage = ::openPage)
               }
             }
@@ -278,9 +292,10 @@ class MainActivity : ComponentActivity() {
                else ProjectScopeSheet(state, controller) { showingProjects = false }
              }
              if (showingAllDraftTarget) AllServersDraftTargetSheet(state, onSelect = { profile, project ->
-               showingAllDraftTarget = false
-               pendingDraftTarget = profile.id to project.id
-               controller.connect(profile.id, project.id)
+                showingAllDraftTarget = false
+                restoreAllServersOnBack = true
+                pendingDraftTarget = profile.id to project.id
+                controller.connect(profile.id, project.id)
              }, onDismiss = { showingAllDraftTarget = false })
             if (showingModelManagement) ModelManagementSheet(state, controller) { showingModelManagement = false }
           }
