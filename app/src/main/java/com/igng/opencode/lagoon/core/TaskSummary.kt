@@ -31,9 +31,11 @@ data class TaskSummary(
   val failed: Int = 0,
   val items: List<TaskSummaryItem> = emptyList(),
   /** 其中在应用处于后台时仍在运行的根会话数（用于“后台运行中”文案）。 */
-  val background: Int = 0
+  val background: Int = 0,
+  /** Work blocked on the server with no phone-local approval prompt. */
+  val processing: Int = 0
 ) {
-  val isEmpty: Boolean get() = running == 0 && completed == 0 && waiting == 0 && failed == 0
+  val isEmpty: Boolean get() = running == 0 && completed == 0 && waiting == 0 && failed == 0 && processing == 0
 
   /**
    * 统一显示文案：
@@ -47,6 +49,7 @@ data class TaskSummary(
       return buildString {
         append("${running}个运行中，${completed}个已完成")
         if (waiting > 0) append("，${waiting}个待回复")
+        if (processing > 0) append("，${processing}个等待服务器处理")
         if (failed > 0) append("，${failed}个失败")
       }
     }
@@ -60,6 +63,7 @@ data class TaskSummary(
     get() = buildString {
       append("${running}跑·${completed}完")
       if (waiting > 0) append("·${waiting}待")
+      if (processing > 0) append("·${processing}处理中")
       if (failed > 0) append("·${failed}败")
     }
 
@@ -91,6 +95,7 @@ data class TaskSummary(
       var waiting = 0
       var failed = 0
       var background = 0
+      var processing = 0
       for (task in rootTasks.values) {
         when (task.phase) {
           in TaskState.RUNNING_PHASES -> {
@@ -98,6 +103,7 @@ data class TaskSummary(
             if (task.sessionId in backgroundRoots) background += 1
           }
           TaskPhase.WAITING_PERMISSION, TaskPhase.WAITING_QUESTION -> waiting += 1
+          TaskPhase.WAITING_SERVER -> processing += 1
           TaskPhase.COMPLETED -> completed += 1
           TaskPhase.FAILED -> failed += 1
           else -> Unit
@@ -105,7 +111,7 @@ data class TaskSummary(
       }
 
       val sortedTasks = rootTasks.values
-        .filter { it.phase in TaskState.RUNNING_PHASES || it.phase in TaskState.WAITING_PHASES || it.phase == TaskPhase.FAILED || it.phase == TaskPhase.COMPLETED }
+        .filter { it.active || it.phase == TaskPhase.FAILED || it.phase == TaskPhase.COMPLETED }
         .sortedWith(compareByDescending<TaskState> { priority(it) }.thenByDescending { it.since })
         .take(3)
         .map { task ->
@@ -127,7 +133,8 @@ data class TaskSummary(
         waiting = waiting,
         failed = failed,
         items = sortedTasks,
-        background = background
+        background = background,
+        processing = processing
       )
     }
 
@@ -143,7 +150,8 @@ data class TaskSummary(
         waiting = summaries.sumOf { it.waiting },
         failed = summaries.sumOf { it.failed },
         items = items,
-        background = summaries.sumOf { it.background }
+        background = summaries.sumOf { it.background },
+        processing = summaries.sumOf { it.processing }
       )
     }
 
@@ -174,7 +182,8 @@ data class TaskSummary(
     private fun priority(task: TaskState): Int = priority(task.phase)
 
     private fun priority(phase: TaskPhase): Int = when (phase) {
-      in TaskState.WAITING_PHASES -> 5
+      TaskPhase.WAITING_SERVER -> 5
+      in TaskState.WAITING_PHASES -> 6
       in TaskState.RUNNING_PHASES -> 4
       TaskPhase.FAILED -> 3
       TaskPhase.COMPLETED -> 2

@@ -139,7 +139,13 @@ class ServerStore internal constructor(private val preferences: SharedPreference
   }
 
   fun selectedId(): String? = preferences.getString("selected", null)
+  fun homeServerId(): String? = preferences.getString("homeServer", null) ?: selectedId()
+  fun rememberHomeServer(id: String) { preferences.edit().putString("homeServer", id).apply() }
   /** The all-servers switch is separate from the last single-server selection. */
+  fun permissionPolicy(): PermissionPolicy = PermissionPolicy(preferences.getBoolean("hidePermissions", false), preferences.getBoolean("autoApprovePermissions", false))
+  fun rememberPermissionPolicy(policy: PermissionPolicy) {
+    preferences.edit().putBoolean("hidePermissions", policy.hide).putBoolean("autoApprovePermissions", policy.autoApprove).apply()
+  }
   fun allServers(): Boolean = preferences.getBoolean("allServersMode", false)
   fun rememberAllServers(enabled: Boolean) {
     preferences.edit().putBoolean("allServersMode", enabled).apply()

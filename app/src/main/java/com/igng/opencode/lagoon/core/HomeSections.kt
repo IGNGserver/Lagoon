@@ -65,7 +65,7 @@ object HomeSections {
       SessionStatus.WAITING_PERMISSION, SessionStatus.WAITING_QUESTION -> 0
       SessionStatus.RUNNING, SessionStatus.BACKGROUND_RUNNING -> 1
       SessionStatus.FAILED, SessionStatus.COMPLETED -> 2
-      SessionStatus.NONE -> 3
+      SessionStatus.NONE, SessionStatus.WAITING_SERVER -> 3
     }
     val titles = listOf("需要处理", "运行中", "未读结果", "其他")
     return sessions.groupBy(::bucket).toSortedMap().map { (index, list) -> HomeSection("status:$index", titles[index], list) }
