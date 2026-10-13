@@ -13,8 +13,12 @@ data class ServerProfile(
   val allowCleartext: Boolean = false
 )
 
-data class Project(val id: String, val directory: String, val name: String, val sandboxes: List<String> = emptyList()) {
+data class Project(val id: String, val directory: String, val name: String, val sandboxes: List<String> = emptyList(),
+  /** Source server when this project is shown in the all-servers overview. */
+  val serverId: String? = null) {
   val directories: List<String> get() = (listOf(directory) + sandboxes).filter(String::isNotBlank).distinctBy(::normalizedDirectory)
+  /** Project ids are only unique within one OpenCode server. */
+  val key: String get() = serverId?.let { scopedKey(it, id) } ?: id
 }
 data class Session(val id: String, val directory: String, val title: String, val updated: Long, val parentId: String? = null,
   val projectId: String? = null, val created: Long = 0, val archived: Boolean = false,
@@ -26,10 +30,21 @@ data class Session(val id: String, val directory: String, val title: String, val
   /** 最近一轮执行的结局（`outcome`）：`succeeded` / `failed` / `interrupted`。 */
   val outcome: String? = null,
   /** 已暂存撤销的边界（`revert.messageID`）：官方时间线隐藏 id ≥ 它的消息。 */
-  val revertMessageId: String? = null) {
+  val revertMessageId: String? = null,
+  /** Source server when this session is shown in the all-servers overview. */
+  val serverId: String? = null) {
   /** 排序口径与官方一致：优先 `time.updated`，缺失时退回 `time.created`。 */
   val activityAt: Long get() = updated.takeIf { it > 0 } ?: created
+  /** Session ids are only unique within one OpenCode server. */
+  val key: String get() = serverId?.let { scopedKey(it, id) } ?: id
+  val target: SessionTarget? get() = serverId?.let { SessionTarget(it, id) }
 }
+
+/** A session identity that remains unambiguous when several servers use the same id. */
+data class SessionTarget(val serverId: String, val sessionId: String)
+
+/** Internal map key for all-server projections; raw server session ids stay unchanged on the wire. */
+internal fun scopedKey(serverId: String, id: String): String = "$serverId\u0000$id"
 
 /**
  * One projected timeline entry (`Session.Message.Info`). [role] is the rendering family:

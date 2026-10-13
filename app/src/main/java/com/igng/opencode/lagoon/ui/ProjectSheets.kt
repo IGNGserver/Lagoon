@@ -52,7 +52,7 @@ internal fun ProjectScopeSheet(state: LagoonState, controller: LagoonController,
       } else item {
         Card(Modifier.fillMaxWidth()) {
           projects.forEach { project ->
-            ProjectChoiceRow(project, "${HomeScope.displayPath(project.directory, null)} · ${counts[project.id] ?: 0} 个会话", state.scopeProjectId == project.id,
+            ProjectChoiceRow(project, "${HomeScope.displayPath(project.directory, null)} · ${counts[project.key] ?: 0} 个会话", state.scopeProjectId == project.id,
               onSelect = { controller.setScope(project.id); onDismiss() },
               onRemove = { removing = project })
           }
@@ -67,6 +67,33 @@ internal fun ProjectScopeSheet(state: LagoonState, controller: LagoonController,
     }
   }
   removing?.let { project -> RemoveProjectDialog(project, controller) { removing = null } }
+}
+
+/** Scope picker used by the aggregate home. Project filtering stays server-local, so selecting one
+ * here intentionally returns to that server's normal context instead of inventing a cross-server
+ * project id. */
+@Composable
+internal fun AllServersScopeSheet(state: LagoonState, controller: LagoonController, onDismiss: () -> Unit) {
+  val counts = state.sessions.filter { it.visibleOnHome }.groupingBy { it.serverId.orEmpty() }.eachCount()
+  SuperBottomSheet(title = "全部服务器", show = true, onDismissRequest = onDismiss) {
+    LazyColumn(Modifier.fillMaxWidth().heightIn(max = 560.dp), contentPadding = PaddingValues(bottom = 16.dp)) {
+      item {
+        Card(Modifier.fillMaxWidth()) {
+          ChoiceRow("全部服务器", "${state.sessions.count { it.parentId == null }} 个会话", true, onClick = onDismiss)
+        }
+      }
+      item { SmallTitle("服务器", insideMargin = PaddingValues(horizontal = 16.dp, vertical = 8.dp)) }
+      items(state.profiles, key = { it.id }) { profile ->
+        val snapshot = state.allServerSnapshots[profile.id]
+        Card(Modifier.fillMaxWidth()) {
+          ChoiceRow(profile.name, "${counts[profile.id] ?: 0} 个会话${if (snapshot?.connected == true) " · 已连接" else " · 未连接"}", false) {
+            controller.connect(profile.id)
+            onDismiss()
+          }
+        }
+      }
+    }
+  }
 }
 
 /** Lightweight project chooser for a draft: picks where the new session starts, without changing the home scope. */
@@ -99,9 +126,41 @@ internal fun DraftTargetSheet(state: LagoonState, controller: LagoonController, 
   removing?.let { project -> RemoveProjectDialog(project, controller) { removing = null } }
 }
 
+/** Chooses both sides of a new-session target while the home is aggregating servers. */
+@Composable
+internal fun AllServersDraftTargetSheet(
+  state: LagoonState,
+  onSelect: (ServerProfile, Project) -> Unit,
+  onDismiss: () -> Unit
+) {
+  val grouped = state.projects.filter { it.serverId != null }.groupBy { it.serverId!! }
+  SuperBottomSheet(title = "在哪台服务器新建", show = true, onDismissRequest = onDismiss) {
+    LazyColumn(Modifier.fillMaxWidth().heightIn(max = 620.dp), contentPadding = PaddingValues(bottom = 16.dp)) {
+      if (grouped.isEmpty()) item {
+        Text("没有可用项目。请先在对应服务器中添加一个项目目录。", Modifier.padding(16.dp),
+          style = MiuixTheme.textStyles.footnote1.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
+      }
+      state.profiles.forEach { profile ->
+        val projects = grouped[profile.id].orEmpty()
+        if (projects.isNotEmpty()) {
+          item { SmallTitle(profile.name, insideMargin = PaddingValues(horizontal = 16.dp, vertical = 8.dp)) }
+          item {
+            Card(Modifier.fillMaxWidth()) {
+              projects.forEach { project ->
+                ProjectChoiceRow(project, HomeScope.displayPath(project.directory, null), false,
+                  onSelect = { onSelect(profile, project) })
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
 /** 项目行：点按选择，行尾「⋯」只提供本机移除；服务器目录与其中的数据不受影响。 */
 @Composable
-private fun ProjectChoiceRow(project: Project, summary: String, selected: Boolean, onSelect: () -> Unit, onRemove: () -> Unit) {
+private fun ProjectChoiceRow(project: Project, summary: String, selected: Boolean, onSelect: () -> Unit, onRemove: (() -> Unit)? = null) {
   var menu by remember { mutableStateOf(false) }
   Box {
     BasicComponent(
@@ -110,14 +169,18 @@ private fun ProjectChoiceRow(project: Project, summary: String, selected: Boolea
       onClick = onSelect,
       endActions = {
         if (selected) Icon(MiuixIcons.Ok, "已选择", Modifier.size(20.dp), tint = MiuixTheme.colorScheme.primary)
-        IconButton(onClick = { menu = true }, minWidth = 36.dp, minHeight = 36.dp) {
-          Icon(MiuixIcons.More, "项目操作", Modifier.size(18.dp), tint = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+        onRemove?.let {
+          IconButton(onClick = { menu = true }, minWidth = 36.dp, minHeight = 36.dp) {
+            Icon(MiuixIcons.More, "项目操作", Modifier.size(18.dp), tint = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+          }
         }
       }
     )
-    MenuPopup(menu, { menu = false }, listOf(MenuSection(listOf(
-      MenuAction("从本机移除", MiuixIcons.Delete, danger = true) { menu = false; onRemove() }
-    ))))
+    onRemove?.let {
+      MenuPopup(menu, { menu = false }, listOf(MenuSection(listOf(
+        MenuAction("从本机移除", MiuixIcons.Delete, danger = true) { menu = false; it() }
+      ))))
+    }
   }
 }
 

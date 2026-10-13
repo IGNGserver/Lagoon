@@ -5,7 +5,9 @@ package com.igng.opencode.lagoon.core
  * completion/failure results of root sessions, 500 entries, 30 days. An entry is created only when this
  * device witnesses a run end; opening the session marks all of its entries viewed.
  */
-data class SessionNotice(val id: String, val sessionId: String, val time: Long, val error: Boolean, val viewed: Boolean = false)
+data class SessionNotice(val id: String, val sessionId: String, val time: Long, val error: Boolean, val viewed: Boolean = false,
+  /** Source server when notices are projected into an all-servers view. */
+  val serverId: String? = null)
 
 /** Live-event source, as in the official client: a root session's `session.execution.succeeded` / `failed`. */
 internal fun ServerEvent.resultNotice(session: Session, now: Long = System.currentTimeMillis()): SessionNotice? {

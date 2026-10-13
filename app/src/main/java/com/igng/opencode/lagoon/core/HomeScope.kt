@@ -7,17 +7,20 @@ package com.igng.opencode.lagoon.core
 object HomeScope {
   /** Root sessions visible in [scope]; null keeps every project's sessions. */
   fun roots(sessions: List<Session>, projects: List<Project>, scope: String?): List<Session> =
-    sessions.filter { it.visibleOnHome && (scope == null || resolveSessionProject(it, projects)?.id == scope) }.sortedWith(sessionActivityOrder)
+    sessions.filter { session ->
+      val project = resolveSessionProject(session, projects)
+      session.visibleOnHome && (scope == null || project?.id == scope || project?.key == scope)
+    }.sortedWith(sessionActivityOrder)
 
   /** Home-visible root session count per project id, for the project picker. */
   fun counts(sessions: List<Session>, projects: List<Project>): Map<String, Int> =
-    sessions.filter { it.visibleOnHome }.mapNotNull { resolveSessionProject(it, projects)?.id }.groupingBy { it }.eachCount()
+    sessions.filter { it.visibleOnHome }.mapNotNull { resolveSessionProject(it, projects)?.key }.groupingBy { it }.eachCount()
 
   /** Projects ordered by their latest root-session activity; projects without sessions keep their order last. */
   fun byActivity(sessions: List<Session>, projects: List<Project>): List<Project> {
-    val latest = sessions.filter { it.visibleOnHome }.groupBy { resolveSessionProject(it, projects)?.id }
+    val latest = sessions.filter { it.visibleOnHome }.groupBy { resolveSessionProject(it, projects)?.key }
       .mapValues { (_, items) -> items.maxOf { it.activityAt } }
-    return projects.withIndex().sortedWith(compareByDescending<IndexedValue<Project>> { latest[it.value.id] ?: Long.MIN_VALUE }.thenBy { it.index }).map { it.value }
+    return projects.withIndex().sortedWith(compareByDescending<IndexedValue<Project>> { latest[it.value.key] ?: Long.MIN_VALUE }.thenBy { it.index }).map { it.value }
   }
 
   /**
@@ -26,7 +29,7 @@ object HomeScope {
    */
   fun draftTarget(sessions: List<Session>, projects: List<Project>, scope: String?, current: String?): String? {
     scope?.takeIf { id -> projects.any { it.id == id } }?.let { return it }
-    byActivity(sessions, projects).firstOrNull { project -> sessions.any { it.parentId == null && resolveSessionProject(it, projects)?.id == project.id } }?.let { return it.id }
+    byActivity(sessions, projects).firstOrNull { project -> sessions.any { it.parentId == null && resolveSessionProject(it, projects)?.key == project.key } }?.let { return it.id }
     return current?.takeIf { id -> projects.any { it.id == id } } ?: projects.firstOrNull()?.id
   }
 

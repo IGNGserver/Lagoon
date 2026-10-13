@@ -139,6 +139,11 @@ class ServerStore internal constructor(private val preferences: SharedPreference
   }
 
   fun selectedId(): String? = preferences.getString("selected", null)
+  /** The all-servers switch is separate from the last single-server selection. */
+  fun allServers(): Boolean = preferences.getBoolean("allServersMode", false)
+  fun rememberAllServers(enabled: Boolean) {
+    preferences.edit().putBoolean("allServersMode", enabled).apply()
+  }
   fun selectedProject(id: String? = selectedId()): String? = id?.let { preferences.getString("location:$it:project", null)
     ?: preferences.getString("selectedProject", null).takeIf { selectedId() == id } }
   fun selectedSession(id: String? = selectedId()): String? = id?.let { preferences.getString("location:$it:session", null)

@@ -24,6 +24,7 @@ import com.igng.opencode.lagoon.core.displayTitle
 import com.igng.opencode.lagoon.core.PermissionRequest
 import com.igng.opencode.lagoon.core.ServerProfile
 import com.igng.opencode.lagoon.core.Session
+import com.igng.opencode.lagoon.core.SessionTarget
 import com.igng.opencode.lagoon.core.TaskPhase
 import com.igng.opencode.lagoon.core.TaskState
 import com.igng.opencode.lagoon.core.TaskSummary
@@ -39,6 +40,8 @@ class TaskNotifications(private val context: Context) {
     const val ATTENTION = "task_attention"
     const val COMPLETED = "task_completed"
     const val SUMMARY = "task_summary"
+    const val ALL_SERVERS_ID = "__all_servers__"
+    val ALL_PROFILE = ServerProfile(ALL_SERVERS_ID, "全部服务器", "")
     fun notificationId(serverId: String, sessionId: String): Int = "${serverId}:$sessionId".hashCode() and 0x7fffffff
     /** One server-wide island/summary notification per server. */
     fun summaryId(serverId: String): Int = "summary:$serverId".hashCode() and 0x7fffffff
@@ -134,7 +137,7 @@ class TaskNotifications(private val context: Context) {
    * settled it is demoted to an ordinary, dismissible notification. The expanded Android 16 card
    * uses the platform's segmented progress rail; the status chip remains intentionally compact.
    */
-  fun buildSummary(profile: ServerProfile, summary: TaskSummary, targetSessionId: String?): Notification {
+  fun buildSummary(profile: ServerProfile, summary: TaskSummary, target: SessionTarget?): Notification {
     val content = LiveUpdateContent.of(summary)
     val active = content.stage == LiveUpdateStage.ACTIVE
     val builder = NotificationCompat.Builder(context, SUMMARY)
@@ -162,7 +165,9 @@ class TaskNotifications(private val context: Context) {
     } else {
       builder.setStyle(NotificationCompat.BigTextStyle().bigText(content.expandedText))
     }
-    (targetSessionId ?: content.headlineSessionId)?.let { builder.setContentIntent(open(profile.id, it)) }
+    (target ?: content.headlineSessionId?.let { SessionTarget(profile.id, it) })?.let { targetSession ->
+      builder.setContentIntent(open(targetSession.serverId, targetSession.sessionId))
+    }
     return builder.build()
   }
 
@@ -197,7 +202,7 @@ class TaskNotifications(private val context: Context) {
     return PendingIntent.getBroadcast(context, summaryId(serverId), intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
   }
 
-  fun showSummary(profile: ServerProfile, summary: TaskSummary, targetSessionId: String?) {
+  fun showSummary(profile: ServerProfile, summary: TaskSummary, target: SessionTarget?) {
     val stage = LiveUpdateContent.stageOf(summary)
     // 只有进行中的任务上岛。全部结束后不再保留任何总览通知：结果交给每会话的完成/失败通知，
     // 这样通知中心在空闲时不会留一条“N 已完成”的汇总。
@@ -212,7 +217,7 @@ class TaskNotifications(private val context: Context) {
       manager.cancel(summaryId(profile.id))
       return
     }
-    manager.notify(summaryId(profile.id), buildSummary(profile, summary, targetSessionId))
+    manager.notify(summaryId(profile.id), buildSummary(profile, summary, target))
   }
   fun cancelSummary(serverId: String) = manager.cancel(summaryId(serverId))
 
