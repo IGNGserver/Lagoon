@@ -2,11 +2,17 @@ package com.igng.opencode.lagoon.core
 
 /** Server identities and execution directories are separate: a worktree is still the same project. */
 fun resolveSessionProject(session: Session, projects: List<Project>): Project? {
-  session.projectId?.let { id -> projects.firstOrNull { it.id == id }?.let { return it } }
+  session.projectId?.let { id ->
+    projects.firstOrNull { project ->
+      project.id == id && (session.serverId == null || project.serverId == null || project.serverId == session.serverId)
+    }?.let { return it }
+  }
   val directory = normalizedDirectory(session.directory)
-  projects.firstOrNull { project -> project.directories.any { normalizedDirectory(it) == directory } }?.let { return it }
+  fun belongsToSource(project: Project): Boolean =
+    session.serverId == null || project.serverId == null || project.serverId == session.serverId
+  projects.firstOrNull { project -> belongsToSource(project) && project.directories.any { normalizedDirectory(it) == directory } }?.let { return it }
   return projects.flatMap { project -> project.directories.map { project to normalizedDirectory(it) } }
-    .filter { (_, root) -> root.isNotEmpty() && (directory == root || directory.startsWith(if (root == "/") root else "$root/")) }
+    .filter { (project, root) -> belongsToSource(project) && root.isNotEmpty() && (directory == root || directory.startsWith(if (root == "/") root else "$root/")) }
     .maxByOrNull { (_, root) -> root.length }?.first
 }
 
@@ -60,12 +66,17 @@ data class SessionGroup(val key: String, val name: String, val sessions: List<Se
 }
 
 /** Keep official root/archive eligibility, regardless of title, content, draft, or execution origin. */
-fun groupSessions(sessions: List<Session>, projects: List<Project>): List<SessionGroup> =
-  sessions.filter { it.visibleOnHome }.sortedWith(sessionActivityOrder).groupBy { session ->
+fun groupSessions(sessions: List<Session>, projects: List<Project>): List<SessionGroup> {
+  // Keep the historical raw project ids for the single-server helper, but scope keys whenever the
+  // input visibly contains more than one server so identical OpenCode ids do not merge.
+  val sourceCount = (sessions.mapNotNull { it.serverId } + projects.mapNotNull { it.serverId }).distinct().size
+  val scoped = sourceCount > 1
+  return sessions.filter { it.visibleOnHome }.sortedWith(sessionActivityOrder).groupBy { session ->
     val project = resolveSessionProject(session, projects)
-    (project?.id ?: "unassigned") to (project?.name ?: "未归入项目")
+    ((if (scoped) project?.key else project?.id) ?: "unassigned") to (project?.name ?: "未归入项目")
   }.map { (key, list) -> SessionGroup(key.first, key.second, list) }
     .sortedWith(compareByDescending<SessionGroup> { it.latest }.thenBy { it.key })
+}
 
 fun List<Message>.sessionPreview(): SessionPreview {
   val visible = filter { it.isDisplayable && it.role != "notice" }

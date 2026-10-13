@@ -47,10 +47,10 @@ import top.yukonga.miuix.kmp.utils.overScrollVertical
 internal fun HomeScreen(
   state: LagoonState,
   controller: LagoonController,
-  onOpen: (String) -> Unit,
+  onOpen: (SessionTarget) -> Unit,
   onNewSession: () -> Unit,
   onProjects: () -> Unit,
-  onSelectServer: (ServerProfile) -> Unit,
+  onSelectServer: (ServerProfile?) -> Unit,
   onEditServer: (ServerProfile?) -> Unit,
   onPage: (RootPage) -> Unit
 ) {
@@ -58,7 +58,7 @@ internal fun HomeScreen(
   var grouping by remember { mutableStateOf(runCatching { HomeGrouping.valueOf(preferences.getString("homeGrouping", null)!!) }.getOrDefault(HomeGrouping.DATE)) }
   var menu by remember { mutableStateOf(false) }
   var searching by rememberSaveable { mutableStateOf(false) }
-  var query by rememberSaveable(state.serverId) { mutableStateOf("") }
+  var query by rememberSaveable(state.allServers, state.serverId) { mutableStateOf("") }
   var renaming by remember { mutableStateOf<Session?>(null) }
   var deleting by remember { mutableStateOf<Session?>(null) }
   fun closeSearch() { searching = false; query = "" }
@@ -67,7 +67,10 @@ internal fun HomeScreen(
     Column(Modifier.fillMaxSize()) {
       if (searching) SearchTopBar(query, { query = it }, ::closeSearch)
       else HomeTopBar(
-        title = state.scopeProjectId?.let { id -> state.projects.firstOrNull { it.id == id }?.name } ?: "全部会话",
+         title = when {
+           state.allServers -> "全部服务器"
+           else -> state.scopeProjectId?.let { id -> state.projects.firstOrNull { it.id == id }?.name } ?: "全部会话"
+         },
         onTitleClick = onProjects,
         menu = {
           Box {
@@ -148,10 +151,10 @@ private fun HomeTopBar(title: String, onTitleClick: () -> Unit, menu: @Composabl
  * connection dot (connected / recovering / offline); tap switches, long press edits, ＋ adds.
  */
 @Composable
-private fun ServerChips(state: LagoonState, onSelect: (ServerProfile) -> Unit, onEdit: (ServerProfile?) -> Unit) {
+private fun ServerChips(state: LagoonState, onSelect: (ServerProfile?) -> Unit, onEdit: (ServerProfile?) -> Unit) {
   LazyRow(Modifier.fillMaxWidth(), contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-    items(state.profiles, key = { it.id }) { profile ->
-      val current = profile.id == state.serverId
+    item(key = "all-servers") {
+      val current = state.allServers
       val dot = when {
         !current -> null
         state.connected && state.streamConnected -> MiuixColorTokens.Success
@@ -163,7 +166,32 @@ private fun ServerChips(state: LagoonState, onSelect: (ServerProfile) -> Unit, o
         insideMargin = PaddingValues(horizontal = 16.dp),
         colors = CardDefaults.defaultColors(color = if (current) MiuixColorTokens.PrimarySubtle else MiuixTheme.colorScheme.secondaryContainer),
         pressFeedbackType = PressFeedbackType.Sink,
-        onClick = { onSelect(profile) },
+        onClick = { onSelect(null) }
+      ) {
+        Row(Modifier.height(40.dp), verticalAlignment = Alignment.CenterVertically) {
+          dot?.let { StatusDot(it); Spacer(Modifier.width(8.dp)) }
+          Text("全部", style = MiuixTheme.textStyles.body2.copy(fontWeight = if (current) FontWeight.Medium else FontWeight.Normal,
+            color = if (current) MiuixTheme.colorScheme.primary else MiuixTheme.colorScheme.onSurfaceVariantSummary))
+        }
+      }
+    }
+    items(state.profiles, key = { it.id }) { profile ->
+      val current = !state.allServers && profile.id == state.serverId
+      val overview = state.allServerSnapshots[profile.id]
+      val dot = when {
+        state.allServers && overview?.connected == true && overview.streamConnected -> MiuixColorTokens.Success
+        state.allServers && overview?.connected == true || state.allServers && overview?.loading == true -> MiuixColorTokens.Warning
+        !current -> null
+        state.connected && state.streamConnected -> MiuixColorTokens.Success
+        state.connected || state.loading -> MiuixColorTokens.Warning
+        else -> MiuixTheme.colorScheme.onSurfaceVariantSummary
+      }
+      Card(
+        cornerRadius = 20.dp,
+        insideMargin = PaddingValues(horizontal = 16.dp),
+        colors = CardDefaults.defaultColors(color = if (current) MiuixColorTokens.PrimarySubtle else MiuixTheme.colorScheme.secondaryContainer),
+        pressFeedbackType = PressFeedbackType.Sink,
+         onClick = { onSelect(profile) },
         onLongPress = { onEdit(profile) }
       ) {
         // A fixed height keeps Latin and CJK names on one baseline row.
@@ -199,7 +227,7 @@ private fun ServerChips(state: LagoonState, onSelect: (ServerProfile) -> Unit, o
 @Composable
 private fun SessionList(
   state: LagoonState, controller: LagoonController, grouping: HomeGrouping, query: String,
-  onOpen: (String) -> Unit, onNewSession: () -> Unit, onEditServer: (ServerProfile?) -> Unit,
+   onOpen: (SessionTarget) -> Unit, onNewSession: () -> Unit, onEditServer: (ServerProfile?) -> Unit,
   onRename: (Session) -> Unit, onDelete: (Session) -> Unit
 ) {
   var refreshing by remember { mutableStateOf(false) }
@@ -207,8 +235,10 @@ private fun SessionList(
   val list = rememberLazyListState()
   val now by produceState(System.currentTimeMillis()) { while (true) { kotlinx.coroutines.delay(60_000); value = System.currentTimeMillis() } }
   val active = remember(state.tasks, state.parents) { state.activeRootTasks }
-  val statuses = remember(state.sessions, state.notices, active, state.backgroundRunning) { state.sessions.associate { it.id to state.sessionStatus(it, active) } }
-  val unseen = remember(state.notices) { state.notices.filterNot { it.viewed }.map { it.sessionId }.toSet() }
+  val statuses = remember(state.sessions, state.notices, active, state.backgroundRunning, state.allSessionStatuses) { state.sessions.associate { it.key to state.sessionStatus(it, active) } }
+  val unseen = remember(state.notices, state.allUnseenSessions, state.allServers) {
+    if (state.allServers) state.allUnseenSessions else state.notices.filterNot { it.viewed }.map { it.sessionId }.toSet()
+  }
   val roots = HomeScope.roots(state.sessions, state.projects, state.scopeProjectId).filter { session ->
     query.isBlank() || session.displayTitle().contains(query, true) ||
       resolveSessionProject(session, state.projects)?.name?.contains(query, true) == true || session.directory.contains(query, true)
@@ -230,13 +260,17 @@ private fun SessionList(
         item(key = "section:${section.key}", contentType = "section") {
           SectionHeader(section.title, collapsed) { controller.toggleSection(section.key) }
         }
-        if (!collapsed) items(section.sessions, key = { "session:${section.key}:${it.id}" }, contentType = { "session" }) { session ->
+         if (!collapsed) items(section.sessions, key = { "session:${section.key}:${it.key}" }, contentType = { "session" }) { session ->
           val pinned = session.id in state.pinned
-          HomeSessionRow(session, statuses[session.id] ?: SessionStatus.NONE, session.id in unseen, onClick = { onOpen(session.id) }, actions = buildList {
-            add(MenuAction(if (pinned) "取消置顶" else "置顶", if (pinned) MiuixIcons.Unpin else MiuixIcons.Pin) { controller.togglePin(session.id) })
-            if (state.connected && state.capabilities.supports(SessionAction.RENAME)) add(MenuAction("重命名", MiuixIcons.Rename) { onRename(session) })
-            if (state.connected && state.capabilities.archive != null) add(MenuAction("归档", ARCHIVE_ICON) { controller.setArchived(session.id, true) })
-            if (state.connected) add(MenuAction("删除", MiuixIcons.Delete, danger = true) { onDelete(session) })
+          HomeSessionRow(session, statuses[session.key] ?: SessionStatus.NONE, session.key in unseen,
+            serverName = if (state.allServers) session.serverId?.let { id -> state.profiles.firstOrNull { it.id == id }?.name } else null,
+            onClick = { (session.target ?: state.serverId?.let { SessionTarget(it, session.id) })?.let(onOpen) }, actions = buildList {
+            if (!state.allServers) {
+              add(MenuAction(if (pinned) "取消置顶" else "置顶", if (pinned) MiuixIcons.Unpin else MiuixIcons.Pin) { controller.togglePin(session.id) })
+              if (state.connected && state.capabilities.supports(SessionAction.RENAME)) add(MenuAction("重命名", MiuixIcons.Rename) { onRename(session) })
+              if (state.connected && state.capabilities.archive != null) add(MenuAction("归档", ARCHIVE_ICON) { controller.setArchived(session.id, true) })
+              if (state.connected) add(MenuAction("删除", MiuixIcons.Delete, danger = true) { onDelete(session) })
+            }
           })
         }
       }
@@ -283,7 +317,7 @@ internal val UNARCHIVE_ICON get() = MiuixIcons.Import
  */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-internal fun HomeSessionRow(session: Session, status: SessionStatus, unseen: Boolean, onClick: () -> Unit, actions: List<MenuAction>) {
+internal fun HomeSessionRow(session: Session, status: SessionStatus, unseen: Boolean, serverName: String? = null, onClick: () -> Unit, actions: List<MenuAction>) {
   var menu by remember { mutableStateOf(false) }
   val haptics = LocalHapticFeedback.current
   val highlighted = unseen || status in setOf(SessionStatus.WAITING_PERMISSION, SessionStatus.WAITING_QUESTION)
@@ -293,8 +327,12 @@ internal fun HomeSessionRow(session: Session, status: SessionStatus, unseen: Boo
       .padding(start = 20.dp, end = 24.dp, top = 12.dp, bottom = 12.dp), verticalAlignment = Alignment.CenterVertically) {
       Box(Modifier.size(24.dp), contentAlignment = Alignment.Center) { StatusGlyph(status, unseen) }
       Spacer(Modifier.width(12.dp))
-      Text(session.displayTitle(), Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis,
-        style = MiuixTheme.textStyles.body1.copy(fontWeight = if (highlighted) FontWeight.Medium else FontWeight.Normal, color = MiuixTheme.colorScheme.onSurface))
+       Column(Modifier.weight(1f)) {
+         Text(session.displayTitle(), maxLines = 1, overflow = TextOverflow.Ellipsis,
+           style = MiuixTheme.textStyles.body1.copy(fontWeight = if (highlighted) FontWeight.Medium else FontWeight.Normal, color = MiuixTheme.colorScheme.onSurface))
+         serverName?.let { Text(it, maxLines = 1, overflow = TextOverflow.Ellipsis,
+           style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary)) }
+       }
       if (status == SessionStatus.BACKGROUND_RUNNING) {
         Spacer(Modifier.width(8.dp))
         Text(status.label, style = MiuixTheme.textStyles.footnote1.copy(color = MiuixTheme.colorScheme.primary))

@@ -7,7 +7,11 @@ data class TaskSummaryItem(
   val sessionId: String,
   val title: String,
   val phase: TaskPhase,
-  val detail: String = ""
+  val detail: String = "",
+  /** Non-null when the item belongs to a multi-server aggregate. */
+  val serverId: String? = null,
+  val serverName: String? = null,
+  val since: Long = 0
 )
 
 /**
@@ -72,7 +76,9 @@ data class TaskSummary(
       notices: List<SessionNotice> = emptyList(),
       parents: Map<String, String> = emptyMap(),
       titles: Map<String, String> = emptyMap(),
-      backgroundRoots: Set<String> = emptySet()
+      backgroundRoots: Set<String> = emptySet(),
+      serverId: String? = null,
+      serverName: String? = null
     ): TaskSummary {
       val active = aggregate(tasks.filterValues { it.active }, parents)
       val results = notices.filterNot { it.viewed || it.sessionId in active }.groupBy { it.sessionId }.map { (session, unseen) ->
@@ -108,7 +114,10 @@ data class TaskSummary(
             sessionId = task.sessionId,
             title = taskTitle,
             phase = task.phase,
-            detail = task.detail
+            detail = task.detail,
+            serverId = serverId,
+            serverName = serverName,
+            since = task.since
           )
         }
 
@@ -119,6 +128,22 @@ data class TaskSummary(
         failed = failed,
         items = sortedTasks,
         background = background
+      )
+    }
+
+    /** Combines independently reduced server summaries without colliding session ids. */
+    fun merge(summaries: List<TaskSummary>): TaskSummary {
+      if (summaries.isEmpty()) return EMPTY
+      val items = summaries.flatMap { it.items }
+        .sortedWith(compareByDescending<TaskSummaryItem> { priority(it.phase) }.thenByDescending { it.since })
+        .take(3)
+      return TaskSummary(
+        running = summaries.sumOf { it.running },
+        completed = summaries.sumOf { it.completed },
+        waiting = summaries.sumOf { it.waiting },
+        failed = summaries.sumOf { it.failed },
+        items = items,
+        background = summaries.sumOf { it.background }
       )
     }
 
@@ -146,7 +171,9 @@ data class TaskSummary(
       }
     }
 
-    private fun priority(task: TaskState): Int = when (task.phase) {
+    private fun priority(task: TaskState): Int = priority(task.phase)
+
+    private fun priority(phase: TaskPhase): Int = when (phase) {
       in TaskState.WAITING_PHASES -> 5
       in TaskState.RUNNING_PHASES -> 4
       TaskPhase.FAILED -> 3

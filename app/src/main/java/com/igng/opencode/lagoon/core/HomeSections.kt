@@ -53,15 +53,15 @@ object HomeSections {
    * server project are not shown as a project of their own — they collect under one 未归入项目 section.
    */
   fun byProject(sessions: List<Session>, projects: List<Project>): List<HomeSection> =
-    sessions.groupBy { session -> resolveSessionProject(session, projects)?.id.orEmpty() }
-      .map { (projectId, list) ->
-        val project = projects.firstOrNull { it.id == projectId }
-        HomeSection("project:${projectId.ifBlank { "unassigned" }}", project?.name ?: "未归入项目", list)
+    sessions.groupBy { session -> resolveSessionProject(session, projects)?.key.orEmpty() }
+      .map { (projectKey, list) ->
+        val project = projects.firstOrNull { it.key == projectKey }
+        HomeSection("project:${project?.key ?: projectKey.ifBlank { "unassigned" }}", project?.name ?: "未归入项目", list)
       }
 
   /** 需要处理 › 运行中 › 未读结果 › 其他, the order the official client ranks session indicators. */
   fun byStatus(sessions: List<Session>, statuses: Map<String, SessionStatus>): List<HomeSection> {
-    fun bucket(session: Session) = when (statuses[session.id] ?: SessionStatus.NONE) {
+    fun bucket(session: Session) = when (statuses[session.key] ?: SessionStatus.NONE) {
       SessionStatus.WAITING_PERMISSION, SessionStatus.WAITING_QUESTION -> 0
       SessionStatus.RUNNING, SessionStatus.BACKGROUND_RUNNING -> 1
       SessionStatus.FAILED, SessionStatus.COMPLETED -> 2
@@ -71,4 +71,3 @@ object HomeSections {
     return sessions.groupBy(::bucket).toSortedMap().map { (index, list) -> HomeSection("status:$index", titles[index], list) }
   }
 }
-

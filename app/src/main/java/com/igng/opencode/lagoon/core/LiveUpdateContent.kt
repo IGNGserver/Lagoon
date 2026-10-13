@@ -53,7 +53,10 @@ data class LiveUpdateContent(
         else -> ""
       }
       val statusText = summary.text.orEmpty()
-      val lines = summary.items.take(MAX_LINES).map { "${phaseLabel(it.phase)} · ${it.title}" }
+       val lines = summary.items.take(MAX_LINES).map { item ->
+         val title = item.serverName?.takeIf(String::isNotBlank)?.let { "$it · ${item.title}" } ?: item.title
+         "${phaseLabel(item.phase)} · $title"
+       }
       val total = summary.running + summary.waiting + summary.completed + summary.failed
       val hidden = total - lines.size
       val detailLines = if (hidden > 0) lines + "另有 $hidden 个任务" else lines

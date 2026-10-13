@@ -21,17 +21,19 @@ import top.yukonga.miuix.kmp.utils.overScrollVertical
  * session; long press restores (only where the instance documents a nullable `time.archived`) or deletes.
  */
 @Composable
-internal fun ArchivedScreen(state: LagoonState, controller: LagoonController, onOpen: (String) -> Unit, onBack: () -> Unit) {
+internal fun ArchivedScreen(state: LagoonState, controller: LagoonController, onOpen: (SessionTarget) -> Unit, onBack: () -> Unit) {
   var deleting by remember { mutableStateOf<Session?>(null) }
   val archived = state.sessions.filter { it.parentId == null && it.archived }.sortedWith(sessionActivityOrder)
   val muted = MiuixTheme.colorScheme.onSurfaceVariantSummary
   Column(Modifier.fillMaxSize()) {
     PageTopBar("已归档", onBack)
     LazyColumn(Modifier.fillMaxSize().overScrollVertical(), contentPadding = PaddingValues(top = 4.dp, bottom = 48.dp)) {
-      items(archived, key = { it.id }) { session ->
-        HomeSessionRow(session, SessionStatus.NONE, unseen = false, onClick = { onOpen(session.id) }, actions = buildList {
-          if (state.connected && state.capabilities.archive?.restorable == true) add(MenuAction("取消归档", UNARCHIVE_ICON) { controller.setArchived(session.id, false) })
-          if (state.connected) add(MenuAction("删除", MiuixIcons.Delete, danger = true) { deleting = session })
+      items(archived, key = { it.key }) { session ->
+        HomeSessionRow(session, SessionStatus.NONE, unseen = false,
+          serverName = if (state.allServers) session.serverId?.let { id -> state.profiles.firstOrNull { it.id == id }?.name } else null,
+          onClick = { (session.target ?: state.serverId?.let { SessionTarget(it, session.id) })?.let(onOpen) }, actions = buildList {
+          if (!state.allServers && state.connected && state.capabilities.archive?.restorable == true) add(MenuAction("取消归档", UNARCHIVE_ICON) { controller.setArchived(session.id, false) })
+          if (!state.allServers && state.connected) add(MenuAction("删除", MiuixIcons.Delete, danger = true) { deleting = session })
         })
       }
       if (archived.isEmpty()) item {

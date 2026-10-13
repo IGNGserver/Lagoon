@@ -73,17 +73,20 @@ class MainActivity : ComponentActivity() {
       var sessionStack by rememberSaveable { mutableStateOf(emptyList<String>()) }
       var navigationServer by rememberSaveable { mutableStateOf(state.serverId) }
       // The server sheet edits one profile (null = add a new one); switching happens on the home capsules.
-      var showingServerForm by remember { mutableStateOf(false) }
-      var editingServerId by remember { mutableStateOf<String?>(null) }
-      var showingProjects by remember { mutableStateOf(false) }
-      var showingModelManagement by remember { mutableStateOf(false) }
+       var showingServerForm by remember { mutableStateOf(false) }
+       var editingServerId by remember { mutableStateOf<String?>(null) }
+       var showingProjects by remember { mutableStateOf(false) }
+       var showingAllDraftTarget by remember { mutableStateOf(false) }
+       var pendingDraftTarget by remember { mutableStateOf<Pair<String, String>?>(null) }
+       var showingModelManagement by remember { mutableStateOf(false) }
       // Each blank draft gets a fresh saveable scope so a sent draft never reappears.
       var draftNonce by rememberSaveable { mutableIntStateOf(0) }
       var chatModal by remember { mutableStateOf(false) }
       var globalMessage by remember { mutableStateOf<String?>(null) }
       var globalMessageType by remember { mutableStateOf(MiuixToastType.INFO) }
       val holder = rememberSaveableStateHolder()
-      val snapshots = remember { mutableMapOf<String, LagoonState>() }
+       val snapshots = remember { mutableMapOf<String, LagoonState>() }
+       var pendingOpen by remember { mutableStateOf<SessionTarget?>(null) }
       val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
       val focusManager = LocalFocusManager.current
       val density = LocalDensity.current
@@ -91,9 +94,9 @@ class MainActivity : ComponentActivity() {
       val navigation = SessionNavigation(currentPage, sessionStack)
       val inChatDetail = sessionStack.isNotEmpty()
       val route = navigation.route
-      fun openSession(id: String, child: Boolean = false) {
-        focusManager.clearFocus()
-        if (state.session != null) snapshots["${state.serverId}:${state.sessionId}"] = state
+       fun openSessionLocal(id: String, child: Boolean = false) {
+         focusManager.clearFocus()
+         if (state.session != null) snapshots["${state.serverId}:${state.sessionId}"] = state
         val known = controller.state.value.sessions.firstOrNull { it.id == id }
         if (child || known?.parentId == null && known != null) {
           sessionStack = SessionNavigation(currentPage, sessionStack).open(id, child).sessions
@@ -105,16 +108,25 @@ class MainActivity : ComponentActivity() {
             sessionStack = lineage
             if (controller.state.value.sessionId != id) controller.selectSession(id)
           }
-        }
-      }
-      fun openDraft() {
-        focusManager.clearFocus()
-        if (!state.connected) { globalMessage = if (state.profiles.isEmpty()) "先添加一个 OpenCode 服务器" else "服务器尚未连接，连接后才能新建会话"; globalMessageType = MiuixToastType.INFO; return }
+         }
+       }
+       fun openSession(target: SessionTarget, child: Boolean = false) {
+         if (state.allServers || state.serverId != target.serverId) {
+           pendingOpen = target
+           controller.connect(target.serverId)
+           return
+         }
+         openSessionLocal(target.sessionId, child)
+       }
+       fun openDraft() {
+         focusManager.clearFocus()
+         if (state.allServers) { showingAllDraftTarget = true; return }
+         if (!state.connected) { globalMessage = if (state.profiles.isEmpty()) "先添加一个 OpenCode 服务器" else "服务器尚未连接，连接后才能新建会话"; globalMessageType = MiuixToastType.INFO; return }
         if (state.projects.isEmpty()) { globalMessage = "先添加一个项目"; globalMessageType = MiuixToastType.INFO; showingProjects = true; return }
         controller.beginDraft()
         draftNonce += 1
-        sessionStack = listOf(DRAFT_SESSION)
-      }
+         sessionStack = listOf(DRAFT_SESSION)
+       }
       fun openPage(page: RootPage) { focusManager.clearFocus(); val next = SessionNavigation(currentPage, sessionStack).push(page); currentPage = next.page; sessionStack = next.sessions }
       fun editServer(profile: ServerProfile?) { editingServerId = profile?.id; showingServerForm = true }
       fun goBack() {
@@ -126,13 +138,29 @@ class MainActivity : ComponentActivity() {
       LaunchedEffect(state.serverId) {
         if (navigationServer != state.serverId) { sessionStack = emptyList(); snapshots.clear(); navigationServer = state.serverId }
       }
-      LaunchedEffect(state.sessionId) {
+       LaunchedEffect(state.sessionId) {
         val id = state.sessionId
-        if (inChatDetail && id != null && sessionStack.lastOrNull() != id) {
-          sessionStack = if (state.session?.parentId == sessionStack.lastOrNull()) sessionStack + id else sessionStack.dropLast(1) + id
+         if (inChatDetail && id != null && sessionStack.lastOrNull() != id) {
+           sessionStack = if (state.session?.parentId == sessionStack.lastOrNull()) sessionStack + id else sessionStack.dropLast(1) + id
+         }
+       }
+       LaunchedEffect(state.allServers, state.serverId, state.connected, pendingOpen) {
+         val target = pendingOpen
+         if (target != null && !state.allServers && state.serverId == target.serverId && state.connected) {
+           pendingOpen = null
+           openSessionLocal(target.sessionId)
+         }
+       }
+       LaunchedEffect(state.allServers, state.serverId, state.connected, pendingDraftTarget) {
+         val target = pendingDraftTarget
+         if (target != null && !state.allServers && state.serverId == target.first && state.connected) {
+           pendingDraftTarget = null
+           if (state.projects.any { it.id == target.second }) controller.selectProject(target.second)
+           draftNonce += 1
+           sessionStack = listOf(DRAFT_SESSION)
+         }
         }
-      }
-      SideEffect {
+       SideEffect {
         WindowCompat.getInsetsController(window, window.decorView).apply { isAppearanceLightStatusBars = !dark; isAppearanceLightNavigationBars = !dark }
         if (state.sessionId != null) {
           snapshots["${state.serverId}:${state.sessionId}"] = state
@@ -149,12 +177,13 @@ class MainActivity : ComponentActivity() {
       LaunchedEffect(state.profiles.isEmpty()) { if (state.profiles.isEmpty()) editServer(null) }
       LaunchedEffect(state.error) { state.error?.let { globalMessage = it; globalMessageType = MiuixToastType.ERROR; controller.clearError() } }
       LaunchedEffect(state.message) { state.message?.let { globalMessage = it; globalMessageType = MiuixToastType.SUCCESS; controller.clearMessage() } }
-      LaunchedEffect(deepLink, state.serverId, state.connected) {
-        val (server, session) = deepLink ?: return@LaunchedEffect
-        if (state.serverId != server) {
-          if (state.profiles.any { it.id == server }) controller.connect(server) else { globalMessage = "这个服务器已移除"; globalMessageType = MiuixToastType.ERROR; deepLink = null }
-        } else if (state.connected) { currentPage = RootPage.HOME; openSession(session); deepLink = null }
-      }
+       LaunchedEffect(deepLink, state.serverId, state.connected, state.allServers) {
+         val (server, session) = deepLink ?: return@LaunchedEffect
+         if (state.profiles.none { it.id == server }) { globalMessage = "这个服务器已移除"; globalMessageType = MiuixToastType.ERROR; deepLink = null }
+         else if (state.connected && !state.allServers && state.serverId == server) {
+           currentPage = RootPage.HOME; openSession(SessionTarget(server, session)); deepLink = null
+         } else if (state.allServers || state.serverId != server) controller.connect(server)
+       }
       val backProgress = remember { Animatable(0f) }
       var gestureActive by remember { mutableStateOf(false) }
       var gestureRoute by remember { mutableStateOf<NavRoute?>(null) }
@@ -193,15 +222,17 @@ class MainActivity : ComponentActivity() {
               val displayed = if (target.session == state.sessionId) state else snapshots["${state.serverId}:${target.session}"] ?: state
               when {
                 target.session == DRAFT_SESSION -> DraftScreen(state, controller, onBack = { goBack() }, onModal = { if (active) chatModal = it }, interactive = active)
-                target.session != null -> ChatScreen(displayed, controller, onBack = { goBack() }, onOpenChild = { child -> openSession(child, child = controller.state.value.sessions.any { it.id == child }) }, onModal = { if (active) chatModal = it }, interactive = active)
-                target.page == RootPage.ARCHIVED -> ArchivedScreen(state, controller, onOpen = { openSession(it) }, onBack = { goBack() })
+                 target.session != null -> ChatScreen(displayed, controller, onBack = { goBack() }, onOpenChild = { child ->
+                   controller.state.value.serverId?.let { server -> openSession(SessionTarget(server, child), child = controller.state.value.sessions.any { it.id == child }) }
+                 }, onModal = { if (active) chatModal = it }, interactive = active)
+                 target.page == RootPage.ARCHIVED -> ArchivedScreen(state, controller, onOpen = { openSession(it) }, onBack = { goBack() })
                  target.page == RootPage.SETTINGS -> SettingsScreen(state, controller, themeMode, { themeMode = it; preferences.edit().putString("themeMode", it.name).apply() }, previewBack, { previewBack = it; preferences.edit().putBoolean("previewBack", it).apply() }, refreshMode, { refreshMode = it; controller.setRefreshMode(it) }, {
                    if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
                    else startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, packageName))
                  }, ::editServer, onManageModels = { showingModelManagement = true }, onBack = { goBack() })
-                else -> HomeScreen(state, controller, onOpen = { openSession(it) }, onNewSession = { openDraft() }, onProjects = { showingProjects = true },
-                  onSelectServer = { profile -> if (profile.id != state.serverId || !state.connected) controller.connect(profile.id) },
-                  onEditServer = ::editServer, onPage = ::openPage)
+                 else -> HomeScreen(state, controller, onOpen = { openSession(it) }, onNewSession = { openDraft() }, onProjects = { showingProjects = true },
+                   onSelectServer = { profile -> if (profile == null) controller.setAllServers(true) else if (profile.id != state.serverId || !state.connected || state.allServers) controller.connect(profile.id) },
+                   onEditServer = ::editServer, onPage = ::openPage)
               }
             }
             peekRoute?.let { peek ->
@@ -242,7 +273,15 @@ class MainActivity : ComponentActivity() {
             MiuixToastHost(globalMessage, globalMessageType, { globalMessage = null }, Modifier.align(Alignment.TopCenter).statusBarsPadding().padding(top = 16.dp))
             // MIUIX popups must stay inside this Scaffold content's popup registry.
             if (showingServerForm) ServersModal(state, controller, state.profiles.firstOrNull { it.id == editingServerId }) { showingServerForm = false; editingServerId = null }
-            if (showingProjects) ProjectScopeSheet(state, controller) { showingProjects = false }
+             if (showingProjects) {
+               if (state.allServers) AllServersScopeSheet(state, controller) { showingProjects = false }
+               else ProjectScopeSheet(state, controller) { showingProjects = false }
+             }
+             if (showingAllDraftTarget) AllServersDraftTargetSheet(state, onSelect = { profile, project ->
+               showingAllDraftTarget = false
+               pendingDraftTarget = profile.id to project.id
+               controller.connect(profile.id, project.id)
+             }, onDismiss = { showingAllDraftTarget = false })
             if (showingModelManagement) ModelManagementSheet(state, controller) { showingModelManagement = false }
           }
         }
