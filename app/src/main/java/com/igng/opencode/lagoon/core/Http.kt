@@ -20,6 +20,12 @@ import java.util.concurrent.TimeUnit
 internal object SharedHttp {
   val connectionPool = ConnectionPool(maxIdleConnections = 5, keepAliveDuration = 5, timeUnit = TimeUnit.MINUTES)
   val dispatcher = Dispatcher()
+  // Long-lived SSE calls must not occupy the HTTP request slots (five per host by default),
+  // especially when several saved endpoints share one reverse-proxy hostname.
+  val streamDispatcher = Dispatcher().apply {
+    maxRequests = Int.MAX_VALUE
+    maxRequestsPerHost = Int.MAX_VALUE
+  }
   /** Blocking HTTP work; shared so per-API instances do not each leak a scope. */
   val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 }

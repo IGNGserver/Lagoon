@@ -76,6 +76,7 @@ fun MiuixStatePill(
     TaskPhase.THINKING, TaskPhase.TOOL, TaskPhase.SUBAGENT, TaskPhase.TESTING -> TaskState.RUNNING_DETAIL
     TaskPhase.WAITING_PERMISSION -> "等待授权"
     TaskPhase.WAITING_QUESTION -> "等待回答"
+    TaskPhase.WAITING_SERVER -> "等待服务器处理"
     TaskPhase.COMPLETED -> "已完成"
     TaskPhase.FAILED -> "失败"
     TaskPhase.ABORTED -> "已停止"

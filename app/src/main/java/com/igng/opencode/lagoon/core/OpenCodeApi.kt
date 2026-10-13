@@ -80,6 +80,7 @@ class OpenCodeApi(
     }
     .build()
   private val streamClient = client.newBuilder()
+    .dispatcher(SharedHttp.streamDispatcher)
     .readTimeout(0, TimeUnit.MILLISECONDS)
     .callTimeout(0, TimeUnit.MILLISECONDS)
     .build()
@@ -439,6 +440,9 @@ class OpenCodeApi(
   /** Pending permission requests owned by one session (official `session.permission.list`). */
   suspend fun sessionPermissions(session: Session): List<PermissionRequest> =
     dataArray(obj(sessionPath(session.id, "/permission"))).objects().map { it.toPermission(session.directory) }
+  /** Location-scoped sweep, also covers parked requests on locally known idle sessions. */
+  suspend fun pendingPermissions(directory: String): List<PermissionRequest> =
+    dataArray(obj("api/permission/request", locationQuery(directory))).objects().map { it.toPermission(directory) }
   /** Pending forms at [directory] (`form.list` is location-scoped); callers filter by session. */
   suspend fun forms(directory: String): List<QuestionRequest> =
     dataArray(obj("api/form", locationQuery(directory))).objects().map { it.toForm(directory) }

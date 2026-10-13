@@ -36,7 +36,8 @@ internal fun leavesSession(from: SessionNavigation, to: SessionNavigation): Bool
 internal const val DRAFT_SESSION = "\u0000draft"
 
 /** What the root AnimatedContent shows: a page, or a chat [depth] levels above 会话. */
-internal data class NavRoute(val page: RootPage, val session: String?, val depth: Int = if (session == null) 0 else 1)
+internal data class NavRoute(val page: RootPage, val session: String?, val depth: Int = if (session == null) 0 else 1,
+  val serverId: String? = null)
 
 /**
  * Horizontal direction of a route change: 1 = the new page enters from the right, -1 = from the left.

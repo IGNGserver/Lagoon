@@ -33,7 +33,7 @@ data class LiveUpdateContent(
     private const val MAX_LINES = 3
 
     fun stageOf(summary: TaskSummary): LiveUpdateStage = when {
-      summary.running > 0 || summary.waiting > 0 -> LiveUpdateStage.ACTIVE
+      summary.running > 0 || summary.waiting > 0 || summary.processing > 0 -> LiveUpdateStage.ACTIVE
       summary.completed > 0 || summary.failed > 0 -> LiveUpdateStage.SETTLED
       else -> LiveUpdateStage.EMPTY
     }
@@ -47,6 +47,7 @@ data class LiveUpdateContent(
           summary.background >= summary.running -> "${summary.running} 个任务在后台运行中"
           else -> "${summary.running} 个任务运行中（${summary.background} 个在后台）"
         }
+        summary.processing > 0 -> "${summary.processing} 个任务等待服务器处理"
         summary.failed > 0 && summary.completed > 0 -> "${summary.completed} 个已完成，${summary.failed} 个失败"
         summary.failed > 0 -> "${summary.failed} 个任务失败"
         summary.completed > 0 -> "${summary.completed} 个任务已完成"
@@ -57,7 +58,7 @@ data class LiveUpdateContent(
          val title = item.serverName?.takeIf(String::isNotBlank)?.let { "$it · ${item.title}" } ?: item.title
          "${phaseLabel(item.phase)} · $title"
        }
-      val total = summary.running + summary.waiting + summary.completed + summary.failed
+      val total = summary.running + summary.waiting + summary.processing + summary.completed + summary.failed
       val hidden = total - lines.size
       val detailLines = if (hidden > 0) lines + "另有 $hidden 个任务" else lines
       val expanded = (listOf(statusText).filter { it.isNotBlank() } + detailLines).joinToString("\n")
@@ -73,6 +74,7 @@ data class LiveUpdateContent(
     }
 
     fun phaseLabel(phase: TaskPhase): String = when (phase) {
+      TaskPhase.WAITING_SERVER -> "等待服务器处理"
       in TaskState.WAITING_PHASES -> "待处理"
       in TaskState.RUNNING_PHASES -> "运行中"
       TaskPhase.FAILED -> "失败"

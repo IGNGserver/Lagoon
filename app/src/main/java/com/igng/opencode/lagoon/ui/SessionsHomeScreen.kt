@@ -179,8 +179,8 @@ private fun ServerChips(state: LagoonState, onSelect: (ServerProfile?) -> Unit, 
       val current = !state.allServers && profile.id == state.serverId
       val overview = state.allServerSnapshots[profile.id]
       val dot = when {
-        state.allServers && overview?.connected == true && overview.streamConnected -> MiuixColorTokens.Success
-        state.allServers && overview?.connected == true || state.allServers && overview?.loading == true -> MiuixColorTokens.Warning
+        overview?.connected == true && overview.streamConnected -> MiuixColorTokens.Success
+        overview?.connected == true || overview?.loading == true -> MiuixColorTokens.Warning
         !current -> null
         state.connected && state.streamConnected -> MiuixColorTokens.Success
         state.connected || state.loading -> MiuixColorTokens.Warning
@@ -333,9 +333,12 @@ internal fun HomeSessionRow(session: Session, status: SessionStatus, unseen: Boo
          serverName?.let { Text(it, maxLines = 1, overflow = TextOverflow.Ellipsis,
            style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary)) }
        }
-      if (status == SessionStatus.BACKGROUND_RUNNING) {
+       if (status == SessionStatus.BACKGROUND_RUNNING) {
         Spacer(Modifier.width(8.dp))
-        Text(status.label, style = MiuixTheme.textStyles.footnote1.copy(color = MiuixTheme.colorScheme.primary))
+         Text(status.label, style = MiuixTheme.textStyles.footnote1.copy(color = MiuixTheme.colorScheme.primary))
+       } else if (status == SessionStatus.WAITING_SERVER) {
+         Spacer(Modifier.width(8.dp))
+         Text(status.label, style = MiuixTheme.textStyles.footnote1.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
       } else if (status == SessionStatus.WAITING_PERMISSION || status == SessionStatus.WAITING_QUESTION) {
         Spacer(Modifier.width(8.dp))
         Text(status.label, style = MiuixTheme.textStyles.footnote1.copy(color = MiuixColorTokens.Warning))
@@ -353,6 +356,8 @@ private fun StatusGlyph(status: SessionStatus, unseen: Boolean) {
       InfiniteProgressIndicator(color = MiuixTheme.colorScheme.primary, size = 16.dp, strokeWidth = 2.dp, orbitingDotSize = 2.dp)
     status == SessionStatus.BACKGROUND_RUNNING ->
       Icon(MiuixIcons.Info, status.label, Modifier.size(20.dp), tint = MiuixTheme.colorScheme.primary)
+    status == SessionStatus.WAITING_SERVER ->
+      Icon(MiuixIcons.Info, status.label, Modifier.size(20.dp), tint = muted)
     status == SessionStatus.WAITING_PERMISSION || status == SessionStatus.WAITING_QUESTION ->
       Icon(MiuixIcons.Info, status.label, Modifier.size(20.dp), tint = MiuixColorTokens.Warning)
     status == SessionStatus.FAILED -> Box(Modifier.size(8.dp).background(MiuixColorTokens.Error, CircleShape))

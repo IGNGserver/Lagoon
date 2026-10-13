@@ -54,6 +54,7 @@ class ControllerRegressionTest {
     put(c,"operationScope",CoroutineScope(SupervisorJob()+Dispatchers.Unconfined))
     put(c,"scope",CoroutineScope(Job().apply { cancel() }+Dispatchers.Default))
     put(c,"store",ServerStore(preferences(),preferences(),{it},{it}));put(c,"cache",OfflineCache(context.getSharedPreferences("cache",0),{it},{it}));put(c,"sendMutex",kotlinx.coroutines.sync.Mutex()); put(c,"referenceMutex",kotlinx.coroutines.sync.Mutex()); put(c,"monitorRequested",mutableSetOf<String>()); put(c,"draftWrites",mutableMapOf<String,Job>()); put(c,"attentionJobs",mutableMapOf<String,Job>()); put(c,"waitingEventSeqAt",mutableMapOf<String,Long>())
+    put(c, "resolvedPermissions", linkedSetOf<String>())
     return c to mutable
   }
   private fun api(s:MockWebServer) = OpenCodeApi(ServerProfile("server","Server",s.url("/").toString(),allowCleartext=true), "fixture")
@@ -563,6 +564,28 @@ class ControllerRegressionTest {
       controller.replyPermission(perm, "once").join()
       assertTrue(state.value.permissions.isEmpty())
       assertFalse(state.value.pending("permission:per_1"))
+      assertEquals(TaskPhase.THINKING, state.value.tasks["ses_r"]?.phase)
+      assertEquals(0, state.value.summary.waiting)
+    }
+  }
+
+  @Test fun replyingOnePermissionKeepsOtherPendingPermissionsUntilLastReply() = runBlocking {
+    MockWebServer().use { server ->
+      server.dispatcher = object : Dispatcher() { override fun dispatch(request: RecordedRequest) =
+        if (request.requestUrl!!.encodedPath == "/api/info") MockResponse().setBody("""{"version":"2.0.22"}""")
+        else MockResponse().setResponseCode(204)
+      }
+      val client = api(server); client.health()
+      val first = PermissionRequest("p1", "s", "/repo", "shell", "one")
+      val second = first.copy(id = "p2")
+      val (controller, state) = controller(client, LagoonState(serverId = "server", connected = true,
+        permissions = listOf(first, second), tasks = mapOf("s" to TaskState("s", TaskPhase.WAITING_PERMISSION))))
+      controller.replyPermission(first, "once").join()
+      assertEquals(listOf(second), state.value.permissions)
+      assertEquals(TaskPhase.WAITING_PERMISSION, state.value.tasks["s"]?.phase)
+      controller.replyPermission(second, "once").join()
+      assertEquals(TaskPhase.THINKING, state.value.tasks["s"]?.phase)
+      assertEquals(0, state.value.summary.waiting)
     }
   }
 

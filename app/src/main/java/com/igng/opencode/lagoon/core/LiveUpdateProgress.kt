@@ -28,7 +28,7 @@ data class LiveUpdateProgress(
 
     fun of(summary: TaskSummary): LiveUpdateProgress {
       val buckets = listOf(
-        LiveUpdateBucket.RUNNING to summary.running,
+        LiveUpdateBucket.RUNNING to summary.running + summary.processing,
         LiveUpdateBucket.WAITING to summary.waiting,
         LiveUpdateBucket.COMPLETED to summary.completed,
         LiveUpdateBucket.FAILED to summary.failed
@@ -42,7 +42,7 @@ data class LiveUpdateProgress(
       }
       val focus = when {
         summary.waiting > 0 -> LiveUpdateBucket.WAITING
-        summary.running > 0 -> LiveUpdateBucket.RUNNING
+        summary.running > 0 || summary.processing > 0 -> LiveUpdateBucket.RUNNING
         summary.failed > 0 -> LiveUpdateBucket.FAILED
         summary.completed > 0 -> LiveUpdateBucket.COMPLETED
         else -> null

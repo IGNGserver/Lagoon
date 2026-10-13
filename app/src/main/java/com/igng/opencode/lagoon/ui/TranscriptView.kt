@@ -63,7 +63,7 @@ internal fun Conversation(state: LagoonState, controller: LagoonController, modi
   onOpenChild: (String) -> Unit = {}, onActivityGroup: (TranscriptRow) -> Unit = {}) {
   val list = rememberLazyListState()
   val scope = rememberCoroutineScope()
-  val task = state.tasks[state.sessionId]
+  val task = state.presentedTasks[state.sessionId]
   val working = task?.active == true
   val revert = state.session?.revertMessageId
   val rows by produceState(emptyList<TranscriptRow>(), state.messages, working, revert) {
@@ -85,7 +85,7 @@ internal fun Conversation(state: LagoonState, controller: LagoonController, modi
     if ((list.isScrollInProgress || dragged) && !autoScroll) follow = nearBottom
   }
   val contentKey = state.messages.lastOrNull()?.let { it.id to it.parts.sumOf { part -> part.text.length + part.output.length } }
-  val permissions = state.permissions.filter { it.sessionId == state.sessionId }
+  val permissions = state.visiblePermissions.filter { it.sessionId == state.sessionId }
   val questions = state.questions.filter { it.sessionId == state.sessionId }
   // The exact number of LazyColumn items the data implies; the scroll effect waits for the list to lay
   // out that many before landing, so the initial open does not scroll while `rows` are still empty.

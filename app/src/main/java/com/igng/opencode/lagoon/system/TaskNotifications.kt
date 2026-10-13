@@ -116,10 +116,11 @@ class TaskNotifications(private val context: Context) {
   fun show(profile: ServerProfile, session: Session, state: TaskState, permission: PermissionRequest? = null) {
     if (!allowed()) return
     if (!profile.notifications) return
-    if (state.phase == TaskPhase.IDLE || state.phase == TaskPhase.DISCONNECTED) return
+    if (state.phase == TaskPhase.IDLE || state.phase == TaskPhase.DISCONNECTED || state.phase == TaskPhase.WAITING_SERVER) return
     // 只有「需要处理」与终态结果发普通通知；运行中一律交给灵动岛总览，避免通知中心堆积。
     if (state.phase in TaskState.RUNNING_PHASES) return
     val store = ServerStore(context)
+    if (state.phase == TaskPhase.WAITING_PERMISSION && store.permissionPolicy().hide) return
     val previous = store.taskStates(profile.id)[session.id]
     val next = store.rememberTask(profile.id, if (previous != null && previous.phase == state.phase) state.copy(since = previous.since) else state, session.parentId)
     if (next.phase in setOf(TaskPhase.COMPLETED, TaskPhase.FAILED) && session.id in store.acknowledgedTasks(profile.id)) return

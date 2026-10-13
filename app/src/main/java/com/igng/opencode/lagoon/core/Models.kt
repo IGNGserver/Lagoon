@@ -133,7 +133,7 @@ data class ShellJob(
   val observedAt: Long = System.currentTimeMillis()
 )
 
-enum class TaskPhase { IDLE, THINKING, TOOL, SUBAGENT, TESTING, WAITING_PERMISSION, WAITING_QUESTION, COMPLETED, FAILED, ABORTED, DISCONNECTED }
+enum class TaskPhase { IDLE, THINKING, TOOL, SUBAGENT, TESTING, WAITING_PERMISSION, WAITING_QUESTION, WAITING_SERVER, COMPLETED, FAILED, ABORTED, DISCONNECTED }
 data class TaskState(
   val sessionId: String,
   val phase: TaskPhase,
@@ -155,7 +155,7 @@ data class TaskState(
   val background: Boolean = false
 ) {
   val active: Boolean get() = when (phase) {
-    TaskPhase.THINKING, TaskPhase.TOOL, TaskPhase.SUBAGENT, TaskPhase.TESTING, TaskPhase.WAITING_PERMISSION, TaskPhase.WAITING_QUESTION -> true
+    TaskPhase.THINKING, TaskPhase.TOOL, TaskPhase.SUBAGENT, TaskPhase.TESTING, TaskPhase.WAITING_PERMISSION, TaskPhase.WAITING_QUESTION, TaskPhase.WAITING_SERVER -> true
     else -> false
   }
 
@@ -167,7 +167,7 @@ data class TaskState(
     /** Phases where the agent is actively working, without an outstanding user prompt. */
     val RUNNING_PHASES: Set<TaskPhase> = setOf(TaskPhase.THINKING, TaskPhase.TOOL, TaskPhase.SUBAGENT, TaskPhase.TESTING)
     /** Phases waiting on a user decision. */
-    val WAITING_PHASES: Set<TaskPhase> = setOf(TaskPhase.WAITING_PERMISSION, TaskPhase.WAITING_QUESTION)
+    val WAITING_PHASES: Set<TaskPhase> = setOf(TaskPhase.WAITING_PERMISSION, TaskPhase.WAITING_QUESTION, TaskPhase.WAITING_SERVER)
     /** Union of [RUNNING_PHASES] and [WAITING_PHASES], matching [active]. */
     val ACTIVE_PHASES: Set<TaskPhase> = RUNNING_PHASES + WAITING_PHASES
     /** Terminal phases that a run never leaves on its own. */

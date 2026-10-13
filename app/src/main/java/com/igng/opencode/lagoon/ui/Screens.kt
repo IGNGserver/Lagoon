@@ -419,6 +419,18 @@ fun SettingsScreen(
     }
 
     item {
+      SmallTitle("授权")
+      Card(Modifier.fillMaxWidth()) {
+        SuperSwitch(title = "不显示授权窗口", summary = "本手机全部服务器：隐藏授权窗口、列表标记和通知；不会因此允许操作，任务可能仍等待电脑端处理",
+          checked = state.permissionPolicy.hide,
+          onCheckedChange = { controller.setPermissionPolicy(state.permissionPolicy.copy(hide = it)) })
+        SuperSwitch(title = "自动授权", summary = "本手机全部服务器：自动对每个权限请求“允许一次”，不保存永久规则；请仅连接可信服务器",
+          checked = state.permissionPolicy.autoApprove,
+          onCheckedChange = { controller.setPermissionPolicy(state.permissionPolicy.copy(autoApprove = it)) })
+      }
+    }
+
+    item {
       SmallTitle("任务通知")
       Card(Modifier.fillMaxWidth()) {
         SuperArrow(

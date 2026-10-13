@@ -135,7 +135,7 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
           ChatSheet.FILES -> FilesPanel(state, controller) { path -> controller.addReference(path); sheet = null }
           ChatSheet.CHILDREN -> LazyColumn { items(state.children.distinctBy { it.id }, key = { it.id }) { child ->
             Card(Modifier.fillMaxWidth().padding(bottom = 8.dp), insideMargin = PaddingValues(14.dp), onClick = { sheet = null; onOpenChild(child.id) }) {
-              Text(state.title(child)); state.tasks[child.id]?.takeIf { it.active }?.let { MiuixStatePill(it.phase) }
+               Text(state.title(child)); state.presentedTasks[child.id]?.takeIf { it.active }?.let { MiuixStatePill(it.phase) }
             }
           } }
         }
@@ -300,6 +300,8 @@ private fun SessionSubtitle(state: LagoonState, session: Session) {
       Text("${status.label} · ", style = MiuixTheme.textStyles.footnote1.copy(color = if (status == SessionStatus.FAILED) MiuixColorTokens.Error else MiuixColorTokens.Warning))
     SessionStatus.BACKGROUND_RUNNING ->
       Text("${status.label} · ", style = MiuixTheme.textStyles.footnote1.copy(color = MiuixTheme.colorScheme.primary))
+    SessionStatus.WAITING_SERVER ->
+      Text("${status.label} · ", style = MiuixTheme.textStyles.footnote1.copy(color = muted))
     else -> {}
   }
   Text(listOfNotNull(state.server?.name, resolveSessionProject(session, state.projects)?.name).joinToString(" · "), maxLines = 1, overflow = TextOverflow.Ellipsis,
@@ -554,7 +556,7 @@ private fun ChatComposer(
   val documents = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { controller.addLocalAttachments(it) }
   LaunchedEffect(state.draft) { if (value.text != state.draft) value = TextFieldValue(state.draft, androidx.compose.ui.text.TextRange(state.draft.length)) }
   DisposableEffect(attachMenu) { onModal(attachMenu); onDispose { onModal(false) } }
-  val task = state.tasks[state.sessionId]
+  val task = state.presentedTasks[state.sessionId]
   val sending = busy
   val hasContent = value.text.isNotBlank() || state.references.isNotEmpty() || state.attachments.isNotEmpty()
   val expanded = focused || value.text.isNotEmpty() || state.attachments.isNotEmpty() || state.references.isNotEmpty()
