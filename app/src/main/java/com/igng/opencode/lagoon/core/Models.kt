@@ -193,6 +193,20 @@ internal fun JSONObject.sessionEventId(type: String): String {
   return sessionInfo().str("id").ifBlank { str("id") }
 }
 
+/**
+ * One error value, whether the server sends a plain string or an object
+ * (`{message}` / `{data:{message}}`). The same envelope used to be parsed two ways in one reducer,
+ * which silently dropped the failure reason.
+ */
+internal fun JSONObject.errorText(key: String = "error"): String {
+  val value = opt(key)
+  return when (value) {
+    is JSONObject -> value.str("message").ifBlank { value.obj("data").str("message") }
+    null, JSONObject.NULL -> ""
+    else -> value.toString().takeUnless { it == "null" }.orEmpty()
+  }
+}
+
 internal fun JSONObject.errorMessage(key: String = "error"): String {
   val direct = str("message")
   if (direct.isNotBlank()) return direct
@@ -263,9 +277,9 @@ internal fun JSONObject.toMessage(): Message {
       }
       val error = optJSONObject("error")
       val retry = optJSONObject("retry")
-      Message(id, "assistant", created, parts, error?.str("message")?.ifBlank { null }, str("agent").ifBlank { null }, obj("model").toModelChoice(),
+      Message(id, "assistant", created, parts, errorText("error").ifBlank { null }, str("agent").ifBlank { null }, obj("model").toModelChoice(),
         longPath("time", "completed").takeIf { it > 0 }, str("finish").ifBlank { null }, error?.str("type")?.ifBlank { null },
-        retry?.let { "第 ${it.optInt("attempt")} 次重试：${it.obj("error").str("message")}" }, type = type)
+        retry?.let { "第 ${it.optInt("attempt")} 次重试：${it.errorText("error")}" }, type = type)
     }
     "shell" -> Message(id, "shell", created, listOf(shellPart(id, str("command"), str("status"), opt("exit") as? Number, obj("output").str("output"))
       .copy(target = str("shellID").ifBlank { null })),
@@ -345,7 +359,7 @@ private fun noticeMessage(id: String, created: Long, type: String, source: JSONO
     "location-switched" -> Notice("已移至", source.obj("location").str("directory"))
     "compaction" -> when (source.str("status")) {
       "running" -> Notice("正在整理上下文", running = true)
-      "failed" -> Notice("上下文整理失败", source.obj("error").str("message"), error = true)
+      "failed" -> Notice("上下文整理失败", source.errorText("error"), error = true)
       else -> Notice("上下文已整理")
     }
     else -> null
@@ -378,7 +392,7 @@ internal fun JSONObject.toAssistantPart(id: String): MessagePart {
     input = when (input) { is JSONObject -> input.toString(2); null, JSONObject.NULL -> ""; else -> input.toString() },
     output = content.contentText(),
     path = inputObject?.str("path").orEmpty(),
-    error = state.optJSONObject("error")?.str("message").orEmpty().ifBlank { if (shellFailed) "退出码 ${metadata.opt("exit") ?: "超时"}" else "" },
+    error = state.errorText("error").ifBlank { if (shellFailed) "退出码 ${metadata.opt("exit") ?: "超时"}" else "" },
     patch = diffs.joinToString("\n") { it.str("patch") }.trim(),
     files = diffs.map { it.str("file") }.filter(String::isNotBlank),
     attachments = content.objects().filter { it.str("type") == "file" }.let { JSONArray(it) }.toAttachments(),
@@ -494,7 +508,7 @@ object TaskReducer {
       "session.execution.succeeded" -> if (backgroundWork || previous?.background == true)
         TaskState(sessionId, TaskPhase.THINKING, TaskState.BACKGROUND_DETAIL, since, activeAt = at, background = true)
         else TaskState(sessionId, TaskPhase.COMPLETED, "任务已完成", since, at)
-      "session.execution.failed" -> TaskState(sessionId, TaskPhase.FAILED, properties.obj("error").str("message").ifBlank { "执行失败" }, since, at)
+      "session.execution.failed" -> TaskState(sessionId, TaskPhase.FAILED, properties.errorText("error").ifBlank { "执行失败" }, since, at)
       // A shutdown keeps the execution claim; the restarted server resumes the same turn.
       "session.execution.interrupted" -> if (properties.str("reason") == "shutdown") previous
         else TaskState(sessionId, TaskPhase.ABORTED, "任务已停止", since, at)
@@ -505,7 +519,7 @@ object TaskReducer {
       }
       "session.idle" -> idle(sessionId, previous, backgroundWork)
       "session.error" -> TaskState(sessionId, TaskPhase.FAILED,
-        properties.errorMessage().ifBlank { properties.obj("error").str("message").ifBlank { "执行失败" } }, since, at)
+        properties.errorMessage().ifBlank { "执行失败" }, since, at)
       // 服务端把阻塞工具/子代理转入后台时写入的合成消息：标记后台工作，直到后台完成重新唤醒 AI。
       "session.synthetic" -> {
         val marker = properties.str("text").contains(BACKGROUND_MARKER, ignoreCase = true)

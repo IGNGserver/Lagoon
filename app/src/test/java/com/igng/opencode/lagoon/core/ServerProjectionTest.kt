@@ -53,4 +53,37 @@ class ServerProjectionTest {
       allServerSnapshots = mapOf("a" to snapshot(a, TaskPhase.THINKING), "b" to snapshot(b, TaskPhase.THINKING)))
     assertEquals(1, state.globalSummary.running)
   }
+
+  @Test fun anOfflineServerIsNotReportedAsDegradedData() {
+    val state = LagoonState(profiles = listOf(a, b), allServers = true,
+      allServerSnapshots = mapOf(
+        "a" to snapshot(a, TaskPhase.THINKING),
+        "b" to snapshot(b, TaskPhase.THINKING).copy(connected = false, loading = false)))
+    assertFalse(state.homeProjection().degraded)
+  }
+
+  @Test fun aConnectedServerWithFailedReadsKeepsTheAggregateDegraded() {
+    val state = LagoonState(profiles = listOf(a, b), allServers = true,
+      allServerSnapshots = mapOf(
+        "a" to snapshot(a, TaskPhase.THINKING),
+        "b" to snapshot(b, TaskPhase.THINKING).copy(degraded = true)))
+    assertTrue(state.homeProjection().degraded)
+  }
+
+  @Test fun serversWithNotificationsOffStayOutOfTheSystemSummary() {
+    val silent = a.copy(notifications = false)
+    val state = LagoonState(profiles = listOf(silent, b), allServers = true,
+      allServerSnapshots = mapOf(
+        "a" to snapshot(silent, TaskPhase.THINKING),
+        "b" to snapshot(b, TaskPhase.THINKING)))
+    assertEquals(1, state.globalSummary.running)
+  }
+
+  @Test fun pendingMatchesListLevelActionsInTheAggregateProjection() {
+    val raw = LagoonState(serverId = "a", projectId = "p", pendingOperations = setOf("a:p:sessions-more"))
+    val aggregate = raw.copy(allServers = true).homeProjection()
+    assertTrue(aggregate.pending("sessions-more"))
+    assertFalse(aggregate.pending("create"))
+  }
+
 }

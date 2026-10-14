@@ -171,4 +171,69 @@ class PersistentConnectionsTest {
       } finally { manager.stop(); scope.cancel() }
     }
   }
+
+  @Test fun aServerWithAutoConnectOffIsOnlyConnectedWhenExplicitlyIncluded() = runBlocking {
+    MockWebServer().use { server ->
+      val requests = AtomicInteger()
+      val base = dispatcher(AtomicInteger())
+      server.dispatcher = object : Dispatcher() {
+        override fun dispatch(request: RecordedRequest): MockResponse {
+          requests.incrementAndGet()
+          return base.dispatch(request)
+        }
+      }
+      val store = store()
+      val profile = profile("a", server).copy(autoConnect = false)
+      store.save(profile, null)
+      val scope = CoroutineScope(coroutineContext + SupervisorJob())
+      val snapshots = ConcurrentHashMap<String, ServerOverviewSnapshot>()
+      val manager = AllServersOverview(store, cache(), scope, { snapshots[it.serverId] = it })
+      try {
+        manager.start(listOf(profile))
+        delay(300)
+        assertEquals("关闭自动连接的服务器不应被拨号", 0, requests.get())
+        manager.start(listOf(profile), include = setOf("a"))
+        awaitCondition { snapshots["a"]?.connected == true }
+        assertTrue(requests.get() > 0)
+      } finally { manager.stop(); scope.cancel() }
+    }
+  }
+
+  @Test fun sessionsDeletedOnTheServerArePrunedFromTheOverview() = runBlocking {
+    MockWebServer().use { server ->
+      val listed = java.util.concurrent.atomic.AtomicReference(sessionPage(listOf("s")))
+      // 会话从未运行：否则活跃任务会（按设计）把它钉在概览里。
+      val active = java.util.concurrent.atomic.AtomicReference(activePage(emptyList()))
+      val base = dispatcher(AtomicInteger())
+      server.dispatcher = object : Dispatcher() {
+        override fun dispatch(request: RecordedRequest): MockResponse = when (request.requestUrl!!.encodedPath) {
+          "/api/session" -> MockResponse().setBody(listed.get())
+          "/api/session/active" -> MockResponse().setBody(active.get())
+          else -> base.dispatch(request)
+        }
+      }
+      val store = store(); val profile = profile("a", server); store.save(profile, null)
+      val scope = CoroutineScope(coroutineContext + SupervisorJob())
+      val snapshots = ConcurrentHashMap<String, ServerOverviewSnapshot>()
+      val manager = AllServersOverview(store, cache(), scope, { snapshots[it.serverId] = it })
+      try {
+        manager.start(listOf(profile))
+        awaitCondition { snapshots["a"]?.sessions?.any { it.id == "s" } == true }
+        listed.set(sessionPage(emptyList()))
+        active.set(activePage(emptyList()))
+        manager.refreshAll()
+        awaitCondition { snapshots["a"]?.sessions?.none { it.id == "s" } == true }
+      } finally { manager.stop(); scope.cancel() }
+    }
+  }
+
+  /** `GET /api/session` 的一页根会话（仅测试用）。 */
+  private fun sessionPage(ids: List<String>) = org.json.JSONObject().put("data", org.json.JSONArray(ids.map { id ->
+    org.json.JSONObject().put("id", id).put("title", "Session").put("location", org.json.JSONObject().put("directory", "/repo"))
+      .put("time", org.json.JSONObject().put("idle", 1).put("updated", 2))
+  })).put("cursor", org.json.JSONObject()).toString()
+
+  private fun activePage(ids: List<String>) = org.json.JSONObject().put("data",
+    org.json.JSONObject().also { data -> ids.forEach { data.put(it, org.json.JSONObject().put("type", "running")) } }).toString()
+
 }

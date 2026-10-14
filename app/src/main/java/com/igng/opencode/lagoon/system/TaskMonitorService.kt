@@ -31,8 +31,9 @@ class TaskMonitorService : Service() {
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
     val controller = LagoonController.get(this)
     val notifications = TaskNotifications(this)
-    val notification = notifications.buildSummary(TaskNotifications.ALL_PROFILE, controller.state.value.globalSummary,
-      controller.state.value.globalSummaryTarget)
+    val summary = controller.state.value.globalSummary
+    val notification = if (summary.isEmpty) notifications.buildConnecting()
+      else notifications.buildSummary(TaskNotifications.ALL_PROFILE, summary, controller.state.value.globalSummaryTarget)
     val id = TaskNotifications.summaryId(TaskNotifications.ALL_SERVERS_ID)
     if (Build.VERSION.SDK_INT >= 29) startForeground(id, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
     else startForeground(id, notification)

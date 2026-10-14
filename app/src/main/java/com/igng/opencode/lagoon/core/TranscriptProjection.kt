@@ -92,10 +92,10 @@ object TranscriptProjection {
       "session.step.ended" -> editAssistant { it.copy(completedAt = at, finish = p.str("finish").ifBlank { "stop" }) }
       "session.step.failed" -> editAssistantOrReconcile {
         val error = p.obj("error")
-        it.copy(completedAt = at, finish = p.str("finish").ifBlank { "error" }, error = error.str("message").ifBlank { "执行失败" },
+        it.copy(completedAt = at, finish = p.str("finish").ifBlank { "error" }, error = p.errorText("error").ifBlank { "执行失败" },
           errorType = error.str("type").ifBlank { null }, retry = null)
       }
-      "session.retry.scheduled" -> editAssistant { it.copy(retry = "第 ${p.optInt("attempt")} 次重试：${p.obj("error").str("message")}") }
+      "session.retry.scheduled" -> editAssistant { it.copy(retry = "第 ${p.optInt("attempt")} 次重试：${p.errorText("error")}") }
       "session.text.started", "session.reasoning.started" -> {
         val kind = if (event.type.contains("reasoning")) "reasoning" else "text"
         editAssistant { message ->
@@ -128,7 +128,7 @@ object TranscriptProjection {
         val state = JSONObject().put("status", if (event.type.endsWith("success")) "completed" else "error")
           .put("input", tool.input.trim().takeIf { it.startsWith("{") }?.let { runCatching { JSONObject(it) }.getOrNull() } ?: JSONObject())
           .put("content", p.optJSONArray("content") ?: JSONArray()).put("metadata", p.optJSONObject("metadata") ?: JSONObject())
-        p.optJSONObject("error")?.let { state.put("error", it) }
+        p.opt("error")?.takeIf { it != JSONObject.NULL }?.let { state.put("error", it) }
         val rebuilt = JSONObject().put("type", "tool").put("id", tool.id).put("name", tool.tool).put("state", state).toAssistantPart(tool.id)
         rebuilt.copy(title = rebuilt.title.ifBlank { tool.title }, target = rebuilt.target ?: tool.target)
       }
@@ -172,7 +172,7 @@ object TranscriptProjection {
       "session.compaction.ended", "session.compaction.failed" -> {
         val failed = event.type.endsWith("failed")
         val index = messages.indexOfLast { it.type == "compaction" && it.notice?.running == true }
-        val fields = JSONObject().put("type", "compaction").put("status", if (failed) "failed" else "completed").put("error", p.obj("error"))
+        val fields = JSONObject().put("type", "compaction").put("status", if (failed) "failed" else "completed").put("error", p.opt("error") ?: JSONObject.NULL)
         if (index >= 0) result(messages.toMutableList().also {
           it[index] = fields.put("id", it[index].id).put("time", JSONObject().put("created", it[index].created)).toMessage()
         }) else insert(fields.put("id", messageId(event)).put("time", JSONObject().put("created", at)).toMessage())

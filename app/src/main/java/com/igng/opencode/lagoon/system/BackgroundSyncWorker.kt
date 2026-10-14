@@ -8,7 +8,9 @@ import androidx.work.NetworkType
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
+import com.igng.opencode.lagoon.core.Diagnostics
 import com.igng.opencode.lagoon.core.LagoonController
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -21,10 +23,21 @@ import java.util.concurrent.TimeUnit
 class BackgroundSyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
   override suspend fun doWork(): Result {
     // The controller is single-threaded on the main dispatcher; the network itself runs on IO inside it.
-    withTimeoutOrNull(TimeUnit.SECONDS.toMillis(60)) {
-      withContext(Dispatchers.Main) { LagoonController.get(applicationContext).backgroundSync() }
+    return try {
+      val finished = withTimeoutOrNull(TimeUnit.SECONDS.toMillis(60)) {
+        withContext(Dispatchers.Main) { LagoonController.get(applicationContext).backgroundSync() }
+      }
+      if (finished == null) {
+        Diagnostics.warn("BackgroundSync", "后台同步超时，交给 WorkManager 退避重试")
+        Result.retry()
+      } else Result.success()
+    } catch (cancel: CancellationException) {
+      throw cancel
+    } catch (error: Exception) {
+      // 未捕获的异常会把周期任务标记为 FAILED 并断链；这里显式退避重试。
+      Diagnostics.warn("BackgroundSync", "后台同步失败", error)
+      Result.retry()
     }
-    return Result.success()
   }
 
   companion object {
@@ -36,7 +49,8 @@ class BackgroundSyncWorker(context: Context, params: WorkerParameters) : Corouti
       val request = PeriodicWorkRequestBuilder<BackgroundSyncWorker>(15, TimeUnit.MINUTES)
         .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
         .build()
-      work.enqueueUniquePeriodicWork(NAME, ExistingPeriodicWorkPolicy.KEEP, request)
+      // UPDATE 让约束/间隔变更在下次运行时生效；KEEP 会让旧参数永久粘住。
+      work.enqueueUniquePeriodicWork(NAME, ExistingPeriodicWorkPolicy.UPDATE, request)
     }
   }
 }

@@ -5,6 +5,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collect
@@ -24,6 +25,8 @@ data class ServerOverviewSnapshot(
   val connected: Boolean = false,
   val cached: Boolean = false,
   val loading: Boolean = true,
+  /** Wall clock of the last successful control-plane read; drives the offline task TTL. */
+  val lastReadAt: Long = 0,
   val error: String? = null,
   val degraded: Boolean = false,
   val streamConnected: Boolean = false,
@@ -55,7 +58,9 @@ internal class AllServersOverview(
   private val onSnapshot: (ServerOverviewSnapshot) -> Unit,
   private val selectedServer: () -> String? = { null },
   private val onEvent: (String, ServerEvent) -> Unit = { _, _ -> },
-  private val onConnected: (String) -> Unit = {}
+  private val onConnected: (String) -> Unit = {},
+  /** Shared with the controller so a dead directory is remembered across every server connection. */
+  private val directoryHealth: DirectoryHealth = DirectoryHealth()
 ) {
   private val jobs = mutableMapOf<String, Job>()
   private val locks = mutableMapOf<String, Mutex>()
@@ -67,9 +72,15 @@ internal class AllServersOverview(
   private val snapshots = mutableMapOf<String, ServerOverviewSnapshot>()
   private val handoffs = mutableMapOf<String, ServerOverviewSnapshot>()
 
-  fun start(profiles: List<ServerProfile>) {
-    (jobs.keys - profiles.map { it.id }.toSet()).forEach(::remove)
-    profiles.forEach { profile ->
+  /**
+   * Ensures one monitor per server that should stay connected: profiles with `autoConnect` enabled,
+   * plus [include] (the server the user just opened). The “自动连接此服务器” switch used to be
+   * ignored and every saved server was dialled forever, including permanently unreachable ones.
+   */
+  fun start(profiles: List<ServerProfile>, include: Set<String> = emptySet()) {
+    val wanted = profiles.filter { it.autoConnect || it.id in include }
+    (jobs.keys - wanted.map { it.id }.toSet()).forEach(::remove)
+    wanted.forEach { profile ->
       val id = profile.id
       val config = profile to store.credentials(id)
       val previous = configurations[id]
@@ -96,6 +107,7 @@ internal class AllServersOverview(
   fun consider(id: String, requests: List<PermissionRequest>) { requests.forEach { approvers[id]?.consider(it) } }
   fun pending(id: String, requests: List<PermissionRequest>): List<PermissionRequest> = approvers[id]?.pending(requests) ?: requests
   fun policyChanged() {
+    approvers.values.forEach { it.resetBackoff() }
     snapshots.values.toList().forEach { snapshot -> consider(snapshot.serverId, snapshot.permissions); publish(snapshot) }
     refreshAll()
   }
@@ -120,8 +132,10 @@ internal class AllServersOverview(
     val id = profile.id
     val client = try {
       client(id)
+    } catch (cancel: CancellationException) {
+      throw cancel
     } catch (error: Exception) {
-      publish(ServerOverviewSnapshot(id, profile, connected = false, loading = false, error = error.message))
+      publish(ServerOverviewSnapshot(id, profile, connected = false, loading = false, error = userFacingError(error, "连接失败")))
       return
     }
     val cachedCatalog = cache.catalog(id)
@@ -177,9 +191,11 @@ internal class AllServersOverview(
     suspend fun refresh() {
       if (selectedServer() == id) return
       handoffs.remove(id)?.let { snapshot = it.copy(streamConnected = snapshot.streamConnected) }
-      // Conflate streaming bursts without issuing a full control-plane read for every token.
+      // Conflate streaming bursts without issuing a full control-plane read for every token. The
+      // overview read repairs state, so a few seconds of coalescing is enough and keeps several
+      // streaming servers from turning every token into HTTP traffic.
       val elapsed = now() - lastReadAt
-      if (elapsed < 1000) delay(1000 - elapsed)
+      if (elapsed < EVENT_READ_COALESCE_MILLIS) delay(EVENT_READ_COALESCE_MILLIS - elapsed)
       if (selectedServer() == id) return
       lastReadAt = now()
       val revision = waitingRevision
@@ -191,7 +207,7 @@ internal class AllServersOverview(
           throw cancel
         } catch (error: Exception) {
           previous.copy(connected = false, loading = false, cached = previous.cached || cachedCatalog != null,
-            degraded = true, error = error.message ?: "连接失败")
+            degraded = true, error = userFacingError(error, "连接失败"))
         }
       }
       if (selectedServer() == id) return
@@ -279,6 +295,16 @@ internal class AllServersOverview(
                   if (session.id.isNotBlank()) snapshot = snapshot.copy(sessions = (listOf(session) + snapshot.sessions).distinctBy { it.id },
                     parents = snapshot.parents + listOfNotNull(session.parentId?.let { session.id to it }).toMap())
                 }
+                if (event.type == "session.deleted") {
+                  waitingRevision++
+                  store.forgetSession(id, sessionId)
+                  snapshot = snapshot.copy(
+                    sessions = snapshot.sessions.filterNot { it.id == sessionId },
+                    tasks = snapshot.tasks - sessionId,
+                    parents = snapshot.parents - sessionId,
+                    permissions = snapshot.permissions.filterNot { it.sessionId == sessionId },
+                    questions = snapshot.questions.filterNot { it.sessionId == sessionId })
+                }
                 if (event.type == "shell.created") props.obj("info").toShellJob(event.directory)?.let { job ->
                   waitingRevision++
                   snapshot = snapshot.copy(shells = snapshot.shells + (job.id to job))
@@ -330,30 +356,54 @@ internal class AllServersOverview(
     val active = activeResult.getOrNull()
 
     val listed = page.items.map { it.copy(serverId = id) }
+    val listedIds = listed.map { it.id }.toSet()
     val identityMap = (previous.sessions + listed).associateBy { it.id }.toMutableMap()
+    /** Ids fetched as ancestors/owners this round: those rows must survive the ghost-session prune. */
+    val fetchedIds = mutableSetOf<String>()
+    fun fetched(session: Session) { identityMap[session.id] = session; fetchedIds += session.id }
     val missing = (active.orEmpty().filterNot(identityMap::containsKey) + previous.tasks.filterValues { it.active }.keys.filter { old -> listed.none { it.id == old } }).distinct()
     if (missing.isNotEmpty()) {
       missing.chunked(4).forEach { batch -> coroutineScope {
         batch.map { sessionId ->
           async { attempt { client.session(sessionId) }.getOrNull()?.copy(serverId = id) }
-        }.forEach { deferred -> deferred.await()?.let { identityMap[it.id] = it } }
+        }.forEach { deferred -> deferred.await()?.let(::fetched) }
       } }
     }
 
-    val permissionDirectories = (identityMap.values.map { it.directory } + previous.permissions.map { it.directory } + projects.map { it.directory })
-      .filter(String::isNotBlank).distinctBy(::normalizedDirectory)
-    val permissionResults = permissionDirectories.chunked(4).flatMap { batch -> coroutineScope {
-      batch.map { directory ->
-        async { directory to attempt { client.pendingPermissions(directory) } }
-      }.map { it.await() }
+    // Pending requests: per-session reads for sessions that can actually be waiting (the active set
+    // and any session with a known pending request). The location sweep only runs for the
+    // auto-approver, matching the controller: sweeping every known directory hammered deleted
+    // worktrees (HTTP 500) and pinned `degraded` on every reconciliation.
+    val activeIds = active.orEmpty()
+    val waitingSessions = (activeIds + previous.permissions.map { it.sessionId } + previous.questions.map { it.sessionId })
+      .distinct().mapNotNull { identityMap[it] }
+    val skippedPermissionSessions = waitingSessions.filter { directoryHealth.isDown(it.directory) }.map { it.id }.toSet()
+    val readableSessions = waitingSessions.filterNot { it.id in skippedPermissionSessions }
+    val sessionPermissionResults = coroutineScope {
+      readableSessions.map { session -> async { session.id to attempt { client.sessionPermissions(session) } } }.awaitAll()
+    }
+    sessionPermissionResults.forEach { (sessionId, result) ->
+      val directory = identityMap[sessionId]?.directory ?: return@forEach
+      if (result.isSuccess) directoryHealth.succeeded(directory) else directoryHealth.failed(directory)
+    }
+    val sweepDirectories = if (store.permissionPolicy().autoApprove) (identityMap.values.map { it.directory } + projects.map { it.directory })
+      .filter(String::isNotBlank).distinctBy(::normalizedDirectory).filterNot { directoryHealth.isDown(it) }.take(MAX_SWEEP_DIRECTORIES) else emptyList()
+    val sweepPermissionResults = sweepDirectories.chunked(4).flatMap { batch -> coroutineScope {
+      batch.map { directory -> async { directory to attempt { client.pendingPermissions(directory) } } }.awaitAll()
     } }
-    val formDirectories = (identityMap.values.filter { it.id in active.orEmpty() }.map { it.directory } + previous.questions.map { it.directory })
-      .filter(String::isNotBlank).distinctBy(::normalizedDirectory)
+    sweepPermissionResults.forEach { (directory, result) -> if (result.isSuccess) directoryHealth.succeeded(directory) else directoryHealth.failed(directory) }
+    val formDirectories = (readableSessions.map { it.directory } + previous.questions.map { it.directory })
+      .filter(String::isNotBlank).distinctBy(::normalizedDirectory).filterNot { directoryHealth.isDown(it) }
     val formResults = formDirectories.chunked(4).flatMap { batch -> coroutineScope {
-      batch.map { directory -> async { directory to attempt { client.forms(directory) } } }.map { it.await() }
+      batch.map { directory -> async { directory to attempt { client.forms(directory) } } }.awaitAll()
     } }
-    val successfulPermissionDirs = permissionResults.filter { it.second.isSuccess }.map { normalizedDirectory(it.first) }.toSet()
-    val permissions = (permissionResults.flatMap { it.second.getOrDefault(emptyList()) } + previous.permissions.filter { normalizedDirectory(it.directory) !in successfulPermissionDirs }).distinctBy { it.id }
+    formResults.forEach { (directory, result) -> if (result.isSuccess) directoryHealth.succeeded(directory) else directoryHealth.failed(directory) }
+    val successfulSessionDirs = sessionPermissionResults.filter { it.second.isSuccess }.mapNotNull { identityMap[it.first]?.directory }.map(::normalizedDirectory).toSet()
+    val successfulSweepDirs = sweepPermissionResults.filter { it.second.isSuccess }.map { normalizedDirectory(it.first) }.toSet()
+    val verifiedPermissionDirs = successfulSessionDirs + successfulSweepDirs
+    val permissions = (sessionPermissionResults.flatMap { it.second.getOrDefault(emptyList()) } +
+      sweepPermissionResults.flatMap { it.second.getOrDefault(emptyList()) } +
+      previous.permissions.filter { normalizedDirectory(it.directory) !in verifiedPermissionDirs }).distinctBy { it.id }
     val successfulFormDirs = formResults.filter { it.second.isSuccess }.map { normalizedDirectory(it.first) }.toSet()
     val questions = (formResults.flatMap { it.second.getOrDefault(emptyList()) } + previous.questions.filter { normalizedDirectory(it.directory) !in successfulFormDirs }).distinctBy { it.id }
 
@@ -361,24 +411,31 @@ internal class AllServersOverview(
     // including child ancestry, before projecting them onto the home/notification root.
     (permissions.map { it.sessionId } + questions.map { it.sessionId }).distinct().filterNot(identityMap::containsKey).chunked(4).forEach { batch ->
       coroutineScope { batch.map { session -> async { attempt { client.session(session) }.getOrNull()?.copy(serverId = id) } }
-        .forEach { deferred -> deferred.await()?.let { identityMap[it.id] = it } } }
+        .forEach { deferred -> deferred.await()?.let(::fetched) } }
     }
     var parentRounds = 0
     while (parentRounds++ < MAX_PARENT_ROUNDS) {
       val parentIds = identityMap.values.mapNotNull { it.parentId }.filterNot(identityMap::containsKey).distinct().take(MAX_PARENT_FETCH)
       if (parentIds.isEmpty()) break
       coroutineScope { parentIds.map { parent -> async { attempt { client.session(parent) }.getOrNull()?.copy(serverId = id) } }
-        .forEach { deferred -> deferred.await()?.let { identityMap[it.id] = it } } }
+        .forEach { deferred -> deferred.await()?.let(::fetched) } }
     }
-    val sessions = identityMap.values.sortedWith(sessionActivityOrder)
-    val parentMap = store.taskParents(id) + identityMap.values.mapNotNull { session -> session.parentId?.let { session.id to it } }
-
     val oldTasks = previous.tasks + store.taskStates(id)
+    val unseenNoticeSessions = store.sessionNotices(id).filterNot { it.viewed }.map { it.sessionId }.toSet()
+    // Drop ghost sessions: rows the server no longer lists and that nothing local still refers to
+    // (active tasks, unread results, or an identity fetched as an ancestor this round). Without
+    // this, a session deleted from another client stayed on the all-servers home forever.
+    val sessions = identityMap.values.filter { session ->
+      session.id in listedIds || session.id in activeIds || session.id in fetchedIds ||
+        oldTasks[session.id]?.active == true || session.id in unseenNoticeSessions
+    }.sortedWith(sessionActivityOrder)
+    val parentMap = store.taskParents(id) + sessions.mapNotNull { session -> session.parentId?.let { session.id to it } }
     val shellDirectories = (projects.map { it.directory } + identityMap.values.map { it.directory })
-      .filter(String::isNotBlank).distinctBy(::normalizedDirectory).take(8)
+      .filter(String::isNotBlank).distinctBy(::normalizedDirectory).filterNot { directoryHealth.isDown(it) }.take(8)
     val shellResults = coroutineScope { shellDirectories.map { directory ->
       async { directory to attempt { client.shells(directory) } }
     }.map { it.await() } }
+    shellResults.forEach { (directory, result) -> if (result.isSuccess) directoryHealth.succeeded(directory) else directoryHealth.failed(directory) }
     val successfulShellDirs = shellResults.filter { it.second.isSuccess }.map { normalizedDirectory(it.first) }.toSet()
     val shells = previous.shells.filter { (_, shell) -> normalizedDirectory(shell.directory) !in successfulShellDirs && now() - shell.observedAt < 300_000 }
       .plus(shellResults.flatMap { it.second.getOrDefault(emptyList()) }.associate { it.id to it.copy(observedAt = now()) })
@@ -420,7 +477,12 @@ internal class AllServersOverview(
     val background = TaskSummary.backgroundRoots(folded, parentMap)
     val titles = sessions.associate { it.id to it.displayTitle() }
     val summary = TaskSummary.of(folded, notices, parentMap, titles, background, serverId = id, serverName = profile.name)
-    val degraded = activeResult.isFailure || permissionResults.any { it.second.isFailure } || formResults.any { it.second.isFailure }
+    // Only failures that can hide currently relevant state count as degraded. Failures for idle
+    // sessions' directories (deleted worktrees) are handled by the directory backoff above.
+    val activeDirectories = activeIds.mapNotNull { identityMap[it]?.directory }.map(::normalizedDirectory).toSet()
+    val degraded = activeResult.isFailure ||
+      sessionPermissionResults.any { it.second.isFailure && (it.first in activeIds || normalizedDirectory(identityMap[it.first]?.directory.orEmpty()) in activeDirectories) } ||
+      formResults.any { it.second.isFailure && normalizedDirectory(it.first) in activeDirectories }
     if (degraded) Diagnostics.warn("AllServers", "服务器 ${profile.name} 部分状态读取失败")
     return reconcileWaiting(previous.copy(
       profile = profile,
@@ -428,6 +490,7 @@ internal class AllServersOverview(
       connected = true,
       cached = false,
       loading = false,
+      lastReadAt = now(),
       error = null,
       degraded = degraded,
       projects = projects,
@@ -440,7 +503,7 @@ internal class AllServersOverview(
       backgroundRunning = background,
       summary = summary,
       shells = shells
-    ), identityMap.values.filter { normalizedDirectory(it.directory) in successfulPermissionDirs }.map { it.id }.toSet(), active?.toSet())
+    ), identityMap.values.filter { normalizedDirectory(it.directory) in verifiedPermissionDirs }.map { it.id }.toSet(), active?.toSet())
   }
 
   /** Empty authoritative pending lists clear old WAITING_PERMISSION instead of carrying it forever. */
@@ -478,5 +541,9 @@ internal class AllServersOverview(
   private companion object {
     const val MAX_PARENT_FETCH = 48
     const val MAX_PARENT_ROUNDS = 8
+    /** Upper bound of directories the auto-approver may sweep in one read. */
+    const val MAX_SWEEP_DIRECTORIES = 12
+    /** Streaming bursts coalesce for this long before one control-plane read is issued. */
+    const val EVENT_READ_COALESCE_MILLIS = 3_000L
   }
 }

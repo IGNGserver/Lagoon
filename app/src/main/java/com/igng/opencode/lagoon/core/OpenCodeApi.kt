@@ -335,7 +335,15 @@ class OpenCodeApi(
     dataArray(obj(sessionPath(id, "/inbox"))).objects().mapNotNull { it.toInboxMessage() }
   }
   /** Sessions whose foreground drain this server currently owns; every other session is idle. */
-  suspend fun activeSessions(): Set<String> = dataObject(obj("api/session/active")).keys().asSequence().toSet()
+  suspend fun activeSessions(): Set<String> {
+    val json = withContext(Dispatchers.IO) { jsonObject(request("GET", "api/session/active")) }
+    // 有的实现把运行集合包成数组；不能把 {"data":[...]} 的键名当成会话 id（会造出一个叫 data 的假会话）。
+    json.optJSONObject("data")?.let { return it.keys().asSequence().toSet() }
+    val array = json.optJSONArray("data") ?: json.optJSONArray("sessions")
+    if (array != null) return array.objects().mapNotNull { it.str("id").ifBlank { it.str("sessionID") }.takeIf(String::isNotBlank) }.toSet()
+    if (!json.has("data")) return json.keys().asSequence().toSet()
+    return emptySet()
+  }
 
   /**
    * Running shell jobs for [directory] (`GET /api/shell`). Shells are not sessions: a background
@@ -486,6 +494,8 @@ class OpenCodeApi(
             Diagnostics.warn("SSE", "事件积压，触发重新同步", delivered.exceptionOrNull())
             close(IOException("SSE 事件积压，已触发全量对账"))
           }
+        } catch (cancel: kotlinx.coroutines.CancellationException) {
+          throw cancel
         } catch (error: Exception) {
           // Ignore malformed event; next event or refresh repairs state. Logged for diagnosis.
           Diagnostics.warn("SSE", "忽略无法解析的事件", error)

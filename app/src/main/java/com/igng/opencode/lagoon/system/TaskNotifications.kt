@@ -96,7 +96,6 @@ class TaskNotifications(private val context: Context) {
       .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
     // Per-session notifications stay ordinary: only the server-wide summary owns the Live Update /
     // island slot, otherwise every running session would compete for the status bar chip.
-    if (running) builder.addAction(0, "停止", action("abort", profile, session))
     if (state.phase == TaskPhase.WAITING_PERMISSION && permission != null && permission.action.isNotBlank() && permission.detail !in setOf("", "{}", "[]")) {
       builder.addAction(0, "拒绝", action("reject", profile, session, permission))
       builder.addAction(0, "允许一次", action("once", profile, session, permission))
@@ -113,7 +112,7 @@ class TaskNotifications(private val context: Context) {
     if (permission.always.isNotEmpty()) append("\n记住规则：").append(permission.always.joinToString(", ").take(200))
   }
 
-  fun show(profile: ServerProfile, session: Session, state: TaskState, permission: PermissionRequest? = null) {
+  fun show(profile: ServerProfile, session: Session, state: TaskState, permission: PermissionRequest? = null, dedupeId: String? = null) {
     if (!allowed()) return
     if (!profile.notifications) return
     if (state.phase == TaskPhase.IDLE || state.phase == TaskPhase.DISCONNECTED || state.phase == TaskPhase.WAITING_SERVER) return
@@ -124,7 +123,9 @@ class TaskNotifications(private val context: Context) {
     val previous = store.taskStates(profile.id)[session.id]
     val next = store.rememberTask(profile.id, if (previous != null && previous.phase == state.phase) state.copy(since = previous.since) else state, session.parentId)
     if (next.phase in setOf(TaskPhase.COMPLETED, TaskPhase.FAILED) && session.id in store.acknowledgedTasks(profile.id)) return
-    val signature = permission?.id.orEmpty()
+    // 去重键必须区分同一次运行里的不同请求：提问没有 permission id，只靠 since+phase 会让
+    // 同一轮的第二次提问被当成重复而不再通知。
+    val signature = dedupeId ?: permission?.id.orEmpty()
     if (!store.claimNotification(profile.id, next, signature)) return
     manager.notify(notificationId(profile.id, session.id), build(profile, session, next, permission))
   }
@@ -171,6 +172,18 @@ class TaskNotifications(private val context: Context) {
     }
     return builder.build()
   }
+
+  /**
+   * 前台服务被系统重投递（START_REDELIVER_INTENT）时控制器可能还没有任何汇总：
+   * 必须先给出一条可读的占位通知，而不是空白的“0跑·0完”。
+   */
+  fun buildConnecting(): Notification = NotificationCompat.Builder(context, SUMMARY)
+    .setSmallIcon(R.drawable.ic_notification).setLargeIcon(appIcon)
+    .setContentTitle("Lagoon").setContentText("正在恢复任务监控…")
+    .setOngoing(true).setOnlyAlertOnce(true).setShowWhen(false).setSilent(true)
+    .setCategory(NotificationCompat.CATEGORY_STATUS)
+    .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
+    .build()
 
   /**
    * A categorical status rail, not a fake completion percentage. Segment lengths represent the

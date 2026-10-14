@@ -30,12 +30,16 @@ internal class PermissionAutoApprover(
   private val jobs = mutableMapOf<String, Job>()
   private val responded = linkedSetOf<String>()
   private val failures = mutableSetOf<String>()
+  /** 连续失败次数与下一次重试时间：失败不再被每轮对账立刻重打（无限请求循环）。 */
+  private val attempts = mutableMapOf<String, Int>()
+  private val retryAt = mutableMapOf<String, Long>()
   private var disposed = false
 
   fun pending(requests: List<PermissionRequest>): List<PermissionRequest> = requests.filterNot { it.id in responded }
 
   fun consider(request: PermissionRequest) {
     if (disposed || !enabled() || request.id in responded || request.id in jobs) return
+    if ((retryAt[request.id] ?: 0L) > System.currentTimeMillis()) return
     // Register before launch, including on Main.immediate / Unconfined dispatchers.
     val job = scope.launch(start = kotlinx.coroutines.CoroutineStart.LAZY) {
       try {
@@ -54,6 +58,9 @@ internal class PermissionAutoApprover(
           } catch (error: Exception) {
             if (attempt == 2) {
               failures += request.id
+              val count = (attempts[request.id] ?: 0) + 1
+              attempts[request.id] = count
+              retryAt[request.id] = System.currentTimeMillis() + backoffMillis(count)
               changed(failures.toSet())
             } else delay(1000L * (attempt + 1))
           }
@@ -70,7 +77,18 @@ internal class PermissionAutoApprover(
     responded += id
     while (responded.size > 1000) responded.remove(responded.first())
     jobs.remove(id)?.cancel()
+    attempts.remove(id); retryAt.remove(id)
     if (failures.remove(id)) changed(failures.toSet())
+  }
+
+  /** 设置变更（重新打开自动授权）时立即重试，而不是等退避窗口过期。 */
+  fun resetBackoff() { attempts.clear(); retryAt.clear() }
+
+  private fun backoffMillis(attempt: Int): Long = when (attempt) {
+    1 -> 30_000L
+    2 -> 120_000L
+    3 -> 600_000L
+    else -> 1_800_000L
   }
 
   fun dispose() {

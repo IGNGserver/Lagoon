@@ -55,7 +55,9 @@ internal fun AgentSelector(
   iconOnly: Boolean = false
 ) {
   var open by remember { mutableStateOf(false) }
-  val options = AGENT_OPTIONS.map { DropdownOption(it, it, state.agentChanged && state.agent == it) }
+  // 服务器自报的 agent 优先（自定义 agent 的实例不再只能选 build/plan）；接口不可用时退回内置两项。
+  val choices = state.agents.ifEmpty { AGENT_OPTIONS.map { AgentChoice(it, "") } }
+  val options = choices.map { DropdownOption(it.name, it.name, state.agentChanged && state.agent == it.name) }
   Box(modifier) {
     if (iconOnly) IconButton(onClick = { open = true }, enabled = enabled) {
       Icon(MiuixIcons.ContactsCircle, "Agent：${state.agent ?: "默认"}", Modifier.size(22.dp),

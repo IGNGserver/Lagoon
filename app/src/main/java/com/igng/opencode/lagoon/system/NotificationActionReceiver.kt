@@ -10,6 +10,7 @@ import com.igng.opencode.lagoon.core.LiveUpdateStage
 import com.igng.opencode.lagoon.core.OpenCodeApi
 import com.igng.opencode.lagoon.core.ServerStore
 import com.igng.opencode.lagoon.core.Session
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -48,6 +49,8 @@ class NotificationActionReceiver : BroadcastReceiver() {
         } ?: false
         if (succeeded) TaskNotifications(appContext).cancel(serverId, sessionId)
         else Diagnostics.warn("NotificationAction", "操作未在时限内确认，保留通知以便重试：$action")
+      } catch (cancel: CancellationException) {
+        throw cancel
       } catch (error: Exception) {
         Diagnostics.warn("NotificationAction", "通知操作失败", error)
       } finally {
@@ -89,6 +92,8 @@ class NotificationActionReceiver : BroadcastReceiver() {
       }
       LagoonController.get(context).notificationCompleted(serverId)
       true
+    } catch (cancel: CancellationException) {
+      throw cancel
     } catch (error: Exception) {
       Diagnostics.warn("NotificationAction", "服务器未确认通知操作：$action", error)
       false
