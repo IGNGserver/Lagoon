@@ -42,7 +42,7 @@ internal fun ProjectScopeSheet(state: LagoonState, controller: LagoonController,
       }
       item {
         Card(Modifier.fillMaxWidth()) {
-          ChoiceRow("全部会话", "${state.sessions.count { it.parentId == null }} 个会话", state.scopeProjectId == null) { controller.setScope(null); onDismiss() }
+          ChoiceRow("全部会话", "${state.sessions.count { it.visibleOnHome }} 个会话", state.scopeProjectId == null) { controller.setScope(null); onDismiss() }
         }
       }
       item { SmallTitle("项目", insideMargin = PaddingValues(horizontal = 16.dp, vertical = 8.dp)) }

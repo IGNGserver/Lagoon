@@ -2,6 +2,7 @@ package com.igng.opencode.lagoon.core
 
 import android.content.Context
 import android.content.SharedPreferences
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -102,7 +103,7 @@ class OfflineCache internal constructor(
               touchIndex(name)
             }
           }
-        } catch (error: Exception) { Diagnostics.warn("OfflineCache", "缓存写入失败", error) }
+        } catch (cancel: CancellationException) { throw cancel } catch (error: Exception) { Diagnostics.warn("OfflineCache", "缓存写入失败", error) }
         finally { synchronized(pendingLock) { inFlight.remove(name); pruneSequences() } }
       }
     }
@@ -111,6 +112,8 @@ class OfflineCache internal constructor(
   private fun read(name: String): String? = try {
     val encoded = preferences.getString(name, null) ?: return null
     decrypt(encoded)
+  } catch (cancel: CancellationException) {
+    throw cancel
   } catch (error: Exception) {
     Diagnostics.warn("OfflineCache", "读取 $name 失败", error)
     null
@@ -118,7 +121,7 @@ class OfflineCache internal constructor(
   fun saveCatalog(serverId: String, projects: List<Project>, sessions: List<Session>, complete: Boolean = true) {
     write("catalog:$serverId") {
       JSONObject().put("complete", complete && sessions.size <= 300).put("projects", JSONArray().apply { projects.forEach { put(JSONObject().put("id", it.id).put("directory", it.directory).put("name", it.name).put("sandboxes", JSONArray(it.sandboxes))) } })
-        .put("sessions", JSONArray().apply { sessions.take(300).forEach { put(JSONObject().put("id", it.id).put("directory", it.directory)
+        .put("sessions", JSONArray().apply { sessions.take(300).forEach { put(JSONObject().put("id", it.id).put("directory", it.directory).put("revertMessageId", it.revertMessageId)
           .put("title", it.title).put("updated", it.updated).put("parentId", it.parentId)
           .put("projectId", it.projectId).put("created", it.created).put("archived", it.archived).put("agent", it.agent)
           .put("viewed", it.viewed).put("idle", it.idle).put("outcome", it.outcome)
@@ -132,7 +135,10 @@ class OfflineCache internal constructor(
     val data = JSONObject(raw)
     data.arr("projects").objects().map { it.toProject() } to
       data.arr("sessions").objects().map { Session(it.str("id"), it.str("directory"), it.str("title"), it.optLong("updated"), it.str("parentId").ifBlank { null }, it.str("projectId").ifBlank { null }, it.optLong("created"), it.optBoolean("archived"),
-        it.str("agent").ifBlank { null }, it.obj("model").toModelChoice(), it.optLong("viewed"), it.optLong("idle"), it.str("outcome").ifBlank { null }) }
+        it.str("agent").ifBlank { null }, it.obj("model").toModelChoice(), it.optLong("viewed"), it.optLong("idle"), it.str("outcome").ifBlank { null },
+        it.str("revertMessageId").ifBlank { null }) }
+  } catch (cancel: CancellationException) {
+    throw cancel
   } catch (error: Exception) {
     Diagnostics.warn("OfflineCache", "catalog 解析失败", error)
     null
@@ -146,12 +152,13 @@ class OfflineCache internal constructor(
       } }
       // Inline `data:` payloads (screenshots, phone files) are never persisted: they can be megabytes each.
       fun url(value: String) = value.takeUnless { it.startsWith("data:") }.orEmpty()
-      val items = JSONArray().apply { messages.takeLast(100).forEach { message ->
+      fun items(list: List<Message>) = JSONArray().apply { list.forEach { message ->
         put(JSONObject().put("id", message.id).put("role", message.role).put("type", message.type).put("created", message.created).put("error", message.error)
           .put("errorType", message.errorType).put("completedAt", message.completedAt).put("finish", message.finish).put("agent", message.agent)
-          .put("model", message.model?.let { model -> JSONObject().put("providerID", model.providerId).put("id", model.modelId).put("name", model.label) })
+          .put("retry", message.retry).put("queued", message.queued)
+          .put("model", message.model?.let { model -> JSONObject().put("providerID", model.providerId).put("id", model.modelId).put("name", model.label).put("variant", model.variant) })
           .put("notice", message.notice?.let { notice -> JSONObject().put("label", notice.label).put("detail", notice.detail).put("items", JSONArray(notice.items))
-            .put("target", notice.target).put("error", notice.error) })
+            .put("target", notice.target).put("error", notice.error).put("running", notice.running) })
           .put("parts", JSONArray().apply { message.parts.forEach { part ->
             put(JSONObject().put("id", part.id).put("type", part.type).put("text", part.text.take(20_000))
               .put("tool", part.tool).put("title", part.title).put("status", part.status).put("input", part.input.take(4_000))
@@ -161,7 +168,17 @@ class OfflineCache internal constructor(
               .put("attachments", JSONArray().apply { part.attachments.filterNot { it.url.startsWith("data:") }.forEach { put(JSONObject().put("uri", it.url).put("mime", it.mime).put("name", it.name)) } }))
           } }))
       } }
-      JSONObject().put("messages", items).put("complete", complete && !clipped).toString()
+      fun payload(list: List<Message>, flag: Boolean) = JSONObject().put("messages", items(list)).put("complete", flag).toString()
+      // 单条缓存有硬上限：超限时保留尽量新的后缀并标记为不完整，而不是整条丢弃、让旧缓存继续
+      // 以 complete=true 冒充完整会话。
+      var kept = messages.takeLast(100)
+      var text = payload(kept, complete && !clipped)
+      while (text.length > MAX_MESSAGES_CHARS && kept.size > 1) {
+        kept = kept.subList(kept.size / 2, kept.size)
+        text = payload(kept, false)
+      }
+      if (text.length > MAX_MESSAGES_CHARS) { kept = emptyList(); text = payload(kept, false) }
+      text
     }
   }
   fun messages(serverId: String, sessionId: String): List<Message> {
@@ -169,15 +186,17 @@ class OfflineCache internal constructor(
     return try {
     val items = if (raw.trimStart().startsWith("[")) JSONArray(raw) else JSONObject(raw).arr("messages")
     items.objects().map { item ->
-      val notice = item.optJSONObject("notice")?.let { Notice(it.str("label"), it.str("detail"), it.arr("items").strings(), it.str("target").ifBlank { null }, it.optBoolean("error")) }
+      val notice = item.optJSONObject("notice")?.let { Notice(it.str("label"), it.str("detail"), it.arr("items").strings(), it.str("target").ifBlank { null }, it.optBoolean("error"), it.optBoolean("running")) }
       val role = item.str("role")
       Message(item.str("id"), role, item.optLong("created"), item.arr("parts").objects().map { part ->
         MessagePart(part.str("id"), part.str("type"), part.str("text"), part.str("tool"), part.str("title"), part.str("status"), part.str("input"), part.str("output"), part.str("path"), part.str("error"), part.str("patch"),
           part.arr("files").strings(), part.str("mime"), part.arr("attachments").toAttachments(), part.str("target").ifBlank { null }, part.optBoolean("background"))
       }, item.str("error").ifBlank { null }, item.str("agent").ifBlank { null }, item.obj("model").toModelChoice(),
         item.optLong("completedAt").takeIf { it > 0 }, item.str("finish").ifBlank { null }, item.str("errorType").ifBlank { null },
-        notice = notice, type = item.str("type").ifBlank { role })
+        item.str("retry").ifBlank { null }, notice = notice, queued = item.optBoolean("queued"), type = item.str("type").ifBlank { role })
     }
+  } catch (cancel: CancellationException) {
+    throw cancel
   } catch (error: Exception) {
     Diagnostics.warn("OfflineCache", "messages 解析失败", error)
     emptyList()
@@ -221,5 +240,7 @@ class OfflineCache internal constructor(
     const val MAX_ENTRIES = 150
     const val MAX_TOTAL_BYTES = 16_000_000L
     const val MAX_ENTRY_BYTES = 2_000_000L
+    /** 明文上限（加密 + Base64 后仍须低于 MAX_ENTRY_BYTES/2）；超出时截断为最新后缀并标记不完整。 */
+    const val MAX_MESSAGES_CHARS = 700_000
   }
 }

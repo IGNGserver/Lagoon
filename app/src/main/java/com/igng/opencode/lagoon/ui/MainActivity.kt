@@ -43,6 +43,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import top.yukonga.miuix.kmp.basic.*
 import top.yukonga.miuix.kmp.extra.SuperBottomSheet
 import top.yukonga.miuix.kmp.icon.MiuixIcons
@@ -51,9 +52,12 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
 
 class MainActivity : ComponentActivity() {
   private var deepLink by mutableStateOf<Pair<String, String>?>(null)
+  /** 已处理的深链目标（随实例状态保存）：旋转/改字体触发重建时不再重复跳回同一会话。 */
+  private var handledDeepLink: String? = null
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
     enableEdgeToEdge()
+    handledDeepLink = savedInstanceState?.getString(KEY_HANDLED_DEEP_LINK)
     parseDeepLink(intent)
     val controller = LagoonController.get(this)
     // Opening the app refreshes from the server; leaving it lets the live stream wind down.
@@ -130,13 +134,22 @@ class MainActivity : ComponentActivity() {
            sessionStack = if (state.session?.parentId == sessionStack.lastOrNull()) sessionStack + id else sessionStack.dropLast(1) + id
          }
        }
-       LaunchedEffect(state.allServers, state.serverId, state.connected, pendingDraftTarget) {
-         val target = pendingDraftTarget
-         if (target != null && state.serverId == target.first && state.connected) {
-           pendingDraftTarget = null
-           if (state.projects.any { it.id == target.second }) controller.selectProject(target.second)
+       LaunchedEffect(pendingDraftTarget) {
+         val target = pendingDraftTarget ?: return@LaunchedEffect
+         // 只等这一次连接成功：没有超时的等待会让“之后手动连接该服务器”被误当成草稿目标，
+         // 把用户突然拽进空白草稿页；失败则给出明确反馈。
+         val connected = withTimeoutOrNull(15_000) {
+           while (!(controller.state.value.serverId == target.first && controller.state.value.connected)) delay(200)
+           true
+         } ?: false
+         if (pendingDraftTarget != target) return@LaunchedEffect
+         pendingDraftTarget = null
+         if (connected) {
+           if (controller.state.value.projects.any { it.id == target.second }) controller.selectProject(target.second)
            draftNonce += 1
            sessionStack = listOf(DRAFT_SESSION)
+         } else {
+           globalMessage = "无法连接服务器，稍后重试"; globalMessageType = MiuixToastType.ERROR
          }
         }
        SideEffect {
@@ -158,6 +171,7 @@ class MainActivity : ComponentActivity() {
       LaunchedEffect(state.message) { state.message?.let { globalMessage = it; globalMessageType = MiuixToastType.SUCCESS; controller.clearMessage() } }
        LaunchedEffect(deepLink) {
          val (server, session) = deepLink ?: return@LaunchedEffect
+         handledDeepLink = "$server:$session"
           if (state.profiles.none { it.id == server }) { globalMessage = "这个服务器已移除"; globalMessageType = MiuixToastType.ERROR; deepLink = null }
           else {
             currentPage = RootPage.HOME; openSession(SessionTarget(server, session)); deepLink = null
@@ -199,7 +213,9 @@ class MainActivity : ComponentActivity() {
             @Composable
             fun Page(target: NavRoute, active: Boolean) {
               val displayed = if (target.session == state.sessionId && target.serverId == state.serverId) state
-                else snapshots["${target.serverId}:${target.session}"] ?: state.copy(messages = emptyList())
+                // 没有快照（例如跨服务器退出动画中）：用路由身份构造空页，不能回退成当前服务器的会话。
+                else snapshots["${target.serverId}:${target.session}"] ?: state.copy(serverId = target.serverId, sessionId = target.session,
+                  sessions = emptyList(), messages = emptyList(), draft = "")
               when {
                 target.session == DRAFT_SESSION -> DraftScreen(state, controller, onBack = { goBack() }, onModal = { if (active) chatModal = it }, interactive = active)
                  target.session != null -> ChatScreen(displayed, controller, onBack = { goBack() }, onOpenChild = { child ->
@@ -273,10 +289,21 @@ class MainActivity : ComponentActivity() {
     }
   }
   override fun onNewIntent(intent: Intent) { super.onNewIntent(intent); setIntent(intent); parseDeepLink(intent) }
+  override fun onSaveInstanceState(outState: Bundle) {
+    super.onSaveInstanceState(outState)
+    handledDeepLink?.let { outState.putString(KEY_HANDLED_DEEP_LINK, it) }
+  }
   private fun parseDeepLink(intent: Intent?) {
     val uri = intent?.data ?: return
     if ((uri.scheme != "lagoon" && uri.scheme != "opencode-lagoon") || uri.host != "server") return
     val parts = uri.pathSegments
-    if (parts.size >= 3 && parts[1] == "session") deepLink = parts[0] to parts[2]
+    if (parts.size >= 3 && parts[1] == "session") {
+      val target = parts[0] to parts[2]
+      deepLink = target.takeIf { "${it.first}:${it.second}" != handledDeepLink }
+    }
+  }
+
+  private companion object {
+    const val KEY_HANDLED_DEEP_LINK = "handledDeepLink"
   }
 }

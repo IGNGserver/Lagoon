@@ -33,6 +33,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import com.igng.opencode.lagoon.core.*
 import com.igng.opencode.lagoon.system.LiveUpdateSupport
 import com.igng.opencode.lagoon.system.TaskNotifications
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -125,8 +126,10 @@ fun ServersModal(
               controller.saveServer(actualProfile, credentials.password, credentials.cookie, credentials.username)
               done("已连接 OpenCode $version")
               onDismiss()
+            } catch (cancel: CancellationException) {
+              throw cancel
             } catch (error: Exception) {
-              done(error.message ?: "连接失败")
+              done(userFacingError(error, "连接失败"))
             }
           }
         }

@@ -177,14 +177,19 @@ private fun ServerChips(state: LagoonState, onSelect: (ServerProfile?) -> Unit, 
     }
     items(state.profiles, key = { it.id }) { profile ->
       val current = !state.allServers && profile.id == state.serverId
+      val selected = profile.id == state.serverId
       val overview = state.allServerSnapshots[profile.id]
+      // 当前（可写）连接的服务器以控制器自己的状态为准：概览读会跳过它，快照可能是旧的 loading。
       val dot = when {
+        selected -> when {
+          state.connected && state.streamConnected -> MiuixColorTokens.Success
+          state.connected || state.loading -> MiuixColorTokens.Warning
+          else -> MiuixTheme.colorScheme.onSurfaceVariantSummary
+        }
         overview?.connected == true && overview.streamConnected -> MiuixColorTokens.Success
         overview?.connected == true || overview?.loading == true -> MiuixColorTokens.Warning
-        !current -> null
-        state.connected && state.streamConnected -> MiuixColorTokens.Success
-        state.connected || state.loading -> MiuixColorTokens.Warning
-        else -> MiuixTheme.colorScheme.onSurfaceVariantSummary
+        state.allServers -> MiuixTheme.colorScheme.onSurfaceVariantSummary
+        else -> null
       }
       Card(
         cornerRadius = 20.dp,
@@ -234,7 +239,7 @@ private fun SessionList(
   val refreshScope = rememberCoroutineScope()
   val list = rememberLazyListState()
   val now by produceState(System.currentTimeMillis()) { while (true) { kotlinx.coroutines.delay(60_000); value = System.currentTimeMillis() } }
-  val active = remember(state.tasks, state.parents) { state.activeRootTasks }
+  val active = remember(state.tasks, state.parents, state.permissionPolicy, state.autoApprovalFailures) { state.activeRootTasks }
   val statuses = remember(state.sessions, state.notices, active, state.backgroundRunning, state.allSessionStatuses) { state.sessions.associate { it.key to state.sessionStatus(it, active) } }
   val unseen = remember(state.notices, state.allUnseenSessions, state.allServers) {
     if (state.allServers) state.allUnseenSessions else state.notices.filterNot { it.viewed }.map { it.sessionId }.toSet()

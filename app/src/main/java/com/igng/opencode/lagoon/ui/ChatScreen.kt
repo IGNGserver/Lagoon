@@ -292,7 +292,9 @@ fun DraftScreen(state: LagoonState, controller: LagoonController, onBack: () -> 
 /** “服务器 · 项目” under a chat title, led by the session's live state (running spinner / waiting / failed). */
 @Composable
 private fun SessionSubtitle(state: LagoonState, session: Session) {
-  val status = state.sessionStatus(session)
+  // 子会话不在根聚合里：优先用该会话自己的实时任务，再退回根聚合 / 未读账本。
+  val own = state.presentedTasks[session.id]
+  val status = if (own != null) state.sessionStatus(session, mapOf(session.id to own)) else state.sessionStatus(session)
   val muted = MiuixTheme.colorScheme.onSurfaceVariantSummary
   when (status) {
     SessionStatus.RUNNING -> { InfiniteProgressIndicator(color = MiuixTheme.colorScheme.primary, size = 12.dp, strokeWidth = 1.5.dp, orbitingDotSize = 1.5.dp); Spacer(Modifier.width(6.dp)) }
@@ -410,9 +412,13 @@ fun MiuixQuestionCard(request: QuestionRequest, controller: LagoonController) {
   }) }
   val uriHandler = androidx.compose.ui.platform.LocalUriHandler.current
   val answerRows = answers.mapIndexed { index, list -> custom[index].trim().takeIf { it.isNotEmpty() }?.let { if (request.questions[index].multiple) list + it else listOf(it) } ?: list }
-  val fieldValues = if (request.form) request.questions.mapIndexed { i, q -> org.json.JSONObject(q.field).str("key") to answerRows[i] }.toMap() else emptyMap()
+  // 服务器字段是外部数据：畸形 JSON 只让该字段退化为“无 key”，不能让组合期崩溃。
+  val fieldValues = if (request.form) request.questions.mapIndexedNotNull { i, q ->
+    runCatching { org.json.JSONObject(q.field).str("key") }.getOrNull()?.let { it to answerRows[i] }
+  }.toMap() else emptyMap()
   // Form fields with a `when` condition can vanish as earlier answers change, so page over what is visible now.
-  fun questionField(index: Int) = request.questions[index].field.takeIf { it.isNotBlank() }?.let { org.json.JSONObject(it) }
+  fun questionField(index: Int) = request.questions[index].field.takeIf { it.isNotBlank() }
+    ?.let { runCatching { org.json.JSONObject(it) }.getOrNull() }
   val visibleIndices = request.questions.indices.filter { index ->
     val field = questionField(index)
     field == null || formVisible(field, fieldValues)

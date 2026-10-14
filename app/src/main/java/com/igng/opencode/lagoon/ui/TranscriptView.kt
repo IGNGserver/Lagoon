@@ -84,7 +84,10 @@ internal fun Conversation(state: LagoonState, controller: LagoonController, modi
   LaunchedEffect(list.isScrollInProgress, dragged, nearBottom) {
     if ((list.isScrollInProgress || dragged) && !autoScroll) follow = nearBottom
   }
-  val contentKey = state.messages.lastOrNull()?.let { it.id to it.parts.sumOf { part -> part.text.length + part.output.length } }
+  // 行高会因工具状态、附件等变化：键里带上每个 part 的状态，否则“转圈→完成”不会触发回底。
+  val contentKey = state.messages.lastOrNull()?.let { message ->
+    message.id to message.parts.joinToString("|") { part -> "${part.status}:${part.text.length}:${part.output.length}:${part.attachments.size}" }
+  }
   val permissions = state.visiblePermissions.filter { it.sessionId == state.sessionId }
   val questions = state.questions.filter { it.sessionId == state.sessionId }
   // The exact number of LazyColumn items the data implies; the scroll effect waits for the list to lay

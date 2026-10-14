@@ -296,7 +296,16 @@ class ServerStore internal constructor(private val preferences: SharedPreference
       val raw = decrypt(id)
       when {
         raw == null -> ServerCredentials(fallback)
-        !raw.trimStart().startsWith("{") -> ServerCredentials(fallback, raw)
+        !raw.trimStart().startsWith("{") -> {
+          // 旧版明文凭据没有 origin 绑定：读取时迁移为 JSON（绑定当前地址），之后改地址会像新格式一样拒绝旧凭据。
+          if (profile != null) {
+            val payload = JSONObject().put("origin", credentialOrigin(profile.url)).put("username", fallback)
+              .put("password", raw).put("cookie", "")
+            runCatching { secrets.edit().putString(id, encryptValue(payload.toString())).apply() }
+              .onFailure { Diagnostics.warn("ServerStore", "旧凭据迁移失败，保留原格式") }
+          }
+          ServerCredentials(fallback, raw)
+        }
         else -> {
           val json = JSONObject(raw)
           if (json.has("origin") && (profile == null || json.str("origin") != credentialOrigin(profile.url))) return ServerCredentials(fallback)
@@ -354,7 +363,7 @@ class ServerStore internal constructor(private val preferences: SharedPreference
     val editor = preferences.edit().putString("profiles", json.toString()).remove("directories:$id").remove("sessionNotices:$id").remove("collapsedSections:$id").remove("collapsedProjects:$id").remove("pinned:$id")
       .remove("backgroundRunning:$id")
       .remove("modelVisibility:$id").remove("modelVisibilityConfigured:$id").remove("modelVariants:$id").remove("recentModels:$id").remove("scope:$id")
-    val prefixes = listOf("location", "preview", "configuration", "taskRead", "taskState", "taskParent", "taskTime", "notification").map { "$it:$id:" }
+    val prefixes = listOf("location", "preview", "configuration", "taskRead", "taskState", "taskParent", "taskTime", "notification", "taskLedgerVersion").map { "$it:$id:" }
     preferences.all.keys.filter { key -> prefixes.any(key::startsWith) }.forEach(editor::remove)
     editor.apply()
     val encrypted = secrets.edit().remove(id)
