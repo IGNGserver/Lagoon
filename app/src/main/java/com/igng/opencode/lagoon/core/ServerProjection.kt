@@ -40,6 +40,7 @@ fun LagoonState.homeProjection(): LagoonState {
       cached = snapshot.cached, loading = snapshot.loading, degraded = snapshot.degraded, sessions = snapshot.sessions,
       projects = snapshot.projects, tasks = snapshot.tasks, permissions = snapshot.permissions, questions = snapshot.questions,
       notices = snapshot.notices, knownParents = snapshot.parents, backgroundRunning = snapshot.backgroundRunning,
+      summary = snapshot.displaySummary(permissionPolicy),
       autoApprovalFailures = snapshot.autoApprovalFailures, sessionId = null, projectId = null, scopeProjectId = null,
       allServerSnapshots = snapshots)
   }

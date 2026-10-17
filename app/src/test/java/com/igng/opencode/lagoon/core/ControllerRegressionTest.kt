@@ -569,6 +569,24 @@ class ControllerRegressionTest {
     }
   }
 
+  @Test fun replyingOrRejectingQuestionRestoresRunningTaskAndSummary() = runBlocking {
+    MockWebServer().use { server ->
+      server.dispatcher = object : Dispatcher() { override fun dispatch(request: RecordedRequest) =
+        if (request.requestUrl!!.encodedPath == "/api/info") MockResponse().setBody("""{"version":"2.0.22"}""")
+        else MockResponse().setResponseCode(204)
+      }
+      val client = api(server); client.health()
+      val form = org.json.JSONObject("""{"id":"q1","sessionID":"s","fields":[{"key":"k","type":"string","required":true}]}""").toForm("/repo")
+      val (controller, state) = controller(client, LagoonState(serverId = "server", connected = true,
+        questions = listOf(form), tasks = mapOf("s" to TaskState("s", TaskPhase.WAITING_QUESTION, "等待你的回答"))))
+      controller.replyQuestion(form, listOf(listOf("ok"))).join()
+      assertTrue(state.value.questions.isEmpty())
+      assertEquals(TaskPhase.THINKING, state.value.tasks["s"]?.phase)
+      assertEquals(0, state.value.summary.waiting)
+      assertEquals(1, state.value.summary.running)
+    }
+  }
+
   @Test fun replyingOnePermissionKeepsOtherPendingPermissionsUntilLastReply() = runBlocking {
     MockWebServer().use { server ->
       server.dispatcher = object : Dispatcher() { override fun dispatch(request: RecordedRequest) =

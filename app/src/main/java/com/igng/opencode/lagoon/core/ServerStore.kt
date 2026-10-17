@@ -209,25 +209,26 @@ class ServerStore internal constructor(private val preferences: SharedPreference
     JSONArray(preferences.getString("directories:$id", "[]")).objects().mapNotNull { item ->
       val directory = item.str("directory").ifBlank { item.str("path") }
       if (directory.isBlank()) null else Project(item.str("id").ifBlank { normalizedDirectory(directory) }, directory,
-        item.str("name").ifBlank { directory.trimEnd('/').substringAfterLast('/').ifBlank { directory } })
+        item.str("name").ifBlank { directory.trimEnd('/').substringAfterLast('/').ifBlank { directory } },
+        item.arr("sandboxes").strings())
     }
   }.getOrDefault(emptyList())
   fun rememberLocalProjects(id: String, projects: List<Project>) {
     preferences.edit().putString("directories:$id", JSONArray().apply {
-      projects.forEach { put(JSONObject().put("id", it.id).put("directory", it.directory).put("name", it.name)) }
+      projects.forEach { put(JSONObject().put("id", it.id).put("directory", it.directory).put("name", it.name).put("sandboxes", JSONArray(it.sandboxes))) }
     }.toString()).apply()
   }
-  /** Registers a server-resolved project, replacing any entry with the same canonical directory. */
+  /**Registers a server-resolved project, replacing any entry with the same canonical directory. */
   fun addLocalProject(id: String, project: Project): List<Project> {
     val canonical = normalizedDirectory(project.directory)
-    val next = (listOf(project) + localProjects(id).filterNot { normalizedDirectory(it.directory) == canonical }).take(50)
+    val next = (listOf(project.copy(serverId = id)) + localProjects(id).filterNot { normalizedDirectory(it.directory) == canonical }).take(50)
     rememberLocalProjects(id, next)
-    return next
+    return next.map { it.copy(serverId = id) }
   }
   fun removeLocalProject(id: String, projectId: String): List<Project> {
     val next = localProjects(id).filterNot { it.id == projectId }
     rememberLocalProjects(id, next)
-    return next
+    return next.map { it.copy(serverId = id) }
   }
   /**
    * One-time reset to device-local projects. Earlier releases auto-imported the server's project list

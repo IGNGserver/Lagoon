@@ -16,7 +16,10 @@ class AllServersAggregationTest {
     assertEquals(firstProject, resolveSessionProject(first, listOf(firstProject, secondProject)))
     assertEquals(secondProject, resolveSessionProject(second, listOf(firstProject, secondProject)))
     assertEquals(2, HomeScope.roots(listOf(first, second), listOf(firstProject, secondProject), null).size)
-    assertEquals(mapOf(firstProject.key to 1, secondProject.key to 1), HomeScope.counts(listOf(first, second), listOf(firstProject, secondProject)))
+    assertEquals(1, HomeScope.counts(listOf(first, second), listOf(firstProject, secondProject))[firstProject.key])
+    assertEquals(1, HomeScope.counts(listOf(first, second), listOf(firstProject, secondProject))[secondProject.key])
+    // Single-server callers look up by raw project.id; scoped projects still report their count under project.id.
+    assertEquals(1, HomeScope.counts(listOf(first), listOf(firstProject))[firstProject.id])
   }
 
   @Test fun aggregateSectionsDoNotMergeSameProjectIds() {

@@ -289,8 +289,7 @@ private fun SessionList(
       if (state.sessionCursors.isNotEmpty()) item(key = "more") {
         TextButton(text = if (state.pending("sessions-more")) "正在加载…" else "加载更多会话", enabled = !state.pending("sessions-more"),
           onClick = { controller.loadMoreSessions() }, modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp))
-      }
-      else if (!state.catalogComplete) item(key = "cached-limit") {
+      } else if (!state.catalogComplete) item(key = "cached-limit") {
         Text("缓存仅保留最近会话", modifier = Modifier.padding(horizontal = 24.dp), color = muted, style = MiuixTheme.textStyles.footnote2)
       }
     }

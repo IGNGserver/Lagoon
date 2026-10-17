@@ -90,8 +90,17 @@ class BoundaryRegressionTest {
     val form=JSONObject("""{"id":"frm","sessionID":"s","fields":[{"key":"mode","type":"string","options":[{"value":"fast","label":"快速"}]},{"key":"count","type":"integer","minimum":1,"maximum":3,"required":true},{"key":"hidden","type":"string","required":true,"when":[{"key":"mode","op":"eq","value":"slow"}]}]}""").toForm("/repo")
     assertEquals("fast",form.questions[0].options.single().value)
     val answer=formAnswer(form,listOf(listOf("fast"),listOf("2"),emptyList()))
-    assertEquals(2,answer.getInt("count"));assertFalse(answer.has("hidden"))
+    assertEquals(2L,answer.get("count"));assertFalse(answer.has("hidden"))
     assertTrue(runCatching{formAnswer(form,listOf(listOf("fast"),listOf("2.5"),emptyList()))}.isFailure)
+  }
+
+  @Test fun formDefaultsAndPatternsTolerateNullsAndInvalidRegex() {
+    val promptWithNullDefault = QuestionPrompt("Title", emptyList(), false, true, """{"key":"k","type":"string","default":null}""")
+    assertTrue(promptWithNullDefault.defaultAnswers().isEmpty())
+    val promptWithArrayNulls = QuestionPrompt("Title", emptyList(), true, false, """{"key":"k","type":"multiselect","default":["a",null,2]}""")
+    assertEquals(listOf("a", "2"), promptWithArrayNulls.defaultAnswers())
+    val badPatternForm = JSONObject("""{"id":"frm","sessionID":"s","fields":[{"key":"k","type":"string","pattern":"["}]}""").toForm("/repo")
+    assertTrue(runCatching { formAnswer(badPatternForm, listOf(listOf("abc"))) }.isFailure)
   }
   @Test fun legacyIslandVendorKeysAreIgnoredAndDroppedOnSave() {
     val p=memoryPreferences();val sec=memoryPreferences()
@@ -120,14 +129,16 @@ class BoundaryRegressionTest {
 
   @Test fun localProjectsAreDedupedByCanonicalDirectoryAndSurviveReload() {
     val p=memoryPreferences();val s=store(p)
-    s.addLocalProject("srv", Project("p","/repo","Repo"))
+    s.addLocalProject("srv", Project("p","/repo","Repo", sandboxes = listOf("/trees/task")))
     // The same canonical folder under a different id must replace, never duplicate.
-    s.addLocalProject("srv", Project("p2","/repo/","Repo again"))
+    s.addLocalProject("srv", Project("p2","/repo/","Repo again", sandboxes = listOf("/trees/task")))
     assertEquals(listOf("/repo"), s.localProjects("srv").map { it.directory }.map(::normalizedDirectory).distinct())
     assertEquals(1, s.localProjects("srv").size)
     assertEquals("p2", s.localProjects("srv").single().id)
+    assertEquals(listOf("/trees/task"), s.localProjects("srv").single().sandboxes)
     val fresh=ServerStore(p,memoryPreferences(),{"encrypted:$it"},{require(it.startsWith("encrypted:"));it.removePrefix("encrypted:")})
     assertEquals("p2", fresh.localProjects("srv").single().id)
+    assertEquals(listOf("/trees/task"), fresh.localProjects("srv").single().sandboxes)
     s.removeLocalProject("srv","p2")
     assertTrue(s.localProjects("srv").isEmpty())
   }

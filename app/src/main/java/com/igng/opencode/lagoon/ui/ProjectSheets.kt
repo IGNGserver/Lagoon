@@ -229,9 +229,11 @@ internal fun DirectoryBrowserSheet(state: LagoonState, controller: LagoonControl
         Text("显示隐藏目录", Modifier.weight(1f), style = MiuixTheme.textStyles.footnote1.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
         Switch(checked = state.browseShowHidden, onCheckedChange = { controller.setBrowseShowHidden(it) })
       }
-      ResourceHint(state.resource("browse"), "这个目录是空的", retry = { if (path.isNotBlank()) controller.browseDirectory(path) })
       if (searching) {
+        val searchStatus = state.resource("browse-search")
         when {
+          searchStatus.state == ResourceState.LOADING || searchStatus.state == ResourceState.ERROR ->
+            ResourceHint(searchStatus, "没有匹配项", retry = { controller.searchDirectories(query) })
           results.isNotEmpty() -> LazyColumn(Modifier.fillMaxWidth()) {
             items(results, key = { it }) { result ->
               val name = result.trimEnd('/').substringAfterLast('/')
@@ -243,6 +245,7 @@ internal fun DirectoryBrowserSheet(state: LagoonState, controller: LagoonControl
           else -> Text("没有匹配项", Modifier.padding(16.dp), style = MiuixTheme.textStyles.footnote1.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
         }
       } else {
+        ResourceHint(state.resource("browse"), "这个目录是空的", retry = { if (path.isNotBlank()) controller.browseDirectory(path) })
         LazyColumn(Modifier.fillMaxWidth().weight(1f)) {
           if (path.isNotBlank() && path.trimEnd('/') != "") item(key = "..") {
             BasicComponent(title = "上级目录", summary = HomeScope.parent(path), onClick = { controller.browseDirectory(HomeScope.parent(path)) })

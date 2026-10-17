@@ -127,19 +127,23 @@ class OpenCodeApi(
   }
 
   private fun httpErrorMessage(status: Int, body: String): String {
-    val serverMessage = runCatching {
-      val json = JSONObject(body)
-      json.errorMessage().ifBlank { json.obj("data").errorMessage() }
-    }.getOrDefault("")
-    return serverMessage.ifBlank {
-      when (status) {
-        401 -> "用户名或密码错误"
-        403 -> "服务器拒绝访问"
-        404 -> "OpenCode 未找到请求的资源或接口"
-        503 -> "OpenCode 服务正在启动或停止，请稍后重试"
-        else -> "服务器返回 HTTP $status"
+      val serverMessage = runCatching {
+        val json = JSONObject(body)
+        json.errorMessage().ifBlank { json.obj("data").errorMessage() }
+      }.getOrDefault("")
+      val translated = serverMessage.takeUnless {
+        // An empty-body 500 or raw `{}` must not stringify as "{}" and hide the status translation.
+        it == "{}" || it == "[]"
+      }.orEmpty()
+      return translated.ifBlank {
+        when (status) {
+          401 -> "用户名或密码错误"
+          403 -> "服务器拒绝访问"
+          404 -> "OpenCode 未找到请求的资源或接口"
+          503 -> "OpenCode 服务正在启动或停止，请稍后重试"
+          else -> "服务器返回 HTTP $status"
+        }
       }
-    }
   }
 
   private suspend fun request(method: String, path: String, query: Map<String, String> = emptyMap(), body: JSONObject? = null): String {

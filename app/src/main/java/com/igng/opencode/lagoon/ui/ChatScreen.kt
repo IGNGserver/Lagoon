@@ -685,6 +685,7 @@ private fun FilesPanel(state: LagoonState, controller: LagoonController, onRefer
   var query by rememberSaveable { mutableStateOf("") }
   val searching = query.trim().length >= 2
   val path = state.filePath
+  val viewingFile = state.fileText != null || state.fileBinary
   val crumbs = remember(path) { if (path == "." || path.isBlank()) emptyList() else HomeScope.crumbs(path) }
   val nodes = remember(state.files, state.searchResults, searching) {
     (if (searching) state.searchResults.map { FileNode(it, "file") } else state.files).distinctBy { it.path }
@@ -693,6 +694,12 @@ private fun FilesPanel(state: LagoonState, controller: LagoonController, onRefer
   Column(Modifier.fillMaxSize()) {
     TextField(query, { query = it; controller.searchFiles(it) }, label = "搜索工程文件", useLabelAsPlaceholder = true, modifier = Modifier.fillMaxWidth())
     Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+      if (viewingFile) {
+        Text("← 返回列表", Modifier.clickable {
+          val parent = path.substringBeforeLast('/', ".").ifBlank { "." }
+          controller.listFiles(if (parent == path) "." else parent)
+        }.padding(end = 8.dp), style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.primary))
+      }
       Text("项目", Modifier.clickable { controller.listFiles(".") },
         style = MiuixTheme.textStyles.footnote2.copy(color = if (path == "." || path.isBlank()) MiuixTheme.colorScheme.primary else MiuixTheme.colorScheme.onSurfaceVariantSummary))
       crumbs.forEachIndexed { index, (label, target) ->
@@ -702,13 +709,18 @@ private fun FilesPanel(state: LagoonState, controller: LagoonController, onRefer
       }
     }
     ResourceHint(state.resource(if (searching) "search" else "files"), "此目录没有文件", retry = { if (searching) controller.searchFiles(query) else controller.listFiles() })
-    if (state.fileBinary) { Text("当前无法预览此二进制文件"); TextButton(text = "引用到消息", enabled = !state.pending("send"), onClick = { onReference(state.filePath) }) }
-    state.fileText?.let { text -> TextButton(text = "引用到消息", onClick = { onReference(state.filePath) }); VirtualText(text, Modifier.weight(1f), highlight = false) }
-      ?: LazyColumn { items(nodes, key = { it.path }) { node ->
+    if (state.fileBinary && !searching) { Text("当前无法预览此二进制文件"); TextButton(text = "引用到消息", enabled = !state.pending("send"), onClick = { onReference(state.filePath) }) }
+    val preview = state.fileText?.takeUnless { searching }
+    if (preview != null) {
+      TextButton(text = "引用到消息", onClick = { onReference(state.filePath) })
+      VirtualText(preview, Modifier.weight(1f), highlight = false)
+    } else if (!state.fileBinary || searching) {
+      LazyColumn { items(nodes, key = { it.path }) { node ->
         val directory = node.type == "directory"
         BasicComponent(title = node.path.substringAfterLast('/').ifBlank { node.path }, summary = if (directory) "文件夹" else node.path,
           onClick = { if (directory) controller.listFiles(node.path) else controller.readFile(node.path) })
       } }
+    }
   }
 }
 

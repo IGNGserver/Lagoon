@@ -139,7 +139,9 @@ internal class AllServersOverview(
       return
     }
     val cachedCatalog = cache.catalog(id)
-    val cachedProjects = cachedCatalog?.first.orEmpty().map { it.copy(serverId = id) }
+    val cachedProjects = (cachedCatalog?.first.orEmpty() + store.localProjects(id))
+      .distinctBy { normalizedDirectory(it.directory) }
+      .map { it.copy(serverId = id) }
     val cachedSessions = cachedCatalog?.second.orEmpty().map { it.copy(serverId = id) }
     val cachedTasks = store.taskStates(id)
     val cachedParents = store.taskParents(id)
@@ -164,6 +166,7 @@ internal class AllServersOverview(
     var waitingRevision = 0L
     var lastReadAt = 0L
     val resolvedSessions = linkedSetOf<String>()
+    val resolvedFormSessions = linkedSetOf<String>()
     val seenEvents = linkedSetOf<String>()
     fun emit(value: ServerOverviewSnapshot) {
       // An onOpen callback queued by a disposed connection must not overwrite its replacement.
@@ -217,7 +220,7 @@ internal class AllServersOverview(
           sessions = (snapshot.sessions + next.sessions).distinctBy { it.id },
           streamConnected = snapshot.streamConnected, autoApprovalFailures = snapshot.autoApprovalFailures)
       snapshot = snapshot.copy(permissions = approver.pending(snapshot.permissions))
-      snapshot = reconcileWaiting(snapshot, resolvedSessions)
+      snapshot = reconcileWaiting(snapshot, resolvedSessions, resolvedFormSessions = resolvedFormSessions)
       store.rememberParents(id, snapshot.sessions)
       snapshot.tasks.values.forEach { store.rememberTask(id, it, snapshot.parents[it.sessionId]) }
       store.taskStates(id).values.filter { it.active && it.sessionId !in snapshot.tasks }.forEach {
@@ -285,6 +288,8 @@ internal class AllServersOverview(
               } else if (event.type in setOf("form.replied", "form.cancelled")) {
                 waitingRevision++
                 val requestId = props.str("id").ifBlank { props.str("requestID") }
+                resolvedFormSessions += props.sessionEventId(event.type)
+                while (resolvedFormSessions.size > 1000) resolvedFormSessions.remove(resolvedFormSessions.first())
                 snapshot = snapshot.copy(questions = snapshot.questions.filterNot { it.id == requestId })
               }
               onEvent(id, event)
@@ -314,7 +319,7 @@ internal class AllServersOverview(
                   snapshot = snapshot.copy(shells = snapshot.shells - props.str("id"))
                 }
                 snapshot = snapshot.copy(tasks = BackgroundWork.fold(snapshot.tasks, snapshot.shells, snapshot.parents))
-                snapshot = reconcileWaiting(snapshot, resolvedSessions)
+                snapshot = reconcileWaiting(snapshot, resolvedSessions, resolvedFormSessions = resolvedFormSessions)
                 val session = snapshot.sessions.firstOrNull { it.id == sessionId }
                 if (event.type in setOf("session.execution.succeeded", "session.execution.failed") && session?.parentId == null && session != null &&
                   TaskSummary.aggregate(snapshot.tasks.filterValues { it.active }, snapshot.parents)[sessionId] == null &&
@@ -503,18 +508,28 @@ internal class AllServersOverview(
       backgroundRunning = background,
       summary = summary,
       shells = shells
-    ), identityMap.values.filter { normalizedDirectory(it.directory) in verifiedPermissionDirs }.map { it.id }.toSet(), active?.toSet())
+    ),
+      identityMap.values.filter { normalizedDirectory(it.directory) in verifiedPermissionDirs }.map { it.id }.toSet(),
+      active?.toSet(),
+      identityMap.values.filter { normalizedDirectory(it.directory) in successfulFormDirs }.map { it.id }.toSet()
+    )
   }
 
-  /** Empty authoritative pending lists clear old WAITING_PERMISSION instead of carrying it forever. */
-  private fun reconcileWaiting(snapshot: ServerOverviewSnapshot, verified: Set<String>, active: Set<String>? = null): ServerOverviewSnapshot {
+  /** Empty authoritative pending lists clear old WAITING_PERMISSION / WAITING_QUESTION instead of carrying them forever. */
+  private fun reconcileWaiting(
+    snapshot: ServerOverviewSnapshot,
+    verified: Set<String>,
+    active: Set<String>? = null,
+    resolvedFormSessions: Set<String> = emptySet()
+  ): ServerOverviewSnapshot {
     val waitingSessions = (snapshot.permissions.map { it.sessionId } + snapshot.questions.map { it.sessionId }).toSet()
     val base = snapshot.tasks + waitingSessions.filterNot { it in snapshot.tasks }.associateWith { TaskState(it, TaskPhase.THINKING) }
     val tasks = base.mapValues { (id, task) ->
       when {
         snapshot.questions.any { it.sessionId == id } -> task.copy(phase = TaskPhase.WAITING_QUESTION, detail = "等待你的回答")
         snapshot.permissions.any { it.sessionId == id } -> task.copy(phase = TaskPhase.WAITING_PERMISSION, detail = "等待权限确认")
-        id in verified && task.phase == TaskPhase.WAITING_PERMISSION ->
+        (id in verified && task.phase == TaskPhase.WAITING_PERMISSION) ||
+          (id in resolvedFormSessions && task.phase == TaskPhase.WAITING_QUESTION) ->
           if (active != null && id !in active && !BackgroundWork.hasBackgroundWork(id, snapshot.tasks, snapshot.shells, snapshot.parents))
             task.copy(phase = TaskPhase.IDLE, detail = "")
           else task.copy(phase = TaskPhase.THINKING, detail = TaskState.RUNNING_DETAIL)

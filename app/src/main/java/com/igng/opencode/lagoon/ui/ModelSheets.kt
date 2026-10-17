@@ -57,7 +57,10 @@ internal fun AgentSelector(
   var open by remember { mutableStateOf(false) }
   // 服务器自报的 agent 优先（自定义 agent 的实例不再只能选 build/plan）；接口不可用时退回内置两项。
   val choices = state.agents.ifEmpty { AGENT_OPTIONS.map { AgentChoice(it, "") } }
-  val options = choices.map { DropdownOption(it.name, it.name, state.agentChanged && state.agent == it.name) }
+  val options = buildList {
+    add(DropdownOption("默认 Agent", null, !state.agentChanged))
+    choices.forEach { add(DropdownOption(it.name, it.name, state.agentChanged && state.agent == it.name)) }
+  }
   Box(modifier) {
     if (iconOnly) IconButton(onClick = { open = true }, enabled = enabled) {
       Icon(MiuixIcons.ContactsCircle, "Agent：${state.agent ?: "默认"}", Modifier.size(22.dp),
@@ -76,17 +79,23 @@ internal fun ModelSelector(state: LagoonState, controller: LagoonController, mod
   var open by remember { mutableStateOf(false) }
   val visible = state.visibleModels
   val currentKey = state.model?.let(::modelKey)
-  val options = buildList {
-    add(DropdownOption("默认模型", null, !state.modelChanged))
-    visible.forEach { model -> add(DropdownOption(model.choice.label, model.key, state.modelChanged && model.key == currentKey)) }
+  val recent = state.recentModels.mapNotNull { key -> visible.firstOrNull { it.key == key } }
+  val recentKeys = recent.map { it.key }.toSet()
+  val rest = visible.filterNot { it.key in recentKeys }
+  val sections = buildList {
+    add(MenuSection(buildList {
+      add(MenuAction("默认模型", selected = !state.modelChanged) { controller.chooseModel(null) })
+      recent.forEach { model -> add(MenuAction(model.choice.label, selected = state.modelChanged && model.key == currentKey) { controller.chooseModel(model.choice) }) }
+    }, title = if (recent.isNotEmpty()) "最近使用" else null))
+    if (rest.isNotEmpty()) {
+      add(MenuSection(rest.map { model ->
+        MenuAction(model.choice.label, selected = state.modelChanged && model.key == currentKey) { controller.chooseModel(model.choice) }
+      }, title = if (recent.isNotEmpty()) "全部模型" else null))
+    }
   }
   Box(modifier) {
     CapsuleSelector(state.model?.label ?: "默认模型", { open = true }, enabled = enabled, maxTextWidth = 180.dp)
-    MenuPopup(open, { open = false }, listOf(MenuSection(options.map { option ->
-      MenuAction(option.label, selected = option.selected) {
-        controller.chooseModel(option.value?.let { key -> visible.firstOrNull { it.key == key }?.choice })
-      }
-    })), alignment = PopupPositionProvider.Align.Start)
+    MenuPopup(open, { open = false }, sections, alignment = PopupPositionProvider.Align.Start)
   }
 }
 
