@@ -3,10 +3,11 @@ plugins {
   id("org.jetbrains.kotlin.android") version "2.2.10" apply false
   id("org.jetbrains.kotlin.plugin.compose") version "2.2.10" apply false
 }
-// Build output is shared under /tmp to keep the (single-disk) project volume for sources, but the
-// leaf directory is namespaced by the checkout path so parallel worktrees of this repository on one
-// machine cannot overwrite each other's APK and test results.
+// Build output goes to BUILD_SCRATCH_ROOT (default ~/.build) on the local disk to keep the
+// project volume for sources, namespaced by the checkout path so parallel worktrees cannot collide.
 val checkoutKey = Integer.toHexString(rootDir.absolutePath.hashCode())
+val scratchRoot = System.getenv("BUILD_SCRATCH_ROOT")?.takeIf { it.isNotBlank() }
+  ?: "${System.getProperty("user.home")}/.build"
 allprojects {
-  layout.buildDirectory.set(file("/tmp/lagoon-gradle/$checkoutKey/${project.name}"))
+  layout.buildDirectory.set(file("$scratchRoot/Lagoon/$checkoutKey/${project.name}"))
 }

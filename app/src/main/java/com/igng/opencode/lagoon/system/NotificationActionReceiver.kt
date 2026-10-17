@@ -90,7 +90,7 @@ class NotificationActionReceiver : BroadcastReceiver() {
         }
         else -> return false
       }
-      LagoonController.get(context).notificationCompleted(serverId)
+      LagoonController.get(context).notificationCompleted(serverId, permissionId)
       true
     } catch (cancel: CancellationException) {
       throw cancel

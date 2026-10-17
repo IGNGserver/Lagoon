@@ -13,8 +13,11 @@ internal fun JSONObject.toForm(directory: String) = QuestionRequest(str("id"), s
 
 internal fun QuestionPrompt.defaultAnswers(): List<String> {
   if (field.isBlank()) return emptyList()
-  val raw = JSONObject(field).opt("default") ?: return emptyList()
-  return if (raw is JSONArray) (0 until raw.length()).map { raw.getString(it) } else listOf(raw.toString())
+  val raw = runCatching { JSONObject(field).opt("default") }.getOrNull() ?: return emptyList()
+  if (raw == JSONObject.NULL) return emptyList()
+  return if (raw is JSONArray) (0 until raw.length()).mapNotNull { index ->
+    raw.opt(index)?.takeIf { it != JSONObject.NULL }?.toString()
+  } else listOf(raw.toString())
 }
 internal fun formVisible(field: JSONObject, values: Map<String, List<String>>): Boolean =
   !field.optBoolean("hidden") && field.arr("when").objects().all { condition ->
@@ -24,7 +27,7 @@ internal fun formVisible(field: JSONObject, values: Map<String, List<String>>): 
   }
 internal fun formAnswer(request: QuestionRequest, answers: List<List<String>>): JSONObject {
   require(answers.size == request.questions.size) { "表单字段已变化，请刷新" }
-  val fields = request.questions.map { JSONObject(it.field) }
+  val fields = request.questions.map { runCatching { JSONObject(it.field) }.getOrElse { JSONObject() } }
   val values = fields.mapIndexed { i, f -> f.str("key") to answers[i] }.toMap()
   return JSONObject().apply {
     fields.forEachIndexed { index, f ->
@@ -38,15 +41,20 @@ internal fun formAnswer(request: QuestionRequest, answers: List<List<String>>): 
       val value: Any = when (f.str("type")) {
         "string" -> {
           require(text.length >= f.optInt("minLength", 0) && text.length <= f.optInt("maxLength", Int.MAX_VALUE)) { "长度无效：$label" }
-          if (f.has("pattern")) require(Regex(f.getString("pattern")).containsMatchIn(text)) { "格式无效：$label" }
+          if (f.has("pattern")) {
+            val pattern = runCatching { Regex(f.str("pattern")) }.getOrElse { error("表单正则格式无效：$label") }
+            require(pattern.containsMatchIn(text)) { "格式无效：$label" }
+          }
           text
         }
         "boolean" -> { require(text == "true" || text == "false"); text.toBooleanStrict() }
         "number", "integer" -> {
           val number = text.toDoubleOrNull() ?: error("请输入数字：$label")
           require(number.isFinite() && number >= f.optDouble("minimum", -Double.MAX_VALUE) && number <= f.optDouble("maximum", Double.MAX_VALUE)) { "数值超出范围：$label" }
-          require(f.str("type") != "integer" || number % 1.0 == 0.0) { "请输入整数：$label" }
-          number
+          if (f.str("type") == "integer") {
+            require(number % 1.0 == 0.0 && number >= Long.MIN_VALUE.toDouble() && number <= Long.MAX_VALUE.toDouble()) { "请输入整数：$label" }
+            number.toLong()
+          } else number
         }
         "multiselect" -> { require(row.size >= f.optInt("minItems", 0) && row.size <= f.optInt("maxItems", Int.MAX_VALUE)) { "选择数量无效：$label" }; JSONArray(row) }
         else -> error("暂不支持此表单字段：$label")

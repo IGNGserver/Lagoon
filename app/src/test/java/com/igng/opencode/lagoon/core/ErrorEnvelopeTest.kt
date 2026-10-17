@@ -15,5 +15,10 @@ class ErrorEnvelopeTest {
     assertEquals("boom", JSONObject("""{"error":{"data":{"message":"boom"}}}""").errorText("error"))
     assertEquals("", JSONObject("{}").errorText("error"))
     assertEquals("", JSONObject("""{"error":null}""").errorText("error"))
+    assertEquals("", JSONObject("""{"error":{}}""").errorText("error"))
+    assertEquals("", JSONObject("""{"error":[]}""").errorText("error"))
+    assertEquals("", JSONObject("{}").errorMessage("error"))
+    assertEquals("", JSONObject("""{"error":{}}""").errorMessage("error"))
+    assertEquals("boom", JSONObject("""{"error":{"data":{"message":"boom"}}}""").errorMessage("error"))
   }
 }

@@ -202,6 +202,7 @@ internal fun JSONObject.errorText(key: String = "error"): String {
   val value = opt(key)
   return when (value) {
     is JSONObject -> value.str("message").ifBlank { value.obj("data").str("message") }
+    is JSONArray -> ""
     null, JSONObject.NULL -> ""
     else -> value.toString().takeUnless { it == "null" }.orEmpty()
   }
@@ -211,10 +212,12 @@ internal fun JSONObject.errorMessage(key: String = "error"): String {
   val direct = str("message")
   if (direct.isNotBlank()) return direct
   val value = opt(key)
-  if (value is JSONObject) {
-    return value.str("message").ifBlank { value.obj("data").str("message") }
+  return when (value) {
+    is JSONObject -> value.str("message").ifBlank { value.obj("data").str("message") }
+    is JSONArray -> ""
+    null, JSONObject.NULL -> ""
+    else -> value.toString().takeUnless { it == "null" }.orEmpty()
   }
-  return value?.toString().orEmpty().takeUnless { it == "null" }.orEmpty()
 }
 
 internal fun JSONObject.valueText(key: String): String {

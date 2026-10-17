@@ -99,6 +99,23 @@ class PersistentConnectionsTest {
     }
   }
 
+  @Test fun successfulEmptyFormReadsClearPersistedFalseQuestionWaiting() = runBlocking {
+    MockWebServer().use { server ->
+      server.dispatcher = dispatcher(AtomicInteger())
+      val store = store(); val profile = profile("a", server); store.save(profile, null)
+      store.rememberTask("a", TaskState("s", TaskPhase.WAITING_QUESTION, activeAt = 1))
+      val scope = CoroutineScope(coroutineContext + SupervisorJob())
+      val snapshots = ConcurrentHashMap<String, ServerOverviewSnapshot>()
+      val manager = AllServersOverview(store, cache(), scope, { snapshots[it.serverId] = it })
+      try {
+        manager.start(listOf(profile))
+        awaitCondition { snapshots["a"]?.connected == true }
+        assertTrue(snapshots.getValue("a").questions.isEmpty())
+        assertEquals(TaskPhase.THINKING, snapshots.getValue("a").tasks.getValue("s").phase)
+      } finally { manager.stop(); scope.cancel() }
+    }
+  }
+
   @Test fun successfulEmptyPermissionReadsClearPersistedFalseWaiting() = runBlocking {
     MockWebServer().use { server ->
       server.dispatcher = dispatcher(AtomicInteger())

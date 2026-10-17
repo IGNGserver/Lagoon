@@ -12,9 +12,16 @@ object HomeScope {
       session.visibleOnHome && (scope == null || project?.id == scope || project?.key == scope)
     }.sortedWith(sessionActivityOrder)
 
-  /** Home-visible root session count per project id, for the project picker. */
-  fun counts(sessions: List<Session>, projects: List<Project>): Map<String, Int> =
-    sessions.filter { it.visibleOnHome }.mapNotNull { resolveSessionProject(it, projects)?.key }.groupingBy { it }.eachCount()
+/** Home-visible root session count per project, keyed by both [Project.id] and [Project.key]. */
+  fun counts(sessions: List<Session>, projects: List<Project>): Map<String, Int> {
+    val result = LinkedHashMap<String, Int>()
+    sessions.filter { it.visibleOnHome }.forEach { session ->
+      val project = resolveSessionProject(session, projects) ?: return@forEach
+      result[project.key] = (result[project.key] ?: 0) + 1
+      if (project.id != project.key) result[project.id] = (result[project.id] ?: 0) + 1
+    }
+    return result
+  }
 
   /** Projects ordered by their latest root-session activity; projects without sessions keep their order last. */
   fun byActivity(sessions: List<Session>, projects: List<Project>): List<Project> {
