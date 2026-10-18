@@ -1723,7 +1723,7 @@ class LagoonController private constructor(private val appContext: Context) {
     loadBrowse(op, path)
   }
   private suspend fun loadBrowse(op: OperationContext, path: String) {
-    val entries = attempt { op.client.files(path, ".") }.getOrElse { error ->
+    val entries = attempt { op.client.files(path, ".", op.snapshot.session) }.getOrElse { error ->
       op.commit { it.copy(resources = it.resources + ("browse" to ResourceStatus(ResourceState.ERROR, userFacingError(error)))) }
       return
     }
@@ -1744,7 +1744,7 @@ class LagoonController private constructor(private val appContext: Context) {
       val op = attempt { beginOperation(path) }.getOrElse { return@launch }
       delay(250)
       if (request != searchSequence) return@launch
-      val results = attempt { op.client.searchFiles(path, text) }.getOrElse { error ->
+      val results = attempt { op.client.searchFiles(path, text, op.snapshot.session) }.getOrElse { error ->
         if (request == searchSequence) op.commit { it.copy(resources = it.resources + ("browse-search" to ResourceStatus(ResourceState.ERROR, userFacingError(error)))) }
         return@launch
       }
@@ -1982,7 +1982,7 @@ class LagoonController private constructor(private val appContext: Context) {
     ++searchSequence
     return act { op ->
       val directory = op.snapshot.executionDirectory ?: error("先选择项目")
-      val files = try { op.client.files(directory, path) } catch (error: Exception) {
+      val files = try { op.client.files(directory, path, op.snapshot.session) } catch (error: Exception) {
         if (request == fileSequence) op.commit { it.copy(resources = it.resources + ("files" to ResourceStatus(ResourceState.ERROR, userFacingError(error)))) }
         throw error
       }
@@ -1995,7 +1995,7 @@ class LagoonController private constructor(private val appContext: Context) {
     mutable.update { it.copy(resources = it.resources + ("files" to ResourceStatus(ResourceState.LOADING))) }
     return act { op ->
       val directory = op.snapshot.executionDirectory ?: error("先选择项目")
-      val content = try { op.client.fileContent(directory, path) } catch (error: Exception) {
+      val content = try { op.client.fileContent(directory, path, op.snapshot.session) } catch (error: Exception) {
         if (request == fileSequence) op.commit { it.copy(resources = it.resources + ("files" to ResourceStatus(ResourceState.ERROR, userFacingError(error)))) }
         throw error
       }
@@ -2014,7 +2014,7 @@ class LagoonController private constructor(private val appContext: Context) {
       delay(250)
       if (request != searchSequence) return@act
       val directory = op.snapshot.executionDirectory ?: error("先选择项目")
-      val results = try { op.client.searchFiles(directory, query.trim()) } catch (error: Exception) {
+      val results = try { op.client.searchFiles(directory, query.trim(), op.snapshot.session) } catch (error: Exception) {
         if (request == searchSequence) op.commit { it.copy(resources = it.resources + ("search" to ResourceStatus(ResourceState.ERROR, userFacingError(error)))) }
         throw error
       }
