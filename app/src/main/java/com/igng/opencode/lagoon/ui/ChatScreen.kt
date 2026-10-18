@@ -369,7 +369,7 @@ fun MiuixPermissionCard(request: PermissionRequest, controller: LagoonController
       )
     }
     Spacer(Modifier.height(10.dp))
-    Text("OpenCode 正在请求执行动作：", style = MiuixTheme.textStyles.headline2.copy(fontWeight = FontWeight.SemiBold))
+    Text("服务器正在请求执行动作：", style = MiuixTheme.textStyles.headline2.copy(fontWeight = FontWeight.SemiBold))
     Spacer(Modifier.height(8.dp))
     Text(
       text = request.detail,

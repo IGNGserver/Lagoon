@@ -39,7 +39,7 @@ internal fun ArchivedScreen(state: LagoonState, controller: LagoonController, on
       if (archived.isEmpty()) item {
         Column(Modifier.fillMaxWidth().padding(horizontal = 32.dp, vertical = 48.dp), horizontalAlignment = Alignment.CenterHorizontally) {
           Text(if (state.loading) "正在读取会话…" else "没有已归档的会话", color = muted)
-          if (state.capabilities.archive == null && !state.loading) Text("这台服务器的 OpenCode 未提供归档接口；在其他客户端归档的会话仍会显示在这里。",
+          if (state.capabilities.archive == null && !state.loading) Text("这台服务器未提供归档接口；在其他客户端归档的会话仍会显示在这里。",
             Modifier.padding(top = 8.dp), color = muted, style = MiuixTheme.textStyles.footnote1)
         }
       }

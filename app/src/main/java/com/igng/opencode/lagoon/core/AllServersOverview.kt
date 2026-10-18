@@ -64,7 +64,7 @@ internal class AllServersOverview(
 ) {
   private val jobs = mutableMapOf<String, Job>()
   private val locks = mutableMapOf<String, Mutex>()
-  private val clients = mutableMapOf<String, OpenCodeApi>()
+  private val clients = mutableMapOf<String, HarnessClient>()
   private val configurations = mutableMapOf<String, Pair<ServerProfile, ServerCredentials>>()
   private val wakes = mutableMapOf<String, Channel<Unit>>()
   private val reconnectHints = mutableMapOf<String, Channel<Unit>>()
@@ -96,9 +96,9 @@ internal class AllServersOverview(
   }
 
   fun restart(profiles: List<ServerProfile>) { start(profiles); refreshAll() }
-  fun client(id: String): OpenCodeApi = clients.getOrPut(id) {
+  fun client(id: String): HarnessClient = clients.getOrPut(id) {
     val (profile, credentials) = configurations[id] ?: error("服务器已移除")
-    OpenCodeApi(profile, credentials)
+    createHarnessClient(profile, credentials)
   }
   fun refreshAll() { wakes.values.forEach { it.trySend(Unit) }; reconnectHints.values.forEach { it.trySend(Unit) } }
   fun refresh(id: String) { wakes[id]?.trySend(Unit) }
@@ -352,7 +352,7 @@ internal class AllServersOverview(
     }
   }
 
-  private suspend fun read(profile: ServerProfile, client: OpenCodeApi, previous: ServerOverviewSnapshot): ServerOverviewSnapshot {
+  private suspend fun read(profile: ServerProfile, client: HarnessClient, previous: ServerOverviewSnapshot): ServerOverviewSnapshot {
     val id = profile.id
     val version = client.health()
     val projects = store.localProjects(id).map { it.copy(serverId = id) }

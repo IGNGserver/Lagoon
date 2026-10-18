@@ -108,7 +108,7 @@ class MainActivity : ComponentActivity() {
        fun openDraft() {
          focusManager.clearFocus()
          if (home.allServers) { showingAllDraftTarget = true; return }
-         if (!state.connected) { globalMessage = if (state.profiles.isEmpty()) "先添加一个 OpenCode 服务器" else "服务器尚未连接，连接后才能新建会话"; globalMessageType = MiuixToastType.INFO; return }
+         if (!state.connected) { globalMessage = if (state.profiles.isEmpty()) "先添加一个服务器" else "服务器尚未连接，连接后才能新建会话"; globalMessageType = MiuixToastType.INFO; return }
         if (state.projects.isEmpty()) { globalMessage = "先添加一个项目"; globalMessageType = MiuixToastType.INFO; showingProjects = true; return }
         controller.beginDraft()
         draftNonce += 1

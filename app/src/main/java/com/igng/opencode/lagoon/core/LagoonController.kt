@@ -273,7 +273,7 @@ class LagoonController private constructor(private val appContext: Context) {
     { id, event -> if (id == state.value.serverId) handleEvent(event) },
     { id -> if (id == state.value.serverId && api != null && connecting?.isActive != true) reloadConversation() },
     directoryHealth)
-  private var api: OpenCodeApi? = null
+  private var api: HarnessClient? = null
   private var stream: Job? = null
   private var generation = 0
   private var refresh: Job? = null
@@ -414,7 +414,7 @@ class LagoonController private constructor(private val appContext: Context) {
     store.rememberRefreshMode(mode)
   }
   suspend fun testServer(profile: ServerProfile, credentials: ServerCredentials): String {
-    val client = OpenCodeApi(profile, credentials)
+    val client = createHarnessClient(profile, credentials)
     val version = client.health()
     client.projects()
     return version
@@ -909,7 +909,7 @@ class LagoonController private constructor(private val appContext: Context) {
   }
   fun loadOlderMessages() = withSession("messages-more") { op, client, session ->
     val cursor = op.snapshot.messagesCursor ?: return@withSession
-    val page = client.messagesPage(session.id, cursor, OpenCodeApi.HISTORY_PAGE)
+    val page = client.messagesPage(session.id, cursor, HarnessClient.HISTORY_PAGE)
     check(page.next != cursor) { "服务器返回了重复分页游标" }
     op.commit { it.copy(messages = (page.items + it.messages).distinctBy { m -> m.id }, messagesCursor = page.next,
       loadedOlderMessages = true, historyRevision = it.historyRevision + 1) }
@@ -1461,7 +1461,7 @@ class LagoonController private constructor(private val appContext: Context) {
     onResolved(lineage.asReversed())
   }
   /** Null when the server no longer has the session. */
-  private suspend fun findSession(client: OpenCodeApi, id: String): Session? = try { client.session(id).takeIf { it.id == id } }
+  private suspend fun findSession(client: HarnessClient, id: String): Session? = try { client.session(id).takeIf { it.id == id } }
     catch (error: ApiException) { if (error.status == 404) null else throw error }
   fun selectSession(id: String) {
     val session = mutable.value.sessions.firstOrNull { it.id == id } ?: return
@@ -1495,7 +1495,7 @@ class LagoonController private constructor(private val appContext: Context) {
       scope.launch { coroutineScope { launch { loadChoices(session.directory, token) }; loadSession(session, token = token) } }
     }
   }
-  private suspend fun loadSession(session: Session, ancillary: Boolean = true, token: Int = generation, client: OpenCodeApi? = api) {
+  private suspend fun loadSession(session: Session, ancillary: Boolean = true, token: Int = generation, client: HarnessClient? = api) {
     val client = client ?: return
     val serverId = state.value.serverId ?: return
     val revision = selectionRevision
@@ -1521,7 +1521,7 @@ class LagoonController private constructor(private val appContext: Context) {
         var cursor = nextCursor
         var extra = 0
         while (cursor != null && extra < MAX_INITIAL_PAGES && needsOlderTurnRoot(merged) && current()) {
-          val older = attempt { client.messagesPage(session.id, cursor, OpenCodeApi.MESSAGE_PAGE) }.getOrElse { break }
+          val older = attempt { client.messagesPage(session.id, cursor, HarnessClient.MESSAGE_PAGE) }.getOrElse { break }
           if (older.items.isEmpty()) { nextCursor = older.next; break }
           merged.addAll(0, older.items)
           nextCursor = older.next
@@ -1804,7 +1804,7 @@ class LagoonController private constructor(private val appContext: Context) {
    * be committed while [isCurrent] still holds, so a request that was in flight when the user
    * switched server/project cannot write its result into the new context (A02).
    */
-  private data class OperationContext(val token: Int, val serverId: String, val client: OpenCodeApi,
+  private data class OperationContext(val token: Int, val serverId: String, val client: HarnessClient,
     val revision: Long, val snapshot: LagoonState) {
     fun connectionCurrent(c: LagoonController) = token == c.generation && c.state.value.serverId == serverId && c.api === client
     fun isCurrent(c: LagoonController) = connectionCurrent(c) && revision == c.selectionRevision &&
@@ -2022,7 +2022,7 @@ class LagoonController private constructor(private val appContext: Context) {
         resources = it.resources + ("search" to ResourceStatus(if (results.isEmpty()) ResourceState.EMPTY else ResourceState.READY))) }
     }
   }
-  private fun withSession(action: String, target: String? = null, block: suspend (OperationContext, OpenCodeApi, Session) -> Unit) = act(action) { op ->
+  private fun withSession(action: String, target: String? = null, block: suspend (OperationContext, HarnessClient, Session) -> Unit) = act(action) { op ->
     val session = (if (target == null) op.snapshot.session else op.snapshot.sessions.firstOrNull { it.id == target }) ?: error("先打开会话")
     block(op, op.client, session)
   }
