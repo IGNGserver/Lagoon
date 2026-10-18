@@ -38,7 +38,7 @@ data class ApiPage<T>(val items: List<T>, val next: String? = null)
 
 /** One `/api/event` frame: `type`, its `data` as [properties], the event `location` and `created` time. */
 data class ServerEvent(val id: String = "", val directory: String, val type: String, val properties: JSONObject, val created: Long = 0)
-class ApiException(val status: Int, message: String) : IOException(message)
+class ApiException(val status: Int, message: String, val code: String? = null) : IOException(message)
 
 /** How a new prompt is delivered while the session is busy (official `Session.Inbox.Delivery`). */
 enum class Delivery(val wire: String) { STEER("steer"), QUEUE("queue") }
@@ -470,15 +470,15 @@ class OpenCodeApi(
   override suspend fun children(session: Session): List<Session> = dataObjects("api/session", mapOf("parentID" to session.id)).map { it.toSession() }
   override suspend fun diff(session: Session): List<FileChange> =
     if (capabilities().diff) dataArray(obj(sessionPath(session.id, "/diff"))).objects().map { it.toChange() } else unsupported("服务器不提供改动记录")
-  override suspend fun files(directory: String, path: String): List<FileNode> =
+  override suspend fun files(directory: String, path: String, session: Session?): List<FileNode> =
     dataArray(obj("api/fs/list", locationQuery(directory) + (if (path.isNotBlank() && path != ".") mapOf("path" to path) else emptyMap())))
       .objects().map { item -> FileNode(item.str("path"), item.str("type")) }
-  override suspend fun fileContent(directory: String, path: String): FileContent {
+  override suspend fun fileContent(directory: String, path: String, session: Session?): FileContent {
     val (bytes, contentType) = requestBytes("api/fs/read/${encodedPath(path)}", locationQuery(directory))
     return if (!isTextFile(path, contentType)) FileContent("binary", Base64.encodeToString(bytes, Base64.NO_WRAP))
     else FileContent("text", bytes.toString(Charsets.UTF_8))
   }
-  override suspend fun searchFiles(directory: String, query: String): List<String> =
+  override suspend fun searchFiles(directory: String, query: String, session: Session?): List<String> =
     dataArray(obj("api/fs/find", locationQuery(directory) + mapOf("query" to query))).objects().mapNotNull { it.str("path").takeIf(String::isNotBlank) }
 
   /** `GET /api/event`: volatile by contract, so a dropped stream is recovered by reconnect + reconciliation. */

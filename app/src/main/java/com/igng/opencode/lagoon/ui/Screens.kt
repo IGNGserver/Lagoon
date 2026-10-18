@@ -244,7 +244,7 @@ private fun MiuixServerForm(
           },
           label = when {
             url.isNotBlank() -> "服务器地址 或 配对链接"
-            isDsh -> "http://192.168.1.x:64599"
+            isDsh -> "http://192.168.1.x:3080"
             else -> "http://192.168.1.x:4096 或配对链接"
           },
           useLabelAsPlaceholder = url.isBlank(),
@@ -253,7 +253,7 @@ private fun MiuixServerForm(
         )
         Text(
           text = if (isDsh) {
-            "示例：http://192.168.1.100:64599。地址填电脑上 dsh web 启动后打印的端口，令牌填同一条链接里的 token 参数；手机无法通过 localhost 访问电脑。"
+            "示例：http://192.168.1.100:3080。默认只监听本机，请用 dsh web --host <电脑的局域网 IP> 启动（端口默认 3080），令牌填启动链接里 token= 后面的那串字符；手机无法通过 localhost 访问电脑。"
           } else {
             "示例：http://192.168.1.100:4096 或 https://oc.example.com。手机无法通过 localhost 访问电脑，请填电脑的局域网 IP 或直接粘贴 opencode pair 配对链接。"
           },
@@ -289,7 +289,7 @@ private fun MiuixServerForm(
           modifier = Modifier.fillMaxWidth()
         )
         if (isDsh) Text(
-          text = "在电脑上运行 dsh web，用它打开的链接里 token= 后面的那串字符；每次重启实例都会变。",
+          text = "在电脑上运行 dsh web --host <局域网 IP>，把启动链接里 token= 后面的字符填在这里；换取会话 Cookie 后默认 30 天内无需重填（换地址或清除资料后需要新令牌）。",
           style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary),
           modifier = Modifier.padding(start = 12.dp, top = 4.dp, end = 12.dp)
         )

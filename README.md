@@ -23,15 +23,15 @@ ANDROID_HOME=/path/to/Android/Sdk ./gradlew :app:assembleDebug :app:testDebugUni
 
 在 App 中添加可访问的 OpenCode Server URL。服务端需启用 Basic Auth；也可以直接粘贴 `opencode pair` 输出的官方链接，App 会访问一次链接、保存返回的会话 Cookie，再用该 Cookie 连接 API。建议通过 HTTPS 或可信 VPN 访问。使用局域网 HTTP 时，必须在该服务器资料中明确开启明文连接，授权会随资料保存。
 
-添加 DeepSeek Harness 时，「服务类型」选择 DeepSeek Harness，填写 `dsh web` 监听地址与启动令牌（`dsh web` 启动时打开的链接里的 `?token=`）。令牌只用于换取该实例的会话 Cookie，随后同样由 Android Keystore 保护。
+添加 DeepSeek Harness 时，「服务类型」选择 DeepSeek Harness，填写 `dsh web` 监听地址与启动令牌（`dsh web` 启动时打印的链接里的 `?token=`）。默认只监听 loopback，手机访问需要 `dsh web --host <本机 IP>`（或经反向代理/TLS）；令牌只用于换取该实例的会话 Cookie，随后同样由 Android Keystore 保护，Cookie 默认 30 天有效且跨 dsh 重启可用。
 
 ### DeepSeek Harness 支持
 
-DSH 的 Client↔Host 协议与 OpenCode 完全不同，Lagoon 用 `HarnessClient` 接口屏蔽差异，由 `DshApi` 做协议翻译：
+DSH 的 Client↔Host 协议与 OpenCode 完全不同，Lagoon 用 `HarnessClient` 接口屏蔽差异，由 `DshApi` 做协议翻译（完整契约见 `docs/dsh-protocol.md`）：
 
-- 连接：`GET /connect?token=…&interactions=answer` 换 `dsh-auth-…` 签名 Cookie；之后一元调用 `POST /api/<endpoint>`（信封 `{type:"client-request",rpcId,method,payload}`，响应 `result.{ok,value|error}`），流式数据走 `/api/remote.mux` WebSocket（`open`/`item`/`end` 帧），全局事件走 `$events` 端点。
-- 已支持：会话列表/创建/重命名/归档/分叉、发送（steer 打断当前轮次、queue 排队）、停止、模型目录与选择、审批与问答（DSH 侧是 `$events` 的 waterfall，回应通过 `$events/result` 结算）、子会话、时间线（用户消息、assistant 文本/Reasoning、工具调用与结果）。
-- 差异：DSH 没有删除会话、compact、revert、改动列表与文件浏览的 RPC，相关入口在这些服务器上返回「不支持」或退化为归档；消息增量由会话事件驱动并在需要时重拉整页，不做 token 级流式渲染。
+- 连接：启动令牌先走浏览器式根路径交换（`GET /?token=…`，长寿命 Cookie，跨进程重启有效），再退回 `GET /connect?token=…&interactions=answer` 的 API Peer；一元调用 `POST /api/<namespace>/<method>`（payload 只含一个 `args` 对象，字段是方法形参名），流式数据走 `/api/remote.mux` WebSocket（`open`/`item`/`end` 帧），全局事件与审批/问答瀑布走 `$events`。
+- 已支持：会话列表/创建/重命名/归档/分叉、发送（steer 打断当前轮次、queue 排队）、停止、模型目录与选择、审批与问答（waterfall 折算成同一套提示，回应走 `$events/result`；其他客户端结算后本机自动撤回）、子会话、时间线（用户消息、assistant 文本/Reasoning 的实时流式、工具调用与结果、压缩与命令记录）、文件浏览（`workspaceFiles`）、改动列表与逐文件对比、后台任务状态、`/compact` 等斜杠命令。
+- 差异：DSH 没有删除会话与消息级回退，分别折算为「归档」与「分叉」语义；没有文件搜索；改动摘要只在 dsh 进程内、会话存活期间提供（重启后旧轮次没有对比）；引用的服务器文件折算成路径文本随消息发送。
 
 ### 当前连接与授权
 

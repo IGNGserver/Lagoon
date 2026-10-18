@@ -107,11 +107,15 @@ interface HarnessClient {
 
   suspend fun diff(session: Session): List<FileChange>
 
-  suspend fun files(directory: String, path: String): List<FileNode>
+  /**
+   * 工作区文件浏览。[session] 是可选的文件访问身份：DSH 的 `workspaceFiles` 需要会话
+   * （`workspaceFileScopeId`），OpenCode 按目录读取、忽略该参数。
+   */
+  suspend fun files(directory: String, path: String, session: Session? = null): List<FileNode>
 
-  suspend fun fileContent(directory: String, path: String): FileContent
+  suspend fun fileContent(directory: String, path: String, session: Session? = null): FileContent
 
-  suspend fun searchFiles(directory: String, query: String): List<String>
+  suspend fun searchFiles(directory: String, query: String, session: Session? = null): List<String>
 
   /** 服务端事件流；[onOpen] 在流真正建立（握手成功）时回调一次。 */
   fun events(onOpen: () -> Unit = {}): Flow<ServerEvent>

@@ -8,7 +8,6 @@ import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -28,18 +27,26 @@ import java.io.IOException
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
-import kotlin.coroutines.resume
 
 /**
  * DeepSeek Harness（DSH）客户端。
  *
- * DSH 的 Host 只暴露一套 Typert RPC：一元调用走 `POST /api/<endpoint>`，长流走
- * `/api/remote.mux` WebSocket 的多路复用帧，全局事件走 `$events` 端点。凭据是一次性
- * 启动令牌换来的签名 Cookie：`GET /connect?token=…` 返回 302 + `Set-Cookie`，之后所有
- * 调用都带该 Cookie。
+ * 目标表面是 `dsh web` 的 Typert RPC Gateway——官方 Web UI 使用的同一套协议，也是 CLI/MCP 之外
+ * 唯一的全功能客户端入口（`dsh sdk` / `acp` 是能力受限的 stdio 表面）。完整契约见
+ * `docs/dsh-protocol.md`：
  *
- * 本类把 DSH 的会话模型（turn/step 事件日志）翻译成 Lagoon 已经在用的 OpenCode 形状：
- * 会话列表、消息时间线、执行事件、审批与问答。控制器和 UI 因此不需要知道服务端是哪一种。
+ * - 一元调用：`POST /api/<namespace>/<method>`，信封 `{type:"client-request", rpcId, method, payload}`，
+ *   `payload` 只包含一个 `args` 对象，字段是方法形参名（`signal` 除外；常见形状是 `{request:…}`，
+ *   `session/list` 是 `{_request:{}}`，无参方法是 `{}`）。
+ * - 长流：`/api/remote.mux` WebSocket 的多路复用 `open`/`item`/`end`/`error`/`cancel` 帧。
+ * - 全局事件与审批/问答瀑布：`$events` 逻辑流；回应走 `POST /api/$events/result`。
+ * - 凭据：启动令牌换签名 Cookie。主路线是浏览器式根路径交换（`GET /?token=…`，长寿命 Cookie，
+ *   跨 dsh 重启仍有效）；备选是 API Peer 的 `GET /connect?token=…&interactions=answer`
+ *   （0.2.1 线起提供，Peer 随生命周期连接与进程重启失效）。
+ *
+ * 本类把 DSH 的会话模型（turn/step 事件日志 + 实时 assistant 流）翻译成 Lagoon 已在用的
+ * OpenCode 形状：会话列表、消息时间线、执行事件、审批与问答。控制器和 UI 因此不需要知道
+ * 服务端是哪一种。
  */
 class DshApi(
   private val profile: ServerProfile,
@@ -91,16 +98,27 @@ class DshApi(
   private val follows = ConcurrentHashMap<String, WebSocket>()
   @Volatile private var eventChannel: Channel<ServerEvent>? = null
   @Volatile private var eventsClientId: String? = null
-  /** 已发出的审批/问答瀑布 id，回复时按 `PermissionRequest.id` 找回。 */
-  private val waterfallRequests = ConcurrentHashMap<String, String>()
-  /** 仍在等待回答的审批（`sessionPermissions`/`pendingPermissions` 用）。 */
+  /** 仍在等待回答的审批/问答瀑布；键是网关事件 id。 */
   private val pendingApprovals = ConcurrentHashMap<String, PermissionRequest>()
   private val pendingQuestions = ConcurrentHashMap<String, QuestionRequest>()
   @Volatile private var catalog: JSONObject? = null
+  /** 已归档会话集合（`workspace/follow` 的 baseline 与 `archived` 增量维护）。 */
+  private val archivedSessions = ConcurrentHashMap.newKeySet<String>()
+  /** `workspace/follow` 的最新工作区清单；null 表示尚未读取。 */
+  @Volatile private var workspaceItems: List<JSONObject>? = null
+  private val workspaceLock = Any()
+  /** 每个会话的作业清单缓存：`job/list` 是每会话一条流，短 TTL 避免对账风暴。 */
+  private val jobCache = ConcurrentHashMap<String, Pair<Long, List<JSONObject>>>()
+  /** 实时流里已经建立文本/推理部件的 `sessionId|turn|step` 键与部件种类。 */
+  private val liveParts = ConcurrentHashMap<String, MutableSet<String>>()
+  /** 活跃 attempt 的 `attemptId → sessionId|turn|step`（chunk 帧不带 turn/step）。 */
+  private val liveAttempts = ConcurrentHashMap<String, String>()
+  /** 每个会话已经投影过的最大事件 seq：消息页与实时流之间按 seq 去重。 */
+  private val lastSeqs = ConcurrentHashMap<String, Long>()
 
-  override fun capabilities(): ApiCapabilities = ApiCapabilities.BASELINE
+  override fun capabilities(): ApiCapabilities = CAPABILITIES
 
-  override suspend fun discoverCapabilities(): ApiCapabilities = ApiCapabilities.BASELINE
+  override suspend fun discoverCapabilities(): ApiCapabilities = CAPABILITIES
 
   // ---------------------------------------------------------------- 鉴权
 
@@ -111,27 +129,51 @@ class DshApi(
     sessionCookie ?: connect().also { sessionCookie = it }
   }
 
-  /** 用启动令牌换签名 Cookie；Host 用 302 + `Set-Cookie` 交付。 */
+  /**
+   * 用启动令牌换签名 Cookie。先走浏览器式根路径交换（Cookie 跨进程重启有效），再退回
+   * `/connect` 的 API Peer（0.2.1 线起；Peer 随生命周期连接与进程重启失效）。
+   */
   private suspend fun connect(): String = withContext(Dispatchers.IO) {
     if (token.isEmpty()) throw ApiException(401, "请填写 DeepSeek Harness 的访问令牌")
-    val url = base.newBuilder()
-      .addPathSegment("connect")
-      .addQueryParameter("token", token)
-      .addQueryParameter("interactions", "answer")
-      .build()
-    val call = http.newCall(Request.Builder().url(url).get().build())
+    try {
+      return@withContext exchange(
+        base.newBuilder().addQueryParameter("token", token).build(),
+        browser = true
+      )
+    } catch (rootError: ApiException) {
+      try {
+        return@withContext exchange(
+          base.newBuilder()
+            .addPathSegment("connect")
+            .addQueryParameter("token", token)
+            .addQueryParameter("interactions", "answer")
+            .build(),
+          browser = false
+        )
+      } catch (connectError: ApiException) {
+        // /connect 不存在（0.2.0 线）时报告根路径交换的原始失败，而不是 404。
+        throw if (connectError.status == 404) rootError else connectError
+      }
+    }
+  }
+
+  /** Host 用 3xx + `Set-Cookie: dsh-auth-…` 交付签名 Cookie。 */
+  private suspend fun exchange(url: HttpUrl, browser: Boolean): String {
+    val builder = Request.Builder().url(url).get()
+    // 根路径交换是浏览器入口；带上 Accept 与浏览器一致，避免被按静态资源处理。
+    if (browser) builder.header("Accept", "text/html,application/xhtml+xml")
     val response = try {
-      withContext(Dispatchers.IO) { call.execute() }
+      http.newCall(builder.build()).execute()
     } catch (error: IOException) {
       throw ApiException(0, "无法连接 DeepSeek Harness：${error.message ?: "网络不可达"}")
     }
     response.use { value ->
-      if (value.code != 302 && value.code != 200) {
+      if (value.code !in 200..399) {
         throw ApiException(value.code, if (value.code == 401 || value.code == 403) "访问令牌无效或已过期" else "连接失败：HTTP ${value.code}")
       }
       for (raw in value.headers("Set-Cookie")) {
         val pair = raw.substringBefore(';').trim()
-        if (pair.startsWith("dsh-auth-")) return@withContext pair
+        if (pair.startsWith("dsh-auth-")) return pair
       }
       throw ApiException(401, "连接成功但没有拿到会话 Cookie，请确认访问令牌来自该实例")
     }
@@ -139,10 +181,20 @@ class DshApi(
 
   // ---------------------------------------------------------------- RPC
 
-  private fun payload(request: JSONObject): JSONObject = JSONObject().put("request", request)
+  /** 0.2.x 的 payload 只包含一个 `args` 对象，字段是方法形参名（`signal` 除外）。 */
+  private fun argsOf(vararg fields: Pair<String, Any?>): JSONObject = JSONObject().also { out ->
+    for ((key, value) in fields) if (value != null) out.put(key, value)
+  }
+
+  private fun envelope(args: JSONObject): JSONObject = JSONObject().put("args", args)
+
+  /** 常见的 `{request: …}` 形状。 */
+  private fun requestArgs(request: JSONObject): JSONObject = envelope(argsOf("request" to request))
+
+  private fun noArgs(): JSONObject = envelope(JSONObject())
 
   /** 一元调用的请求信封是 `{type, rpcId, method, payload}`；响应是 `{type, rpcId, result}`。 */
-  private suspend fun call(endpoint: String, payload: JSONObject = JSONObject(), retried: Boolean = false): Any? =
+  private suspend fun call(endpoint: String, payload: JSONObject = noArgs(), retried: Boolean = false): Any? =
     withContext(Dispatchers.IO) {
       val current = cookie()
       val url = base.newBuilder().addEncodedPathSegment("api").addEncodedPathSegments(endpoint).build()
@@ -165,38 +217,72 @@ class DshApi(
       val status = response.code
       val text = response.use { it.body?.string().orEmpty() }
       if (status == 401 && !retried) {
+        // Cookie 失效（API Peer 随连接/进程消失）：清掉重新交换。
         authLock.withLock { sessionCookie = null }
         return@withContext call(endpoint, payload, retried = true)
       }
-      if (status !in 200..299) throw ApiException(status, httpMessage(status, text))
+      if (status !in 200..299) throw ApiException(status, httpMessage(status), "http/$status")
       val parsed = try { JSONObject(text) } catch (error: Exception) {
         throw ApiException(status, "服务器响应不是 JSON，请确认地址指向 DeepSeek Harness 的 Web 实例")
       }
       val result = parsed.optJSONObject("result") ?: throw ApiException(status, "服务器响应缺少 result")
       if (result.optBoolean("ok")) return@withContext result.opt("value")
       val failure = result.optJSONObject("error")
-      throw ApiException(status, failure?.optString("message").orEmpty().ifBlank { "请求失败" })
+      val code = failure?.optString("code").orEmpty()
+      val message = failure?.optString("message").orEmpty()
+      throw ApiException(status, friendlyMessage(code, message.ifBlank { "请求失败" }), code.ifBlank { null })
     }
 
-  private suspend fun callObject(endpoint: String, payload: JSONObject = JSONObject()): JSONObject =
+  /** 已知的 DSH 错误码折算成用户可读文案；未知错误保留服务端原文（便于诊断协议漂移）。 */
+  private fun friendlyMessage(code: String, upstream: String): String = when (code) {
+    "session/not-found" -> "会话不存在或已被删除"
+    "session/writer-held" -> "会话正被其他进程占用，请稍后重试"
+    "session/agent-busy" -> "会话正忙，请稍后重试"
+    "session/fork-unavailable" -> "会话还没有完成的轮次，无法分叉"
+    "session/migration-required" -> "会话日志需要迁移，请先在 dsh 里打开一次"
+    "workspace/session-active" -> "会话仍在运行，请先停止再归档"
+    "workspace-file/not-found" -> "文件不存在或已被移动"
+    "workspace-file/outside-workspace" -> "该路径在工作区之外"
+    "workspace-file/not-directory" -> "目标不是目录"
+    "workspace-file/too-large" -> "文件过大，无法读取"
+    "gateway/service-unavailable" -> "该实例没有提供这项能力"
+    "gateway/arguments-invalid" -> "请求与实例契约不一致，请更新 Lagoon 或 dsh"
+    else -> upstream
+  }
+
+  private suspend fun callObject(endpoint: String, payload: JSONObject = noArgs()): JSONObject =
     call(endpoint, payload) as? JSONObject ?: JSONObject()
 
-  private fun httpMessage(status: Int, body: String): String = when (status) {
+  private fun httpMessage(status: Int): String = when (status) {
     401, 403 -> "访问令牌无效或已过期"
     404 -> "该地址不是 DeepSeek Harness 的 Web 实例"
-    409 -> "连接已被其他客户端占用，请重新启动实例"
     else -> "请求失败：HTTP $status"
+  }
+
+  /** 认证栅栏内的精确 GET 路由（改动摘要/对比）；失败返回 null。 */
+  private suspend fun fetchJson(url: HttpUrl): JSONObject? = withContext(Dispatchers.IO) {
+    val request = Request.Builder().url(url).header("Cookie", cookie()).get().build()
+    try {
+      http.newCall(request).execute().use { response ->
+        if (response.code !in 200..299) return@withContext null
+        val text = response.body?.string().orEmpty()
+        runCatching { JSONObject(text) }.getOrNull()
+      }
+    } catch (error: IOException) {
+      null
+    }
   }
 
   // ---------------------------------------------------------------- 会话读
 
   /** `session/list` 的形状：`{items:[{sessionId,updatedAt,running,cwd,parentSessionId,projections,…}]}`。 */
   private data class Listing(val items: List<JSONObject>) {
-    val running: Set<String> get() = items.filter { it.optBoolean("running") }.map { it.str("sessionId") }.toSet()
+    val running: Set<String>
+      get() = items.filter { it.optBoolean("running") }.mapNotNull { it.str("sessionId").takeIf(String::isNotBlank) }.toSet()
   }
 
   private suspend fun listing(): Listing {
-    val result = callObject("session/list", JSONObject().put("_request", JSONObject()))
+    val result = callObject("session/list", envelope(argsOf("_request" to JSONObject())))
     val items = result.arr("items").objects()
     // session/list 没有 directory 过滤参数；顺手刷新目录缓存，事件解码时要用。
     for (item in items) itemToSession(item)?.let { known[it.id] = it }
@@ -206,6 +292,7 @@ class DshApi(
   private fun itemToSession(item: JSONObject): Session? {
     val id = item.str("sessionId").ifBlank { return null }
     val values = item.obj("projections").obj("values")
+    // 0.2.x 把工作目录放在行顶层 `cwd`；`workingDirectory` 只是旧形状的兜底。
     val directory = item.str("cwd").ifBlank { values.str("workingDirectory") }
     val updated = item.optDouble("updatedAt", 0.0).toLong()
     val previous = known[id]
@@ -218,7 +305,7 @@ class DshApi(
       parentId = item.str("parentSessionId").ifBlank { null },
       projectId = directory.ifBlank { null },
       created = previous?.created ?: updated,
-      archived = previous?.archived ?: false,
+      archived = id in archivedSessions || previous?.archived == true,
       agent = values.str("agentPreset").ifBlank { previous?.agent }?.takeIf(String::isNotBlank),
       model = previous?.model,
       viewed = previous?.viewed ?: 0,
@@ -237,15 +324,55 @@ class DshApi(
   override suspend fun session(id: String): Session = sessionOrFetch(id)
 
   override suspend fun projects(): List<Project> = withContext(Dispatchers.IO) {
-    // DSH 的 Workspace 就是「项目」：一次 workspace/follow 的首帧给出全量清单。
-    val frame = fetchFirstFrame("workspace/follow", JSONObject()) ?: return@withContext emptyList()
-    frame.arr("items").objects().mapNotNull { workspace ->
+    // DSH 的 Workspace 就是「项目」：workspace/follow 的 baseline 给出全量清单。
+    val items = workspaceItems ?: fetchWorkspaceBaseline()
+    items.mapNotNull { workspace ->
       val path = workspace.str("path").ifBlank { return@mapNotNull null }
       Project(
         id = workspace.str("workspaceId").ifBlank { path },
         directory = path,
         name = workspace.str("title").ifBlank { path.trimEnd('/').substringAfterLast('/').ifBlank { path } }
       )
+    }
+  }
+
+  /** 取一次 workspace/follow 首帧并落缓存（事件流不在线时的兜底）。 */
+  private suspend fun fetchWorkspaceBaseline(): List<JSONObject> {
+    val frame = fetchFirstFrame("workspace/follow", noArgs()) ?: return emptyList()
+    if (frame.str("type") == "baseline") applyWorkspaceFrame(frame)
+    return workspaceItems ?: emptyList()
+  }
+
+  /** baseline / upsert / remove / order / archived 帧；pinned 暂不消费。 */
+  private fun applyWorkspaceFrame(frame: JSONObject) {
+    synchronized(workspaceLock) {
+      when (frame.str("type")) {
+        "baseline" -> {
+          val value = frame.obj("value")
+          workspaceItems = value.arr("items").objects()
+          archivedSessions.clear()
+          archivedSessions += value.arr("archivedSessionIds").strings()
+        }
+        "upsert" -> {
+          val workspace = frame.obj("workspace")
+          val id = workspace.str("workspaceId")
+          if (id.isNotBlank()) workspaceItems = ((workspaceItems ?: emptyList()).filterNot { it.str("workspaceId") == id } + workspace)
+        }
+        "remove" -> {
+          val id = frame.str("workspaceId")
+          if (id.isNotBlank()) workspaceItems = (workspaceItems ?: emptyList()).filterNot { it.str("workspaceId") == id }
+        }
+        "order" -> {
+          val order = frame.arr("workspaceIds").strings()
+          val list = workspaceItems ?: return
+          workspaceItems = order.mapNotNull { id -> list.firstOrNull { it.str("workspaceId") == id } } +
+            list.filterNot { it.str("workspaceId") in order }
+        }
+        "archived" -> {
+          archivedSessions.clear()
+          archivedSessions += frame.arr("archivedSessionIds").strings()
+        }
+      }
     }
   }
 
@@ -278,7 +405,11 @@ class DshApi(
       val snapshot = fetchSnapshot(id)
       val through = snapshot.optDouble("cursor", 0.0).toLong()
       if (through > 0) cursors[id] = through
-      val messages = recordsToMessages(session, snapshot.arr("records").objects())
+      val records = snapshot.arr("records").objects()
+      val messages = recordsToMessages(session, records)
+      // 时间线被整页替换：清掉实时部件记录，让后续增量重建部件而不是写进已消失的行。
+      liveParts.keys.filter { it.startsWith("${session.id}|") }.forEach { liveParts.remove(it) }
+      advanceSeq(id, records.mapNotNull { it.obj("event").optDouble("seq", 0.0).toLong().takeIf { value -> value > 0 } }.maxOrNull())
       ApiPage(messages.takeLast(wanted), null)
     } else {
       val through = cursors[id] ?: run {
@@ -292,7 +423,7 @@ class DshApi(
         .put("throughSeq", through)
         .put("beforeSeq", before)
         .put("maxMessages", wanted)
-      val page = callObject("session/page", payload(request))
+      val page = callObject("session/page", requestArgs(request))
       val records = page.arr("records").objects()
       val messages = recordsToMessages(session, records)
       val next = if (page.optBoolean("hasMore")) earlierCursor(records) else null
@@ -302,6 +433,14 @@ class DshApi(
 
   private fun earlierCursor(records: List<JSONObject>): String? =
     records.mapNotNull { it.obj("event").optDouble("seq", 0.0).toLong().takeIf { value -> value > 0 } }.minOrNull()?.toString()
+
+  /** 已投影的最大事件 seq（只前进不后退）；实时帧按它去重，避免与消息页快照重复。 */
+  private fun lastSeq(sessionId: String): Long = lastSeqs[sessionId] ?: 0
+
+  private fun advanceSeq(sessionId: String, seq: Long?) {
+    if (seq == null || seq <= 0) return
+    lastSeqs.compute(sessionId) { _, current -> if (current == null || seq > current) seq else current }
+  }
 
   // ---------------------------------------------------------------- mux 流
 
@@ -337,13 +476,18 @@ class DshApi(
           "item" -> frame.optJSONObject("value")?.let(onItem) ?: onItem(JSONObject())
           "error" -> onClosed(IOException(frame.obj("error").str("message").ifBlank { "会话流出错" }))
           "end" -> {
-            webSocket.close(1000, null)
+            // 立即关闭：mux 流不需要关闭握手，优雅关闭会让 MockWebServer 一类的对端等待超时。
+            webSocket.cancel()
             onClosed(null)
           }
         }
       }
 
       override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+        if (response?.code == 401) {
+          // Cookie 失效：清掉让下一次调用重新交换。
+          ioScope.launch { authLock.withLock { sessionCookie = null } }
+        }
         onClosed(t)
       }
 
@@ -354,7 +498,7 @@ class DshApi(
     streamHttp.newWebSocket(request, listener)
   }
 
-  /** 取一条流的首个 `item` 帧（`workspace/follow` 的清单、`session/follow` 的快照）。 */
+  /** 取一条流的首个 `item` 帧（`workspace/follow` 的清单、`session/follow` 的快照、`job/list` 的行）。 */
   private suspend fun fetchFirstFrame(endpoint: String, payload: JSONObject): JSONObject? {
     val deferred = CompletableDeferred<JSONObject?>()
     val socket = try {
@@ -373,12 +517,12 @@ class DshApi(
     } catch (error: Exception) {
       null
     } finally {
-      runCatching { socket.close(1000, null) }
+      runCatching { socket.cancel() }
     }
   }
 
   private suspend fun fetchSnapshot(id: String): JSONObject =
-    fetchFirstFrame("session/follow", payload(JSONObject().put("address", address(id))))
+    fetchFirstFrame("session/follow", requestArgs(JSONObject().put("address", address(id))))
       ?: throw ApiException(502, "无法读取会话日志：DSH 没有返回快照")
 
   private fun address(id: String): JSONObject = JSONObject().put("kind", "session").put("sessionId", id)
@@ -387,7 +531,7 @@ class DshApi(
 
   /**
    * 把一条 DSH 会话事件翻译成 Lagoon 认识的事件；一次输入可能产出多条（例如 `assistant/message`
-   * 里的多个内容块）。不认识的记录（`user/message`、`tool/result` 之外的内部事件）返回空列表。
+   * 里的多个内容块）。不认识的记录（内部事件、log-only 标记）返回空列表。
    */
   private fun translate(session: Session, event: JSONObject): List<ServerEvent> {
     val type = event.str("type")
@@ -404,12 +548,16 @@ class DshApi(
       "turn/end" -> {
         val reason = data.obj("reason")
         when (reason.str("kind")) {
-          "completed" -> emit("session.execution.succeeded", base)
-          "aborted" -> emit("session.execution.interrupted", base.put("reason", reason.obj("reason").str("kind").ifBlank { "user" }))
+          "completed", "forked" -> emit("session.execution.succeeded", base)
+          "aborted", "blocked", "interrupted" -> emit("session.execution.interrupted",
+            base.put("reason", reason.obj("reason").str("kind").ifBlank { "user" }))
+          "max-tokens" -> emit("session.execution.failed", base.put("error", JSONObject()
+            .put("type", "max-tokens")
+            .put("message", "达到输出长度上限")))
           else -> {
             val error = reason.obj("error")
             emit("session.execution.failed", base.put("error", JSONObject()
-              .put("type", error.str("code").ifBlank { "error" })
+              .put("type", error.str("code").ifBlank { reason.str("kind").ifBlank { "error" } })
               .put("message", error.str("message").ifBlank { "执行失败" })))
           }
         }
@@ -422,15 +570,22 @@ class DshApi(
         .put("finish", "stop"))
       "assistant/message" -> {
         val assistantId = messageId(data)
+        val key = liveKey(session.id, data)
+        // 实时流已经建过部件时只用耐久文本收口，避免同一段文字出现两次。
+        val live = liveParts.remove(key)
         val message = data.obj("message")
         for (block in message.arr("content").objects()) {
           when (block.str("type")) {
             "reasoning" -> {
-              emit("session.reasoning.started", base.put("assistantMessageID", assistantId).put("started", time))
+              if (live?.contains("reasoning") != true) {
+                emit("session.reasoning.started", base.put("assistantMessageID", assistantId).put("started", time))
+              }
               emit("session.reasoning.ended", base.put("assistantMessageID", assistantId).put("text", block.str("text")))
             }
             "text" -> {
-              emit("session.text.started", base.put("assistantMessageID", assistantId).put("started", time))
+              if (live?.contains("text") != true) {
+                emit("session.text.started", base.put("assistantMessageID", assistantId).put("started", time))
+              }
               emit("session.text.ended", base.put("assistantMessageID", assistantId).put("text", block.str("text")))
             }
             // 工具调用由独立的 `tool/call` 记录承载，避免同一调用出现两行。
@@ -456,25 +611,110 @@ class DshApi(
           for (block in content.objects()) {
             if (block.str("type") == "text") json.put(JSONObject().put("type", "text").put("text", block.str("text")))
           }
-          emit("session.tool.success", base
+          val properties = base
             .put("assistantMessageID", messageId(data))
             .put("id", callId)
             .put("content", json)
-            .put("metadata", JSONObject()))
+            .put("metadata", JSONObject())
+          if (message.optBoolean("isError")) {
+            val failure = data.obj("error")
+            val reason = failure.str("reason").ifBlank { failure.str("message") }.ifBlank { "工具执行失败" }
+            emit("session.tool.failed", properties.put("error", JSONObject().put("message", reason)))
+          } else {
+            emit("session.tool.success", properties)
+          }
         }
       }
       "session/title" -> emit("session.renamed", base.put("title", data.str("title")))
-      "approval/asked", "todo/write" -> Unit
+      "compaction/start" -> emit("session.compaction.started", base
+        .put("inputID", data.str("compactionId"))
+        .put("at", time))
+      "compaction/end" -> {
+        val error = data.str("error")
+        if (error.isNotBlank()) emit("session.compaction.failed", base.put("error", JSONObject().put("message", error)))
+        else emit("session.compaction.ended", base)
+      }
+      "command/done" -> {
+        // 失败的命令在时间线上留一行错误记录；成功的命令由它自己的领域事件呈现。
+        if (data.str("kind") == "error") {
+          val text = data.str("text").ifBlank { "命令执行失败" }
+          emit("session.synthetic", base
+            .put("text", text)
+            .put("description", text)
+            .put("metadata", JSONObject().put("state", "error")))
+        }
+      }
       else -> Unit
     }
     return output
   }
 
   /** `msg_<turn>:<step>`：同一步的 `step/start`、`assistant/message`、`tool/call` 共用一个消息 id。 */
-  private fun messageId(data: JSONObject): String {
-    val turn = data.optDouble("turn", 0.0).toLong()
-    val step = data.optDouble("step", 0.0).toLong()
-    return "msg_$turn:$step"
+  private fun messageId(data: JSONObject): String = "msg_${data.optDouble("turn", 0.0).toLong()}:${data.optDouble("step", 0.0).toLong()}"
+
+  private fun liveKey(sessionId: String, data: JSONObject): String =
+    "$sessionId|${data.optDouble("turn", 0.0).toLong()}|${data.optDouble("step", 0.0).toLong()}"
+
+  /**
+   * 实时 assistant 流（`assistant-stream` 帧）折算成 `session.text/reasoning.delta`。
+   * `chunk` 帧不带 turn/step，按 `start` 帧登记的 attempt 找回。
+   */
+  private fun translateLive(session: Session, frame: JSONObject, push: (ServerEvent) -> Unit) {
+    val at = System.currentTimeMillis()
+    when (frame.str("type")) {
+      "start" -> {
+        val attemptId = frame.str("attemptId")
+        val turn = frame.optDouble("turn", 0.0).toLong()
+        val step = frame.optDouble("step", 0.0).toLong()
+        if (attemptId.isNotBlank()) liveAttempts[attemptId] = liveKey(session.id, frame)
+        // 同一步的第二次 attempt（重试）：清空已显示的实时文本，后续增量写回同一个部件。
+        val parts = liveParts[liveKey(session.id, frame)] ?: return
+        if (parts.isNotEmpty()) {
+          val message = "msg_$turn:$step"
+          if ("text" in parts) push(ServerEvent(id = "dsh:live:$message:text:reset", directory = session.directory, type = "session.text.ended",
+            properties = JSONObject().put("sessionID", session.id).put("assistantMessageID", message).put("text", ""), created = at))
+          if ("reasoning" in parts) push(ServerEvent(id = "dsh:live:$message:reasoning:reset", directory = session.directory, type = "session.reasoning.ended",
+            properties = JSONObject().put("sessionID", session.id).put("assistantMessageID", message).put("text", ""), created = at))
+        }
+      }
+      "chunk" -> {
+        val attemptId = frame.str("attemptId")
+        val key = liveAttempts[attemptId] ?: return
+        val chunk = frame.obj("chunk")
+        val kind = when (chunk.str("type")) {
+          "text-delta" -> "text"
+          "reasoning-delta" -> "reasoning"
+          else -> return
+        }
+        val text = chunk.str("text")
+        if (text.isEmpty()) return
+        emitLiveDelta(session, key, kind, text, frame.optDouble("time", 0.0).toLong().takeIf { it > 0 } ?: at, push)
+      }
+      "end" -> {
+        val attemptId = frame.str("attemptId")
+        if (attemptId.isNotBlank()) liveAttempts.remove(attemptId)
+        // committed 的耐久 assistant/message 随后收口；abandoned 保留已显示的片段直到下一次 attempt。
+      }
+    }
+  }
+
+  private fun emitLiveDelta(session: Session, key: String, kind: String, text: String, at: Long, push: (ServerEvent) -> Unit) {
+    val message = "msg_${key.substringAfter('|').substringBefore('|')}:${key.substringAfterLast('|')}"
+    val parts = liveParts.computeIfAbsent(key) { ConcurrentHashMap.newKeySet() }
+    val first = parts.isEmpty()
+    if (parts.add(kind)) {
+      if (first) {
+        // 补出这条 assistant 消息（幂等）：跟随在 attempt 中途打开时也不会丢文本。
+        push(ServerEvent(id = "dsh:live:$key:step", directory = session.directory, type = "session.step.started",
+          properties = JSONObject().put("sessionID", session.id).put("assistantMessageID", message).put("started", at), created = at))
+      }
+      push(ServerEvent(id = "dsh:live:$key:$kind:start", directory = session.directory,
+        type = if (kind == "reasoning") "session.reasoning.started" else "session.text.started",
+        properties = JSONObject().put("sessionID", session.id).put("assistantMessageID", message).put("started", at), created = at))
+    }
+    push(ServerEvent(id = "dsh:live:$key:$kind:$at", directory = session.directory,
+      type = if (kind == "reasoning") "session.reasoning.delta" else "session.text.delta",
+      properties = JSONObject().put("sessionID", session.id).put("assistantMessageID", message).put("delta", text), created = at))
   }
 
   private fun parseArguments(raw: String): Any =
@@ -489,7 +729,7 @@ class DshApi(
     val push: (ServerEvent) -> Unit = { event -> channel.trySend(event) }
 
     val globalSocket = try {
-      openMux("\$events", JSONObject(), onItem = { frame ->
+      openMux("\$events", noArgs(), onItem = { frame ->
         when (frame.str("type")) {
           "ready" -> {
             eventsClientId = frame.str("clientId")
@@ -497,6 +737,7 @@ class DshApi(
           }
           "emit" -> handleEmit(frame, push)
           "waterfall" -> handleWaterfall(frame, push)
+          "cancel" -> handleCancelled(frame, push)
           else -> Unit
         }
       }, onClosed = { cause ->
@@ -511,6 +752,13 @@ class DshApi(
       return@callbackFlow
     }
 
+    // 工作区清单与归档集合：项目页与归档标记随增量保持新鲜。
+    val workspaceSocket = try {
+      openMux("workspace/follow", noArgs(), onItem = { frame -> applyWorkspaceFrame(frame) }, onClosed = { })
+    } catch (error: Exception) {
+      null
+    }
+
     val pump = launch {
       for (event in channel) send(event)
     }
@@ -520,8 +768,9 @@ class DshApi(
 
     awaitClose {
       closed = true
-      runCatching { globalSocket.close(1000, null) }
-      followers().forEach { runCatching { it.close(1000, null) } }
+      runCatching { globalSocket.cancel() }
+      workspaceSocket?.let { runCatching { it.cancel() } }
+      followers().forEach { runCatching { it.cancel() } }
       follows.clear()
       pump.cancel()
       channel.close()
@@ -533,27 +782,49 @@ class DshApi(
 
   private fun handleEmit(frame: JSONObject, push: (ServerEvent) -> Unit) {
     val name = frame.str("event")
-    val args = frame.arr("args").objects()
+    val args = frame.arr("args")
     when (name) {
       "api-session/added" -> {
-        val item = args.firstOrNull() ?: return
+        val item = args.optJSONObject(0) ?: return
         val session = itemToSession(item) ?: return
         push(ServerEvent(id = "dsh:added:${session.id}:${session.updated}", directory = session.directory,
           type = "session.created", properties = JSONObject().put("sessionID", session.id).put("title", session.title), created = session.updated))
       }
       "api-session/removed" -> {
-        val item = args.firstOrNull() ?: return
-        val id = item.str("sessionId").ifBlank { item.str("id") }
+        // 参数是纯字符串的会话 id，不是行对象。
+        val id = args.optString(0).takeUnless { it == "null" }.orEmpty()
         if (id.isNotBlank()) {
           known.remove(id)
-          watched.remove(id)
-          follows.remove(id)?.close(1000, null)
+          synchronized(watched) { watched.remove(id) }
+          follows.remove(id)?.cancel()
           push(ServerEvent(id = "dsh:removed:$id", directory = "", type = "session.deleted",
             properties = JSONObject().put("sessionID", id), created = System.currentTimeMillis()))
         }
       }
-      // api-session/activity|status 只影响列表排序与运行标记，控制器会定期对账。
-      else -> Unit
+      "api-session/status" -> {
+        // running 状态折算成 OpenCode 形状的 session.status，未关注的会话也能实时收尾。
+        val id = args.optString(0).takeUnless { it == "null" }.orEmpty()
+        if (id.isBlank()) return
+        val running = args.optBoolean(1, false)
+        val now = System.currentTimeMillis()
+        push(ServerEvent(id = "dsh:status:$id:$running:$now", directory = known[id]?.directory.orEmpty(), type = "session.status",
+          properties = JSONObject()
+            .put("sessionID", id)
+            .put("status", JSONObject().put("type", if (running) "busy" else "idle")), created = now))
+      }
+      "api-session/activity" -> {
+        val id = args.optString(0).takeUnless { it == "null" }.orEmpty()
+        val updatedAt = args.optDouble(1, 0.0).toLong()
+        if (id.isNotBlank() && updatedAt > 0) known[id]?.let { known[id] = it.copy(updated = updatedAt) }
+      }
+      "api-session/error" -> {
+        val id = args.optString(0).takeUnless { it == "null" }.orEmpty()
+        val message = args.optString(1).takeUnless { it == "null" }.orEmpty()
+        if (id.isNotBlank()) {
+          push(ServerEvent(id = "dsh:error:$id:${message.hashCode()}", directory = known[id]?.directory.orEmpty(), type = "session.error",
+            properties = JSONObject().put("sessionID", id).put("message", message.ifBlank { "执行失败" }), created = System.currentTimeMillis()))
+        }
+      }
     }
   }
 
@@ -578,16 +849,13 @@ class DshApi(
           .put("save", JSONArray())
           .put("source", JSONObject().put("messageID", "").put("id", request.str("callId")))
         val permission = try { properties.toPermission(directory) } catch (error: Exception) { null }
-        if (permission != null) {
-          pendingApprovals[eventId] = permission
-          waterfallRequests[eventId] = eventId
-        }
+        if (permission != null) pendingApprovals[eventId] = permission
         push(ServerEvent(id = "dsh:approval:$eventId", directory = directory, type = "permission.asked",
           properties = properties, created = System.currentTimeMillis()))
       }
       "user-questions/request" -> {
         if (eventId.isBlank()) return
-        val questions = JSONArray()
+        val fields = JSONArray()
         for (question in request.arr("questions").objects()) {
           val options = JSONArray()
           for (option in question.arr("options").objects()) {
@@ -595,22 +863,40 @@ class DshApi(
               .put("label", option.str("label"))
               .put("description", option.str("description")))
           }
-          questions.put(JSONObject()
+          fields.put(JSONObject()
+            .put("key", question.str("id"))
             .put("title", question.str("question"))
+            .put("description", question.str("detail"))
+            .put("type", if (question.optBoolean("multiSelect")) "multiselect" else "select")
             .put("options", options)
-            .put("multiple", question.optBoolean("multiSelect"))
-            .put("custom", true)
-            .put("field", question.str("id")))
+            .put("custom", true))
         }
-        val properties = JSONObject()
-          .put("id", eventId)
-          .put("sessionID", sessionId)
-          .put("questions", questions)
-        val form = try { properties.toForm(directory) } catch (error: Exception) { null }
-        if (form != null) pendingQuestions[eventId] = form
+        // 控制器从 `properties.form` 读表单；id 用瀑布事件 id，回答时按它结算。
+        val form = JSONObject().put("id", eventId).put("sessionID", sessionId).put("fields", fields)
+        val properties = JSONObject().put("form", form)
+        val parsed = try { form.toForm(directory) } catch (error: Exception) { null }
+        if (parsed != null) pendingQuestions[eventId] = parsed
         push(ServerEvent(id = "dsh:question:$eventId", directory = directory, type = "form.created",
           properties = properties, created = System.currentTimeMillis()))
       }
+    }
+  }
+
+  /** 其他客户端结算了瀑布：移除本地待办，让 UI/任务状态跟随。 */
+  private fun handleCancelled(frame: JSONObject, push: (ServerEvent) -> Unit) {
+    val eventId = frame.str("eventId")
+    if (eventId.isBlank()) return
+    val now = System.currentTimeMillis()
+    val permission = pendingApprovals.remove(eventId)
+    if (permission != null) {
+      push(ServerEvent(id = "dsh:approval-settled:$eventId", directory = permission.directory, type = "permission.replied",
+        properties = JSONObject().put("sessionID", permission.sessionId).put("id", eventId), created = now))
+      return
+    }
+    val question = pendingQuestions.remove(eventId)
+    if (question != null) {
+      push(ServerEvent(id = "dsh:question-settled:$eventId", directory = question.directory, type = "form.cancelled",
+        properties = JSONObject().put("sessionID", question.sessionId).put("id", eventId), created = now))
     }
   }
 
@@ -619,7 +905,18 @@ class DshApi(
     val clientId = eventsClientId ?: throw ApiException(409, "事件流尚未连接，请稍后重试")
     val outcome = JSONObject().put("kind", "result")
     if (value != null) outcome.put("value", value)
-    call("${'$'}events/result", JSONObject().put("clientId", clientId).put("eventId", eventId).put("outcome", outcome))
+    val args = JSONObject().put("clientId", clientId).put("eventId", eventId).put("outcome", outcome)
+    call("\$events/result", envelope(args))
+  }
+
+  /** 拒绝一条瀑布：`{kind:"rejected", error:{name, message}}`。 */
+  private suspend fun reject(eventId: String, message: String) {
+    val clientId = eventsClientId ?: throw ApiException(409, "事件流尚未连接，请稍后重试")
+    val outcome = JSONObject()
+      .put("kind", "rejected")
+      .put("error", JSONObject().put("name", "cancelled").put("message", message))
+    val args = JSONObject().put("clientId", clientId).put("eventId", eventId).put("outcome", outcome)
+    call("\$events/result", envelope(args))
   }
 
   private fun startFollow(id: String, channel: Channel<ServerEvent>) {
@@ -627,18 +924,30 @@ class DshApi(
     val session = known[id] ?: return
     ioScope.launch {
       try {
-        val socket = openMux("session/follow", payload(JSONObject().put("address", address(id))), onItem = { frame ->
-          when (frame.str("type")) {
-            "snapshot" -> {
-              frame.optDouble("cursor", 0.0).toLong().takeIf { it > 0 }?.let { cursors[id] = it }
-              frame.arr("records").objects().forEach { record ->
-                translate(session, record.obj("event")).forEach { channel.trySend(it) }
+        val socket = openMux(
+          "session/follow",
+          requestArgs(JSONObject().put("address", address(id)).put("assistantStream", true)),
+          onItem = { frame ->
+            when (frame.str("type")) {
+              "snapshot" -> {
+                frame.optDouble("cursor", 0.0).toLong().takeIf { it > 0 }?.let { cursors[id] = it }
+                // 快照记录已由消息页拉取；这里只登记切点，避免重复投影。
               }
+              "event" -> {
+                val event = frame.obj("event")
+                val seq = event.optDouble("seq", 0.0).toLong()
+                // 只投影时间线还没有的耐久事件（与消息页快照按 seq 去重）。
+                if (seq <= 0 || seq > lastSeq(id)) {
+                  translate(session, event).forEach { channel.trySend(it) }
+                  if (seq > 0) advanceSeq(id, seq)
+                }
+              }
+              "assistant-stream" -> translateLive(session, frame.obj("frame"), { channel.trySend(it) })
+              else -> Unit
             }
-            "event" -> translate(session, frame.obj("event")).forEach { channel.trySend(it) }
-            else -> Unit
-          }
-        }, onClosed = { follows.remove(id) })
+          },
+          onClosed = { follows.remove(id) }
+        )
         follows[id] = socket
       } catch (error: CancellationException) {
         throw error
@@ -649,7 +958,7 @@ class DshApi(
   }
 
   private fun stopFollow(id: String) {
-    follows.remove(id)?.close(1000, null)
+    follows.remove(id)?.cancel()
   }
 
   /** 记录最近打开的会话并限制 follow 数量，避免长连堆积。 */
@@ -770,7 +1079,29 @@ class DshApi(
 
   // ---------------------------------------------------------------- 写操作
 
-  override suspend fun inbox(id: String): List<Message> = emptyList()
+  /** 未送达的排队输入来自 `session/projections` 的 `inbox` 投影（`next-turn` 等待当前轮，`next-step` 下一步）。 */
+  override suspend fun inbox(id: String): List<Message> = withContext(Dispatchers.IO) {
+    val value = call("session/projections", requestArgs(JSONObject().put("sessionId", id))) as? JSONObject ?: return@withContext emptyList()
+    val inbox = value.obj("values").obj("inbox")
+    if (inbox.length() == 0) return@withContext emptyList()
+    val now = System.currentTimeMillis()
+    val out = mutableListOf<Message>()
+    for ((key, queued) in listOf("next-turn" to true, "next-step" to false)) {
+      for (item in inbox.arr(key).objects()) {
+        val message = inboxMessage(item, queued, now) ?: continue
+        out += message
+      }
+    }
+    out
+  }
+
+  private fun inboxMessage(item: JSONObject, queued: Boolean, created: Long): Message? {
+    val id = item.str("id")
+    if (id.isBlank()) return null
+    val text = item.arr("content").objects().mapNotNull { it.str("text").takeIf(String::isNotBlank) }.joinToString("\n")
+    val parts = listOfNotNull(text.takeIf(String::isNotBlank)?.let { MessagePart("$id:text", "text", text = it) })
+    return Message(id, "user", created, parts, queued = queued, type = "user")
+  }
 
   override suspend fun activeSessions(): Set<String> = withContext(Dispatchers.IO) {
     val listing = listing()
@@ -779,12 +1110,47 @@ class DshApi(
     listing.running
   }
 
-  override suspend fun shells(directory: String): List<ShellJob> = emptyList()
+  /**
+   * 后台作业（`job/list`）：DSH 的后台 shell / 长任务。每个会话的作业清单是完整的，
+   * 按目录聚合需要逐个会话读取；没有已知会话时该目录没有可归属的作业。
+   */
+  override suspend fun shells(directory: String): List<ShellJob> = withContext(Dispatchers.IO) {
+    val normalized = normalizedDirectory(directory)
+    val sessions = known.values.filter { normalizedDirectory(it.directory) == normalized }
+      .sortedByDescending { it.updated }.take(MAX_JOB_SESSIONS)
+    if (sessions.isEmpty()) return@withContext emptyList()
+    val jobs = LinkedHashMap<String, ShellJob>()
+    for (session in sessions) {
+      for (job in runningJobs(session)) {
+        val id = job.str("id")
+        val owner = job.str("owner")
+        // 无主作业是 Host 全局的，无法归属到目录/会话，跳过。
+        if (id.isBlank() || owner.isBlank() || job.str("status") !in ACTIVE_JOB_STATUSES) continue
+        jobs[id] = ShellJob(
+          id = id,
+          sessionId = owner,
+          command = job.str("label"),
+          started = job.optDouble("startedAt", 0.0).toLong(),
+          directory = directory
+        )
+      }
+    }
+    jobs.values.toList()
+  }
+
+  /** `job/list` 是每会话一条流；短 TTL 缓存把同一轮对账里的重复读取收敛掉。 */
+  private suspend fun runningJobs(session: Session): List<JSONObject> {
+    val now = System.currentTimeMillis()
+    jobCache[session.id]?.takeIf { now - it.first < JOB_CACHE_MILLIS }?.let { return it.second }
+    val jobs = fetchFirstFrame("job/list", requestArgs(JSONObject().put("sessionId", session.id)))?.arr("jobs")?.objects() ?: emptyList()
+    jobCache[session.id] = now to jobs
+    return jobs
+  }
 
   override suspend fun createSession(directory: String, title: String): Session = withContext(Dispatchers.IO) {
     val request = JSONObject().put("cwd", directory)
     if (title.isNotBlank()) request.put("title", title)
-    val result = callObject("session/create", payload(request))
+    val result = callObject("session/create", requestArgs(request))
     val id = result.str("sessionId").ifBlank { throw ApiException(502, "服务器没有返回新会话 id") }
     val created = Session(
       id = id, directory = directory, title = title.ifBlank { "新会话" },
@@ -797,41 +1163,44 @@ class DshApi(
   }
 
   override suspend fun renameSession(session: Session, title: String) {
-    callObject("session/rename", payload(JSONObject().put("sessionId", session.id).put("title", title)))
+    call("session/rename", requestArgs(JSONObject().put("sessionId", session.id).put("title", title)))
     known[session.id] = session.copy(title = title)
   }
 
   override suspend fun setArchived(session: Session, archived: Boolean, now: Long) {
-    val request = JSONObject().put("sessionId", session.id).put("stopActivity", true)
-    callObject(if (archived) "workspace/archiveSession" else "workspace/unarchiveSession", payload(request))
+    val request = JSONObject().put("sessionId", session.id)
+    if (archived) request.put("stopActivity", true)
+    callObject(if (archived) "workspace/archiveSession" else "workspace/unarchiveSession", requestArgs(request))
+    if (archived) archivedSessions += session.id else archivedSessions -= session.id
     known[session.id] = session.copy(archived = archived)
   }
 
   override suspend fun deleteSession(session: Session) {
-    // DSH 没有删除会话的 RPC：归档是唯一可逆的“移出列表”语义。
+    // DSH 没有删除会话的 RPC：归档是唯一可逆的「移出列表」语义。
     setArchived(session, true)
   }
 
   override suspend fun forkSession(session: Session): Session = withContext(Dispatchers.IO) {
-    val result = callObject("session/fork", payload(JSONObject().put("sessionId", session.id)))
+    val result = callObject("session/fork", requestArgs(JSONObject().put("sessionId", session.id)))
     val id = result.str("sessionId").ifBlank { throw ApiException(502, "服务器没有返回分支会话") }
     known[id] ?: session.copy(id = id, title = "${session.title} 副本", updated = System.currentTimeMillis())
   }
 
   override suspend fun abort(session: Session) {
-    callObject("session/cancel", payload(JSONObject().put("sessionId", session.id)))
+    call("session/cancel", requestArgs(JSONObject().put("sessionId", session.id)))
   }
 
   override suspend fun compact(session: Session) {
-    throw ApiException(501, "DeepSeek Harness 没有手动压缩接口")
+    // DSH 的手动压缩是 `/compact` 命令，不是独立 RPC。
+    executeCommand(session, "/compact")
   }
 
   override suspend fun revert(session: Session, messageId: String) {
-    throw ApiException(501, "DeepSeek Harness 不支持回退消息")
+    throw ApiException(501, "DeepSeek Harness 不支持回退消息；可改用「分叉」从更早的位置继续")
   }
 
   override suspend fun unrevert(session: Session) {
-    throw ApiException(501, "DeepSeek Harness 不支持回退消息")
+    throw ApiException(501, "DeepSeek Harness 不支持回退消息；可改用「分叉」从更早的位置继续")
   }
 
   override suspend fun send(
@@ -846,7 +1215,15 @@ class DshApi(
   ) {
     if (model != null) runCatching { selectModel(session, model) }
     val content = JSONArray()
-    if (text.isNotBlank()) content.put(JSONObject().put("type", "text").put("text", text))
+    // DSH 的 prompt 没有「文件引用」块；引用的服务器文件折算成路径文本，让模型自行读取。
+    val body = buildString {
+      append(text)
+      if (references.isNotEmpty()) {
+        if (isNotEmpty()) append('\n')
+        append(references.joinToString("\n") { it.path })
+      }
+    }.trim()
+    if (body.isNotBlank()) content.put(JSONObject().put("type", "text").put("text", body))
     for (file in inline) {
       val payload = inlineContent(file) ?: continue
       content.put(payload)
@@ -857,10 +1234,10 @@ class DshApi(
       .put("mode", delivery.wire)
       .put("content", content)
       .put("clientTimeZone", java.util.TimeZone.getDefault().id)
-    callObject("session/prompt", payload(request))
+    call("session/prompt", requestArgs(request))
   }
 
-  /** 图片附件走 DSH 的多模态内容块；其他类型暂时只保留文件名提示。 */
+  /** 图片附件走 DSH 的多模态内容块；其他类型需要先上传换 receipt，暂不转发。 */
   private fun inlineContent(file: InlineFile): JSONObject? {
     val mime = file.mime.lowercase()
     if (!mime.startsWith("image/")) return null
@@ -895,8 +1272,23 @@ class DshApi(
     inline: List<InlineFile>,
     delivery: Delivery
   ) {
-    // DSH 没有 slash command 路由：按普通提示词发送，保留命令原文。
-    send(session, "/$name $arguments".trim(), agent, model, references, inline, MessageIds.ascending(), delivery)
+    if (model != null) runCatching { selectModel(session, model) }
+    executeCommand(session, "/$name $arguments".trim())
+  }
+
+  /** `commands/execute`：DSH 的命令是独立通道，不创建模型消息。 */
+  private suspend fun executeCommand(session: Session, line: String) {
+    val args = JSONObject()
+      .put("agentId", session.id)
+      .put("line", line)
+      .put("submittedAttachments", JSONArray())
+    val value = call("commands/execute", envelope(args))
+    val execution = value as? JSONObject
+    if (execution == null) throw ApiException(501, "该实例没有 ${line.substringBefore(' ')} 命令")
+    val result = execution.obj("result")
+    if (result.str("kind") == "error") {
+      throw ApiException(400, result.str("text").ifBlank { "命令执行失败" })
+    }
   }
 
   private suspend fun selectModel(session: Session, model: ModelChoice) {
@@ -905,7 +1297,7 @@ class DshApi(
       .put("provider", model.providerId)
       .put("model", model.modelId)
     model.variant?.takeIf { it.isNotBlank() }?.let { request.put("reasoningEffort", it) }
-    callObject("session/selectModel", payload(request))
+    call("session/selectModel", requestArgs(request))
     known[session.id] = session.copy(model = model)
   }
 
@@ -919,10 +1311,18 @@ class DshApi(
     names.map { AgentChoice(it, "") }
   }
 
-  override suspend fun commands(directory: String): List<CommandChoice> = emptyList()
+  /** 命令按 agent（会话）作用域注册；用该目录最近观察到的会话读取。 */
+  override suspend fun commands(directory: String): List<CommandChoice> = withContext(Dispatchers.IO) {
+    val session = sessionIn(directory) ?: return@withContext emptyList()
+    val value = call("commands/list", envelope(argsOf("agentId" to session.id)))
+    (value as? JSONArray)?.objects()?.mapNotNull { descriptor ->
+      val name = descriptor.str("name")
+      if (name.isBlank()) null else CommandChoice(name, descriptor.str("description"))
+    } ?: emptyList()
+  }
 
   override suspend fun modelCatalog(directory: String): List<ModelInfo> = withContext(Dispatchers.IO) {
-    val result = catalog ?: callObject("session/modelCatalog").also { catalog = it }
+    val result = catalog ?: callObject("session/modelCatalog", noArgs()).also { catalog = it }
     val models = mutableListOf<ModelInfo>()
     for (group in result.arr("groups").objects()) {
       val providerId = group.str("id")
@@ -952,50 +1352,168 @@ class DshApi(
   override suspend fun forms(directory: String): List<QuestionRequest> = pendingQuestions.values.toList()
 
   override suspend fun replyPermission(request: PermissionRequest, reply: String) {
-    val eventId = waterfallRequests.remove(request.id) ?: request.id
-    pendingApprovals.remove(eventId)
+    pendingApprovals.remove(request.id)
     val outcome = when (reply) {
       "once", "always" -> "allowed-once"
       else -> "rejected"
     }
-    settle(eventId, outcome)
+    settle(request.id, outcome)
   }
 
   override suspend fun replyQuestion(request: QuestionRequest, answers: List<List<String>>) {
-    val eventId = request.id
-    pendingQuestions.remove(eventId)
+    pendingQuestions.remove(request.id)
     val payload = JSONArray()
     request.questions.forEachIndexed { index, prompt ->
       val selected = answers.getOrNull(index).orEmpty().filter(String::isNotBlank)
+      // `field` 是 OpenCode 形状的表单字段 JSON，问题 id 存在 `key` 里。
+      val questionId = runCatching { JSONObject(prompt.field).str("key") }.getOrNull()?.takeIf(String::isNotBlank)
+        ?: prompt.field.ifBlank { prompt.title }
       payload.put(JSONObject()
-        .put("id", prompt.field.ifBlank { prompt.title })
+        .put("id", questionId)
         .put("selected", JSONArray(selected)))
     }
-    settle(eventId, JSONObject().put("answers", payload))
+    settle(request.id, JSONObject().put("answers", payload))
   }
 
   override suspend fun rejectQuestion(request: QuestionRequest) {
     pendingQuestions.remove(request.id)
-    val clientId = eventsClientId ?: throw ApiException(409, "事件流尚未连接，请稍后重试")
-    val outcome = JSONObject()
-      .put("kind", "rejected")
-      .put("error", JSONObject().put("message", "用户取消了回答"))
-    call("${'$'}events/result", JSONObject().put("clientId", clientId).put("eventId", request.id).put("outcome", outcome))
+    reject(request.id, "用户取消了回答")
   }
 
   override suspend fun children(session: Session): List<Session> = withContext(Dispatchers.IO) {
     listing().items.mapNotNull { itemToSession(it) }.filter { it.parentId == session.id }
   }
 
-  override suspend fun diff(session: Session): List<FileChange> = emptyList()
+  // ---------------------------------------------------------------- 改动 / 文件
 
-  override suspend fun files(directory: String, path: String): List<FileNode> = emptyList()
-
-  override suspend fun fileContent(directory: String, path: String): FileContent {
-    throw ApiException(501, "DeepSeek Harness 客户端暂不支持浏览工作区文件")
+  /**
+   * 会话改动：读取最近若干 `workspace/changes` 事件的摘要（最新轮次优先）并按路径合并，
+   * 逐文件对比来自认证栅栏内的 `/api/changes.diff`。摘要只在该 Host 进程内、会话存活期间提供。
+   */
+  override suspend fun diff(session: Session): List<FileChange> = withContext(Dispatchers.IO) {
+    val snapshot = try { fetchSnapshot(session.id) } catch (error: CancellationException) { throw error } catch (error: Exception) { return@withContext emptyList() }
+    val announced = mutableListOf<Long>()
+    for (record in snapshot.arr("records").objects()) {
+      val event = record.obj("event")
+      if (event.str("type") != "workspace/changes") continue
+      event.optDouble("seq", 0.0).toLong().takeIf { it > 0 }?.let(announced::add)
+    }
+    data class Changed(val file: JSONObject, val seq: Long, val index: Int)
+    val merged = LinkedHashMap<String, Changed>()
+    for (seq in announced.takeLast(MAX_CHANGE_TURNS)) {
+      val summary = changesSummary(session.id, seq) ?: continue
+      summary.arr("files").objects().forEachIndexed { index, file ->
+        val path = file.str("path")
+        if (path.isNotBlank()) merged[path] = Changed(file, seq, index)
+      }
+    }
+    merged.values
+      .sortedBy { it.file.str("display").ifBlank { it.file.str("path") } }
+      .take(MAX_CHANGED_FILES)
+      .map { changed ->
+        val file = changed.file
+        val display = file.str("display").ifBlank { file.str("path") }
+        val comparison = changesDiff(session.id, changed.seq, changed.index)
+        FileChange(
+          path = display,
+          after = when (comparison?.str("kind")) {
+            "binary" -> "二进制文件，无法预览对比"
+            "oversized" -> "文件过大，无法预览对比"
+            else -> ""
+          },
+          additions = file.optInt("added"),
+          deletions = file.optInt("deleted"),
+          patch = if (comparison?.str("kind") == "text") renderPatch(display, comparison) else ""
+        )
+      }
   }
 
-  override suspend fun searchFiles(directory: String, query: String): List<String> = emptyList()
+  private suspend fun changesSummary(sessionId: String, seq: Long): JSONObject? =
+    fetchJson(base.newBuilder()
+      .addEncodedPathSegment("api")
+      .addEncodedPathSegment("changes.summary")
+      .addQueryParameter("sessionId", sessionId)
+      .addQueryParameter("seq", seq.toString())
+      .build())
+
+  private suspend fun changesDiff(sessionId: String, seq: Long, index: Int): JSONObject? =
+    fetchJson(base.newBuilder()
+      .addEncodedPathSegment("api")
+      .addEncodedPathSegment("changes.diff")
+      .addQueryParameter("sessionId", sessionId)
+      .addQueryParameter("seq", seq.toString())
+      .addQueryParameter("index", index.toString())
+      .build())
+
+  private fun renderPatch(display: String, diff: JSONObject): String {
+    val hunks = diff.arr("hunks").objects()
+    if (hunks.isEmpty()) return ""
+    val out = StringBuilder()
+    out.append("--- a/").append(display).append('\n')
+    out.append("+++ b/").append(display).append('\n')
+    for (hunk in hunks) {
+      out.append("@@ -").append(hunk.optInt("oldStart")).append(',').append(hunk.optInt("oldLines"))
+        .append(" +").append(hunk.optInt("newStart")).append(',').append(hunk.optInt("newLines")).append(" @@\n")
+      val lines = hunk.arr("lines")
+      for (i in 0 until lines.length()) out.append(lines.optString(i)).append('\n')
+    }
+    return out.toString()
+  }
+
+  /**
+   * 工作区文件读取需要一个会话身份（`workspaceFileScopeId`）。优先用调用方给出的会话，
+   * 其次用该目录最近观察到的会话；目录里没有会话时无法浏览。
+   */
+  private suspend fun fileScope(directory: String, preferred: Session?): Session {
+    val normalized = normalizedDirectory(directory)
+    preferred?.takeIf { normalizedDirectory(it.directory) == normalized }?.let { return it }
+    sessionIn(directory)?.let { return it }
+    throw ApiException(409, "DeepSeek Harness 需要先在该目录创建会话才能浏览文件")
+  }
+
+  private suspend fun sessionIn(directory: String): Session? {
+    val normalized = normalizedDirectory(directory)
+    synchronized(watched) { watched.toList() }.asReversed().forEach { id ->
+      known[id]?.takeIf { normalizedDirectory(it.directory) == normalized }?.let { return it }
+    }
+    known.values.firstOrNull { normalizedDirectory(it.directory) == normalized }?.let { return it }
+    listing()
+    return known.values.firstOrNull { normalizedDirectory(it.directory) == normalized }
+  }
+
+  override suspend fun files(directory: String, path: String, session: Session?): List<FileNode> = withContext(Dispatchers.IO) {
+    val scope = fileScope(directory, session)
+    val relative = path.trim().ifBlank { "." }
+    val result = callObject("workspaceFiles/list", envelope(argsOf(
+      "workspaceFileScopeId" to scope.id,
+      "path" to relative
+    )))
+    val listed = result.str("path").trim('/')
+    result.arr("entries").objects().mapNotNull { entry ->
+      val name = entry.str("name")
+      if (name.isBlank()) return@mapNotNull null
+      FileNode(if (listed.isEmpty()) name else "$listed/$name", entry.str("type").ifBlank { "file" })
+    }
+  }
+
+  override suspend fun fileContent(directory: String, path: String, session: Session?): FileContent {
+    val scope = fileScope(directory, session)
+    return try {
+      val result = callObject("workspaceFiles/read", envelope(argsOf(
+        "workspaceFileScopeId" to scope.id,
+        "path" to path,
+        "range" to JSONObject()
+      )))
+      FileContent("text", result.str("text"))
+    } catch (error: ApiException) {
+      // 二进制文件以 `workspace-file/not-text` 拒绝；UI 只提示无法预览。
+      if (error.code == "workspace-file/not-text") FileContent("binary", "") else throw error
+    }
+  }
+
+  override suspend fun searchFiles(directory: String, query: String, session: Session?): List<String> {
+    throw ApiException(501, "DeepSeek Harness 暂不支持文件搜索")
+  }
 
   override suspend fun health(): String = withContext(Dispatchers.IO) {
     listing()
@@ -1004,6 +1522,30 @@ class DshApi(
 
   private companion object {
     const val WATCH_LIMIT = 12
+
+    /** 单次改动列表最多合并的轮次数与文件数。 */
+    const val MAX_CHANGE_TURNS = 8
+    const val MAX_CHANGED_FILES = 60
+
+    /** 单次 shell 读取最多查询的会话数（`job/list` 是每会话一条流）。 */
+    const val MAX_JOB_SESSIONS = 3
+
+    /** 作业清单缓存的有效期：把同一轮对账里的重复读取收敛掉。 */
+    const val JOB_CACHE_MILLIS = 20_000L
+    val ACTIVE_JOB_STATUSES = setOf("running", "stopping")
+
     val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
+
+    /**
+     * DSH 的实例能力。删除没有对应 RPC（归档代替）；回退没有对应语义；没有 `/openapi.json`
+     * 之类的契约文档，漂移按方法级失败处理。
+     */
+    val CAPABILITIES = ApiCapabilities(
+      actions = mapOf(SessionAction.RENAME to ActionEndpoint("POST", "session/rename")),
+      diff = true,
+      sessionView = null,
+      archive = ArchiveEndpoint(ActionEndpoint("POST", "workspace/archiveSession"), restorable = true),
+      documented = false
+    )
   }
 }
