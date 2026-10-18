@@ -54,7 +54,7 @@ class OpenCodeApi(
   /** Whole-call deadline. Background callers (e.g. notification actions) pass a small value to stay
    *  inside the short lifetime Android grants a BroadcastReceiver; foreground callers keep the default. */
   callTimeoutSeconds: Long = 60
-) {
+) : HarnessClient {
   constructor(profile: ServerProfile, password: String) : this(profile, ServerCredentials(profile.username, password))
 
   private val base: HttpUrl = requireNotNull(profile.url.trimEnd('/').toHttpUrlOrNull()) { "服务器地址无效" }
@@ -88,10 +88,10 @@ class OpenCodeApi(
   private val ioScope = SharedHttp.ioScope
   @Volatile private var version: String? = null
   @Volatile private var discoveredCapabilities: ApiCapabilities? = null
-  fun capabilities(): ApiCapabilities = discoveredCapabilities ?: ApiCapabilities.BASELINE
+  override fun capabilities(): ApiCapabilities = discoveredCapabilities ?: ApiCapabilities.BASELINE
 
   /** Reads the instance's own OpenAPI document once; routes that moved between 2.0.x releases are taken from it. */
-  suspend fun discoverCapabilities(): ApiCapabilities {
+  override suspend fun discoverCapabilities(): ApiCapabilities {
     discoveredCapabilities?.let { return it }
     val document = try { obj("openapi.json") } catch (cancel: kotlinx.coroutines.CancellationException) { throw cancel }
       catch (error: Exception) { Diagnostics.warn("OpenCodeApi", "无法读取 /openapi.json，按 2.x 最新契约处理", error); null }
@@ -273,7 +273,7 @@ class OpenCodeApi(
   private fun ActionEndpoint.path(session: Session) = path.replace(Regex("\\{[^}]+\\}"), segment(session.id))
 
   /** `GET /api/info`: the server version. Older addresses (1.x) do not have it and are rejected. */
-  suspend fun health(): String {
+  override suspend fun health(): String {
     version?.let { return it }
     val info = try { obj("api/info") } catch (error: ApiException) {
       if (error.status == 404) throw IOException("该地址不是 OpenCode 2.x 服务器（需要 OpenCode 2.0 及以上版本）")
@@ -282,7 +282,7 @@ class OpenCodeApi(
     return info.str("version").ifBlank { "2.x" }.also { version = it }
   }
 
-  suspend fun projects(): List<Project> {
+  override suspend fun projects(): List<Project> {
     val listed = try {
       val raw = withContext(Dispatchers.IO) { request("GET", "api/project") }
       // The published contract returns `Project[]` as a bare array; accept a `{data: […]}` envelope too.
@@ -294,14 +294,14 @@ class OpenCodeApi(
     return if (directory.isBlank()) emptyList()
     else listOf(Project(location.obj("project").str("id").ifBlank { directory }, directory, directory.substringAfterLast('/')))
   }
-  suspend fun session(id: String): Session = dataObject(obj(sessionPath(id))).toSession()
+  override suspend fun session(id: String): Session = dataObject(obj(sessionPath(id))).toSession()
 
   /**
    * Resolve [directory] to the server's canonical project, like the desktop client's `project.current()`.
    * Passing the directory through `location[directory]` lets the server do the path normalization, so
    * the phone stores the canonical directory and never spawns a duplicate project for the same folder.
    */
-  suspend fun projectAt(directory: String): Project? {
+  override suspend fun projectAt(directory: String): Project? {
     val location = dataObject(obj("api/location", locationQuery(directory)))
     val project = location.obj("project")
     val canonical = project.str("canonical").ifBlank { project.str("worktree") }.ifBlank { location.str("directory") }.ifBlank { directory }
@@ -311,7 +311,7 @@ class OpenCodeApi(
   }
 
   /** Home catalog: like the official home index, global root sessions newest first (`parentID=null`). */
-  suspend fun rootSessionsPage(directory: String? = null, cursor: String? = null, size: Int = 100): ApiPage<Session> = withContext(Dispatchers.IO) {
+  override suspend fun rootSessionsPage(directory: String?, cursor: String?, size: Int): ApiPage<Session> = withContext(Dispatchers.IO) {
     val query = mutableMapOf("limit" to size.toString(), "parentID" to "null")
     if (directory != null) query["directory"] = directory
     if (cursor == null) query["order"] = "desc" else query["cursor"] = cursor
@@ -319,7 +319,7 @@ class OpenCodeApi(
     ApiPage(dataArray(page).objects().map { it.toSession() }, page.obj("cursor").str("next").takeIf(String::isNotBlank))
   }
   /** Bind the acknowledgement to the exact completed execution, never to wall-clock time. */
-  suspend fun viewSession(session: Session, idle: Long) {
+  override suspend fun viewSession(session: Session, idle: Long) {
     if (idle <= 0) return
     val endpoint = capabilities().sessionView ?: return
     request(endpoint.method, endpoint.path(session), body = JSONObject().put("idle", idle))
@@ -328,18 +328,18 @@ class OpenCodeApi(
    * One page of the projected timeline, oldest first. The first page is the newest [size] messages
    * (official page size 20); [cursor] walks further back.
    */
-  suspend fun messagesPage(id: String, cursor: String? = null, size: Int = MESSAGE_PAGE): ApiPage<Message> = withContext(Dispatchers.IO) {
+  override suspend fun messagesPage(id: String, cursor: String?, size: Int): ApiPage<Message> = withContext(Dispatchers.IO) {
     val query = mutableMapOf("limit" to size.toString())
     if (cursor == null) query["order"] = "desc" else query["cursor"] = cursor
     val page = obj(sessionPath(id, "/message"), query)
     ApiPage(dataArray(page).objects().map { it.toMessage() }.asReversed(), page.obj("cursor").str("next").takeIf(String::isNotBlank))
   }
   /** Durable input admitted but not yet delivered to the agent loop (`GET /api/session/{id}/inbox`). */
-  suspend fun inbox(id: String): List<Message> = withContext(Dispatchers.IO) {
+  override suspend fun inbox(id: String): List<Message> = withContext(Dispatchers.IO) {
     dataArray(obj(sessionPath(id, "/inbox"))).objects().mapNotNull { it.toInboxMessage() }
   }
   /** Sessions whose foreground drain this server currently owns; every other session is idle. */
-  suspend fun activeSessions(): Set<String> {
+  override suspend fun activeSessions(): Set<String> {
     val json = withContext(Dispatchers.IO) { jsonObject(request("GET", "api/session/active")) }
     // 有的实现把运行集合包成数组；不能把 {"data":[...]} 的键名当成会话 id（会造出一个叫 data 的假会话）。
     json.optJSONObject("data")?.let { return it.keys().asSequence().toSet() }
@@ -354,31 +354,31 @@ class OpenCodeApi(
    * command keeps running while its session execution is idle, so this is the only authoritative
    * read for "background work still pending" after a cold start (official `shell.list`).
    */
-  suspend fun shells(directory: String): List<ShellJob> =
+  override suspend fun shells(directory: String): List<ShellJob> =
     dataArray(obj("api/shell", locationQuery(directory))).objects().mapNotNull { it.toShellJob(directory) }
 
-  suspend fun createSession(directory: String, title: String): Session =
+  override suspend fun createSession(directory: String, title: String): Session =
     dataObject(requestObject("POST", "api/session", JSONObject().put("location", JSONObject().put("directory", directory)).apply {
       if (title.isNotBlank()) put("title", title.trim())
     })).toSession()
-  suspend fun renameSession(session: Session, title: String) {
+  override suspend fun renameSession(session: Session, title: String) {
     val endpoint = capabilities().actions[SessionAction.RENAME] ?: unsupported("服务器未提供重命名")
     request(endpoint.method, endpoint.path(session), body = JSONObject().put("title", title))
   }
   /** Archive (or, when the instance allows a null `time.archived`, restore) through the documented update body. */
-  suspend fun setArchived(session: Session, archived: Boolean, now: Long = System.currentTimeMillis()) {
+  override suspend fun setArchived(session: Session, archived: Boolean, now: Long) {
     val archive = capabilities().archive ?: unsupported("服务器未提供归档")
     if (!archived && !archive.restorable) unsupported("服务器不支持取消归档")
     request(archive.endpoint.method, archive.endpoint.path(session), body = JSONObject().put("time", JSONObject().put("archived", if (archived) now else JSONObject.NULL)))
   }
-  suspend fun deleteSession(session: Session) { request("DELETE", sessionPath(session.id)) }
-  suspend fun forkSession(session: Session): Session = dataObject(requestObject("POST", sessionPath(session.id, "/fork"), JSONObject())).toSession()
-  suspend fun abort(session: Session) { request("POST", sessionPath(session.id, "/interrupt")) }
-  suspend fun compact(session: Session) { request("POST", sessionPath(session.id, "/compact")) }
-  suspend fun revert(session: Session, messageId: String) {
+  override suspend fun deleteSession(session: Session) { request("DELETE", sessionPath(session.id)) }
+  override suspend fun forkSession(session: Session): Session = dataObject(requestObject("POST", sessionPath(session.id, "/fork"), JSONObject())).toSession()
+  override suspend fun abort(session: Session) { request("POST", sessionPath(session.id, "/interrupt")) }
+  override suspend fun compact(session: Session) { request("POST", sessionPath(session.id, "/compact")) }
+  override suspend fun revert(session: Session, messageId: String) {
     request("POST", sessionPath(session.id, "/revert/stage"), body = JSONObject().put("messageID", messageId))
   }
-  suspend fun unrevert(session: Session) {
+  override suspend fun unrevert(session: Session) {
     val endpoint = capabilities().actions[SessionAction.UNREVERT] ?: unsupported("服务器未提供恢复撤销")
     request(endpoint.method, endpoint.path(session))
   }
@@ -388,8 +388,8 @@ class OpenCodeApi(
    * the session, then admits the prompt under a client-minted id so one retry of a lost response is
    * idempotent. Phone files travel inline as `data:` URIs in `files[].uri`.
    */
-  suspend fun send(session: Session, text: String, agent: String?, model: ModelChoice?, references: List<FileReference> = emptyList(),
-    inline: List<InlineFile> = emptyList(), id: String = MessageIds.ascending(), delivery: Delivery = Delivery.STEER) {
+  override suspend fun send(session: Session, text: String, agent: String?, model: ModelChoice?, references: List<FileReference>,
+    inline: List<InlineFile>, id: String, delivery: Delivery) {
     if (delivery == Delivery.STEER) applySelection(session, agent, model)
     val body = JSONObject().put("id", id).put("text", text).put("delivery", delivery.wire)
     files(session, references, inline)?.let { body.put("files", it) }
@@ -400,8 +400,8 @@ class OpenCodeApi(
     retryOnce { request("POST", sessionPath(session.id, "/prompt"), body = body) }
   }
   /** `POST /api/session/{id}/command`: the server expands the command template (never sent as plain text). */
-  suspend fun command(session: Session, name: String, arguments: String, agent: String?, model: ModelChoice?,
-    references: List<FileReference> = emptyList(), inline: List<InlineFile> = emptyList(), delivery: Delivery = Delivery.STEER) {
+  override suspend fun command(session: Session, name: String, arguments: String, agent: String?, model: ModelChoice?,
+    references: List<FileReference>, inline: List<InlineFile>, delivery: Delivery) {
     if (delivery == Delivery.STEER) applySelection(session, agent, model)
     val body = JSONObject().put("name", name).put("text", arguments).put("delivery", delivery.wire)
     files(session, references, inline)?.let { body.put("files", it) }
@@ -435,13 +435,13 @@ class OpenCodeApi(
     val path = if (reference.path.startsWith('/')) reference.path else session.directory.trimEnd('/') + "/" + reference.path
     return java.net.URI("file", "", path, null).toASCIIString()
   }
-  suspend fun agents(directory: String): List<AgentChoice> =
+  override suspend fun agents(directory: String): List<AgentChoice> =
     dataArray(obj("api/agent", locationQuery(directory))).objects().filterNot { it.optBoolean("hidden") }.map { AgentChoice(it.str("id").ifBlank { it.str("name") }, it.str("description")) }
-  suspend fun commands(directory: String): List<CommandChoice> =
+  override suspend fun commands(directory: String): List<CommandChoice> =
     dataArray(obj("api/command", locationQuery(directory))).objects().map { CommandChoice(it.str("name"), it.str("description")) }
 
   /** Models the server can run in [directory], with the metadata [ModelVisibility] needs. */
-  suspend fun modelCatalog(directory: String): List<ModelInfo> {
+  override suspend fun modelCatalog(directory: String): List<ModelInfo> {
     val models = dataArray(obj("api/model", locationQuery(directory))).objects()
     // Display names only; the catalog stays usable when this optional route is missing.
     val names = try {
@@ -450,39 +450,39 @@ class OpenCodeApi(
     return models.mapNotNull { it.toV2ModelInfo(names) }
   }
   /** Pending permission requests owned by one session (official `session.permission.list`). */
-  suspend fun sessionPermissions(session: Session): List<PermissionRequest> =
+  override suspend fun sessionPermissions(session: Session): List<PermissionRequest> =
     dataArray(obj(sessionPath(session.id, "/permission"))).objects().map { it.toPermission(session.directory) }
   /** Location-scoped sweep, also covers parked requests on locally known idle sessions. */
-  suspend fun pendingPermissions(directory: String): List<PermissionRequest> =
+  override suspend fun pendingPermissions(directory: String): List<PermissionRequest> =
     dataArray(obj("api/permission/request", locationQuery(directory))).objects().map { it.toPermission(directory) }
   /** Pending forms at [directory] (`form.list` is location-scoped); callers filter by session. */
-  suspend fun forms(directory: String): List<QuestionRequest> =
+  override suspend fun forms(directory: String): List<QuestionRequest> =
     dataArray(obj("api/form", locationQuery(directory))).objects().map { it.toForm(directory) }
-  suspend fun replyPermission(request: PermissionRequest, reply: String) {
+  override suspend fun replyPermission(request: PermissionRequest, reply: String) {
     require(reply in setOf("once", "always", "reject")) { "未知权限决定" }
     require(reply != "always" || request.always.isNotEmpty()) { "无法确认保存规则范围，请仅允许一次" }
     request("POST", sessionPath(request.sessionId, "/permission/${segment(request.id)}/reply"), body = JSONObject().put("decision", reply))
   }
-  suspend fun replyQuestion(request: QuestionRequest, answers: List<List<String>>) {
+  override suspend fun replyQuestion(request: QuestionRequest, answers: List<List<String>>) {
     request("POST", sessionPath(request.sessionId, "/form/${segment(request.id)}/reply"), body = JSONObject().put("answer", formAnswer(request, answers)))
   }
-  suspend fun rejectQuestion(request: QuestionRequest) { request("DELETE", sessionPath(request.sessionId, "/form/${segment(request.id)}")) }
-  suspend fun children(session: Session): List<Session> = dataObjects("api/session", mapOf("parentID" to session.id)).map { it.toSession() }
-  suspend fun diff(session: Session): List<FileChange> =
+  override suspend fun rejectQuestion(request: QuestionRequest) { request("DELETE", sessionPath(request.sessionId, "/form/${segment(request.id)}")) }
+  override suspend fun children(session: Session): List<Session> = dataObjects("api/session", mapOf("parentID" to session.id)).map { it.toSession() }
+  override suspend fun diff(session: Session): List<FileChange> =
     if (capabilities().diff) dataArray(obj(sessionPath(session.id, "/diff"))).objects().map { it.toChange() } else unsupported("服务器不提供改动记录")
-  suspend fun files(directory: String, path: String): List<FileNode> =
+  override suspend fun files(directory: String, path: String): List<FileNode> =
     dataArray(obj("api/fs/list", locationQuery(directory) + (if (path.isNotBlank() && path != ".") mapOf("path" to path) else emptyMap())))
       .objects().map { item -> FileNode(item.str("path"), item.str("type")) }
-  suspend fun fileContent(directory: String, path: String): FileContent {
+  override suspend fun fileContent(directory: String, path: String): FileContent {
     val (bytes, contentType) = requestBytes("api/fs/read/${encodedPath(path)}", locationQuery(directory))
     return if (!isTextFile(path, contentType)) FileContent("binary", Base64.encodeToString(bytes, Base64.NO_WRAP))
     else FileContent("text", bytes.toString(Charsets.UTF_8))
   }
-  suspend fun searchFiles(directory: String, query: String): List<String> =
+  override suspend fun searchFiles(directory: String, query: String): List<String> =
     dataArray(obj("api/fs/find", locationQuery(directory) + mapOf("query" to query))).objects().mapNotNull { it.str("path").takeIf(String::isNotBlank) }
 
   /** `GET /api/event`: volatile by contract, so a dropped stream is recovered by reconnect + reconciliation. */
-  fun events(onOpen: () -> Unit = {}): Flow<ServerEvent> = callbackFlow {
+  override fun events(onOpen: () -> Unit): Flow<ServerEvent> = callbackFlow {
     val request = requestBuilder("api/event", emptyMap()).header("Accept", "text/event-stream").build()
     requireOrigin(request)
     val source: EventSource = EventSources.createFactory(streamClient).newEventSource(request, object : EventSourceListener() {

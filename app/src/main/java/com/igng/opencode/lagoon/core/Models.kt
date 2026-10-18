@@ -10,7 +10,9 @@ data class ServerProfile(
   val username: String = "opencode",
   val autoConnect: Boolean = true,
   val notifications: Boolean = true,
-  val allowCleartext: Boolean = false
+  val allowCleartext: Boolean = false,
+  /** 该服务器使用的 harness 协议（OpenCode / DeepSeek Harness）。 */
+  val kind: ServerKind = ServerKind.OPENCODE
 )
 
 data class Project(val id: String, val directory: String, val name: String, val sandboxes: List<String> = emptyList(),

@@ -68,7 +68,7 @@ class ControllerRegressionTest {
   private suspend fun readTranscript(c: LagoonController, client: OpenCodeApi, session: Session) = suspendCoroutine<Unit> { continuation ->
     try {
       val method = LagoonController::class.java.getDeclaredMethod("loadSession", Session::class.java, Boolean::class.javaPrimitiveType,
-        Int::class.javaPrimitiveType, OpenCodeApi::class.java, Continuation::class.java).apply { isAccessible = true }
+        Int::class.javaPrimitiveType, HarnessClient::class.java, Continuation::class.java).apply { isAccessible = true }
       val result = method.invoke(c, session, false, 1, client, continuation)
       if (result !== COROUTINE_SUSPENDED) continuation.resume(Unit)
     } catch (error: Throwable) { continuation.resumeWithException(error.cause ?: error) }
@@ -396,7 +396,7 @@ class ControllerRegressionTest {
       cache.saveMessages("server", "s", listOf(Message("old", "user", 0, emptyList()))); cache.awaitWrites()
       suspendCoroutine<Unit> { cont ->
         val method=LagoonController::class.java.getDeclaredMethod("loadSession", Session::class.java, Boolean::class.javaPrimitiveType,
-          Int::class.javaPrimitiveType, OpenCodeApi::class.java, Continuation::class.java).apply { isAccessible=true }
+          Int::class.javaPrimitiveType, HarnessClient::class.java, Continuation::class.java).apply { isAccessible=true }
         val result=method.invoke(controller, session, false, 1, api, cont)
         if (result !== COROUTINE_SUSPENDED) cont.resume(Unit)
       }

@@ -124,7 +124,9 @@ fun ServersModal(
               )
               val version = controller.testServer(actualProfile, credentials)
               controller.saveServer(actualProfile, credentials.password, credentials.cookie, credentials.username)
-              done("已连接 OpenCode $version")
+              val label = actualProfile.kind.label
+              val detail = if (version.isBlank() || version.equals(label, ignoreCase = true) || version == "DeepSeek Harness") "" else " $version"
+              done("已连接 $label$detail")
               onDismiss()
             } catch (cancel: CancellationException) {
               throw cancel
@@ -169,6 +171,8 @@ private fun MiuixServerForm(
   val id = remember(existing?.id) { existing?.id ?: UUID.randomUUID().toString() }
   var name by rememberSaveable(existing?.id) { mutableStateOf(existing?.name ?: "") }
   var url by remember(existing?.id) { mutableStateOf(existing?.url ?: "") }
+  var harness by rememberSaveable(existing?.id) { mutableStateOf(existing?.kind ?: ServerKind.OPENCODE) }
+  val isDsh = harness == ServerKind.DSH
   var username by rememberSaveable(existing?.id) { mutableStateOf(existing?.username ?: "opencode") }
   var password by remember(existing?.id) { mutableStateOf("") }
   var autoConnect by rememberSaveable(existing?.id) { mutableStateOf(existing?.autoConnect ?: true) }
@@ -209,6 +213,19 @@ private fun MiuixServerForm(
     }
 
     item {
+      SuperDropdown(
+        title = "服务类型",
+        items = ServerKind.entries.map { it.label },
+        selectedIndex = ServerKind.entries.indexOf(harness),
+        onSelectedIndexChange = { index ->
+          harness = ServerKind.entries[index]
+          if (name.isBlank()) name = "我的 ${harness.label}"
+          if (harness == ServerKind.DSH) username = "dsh"
+        }
+      )
+    }
+
+    item {
       TextField(
         value = name,
         onValueChange = { text: String -> name = text },
@@ -225,13 +242,21 @@ private fun MiuixServerForm(
             url = text
             if (name.isBlank() && text.isNotBlank()) name = "我的 OpenCode"
           },
-          label = if (url.isBlank()) "http://192.168.1.x:4096 或配对链接" else "服务器地址 或 配对链接",
+          label = when {
+            url.isNotBlank() -> "服务器地址 或 配对链接"
+            isDsh -> "http://192.168.1.x:64599"
+            else -> "http://192.168.1.x:4096 或配对链接"
+          },
           useLabelAsPlaceholder = url.isBlank(),
           keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
           modifier = Modifier.fillMaxWidth()
         )
         Text(
-          text = "示例：http://192.168.1.100:4096 或 https://oc.example.com。手机无法通过 localhost 访问电脑，请填电脑的局域网 IP 或直接粘贴 opencode pair 配对链接。",
+          text = if (isDsh) {
+            "示例：http://192.168.1.100:64599。地址填电脑上 dsh web 启动后打印的端口，令牌填同一条链接里的 token 参数；手机无法通过 localhost 访问电脑。"
+          } else {
+            "示例：http://192.168.1.100:4096 或 https://oc.example.com。手机无法通过 localhost 访问电脑，请填电脑的局域网 IP 或直接粘贴 opencode pair 配对链接。"
+          },
           style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary),
           modifier = Modifier.padding(start = 12.dp, top = 4.dp, end = 12.dp)
         )
@@ -242,7 +267,7 @@ private fun MiuixServerForm(
       SuperSwitch(title = "允许此地址使用 HTTP", summary = "请仅在你信任的网络中开启", checked = allowHttp, onCheckedChange = { allowHttp = it })
     }
     if (!isPair) {
-      item {
+      if (!isDsh) item {
         TextField(
           value = username,
           onValueChange = { text: String -> username = text },
@@ -254,10 +279,19 @@ private fun MiuixServerForm(
         TextField(
           value = password,
           onValueChange = { text: String -> password = text },
-          label = if (existing == null) "访问密码（无认证服务器可留空）" else "新密码（留空保持不变）",
+          label = when {
+            isDsh -> if (existing == null) "访问令牌（dsh web 启动链接里的 token）" else "新令牌（留空保持不变）"
+            existing == null -> "访问密码（无认证服务器可留空）"
+            else -> "新密码（留空保持不变）"
+          },
           keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
           visualTransformation = PasswordVisualTransformation(),
           modifier = Modifier.fillMaxWidth()
+        )
+        if (isDsh) Text(
+          text = "在电脑上运行 dsh web，用它打开的链接里 token= 后面的那串字符；每次重启实例都会变。",
+          style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary),
+          modifier = Modifier.padding(start = 12.dp, top = 4.dp, end = 12.dp)
         )
       }
     }
@@ -306,8 +340,11 @@ private fun MiuixServerForm(
         working = true
         val normalizedUrl = normalizedInput.trimEnd('/')
         val profile = (existing ?: ServerProfile(id, "", "")).copy(
-          name = name.trim().ifBlank { "OpenCode" }, url = normalizedUrl, username = username.trim().ifBlank { "opencode" }, autoConnect = autoConnect, notifications = notifications,
-          allowCleartext = normalizedUrl.startsWith("http://", true) && allowHttp
+          name = name.trim().ifBlank { harness.label }, url = normalizedUrl,
+          username = if (isDsh) "dsh" else username.trim().ifBlank { "opencode" },
+          autoConnect = autoConnect, notifications = notifications,
+          allowCleartext = normalizedUrl.startsWith("http://", true) && allowHttp,
+          kind = harness
         )
         onSave(profile, password.takeIf { it.isNotBlank() || existing == null }) { message ->
           result = message
@@ -380,11 +417,11 @@ fun SettingsScreen(
           val current = profile.id == state.serverId
           SuperArrow(
             title = profile.name,
-            summary = if (!current) profile.url else if (state.connected) "当前 · OpenCode ${state.version.ifBlank { "2.x" }} · ${profile.url}" else "当前 · 未连接 · ${profile.url}",
+            summary = if (!current) profile.url else if (state.connected) "当前 · ${profile.kind.label}${state.version.takeIf { it.isNotBlank() && !it.equals(profile.kind.label, true) }?.let { " $it" }.orEmpty()} · ${profile.url}" else "当前 · 未连接 · ${profile.url}",
             onClick = { onEditServer(profile) }
           )
         }
-        SuperArrow(title = "添加服务器", summary = "地址或 opencode pair 配对链接", onClick = { onEditServer(null) })
+        SuperArrow(title = "添加服务器", summary = "OpenCode 地址 / pair 链接，或 DeepSeek Harness 令牌", onClick = { onEditServer(null) })
         SuperArrow(
           title = "模型显示",
           summary = when {

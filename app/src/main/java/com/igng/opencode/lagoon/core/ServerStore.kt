@@ -17,7 +17,8 @@ class ServerStore internal constructor(private val preferences: SharedPreference
     JSONArray(preferences.getString("profiles", "[]")).objects().map {
       val id = it.str("id")
       ServerProfile(id, it.str("name"), it.str("url"), it.str("username"),
-        it.optBoolean("autoConnect", true), it.optBoolean("notifications", true), it.optBoolean("allowCleartext", false))
+        it.optBoolean("autoConnect", true), it.optBoolean("notifications", true), it.optBoolean("allowCleartext", false),
+        ServerKind.fromWire(it.str("kind")))
     }
   } catch (error: Exception) {
     Diagnostics.warn("ServerStore", "profiles 解析失败，已忽略全部服务器资料", error)
@@ -346,7 +347,7 @@ class ServerStore internal constructor(private val preferences: SharedPreference
     val json = JSONArray().apply { updated.forEach { item -> put(JSONObject()
       .put("id", item.id).put("name", item.name).put("url", item.url).put("username", item.username)
       .put("autoConnect", item.autoConnect).put("notifications", item.notifications)
-      .put("allowCleartext", item.allowCleartext)) } }
+      .put("allowCleartext", item.allowCleartext).put("kind", item.kind.wire)) } }
     check(secrets.edit().putString(profile.id, encoded).commit()) { "无法保存凭据，请重试" }
     check(preferences.edit().putString("profiles", json.toString()).commit()) { "无法保存服务器资料，请重试" }
   }
@@ -359,7 +360,7 @@ class ServerStore internal constructor(private val preferences: SharedPreference
       put(JSONObject().put("id", item.id).put("name", item.name).put("url", item.url)
         .put("username", item.username).put("autoConnect", item.autoConnect)
         .put("notifications", item.notifications)
-        .put("allowCleartext", item.allowCleartext))
+        .put("allowCleartext", item.allowCleartext).put("kind", item.kind.wire))
     } }
     val editor = preferences.edit().putString("profiles", json.toString()).remove("directories:$id").remove("sessionNotices:$id").remove("collapsedSections:$id").remove("collapsedProjects:$id").remove("pinned:$id")
       .remove("backgroundRunning:$id")

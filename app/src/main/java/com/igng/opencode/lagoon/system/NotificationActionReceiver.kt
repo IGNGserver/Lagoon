@@ -7,7 +7,7 @@ import com.igng.opencode.lagoon.core.ApiException
 import com.igng.opencode.lagoon.core.Diagnostics
 import com.igng.opencode.lagoon.core.LagoonController
 import com.igng.opencode.lagoon.core.LiveUpdateStage
-import com.igng.opencode.lagoon.core.OpenCodeApi
+import com.igng.opencode.lagoon.core.createHarnessClient
 import com.igng.opencode.lagoon.core.ServerStore
 import com.igng.opencode.lagoon.core.Session
 import kotlinx.coroutines.CancellationException
@@ -72,7 +72,7 @@ class NotificationActionReceiver : BroadcastReceiver() {
     val store = ServerStore(context)
     val profile = store.profiles().firstOrNull { it.id == serverId } ?: return false
     if (profileUrl != profile.url) return false
-    val client = OpenCodeApi(profile, store.credentials(serverId), callTimeoutSeconds = 8)
+    val client = createHarnessClient(profile, store.credentials(serverId), callTimeoutSeconds = 8)
     return try {
       when (action) {
         "abort" -> client.abort(Session(sessionId, directory, "", 0))
