@@ -12,6 +12,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -286,7 +287,7 @@ class LagoonController private constructor(private val appContext: Context) {
     { id, event -> if (id == state.value.serverId) handleEvent(event) },
     { id ->
       if (id == state.value.serverId) trace(generation, ConnectMilestone.STREAM)
-      if (id == state.value.serverId && api != null && connecting?.isActive != true) reloadConversation()
+      if (id == state.value.serverId && api != null && connecting?.isActive != true) reconcileAfterStream()
     },
     directoryHealth)
   private var api: HarnessClient? = null
@@ -446,6 +447,23 @@ class LagoonController private constructor(private val appContext: Context) {
   }
   fun notifyOverviewAction(serverId: String) = allOverview.refresh(serverId)
   fun clearError() = mutable.update { it.copy(error = null) }
+  /**
+   * The live stream (re)connected. Events between the last read and the handshake may be lost, so the
+   * control plane and the open transcript's tail are re-read — but only those: the catalog paging,
+   * model/agent/command lists, children and diff did not go stale because a socket reconnected.
+   */
+  private fun reconcileAfterStream() {
+    if (!state.value.connected) { reloadConversation(); return }
+    if (refresh?.isActive == true) return
+    val token = generation
+    refresh = scope.launch {
+      try { loadAll(token, controlOnly = true) } catch (error: Exception) {
+        if (error is CancellationException) throw error
+        Diagnostics.warn("LagoonController", "实时连接恢复后的对账失败", error)
+        if (token == generation) mutable.update { it.copy(degraded = true) }
+      }
+    }
+  }
   /** “立即重试” from the status strip: skip the backoff wait and read the server now. */
   fun retryNow() {
     val id = state.value.serverId ?: return
@@ -704,25 +722,53 @@ class LagoonController private constructor(private val appContext: Context) {
     val readWaitingSeq = waitingEventSeq
     // 本设备认为仍在运行的会话；读取后用于判断哪些需要重新拉取会话信息（取得权威 outcome/time.idle）。
     val previousActiveIds = state.value.tasks.filterValues { it.active }.keys.toSet()
-    val version = client.health()
-    val capabilities = client.discoverCapabilities()
-    if (token != generation) return
-    advanceStage(token, ConnectStage.READING)
     val serverId = state.value.serverId ?: return
+    // Probe, contract, catalog and activity are independent reads: one round trip instead of four.
+    // The probe is awaited first so a wrong address or old server still reports its own error.
+    val firstRound = coroutineScope {
+      val versionTask = async { client.health() }
+      val capabilitiesTask = async { client.discoverCapabilities() }
+      val pageTask = async { attempt { client.rootSessionsPage() } }
+      val activeTask = async { attempt { client.activeSessions() } }
+      val version = versionTask.await()
+      if (token == generation) advanceStage(token, ConnectStage.READING)
+      FirstRound(version, capabilitiesTask.await(), pageTask.await().getOrThrow(), activeTask.await())
+    }
+    val version = firstRound.version
+    val capabilities = firstRound.capabilities
+    if (token != generation || state.value.serverId != serverId) return
     // The project list is device-local: the user registers a server directory, and the server's own
     // list is never auto-imported. A control-only refresh keeps the current list to avoid flicker.
     val projects = if (controlOnly && state.value.projects.isNotEmpty()) state.value.projects else store.localProjects(serverId).map { it.copy(serverId = serverId) }
     // Official home index: one global, newest-first listing of root sessions (directory filters are
     // exact, so per-project queries would miss worktrees). Reconciliation re-reads its first page too,
     // so a session created elsewhere while an event was missed still appears.
-    val page = client.rootSessionsPage()
+    val page = firstRound.page
     trace(token, ConnectMilestone.CATALOG)
     advanceStage(token, ConnectStage.SYNCING)
     val sessions = page.items.map { scoped(serverId, it) }
     // Activity is authoritative from `/api/session/active`; a failed read keeps last-known tasks.
-    val activeResult = attempt { client.activeSessions() }
+    val activeResult = firstRound.active
     val active = activeResult.getOrNull()
     if (token != generation || requestSequence != catalogSequence) return
+    // First tier done: the catalog is authoritative and the conversation can be read and written now,
+    // while the slower control-plane reads below (ancestry, children, shells, permissions, forms) run.
+    var earlyFollowUp: Job? = null
+    var earlySession: Session? = null
+    if (!controlOnly) {
+      mutable.update { current -> withSummary(current.copy(version = version, capabilities = capabilities, connected = true, loading = false,
+        error = null, lastContactAt = System.currentTimeMillis(),
+        sessions = (sessions + current.sessions).distinctBy { it.id }.sortedWith(sessionActivityOrder))) }
+      trace(token, ConnectMilestone.INTERACTIVE)
+      if (followUp) {
+        val current = state.value
+        earlySession = current.session
+        earlyFollowUp = CoroutineScope(currentCoroutineContext()).launch {
+          launch { loadChoices(current.homeDirectory.orEmpty(), token) }
+          current.session?.let { loadSession(it, token = token) }
+        }
+      }
+    }
     // Active sessions (often subagent children) may be older than the first page. Keep their identity and parent chain.
     val missingIds = (active.orEmpty() + listOfNotNull(state.value.sessionId, store.selectedSession(serverId)))
       .filter { id -> sessions.none { it.id == id } && state.value.sessions.none { it.id == id } }.distinct()
@@ -752,6 +798,25 @@ class LagoonController private constructor(private val appContext: Context) {
       return true
     }
     if (!fetchMissingParents()) return
+
+    // Pending requests only need the running and selected sessions' identities, which are all known
+    // now, so they are read while the child and shell discovery below runs instead of after it.
+    // Pending requests, read like the official client: permissions per session, forms per location.
+    // A directory whose recent read failed (typically a deleted worktree answering 500) is skipped
+    // until its retry window opens, so one dead directory cannot degrade the whole list forever.
+    val waitingCandidates = (active.orEmpty() + state.value.permissions.map { it.sessionId } + listOfNotNull(state.value.sessionId))
+      .distinct().mapNotNull { identities[it] }
+    val skippedPermissionSessions = waitingCandidates.filter { directoryHealth.isDown(it.directory) }.map { it.id }.toSet()
+    val readableCandidates = waitingCandidates.filterNot { it.id in skippedPermissionSessions }
+    val formDirectories = readableCandidates.map { it.directory }.filter(String::isNotBlank).distinctBy(::normalizedDirectory)
+      .filterNot { directoryHealth.isDown(it) }
+    val pendingReads = CoroutineScope(currentCoroutineContext()).async {
+      coroutineScope {
+        val permissionTasks = readableCandidates.map { session -> async { session.id to attempt { client.sessionPermissions(session) } } }
+        val formTasks = formDirectories.map { directory -> async { directory to attempt { client.forms(directory) } } }
+        permissionTasks.awaitAll() to formTasks.awaitAll()
+      }
+    }
 
     // `/api/session/active` and the event stream can both omit a child identity after a reconnect.
     // A persisted live root is enough to discover its descendants through the authoritative child
@@ -819,11 +884,7 @@ class LagoonController private constructor(private val appContext: Context) {
     // Pending requests, read like the official client: permissions per session, forms per location.
     // A directory whose recent read failed (typically a deleted worktree answering 500) is skipped
     // until its retry window opens, so one dead directory cannot degrade the whole list forever.
-    val waitingCandidates = (active.orEmpty() + state.value.permissions.map { it.sessionId } + listOfNotNull(state.value.sessionId))
-      .distinct().mapNotNull { identities[it] }
-    val skippedPermissionSessions = waitingCandidates.filter { directoryHealth.isDown(it.directory) }.map { it.id }.toSet()
-    val readableCandidates = waitingCandidates.filterNot { it.id in skippedPermissionSessions }
-    val permissionResults = coroutineScope { readableCandidates.map { session -> async { session.id to attempt { client.sessionPermissions(session) } } }.awaitAll() }
+    val (permissionResults, formResults) = pendingReads.await()
     permissionResults.forEach { (sessionId, result) ->
       val directory = identities[sessionId]?.directory ?: return@forEach
       if (result.isSuccess) directoryHealth.succeeded(directory) else directoryHealth.failed(directory)
@@ -836,9 +897,6 @@ class LagoonController private constructor(private val appContext: Context) {
       batch.map { directory -> async { directory to attempt { client.pendingPermissions(directory) } } }.awaitAll()
     } }
     sweptPermissions.forEach { (directory, result) -> if (result.isSuccess) directoryHealth.succeeded(directory) else directoryHealth.failed(directory) }
-    val formDirectories = readableCandidates.map { it.directory }.filter(String::isNotBlank).distinctBy(::normalizedDirectory)
-      .filterNot { directoryHealth.isDown(it) }
-    val formResults = coroutineScope { formDirectories.map { directory -> async { directory to attempt { client.forms(directory) } } }.awaitAll() }
     formResults.forEach { (directory, result) -> if (result.isSuccess) directoryHealth.succeeded(directory) else directoryHealth.failed(directory) }
     if (token != generation || requestSequence != catalogSequence) return
     val failedPermissionSessions = permissionResults.filter { it.second.isFailure }.map { it.first }.toSet() + skippedPermissionSessions
@@ -969,6 +1027,7 @@ class LagoonController private constructor(private val appContext: Context) {
         sessionId = (previous.sessionId ?: store.selectedSession(serverId))?.takeIf { id -> nextSessions.any { it.id == id } }))
     }
     trace(token, ConnectMilestone.INTERACTIVE)
+    trace(token, ConnectMilestone.CONTROL)
     // 权威读取证明已处理的等待项：撤掉可能已发出的“需要授权 / 等待回答”通知。
     resolvedWaitingIds.forEach(::cancelAttention)
     finishedRuns.forEach { (session, runSince) ->
@@ -987,10 +1046,11 @@ class LagoonController private constructor(private val appContext: Context) {
       current.session?.let { loadSession(it, token = token, ancillary = false) }
       return
     }
-     // 未打开会话时也按首页选中的服务器加载模型目录（项目 → 最近会话目录），管理模型因此不再依赖会话。
-     // 没有项目/会话时传空目录，让服务器按自己的默认工作区返回模型目录。
-     loadChoices(current.homeDirectory.orEmpty(), token)
-    current.session?.let { loadSession(it, token = token) }
+    // 未打开会话时也按首页选中的服务器加载模型目录（项目 → 最近会话目录），管理模型因此不再依赖会话。
+    // 没有项目/会话时传空目录，让服务器按自己的默认工作区返回模型目录。它们与会话内容已在第一层读完后
+    // 并行开始；这里只补上当时还不认识的会话（例如只能从祖先链补读到的会话）。
+    earlyFollowUp?.join()
+    if (earlySession == null) current.session?.let { loadSession(it, token = token) }
   }
   fun loadMoreSessions() = act("sessions-more") { op ->
     val cursor = op.snapshot.sessionCursors[""] ?: return@act
@@ -2170,3 +2230,6 @@ class LagoonController private constructor(private val appContext: Context) {
     catch (cancel: CancellationException) { throw cancel }
     catch (error: Exception) { Result.failure(error) }
 }
+
+/** The four independent reads of a control-plane load's first round trip. */
+private data class FirstRound(val version: String, val capabilities: ApiCapabilities, val page: ApiPage<Session>, val active: Result<Set<String>>)
