@@ -123,6 +123,12 @@ data class LagoonState(
   val transcriptLoadingSince: Long = 0
 ) {
   val server: ServerProfile? get() = profiles.firstOrNull { it.id == serverId }
+  /**
+   * The open conversation can take a prompt now and deliver it once the server answers: the server is
+   * still connecting or is between retries, rather than not configured at all.
+   */
+  val canQueueSend: Boolean get() = !connected && serverId != null && session != null &&
+    connection.stage in setOf(ConnectStage.CONNECTING, ConnectStage.READING, ConnectStage.SYNCING, ConnectStage.RETRYING)
   val project: Project? get() = projects.firstOrNull { it.id == projectId }
   val session: Session? get() = sessions.firstOrNull { it.id == sessionId }
   val executionDirectory: String? get() = session?.directory ?: project?.directory
@@ -174,6 +180,8 @@ class LagoonController private constructor(private val appContext: Context) {
     private const val MAX_REQUEST_SESSIONS = 24
     /** Extra pages the initial load may pull so the first screen starts on a whole turn (official behaviour). */
     private const val MAX_INITIAL_PAGES = 5
+    /** Recent conversations whose first page is fetched into memory after a full read. */
+    private const val PREFETCH_SESSIONS = 3
     /** Away from the foreground longer than this, the live streams are rebuilt on return. */
     private const val STREAM_RESUME_RESTART_MILLIS = 60_000L
     /** 一次对账最多读取多少个目录的 shell 列表（首页项目优先，其次是最近活跃会话的目录）。 */
@@ -338,6 +346,8 @@ class LagoonController private constructor(private val appContext: Context) {
   private val openTrace = ConnectTrace()
   /** Recently viewed transcripts kept in memory, so switching back paints without decrypting the cache. */
   private val transcriptMemory = TranscriptMemory()
+  /** Prompts submitted while the server was unreachable; delivered once it is interactive again. */
+  private val queuedSends = mutableListOf<QueuedPrompt>()
 
   init {
     store.migrateLocalProjects()
@@ -471,6 +481,79 @@ class LagoonController private constructor(private val appContext: Context) {
   private var networkSeen = false
   /** Wall clock when the app last left the foreground; 0 while visible. */
   @Volatile private var backgroundedAt = 0L
+  /**
+   * Holds a prompt typed while the server is unreachable. It is shown at once as a “等待连接后发送” row
+   * and the composer is cleared; one pending prompt per conversation, so a second one is appended to
+   * it. Nothing typed is ever dropped: if it is not delivered, it goes back into the draft.
+   */
+  private fun queuePrompt(text: String, accepted: (() -> Unit)?) {
+    val current = state.value
+    val serverId = current.serverId ?: return
+    val sessionId = current.sessionId ?: return
+    if (text.isBlank()) { mutable.update { it.copy(error = "附件需要在连接恢复后发送") }; return }
+    val existing = queuedSends.firstOrNull { it.serverId == serverId && it.sessionId == sessionId }
+    val prompt = existing?.copy(text = existing.text + "\n\n" + text)
+      ?: QueuedPrompt(serverId, sessionId, text, PENDING_PREFIX + MessageIds.ascending(), System.currentTimeMillis())
+    queuedSends.remove(existing); queuedSends += prompt
+    mutable.update { it.copy(messages = it.messages.filterNot { message -> message.id == prompt.messageId } + prompt.row()) }
+    accepted?.invoke()
+  }
+  /** [messages] plus the conversation's pending prompt row, which no server read or cache paint knows about. */
+  private fun withPending(serverId: String?, sessionId: String?, messages: List<Message>): List<Message> {
+    val prompt = queuedSends.firstOrNull { it.serverId == serverId && it.sessionId == sessionId } ?: return messages
+    return if (messages.any { it.id == prompt.messageId }) messages else messages + prompt.row()
+  }
+  /** Delivers the open conversation's pending prompt once the server is interactive. */
+  private fun flushQueuedSends() {
+    val current = state.value
+    if (queuedSends.isEmpty() || !current.connected) return
+    val prompt = queuedSends.firstOrNull { it.serverId == current.serverId && it.sessionId == current.sessionId } ?: return
+    queuedSends.remove(prompt)
+    mutable.update { it.copy(messages = it.messages.filterNot { message -> message.id == prompt.messageId }) }
+    deliver(prompt.text, prompt.serverId, prompt.sessionId, accepted = null, onFailed = { restoreDraft(prompt) })
+  }
+  /** Pending prompts of conversations the user is leaving go back into their drafts, undelivered. */
+  private fun returnQueuedToDrafts(keep: (QueuedPrompt) -> Boolean = { false }) {
+    val leaving = queuedSends.filterNot(keep)
+    if (leaving.isEmpty()) return
+    queuedSends.removeAll(leaving)
+    val ids = leaving.map { it.messageId }.toSet()
+    mutable.update { it.copy(messages = it.messages.filterNot { message -> message.id in ids }) }
+    leaving.forEach(::restoreDraft)
+  }
+  private fun restoreDraft(prompt: QueuedPrompt) {
+    val current = state.value
+    if (current.serverId == prompt.serverId && current.sessionId == prompt.sessionId) {
+      updateDraft(listOf(prompt.text, current.draft).filter(String::isNotBlank).joinToString("\n\n"))
+    } else {
+      draftWrites.remove("${prompt.serverId}:${prompt.sessionId}")?.cancel()
+      val stored = attempt { store.draft(prompt.serverId, prompt.sessionId) }.getOrDefault("")
+      attempt { store.rememberDraft(prompt.serverId, prompt.sessionId, listOf(prompt.text, stored).filter(String::isNotBlank).joinToString("\n\n")) }
+    }
+  }
+  /**
+   * After a full read, the first page of the few most recent other conversations is fetched into
+   * memory, so opening one paints at once. OpenCode only (a DSH page read changes its live
+   * subscriptions), never on a metered network, and the server copy still replaces it on open.
+   */
+  private fun prefetchTranscripts(token: Int, client: HarnessClient) {
+    val current = state.value
+    val serverId = current.serverId ?: return
+    if (current.server?.kind != ServerKind.OPENCODE) return
+    val targets = current.sessions.asSequence()
+      .filter { it.parentId == null && !it.archived && it.id != current.sessionId && transcriptMemory.get(serverId, it.id) == null }
+      .take(PREFETCH_SESSIONS).toList()
+    if (targets.isEmpty()) return
+    scope.launch {
+      val metered = attempt { (appContext.getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager).isActiveNetworkMetered }.getOrDefault(true)
+      if (metered) return@launch
+      for (session in targets) {
+        if (token != generation) return@launch
+        val page = kotlinx.coroutines.withContext(Dispatchers.IO) { attempt { client.messagesPage(session.id) }.getOrNull() } ?: continue
+        if (token == generation && transcriptMemory.get(serverId, session.id) == null) transcriptMemory.put(serverId, session.id, page.items)
+      }
+    }
+  }
   /** “立即重试” from the status strip: skip the backoff wait and read the server now. */
   fun retryNow() {
     val id = state.value.serverId ?: return
@@ -503,10 +586,10 @@ class LagoonController private constructor(private val appContext: Context) {
    */
   private fun showCachedTranscript(serverId: String, sessionId: String, revision: Long) {
     fun stillWaiting() = state.value.serverId == serverId && state.value.sessionId == sessionId && selectionRevision == revision &&
-      state.value.messages.isEmpty() && state.value.resource("messages").state in setOf(ResourceState.LOADING, ResourceState.NOT_LOADED)
+      state.value.messages.persistable().isEmpty() && state.value.resource("messages").state in setOf(ResourceState.LOADING, ResourceState.NOT_LOADED)
     fun show(messages: List<Message>) {
       if (messages.isEmpty() || !stillWaiting()) return
-      mutable.update { withSummary(it.copy(messages = messages, provisionalMessageIds = messages.mapTo(mutableSetOf()) { message -> message.id })) }
+      mutable.update { withSummary(it.copy(messages = withPending(serverId, sessionId, messages), provisionalMessageIds = messages.mapTo(mutableSetOf()) { message -> message.id })) }
       openTrace.mark(revision, ConnectMilestone.CACHE_PAINT)
     }
     transcriptMemory.get(serverId, sessionId)?.let { show(it); return }
@@ -619,6 +702,8 @@ class LagoonController private constructor(private val appContext: Context) {
     allSnapshots.putAll(previous.serverSnapshots())
     previousServer?.let { previous.serverSnapshots()[it]?.let(allOverview::handoff) }
     if (!preserveHome) { store.rememberAllServers(false); store.rememberHomeServer(id) }
+    // A reconnect to the same server keeps the open conversation's pending prompt; anything else goes back to its draft.
+    returnQueuedToDrafts { it.serverId == id && it.sessionId == (sessionOverride ?: previous.sessionId) && id == previousServer }
     stopSingleConnection()
     val token = generation
     connectTrace.begin(token.toLong(), "连接 ${profile.kind.label}")
@@ -723,12 +808,12 @@ class LagoonController private constructor(private val appContext: Context) {
       trace(token, ConnectMilestone.CACHE_PAINT)
       mutable.update { it.copy(loading = false, connected = false, cached = true, error = "离线缓存：$reason",
         projects = projects, sessions = sessions, projectId = store.selectedProject(id) ?: projects.firstOrNull()?.id,
-        sessionId = sessionId, messages = emptyList(), catalogComplete = catalogComplete) }
+        sessionId = sessionId, messages = withPending(id, sessionId, emptyList()), catalogComplete = catalogComplete) }
       if (sessionId != null) {
         val (messages, messagesComplete) = kotlinx.coroutines.withContext(Dispatchers.IO) {
           cache.messages(id, sessionId) to cache.messagesComplete(id, sessionId)
         }
-        if (token == generation && state.value.serverId == id && state.value.sessionId == sessionId) mutable.update { withSummary(it.copy(messages = messages, cacheComplete = messagesComplete, resources = mapOf("messages" to ResourceStatus(ResourceState.STALE, "离线缓存")))) }
+        if (token == generation && state.value.serverId == id && state.value.sessionId == sessionId) mutable.update { withSummary(it.copy(messages = withPending(id, sessionId, messages), cacheComplete = messagesComplete, resources = mapOf("messages" to ResourceStatus(ResourceState.STALE, "离线缓存")))) }
       }
     }
   }
@@ -777,6 +862,7 @@ class LagoonController private constructor(private val appContext: Context) {
         error = null, lastContactAt = System.currentTimeMillis(),
         sessions = (sessions + current.sessions).distinctBy { it.id }.sortedWith(sessionActivityOrder))) }
       trace(token, ConnectMilestone.INTERACTIVE)
+      flushQueuedSends()
       if (followUp) {
         val current = state.value
         earlySession = current.session
@@ -1045,6 +1131,7 @@ class LagoonController private constructor(private val appContext: Context) {
     }
     trace(token, ConnectMilestone.INTERACTIVE)
     trace(token, ConnectMilestone.CONTROL)
+    flushQueuedSends()
     // 权威读取证明已处理的等待项：撤掉可能已发出的“需要授权 / 等待回答”通知。
     resolvedWaitingIds.forEach(::cancelAttention)
     finishedRuns.forEach { (session, runSince) ->
@@ -1068,6 +1155,7 @@ class LagoonController private constructor(private val appContext: Context) {
     // 并行开始；这里只补上当时还不认识的会话（例如只能从祖先链补读到的会话）。
     earlyFollowUp?.join()
     if (earlySession == null) current.session?.let { loadSession(it, token = token) }
+    prefetchTranscripts(token, client)
   }
   fun loadMoreSessions() = act("sessions-more") { op ->
     val cursor = op.snapshot.sessionCursors[""] ?: return@act
@@ -1652,14 +1740,15 @@ class LagoonController private constructor(private val appContext: Context) {
     openTrace.begin(selectionRevision, "打开会话")
     val project = resolveSessionProject(session, mutable.value.projects)
     val serverId = state.value.serverId ?: return
+    returnQueuedToDrafts { it.serverId == serverId && it.sessionId == id }
     val outgoing = mutable.value
-    outgoing.sessionId?.takeIf { it != id && outgoing.provisionalMessageIds.isEmpty() }?.let { transcriptMemory.put(serverId, it, outgoing.messages) }
+    outgoing.sessionId?.takeIf { it != id && outgoing.provisionalMessageIds.isEmpty() }?.let { transcriptMemory.put(serverId, it, outgoing.messages.persistable()) }
     val configuration = store.configuration(serverId, id)
     // 同一会话被重新选中（通知/深链）时保留输入框里的最新文字，避免回退尚未落盘（约 350ms 防抖）的输入。
     val draft = if (mutable.value.sessionId == id) mutable.value.draft else store.draft(serverId, id)
     visibleConversation = null
     val offline = mutable.value.cached && !mutable.value.connected
-    val messages = emptyList<Message>()
+    val messages = withPending(serverId, id, emptyList())
     mutable.update { withSummary(it.copy(projectId = project?.id, sessionId = id, messages = messages,
       agent = configuration.agent ?: session.agent, model = configuration.model ?: session.model,
       agentChanged = configuration.agentChanged, modelChanged = configuration.modelChanged,
@@ -1725,7 +1814,7 @@ class LagoonController private constructor(private val appContext: Context) {
       }
       // Merge by id so a tail refresh keeps older pages the reader already loaded and any
       // streaming/optimistic entry the server page has not caught up with yet.
-      mergeTranscript(previousMessages.takeIf { current() }.orEmpty(), fetched, pending)
+      withPending(serverId, session.id, mergeTranscript(previousMessages.takeIf { current() }.orEmpty(), fetched, pending))
     }.getOrElse { error ->
       // Shown in place (“保留上次数据 · …”); a transcript read failure is not a global error toast.
       Diagnostics.warn("LagoonController", "会话消息读取失败", error)
@@ -1734,7 +1823,7 @@ class LagoonController private constructor(private val appContext: Context) {
         resources = it.resources + ("messages" to ResourceStatus(if (fallback.isEmpty()) ResourceState.ERROR else ResourceState.STALE, userFacingError(error)))) }
       if (fallback.isEmpty()) return else fallback
     }
-    if (result.isSuccess) cache.saveMessages(serverId, session.id, messages, complete = nextCursor == null)
+    if (result.isSuccess) cache.saveMessages(serverId, session.id, messages.persistable(), complete = nextCursor == null)
     if (!current()) return
     if (result.isSuccess) {
       trace(token, ConnectMilestone.TRANSCRIPT)
@@ -1742,12 +1831,12 @@ class LagoonController private constructor(private val appContext: Context) {
     }
     val preview = messages.sessionPreview()
     if (result.isSuccess) store.rememberPreview(serverId, session.id, preview)
-    if (result.isSuccess) transcriptMemory.put(serverId, session.id, messages)
+    if (result.isSuccess) transcriptMemory.put(serverId, session.id, messages.persistable())
     val latestAgent = messages.asReversed().firstNotNullOfOrNull { it.agent } ?: session.agent
     val latestModel = messages.asReversed().firstNotNullOfOrNull { it.model } ?: session.model
     // 缓存完整性标志解密+解析缓存体，不能放在主线程的状态提交里。
     val cachedComplete = if (result.isSuccess) true else kotlinx.coroutines.withContext(Dispatchers.IO) { cache.messagesComplete(serverId, session.id) }
-    mutable.update { withSummary(it.copy(messages = messages, cached = result.isFailure, messagesCursor = if (it.loadedOlderMessages) it.messagesCursor else nextCursor, cacheComplete = cachedComplete,
+    mutable.update { withSummary(it.copy(messages = withPending(serverId, session.id, messages), cached = result.isFailure, messagesCursor = if (it.loadedOlderMessages) it.messagesCursor else nextCursor, cacheComplete = cachedComplete,
       provisionalMessageIds = emptySet(), transcriptLoadingSince = 0,
       previews = it.previews + (session.id to preview),
       agent = if (it.agentChanged) it.agent else latestAgent,
@@ -2053,10 +2142,17 @@ class LagoonController private constructor(private val appContext: Context) {
    * running turn instead of being refused, and a failed admission removes the optimistic row again.
    * A slash command known to the server runs through `/command`.
    */
-  fun send(text: String, expectedServer: String? = state.value.serverId, expectedSession: String? = state.value.sessionId, accepted: (() -> Unit)? = null): Job {
+  fun send(text: String, expectedServer: String? = state.value.serverId, expectedSession: String? = state.value.sessionId, accepted: (() -> Unit)? = null): Job =
+    deliver(text, expectedServer, expectedSession, accepted, onFailed = null)
+  /** [send] with [onFailed] run when the server refuses the prompt (a held prompt then returns to the draft). */
+  private fun deliver(text: String, expectedServer: String?, expectedSession: String?, accepted: (() -> Unit)?, onFailed: (() -> Unit)?): Job {
     if (state.value.serverId != expectedServer || state.value.sessionId != expectedSession) {
       // 静默丢弃会让用户以为已经发出；明确提示并要求重试。
       mutable.update { it.copy(error = "当前会话已切换，消息未发送，请重试") }
+      return operationScope.launch { }
+    }
+    if (state.value.canQueueSend) {
+      queuePrompt(text, accepted)
       return operationScope.launch { }
     }
     return act("send") { op ->
@@ -2077,6 +2173,7 @@ class LagoonController private constructor(private val appContext: Context) {
         else op.client.send(session, text, agent, model, op.snapshot.references, inline, id)
       } catch (error: Exception) {
         op.commit { it.copy(messages = it.messages.filterNot { message -> message.id == id }) }
+        onFailed?.invoke()
         throw error
       }
       if (attachments.isNotEmpty()) {
@@ -2256,3 +2353,14 @@ class LagoonController private constructor(private val appContext: Context) {
 
 /** The four independent reads of a control-plane load's first round trip. */
 private data class FirstRound(val version: String, val capabilities: ApiCapabilities, val page: ApiPage<Session>, val active: Result<Set<String>>)
+
+/** A prompt held while its server is unreachable (see `LagoonController.queuePrompt`). */
+private data class QueuedPrompt(val serverId: String, val sessionId: String, val text: String, val messageId: String, val created: Long) {
+  fun row() = Message(messageId, "user", created, listOf(MessagePart("$messageId:text", "text", text = text)), queued = true, type = "user")
+}
+
+/** Id prefix of “等待连接后发送” rows; they exist only on this device and are never cached. */
+internal const val PENDING_PREFIX = "pending:"
+
+/** Rows that may be written to the transcript cache: everything except local pending prompts. */
+internal fun List<Message>.persistable(): List<Message> = filterNot { it.id.startsWith(PENDING_PREFIX) }

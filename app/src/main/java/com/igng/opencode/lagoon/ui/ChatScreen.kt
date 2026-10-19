@@ -570,9 +570,12 @@ private fun ChatComposer(
   val hasContent = value.text.isNotBlank() || state.references.isNotEmpty() || state.attachments.isNotEmpty()
   val expanded = focused || value.text.isNotEmpty() || state.attachments.isNotEmpty() || state.references.isNotEmpty()
   // Like the official composer, a prompt typed while the agent works steers the running turn.
-  val canSend = ready && state.connected && !state.cached && !sending && hasContent
+  // While the server is connecting or retrying, a typed prompt is held and delivered once it answers.
+  val queueing = actionKey == "send" && state.canQueueSend
+  val canSend = ready && !sending && hasContent && (state.connected && !state.cached || queueing && value.text.isNotBlank())
   val muted = MiuixTheme.colorScheme.onSurfaceVariantSummary
   val hint = when {
+    queueing -> "未连接 · 现在发送，连接恢复后会自动发出"
     !state.connected -> "离线 · 草稿保留，恢复连接后可发送"
     state.cached -> "消息未同步，刷新后可发送"
     sending -> "正在发送…"
