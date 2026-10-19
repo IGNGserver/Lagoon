@@ -133,8 +133,10 @@ interface HarnessClient {
 fun createHarnessClient(
   profile: ServerProfile,
   credentials: ServerCredentials,
-  callTimeoutSeconds: Long = 60
+  callTimeoutSeconds: Long = 60,
+  /** 客户端换到新会话 Cookie（或确认旧 Cookie 失效，传空串）时回调，由调用方落盘。 */
+  onCookie: (String) -> Unit = {}
 ): HarnessClient = when (profile.kind) {
   ServerKind.OPENCODE -> OpenCodeApi(profile, credentials, callTimeoutSeconds)
-  ServerKind.DSH -> DshApi(profile, credentials, callTimeoutSeconds)
+  ServerKind.DSH -> DshApi(profile, credentials, callTimeoutSeconds, onCookie)
 }

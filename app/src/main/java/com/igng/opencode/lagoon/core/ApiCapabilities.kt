@@ -25,7 +25,14 @@ data class ApiCapabilities(
   val sessionView: ActionEndpoint? = null,
   val archive: ArchiveEndpoint? = null,
   /** True when [fromDocument] read the instance's own OpenAPI document. */
-  val documented: Boolean = false
+  val documented: Boolean = false,
+  /** Sessions can be permanently deleted. DeepSeek Harness only archives. */
+  val deleteSession: Boolean = true,
+  /**
+   * Forking is offered on the phone. OpenCode keeps it off (revert covers "go back"); DeepSeek Harness
+   * has no message-level revert, so a fork is its way to branch off a session.
+   */
+  val fork: Boolean = false
 ) {
   fun supports(action: SessionAction) = action in actions
   companion object {

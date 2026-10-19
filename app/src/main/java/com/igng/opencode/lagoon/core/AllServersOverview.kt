@@ -98,7 +98,19 @@ internal class AllServersOverview(
   fun restart(profiles: List<ServerProfile>) { start(profiles); refreshAll() }
   fun client(id: String): HarnessClient = clients.getOrPut(id) {
     val (profile, credentials) = configurations[id] ?: error("服务器已移除")
-    createHarnessClient(profile, credentials)
+    createHarnessClient(profile, credentials) { cookie -> rememberCookie(id, profile, cookie) }
+  }
+
+  /**
+   * DSH 换到的会话 Cookie 落盘，下次启动直接复用（启动令牌在 dsh 重启后就作废了）。同步更新
+   * [configurations]，否则下一次 [start] 会把凭据变化误判为资料变更而重建这台服务器的连接。
+   */
+  private fun rememberCookie(id: String, profile: ServerProfile, cookie: String) {
+    store.rememberCookie(id, profile.url, cookie)
+    scope.launch {
+      val current = configurations[id] ?: return@launch
+      if (current.first == profile) configurations[id] = profile to store.credentials(id)
+    }
   }
   fun refreshAll() { wakes.values.forEach { it.trySend(Unit) }; reconnectHints.values.forEach { it.trySend(Unit) } }
   fun refresh(id: String) { wakes[id]?.trySend(Unit) }
