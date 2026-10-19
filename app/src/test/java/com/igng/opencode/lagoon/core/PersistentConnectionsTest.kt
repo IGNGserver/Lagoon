@@ -253,4 +253,35 @@ class PersistentConnectionsTest {
   private fun activePage(ids: List<String>) = org.json.JSONObject().put("data",
     org.json.JSONObject().also { data -> ids.forEach { data.put(it, org.json.JSONObject().put("type", "running")) } }).toString()
 
+
+  @Test fun restartStreamsReconnectsAStreamThatOnlyLooksAlive() = runBlocking {
+    MockWebServer().use { server ->
+      val streams = AtomicInteger()
+      val base = dispatcher(streams)
+      server.dispatcher = object : Dispatcher() {
+        override fun dispatch(request: RecordedRequest): MockResponse {
+          if (request.requestUrl!!.encodedPath != "/api/event") return base.dispatch(request)
+          streams.incrementAndGet()
+          // Delivers one event, then stalls: alive on paper only. (Short stall so the server can shut down.)
+          val event = "data: {\"type\":\"server.connected\",\"data\":{}}\n\n"
+          return MockResponse().setHeader("Content-Type", "text/event-stream")
+            .setBody(event + " ".repeat(64)).throttleBody(event.length.toLong(), 3, java.util.concurrent.TimeUnit.SECONDS)
+        }
+      }
+      val store = store(); val profile = profile("a", server); store.save(profile, null)
+      val scope = CoroutineScope(coroutineContext + SupervisorJob())
+      val snapshots = ConcurrentHashMap<String, ServerOverviewSnapshot>()
+      val manager = AllServersOverview(store, cache(), scope, { snapshots[it.serverId] = it })
+      try {
+        manager.start(listOf(profile))
+        awaitCondition { snapshots["a"]?.streamConnected == true }
+        assertEquals(1, streams.get())
+        manager.restartStreams()
+        // Reconnects without waiting out a backoff or the stalled socket.
+        withTimeout(1_500) { while (streams.get() < 2) delay(20) }
+        awaitCondition { snapshots["a"]?.streamConnected == true }
+      } finally { manager.stop(); scope.cancel() }
+    }
+  }
+
 }

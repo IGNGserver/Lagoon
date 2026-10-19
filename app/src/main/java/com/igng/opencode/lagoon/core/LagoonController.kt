@@ -174,6 +174,8 @@ class LagoonController private constructor(private val appContext: Context) {
     private const val MAX_REQUEST_SESSIONS = 24
     /** Extra pages the initial load may pull so the first screen starts on a whole turn (official behaviour). */
     private const val MAX_INITIAL_PAGES = 5
+    /** Away from the foreground longer than this, the live streams are rebuilt on return. */
+    private const val STREAM_RESUME_RESTART_MILLIS = 60_000L
     /** 一次对账最多读取多少个目录的 shell 列表（首页项目优先，其次是最近活跃会话的目录）。 */
     private const val MAX_SHELL_DIRECTORIES = 8
     /** shell 归属会话不在目录页时，最多补读多少个会话身份来解析父链。 */
@@ -464,6 +466,11 @@ class LagoonController private constructor(private val appContext: Context) {
       }
     }
   }
+  /** The default network last reported by Android; a different one means sockets may be stale. */
+  private var defaultNetwork: Any? = null
+  private var networkSeen = false
+  /** Wall clock when the app last left the foreground; 0 while visible. */
+  @Volatile private var backgroundedAt = 0L
   /** “立即重试” from the status strip: skip the backoff wait and read the server now. */
   fun retryNow() {
     val id = state.value.serverId ?: return
@@ -533,7 +540,17 @@ class LagoonController private constructor(private val appContext: Context) {
       val manager = appContext.getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
       manager.registerDefaultNetworkCallback(object : android.net.ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: android.net.Network) {
-          scope.launch { allOverview.refreshAll(); if (!state.value.connected) reloadConversation() }
+          scope.launch {
+            // The default network changed (Wi-Fi ↔ cellular, or back after a loss): sockets opened on the
+            // previous network may be half-open, so every stream reconnects now instead of hanging.
+            val switched = networkSeen && network != defaultNetwork
+            networkSeen = true; defaultNetwork = network
+            if (switched) allOverview.restartStreams()
+            allOverview.refreshAll(); if (!state.value.connected) reloadConversation()
+          }
+        }
+        override fun onLost(network: android.net.Network) {
+          scope.launch { if (network == defaultNetwork) defaultNetwork = null }
         }
       })
     }.onFailure { Diagnostics.warn("Network", "无法监听网络恢复", it) }
@@ -1105,6 +1122,11 @@ class LagoonController private constructor(private val appContext: Context) {
   fun onForeground() {
     foreground = true
     backgroundStop?.cancel()
+    // After a long pause the OS may have frozen or silently dropped the sockets; reconnect rather than
+    // trust a stream that only looks open.
+    val away = backgroundedAt.takeIf { it > 0 }?.let { System.currentTimeMillis() - it } ?: 0
+    backgroundedAt = 0
+    if (away > STREAM_RESUME_RESTART_MILLIS) allOverview.restartStreams()
     allOverview.start(store.profiles(), include = setOfNotNull(state.value.serverId))
     allOverview.refreshAll()
     ensureMonitoring(state.value)
@@ -1121,6 +1143,7 @@ class LagoonController private constructor(private val appContext: Context) {
   /** The app left the foreground: process-level connections keep running, the fallback reconcile pauses. */
   fun onBackground() {
     foreground = false
+    backgroundedAt = System.currentTimeMillis()
   }
 
   /** Called by [TaskMonitorService]: while it runs, the process (and the live stream) may stay up in background. */
