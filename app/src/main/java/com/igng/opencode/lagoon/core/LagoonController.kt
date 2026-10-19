@@ -273,7 +273,10 @@ class LagoonController private constructor(private val appContext: Context) {
   private val directoryHealth = DirectoryHealth()
   private val allOverview = AllServersOverview(store, cache, scope, ::acceptAllSnapshot, { state.value.serverId },
     { id, event -> if (id == state.value.serverId) handleEvent(event) },
-    { id -> if (id == state.value.serverId && api != null && connecting?.isActive != true) reloadConversation() },
+    { id ->
+      if (id == state.value.serverId) trace(generation, ConnectMilestone.STREAM)
+      if (id == state.value.serverId && api != null && connecting?.isActive != true) reloadConversation()
+    },
     directoryHealth)
   private var api: HarnessClient? = null
   private var stream: Job? = null
@@ -315,6 +318,10 @@ class LagoonController private constructor(private val appContext: Context) {
   private var waitingEventSeq = 0L
   private val waitingEventSeqAt = mutableMapOf<String, Long>()
   private val resolvedPermissions = linkedSetOf<String>()
+  /** Field timing of connect / reconnect / refresh attempts, keyed by [generation]. */
+  private val connectTrace = ConnectTrace()
+  /** Field timing of opening a conversation, keyed by [selectionRevision]. */
+  private val openTrace = ConnectTrace()
 
   init {
     store.migrateLocalProjects()
@@ -424,6 +431,11 @@ class LagoonController private constructor(private val appContext: Context) {
   }
   fun notifyOverviewAction(serverId: String) = allOverview.refresh(serverId)
   fun clearError() = mutable.update { it.copy(error = null) }
+  /** Recent connection and conversation-open timings, one line each, for the copied diagnostics. */
+  fun connectionDiagnostics(): String = (connectTrace.reports() + openTrace.reports()).joinToString("\n") { it.line() }
+  private fun trace(token: Int, milestone: ConnectMilestone) {
+    connectTrace.mark(token.toLong(), milestone)?.let { Diagnostics.info("ConnectTrace", "${milestone.label} ${it}ms") }
+  }
   fun clearMessage() = mutable.update { it.copy(message = null) }
 
   fun setPermissionPolicy(policy: PermissionPolicy) {
@@ -514,6 +526,7 @@ class LagoonController private constructor(private val appContext: Context) {
     if (!preserveHome) { store.rememberAllServers(false); store.rememberHomeServer(id) }
     stopSingleConnection()
     val token = generation
+    connectTrace.begin(token.toLong(), "连接 ${profile.kind.label}")
     allOverview.start(store.profiles(), include = setOfNotNull(id))
     api = allOverview.client(id)
     val rememberedProject = projectOverride ?: store.selectedProject(id)
@@ -537,6 +550,7 @@ class LagoonController private constructor(private val appContext: Context) {
       pendingAttachments = previous.pendingAttachments,
       modelOverrides = store.modelOverrides(id), modelVisibilityConfigured = store.modelVisibilityConfigured(id),
       modelVariants = store.modelVariants(id), recentModels = store.recentModels(id), scopeProjectId = store.scope(id)) }
+    if (state.value.sessions.isNotEmpty()) trace(token, ConnectMilestone.CACHE_PAINT)
     allOverview.selectionChanged(previousServer)
     connecting = scope.launch {
       try {
@@ -547,6 +561,7 @@ class LagoonController private constructor(private val appContext: Context) {
       } catch (error: Exception) {
         if (error is CancellationException) throw error
         if (token != generation) return@launch
+        connectTrace.fail(token.toLong(), userFacingError(error, "连接失败"))
         showOffline(id, token, userFacingError(error, "连接失败"))
         // A refresh while offline must be able to recover: retry the connection with backoff instead
         // of leaving the user on a stale snapshot with no path back to a live stream (A10).
@@ -575,6 +590,7 @@ class LagoonController private constructor(private val appContext: Context) {
   }
   private suspend fun reconnect(id: String, token: Int, attempt: Int) {
     val profile = store.profiles().firstOrNull { it.id == id } ?: return
+    connectTrace.begin(token.toLong(), "重连 ${profile.kind.label} 第 ${attempt + 1} 次")
     api = allOverview.client(id)
     try {
       loadAll(token)
@@ -582,6 +598,7 @@ class LagoonController private constructor(private val appContext: Context) {
       if (streamAllowed()) startStream(token)
     } catch (error: Exception) {
       if (error is CancellationException) throw error
+      if (token == generation) connectTrace.fail(token.toLong(), userFacingError(error, "连接失败"))
       if (token == generation) showOffline(id, token, if (error.isAuthFailure) userFacingError(error) else "连接失败，正在重试")
       scheduleReconnect(id, token, if (error.isAuthFailure) AUTH_RETRY_ATTEMPT else attempt + 1)
     }
@@ -601,6 +618,7 @@ class LagoonController private constructor(private val appContext: Context) {
         .map { it.copy(serverId = id) }
       val sessions = cachedSessions.map { scoped(id, it) }
       val sessionId = store.selectedSession(id)?.takeIf { selected -> sessions.any { it.id == selected } }
+      trace(token, ConnectMilestone.CACHE_PAINT)
       mutable.update { it.copy(loading = false, connected = false, cached = true, error = "离线缓存：$reason",
         projects = projects, sessions = sessions, projectId = store.selectedProject(id) ?: projects.firstOrNull()?.id,
         sessionId = sessionId, messages = emptyList(), catalogComplete = catalogComplete) }
@@ -630,6 +648,7 @@ class LagoonController private constructor(private val appContext: Context) {
     // exact, so per-project queries would miss worktrees). Reconciliation re-reads its first page too,
     // so a session created elsewhere while an event was missed still appears.
     val page = client.rootSessionsPage()
+    trace(token, ConnectMilestone.CATALOG)
     val sessions = page.items.map { scoped(serverId, it) }
     // Activity is authoritative from `/api/session/active`; a failed read keeps last-known tasks.
     val activeResult = attempt { client.activeSessions() }
@@ -879,6 +898,7 @@ class LagoonController private constructor(private val appContext: Context) {
         scopeProjectId = previous.scopeProjectId?.takeIf { id -> projects.any { it.id == id } },
         sessionId = (previous.sessionId ?: store.selectedSession(serverId))?.takeIf { id -> nextSessions.any { it.id == id } }))
     }
+    trace(token, ConnectMilestone.INTERACTIVE)
     // 权威读取证明已处理的等待项：撤掉可能已发出的“需要授权 / 等待回答”通知。
     resolvedWaitingIds.forEach(::cancelAttention)
     finishedRuns.forEach { (session, runSince) ->
@@ -926,6 +946,7 @@ class LagoonController private constructor(private val appContext: Context) {
     if (api == null || state.value.serverId == null) return scope.launch { }
     val token = generation
     refresh?.cancel()
+    connectTrace.begin(token.toLong(), "刷新")
     return scope.launch {
       try {
         loadAll(token)
@@ -934,6 +955,7 @@ class LagoonController private constructor(private val appContext: Context) {
         if (token == generation && stream?.isActive != true && streamAllowed()) startStream(token)
       } catch (error: Exception) {
         if (error is CancellationException) throw error
+        if (token == generation) connectTrace.fail(token.toLong(), userFacingError(error, "刷新失败"))
         if (token == generation) mutable.update { state -> state.copy(error = userFacingError(error, "刷新失败")) }
       }
     }.also { refresh = it }
@@ -1470,6 +1492,7 @@ class LagoonController private constructor(private val appContext: Context) {
   fun selectSession(id: String) {
     val session = mutable.value.sessions.firstOrNull { it.id == id } ?: return
     selectionRevision += 1
+    openTrace.begin(selectionRevision, "打开会话")
     val project = resolveSessionProject(session, mutable.value.projects)
     val serverId = state.value.serverId ?: return
     val configuration = store.configuration(serverId, id)
@@ -1490,6 +1513,7 @@ class LagoonController private constructor(private val appContext: Context) {
       val revision = selectionRevision
       scope.launch {
         val cachedMessages = kotlinx.coroutines.withContext(Dispatchers.IO) { cache.messages(serverId, id) }
+        if (state.value.serverId == serverId && selectionRevision == revision && cachedMessages.isNotEmpty()) openTrace.mark(revision, ConnectMilestone.CACHE_PAINT)
         if (state.value.serverId == serverId && selectionRevision == revision) mutable.update { it.copy(messages = cachedMessages, cacheComplete = false,
           resources = it.resources + ("messages" to ResourceStatus(if (cachedMessages.isEmpty()) ResourceState.ERROR else ResourceState.STALE, "离线缓存"))) }
       }
@@ -1547,6 +1571,10 @@ class LagoonController private constructor(private val appContext: Context) {
     }
     if (result.isSuccess) cache.saveMessages(serverId, session.id, messages, complete = nextCursor == null)
     if (!current()) return
+    if (result.isSuccess) {
+      trace(token, ConnectMilestone.TRANSCRIPT)
+      openTrace.mark(revision, ConnectMilestone.TRANSCRIPT)?.let { Diagnostics.info("ConnectTrace", "打开会话 · 会话内容 ${it}ms") }
+    }
     val preview = messages.sessionPreview()
     if (result.isSuccess) store.rememberPreview(serverId, session.id, preview)
     val latestAgent = messages.asReversed().firstNotNullOfOrNull { it.agent } ?: session.agent

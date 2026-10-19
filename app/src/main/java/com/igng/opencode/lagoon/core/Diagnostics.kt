@@ -14,4 +14,6 @@ internal object Diagnostics {
   private const val TAG = "Lagoon"
 
   fun warn(area: String, message: String, error: Throwable? = null) = Log.w(TAG, "[$area] $message", error)
+
+  fun info(area: String, message: String) = Log.i(TAG, "[$area] $message")
 }
