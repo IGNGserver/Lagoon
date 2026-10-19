@@ -580,7 +580,7 @@ private fun ThinkingRow(text: String) {
 @Composable
 internal fun ResourceHint(status: ResourceStatus, empty: String, explanation: String = "", retry: () -> Unit) {
   when (status.state) {
-    ResourceState.LOADING, ResourceState.NOT_LOADED -> Text("正在加载…", style = MiuixTheme.textStyles.footnote1)
+    ResourceState.LOADING, ResourceState.NOT_LOADED -> LoadingSkeleton()
     ResourceState.ERROR -> Column { Text(status.error ?: "加载失败", color = MiuixColorTokens.Error); TextButton(text = "重试", onClick = retry) }
     ResourceState.UNSUPPORTED -> Text("此服务器不提供该功能", style = MiuixTheme.textStyles.footnote1)
     ResourceState.STALE -> Column { Text("保留上次数据 · ${status.error.orEmpty()}", color = MiuixColorTokens.Warning); TextButton(text = "重新同步", onClick = retry) }

@@ -55,7 +55,7 @@ class ControllerRegressionTest {
     put(c,"scope",CoroutineScope(Job().apply { cancel() }+Dispatchers.Default))
     put(c,"store",ServerStore(preferences(),preferences(),{it},{it}));put(c,"cache",OfflineCache(context.getSharedPreferences("cache",0),{it},{it}));put(c,"sendMutex",kotlinx.coroutines.sync.Mutex()); put(c,"referenceMutex",kotlinx.coroutines.sync.Mutex()); put(c,"monitorRequested",mutableSetOf<String>()); put(c,"draftWrites",mutableMapOf<String,Job>()); put(c,"attentionJobs",mutableMapOf<String,Job>()); put(c,"waitingEventSeqAt",mutableMapOf<String,Long>())
     put(c, "resolvedPermissions", linkedSetOf<String>()); put(c,"backgroundSettles",mutableMapOf<String,Job>()); put(c,"directoryHealth",DirectoryHealth())
-    put(c, "connectTrace", ConnectTrace()); put(c, "openTrace", ConnectTrace())
+    put(c, "connectTrace", ConnectTrace()); put(c, "openTrace", ConnectTrace()); put(c, "transcriptMemory", TranscriptMemory())
     return c to mutable
   }
   private fun api(s:MockWebServer) = OpenCodeApi(ServerProfile("server","Server",s.url("/").toString(),allowCleartext=true), "fixture")
@@ -629,6 +629,30 @@ class ControllerRegressionTest {
       // The newest page began mid-turn, so one older page was pulled to start on the user turn.
       assertEquals(listOf("u1", "a1"), state.value.messages.map { it.id })
       assertEquals(2, requests.count { it.contains("/api/session/s/message") })
+    }
+  }
+
+  @Test fun cachePaintedRowsAreReplacedByTheServerPageWhileStreamedRowsSurvive() = runBlocking {
+    MockWebServer().use { server ->
+      server.dispatcher = object : Dispatcher() { override fun dispatch(request: RecordedRequest): MockResponse {
+        val url = request.requestUrl!!
+        return when (url.encodedPath) {
+          "/api/info" -> MockResponse().setBody("""{"version":"2.0.22"}""")
+          "/api/session/s/message" -> MockResponse().setBody("""{"data":[{"id":"u1","type":"user","time":{"created":1},"text":"hi"}],"cursor":{}}""")
+          else -> MockResponse().setBody("""{"data":[]}""")
+        }
+      } }
+      val api = api(server); api.health()
+      val session = Session("s", "/repo", "T", 0)
+      // "gone" was reverted on the server after the cache was written; "live" streamed in during the read.
+      val cached = listOf(Message("u1", "user", 1, emptyList()), Message("gone", "assistant", 2, emptyList()))
+      val (controller, state) = controller(api, LagoonState(serverId = "server", connected = true, sessions = listOf(session), sessionId = "s",
+        messages = cached + Message("live", "assistant", 3, emptyList()), provisionalMessageIds = setOf("u1", "gone"),
+        transcriptLoadingSince = 1))
+      readTranscript(controller, api, session)
+      assertEquals(listOf("u1", "live"), state.value.messages.map { it.id })
+      assertTrue(state.value.provisionalMessageIds.isEmpty())
+      assertEquals(0L, state.value.transcriptLoadingSince)
     }
   }
 

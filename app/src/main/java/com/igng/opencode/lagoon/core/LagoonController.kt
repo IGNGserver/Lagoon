@@ -108,7 +108,18 @@ data class LagoonState(
   val permissionPolicy: PermissionPolicy = PermissionPolicy(),
   val autoApprovalFailures: Set<String> = emptySet(),
   /** Wall clock of the last successful control-plane read of the writable server. */
-  val lastContactAt: Long = 0
+  val lastContactAt: Long = 0,
+  /** What the selected server's connection is waiting for; drives the status strip under the header. */
+  val connection: ConnectionStatus = ConnectionStatus(),
+  /** Wall clock when the selected server's live stream went down; 0 while it is up. */
+  val streamDownSince: Long = 0,
+  /**
+   * Ids of transcript rows shown from the device cache while the server copy is read. They are
+   * replaced, not merged, once the authoritative page arrives.
+   */
+  val provisionalMessageIds: Set<String> = emptySet(),
+  /** Wall clock when the open conversation's transcript read began; 0 when it is not loading. */
+  val transcriptLoadingSince: Long = 0
 ) {
   val server: ServerProfile? get() = profiles.firstOrNull { it.id == serverId }
   val project: Project? get() = projects.firstOrNull { it.id == projectId }
@@ -322,6 +333,8 @@ class LagoonController private constructor(private val appContext: Context) {
   private val connectTrace = ConnectTrace()
   /** Field timing of opening a conversation, keyed by [selectionRevision]. */
   private val openTrace = ConnectTrace()
+  /** Recently viewed transcripts kept in memory, so switching back paints without decrypting the cache. */
+  private val transcriptMemory = TranscriptMemory()
 
   init {
     store.migrateLocalProjects()
@@ -355,6 +368,8 @@ class LagoonController private constructor(private val appContext: Context) {
     mutable.update { current ->
       withSummary(current.copy(profiles = profiles, allServerSnapshots = allSnapshots.toMap(),
         streamConnected = if (current.serverId == snapshot.serverId) snapshot.streamConnected else current.streamConnected,
+        streamDownSince = if (current.serverId != snapshot.serverId) current.streamDownSince
+          else if (snapshot.streamConnected) 0 else current.streamDownSince.takeIf { it > 0 } ?: System.currentTimeMillis(),
         autoApprovalFailures = if (current.serverId == snapshot.serverId) snapshot.autoApprovalFailures else current.autoApprovalFailures))
     }
     // The conversation reducer publishes its own attention/results. Never have two owners.
@@ -431,6 +446,50 @@ class LagoonController private constructor(private val appContext: Context) {
   }
   fun notifyOverviewAction(serverId: String) = allOverview.refresh(serverId)
   fun clearError() = mutable.update { it.copy(error = null) }
+  /** “立即重试” from the status strip: skip the backoff wait and read the server now. */
+  fun retryNow() {
+    val id = state.value.serverId ?: return
+    if (api == null) connect(id, preserveHome = true) else reload()
+  }
+  private fun retryReason(error: String?): String = error?.removePrefix("离线缓存：")?.takeIf { it.isNotBlank() } ?: "连接失败"
+  private fun setStage(token: Int, stage: ConnectStage) {
+    if (token != generation) return
+    mutable.update { if (it.connection.stage == stage) it else it.copy(connection = ConnectionStatus(stage, System.currentTimeMillis())) }
+  }
+  /** Moves the connecting stages forward; a background refresh of an interactive screen stays READY. */
+  private fun advanceStage(token: Int, stage: ConnectStage) {
+    if (state.value.connection.stage != ConnectStage.READY) setStage(token, stage)
+  }
+  /** Cold start: show the last catalog this device saw while the server is read, never an empty list. */
+  private fun paintCachedCatalog(id: String, token: Int) {
+    scope.launch {
+      val cached = kotlinx.coroutines.withContext(Dispatchers.IO) { attempt { cache.catalog(id) }.getOrNull() } ?: return@launch
+      if (token != generation || state.value.serverId != id || state.value.connected || state.value.sessions.isNotEmpty()) return@launch
+      val projects = (cached.first + store.localProjects(id)).distinctBy { normalizedDirectory(it.directory) }.map { it.copy(serverId = id) }
+      if (cached.second.isEmpty()) return@launch
+      mutable.update { current -> withSummary(current.copy(sessions = cached.second.map { scoped(id, it) }.sortedWith(sessionActivityOrder),
+        projects = current.projects.takeIf { it.isNotEmpty() } ?: projects)) }
+      trace(token, ConnectMilestone.CACHE_PAINT)
+    }
+  }
+  /**
+   * Shows the conversation's last known transcript (memory first, then the encrypted cache) while the
+   * server copy is read. Only fills an empty, still-loading transcript of the same selection.
+   */
+  private fun showCachedTranscript(serverId: String, sessionId: String, revision: Long) {
+    fun stillWaiting() = state.value.serverId == serverId && state.value.sessionId == sessionId && selectionRevision == revision &&
+      state.value.messages.isEmpty() && state.value.resource("messages").state in setOf(ResourceState.LOADING, ResourceState.NOT_LOADED)
+    fun show(messages: List<Message>) {
+      if (messages.isEmpty() || !stillWaiting()) return
+      mutable.update { withSummary(it.copy(messages = messages, provisionalMessageIds = messages.mapTo(mutableSetOf()) { message -> message.id })) }
+      openTrace.mark(revision, ConnectMilestone.CACHE_PAINT)
+    }
+    transcriptMemory.get(serverId, sessionId)?.let { show(it); return }
+    scope.launch {
+      val cached = kotlinx.coroutines.withContext(Dispatchers.IO) { attempt { cache.messages(serverId, sessionId) }.getOrDefault(emptyList()) }
+      show(cached)
+    }
+  }
   /** Recent connection and conversation-open timings, one line each, for the copied diagnostics. */
   fun connectionDiagnostics(): String = (connectTrace.reports() + openTrace.reports()).joinToString("\n") { it.line() }
   private fun trace(token: Int, milestone: ConnectMilestone) {
@@ -493,6 +552,7 @@ class LagoonController private constructor(private val appContext: Context) {
       stopSingleConnection()
     }
     allSnapshots.remove(id)
+    transcriptMemory.forgetServer(id)
     store.delete(id)
     cache.delete(id)
     scheduleBackgroundSync()
@@ -544,6 +604,8 @@ class LagoonController private constructor(private val appContext: Context) {
       sessions = snapshot?.sessions.orEmpty(), projects = snapshot?.projects ?: store.localProjects(id).map { it.copy(serverId = id) },
       permissions = snapshot?.permissions.orEmpty(), questions = snapshot?.questions.orEmpty(),
       autoApprovalFailures = snapshot?.autoApprovalFailures.orEmpty(), streamConnected = snapshot?.streamConnected == true,
+      streamDownSince = if (snapshot?.streamConnected == true) 0 else System.currentTimeMillis(),
+      connection = ConnectionStatus(ConnectStage.CONNECTING, System.currentTimeMillis()),
       agent = configuration.agent, model = configuration.model, agentChanged = configuration.agentChanged, modelChanged = configuration.modelChanged,
       draft = rememberedSession?.let { store.draft(id, it) }.orEmpty(), references = rememberedSession?.let { store.references(id, it) }.orEmpty(),
       tasks = snapshot?.tasks ?: store.taskStates(id), knownParents = store.taskParents(id), notices = store.sessionNotices(id), collapsedSections = store.collapsedSections(id), pinned = store.pinnedSessions(id),
@@ -551,6 +613,8 @@ class LagoonController private constructor(private val appContext: Context) {
       modelOverrides = store.modelOverrides(id), modelVisibilityConfigured = store.modelVisibilityConfigured(id),
       modelVariants = store.modelVariants(id), recentModels = store.recentModels(id), scopeProjectId = store.scope(id)) }
     if (state.value.sessions.isNotEmpty()) trace(token, ConnectMilestone.CACHE_PAINT)
+    else paintCachedCatalog(id, token)
+    rememberedSession?.let { openTrace.begin(selectionRevision, "恢复会话"); showCachedTranscript(id, it, selectionRevision) }
     allOverview.selectionChanged(previousServer)
     connecting = scope.launch {
       try {
@@ -583,6 +647,8 @@ class LagoonController private constructor(private val appContext: Context) {
   private fun scheduleReconnect(id: String, token: Int, attempt: Int = 0) {
     if (token != generation || state.value.serverId != id) return
     val delayMillis = (2_000L shl attempt.coerceAtMost(4)).coerceAtMost(60_000L)
+    val now = System.currentTimeMillis()
+    mutable.update { it.copy(connection = ConnectionStatus(ConnectStage.RETRYING, now, now + delayMillis, retryReason(it.error))) }
     scope.launch {
       delay(delayMillis)
       if (token == generation && state.value.serverId == id && !state.value.connected) reconnect(id, token, attempt)
@@ -591,6 +657,7 @@ class LagoonController private constructor(private val appContext: Context) {
   private suspend fun reconnect(id: String, token: Int, attempt: Int) {
     val profile = store.profiles().firstOrNull { it.id == id } ?: return
     connectTrace.begin(token.toLong(), "重连 ${profile.kind.label} 第 ${attempt + 1} 次")
+    setStage(token, ConnectStage.CONNECTING)
     api = allOverview.client(id)
     try {
       loadAll(token)
@@ -640,6 +707,7 @@ class LagoonController private constructor(private val appContext: Context) {
     val version = client.health()
     val capabilities = client.discoverCapabilities()
     if (token != generation) return
+    advanceStage(token, ConnectStage.READING)
     val serverId = state.value.serverId ?: return
     // The project list is device-local: the user registers a server directory, and the server's own
     // list is never auto-imported. A control-only refresh keeps the current list to avoid flicker.
@@ -649,6 +717,7 @@ class LagoonController private constructor(private val appContext: Context) {
     // so a session created elsewhere while an event was missed still appears.
     val page = client.rootSessionsPage()
     trace(token, ConnectMilestone.CATALOG)
+    advanceStage(token, ConnectStage.SYNCING)
     val sessions = page.items.map { scoped(serverId, it) }
     // Activity is authoritative from `/api/session/active`; a failed read keeps last-known tasks.
     val activeResult = attempt { client.activeSessions() }
@@ -892,6 +961,7 @@ class LagoonController private constructor(private val appContext: Context) {
       withSummary(previous.copy(version = version, capabilities = capabilities,
         draftSessions = store.draftSessionIds(serverId), previews = nextSessions.associate { session -> session.id to (previous.previews[session.id] ?: store.sessionPreview(serverId, session.id)) }, connected = true, cached = previous.cached && previous.sessionId != null, loading = false,
         error = null, degraded = degraded, lastContactAt = System.currentTimeMillis(),
+        connection = if (previous.connection.stage == ConnectStage.READY) previous.connection else ConnectionStatus(ConnectStage.READY, System.currentTimeMillis()),
         projects = projects, sessions = nextSessions, knownParents = store.taskParents(serverId), tasks = states, shells = nextShells, notices = store.sessionNotices(serverId), collapsedSections = store.collapsedSections(serverId), sessionCursors = cursors, catalogComplete = cursors.isEmpty(),
         permissions = nextPermissions, questions = nextQuestions,
         projectId = (previous.projectId ?: store.selectedProject(serverId))?.takeIf { id -> projects.any { it.id == id } } ?: projects.firstOrNull()?.id,
@@ -947,6 +1017,7 @@ class LagoonController private constructor(private val appContext: Context) {
     val token = generation
     refresh?.cancel()
     connectTrace.begin(token.toLong(), "刷新")
+    advanceStage(token, ConnectStage.CONNECTING)
     return scope.launch {
       try {
         loadAll(token)
@@ -956,7 +1027,9 @@ class LagoonController private constructor(private val appContext: Context) {
       } catch (error: Exception) {
         if (error is CancellationException) throw error
         if (token == generation) connectTrace.fail(token.toLong(), userFacingError(error, "刷新失败"))
-        if (token == generation) mutable.update { state -> state.copy(error = userFacingError(error, "刷新失败")) }
+        if (token == generation) mutable.update { state -> state.copy(error = userFacingError(error, "刷新失败"),
+          connection = if (state.connection.stage == ConnectStage.READY) state.connection
+            else ConnectionStatus(ConnectStage.RETRYING, System.currentTimeMillis(), state.connection.retryAt, retryReason(userFacingError(error, "刷新失败")))) }
       }
     }.also { refresh = it }
   }
@@ -1158,6 +1231,7 @@ class LagoonController private constructor(private val appContext: Context) {
         attentionJobs.remove(sessionId)?.cancel()
         waitingEventSeqAt.remove(sessionId)
         state.value.serverId?.let { server ->
+          transcriptMemory.forget(server, sessionId)
           store.forgetSession(server, sessionId)
           attempt { notifications.cancel(server, sessionId) }
         }
@@ -1495,6 +1569,8 @@ class LagoonController private constructor(private val appContext: Context) {
     openTrace.begin(selectionRevision, "打开会话")
     val project = resolveSessionProject(session, mutable.value.projects)
     val serverId = state.value.serverId ?: return
+    val outgoing = mutable.value
+    outgoing.sessionId?.takeIf { it != id && outgoing.provisionalMessageIds.isEmpty() }?.let { transcriptMemory.put(serverId, it, outgoing.messages) }
     val configuration = store.configuration(serverId, id)
     // 同一会话被重新选中（通知/深链）时保留输入框里的最新文字，避免回退尚未落盘（约 350ms 防抖）的输入。
     val draft = if (mutable.value.sessionId == id) mutable.value.draft else store.draft(serverId, id)
@@ -1505,6 +1581,7 @@ class LagoonController private constructor(private val appContext: Context) {
       agent = configuration.agent ?: session.agent, model = configuration.model ?: session.model,
       agentChanged = configuration.agentChanged, modelChanged = configuration.modelChanged,
       draft = draft, references = store.references(serverId, id), loadedOlderMessages = false, messagesCursor = null, resources = mapOf("messages" to ResourceStatus(ResourceState.LOADING)),
+      provisionalMessageIds = emptySet(), transcriptLoadingSince = if (offline) 0 else System.currentTimeMillis(),
       children = emptyList(), changes = emptyList(), files = emptyList(),
       searchResults = emptyList(), fileText = null, fileBinary = false)) }
     store.rememberLocation(project?.id, id)
@@ -1519,6 +1596,7 @@ class LagoonController private constructor(private val appContext: Context) {
       }
     } else {
       val token = generation
+      showCachedTranscript(serverId, id, selectionRevision)
       // Choices and the session transcript are independent; run them concurrently.
       scope.launch { coroutineScope { launch { loadChoices(session.directory, token) }; loadSession(session, token = token) } }
     }
@@ -1529,8 +1607,11 @@ class LagoonController private constructor(private val appContext: Context) {
     val revision = selectionRevision
     val requestSequence = ++messageSequence
     fun current() = token == generation && revision == selectionRevision && state.value.sessionId == session.id && state.value.executionDirectory == session.directory && requestSequence == messageSequence
-    if (current() && state.value.messages.isEmpty()) mutable.update { it.copy(resources = it.resources + ("messages" to ResourceStatus(ResourceState.LOADING))) }
-    val initialWindow = state.value.messages.isEmpty() && !state.value.loadedOlderMessages
+    val showingCache = state.value.provisionalMessageIds.isNotEmpty()
+    if (current() && (state.value.messages.isEmpty() || showingCache)) mutable.update { it.copy(resources = it.resources + ("messages" to ResourceStatus(ResourceState.LOADING)),
+      transcriptLoadingSince = it.transcriptLoadingSince.takeIf { since -> since > 0 } ?: System.currentTimeMillis()) }
+    // Rows painted from the cache are a placeholder: the read starts from a fresh initial window.
+    val initialWindow = (state.value.messages.isEmpty() || showingCache) && !state.value.loadedOlderMessages
     var nextCursor: String? = null
     // The newest page of the projected timeline plus admitted-but-undelivered input, like the official
     // client's message and pending syncs.
@@ -1540,7 +1621,8 @@ class LagoonController private constructor(private val appContext: Context) {
       page.await() to inbox.await().getOrDefault(emptyList())
     }
     if (token != generation) return
-    val previousMessages = state.value.messages
+    // Cache-painted rows are replaced by the server page; rows streamed in meanwhile are kept.
+    val previousMessages = state.value.provisionalMessageIds.let { provisional -> state.value.messages.filterNot { it.id in provisional } }
     val messages = result.map { first ->
       // Official initial window: keep pulling older pages until the oldest boundary is a whole turn,
       // so the first screen never starts mid-reply. Bounded so a refresh cannot burst unbounded.
@@ -1565,7 +1647,7 @@ class LagoonController private constructor(private val appContext: Context) {
       // Shown in place (“保留上次数据 · …”); a transcript read failure is not a global error toast.
       Diagnostics.warn("LagoonController", "会话消息读取失败", error)
       val fallback = kotlinx.coroutines.withContext(Dispatchers.IO) { cache.messages(serverId, session.id) }
-      if (current()) mutable.update { it.copy(cached = fallback.isNotEmpty(), cacheComplete = false,
+      if (current()) mutable.update { it.copy(cached = fallback.isNotEmpty(), cacheComplete = false, provisionalMessageIds = emptySet(), transcriptLoadingSince = 0,
         resources = it.resources + ("messages" to ResourceStatus(if (fallback.isEmpty()) ResourceState.ERROR else ResourceState.STALE, userFacingError(error)))) }
       if (fallback.isEmpty()) return else fallback
     }
@@ -1577,11 +1659,13 @@ class LagoonController private constructor(private val appContext: Context) {
     }
     val preview = messages.sessionPreview()
     if (result.isSuccess) store.rememberPreview(serverId, session.id, preview)
+    if (result.isSuccess) transcriptMemory.put(serverId, session.id, messages)
     val latestAgent = messages.asReversed().firstNotNullOfOrNull { it.agent } ?: session.agent
     val latestModel = messages.asReversed().firstNotNullOfOrNull { it.model } ?: session.model
     // 缓存完整性标志解密+解析缓存体，不能放在主线程的状态提交里。
     val cachedComplete = if (result.isSuccess) true else kotlinx.coroutines.withContext(Dispatchers.IO) { cache.messagesComplete(serverId, session.id) }
     mutable.update { withSummary(it.copy(messages = messages, cached = result.isFailure, messagesCursor = if (it.loadedOlderMessages) it.messagesCursor else nextCursor, cacheComplete = cachedComplete,
+      provisionalMessageIds = emptySet(), transcriptLoadingSince = 0,
       previews = it.previews + (session.id to preview),
       agent = if (it.agentChanged) it.agent else latestAgent,
       model = if (it.modelChanged) it.model else latestModel?.let { candidate ->
