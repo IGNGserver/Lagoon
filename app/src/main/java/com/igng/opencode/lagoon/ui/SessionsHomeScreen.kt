@@ -89,6 +89,7 @@ internal fun HomeScreen(
         }
       )
       if (!searching) ServerChips(state, onSelectServer, onEditServer)
+      if (!state.allServers) ConnectionStrip(state, controller)
       Box(Modifier.weight(1f).fillMaxWidth()) {
         SessionList(state, controller, grouping, query.trim(), onOpen, onNewSession, onEditServer,
           onRename = { renaming = it }, onDelete = { deleting = it })
@@ -280,7 +281,8 @@ private fun SessionList(
         }
       }
       if (sections.isEmpty()) item(key = "empty") {
-        Column(Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 48.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+        if (state.loading && query.isBlank()) SessionRowsSkeleton()
+        else Column(Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 48.dp), horizontalAlignment = Alignment.CenterHorizontally) {
           Text(when { state.loading -> "正在读取会话…"; query.isNotBlank() -> "没有符合条件的会话"; state.connected -> "暂无会话"; state.profiles.isEmpty() -> "还没有服务器"; else -> "尚未连接" }, color = muted)
           if (!state.loading && query.isBlank()) TextButton(text = if (state.connected) "新建会话" else if (state.profiles.isEmpty()) "添加服务器" else "重新连接",
             onClick = { if (state.connected) onNewSession() else if (state.profiles.isEmpty()) onEditServer(null) else controller.reload() })

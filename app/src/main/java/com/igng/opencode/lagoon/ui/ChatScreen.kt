@@ -97,6 +97,7 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
             MenuPopup(menu, { menu = false }, menuSections)
           }
         }
+        ConnectionStrip(state, controller)
         Conversation(state, controller, Modifier.weight(1f).fillMaxWidth(), ::openFile, { requestModal = it }, onOpenChild,
           onActivityGroup = {
             focusManager.clearFocus(); keyboard?.hide()
