@@ -55,7 +55,7 @@ class ControllerRegressionTest {
     put(c,"scope",CoroutineScope(Job().apply { cancel() }+Dispatchers.Default))
     put(c,"store",ServerStore(preferences(),preferences(),{it},{it}));put(c,"cache",OfflineCache(context.getSharedPreferences("cache",0),{it},{it}));put(c,"sendMutex",kotlinx.coroutines.sync.Mutex()); put(c,"referenceMutex",kotlinx.coroutines.sync.Mutex()); put(c,"monitorRequested",mutableSetOf<String>()); put(c,"draftWrites",mutableMapOf<String,Job>()); put(c,"attentionJobs",mutableMapOf<String,Job>()); put(c,"waitingEventSeqAt",mutableMapOf<String,Long>())
     put(c, "resolvedPermissions", linkedSetOf<String>()); put(c,"backgroundSettles",mutableMapOf<String,Job>()); put(c,"directoryHealth",DirectoryHealth())
-    put(c, "connectTrace", ConnectTrace()); put(c, "openTrace", ConnectTrace()); put(c, "transcriptMemory", TranscriptMemory())
+    put(c, "connectTrace", ConnectTrace()); put(c, "openTrace", ConnectTrace()); put(c, "transcriptMemory", TranscriptMemory()); put(c, "queuedSends", mutableListOf<Any>())
     return c to mutable
   }
   private fun api(s:MockWebServer) = OpenCodeApi(ServerProfile("server","Server",s.url("/").toString(),allowCleartext=true), "fixture")
@@ -692,6 +692,48 @@ class ControllerRegressionTest {
       assertEquals(ConnectStage.READY, state.value.connection.stage)
       assertEquals(listOf("u1"), state.value.messages.map { it.id })
     }
+  }
+
+
+  @Test fun aPromptTypedWhileReconnectingIsHeldThenDeliveredOnceTheServerAnswers() = runBlocking {
+    MockWebServer().use { server ->
+      val prompts = java.util.Collections.synchronizedList(mutableListOf<String>())
+      server.dispatcher = object : Dispatcher() { override fun dispatch(request: RecordedRequest): MockResponse {
+        val url = request.requestUrl!!
+        return when (url.encodedPath) {
+          "/api/info" -> MockResponse().setBody("""{"version":"2.0.22"}""")
+          "/api/session" -> MockResponse().setBody("""{"data":[{"id":"s","projectID":"p","location":{"directory":"/repo"},"time":{"created":1,"updated":1}}],"cursor":{}}""")
+          "/api/session/active" -> MockResponse().setBody("""{"data":{}}""")
+          "/api/session/s/prompt" -> { prompts += request.body.readUtf8(); MockResponse().setResponseCode(204) }
+          else -> MockResponse().setBody("""{"data":[]}""")
+        }
+      } }
+      val session = Session("s", "/repo", "T", 0, projectId = "p")
+      val (controller, state) = controller(api(server), LagoonState(serverId = "server", sessions = listOf(session), sessionId = "s",
+        connection = ConnectionStatus(ConnectStage.RETRYING, 1, 2, "连接失败")))
+      assertTrue(state.value.canQueueSend)
+      var cleared = 0
+      controller.send("hello", "server", "s") { cleared++ }.join()
+      controller.send("again", "server", "s") { cleared++ }.join()
+      // Shown at once as one pending row, the composer is cleared, nothing reached the server yet.
+      val pending = state.value.messages.single()
+      assertTrue(pending.id.startsWith(PENDING_PREFIX))
+      assertEquals("hello\n\nagain", pending.parts.single().text)
+      assertEquals(2, cleared)
+      assertTrue(prompts.isEmpty())
+      assertTrue("等待连接后发送" in TranscriptRows.build(state.value.messages, emptySet(), false).first { it.kind == "user" }.meta)
+      // The server answers: the held prompt goes out once, and its placeholder is replaced by the real row.
+      refresh(controller, controlOnly = false)
+      withTimeout(3_000) { while (prompts.isEmpty() || state.value.pending("send")) delay(10) }
+      assertEquals(1, prompts.size)
+      assertTrue(prompts.single(), prompts.single().contains("hello\\n\\nagain"))
+      assertTrue(state.value.messages.none { it.id.startsWith(PENDING_PREFIX) })
+    }
+  }
+
+  @Test fun pendingPromptsAreNeverWrittenToTheTranscriptCache() {
+    val rows = listOf(Message("m1", "user", 1, emptyList()), Message(PENDING_PREFIX + "x", "user", 2, emptyList(), queued = true))
+    assertEquals(listOf("m1"), rows.persistable().map { it.id })
   }
 
 }

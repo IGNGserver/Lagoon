@@ -136,7 +136,8 @@ object TranscriptRows {
       val text = user.parts.filter { it.type == "text" }.joinToString("\n") { it.text }.trim()
       val attachments = (user.parts.filter { it.type == "file" }.map { Attachment(it.path, it.mime, it.title) } + user.parts.flatMap { it.attachments }).distinctBy { it.url }
       rows += TranscriptRow("user:${user.id}", "user", text = text, attachments = attachments,
-        meta = listOfNotNull(if (user.queued) "排队中" else null, user.agent, user.model?.label, formatTime(user.created).substringAfter(' '))
+        meta = listOfNotNull(if (user.id.startsWith(PENDING_PREFIX)) "等待连接后发送" else if (user.queued) "排队中" else null,
+          user.agent, user.model?.label, formatTime(user.created).substringAfter(' '))
           .filter { it.isNotBlank() }.joinToString(" · "),
         copyText = text.takeIf { it.isNotBlank() }, status = if (user.queued) "queued" else "")
     }
