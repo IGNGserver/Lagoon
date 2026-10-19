@@ -53,14 +53,16 @@ class OpenCodeApi(
   private val credentials: ServerCredentials,
   /** Whole-call deadline. Background callers (e.g. notification actions) pass a small value to stay
    *  inside the short lifetime Android grants a BroadcastReceiver; foreground callers keep the default. */
-  callTimeoutSeconds: Long = 60
+  callTimeoutSeconds: Long = 60,
+  /** Silence after which the live event stream counts as dead; see [SharedHttp.STREAM_IDLE_SECONDS]. */
+  streamIdleSeconds: Long = SharedHttp.STREAM_IDLE_SECONDS
 ) : HarnessClient {
   constructor(profile: ServerProfile, password: String) : this(profile, ServerCredentials(profile.username, password))
 
   private val base: HttpUrl = requireNotNull(profile.url.trimEnd('/').toHttpUrlOrNull()) { "服务器地址无效" }
   private val origin = HttpOrigin.of(base)
   private val client = OkHttpClient.Builder()
-    .connectTimeout(10, TimeUnit.SECONDS)
+    .connectTimeout(SharedHttp.CONNECT_TIMEOUT_SECONDS, TimeUnit.SECONDS)
     .readTimeout(25, TimeUnit.SECONDS)
     .callTimeout(callTimeoutSeconds, TimeUnit.SECONDS)
     .connectionPool(SharedHttp.connectionPool)
@@ -84,7 +86,11 @@ class OpenCodeApi(
     // Long-lived streams would pin the in-flight counter; only request/response calls are measured.
     .apply { interceptors().remove(HttpMetrics.interceptor) }
     .dispatcher(SharedHttp.streamDispatcher)
-    .readTimeout(0, TimeUnit.MILLISECONDS)
+    // Not unbounded: a half-open socket (Wi-Fi/cellular switch, NAT expiry) otherwise looks connected
+    // forever. Any bytes (events, heartbeats, SSE comments) reset the timer; a stream silent this long
+    // is reconnected. Even on a server that sends no heartbeat that only costs one control-plane
+    // re-read per idle period, which the reconcile loop does anyway.
+    .readTimeout(streamIdleSeconds, TimeUnit.SECONDS)
     .callTimeout(0, TimeUnit.MILLISECONDS)
     .build()
   /** Dedicated scope for blocking HTTP work so a cancelled caller never waits on the socket. */

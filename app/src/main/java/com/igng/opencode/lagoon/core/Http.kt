@@ -29,6 +29,13 @@ internal object SharedHttp {
     maxRequestsPerHost = Int.MAX_VALUE
   }
   const val MAX_REQUESTS_PER_HOST = 8
+  /**
+   * TCP connect deadline. An unreachable server (VPN down, wrong LAN) used to hold the user for 10 s
+   * per attempt before anything said it failed; reachable servers connect well within this.
+   */
+  const val CONNECT_TIMEOUT_SECONDS = 6L
+  /** Longest silence tolerated on a live event stream before it is treated as dead and reconnected. */
+  const val STREAM_IDLE_SECONDS = 90L
   /** Blocking HTTP work; shared so per-API instances do not each leak a scope. */
   val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 }

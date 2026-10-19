@@ -72,7 +72,7 @@ class DshApi(
     if (profile.dshAuth == DshAuthMode.SECRET) DshCookie.decodeSecret(credentials.password) else null
 
   private val http = OkHttpClient.Builder()
-    .connectTimeout(10, TimeUnit.SECONDS)
+    .connectTimeout(SharedHttp.CONNECT_TIMEOUT_SECONDS, TimeUnit.SECONDS)
     .readTimeout(25, TimeUnit.SECONDS)
     .callTimeout(callTimeoutSeconds, TimeUnit.SECONDS)
     .connectionPool(SharedHttp.connectionPool)

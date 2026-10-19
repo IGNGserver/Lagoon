@@ -455,4 +455,22 @@ class OpenCodeApiTest {
       assertTrue(empty!!.message!!, empty.message!!.contains("空响应"))
     }
   }
+
+  @Test fun aSilentEventStreamFailsInsteadOfLookingConnectedForever() = runBlocking {
+    MockWebServer().use { server ->
+      // One event, then the connection goes quiet without closing: a half-open socket.
+      val event = "data: {\"type\":\"server.connected\",\"data\":{}}\n\n"
+      server.enqueue(MockResponse().setHeader("Content-Type", "text/event-stream")
+        .setBody(event + " ".repeat(64)).throttleBody(event.length.toLong(), 3, TimeUnit.SECONDS))
+      val api = OpenCodeApi(ServerProfile("local", "Local", server.url("/").toString().trimEnd('/'), "opencode", allowCleartext = true),
+        ServerCredentials("opencode", "secret"), streamIdleSeconds = 1)
+      val received = mutableListOf<String>()
+      val started = System.nanoTime()
+      val failure = kotlinx.coroutines.withTimeout(10_000) { runCatching { api.events().collect { received += it.type } }.exceptionOrNull() }
+      assertEquals(listOf("server.connected"), received)
+      assertTrue("a quiet stream must fail so the caller reconnects: $failure", failure is IOException)
+      assertTrue((System.nanoTime() - started) / 1_000_000 < 2_900)
+    }
+  }
+
 }

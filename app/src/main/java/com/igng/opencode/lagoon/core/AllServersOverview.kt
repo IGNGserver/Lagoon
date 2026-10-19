@@ -71,6 +71,8 @@ internal class AllServersOverview(
   private val approvers = mutableMapOf<String, PermissionAutoApprover>()
   private val snapshots = mutableMapOf<String, ServerOverviewSnapshot>()
   private val handoffs = mutableMapOf<String, ServerOverviewSnapshot>()
+  /** The collecting job of each server's live event stream, so it can be dropped on purpose. */
+  private val liveStreams = mutableMapOf<String, Job>()
 
   /**
    * Ensures one monitor per server that should stay connected: profiles with `autoConnect` enabled,
@@ -113,6 +115,14 @@ internal class AllServersOverview(
     }
   }
   fun refreshAll() { wakes.values.forEach { it.trySend(Unit) }; reconnectHints.values.forEach { it.trySend(Unit) } }
+
+  /**
+   * Drops every live event stream so each reconnects at once. After a network switch, or after the
+   * app slept in the background, a socket can be half-open: it looks connected but will never deliver
+   * another frame until the OS gives up on it, minutes later. Reconnecting is cheap, the stale stream
+   * is not.
+   */
+  fun restartStreams() { liveStreams.values.toList().forEach { it.cancel(CancellationException(STREAM_RESTART)) } }
   fun refresh(id: String) { wakes[id]?.trySend(Unit) }
   fun selectionChanged(previous: String?) { previous?.let(::refresh) }
   fun handoff(snapshot: ServerOverviewSnapshot) { handoffs[snapshot.serverId] = snapshot }
@@ -257,105 +267,116 @@ internal class AllServersOverview(
       launch {
         var retry = 1_000L
         while (isActive) {
+          var restarted = false
           try {
-            client.events(onOpen = {
-              scope.launch {
-                snapshot = snapshot.copy(streamConnected = true)
-                if (clients[id] !== client) return@launch
-                emit(snapshot)
-                refresh(id)
-                onConnected(id)
-              }
-            }).collect { event ->
-              if (event.id.isNotBlank()) {
-                if (!seenEvents.add(event.id)) return@collect
-                while (seenEvents.size > 512) seenEvents.remove(seenEvents.first())
-              }
-              val props = event.properties
-              val sessionId = props.sessionEventId(event.type)
-              if (event.type == "permission.asked" && approver.pending(listOf(props.toPermission(event.directory))).isEmpty()) return@collect
-              val before = snapshot.tasks[sessionId]
-              if (selectedServer() != id && sessionId.isNotBlank()) {
-                val backgroundWork = BackgroundWork.hasBackgroundWork(sessionId, snapshot.tasks, snapshot.shells, snapshot.parents)
-                TaskReducer.event(sessionId, event.type, props, before, event.created, backgroundWork)?.let { task ->
-                  waitingRevision++
-                  snapshot = snapshot.copy(tasks = snapshot.tasks + (sessionId to task))
+            coroutineScope {
+              val stream = launch {
+                client.events(onOpen = {
+                  scope.launch {
+                    snapshot = snapshot.copy(streamConnected = true)
+                    if (clients[id] !== client) return@launch
+                    emit(snapshot)
+                    refresh(id)
+                    onConnected(id)
+                  }
+                }).collect { event ->
+                  if (event.id.isNotBlank()) {
+                    if (!seenEvents.add(event.id)) return@collect
+                    while (seenEvents.size > 512) seenEvents.remove(seenEvents.first())
+                  }
+                  val props = event.properties
+                  val sessionId = props.sessionEventId(event.type)
+                  if (event.type == "permission.asked" && approver.pending(listOf(props.toPermission(event.directory))).isEmpty()) return@collect
+                  val before = snapshot.tasks[sessionId]
+                  if (selectedServer() != id && sessionId.isNotBlank()) {
+                    val backgroundWork = BackgroundWork.hasBackgroundWork(sessionId, snapshot.tasks, snapshot.shells, snapshot.parents)
+                    TaskReducer.event(sessionId, event.type, props, before, event.created, backgroundWork)?.let { task ->
+                      waitingRevision++
+                      snapshot = snapshot.copy(tasks = snapshot.tasks + (sessionId to task))
+                    }
+                  }
+                  if (event.type == "permission.asked") {
+                    waitingRevision++
+                    val request = props.toPermission(event.directory)
+                    snapshot = snapshot.copy(permissions = approver.pending(snapshot.permissions.filterNot { it.id == request.id } + request))
+                  } else if (event.type == "permission.replied") {
+                    waitingRevision++
+                    val requestId = props.str("requestID").ifBlank { props.str("id") }
+                    resolvedSessions += props.sessionEventId(event.type)
+                    while (resolvedSessions.size > 1000) resolvedSessions.remove(resolvedSessions.first())
+                    approver.settled(requestId)
+                    snapshot = snapshot.copy(permissions = snapshot.permissions.filterNot { it.id == requestId })
+                  } else if (event.type == "form.created") {
+                    waitingRevision++
+                    val form = props.obj("form").toForm(event.directory)
+                    snapshot = snapshot.copy(questions = snapshot.questions.filterNot { it.id == form.id } + form)
+                  } else if (event.type in setOf("form.replied", "form.cancelled")) {
+                    waitingRevision++
+                    val requestId = props.str("id").ifBlank { props.str("requestID") }
+                    resolvedFormSessions += props.sessionEventId(event.type)
+                    while (resolvedFormSessions.size > 1000) resolvedFormSessions.remove(resolvedFormSessions.first())
+                    snapshot = snapshot.copy(questions = snapshot.questions.filterNot { it.id == requestId })
+                  }
+                  onEvent(id, event)
+                  if (selectedServer() != id) {
+                    if (event.type == "session.created") {
+                      waitingRevision++
+                      val session = props.sessionInfo().toSession().copy(serverId = id)
+                      if (session.id.isNotBlank()) snapshot = snapshot.copy(sessions = (listOf(session) + snapshot.sessions).distinctBy { it.id },
+                        parents = snapshot.parents + listOfNotNull(session.parentId?.let { session.id to it }).toMap())
+                    }
+                    if (event.type == "session.deleted") {
+                      waitingRevision++
+                      store.forgetSession(id, sessionId)
+                      snapshot = snapshot.copy(
+                        sessions = snapshot.sessions.filterNot { it.id == sessionId },
+                        tasks = snapshot.tasks - sessionId,
+                        parents = snapshot.parents - sessionId,
+                        permissions = snapshot.permissions.filterNot { it.sessionId == sessionId },
+                        questions = snapshot.questions.filterNot { it.sessionId == sessionId })
+                    }
+                    if (event.type == "shell.created") props.obj("info").toShellJob(event.directory)?.let { job ->
+                      waitingRevision++
+                      snapshot = snapshot.copy(shells = snapshot.shells + (job.id to job))
+                    }
+                    if (event.type in setOf("shell.exited", "shell.deleted")) {
+                      waitingRevision++
+                      snapshot = snapshot.copy(shells = snapshot.shells - props.str("id"))
+                    }
+                    snapshot = snapshot.copy(tasks = BackgroundWork.fold(snapshot.tasks, snapshot.shells, snapshot.parents))
+                    snapshot = reconcileWaiting(snapshot, resolvedSessions, resolvedFormSessions = resolvedFormSessions)
+                    val session = snapshot.sessions.firstOrNull { it.id == sessionId }
+                    if (event.type in setOf("session.execution.succeeded", "session.execution.failed") && session?.parentId == null && session != null &&
+                      TaskSummary.aggregate(snapshot.tasks.filterValues { it.active }, snapshot.parents)[sessionId] == null &&
+                      !snapshot.notices.coversRun(sessionId, before?.since ?: event.created)) {
+                      val notice = SessionNotice("event:${event.id.ifBlank { "$sessionId:${event.created}" }}", sessionId,
+                        event.created.takeIf { it > 0 } ?: now(), event.type == "session.execution.failed")
+                      store.rememberNotice(id, notice)
+                      snapshot = snapshot.copy(notices = store.sessionNotices(id))
+                    }
+                    snapshot.tasks.values.forEach { store.rememberTask(id, it, snapshot.parents[it.sessionId]) }
+                  }
+                  emit(snapshot)
+                  if (event.type == "permission.asked") approver.consider(props.toPermission(event.directory))
+                  // Conflation keeps event consumption fast; never do a full HTTP round per token.
+                  refresh(id)
+                  retry = 1_000L
                 }
               }
-              if (event.type == "permission.asked") {
-                waitingRevision++
-                val request = props.toPermission(event.directory)
-                snapshot = snapshot.copy(permissions = approver.pending(snapshot.permissions.filterNot { it.id == request.id } + request))
-              } else if (event.type == "permission.replied") {
-                waitingRevision++
-                val requestId = props.str("requestID").ifBlank { props.str("id") }
-                resolvedSessions += props.sessionEventId(event.type)
-                while (resolvedSessions.size > 1000) resolvedSessions.remove(resolvedSessions.first())
-                approver.settled(requestId)
-                snapshot = snapshot.copy(permissions = snapshot.permissions.filterNot { it.id == requestId })
-              } else if (event.type == "form.created") {
-                waitingRevision++
-                val form = props.obj("form").toForm(event.directory)
-                snapshot = snapshot.copy(questions = snapshot.questions.filterNot { it.id == form.id } + form)
-              } else if (event.type in setOf("form.replied", "form.cancelled")) {
-                waitingRevision++
-                val requestId = props.str("id").ifBlank { props.str("requestID") }
-                resolvedFormSessions += props.sessionEventId(event.type)
-                while (resolvedFormSessions.size > 1000) resolvedFormSessions.remove(resolvedFormSessions.first())
-                snapshot = snapshot.copy(questions = snapshot.questions.filterNot { it.id == requestId })
-              }
-              onEvent(id, event)
-              if (selectedServer() != id) {
-                if (event.type == "session.created") {
-                  waitingRevision++
-                  val session = props.sessionInfo().toSession().copy(serverId = id)
-                  if (session.id.isNotBlank()) snapshot = snapshot.copy(sessions = (listOf(session) + snapshot.sessions).distinctBy { it.id },
-                    parents = snapshot.parents + listOfNotNull(session.parentId?.let { session.id to it }).toMap())
-                }
-                if (event.type == "session.deleted") {
-                  waitingRevision++
-                  store.forgetSession(id, sessionId)
-                  snapshot = snapshot.copy(
-                    sessions = snapshot.sessions.filterNot { it.id == sessionId },
-                    tasks = snapshot.tasks - sessionId,
-                    parents = snapshot.parents - sessionId,
-                    permissions = snapshot.permissions.filterNot { it.sessionId == sessionId },
-                    questions = snapshot.questions.filterNot { it.sessionId == sessionId })
-                }
-                if (event.type == "shell.created") props.obj("info").toShellJob(event.directory)?.let { job ->
-                  waitingRevision++
-                  snapshot = snapshot.copy(shells = snapshot.shells + (job.id to job))
-                }
-                if (event.type in setOf("shell.exited", "shell.deleted")) {
-                  waitingRevision++
-                  snapshot = snapshot.copy(shells = snapshot.shells - props.str("id"))
-                }
-                snapshot = snapshot.copy(tasks = BackgroundWork.fold(snapshot.tasks, snapshot.shells, snapshot.parents))
-                snapshot = reconcileWaiting(snapshot, resolvedSessions, resolvedFormSessions = resolvedFormSessions)
-                val session = snapshot.sessions.firstOrNull { it.id == sessionId }
-                if (event.type in setOf("session.execution.succeeded", "session.execution.failed") && session?.parentId == null && session != null &&
-                  TaskSummary.aggregate(snapshot.tasks.filterValues { it.active }, snapshot.parents)[sessionId] == null &&
-                  !snapshot.notices.coversRun(sessionId, before?.since ?: event.created)) {
-                  val notice = SessionNotice("event:${event.id.ifBlank { "$sessionId:${event.created}" }}", sessionId,
-                    event.created.takeIf { it > 0 } ?: now(), event.type == "session.execution.failed")
-                  store.rememberNotice(id, notice)
-                  snapshot = snapshot.copy(notices = store.sessionNotices(id))
-                }
-                snapshot.tasks.values.forEach { store.rememberTask(id, it, snapshot.parents[it.sessionId]) }
-              }
-              emit(snapshot)
-              if (event.type == "permission.asked") approver.consider(props.toPermission(event.directory))
-              // Conflation keeps event consumption fast; never do a full HTTP round per token.
-              refresh(id)
-              retry = 1_000L
+              liveStreams[id] = stream
+              stream.join()
+              // A deliberate restart cancels only this collector; the monitor itself keeps running.
+              restarted = stream.isCancelled
             }
           } catch (cancel: CancellationException) {
             throw cancel
           } catch (error: Exception) {
             Diagnostics.warn("AllServers", "服务器 ${profile.name} 实时连接断开", error)
           }
+          liveStreams.remove(id)
           snapshot = snapshot.copy(streamConnected = false)
           emit(snapshot)
+          if (restarted) { retry = 1_000L; continue }
           kotlinx.coroutines.withTimeoutOrNull(retry + kotlin.random.Random.nextLong(250)) { reconnectHints[id]?.receive() }
           retry = (retry * 2).coerceAtMost(30_000L)
         }
@@ -572,5 +593,6 @@ internal class AllServersOverview(
     const val MAX_SWEEP_DIRECTORIES = 12
     /** Streaming bursts coalesce for this long before one control-plane read is issued. */
     const val EVENT_READ_COALESCE_MILLIS = 3_000L
+    const val STREAM_RESTART = "实时连接重建"
   }
 }
