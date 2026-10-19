@@ -82,9 +82,12 @@ class DshApi(
       if (HttpOrigin.of(request.url) != origin) throw IOException("拒绝向非授权地址发送凭据")
       chain.proceed(request)
     }
+    .addInterceptor(HttpMetrics.interceptor)
     .build()
 
   private val streamHttp = http.newBuilder()
+    // Long-lived streams would pin the in-flight counter; only request/response calls are measured.
+    .apply { interceptors().remove(HttpMetrics.interceptor) }
     .dispatcher(SharedHttp.streamDispatcher)
     .readTimeout(0, TimeUnit.MILLISECONDS)
     .callTimeout(0, TimeUnit.MILLISECONDS)
