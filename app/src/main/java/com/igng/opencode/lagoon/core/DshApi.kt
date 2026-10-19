@@ -51,15 +51,23 @@ import java.util.concurrent.TimeUnit
 class DshApi(
   private val profile: ServerProfile,
   private val credentials: ServerCredentials,
-  callTimeoutSeconds: Long = 60
+  callTimeoutSeconds: Long = 60,
+  /**
+   * 换到新的浏览器 Cookie，或确认已落盘的 Cookie 被服务端拒绝（传空串）时回调，由调用方加密落盘。
+   * 落盘的 Cookie 跨 App 与 dsh 重启复用，启动令牌只在没有可用 Cookie 时才用得上。
+   */
+  private val onCookie: (String) -> Unit = {},
+  private val clock: () -> Long = System::currentTimeMillis
 ) : HarnessClient {
   constructor(profile: ServerProfile, password: String) : this(profile, ServerCredentials(profile.username, password))
 
   private val base: HttpUrl = requireNotNull(profile.url.trimEnd('/').toHttpUrlOrNull()) { "服务器地址无效" }
   private val origin = HttpOrigin.of(base)
 
-  /** DSH 用一次性启动令牌换 Cookie；令牌沿用凭据的 password 槽位。 */
-  private val token: String = credentials.password.trim()
+  /** 凭据的 password 槽位：令牌模式是启动令牌，密钥模式是 Cookie 签名密钥。 */
+  private val token: String = if (profile.dshAuth == DshAuthMode.TOKEN) credentials.password.trim() else ""
+  private val signingSecret: ByteArray? =
+    if (profile.dshAuth == DshAuthMode.SECRET) DshCookie.decodeSecret(credentials.password) else null
 
   private val http = OkHttpClient.Builder()
     .connectTimeout(10, TimeUnit.SECONDS)
@@ -80,6 +88,8 @@ class DshApi(
     .dispatcher(SharedHttp.streamDispatcher)
     .readTimeout(0, TimeUnit.MILLISECONDS)
     .callTimeout(0, TimeUnit.MILLISECONDS)
+    // 长连心跳：Wi-Fi/NAT 会静默回收空闲连接，没有 ping 时事件流会「看起来在线」却再也收不到帧。
+    .pingInterval(STREAM_PING_SECONDS, TimeUnit.SECONDS)
     .build()
 
   private val ioScope = SharedHttp.ioScope
@@ -101,6 +111,11 @@ class DshApi(
   /** 仍在等待回答的审批/问答瀑布；键是网关事件 id。 */
   private val pendingApprovals = ConcurrentHashMap<String, PermissionRequest>()
   private val pendingQuestions = ConcurrentHashMap<String, QuestionRequest>()
+  /** 当前 `$events` 客户端代次与它重新投递过的瀑布 id（断线重连后对账用）。 */
+  private val readyGeneration = java.util.concurrent.atomic.AtomicInteger()
+  private val redelivered = ConcurrentHashMap.newKeySet<String>()
+  /** 会话 follow 意外断开后的重试退避（毫秒），收到帧即清零。 */
+  private val followRetries = ConcurrentHashMap<String, Long>()
   @Volatile private var catalog: JSONObject? = null
   /** 已归档会话集合（`workspace/follow` 的 baseline 与 `archived` 增量维护）。 */
   private val archivedSessions = ConcurrentHashMap.newKeySet<String>()
@@ -122,43 +137,99 @@ class DshApi(
 
   // ---------------------------------------------------------------- 鉴权
 
-  @Volatile private var sessionCookie: String? = null
+  /** 当前使用的 Cookie；先取落盘的浏览器 Cookie，过期或缺失时才用令牌/密钥换新的。 */
+  @Volatile private var sessionCookie: String? =
+    credentials.cookie.trim().takeIf { DshCookie.isFresh(it, clock()) && (signingSecret == null || DshCookie.isDurable(it)) }
+  /** 落盘 Cookie 被服务端拒绝过：换新失败时提示「需要重新配对」而不是泛泛的令牌错误。 */
+  @Volatile private var cookieRejected = false
+  @Volatile private var renewAttemptedAt = 0L
   private val authLock = Mutex()
 
   private suspend fun cookie(): String = authLock.withLock {
-    sessionCookie ?: connect().also { sessionCookie = it }
+    val current = sessionCookie?.takeIf { DshCookie.isFresh(it, clock()) }
+    if (current != null) {
+      scheduleRenewal(current)
+      return@withLock current
+    }
+    sessionCookie = null
+    connect().also(::adopt)
+  }
+
+  private fun repairMessage(): String = if (signingSecret != null) SECRET_REJECTED_MESSAGE else REPAIR_MESSAGE
+
+  /** 采用新 Cookie；浏览器 Cookie 回调落盘，API Peer Cookie 只放内存（dsh 重启即失效）。 */
+  private fun adopt(pair: String) {
+    sessionCookie = pair
+    cookieRejected = false
+    // 密钥模式随时能在本机重签，不需要落盘。
+    if (signingSecret == null && DshCookie.isDurable(pair) && pair != credentials.cookie.trim()) runCatching { onCookie(pair) }
   }
 
   /**
-   * 用启动令牌换签名 Cookie。先走浏览器式根路径交换（Cookie 跨进程重启有效），再退回
-   * `/connect` 的 API Peer（0.2.1 线起；Peer 随生命周期连接与进程重启失效）。
+   * 密钥模式下 HTTPS 地址的 Cookie audience 取决于 dsh 自己是否是 TLS 监听：直连 TLS 是 `https://host`，
+   * HTTPS 反向代理后面的 HTTP 监听是 `host`。先按 TLS 签发，被拒后改用后者再试一次。
    */
-  private suspend fun connect(): String = withContext(Dispatchers.IO) {
-    if (token.isEmpty()) throw ApiException(401, "请填写 DeepSeek Harness 的访问令牌")
-    try {
-      return@withContext exchange(
-        base.newBuilder().addQueryParameter("token", token).build(),
-        browser = true
-      )
-    } catch (rootError: ApiException) {
-      try {
-        return@withContext exchange(
-          base.newBuilder()
-            .addPathSegment("connect")
-            .addQueryParameter("token", token)
-            .addQueryParameter("interactions", "answer")
-            .build(),
-          browser = false
-        )
-      } catch (connectError: ApiException) {
-        // /connect 不存在（0.2.0 线）时报告根路径交换的原始失败，而不是 404。
-        throw if (connectError.status == 404) rootError else connectError
-      }
+  @Volatile private var plainListener = false
+
+  /** 服务端拒绝了当前 Cookie（401）：丢弃，并把落盘副本一起清掉，避免每次启动都先撞一次 401。 */
+  private suspend fun rejectCookie(pair: String) = authLock.withLock {
+    if (sessionCookie != pair) return@withLock
+    sessionCookie = null
+    if (signingSecret != null && base.isHttps && !plainListener) {
+      plainListener = true
+      return@withLock
+    }
+    cookieRejected = true
+    if (DshCookie.isDurable(pair)) runCatching { onCookie("") }
+  }
+
+  /**
+   * 滑动续期：Cookie 有绝对有效期，签发超过 [RENEW_AFTER_MILLIS] 后用手里的凭据在后台换一张新的。
+   * 令牌模式只在该 dsh 进程仍存活（令牌未轮换）时成功，失败静默；密钥模式在本机直接重新签发。
+   */
+  private fun scheduleRenewal(current: String) {
+    val lifetime = DshCookie.lifetime(current) ?: return
+    if (lifetime.version != 1) return
+    val now = clock()
+    val dueAt = if (signingSecret != null) lifetime.expiresAt - MINTED_RENEW_MARGIN_MILLIS else lifetime.issuedAt + RENEW_AFTER_MILLIS
+    if (now < dueAt || now - renewAttemptedAt < RENEW_RETRY_MILLIS) return
+    if (signingSecret == null && token.isEmpty()) return
+    renewAttemptedAt = now
+    ioScope.launch {
+      val fresh = try { connect() } catch (error: CancellationException) { throw error } catch (error: Exception) { null }
+      if (fresh != null && DshCookie.isDurable(fresh)) authLock.withLock { if (sessionCookie == current) adopt(fresh) }
     }
   }
 
-  /** Host 用 3xx + `Set-Cookie: dsh-auth-…` 交付签名 Cookie。 */
-  private suspend fun exchange(url: HttpUrl, browser: Boolean): String {
+  /**
+   * 换新 Cookie。密钥模式在本机签发；令牌模式先走浏览器式根路径交换（Cookie 跨进程重启有效），
+   * 再退回 `/connect` 的 API Peer（0.2.1 线起；Peer 随生命周期连接与进程重启失效）。
+   */
+  private suspend fun connect(): String = withContext(Dispatchers.IO) {
+    signingSecret?.let { return@withContext DshCookie.mint(it, base, clock(), secureListener = base.isHttps && !plainListener) }
+    if (profile.dshAuth == DshAuthMode.SECRET) throw ApiException(401, "签名密钥格式不正确：应为 43 个字符的 base64url 字符串", AUTH_EXPIRED)
+    if (token.isEmpty()) throw ApiException(401, "请填写 DeepSeek Harness 的启动令牌", AUTH_EXPIRED)
+    exchange(base.newBuilder().addQueryParameter("token", token).build(), browser = true)?.let { return@withContext it }
+    // 根路径没有交付 Cookie（不是 dsh 的认证首页）：退回 API Peer。令牌被拒（401/403）时同一个令牌
+    // 换 /connect 也不会成功，上面已经直接抛出。
+    try {
+      exchange(
+        base.newBuilder()
+          .addPathSegment("connect")
+          .addQueryParameter("token", token)
+          .addQueryParameter("interactions", "answer")
+          .build(),
+        browser = false
+      ) ?: throw ApiException(401, "连接成功但没有拿到会话 Cookie，请确认地址指向 dsh web 且启动令牌来自该实例", AUTH_EXPIRED)
+    } catch (error: ApiException) {
+      // /connect 不存在（0.2.0 线）：说明根路径就不是 dsh 的认证入口。
+      if (error.status == 404) throw ApiException(401, "连接成功但没有拿到会话 Cookie，请确认地址指向 dsh web 且启动令牌来自该实例", AUTH_EXPIRED)
+      throw error
+    }
+  }
+
+  /** Host 用 3xx + `Set-Cookie: dsh-auth-…` 交付签名 Cookie；没有 Cookie 时返回 null。 */
+  private suspend fun exchange(url: HttpUrl, browser: Boolean): String? {
     val builder = Request.Builder().url(url).get()
     // 根路径交换是浏览器入口；带上 Accept 与浏览器一致，避免被按静态资源处理。
     if (browser) builder.header("Accept", "text/html,application/xhtml+xml")
@@ -168,14 +239,16 @@ class DshApi(
       throw ApiException(0, "无法连接 DeepSeek Harness：${error.message ?: "网络不可达"}")
     }
     response.use { value ->
-      if (value.code !in 200..399) {
-        throw ApiException(value.code, if (value.code == 401 || value.code == 403) "访问令牌无效或已过期" else "连接失败：HTTP ${value.code}")
+      when (value.code) {
+        401 -> throw ApiException(401, if (cookieRejected) REPAIR_MESSAGE else "启动令牌无效：dsh 每次启动都会换新令牌，请填写当前启动链接里的 token", AUTH_EXPIRED)
+        403 -> throw ApiException(403, UNTRUSTED_HOST_MESSAGE, "http/403")
+        !in 200..399 -> throw ApiException(value.code, "连接失败：HTTP ${value.code}")
       }
       for (raw in value.headers("Set-Cookie")) {
         val pair = raw.substringBefore(';').trim()
         if (pair.startsWith("dsh-auth-")) return pair
       }
-      throw ApiException(401, "连接成功但没有拿到会话 Cookie，请确认访问令牌来自该实例")
+      return null
     }
   }
 
@@ -217,10 +290,11 @@ class DshApi(
       val status = response.code
       val text = response.use { it.body?.string().orEmpty() }
       if (status == 401 && !retried) {
-        // Cookie 失效（API Peer 随连接/进程消失）：清掉重新交换。
-        authLock.withLock { sessionCookie = null }
+        // Cookie 失效（过期、签名密钥被撤销，或 API Peer 随连接/进程消失）：丢弃后重新换一张。
+        rejectCookie(current)
         return@withContext call(endpoint, payload, retried = true)
       }
+      if (status == 401) throw ApiException(401, repairMessage(), AUTH_EXPIRED)
       if (status !in 200..299) throw ApiException(status, httpMessage(status), "http/$status")
       val parsed = try { JSONObject(text) } catch (error: Exception) {
         throw ApiException(status, "服务器响应不是 JSON，请确认地址指向 DeepSeek Harness 的 Web 实例")
@@ -254,7 +328,8 @@ class DshApi(
     call(endpoint, payload) as? JSONObject ?: JSONObject()
 
   private fun httpMessage(status: Int): String = when (status) {
-    401, 403 -> "访问令牌无效或已过期"
+    401 -> repairMessage()
+    403 -> UNTRUSTED_HOST_MESSAGE
     404 -> "该地址不是 DeepSeek Harness 的 Web 实例"
     else -> "请求失败：HTTP $status"
   }
@@ -459,6 +534,14 @@ class DshApi(
       .addEncodedPathSegment("remote.mux")
       .build()
     val request = Request.Builder().url(socketUrl).header("Cookie", current).build()
+    // 每条逻辑流只收尾一次：error 帧、end 帧、主动 cancel 与底层失败可能先后到达。
+    val finished = java.util.concurrent.atomic.AtomicBoolean(false)
+    fun finish(webSocket: WebSocket, cause: Throwable?) {
+      if (!finished.compareAndSet(false, true)) return
+      // 立即关闭：mux 流不需要关闭握手，优雅关闭会让 MockWebServer 一类的对端等待超时。
+      webSocket.cancel()
+      onClosed(cause)
+    }
     val listener = object : WebSocketListener() {
       override fun onOpen(webSocket: WebSocket, response: Response) {
         val open = JSONObject()
@@ -474,25 +557,26 @@ class DshApi(
         if (frame.optString("streamId") != streamId) return
         when (frame.optString("type")) {
           "item" -> frame.optJSONObject("value")?.let(onItem) ?: onItem(JSONObject())
-          "error" -> onClosed(IOException(frame.obj("error").str("message").ifBlank { "会话流出错" }))
-          "end" -> {
-            // 立即关闭：mux 流不需要关闭握手，优雅关闭会让 MockWebServer 一类的对端等待超时。
-            webSocket.cancel()
-            onClosed(null)
-          }
+          "error" -> finish(webSocket, IOException(frame.obj("error").str("message").ifBlank { "会话流出错" }))
+          "end" -> finish(webSocket, null)
         }
       }
 
       override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
         if (response?.code == 401) {
-          // Cookie 失效：清掉让下一次调用重新交换。
-          ioScope.launch { authLock.withLock { sessionCookie = null } }
+          // Cookie 失效：丢弃，让下一次调用重新换取。
+          ioScope.launch { rejectCookie(current) }
         }
-        onClosed(t)
+        finish(webSocket, t)
+      }
+
+      override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+        // 服务端主动关闭整条连接（dsh 重启、Host 下线）：按异常断开处理，让上层重连。
+        finish(webSocket, IOException("DeepSeek Harness 关闭了连接（$code）"))
       }
 
       override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-        onClosed(null)
+        finish(webSocket, null)
       }
     }
     streamHttp.newWebSocket(request, listener)
@@ -733,6 +817,7 @@ class DshApi(
         when (frame.str("type")) {
           "ready" -> {
             eventsClientId = frame.str("clientId")
+            reconcileAfterReady(push)
             onOpen()
           }
           "emit" -> handleEmit(frame, push)
@@ -787,8 +872,17 @@ class DshApi(
       "api-session/added" -> {
         val item = args.optJSONObject(0) ?: return
         val session = itemToSession(item) ?: return
+        known[session.id] = session
+        // 总览按 OpenCode 的 `info` 形状解析新会话（id / directory / title / parentID / time）。
+        val info = JSONObject()
+          .put("id", session.id)
+          .put("directory", session.directory)
+          .put("title", session.title)
+          .putOpt("parentID", session.parentId)
+          .put("time", JSONObject().put("created", session.created).put("updated", session.updated))
         push(ServerEvent(id = "dsh:added:${session.id}:${session.updated}", directory = session.directory,
-          type = "session.created", properties = JSONObject().put("sessionID", session.id).put("title", session.title), created = session.updated))
+          type = "session.created", properties = JSONObject().put("sessionID", session.id).put("title", session.title).put("info", info),
+          created = session.updated))
       }
       "api-session/removed" -> {
         // 参数是纯字符串的会话 id，不是行对象。
@@ -831,6 +925,7 @@ class DshApi(
   private fun handleWaterfall(frame: JSONObject, push: (ServerEvent) -> Unit) {
     val name = frame.str("event")
     val eventId = frame.str("eventId")
+    if (eventId.isNotBlank()) redelivered += eventId
     val sessionId = frame.str("agentId")
     val request = frame.obj("request")
     val session = known[sessionId]
@@ -882,10 +977,30 @@ class DshApi(
     }
   }
 
+  /**
+   * 新的 `$events` 客户端建立后，Host 会把仍在等待的瀑布全部重新投递给它（同一个 eventId）。
+   * 断线期间被别处结算的审批不会再有 `cancel` 帧：宽限期内没有重新投递的旧待办按已结算撤回。
+   */
+  private fun reconcileAfterReady(push: (ServerEvent) -> Unit) {
+    val generation = readyGeneration.incrementAndGet()
+    redelivered.clear()
+    val stale = pendingApprovals.keys.toSet() + pendingQuestions.keys.toSet()
+    if (stale.isEmpty()) return
+    ioScope.launch {
+      kotlinx.coroutines.delay(REDELIVERY_GRACE_MILLIS)
+      if (readyGeneration.get() != generation) return@launch
+      for (eventId in stale - redelivered) settleLocally(eventId, push)
+    }
+  }
+
   /** 其他客户端结算了瀑布：移除本地待办，让 UI/任务状态跟随。 */
   private fun handleCancelled(frame: JSONObject, push: (ServerEvent) -> Unit) {
     val eventId = frame.str("eventId")
     if (eventId.isBlank()) return
+    settleLocally(eventId, push)
+  }
+
+  private fun settleLocally(eventId: String, push: (ServerEvent) -> Unit) {
     val now = System.currentTimeMillis()
     val permission = pendingApprovals.remove(eventId)
     if (permission != null) {
@@ -930,8 +1045,18 @@ class DshApi(
           onItem = { frame ->
             when (frame.str("type")) {
               "snapshot" -> {
+                followRetries.remove(id)
                 frame.optDouble("cursor", 0.0).toLong().takeIf { it > 0 }?.let { cursors[id] = it }
-                // 快照记录已由消息页拉取；这里只登记切点，避免重复投影。
+                // 首次 follow 的快照记录已由消息页拉取，只登记切点；重连后的快照补投断线期间的事件。
+                if (lastSeq(id) > 0) {
+                  for (record in frame.arr("records").objects()) {
+                    val event = record.obj("event")
+                    val seq = event.optDouble("seq", 0.0).toLong()
+                    if (seq <= lastSeq(id)) continue
+                    translate(session, event).forEach { channel.trySend(it) }
+                    advanceSeq(id, seq)
+                  }
+                }
               }
               "event" -> {
                 val event = frame.obj("event")
@@ -946,7 +1071,10 @@ class DshApi(
               else -> Unit
             }
           },
-          onClosed = { follows.remove(id) }
+          onClosed = { cause ->
+            follows.remove(id)
+            if (cause != null) retryFollow(id, channel)
+          }
         )
         follows[id] = socket
       } catch (error: CancellationException) {
@@ -954,6 +1082,16 @@ class DshApi(
       } catch (error: Exception) {
         Diagnostics.warn("DshApi", "会话事件流未建立", error)
       }
+    }
+  }
+
+  /** 单条会话流意外断开（全局事件流仍在）：退避后重新 follow，仍在观察的会话才重连。 */
+  private fun retryFollow(id: String, channel: Channel<ServerEvent>) {
+    val wait = followRetries.merge(id, FOLLOW_RETRY_MIN_MILLIS) { previous, _ -> (previous * 2).coerceAtMost(FOLLOW_RETRY_MAX_MILLIS) } ?: return
+    ioScope.launch {
+      kotlinx.coroutines.delay(wait)
+      val stillWatched = synchronized(watched) { id in watched }
+      if (eventChannel === channel && stillWatched) startFollow(id, channel)
     }
   }
 
@@ -1148,8 +1286,9 @@ class DshApi(
   }
 
   override suspend fun createSession(directory: String, title: String): Session = withContext(Dispatchers.IO) {
+    // `session/create` 的请求只有 cwd/workspaceId/sessionId/agentPreset，网关按严格 schema 校验，
+    // 多带 title 会以 gateway/arguments-invalid 失败；标题在创建后用 rename 设置。
     val request = JSONObject().put("cwd", directory)
-    if (title.isNotBlank()) request.put("title", title)
     val result = callObject("session/create", requestArgs(request))
     val id = result.str("sessionId").ifBlank { throw ApiException(502, "服务器没有返回新会话 id") }
     val created = Session(
@@ -1214,13 +1353,14 @@ class DshApi(
     delivery: Delivery
   ) {
     if (model != null) runCatching { selectModel(session, model) }
+    selectPreset(session, agent)
     val content = JSONArray()
-    // DSH 的 prompt 没有「文件引用」块；引用的服务器文件折算成路径文本，让模型自行读取。
+    // DSH 的 prompt 没有「文件引用」块；引用的服务器文件折算成 `@路径` 文本，与官方 Web 的提及写法一致。
     val body = buildString {
       append(text)
       if (references.isNotEmpty()) {
         if (isNotEmpty()) append('\n')
-        append(references.joinToString("\n") { it.path })
+        append(references.joinToString("\n") { "@${it.path}" })
       }
     }.trim()
     if (body.isNotBlank()) content.put(JSONObject().put("type", "text").put("text", body))
@@ -1228,6 +1368,7 @@ class DshApi(
       val payload = inlineContent(file) ?: continue
       content.put(payload)
     }
+    if (content.length() == 0) throw ApiException(400, "消息内容为空：附件无法读取或格式不受支持")
     val request = JSONObject()
       .put("requestId", id)
       .put("sessionId", session.id)
@@ -1237,28 +1378,57 @@ class DshApi(
     call("session/prompt", requestArgs(request))
   }
 
-  /** 图片附件走 DSH 的多模态内容块；其他类型需要先上传换 receipt，暂不转发。 */
+  /**
+   * 手机附件（[InlineFile.uri] 是 `data:` URI）折算成 DSH 内容块：图片走多模态 `image` 块，
+   * 文本文件内联成带文件名的 `text` 块（不经 `fileUploads`，也不会写进服务器上的项目）。
+   */
   private fun inlineContent(file: InlineFile): JSONObject? {
-    val mime = file.mime.lowercase()
-    if (!mime.startsWith("image/")) return null
-    return try {
-      val bytes = readInlineBytes(file) ?: return null
-      JSONObject()
-        .put("type", "image")
-        .put("mediaType", mime)
-        .put("data", android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP))
-        .put("name", file.name)
-    } catch (error: Exception) {
+    val bytes = try { readInlineBytes(file) } catch (error: Exception) {
       Diagnostics.warn("DshApi", "附件无法读取，已跳过", error)
       null
+    } ?: return null
+    val mime = file.mime.substringBefore(';').trim().lowercase()
+    return when (AttachmentPolicy.kind(mime, file.name)) {
+      AttachmentPolicy.Kind.IMAGE -> JSONObject()
+        .put("type", "image")
+        .put("mediaType", mime)
+        .put("data", java.util.Base64.getEncoder().encodeToString(bytes))
+        .put("name", file.name)
+      AttachmentPolicy.Kind.TEXT -> JSONObject()
+        .put("type", "text")
+        .put("text", "附件 ${file.name}：\n```\n${String(bytes, Charsets.UTF_8).trimEnd()}\n```")
+      null -> null
     }
   }
 
+  /** `data:<mime>;base64,<…>`（Lagoon 选取附件时生成）或本地 `file:` 路径。 */
   private fun readInlineBytes(file: InlineFile): ByteArray? {
-    val uri = android.net.Uri.parse(file.uri)
-    return when (uri.scheme) {
-      "file" -> uri.path?.let { java.io.File(it).takeIf(java.io.File::isFile)?.readBytes() }
-      else -> null
+    val uri = file.uri
+    if (uri.startsWith("data:", ignoreCase = true)) {
+      val comma = uri.indexOf(',')
+      if (comma < 0) return null
+      val meta = uri.substring(5, comma)
+      val data = uri.substring(comma + 1)
+      return if (meta.endsWith(";base64", ignoreCase = true)) java.util.Base64.getDecoder().decode(data)
+        else java.net.URLDecoder.decode(data, "UTF-8").toByteArray(Charsets.UTF_8)
+    }
+    if (uri.startsWith("file:", ignoreCase = true)) {
+      return java.io.File(java.net.URI(uri)).takeIf(java.io.File::isFile)?.readBytes()
+    }
+    return null
+  }
+
+  /** 会话的 Agent 预设（`agentPresets/select`）；只在轮次边界生效，失败保留当前预设。 */
+  private suspend fun selectPreset(session: Session, agent: String?) {
+    val wanted = agent?.takeIf(String::isNotBlank) ?: return
+    if (wanted == (known[session.id] ?: session).agent) return
+    try {
+      call("agentPresets/select", envelope(argsOf("agentId" to session.id, "agentPreset" to wanted)))
+      known[session.id] = (known[session.id] ?: session).copy(agent = wanted)
+    } catch (error: CancellationException) {
+      throw error
+    } catch (error: Exception) {
+      Diagnostics.warn("DshApi", "切换 Agent 预设失败，沿用当前预设", error)
     }
   }
 
@@ -1303,12 +1473,19 @@ class DshApi(
 
   // ---------------------------------------------------------------- 目录 / 模型 / 权限
 
+  /** `agentPresets/list` 的预设名册：默认预设排第一，不能组合会话的（`broken`）不提供。 */
   override suspend fun agents(directory: String): List<AgentChoice> = withContext(Dispatchers.IO) {
-    val names = LinkedHashSet<String>()
-    for (item in listing().items) {
-      item.obj("projections").obj("values").str("agentPreset").takeIf(String::isNotBlank)?.let(names::add)
+    val roster = try { callObject("agentPresets/list", noArgs()) } catch (error: ApiException) {
+      if (error.code?.startsWith("gateway/") != true) throw error
+      // 没有预设注册表的实例：退回列表行里出现过的预设。
+      val names = LinkedHashSet<String>()
+      for (item in listing().items) item.obj("projections").obj("values").str("agentPreset").takeIf(String::isNotBlank)?.let(names::add)
+      return@withContext names.map { AgentChoice(it, "") }
     }
-    names.map { AgentChoice(it, "") }
+    roster.arr("presets").objects()
+      .filter { it.str("id").isNotBlank() && it.str("broken").isBlank() }
+      .sortedByDescending { it.optBoolean("isDefault") }
+      .map { AgentChoice(it.str("id"), it.str("description").ifBlank { it.str("name") }) }
   }
 
   /** 命令按 agent（会话）作用域注册；用该目录最近观察到的会话读取。 */
@@ -1482,7 +1659,11 @@ class DshApi(
   }
 
   override suspend fun files(directory: String, path: String, session: Session?): List<FileNode> = withContext(Dispatchers.IO) {
-    val scope = fileScope(directory, session)
+    val scope = try { fileScope(directory, session) } catch (error: ApiException) {
+      // 目录里还没有会话（例如添加项目时浏览服务器目录）：退回 Host 的目录选择器，只列子目录。
+      if (error.status != 409) throw error
+      return@withContext pickerDirectories(directory, path)
+    }
     val relative = path.trim().ifBlank { "." }
     val result = callObject("workspaceFiles/list", envelope(argsOf(
       "workspaceFileScopeId" to scope.id,
@@ -1493,6 +1674,20 @@ class DshApi(
       val name = entry.str("name")
       if (name.isBlank()) return@mapNotNull null
       FileNode(if (listed.isEmpty()) name else "$listed/$name", entry.str("type").ifBlank { "file" })
+    }
+  }
+
+  /** `directoryPicker/list`：Host 账户可见的一层子目录（官方 Web「选择工作目录」用的同一接口）。 */
+  private suspend fun pickerDirectories(directory: String, path: String): List<FileNode> {
+    val relative = path.trim().trim('/').takeUnless { it.isEmpty() || it == "." }
+    val target = when {
+      relative == null -> directory.ifBlank { "/" }
+      directory.isBlank() || directory == "/" -> "/$relative"
+      else -> "${directory.trimEnd('/')}/$relative"
+    }
+    val listing = callObject("directoryPicker/list", envelope(argsOf("path" to target)))
+    return listing.arr("entries").objects().mapNotNull { entry ->
+      entry.str("name").takeIf(String::isNotBlank)?.let { FileNode(it, "directory") }
     }
   }
 
@@ -1511,8 +1706,14 @@ class DshApi(
     }
   }
 
-  override suspend fun searchFiles(directory: String, query: String, session: Session?): List<String> {
-    throw ApiException(501, "DeepSeek Harness 暂不支持文件搜索")
+  /** `fileReferences/list`：与官方 `@` 提及同一个候选源，按会话工作目录搜索文件与目录。 */
+  override suspend fun searchFiles(directory: String, query: String, session: Session?): List<String> = withContext(Dispatchers.IO) {
+    val scope = fileScope(directory, session)
+    val value = call("fileReferences/list", envelope(argsOf("agentId" to scope.id, "query" to query.trim())))
+    (value as? JSONArray)?.objects()
+      ?.mapNotNull { candidate -> candidate.str("path").trim().trimEnd('/').takeIf(String::isNotBlank) }
+      ?.distinct()
+      ?: emptyList()
   }
 
   override suspend fun health(): String = withContext(Dispatchers.IO) {
@@ -1522,6 +1723,24 @@ class DshApi(
 
   private companion object {
     const val WATCH_LIMIT = 12
+
+    /** 认证失效的错误码：控制器据此提示重新配对，而不是当成网络抖动。 */
+    const val AUTH_EXPIRED = DSH_AUTH_EXPIRED
+    const val REPAIR_MESSAGE = "登录已失效：dsh 重启后旧令牌作废、Cookie 也已过期或被撤销，请用电脑上新的 dsh web 启动链接重新配对"
+    const val SECRET_REJECTED_MESSAGE = "签名密钥被拒绝：密钥不对，或 dsh 的 browser-session 记录已被删除重建，请重新复制 secret"
+    const val UNTRUSTED_HOST_MESSAGE = "dsh 拒绝了这个地址（403）：请用 dsh web --host <该 IP> 启动，域名或反向代理需加 --trusted-host"
+
+    /** 令牌模式：Cookie 签发超过半天就尝试续期（dsh 未重启时令牌仍可用）。 */
+    const val RENEW_AFTER_MILLIS = 12 * 60 * 60_000L
+    /** 密钥模式：过期前两小时重新签发。 */
+    const val MINTED_RENEW_MARGIN_MILLIS = 2 * 60 * 60_000L
+    /** 续期失败后的冷却，避免每个请求都撞一次失效令牌。 */
+    const val RENEW_RETRY_MILLIS = 60 * 60_000L
+    const val STREAM_PING_SECONDS = 20L
+    /** 重连后等待 Host 重新投递瀑布的宽限期。 */
+    const val REDELIVERY_GRACE_MILLIS = 3_000L
+    const val FOLLOW_RETRY_MIN_MILLIS = 2_000L
+    const val FOLLOW_RETRY_MAX_MILLIS = 60_000L
 
     /** 单次改动列表最多合并的轮次数与文件数。 */
     const val MAX_CHANGE_TURNS = 8
@@ -1545,7 +1764,9 @@ class DshApi(
       diff = true,
       sessionView = null,
       archive = ArchiveEndpoint(ActionEndpoint("POST", "workspace/archiveSession"), restorable = true),
-      documented = false
+      documented = false,
+      deleteSession = false,
+      fork = true
     )
   }
 }

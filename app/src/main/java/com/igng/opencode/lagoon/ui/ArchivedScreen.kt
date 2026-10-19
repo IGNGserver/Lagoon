@@ -33,7 +33,7 @@ internal fun ArchivedScreen(state: LagoonState, controller: LagoonController, on
           serverName = if (state.allServers) session.serverId?.let { id -> state.profiles.firstOrNull { it.id == id }?.name } else null,
           onClick = { (session.target ?: state.serverId?.let { SessionTarget(it, session.id) })?.let(onOpen) }, actions = buildList {
           if (!state.allServers && state.connected && state.capabilities.archive?.restorable == true) add(MenuAction("取消归档", UNARCHIVE_ICON) { controller.setArchived(session.id, false) })
-          if (!state.allServers && state.connected) add(MenuAction("删除", MiuixIcons.Delete, danger = true) { deleting = session })
+          if (!state.allServers && state.connected && state.capabilities.deleteSession) add(MenuAction("删除", MiuixIcons.Delete, danger = true) { deleting = session })
         })
       }
       if (archived.isEmpty()) item {

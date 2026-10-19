@@ -13,6 +13,7 @@ import okhttp3.mockwebserver.MockWebServer
 import okhttp3.mockwebserver.RecordedRequest
 import org.json.JSONArray
 import org.json.JSONObject
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -660,5 +661,286 @@ class DshApiTest {
     val opencode = createHarnessClient(profile(server).copy(kind = ServerKind.OPENCODE), ServerCredentials("opencode", "pw"))
     assertTrue(opencode is OpenCodeApi)
     assertFalse(client === opencode)
+  }
+
+  // ---------------------------------------------------------------- 登录持久化（P0）
+
+  private val signingSecret = ByteArray(32) { (it * 7).toByte() }
+
+  /** 一张由 [signingSecret] 签发、绑定 MockWebServer authority 的浏览器 Cookie（v1）。 */
+  private fun browserCookie(server: MockWebServer, now: Long = System.currentTimeMillis()) =
+    DshCookie.mint(signingSecret, server.url("/"), now)
+
+  private fun rootWith(pair: String) = MockResponse().setResponseCode(303)
+    .addHeader("Set-Cookie", "$pair; Max-Age=2592000; Path=/; HttpOnly; SameSite=Strict")
+    .addHeader("Location", "./")
+
+  @Test fun storedBrowserCookieIsReusedWithoutTokenExchange() = runBlocking {
+    MockWebServer().use { server ->
+      val stored = browserCookie(server)
+      server.enqueue(envelope("""{"items":[]}"""))
+      val persisted = mutableListOf<String>()
+      DshApi(profile(server), ServerCredentials("dsh", "stale-token", stored), onCookie = { persisted += it }).rootSessionsPage()
+      val list = server.takeRequest()
+      assertEquals("/api/session/list", list.requestUrl!!.encodedPath)
+      assertEquals(stored, list.getHeader("Cookie"))
+      assertEquals(1, server.requestCount)
+      assertTrue(persisted.isEmpty())
+    }
+  }
+
+  @Test fun exchangedBrowserCookieIsHandedOutForPersistence() = runBlocking {
+    MockWebServer().use { server ->
+      val minted = browserCookie(server)
+      server.enqueue(rootWith(minted))
+      server.enqueue(envelope("""{"items":[]}"""))
+      val persisted = mutableListOf<String>()
+      DshApi(profile(server), ServerCredentials("dsh", "tok"), onCookie = { persisted += it }).rootSessionsPage()
+      assertEquals(listOf(minted), persisted)
+    }
+  }
+
+  @Test fun apiPeerCookieStaysInMemoryOnly() = runBlocking {
+    MockWebServer().use { server ->
+      server.enqueue(MockResponse().setResponseCode(200).setBody("<html></html>"))
+      server.enqueue(connectOk())
+      server.enqueue(envelope("""{"items":[]}"""))
+      val persisted = mutableListOf<String>()
+      DshApi(profile(server), ServerCredentials("dsh", "tok"), onCookie = { persisted += it }).rootSessionsPage()
+      assertTrue(persisted.isEmpty())
+    }
+  }
+
+  @Test fun rejectedStoredCookieIsClearedThenTokenExchangedAndRetried() = runBlocking {
+    MockWebServer().use { server ->
+      val stale = browserCookie(server)
+      val fresh = browserCookie(server, System.currentTimeMillis() + 1_000)
+      server.enqueue(MockResponse().setResponseCode(401))
+      server.enqueue(rootWith(fresh))
+      server.enqueue(envelope("""{"items":[]}"""))
+      val persisted = mutableListOf<String>()
+      DshApi(profile(server), ServerCredentials("dsh", "tok", stale), onCookie = { persisted += it }).rootSessionsPage()
+      assertEquals(stale, server.takeRequest().getHeader("Cookie"))
+      assertEquals("tok", server.takeRequest().requestUrl!!.queryParameter("token"))
+      assertEquals(fresh, server.takeRequest().getHeader("Cookie"))
+      assertEquals(listOf("", fresh), persisted)
+    }
+  }
+
+  @Test fun rejectedCookieWithRotatedTokenAsksForRepairing() = runBlocking {
+    MockWebServer().use { server ->
+      server.enqueue(MockResponse().setResponseCode(401))
+      server.enqueue(MockResponse().setResponseCode(401))
+      val failure = runCatching {
+        DshApi(profile(server), ServerCredentials("dsh", "old-token", browserCookie(server))).rootSessionsPage()
+      }.exceptionOrNull()
+      assertTrue(failure!!.isAuthFailure)
+      assertTrue(failure.message!!.contains("重新配对"))
+    }
+  }
+
+  @Test fun expiredStoredCookieIsNotSentAtAll() = runBlocking {
+    MockWebServer().use { server ->
+      val expired = browserCookie(server, System.currentTimeMillis() - 2 * 24 * 60 * 60_000L)
+      server.enqueue(rootOk())
+      server.enqueue(envelope("""{"items":[]}"""))
+      DshApi(profile(server), ServerCredentials("dsh", "tok", expired)).rootSessionsPage()
+      assertEquals("/", server.takeRequest().requestUrl!!.encodedPath)
+    }
+  }
+
+  @Test fun oldBrowserCookieIsRenewedInBackgroundWhileTokenStillWorks() = runBlocking {
+    MockWebServer().use { server ->
+      val now = System.currentTimeMillis()
+      // 签发于 13 小时前：仍然有效，但超过续期阈值。
+      val old = DshCookie.mint(signingSecret, server.url("/"), now - 13 * 60 * 60_000L + DshCookie.CLOCK_SKEW_MILLIS)
+      val renewed = browserCookie(server)
+      server.dispatcher = object : Dispatcher() {
+        override fun dispatch(request: RecordedRequest): MockResponse = when {
+          request.path!!.startsWith("/?token=") -> rootWith(renewed)
+          else -> envelope("""{"items":[]}""")
+        }
+      }
+      val persisted = CountDownLatch(1)
+      var saved = ""
+      val client = DshApi(profile(server), ServerCredentials("dsh", "tok", old), onCookie = { saved = it; persisted.countDown() })
+      client.rootSessionsPage()
+      assertTrue(persisted.await(10, TimeUnit.SECONDS))
+      assertEquals(renewed, saved)
+      client.rootSessionsPage()
+      val cookies = (0 until server.requestCount).map { server.takeRequest() }.filter { it.path!!.startsWith("/api/") }.map { it.getHeader("Cookie") }
+      assertEquals(old, cookies.first())
+      assertEquals(renewed, cookies.last())
+    }
+  }
+
+  @Test fun secretModeSignsItsOwnCookieWithoutExchange() = runBlocking {
+    MockWebServer().use { server ->
+      server.enqueue(envelope("""{"items":[]}"""))
+      val secret = java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(signingSecret)
+      val persisted = mutableListOf<String>()
+      DshApi(profile(server).copy(dshAuth = DshAuthMode.SECRET), ServerCredentials("dsh", secret), onCookie = { persisted += it }).rootSessionsPage()
+      val list = server.takeRequest()
+      assertEquals("/api/session/list", list.requestUrl!!.encodedPath)
+      val cookie = list.getHeader("Cookie")!!
+      assertTrue(cookie.startsWith(DshCookie.name(DshCookie.authority(server.url("/"))) + "=v1."))
+      assertEquals(1, server.requestCount)
+      assertTrue(persisted.isEmpty())
+    }
+  }
+
+  @Test fun malformedSecretFailsAsAuthProblem() = runBlocking {
+    MockWebServer().use { server ->
+      val failure = runCatching {
+        DshApi(profile(server).copy(dshAuth = DshAuthMode.SECRET), ServerCredentials("dsh", "not-a-secret")).rootSessionsPage()
+      }.exceptionOrNull()
+      assertTrue(failure!!.isAuthFailure)
+      assertEquals(0, server.requestCount)
+    }
+  }
+
+  @Test fun untrustedHostIsExplained() = runBlocking {
+    MockWebServer().use { server ->
+      server.enqueue(MockResponse().setResponseCode(403))
+      val failure = runCatching { api(server).rootSessionsPage() }.exceptionOrNull()
+      assertTrue(failure!!.message!!.contains("--trusted-host"))
+    }
+  }
+
+  @Test fun createSessionSendsOnlyContractFieldsThenRenames() = runBlocking {
+    MockWebServer().use { server ->
+      server.enqueue(rootOk())
+      server.enqueue(envelope("""{"sessionId":"s5"}"""))
+      server.enqueue(envelope("""{"title":"新任务","seq":2}"""))
+      val created = api(server).createSession("/repo", "新任务")
+      assertEquals("s5", created.id)
+      server.takeRequest()
+      val create = JSONObject(server.takeRequest().body.readUtf8()).getJSONObject("payload").getJSONObject("args").getJSONObject("request")
+      assertEquals("/repo", create.getString("cwd"))
+      assertFalse(create.has("title"))
+      val rename = server.takeRequest()
+      assertEquals("/api/session/rename", rename.requestUrl!!.encodedPath)
+    }
+  }
+
+  // ---------------------------------------------------------------- 功能补齐（P1）
+
+  @Test fun fileSearchUsesFileReferencesWithAgentScope() = runBlocking {
+    MockWebServer().use { server ->
+      server.enqueue(rootOk())
+      server.enqueue(envelope("""[{"path":"src/Main.kt","kind":"file"},{"path":"src/","kind":"directory"}]"""))
+      val results = api(server).searchFiles("/repo", " Main ", Session("s1", "/repo", "T", 1))
+      assertEquals(listOf("src/Main.kt", "src"), results)
+      server.takeRequest()
+      val call = server.takeRequest()
+      assertEquals("/api/fileReferences/list", call.requestUrl!!.encodedPath)
+      val args = JSONObject(call.body.readUtf8()).getJSONObject("payload").getJSONObject("args")
+      assertEquals("s1", args.getString("agentId"))
+      assertEquals("Main", args.getString("query"))
+    }
+  }
+
+  @Test fun agentsComeFromPresetRosterDefaultFirst() = runBlocking {
+    MockWebServer().use { server ->
+      server.enqueue(rootOk())
+      server.enqueue(envelope("""{"presets":[{"id":"plan","isDefault":false,"description":"只规划"},{"id":"standard","isDefault":true,"name":"标准"},{"id":"bad","isDefault":false,"broken":"缺依赖"}]}"""))
+      val agents = api(server).agents("/repo")
+      assertEquals(listOf("standard", "plan"), agents.map { it.name })
+      assertEquals("标准", agents[0].description)
+      server.takeRequest()
+      assertEquals("/api/agentPresets/list", server.takeRequest().requestUrl!!.encodedPath)
+    }
+  }
+
+  @Test fun differentAgentSelectsPresetBeforePrompt() = runBlocking {
+    MockWebServer().use { server ->
+      server.enqueue(rootOk())
+      server.enqueue(envelope("\"plan\""))
+      server.enqueue(envelope("""{"accepted":true}"""))
+      api(server).send(Session("s1", "/repo", "T", 1, agent = "standard"), "先规划", "plan", null)
+      server.takeRequest()
+      val select = server.takeRequest()
+      assertEquals("/api/agentPresets/select", select.requestUrl!!.encodedPath)
+      val args = JSONObject(select.body.readUtf8()).getJSONObject("payload").getJSONObject("args")
+      assertEquals("s1", args.getString("agentId"))
+      assertEquals("plan", args.getString("agentPreset"))
+      assertEquals("/api/session/prompt", server.takeRequest().requestUrl!!.encodedPath)
+    }
+  }
+
+  @Test fun dataUriAttachmentsBecomeImageAndTextBlocks() = runBlocking {
+    MockWebServer().use { server ->
+      server.enqueue(rootOk())
+      server.enqueue(envelope("""{"accepted":true}"""))
+      val png = byteArrayOf(1, 2, 3)
+      val image = InlineFile("shot.png", "image/png", AttachmentPolicy.dataUri("image/png", png))
+      val note = InlineFile("note.md", "text/markdown", AttachmentPolicy.dataUri("text/markdown", "# 标题".toByteArray()))
+      api(server).send(Session("s1", "/repo", "T", 1), "看图", null, null,
+        references = listOf(FileReference("src/A.kt")), inline = listOf(image, note))
+      server.takeRequest()
+      val content = JSONObject(server.takeRequest().body.readUtf8()).getJSONObject("payload").getJSONObject("args")
+        .getJSONObject("request").getJSONArray("content")
+      assertEquals("看图\n@src/A.kt", content.getJSONObject(0).getString("text"))
+      val imageBlock = content.getJSONObject(1)
+      assertEquals("image", imageBlock.getString("type"))
+      assertEquals("image/png", imageBlock.getString("mediaType"))
+      assertArrayEquals(png, java.util.Base64.getDecoder().decode(imageBlock.getString("data")))
+      val textBlock = content.getJSONObject(2)
+      assertEquals("text", textBlock.getString("type"))
+      assertTrue(textBlock.getString("text").contains("note.md"))
+      assertTrue(textBlock.getString("text").contains("# 标题"))
+    }
+  }
+
+  @Test fun directoryWithoutSessionIsBrowsedThroughDirectoryPicker() = runBlocking {
+    MockWebServer().use { server ->
+      server.enqueue(rootOk())
+      server.enqueue(envelope("""{"items":[]}"""))
+      server.enqueue(envelope("""{"path":"/home/me","home":"/home/me","crumbs":[],"entries":[{"name":"repo","path":"/home/me/repo","hidden":false}],"truncated":false}"""))
+      val nodes = api(server).files("/home/me", ".", null)
+      assertEquals(listOf("repo" to "directory"), nodes.map { it.path to it.type })
+      server.takeRequest(); server.takeRequest()
+      val call = server.takeRequest()
+      assertEquals("/api/directoryPicker/list", call.requestUrl!!.encodedPath)
+      assertEquals("/home/me", JSONObject(call.body.readUtf8()).getJSONObject("payload").getJSONObject("args").getString("path"))
+    }
+  }
+
+  @Test fun addedSessionEventCarriesOverviewInfo() = runBlocking {
+    val server = MockWebServer().also { it.start() }
+    try {
+      server.dispatcher = object : Dispatcher() {
+        override fun dispatch(request: RecordedRequest): MockResponse = when {
+          request.path!!.startsWith("/?token") -> rootOk()
+          request.path == "/api/remote.mux" -> MockResponse().withWebSocketUpgrade(object : WebSocketListener() {
+            override fun onMessage(webSocket: WebSocket, text: String) {
+              val frame = JSONObject(text)
+              if (frame.optString("endpoint") != "\$events") return
+              val id = frame.getString("streamId")
+              webSocket.send("""{"type":"item","streamId":"$id","value":{"type":"ready","clientId":"c1"}}""")
+              webSocket.send("""{"type":"item","streamId":"$id","value":{"type":"emit","event":"api-session/added","args":[${sessionRow(id = "s7", directory = "/w")}]}}""")
+            }
+          })
+          else -> MockResponse().setResponseCode(404)
+        }
+      }
+      val event = withTimeout(20_000) { api(server).events().take(1).toList() }.single()
+      val session = event.properties.sessionInfo().toSession()
+      assertEquals("s7", session.id)
+      assertEquals("/w", session.directory)
+      assertEquals("修复登录", session.title)
+    } finally {
+      server.shutdown()
+    }
+  }
+
+  // ---------------------------------------------------------------- 前端差异（P2）
+
+  @Test fun dshCapabilitiesReplaceDeleteWithArchiveAndOfferFork() {
+    val capabilities = api(MockWebServer()).capabilities()
+    assertFalse(capabilities.deleteSession)
+    assertTrue(capabilities.fork)
+    assertTrue(ApiCapabilities.BASELINE.deleteSession)
+    assertFalse(ApiCapabilities.BASELINE.fork)
   }
 }

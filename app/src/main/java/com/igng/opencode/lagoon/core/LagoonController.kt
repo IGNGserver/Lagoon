@@ -146,6 +146,8 @@ data class LagoonState(
 class LagoonController private constructor(private val appContext: Context) {
   companion object {
     private val TERMINAL_PHASES = setOf(TaskPhase.COMPLETED, TaskPhase.FAILED)
+    /** Backoff attempt that maps to the slowest reconnect delay; used once credentials are rejected. */
+    private const val AUTH_RETRY_ATTEMPT = 4
     /** Keep the live stream briefly after leaving the app so quick app switches do not reconnect. */
     private const val BACKGROUND_GRACE_MILLIS = 30_000L
     /** 总览读完为非活跃后，先等这么久复核再拆岛，避免多步任务步骤间隙导致息屏超级岛反复重弹。 */
@@ -413,8 +415,9 @@ class LagoonController private constructor(private val appContext: Context) {
     refreshMode = mode
     store.rememberRefreshMode(mode)
   }
-  suspend fun testServer(profile: ServerProfile, credentials: ServerCredentials): String {
-    val client = createHarnessClient(profile, credentials)
+  /** [onCookie] 收到测试连接换到的会话 Cookie，保存资料时一并落盘，避免保存后再用令牌换一次。 */
+  suspend fun testServer(profile: ServerProfile, credentials: ServerCredentials, onCookie: (String) -> Unit = {}): String {
+    val client = createHarnessClient(profile, credentials, onCookie = onCookie)
     val version = client.health()
     client.projects()
     return version
@@ -547,7 +550,8 @@ class LagoonController private constructor(private val appContext: Context) {
         showOffline(id, token, userFacingError(error, "连接失败"))
         // A refresh while offline must be able to recover: retry the connection with backoff instead
         // of leaving the user on a stale snapshot with no path back to a live stream (A10).
-        scheduleReconnect(id, token)
+        // Expired credentials do not heal by retrying quickly; keep probing at the slowest pace.
+        scheduleReconnect(id, token, if (error.isAuthFailure) AUTH_RETRY_ATTEMPT else 0)
       }
     }
   }
@@ -578,8 +582,8 @@ class LagoonController private constructor(private val appContext: Context) {
       if (streamAllowed()) startStream(token)
     } catch (error: Exception) {
       if (error is CancellationException) throw error
-      if (token == generation) showOffline(id, token, "连接失败，正在重试")
-      scheduleReconnect(id, token, attempt + 1)
+      if (token == generation) showOffline(id, token, if (error.isAuthFailure) userFacingError(error) else "连接失败，正在重试")
+      scheduleReconnect(id, token, if (error.isAuthFailure) AUTH_RETRY_ATTEMPT else attempt + 1)
     }
   }
   private suspend fun showOffline(id: String, token: Int, reason: String) {

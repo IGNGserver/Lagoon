@@ -26,6 +26,36 @@
 - 每个请求都要求 `Host` 属于 loopback / 监听绑定 IP / `--trusted-host` 之一（否则 403），
   未认证返回 401。Cookie 按 authority（host:port，TLS 时含 scheme）绑定。
 
+### Lagoon 的登录保持
+
+源码依据：dsh `packages/client/connection/src/browser-auth.ts`（2026-10 master）。
+
+- 启动令牌是**每个进程随机生成、从不落盘**的；dsh 一重启旧令牌就作废。真正长期有效的是浏览器
+  Cookie：`dsh-auth-<base64url(sha256(authority))>=v1.<base64url(JSON{version,authority,issuedAt,expiresAt})>.<base64url(HMAC-SHA256(secret, body))>`，
+  `authority` 是请求 Host（HTTP 为 `host[:port]`、默认端口省略；HTTPS 为完整 origin）。服务端只校验签名、
+  authority 与 `issuedAt <= now < expiresAt`、`expiresAt - issuedAt <= cookieMaxAgeDays`。
+- 因此 Lagoon 把换到的 **v1 浏览器 Cookie** 加密落盘（凭据的 `cookie` 槽位），之后 App 与 dsh 重启都直接复用；
+  启动令牌只在没有可用 Cookie 时使用。`/connect` 的 v2 API Peer Cookie 绑定进程内 Peer，只放内存。
+- 滑动续期：Cookie 签发超过 12 小时后，后台用保存的令牌再换一张（dsh 未重启时成功，失败静默、冷却 1 小时）。
+- 服务端 401：清掉落盘 Cookie，用令牌重换一次；仍失败则以错误码 `auth/expired` 提示「重新配对」，
+  控制器按最慢节奏重试而不是当成网络抖动。403 是 Host 栅栏（未 `--host` 绑定该 IP 或缺 `--trusted-host`）。
+- **签名密钥模式**（不看电脑配对）：凭据填 `$DSH_HOME/.credentials.yaml` 中
+  `records."client-connection/browser-session".payload.secret`（32 字节 base64url，43 个字符）。Lagoon 按上面的格式
+  在本机签发 v1 Cookie：`issuedAt` 回拨 10 分钟吸收时钟偏差，有效期 20 小时（不超过 `cookieMaxAgeDays` 的下限 1 天），
+  到期前 2 小时重签。这是依赖 dsh 内部 Cookie 格式的做法：dsh 改动格式时会表现为 401，需要改回令牌模式。
+  删除该记录并重启 dsh 会轮换密钥、吊销所有 Cookie。
+- 延长 Cookie 有效期（令牌模式）：在 `~/.dsh/profiles/web/cordis.patch.yml` 重述 `connection` 行（patch 会整体替换该行 config）：
+
+  ```yaml
+  - id: connection
+    inject: [webStartup]
+    config:
+      trustedHosts: !!js ctx.webStartup.trustedHosts
+      cookieMaxAgeDays: 365
+  ```
+
+  该写法按 dsh 源码与升级指南整理，尚未在真机上逐项核对；启动前可用 `dsh --profile web --dump-config` 检查组合结果。
+
 ## 传输
 
 - 一元调用：`POST /api/<namespace>/<method>`，信封
@@ -67,10 +97,14 @@
 | `userQuestions` | 瀑布 + `userQuestions` 投影 | 结构化提问 |
 | `subagent` | — | 子代理（当前用列表行 `parentSessionId` 折算） |
 | `$events` | `$events` / `$events/result` | 全局事件、审批/问答瀑布与结算 |
+| `fileReferences` | `list` | 文件搜索（`{agentId, query}` → `[{path, kind}]`，与 `@` 提及同源） |
+| `agentPresets` | `list` / `select` | Agent 预设名册（`{presets:[{id,isDefault,name?,description?,broken?}]}`）与切换（`{agentId, agentPreset}`，轮次边界生效） |
+| `directoryPicker` | `list` | Host 账户的一层子目录（`{path}` → `{path,home,crumbs,entries:[{name,path,hidden}],truncated}`），用于没有会话的目录 |
 
 关键请求形状（0.2.0-rc.2 实测）：
 
-- `session/create`：`{request:{cwd?, workspaceId?, sessionId?, agentPreset?}}`（没有 `title`）。
+- `session/create`：`{request:{cwd?, workspaceId?, sessionId?, agentPreset?}}`（没有 `title`；网关严格校验，多带字段会
+  `gateway/arguments-invalid`，标题在创建后用 `session/rename` 设置）。
 - `session/prompt`：`{request:{requestId, sessionId, mode:"queue"|"steer", content:[…], clientTimeZone?}}`。
   `content` 支持 `{type:"text",text}`、`{type:"image",mediaType,data,name?}`、
   `{type:"file",receiptId}`（receipt 需要先上传）。
@@ -132,8 +166,14 @@
   `session.text.delta` / `session.reasoning.delta`，耐久消息到达时用 `*.ended` 收口）。
 - 审批/问答：瀑布事件折算为 `permission.asked` / `form.created`，回应走 `$events/result`；
   其他客户端结算时收到 `cancel` 帧，按本地待办移除并折算为 `permission.replied` / `form.cancelled`。
-- 删除会话 = 归档（DSH 没有删除）；回退（revert）在 DSH 里没有对应语义，保持不支持；
-  手动压缩走 `/compact` 命令。
+  `$events` 重连后 Host 会把仍在等待的瀑布按原 eventId 重新投递给新客户端；宽限 3 秒内没有重新投递的本地待办
+  视为断线期间已被结算，同样撤回。审批 outcome 只有 `allowed-once` 一种授权，界面不提供「始终允许」。
+- 实时流：mux WebSocket 20 秒 ping；单条 `session/follow` 意外断开时按 2 秒起、最长 60 秒退避重连，
+  重连后的快照把 seq 大于已投影位置的事件补投进时间线。服务端关闭整条连接按异常断开处理，上层重连。
+- 附件：Lagoon 的附件是 `data:` URI。图片折算为 `{type:"image", mediaType, data, name}`，文本文件内联为带文件名的
+  `text` 块；都不经 `fileUploads`，也不写进服务器上的项目。
+- 删除会话 = 归档（DSH 没有删除），界面按能力隐藏「删除」、提供「分叉」；回退（revert）在 DSH 里没有对应语义，
+  保持不支持；手动压缩走 `/compact` 命令。
 - 改动列表取最近若干 `workspace/changes` 事件的摘要并按路径合并（最新轮次优先），
   逐文件对比来自 `/api/changes.diff`。
 
@@ -141,7 +181,7 @@
 
 - DSH 处于 developer preview，跨版本破坏性变更；适配按当前 0.2.x 形状实现，遇到未知
   错误码/形状时给出明确失败而不是猜测。
-- 会话删除、消息级回退、文件搜索（`searchFiles`）没有对应 RPC。
+- 会话删除、消息级回退没有对应 RPC。
 - 改动摘要/对比仅在 Host 进程内、会话存活期间提供；重启后旧轮次不可读。
 - 工作区文件访问需要会话身份（`workspaceFileScopeId`）；没有会话的目录无法浏览。
-- 文件附件需要先经 `fileUploads` 上传换取 receipt；当前只支持内联图片。
+- 二进制非图片附件（PDF 等）需要先经 `fileUploads` 上传换取 receipt；Lagoon 只发送图片与文本附件（与 OpenCode 侧一致）。

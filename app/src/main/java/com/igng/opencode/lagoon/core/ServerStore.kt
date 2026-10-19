@@ -18,7 +18,7 @@ class ServerStore internal constructor(private val preferences: SharedPreference
       val id = it.str("id")
       ServerProfile(id, it.str("name"), it.str("url"), it.str("username"),
         it.optBoolean("autoConnect", true), it.optBoolean("notifications", true), it.optBoolean("allowCleartext", false),
-        ServerKind.fromWire(it.str("kind")))
+        ServerKind.fromWire(it.str("kind")), DshAuthMode.fromWire(it.str("dshAuth")))
     }
   } catch (error: Exception) {
     Diagnostics.warn("ServerStore", "profiles 解析失败，已忽略全部服务器资料", error)
@@ -347,9 +347,22 @@ class ServerStore internal constructor(private val preferences: SharedPreference
     val json = JSONArray().apply { updated.forEach { item -> put(JSONObject()
       .put("id", item.id).put("name", item.name).put("url", item.url).put("username", item.username)
       .put("autoConnect", item.autoConnect).put("notifications", item.notifications)
-      .put("allowCleartext", item.allowCleartext).put("kind", item.kind.wire)) } }
+      .put("allowCleartext", item.allowCleartext).put("kind", item.kind.wire).put("dshAuth", item.dshAuth.wire)) } }
     check(secrets.edit().putString(profile.id, encoded).commit()) { "无法保存凭据，请重试" }
     check(preferences.edit().putString("profiles", json.toString()).commit()) { "无法保存服务器资料，请重试" }
+  }
+  /**
+   * 只更新已保存凭据里的会话 Cookie（DSH 换到新 Cookie 或旧 Cookie 被拒）。[url] 是签发该 Cookie
+   * 时的服务器地址：资料已改到别的地址时丢弃，绝不把旧地址的 Cookie 绑到新地址上。
+   */
+  fun rememberCookie(id: String, url: String, cookie: String) {
+    val profile = profiles().firstOrNull { it.id == id } ?: return
+    if (profile.url != url) return
+    val current = credentials(id)
+    if (current.cookie == cookie) return
+    val encoded = if (current.password.isEmpty() && cookie.isEmpty()) null else encryptValue(JSONObject()
+      .put("origin", credentialOrigin(profile.url)).put("username", current.username).put("password", current.password).put("cookie", cookie).toString())
+    secrets.edit().putString(id, encoded).apply()
   }
   private fun decrypt(id: String): String? = try {
     val value = secrets.getString(id, null) ?: return null
@@ -360,7 +373,7 @@ class ServerStore internal constructor(private val preferences: SharedPreference
       put(JSONObject().put("id", item.id).put("name", item.name).put("url", item.url)
         .put("username", item.username).put("autoConnect", item.autoConnect)
         .put("notifications", item.notifications)
-        .put("allowCleartext", item.allowCleartext).put("kind", item.kind.wire))
+        .put("allowCleartext", item.allowCleartext).put("kind", item.kind.wire).put("dshAuth", item.dshAuth.wire))
     } }
     val editor = preferences.edit().putString("profiles", json.toString()).remove("directories:$id").remove("sessionNotices:$id").remove("collapsedSections:$id").remove("collapsedProjects:$id").remove("pinned:$id")
       .remove("backgroundRunning:$id")

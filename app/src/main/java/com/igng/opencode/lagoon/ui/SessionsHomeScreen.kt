@@ -274,7 +274,7 @@ private fun SessionList(
               add(MenuAction(if (pinned) "取消置顶" else "置顶", if (pinned) MiuixIcons.Unpin else MiuixIcons.Pin) { controller.togglePin(session.id) })
               if (state.connected && state.capabilities.supports(SessionAction.RENAME)) add(MenuAction("重命名", MiuixIcons.Rename) { onRename(session) })
               if (state.connected && state.capabilities.archive != null) add(MenuAction("归档", ARCHIVE_ICON) { controller.setArchived(session.id, true) })
-              if (state.connected) add(MenuAction("删除", MiuixIcons.Delete, danger = true) { onDelete(session) })
+              if (state.connected && state.capabilities.deleteSession) add(MenuAction("删除", MiuixIcons.Delete, danger = true) { onDelete(session) })
             }
           })
         }

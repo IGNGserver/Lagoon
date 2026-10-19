@@ -119,11 +119,15 @@ fun ServersModal(
               val resolved = if (pair) PairLinkResolver.resolve(profile.url) else null
               val actualProfile = if (resolved == null) profile else profile.copy(url = resolved.serverUrl, username = resolved.credentials.username)
               val savedUrl = state.profiles.firstOrNull { it.id == profile.id }?.url
+              val previous = state.profiles.firstOrNull { it.id == profile.id }
               val credentials = resolved?.credentials ?: profileCredentials(
-                savedUrl, actualProfile.url, controller.credentials(profile.id), actualProfile.username, password
+                savedUrl, actualProfile.url, controller.credentials(profile.id), actualProfile.username, password,
+                // DSH 填了新令牌/密钥或换了认证方式：丢掉旧 Cookie，让这次测试真正验证新凭据。
+                cookie = "".takeIf { actualProfile.kind == ServerKind.DSH && (password != null || previous?.dshAuth != actualProfile.dshAuth) }
               )
-              val version = controller.testServer(actualProfile, credentials)
-              controller.saveServer(actualProfile, credentials.password, credentials.cookie, credentials.username)
+              var minted: String? = null
+              val version = controller.testServer(actualProfile, credentials) { minted = it }
+              controller.saveServer(actualProfile, credentials.password, minted ?: credentials.cookie, credentials.username)
               val label = actualProfile.kind.label
               val detail = if (version.isBlank() || version.equals(label, ignoreCase = true) || version == "DeepSeek Harness") "" else " $version"
               done("已连接 $label$detail")
@@ -173,6 +177,8 @@ private fun MiuixServerForm(
   var url by remember(existing?.id) { mutableStateOf(existing?.url ?: "") }
   var harness by rememberSaveable(existing?.id) { mutableStateOf(existing?.kind ?: ServerKind.OPENCODE) }
   val isDsh = harness == ServerKind.DSH
+  var dshAuth by rememberSaveable(existing?.id) { mutableStateOf(existing?.dshAuth ?: DshAuthMode.TOKEN) }
+  val isSecret = isDsh && dshAuth == DshAuthMode.SECRET
   var username by rememberSaveable(existing?.id) { mutableStateOf(existing?.username ?: "opencode") }
   var password by remember(existing?.id) { mutableStateOf("") }
   var autoConnect by rememberSaveable(existing?.id) { mutableStateOf(existing?.autoConnect ?: true) }
@@ -182,9 +188,23 @@ private fun MiuixServerForm(
   var result by remember { mutableStateOf("") }
   var working by remember { mutableStateOf(false) }
 
+  /** 粘贴 `dsh web` 的完整启动链接：拆成地址与令牌，并切到 DSH。 */
+  fun acceptLaunchLink(text: String): Boolean {
+    val link = DshLaunchLink.parse(text) ?: return false
+    harness = ServerKind.DSH
+    dshAuth = DshAuthMode.TOKEN
+    username = "dsh"
+    url = link.serverUrl
+    password = link.token
+    if (link.serverUrl.startsWith("http://", true)) allowHttp = true
+    if (name.isBlank()) name = "我的 ${ServerKind.DSH.label}"
+    return true
+  }
+
   LaunchedEffect(Unit) {
     if (existing == null && url.isBlank()) {
       val clipText = clipboard.getText()?.text?.trim().orEmpty()
+      if (acceptLaunchLink(clipText)) return@LaunchedEffect
       if (clipText.isNotBlank() && (PairLinkResolver.isPairLink(clipText) || clipText.startsWith("http://") || clipText.startsWith("https://"))) {
         url = clipText
         if (name.isBlank()) name = "我的服务器"
@@ -206,7 +226,8 @@ private fun MiuixServerForm(
         insideMargin = PaddingValues(12.dp)
       ) {
         Text(
-          "💡 推荐在电脑端运行 opencode pair 并将配对链接直接粘贴到下方，即可免密码一键配置认证。",
+          if (isDsh) "💡 直接粘贴 dsh web 打印的完整启动链接即可配对；配对后 Cookie 会保存在本机，dsh 重启也不用重新配对。想完全不看电脑，可改用「签名密钥」。"
+          else "💡 推荐在电脑端运行 opencode pair 并将配对链接直接粘贴到下方，即可免密码一键配置认证。",
           style = MiuixTheme.textStyles.footnote1.copy(color = MiuixTheme.colorScheme.primary)
         )
       }
@@ -239,12 +260,14 @@ private fun MiuixServerForm(
         TextField(
           value = url,
           onValueChange = { text: String ->
-            url = text
-            if (name.isBlank() && text.isNotBlank()) name = "我的 OpenCode"
+            if (!acceptLaunchLink(text)) {
+              url = text
+              if (name.isBlank() && text.isNotBlank()) name = "我的 ${harness.label}"
+            }
           },
           label = when {
-            url.isNotBlank() -> "服务器地址 或 配对链接"
-            isDsh -> "http://192.168.1.x:3080"
+            url.isNotBlank() -> if (isDsh) "服务器地址 或 启动链接" else "服务器地址 或 配对链接"
+            isDsh -> "http://192.168.1.x:3080 或启动链接"
             else -> "http://192.168.1.x:4096 或配对链接"
           },
           useLabelAsPlaceholder = url.isBlank(),
@@ -253,7 +276,7 @@ private fun MiuixServerForm(
         )
         Text(
           text = if (isDsh) {
-            "示例：http://192.168.1.100:3080。默认只监听本机，请用 dsh web --host <电脑的局域网 IP> 启动（端口默认 3080），令牌填启动链接里 token= 后面的那串字符；手机无法通过 localhost 访问电脑。"
+            "示例：http://192.168.1.100:3080。dsh 默认只监听本机，请用 dsh web --host <电脑的局域网 IP> --no-open 启动；可直接粘贴它打印的整条启动链接，地址和令牌会自动拆开。手机无法通过 localhost 访问电脑。"
           } else {
             "示例：http://192.168.1.100:4096 或 https://oc.example.com。手机无法通过 localhost 访问电脑，请填电脑的局域网 IP 或直接粘贴 opencode pair 配对链接。"
           },
@@ -265,6 +288,15 @@ private fun MiuixServerForm(
 
     if (normalizedInput.startsWith("http://", true)) item {
       SuperSwitch(title = "允许此地址使用 HTTP", summary = "请仅在你信任的网络中开启", checked = allowHttp, onCheckedChange = { allowHttp = it })
+    }
+    if (isDsh) item {
+      SuperDropdown(
+        title = "认证方式",
+        summary = if (isSecret) "填 Cookie 签名密钥，长期有效，配对不需要看电脑" else "填启动令牌，换到 Cookie 后保存在本机",
+        items = DshAuthMode.entries.map { it.label },
+        selectedIndex = DshAuthMode.entries.indexOf(dshAuth),
+        onSelectedIndexChange = { index -> dshAuth = DshAuthMode.entries[index] }
+      )
     }
     if (!isPair) {
       if (!isDsh) item {
@@ -280,7 +312,8 @@ private fun MiuixServerForm(
           value = password,
           onValueChange = { text: String -> password = text },
           label = when {
-            isDsh -> if (existing == null) "访问令牌（dsh web 启动链接里的 token）" else "新令牌（留空保持不变）"
+            isSecret -> if (existing?.dshAuth == DshAuthMode.SECRET) "新签名密钥（留空保持不变）" else "签名密钥（browser-session 记录的 secret）"
+            isDsh -> if (existing?.dshAuth == DshAuthMode.TOKEN) "新启动令牌（留空保持不变）" else "启动令牌（启动链接里 token= 后面的字符）"
             existing == null -> "访问密码（无认证服务器可留空）"
             else -> "新密码（留空保持不变）"
           },
@@ -289,7 +322,11 @@ private fun MiuixServerForm(
           modifier = Modifier.fillMaxWidth()
         )
         if (isDsh) Text(
-          text = "在电脑上运行 dsh web --host <局域网 IP>，把启动链接里 token= 后面的字符填在这里；换取会话 Cookie 后默认 30 天内无需重填（换地址或清除资料后需要新令牌）。",
+          text = if (isSecret) {
+            "签名密钥在电脑的 ~/.dsh/.credentials.yaml 里 client-connection/browser-session 记录的 secret（43 个字符）。它相当于这台 dsh 的长期密码：手机用它自行签发 Cookie，dsh 重启、Cookie 过期都不用重新配对。删除该记录并重启 dsh 即可吊销。请只在 HTTPS 或可信局域网中使用。"
+          } else {
+            "令牌只用来换 Cookie：Cookie 保存在本机、dsh 重启后仍然有效，默认 30 天过期（dsh 未重启时会自动续期）。想更久可在 dsh 配置里调大 cookieMaxAgeDays。"
+          },
           style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary),
           modifier = Modifier.padding(start = 12.dp, top = 4.dp, end = 12.dp)
         )
@@ -344,9 +381,17 @@ private fun MiuixServerForm(
           username = if (isDsh) "dsh" else username.trim().ifBlank { "opencode" },
           autoConnect = autoConnect, notifications = notifications,
           allowCleartext = normalizedUrl.startsWith("http://", true) && allowHttp,
-          kind = harness
+          kind = harness, dshAuth = if (isDsh) dshAuth else DshAuthMode.TOKEN
         )
-        onSave(profile, password.takeIf { it.isNotBlank() || existing == null }) { message ->
+        // 换了 DSH 认证方式时旧凭据不能沿用：必须重新填写。
+        val authChanged = isDsh && existing != null && existing.dshAuth != dshAuth
+        if (authChanged && password.isBlank()) {
+          result = "切换认证方式后请填写新的${dshAuth.label}"
+          working = false
+          return@DialogActions
+        }
+        val secret = if (isDsh) password.trim() else password
+        onSave(profile, secret.takeIf { it.isNotBlank() || existing == null }) { message ->
           result = message
           working = false
         }
