@@ -2,6 +2,8 @@ package com.igng.opencode.lagoon.core
 
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.async
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.awaitClose
@@ -359,7 +361,24 @@ class DshApi(
       get() = items.filter { it.optBoolean("running") }.mapNotNull { it.str("sessionId").takeIf(String::isNotBlank) }.toSet()
   }
 
+  /** The `session/list` read in flight; concurrent callers share it (see [listing]). */
+  private var listingFlight: Deferred<Listing>? = null
+  private val listingLock = Mutex()
+
+  /**
+   * `session/list` backs the probe, the catalog, activity and every child listing, so one control-plane
+   * read used to issue it many times at once. Callers that arrive while a read is in flight share it;
+   * nothing is cached afterwards, so a later call always sees fresh state. The shared read runs in
+   * [ioScope], so one caller's cancellation does not fail the others.
+   */
   private suspend fun listing(): Listing {
+    val flight = listingLock.withLock {
+      listingFlight?.takeIf { it.isActive } ?: ioScope.async { fetchListing() }.also { listingFlight = it }
+    }
+    return flight.await()
+  }
+
+  private suspend fun fetchListing(): Listing {
     val result = callObject("session/list", envelope(argsOf("_request" to JSONObject())))
     val items = result.arr("items").objects()
     // session/list 没有 directory 过滤参数；顺手刷新目录缓存，事件解码时要用。

@@ -2,6 +2,8 @@ package com.igng.opencode.lagoon.core
 
 import kotlinx.coroutines.flow.take
 import kotlinx.coroutines.flow.toList
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import okhttp3.Response
@@ -943,4 +945,33 @@ class DshApiTest {
     assertTrue(ApiCapabilities.BASELINE.deleteSession)
     assertFalse(ApiCapabilities.BASELINE.fork)
   }
+
+  @Test fun concurrentListingReadsShareOneSessionListRequest() = runBlocking {
+    MockWebServer().use { server ->
+      val lists = java.util.concurrent.atomic.AtomicInteger()
+      server.dispatcher = object : Dispatcher() {
+        override fun dispatch(request: RecordedRequest): MockResponse = when {
+          request.path!!.startsWith("/?token") || request.path == "/" -> rootOk()
+          request.path == "/api/session/list" -> { lists.incrementAndGet()
+            envelope("""{"items":[${sessionRow(running = true)}]}""").setBodyDelay(200, TimeUnit.MILLISECONDS) }
+          else -> MockResponse().setResponseCode(404)
+        }
+      }
+      val client = api(server)
+      val (version, page, active) = coroutineScope {
+        val version = async { client.health() }
+        val page = async { client.rootSessionsPage() }
+        val active = async { client.activeSessions() }
+        Triple(version.await(), page.await(), active.await())
+      }
+      assertEquals("DeepSeek Harness", version)
+      assertEquals(listOf("s1"), page.items.map { it.id })
+      assertEquals(setOf("s1"), active)
+      assertEquals("one shared session/list read", 1, lists.get())
+      // Nothing is cached afterwards: the next read goes to the server again.
+      client.rootSessionsPage()
+      assertEquals(2, lists.get())
+    }
+  }
+
 }

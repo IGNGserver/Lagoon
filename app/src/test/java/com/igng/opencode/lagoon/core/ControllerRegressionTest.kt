@@ -656,4 +656,42 @@ class ControllerRegressionTest {
     }
   }
 
+
+  @Test fun firstRoundReadsRunTogetherAndTheTranscriptDoesNotWaitForPendingRequests() = runBlocking {
+    MockWebServer().use { server ->
+      val firstRound = java.util.concurrent.CountDownLatch(4)
+      val transcriptRead = java.util.concurrent.CountDownLatch(1)
+      val sequentialFirstRound = java.util.concurrent.atomic.AtomicBoolean(false)
+      val transcriptWaitedForPermissions = java.util.concurrent.atomic.AtomicBoolean(false)
+      server.dispatcher = object : Dispatcher() { override fun dispatch(request: RecordedRequest): MockResponse {
+        val url = request.requestUrl!!
+        // Each first-round read holds its response until all four have arrived: a sequential client never gets there.
+        fun gate() { firstRound.countDown(); if (!firstRound.await(3, TimeUnit.SECONDS)) sequentialFirstRound.set(true) }
+        return when {
+          url.encodedPath == "/api/info" -> { gate(); MockResponse().setBody("""{"version":"2.0.22"}""") }
+          url.encodedPath == "/openapi.json" -> { gate(); MockResponse().setResponseCode(404) }
+          url.encodedPath == "/api/session" && url.queryParameter("parentID") == "null" -> { gate()
+            MockResponse().setBody("""{"data":[{"id":"s","projectID":"p","location":{"directory":"/repo"},"time":{"created":1,"updated":1}}],"cursor":{}}""") }
+          url.encodedPath == "/api/session/active" -> { gate(); MockResponse().setBody("""{"data":{"s":{}}}""") }
+          // The permission read only answers once the transcript was requested.
+          url.encodedPath == "/api/session/s/permission" -> {
+            if (!transcriptRead.await(3, TimeUnit.SECONDS)) transcriptWaitedForPermissions.set(true)
+            MockResponse().setBody("""{"data":[]}""")
+          }
+          url.encodedPath == "/api/session/s/message" -> { transcriptRead.countDown()
+            MockResponse().setBody("""{"data":[{"id":"u1","type":"user","time":{"created":1},"text":"hi"}],"cursor":{}}""") }
+          else -> MockResponse().setBody("""{"data":[]}""")
+        }
+      } }
+      val session = Session("s", "/repo", "T", 0, projectId = "p")
+      val (controller, state) = controller(api(server), LagoonState(serverId = "server", sessions = listOf(session), sessionId = "s"))
+      refresh(controller, controlOnly = false)
+      assertFalse("probe, contract, catalog and activity must be read in one round trip", sequentialFirstRound.get())
+      assertFalse("the transcript must not wait for pending-request reads", transcriptWaitedForPermissions.get())
+      assertTrue(state.value.connected)
+      assertEquals(ConnectStage.READY, state.value.connection.stage)
+      assertEquals(listOf("u1"), state.value.messages.map { it.id })
+    }
+  }
+
 }
