@@ -1,5 +1,11 @@
 package com.igng.opencode.lagoon.ui
 
+import android.content.Context
+import android.content.Intent
+import android.os.Build
+import android.provider.Settings
+import android.text.format.Formatter
+import android.widget.Toast
 import androidx.compose.animation.*
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.spring
@@ -30,7 +36,12 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.core.content.edit
+import androidx.core.net.toUri
 import com.igng.opencode.lagoon.core.*
+import com.igng.opencode.lagoon.system.AppUpdatePhase
+import com.igng.opencode.lagoon.system.AppUpdateState
+import com.igng.opencode.lagoon.system.AppUpdater
 import com.igng.opencode.lagoon.system.LiveUpdateSupport
 import com.igng.opencode.lagoon.system.TaskNotifications
 import kotlinx.coroutines.CancellationException
@@ -421,6 +432,14 @@ fun SettingsScreen(
   onBack: () -> Unit
 ) {
   val context = androidx.compose.ui.platform.LocalContext.current
+  val updater = remember(context) { AppUpdater.get(context) }
+  val update by updater.state.collectAsState()
+  val updatePreferences = remember(context) { context.getSharedPreferences("ui", Context.MODE_PRIVATE) }
+  var includePrerelease by remember { mutableStateOf(updatePreferences.getBoolean("updatePrerelease", true)) }
+  var installAllowed by remember { mutableStateOf(context.packageManager.canRequestPackageInstalls()) }
+  var pendingInstall by rememberSaveable { mutableStateOf(false) }
+  var showReleaseNotes by rememberSaveable { mutableStateOf(false) }
+  LaunchedEffect(update.release?.version) { showReleaseNotes = false }
   // 只展示系统标准实时更新的状态；不检测任何厂商通道。检测放到 IO 线程执行。
   var notificationsEnabled by remember { mutableStateOf(true) }
   var liveUpdate by remember { mutableStateOf<LiveUpdateSupport?>(null) }
@@ -435,12 +454,50 @@ fun SettingsScreen(
       liveUpdate = support
     }
   }
+  fun requestInstall() {
+    val apk = updater.readyApk()
+    if (apk == null) return
+    if (!context.packageManager.canRequestPackageInstalls()) {
+      pendingInstall = true
+      installAllowed = false
+      val opened = runCatching {
+        context.startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, "package:${context.packageName}".toUri()))
+      }.isSuccess
+      if (!opened) {
+        pendingInstall = false
+        Toast.makeText(context, "无法打开“安装未知应用”设置，请手动在系统设置中授权", Toast.LENGTH_LONG).show()
+      }
+      return
+    }
+    pendingInstall = false
+    installAllowed = true
+    val uri = updater.installerUri(apk)
+    val intent = Intent(Intent.ACTION_VIEW).apply {
+      setDataAndType(uri, "application/vnd.android.package-archive")
+      addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+      addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    }
+    runCatching { context.startActivity(intent) }.onFailure {
+      Toast.makeText(context, "无法打开系统安装器：${it.message ?: "未知错误"}", Toast.LENGTH_LONG).show()
+    }
+  }
   DisposableEffect(lifecycleOwner) {
-    val observer = LifecycleEventObserver { _, event -> if (event == Lifecycle.Event.ON_RESUME) refreshSupport() }
+    val observer = LifecycleEventObserver { _, event ->
+      if (event == Lifecycle.Event.ON_RESUME) {
+        refreshSupport()
+        installAllowed = context.packageManager.canRequestPackageInstalls()
+        if (pendingInstall && installAllowed) {
+          pendingInstall = false
+          requestInstall()
+        }
+      }
+    }
     lifecycleOwner.lifecycle.addObserver(observer); refreshSupport()
     onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
   }
   val packageInfo = remember { context.packageManager.getPackageInfo(context.packageName, 0) }
+  val versionCode = if (Build.VERSION.SDK_INT >= 28) packageInfo.longVersionCode
+    else @Suppress("DEPRECATION") packageInfo.versionCode.toLong()
   val clipboard = LocalClipboardManager.current
   var crashReport by remember { mutableStateOf<String?>(null) }
   LaunchedEffect(Unit) { crashReport = withContext(Dispatchers.IO) { CrashLog.read(context) } }
@@ -558,10 +615,45 @@ fun SettingsScreen(
     }
 
     item {
+      SmallTitle("版本与更新")
+      Card(Modifier.fillMaxWidth()) {
+        BasicComponent(
+          title = "Lagoon ${packageInfo.versionName} ($versionCode)",
+          summary = "Android ${Build.VERSION.RELEASE} · API ${Build.VERSION.SDK_INT} · 更新源 GitHub"
+        )
+        HorizontalDivider()
+        SuperSwitch(
+          title = "包含预发布版本",
+          summary = if (includePrerelease) "包含 rc / beta 等预发布版；关闭后只检查正式版" else "只检查正式版；rc / beta 不会提示",
+          checked = includePrerelease,
+          enabled = update.phase != AppUpdatePhase.DOWNLOADING && update.phase != AppUpdatePhase.CHECKING,
+          onCheckedChange = { enabled ->
+            includePrerelease = enabled
+            updatePreferences.edit { putBoolean("updatePrerelease", enabled) }
+            updater.clearResult()
+            updater.check(enabled, force = true)
+          }
+        )
+        HorizontalDivider()
+        UpdateControls(
+          update = update,
+          includePrerelease = includePrerelease,
+          installAllowed = installAllowed,
+          onCheck = { updater.check(includePrerelease) },
+          onRetryCheck = { updater.check(includePrerelease, force = true) },
+          onDownload = { updater.download() },
+          onCancel = { updater.cancelDownload() },
+          onInstall = { requestInstall() },
+          onShowNotes = { showReleaseNotes = true }
+        )
+      }
+    }
+
+    item {
       SmallTitle("关于与诊断")
       Card(Modifier.fillMaxWidth()) {
         BasicComponent(
-          title = "Lagoon ${packageInfo.versionName} (${if (android.os.Build.VERSION.SDK_INT >= 28) packageInfo.longVersionCode else @Suppress("DEPRECATION") packageInfo.versionCode.toLong()})",
+          title = "服务与同步",
           summary = "服务：${state.version.ifBlank { "未知版本" }} · ${if (state.connected) "可连接" else "未连接"}\n实时同步：${if (state.streamConnected) "正常" else "恢复中"} · ${if (state.degraded || state.cached) "数据待更新" else "数据已同步"}"
         )
         SuperArrow(
@@ -579,6 +671,189 @@ fun SettingsScreen(
       }
     }
   }
+  }
 
+  val releaseForNotes = update.release
+  if (showReleaseNotes && releaseForNotes != null) {
+    SuperBottomSheet(
+      title = "Lagoon ${releaseForNotes.version} 更新说明",
+      show = true,
+      onDismissRequest = { showReleaseNotes = false }
+    ) {
+      Column(
+        Modifier.fillMaxWidth().fillMaxHeight(0.8f).verticalScroll(rememberScrollState())
+          .padding(horizontal = 20.dp, vertical = 12.dp)
+      ) {
+        if (releaseForNotes.notes.isBlank()) {
+          Text("本次发布没有附加说明。", style = MiuixTheme.textStyles.body2)
+        } else {
+          DetailMarkdown(releaseForNotes.notes)
+        }
+        Spacer(Modifier.height(24.dp))
+      }
+    }
+  }
+}
+
+@Composable
+private fun UpdateControls(
+  update: AppUpdateState,
+  includePrerelease: Boolean,
+  installAllowed: Boolean,
+  onCheck: () -> Unit,
+  onRetryCheck: () -> Unit,
+  onDownload: () -> Unit,
+  onCancel: () -> Unit,
+  onInstall: () -> Unit,
+  onShowNotes: () -> Unit
+) {
+  val context = androidx.compose.ui.platform.LocalContext.current
+  val release = update.release
+  val failure = update.failure
+  if (failure != null && release == null) {
+    BasicComponent(
+      title = "检查失败",
+      summary = failure.userMessage(update.failureDetail),
+      endActions = { TextButton(text = "重试", onClick = onRetryCheck) }
+    )
+    return
+  }
+  if (release == null) {
+    when (update.phase) {
+      AppUpdatePhase.CHECKING -> BasicComponent(
+        title = "检查更新",
+        summary = "正在向 GitHub 查询新版本…",
+        endActions = { InfiniteProgressIndicator(size = 16.dp, strokeWidth = 2.dp) }
+      )
+      AppUpdatePhase.UP_TO_DATE -> SuperArrow(
+        title = "已是最新版本",
+        summary = updateChannelsText(update.lastCheckedAt, includePrerelease),
+        onClick = onCheck
+      )
+      else -> SuperArrow(
+        title = "检查更新",
+        summary = "从 GitHub Releases 检查 Lagoon 新版本",
+        onClick = onCheck
+      )
+    }
+    return
+  }
+
+  Column(
+    Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
+    verticalArrangement = Arrangement.spacedBy(8.dp)
+  ) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+      Text(
+        if (release.prerelease) "发现预发布版" else "发现新版本",
+        style = MiuixTheme.textStyles.footnote1,
+        color = MiuixTheme.colorScheme.onSurfaceVariantSummary
+      )
+      Spacer(Modifier.width(8.dp))
+      Text(
+        "v${release.version}",
+        style = MiuixTheme.textStyles.title4.copy(fontWeight = FontWeight.Medium),
+        color = MiuixTheme.colorScheme.primary
+      )
+    }
+    val meta = buildList {
+      formatUpdateDate(release.publishedAt)?.let { add("发布 $it") }
+      release.assetSize?.let { add(Formatter.formatFileSize(context, it)) }
+      add(if (release.prerelease) "预发布" else "正式版")
+    }.joinToString(" · ")
+    Text(meta, style = MiuixTheme.textStyles.footnote1, color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+    Row(verticalAlignment = Alignment.CenterVertically) {
+      if (release.notes.isNotBlank()) TextButton(text = "查看更新说明", onClick = onShowNotes)
+      TextButton(
+        text = "重新检查",
+        enabled = update.phase != AppUpdatePhase.CHECKING && update.phase != AppUpdatePhase.DOWNLOADING,
+        onClick = onRetryCheck
+      )
+    }
+    if (failure != null) {
+      Text(
+        (if (update.phase == AppUpdatePhase.READY) "检查更新失败：" else "") + failure.userMessage(update.failureDetail),
+        style = MiuixTheme.textStyles.footnote1,
+        color = if (update.phase == AppUpdatePhase.READY) MiuixColorTokens.Warning else MiuixColorTokens.Error
+      )
+    }
+    when (update.phase) {
+      AppUpdatePhase.CHECKING -> Row(verticalAlignment = Alignment.CenterVertically) {
+        InfiniteProgressIndicator(size = 14.dp, strokeWidth = 2.dp)
+        Spacer(Modifier.width(8.dp))
+        Text(
+          "正在检查新版本…",
+          style = MiuixTheme.textStyles.footnote1,
+          color = MiuixTheme.colorScheme.onSurfaceVariantSummary
+        )
+      }
+      AppUpdatePhase.DOWNLOADING -> {
+        LinearProgressIndicator(
+          progress = update.progress,
+          modifier = Modifier.fillMaxWidth(),
+          height = 4.dp
+        )
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+          Text(
+            downloadProgressText(context, update),
+            Modifier.weight(1f),
+            style = MiuixTheme.textStyles.footnote1,
+            color = MiuixTheme.colorScheme.onSurfaceVariantSummary
+          )
+          TextButton(text = "取消", onClick = onCancel)
+        }
+      }
+      AppUpdatePhase.READY -> {
+        Text(
+          if (installAllowed) "安装包已校验完成，可以覆盖安装" else "安装包已校验完成；需要允许 Lagoon 安装未知应用",
+          style = MiuixTheme.textStyles.footnote1,
+          color = if (installAllowed) MiuixColorTokens.Success else MiuixColorTokens.Warning
+        )
+        TextButton(
+          text = if (installAllowed) "安装更新" else "允许后安装",
+          onClick = onInstall,
+          modifier = Modifier.fillMaxWidth(),
+          colors = ButtonDefaults.textButtonColorsPrimary()
+        )
+      }
+      AppUpdatePhase.FAILED -> TextButton(
+        text = "重新下载",
+        onClick = onDownload,
+        modifier = Modifier.fillMaxWidth(),
+        colors = ButtonDefaults.textButtonColorsPrimary()
+      )
+      else -> TextButton(
+        text = "下载并安装",
+        onClick = onDownload,
+        modifier = Modifier.fillMaxWidth(),
+        colors = ButtonDefaults.textButtonColorsPrimary()
+      )
+    }
+  }
+}
+
+private fun updateChannelsText(lastCheckedAt: Long, includePrerelease: Boolean): String {
+  val channel = if (includePrerelease) "预发布（含正式版）" else "仅正式版"
+  return if (lastCheckedAt <= 0) "更新通道：$channel"
+  else "更新通道：$channel · 上次检查 ${formatRelative(lastCheckedAt)}"
+}
+
+private fun formatUpdateDate(value: String?): String? {
+  if (value.isNullOrBlank()) return null
+  return runCatching {
+    java.time.Instant.parse(value).atZone(java.time.ZoneId.systemDefault())
+      .format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd"))
+  }.getOrNull()
+}
+
+private fun downloadProgressText(context: Context, state: AppUpdateState): String {
+  val downloaded = Formatter.formatFileSize(context, state.downloadedBytes)
+  val total = state.totalBytes?.let { Formatter.formatFileSize(context, it) }
+  val percent = state.progress?.let { (it * 100).toInt() }
+  return when {
+    percent != null && total != null -> "下载中 $percent% · $downloaded / $total"
+    percent != null -> "下载中 $percent% · $downloaded"
+    total != null -> "正在下载 · $downloaded / $total"
+    else -> "正在下载 · $downloaded"
   }
 }

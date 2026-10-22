@@ -26,6 +26,7 @@
 - 仓库 Secrets：`OPENCODE_LAGOON_KEYSTORE_BASE64`、`OPENCODE_LAGOON_KEYSTORE_PASSWORD`、`OPENCODE_LAGOON_KEY_ALIAS`、`OPENCODE_LAGOON_KEY_PASSWORD`、`OPENCODE_LAGOON_SIGNING_CERT_SHA256`。最后一项是签名证书 SHA-256 指纹。工作流将 keystore 写入 runner 临时目录，构建后用 apksigner 验证实际证书。
 - 版本名来自 tag；版本码为 `1000 + GITHUB_RUN_NUMBER`。正常发布须按运行顺序完成，不得将旧 tag 重新构建为较新升级版本；工作流更名/计数重置前需迁移版本码基数。
 - 本地未配置 keystore 的 assembleRelease 仅用于编译验证，可能使用 debug 签名，不能作为发布产物。历史 debug 签名安装包无法用新稳定证书直接覆盖，应在目标设备验证迁移并事先保存服务器配置。
+- 应用内更新要求下载的 APK 与已安装应用签名一致：发布构建必须继续使用同一固定证书。debug 包或不同来源的 APK 会由客户端在调起系统安装器前拒绝覆盖，详见 `docs/APP_UPDATE.md`。
 - keystore、口令均不得进入仓库。CI 在成功或失败后清理注入文件。
 - 当前签名证书指纹、主备份位置和恢复步骤见 [`docs/ANDROID_SIGNING.md`](ANDROID_SIGNING.md)；生成 keystore 摘要见 [`docs/ANDROID_SIGNING_MANIFEST.txt`](ANDROID_SIGNING_MANIFEST.txt)。
 
