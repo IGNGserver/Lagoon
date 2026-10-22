@@ -102,6 +102,8 @@ data class LagoonState(
   val allServerSnapshots: Map<String, ServerOverviewSnapshot> = emptyMap(),
   val allSessionStatuses: Map<String, SessionStatus> = emptyMap(),
   val allUnseenSessions: Set<String> = emptySet(),
+  /** The independent server-side read sync is in flight; the menu shows progress and ignores retaps. */
+  val serverReadPending: Boolean = false,
   /** Home is projecting all saved servers instead of the writable single-server connection. */
   val allServers: Boolean = false,
   /** Home filter; the writable conversation's serverId can differ without changing this. */
@@ -336,6 +338,8 @@ class LagoonController private constructor(private val appContext: Context) {
   private val attentionJobs = mutableMapOf<String, Job>()
   /** 后台工作结束后的宽限收尾任务，按根会话 id 去重（见 [scheduleBackgroundSettle]）。 */
   private val backgroundSettles = mutableMapOf<String, Job>()
+  /** The long-running independent “服务端已读” sweep; prevents a second tap from racing it. */
+  private var serverReadJob: Job? = null
   /** 等待态事件的单调序号：对账只在读取期间没有新的等待事件时才清除等待态，避免事件/对读竞态造成抖动。 */
   private var waitingEventSeq = 0L
   private val waitingEventSeqAt = mutableMapOf<String, Long>()
@@ -2056,6 +2060,125 @@ class LagoonController private constructor(private val appContext: Context) {
     if (visible) visibleConversation = server to session
     else if (visibleConversation == (server to session)) visibleConversation = null
     acknowledgeVisible()
+  }
+  /**
+   * 首页「全部已读」：把当前首页范围内的本机结果账本全部标为已读，并撤下对应的结果通知。
+   *
+   * 单服务器模式只作用于首页显示的那台服务器；「全部」模式作用于所有已监视服务器。它不写服务端，
+   * 也不改变运行中/待处理状态；同一会话正在等待授权或回答时保留其通知。
+   */
+  fun markAllRead() {
+    val current = state.value
+    val snapshots = current.homeReadSnapshots()
+    val unseen = snapshots.mapValues { (_, snapshot) -> snapshot.notices.filterNot { it.viewed } }
+      .filterValues { it.isNotEmpty() }
+    if (unseen.isEmpty()) return
+    var cleared = 0
+    val noticesByServer = mutableMapOf<String, List<SessionNotice>>()
+    unseen.forEach { (server, notices) ->
+      val sessions = notices.map { it.sessionId }.distinct()
+      cleared += sessions.size
+      noticesByServer[server] = store.viewAllNotices(server)
+      snapshots.getValue(server).resultNotificationSessions(sessions.toSet()).forEach { session ->
+        attempt { notifications.cancel(server, session) }
+      }
+    }
+    if (noticesByServer.isEmpty()) return
+    noticesByServer.forEach { (server, notices) ->
+      val snapshot = snapshots[server] ?: return@forEach
+      allSnapshots[server] = snapshot.copy(notices = notices,
+        summary = snapshot.copy(notices = notices).displaySummary(current.permissionPolicy))
+    }
+    mutable.update { latest ->
+      val next = noticesByServer[latest.serverId]?.let { withSummary(latest.copy(notices = it)) } ?: latest
+      next.copy(allServerSnapshots = allSnapshots.toMap(),
+        message = "已将 $cleared 个会话标记为已读")
+    }
+  }
+  /**
+   * 独立的「服务端已读」：对当前首页范围内、支持 `POST /api/session/{id}/view` 且已连接的服务器，
+   * 把本机结果账本里已结束但 `time.viewed < time.idle` 的主会话按精确 idle 写回服务端。它不清本机
+   * 未读，也不发通知；因此可以先清本机、之后再同步服务端，或只同步服务端给其他客户端看。
+   */
+  fun markServerRead() {
+    if (serverReadJob?.isActive == true) return
+    val current = state.value
+    val targets = current.serverReadTargets()
+    if (targets.isEmpty()) {
+      mutable.update { it.copy(message = "没有需要同步的服务端已读") }
+      return
+    }
+    val clients = targets.keys.associateWith { server ->
+      if (server == current.serverId) api else attempt { allOverview.client(server) }.getOrNull()
+    }
+    mutable.update { it.copy(serverReadPending = true) }
+    serverReadJob = operationScope.launch {
+      var succeeded = 0
+      var failed = 0
+      val acknowledged = mutableMapOf<String, MutableMap<String, Long>>()
+      try {
+        targets.forEach { (server, sessions) ->
+          val client = clients[server]
+          if (client == null) {
+            failed += sessions.size
+            return@forEach
+          }
+          sessions.chunked(4).forEach { batch ->
+            val results = coroutineScope {
+              batch.map { session -> async { session to attempt { client.viewSession(session, session.idle) } } }.awaitAll()
+            }
+            results.forEach { (session, result) ->
+              result.fold(
+                onSuccess = {
+                  succeeded += 1
+                  acknowledged.getOrPut(server) { mutableMapOf() }[session.id] = session.idle
+                },
+                onFailure = { Diagnostics.warn("SessionView", "服务端已读同步失败：$server/${session.id}", it); failed += 1 }
+              )
+            }
+          }
+        }
+        applyServerRead(acknowledged)
+        mutable.update {
+          it.copy(
+            message = when {
+              failed == 0 -> "服务端已读已同步 $succeeded 个会话"
+              succeeded == 0 -> null
+              else -> "服务端已读：$succeeded 个成功，$failed 个失败"
+            },
+            error = if (succeeded == 0 && failed > 0) "服务端已读同步失败" else it.error
+          )
+        }
+      } catch (cancel: CancellationException) {
+        throw cancel
+      } catch (error: Exception) {
+        Diagnostics.warn("SessionView", "服务端已读同步失败", error)
+        mutable.update { it.copy(error = "服务端已读同步失败") }
+      } finally {
+        mutable.update { it.copy(serverReadPending = false) }
+      }
+    }
+  }
+  /** Locally reflect acknowledged idle timestamps; a newer idle is never acknowledged by an older request. */
+  private fun applyServerRead(acknowledged: Map<String, Map<String, Long>>) {
+    if (acknowledged.isEmpty()) return
+    val current = state.value
+    val sources = current.serverSnapshots()
+    val updated = mutableMapOf<String, List<Session>>()
+    acknowledged.forEach { (server, idles) ->
+      val snapshot = sources[server] ?: return@forEach
+      val sessions = snapshot.sessions.map { session ->
+        val idle = idles[session.id]
+        if (idle != null && session.idle == idle && session.viewed < idle) session.copy(viewed = idle) else session
+      }
+      updated[server] = sessions
+      allSnapshots[server] = snapshot.copy(sessions = sessions)
+    }
+    if (updated.isEmpty()) return
+    mutable.update { latest ->
+      latest.copy(sessions = updated[latest.serverId] ?: latest.sessions,
+        allServerSnapshots = allSnapshots.toMap())
+    }
   }
   /**
    * Official `MarkSessionNotificationsViewed`: once the conversation is on screen, every unread result of

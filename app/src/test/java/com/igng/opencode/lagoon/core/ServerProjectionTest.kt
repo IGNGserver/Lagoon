@@ -79,6 +79,45 @@ class ServerProjectionTest {
     assertEquals(1, state.globalSummary.running)
   }
 
+  @Test fun homeReadTargetsFollowTheProjectedServerAndAllServersMode() {
+    val state = LagoonState(profiles = listOf(a, b), serverId = "a", homeServerId = "b", connected = true,
+      sessions = snapshot(a, TaskPhase.IDLE).sessions,
+      allServerSnapshots = mapOf("a" to snapshot(a, TaskPhase.IDLE), "b" to snapshot(b, TaskPhase.IDLE)))
+    assertEquals(setOf("b"), state.homeReadSnapshots().keys)
+    assertEquals(setOf("a", "b"), state.copy(allServers = true).homeReadSnapshots().keys)
+  }
+
+  @Test fun homeUnseenSessionsStayScopedInAllServersMode() {
+    val single = LagoonState(notices = listOf(SessionNotice("n", "same", 1, false)))
+    assertEquals(setOf("same"), single.homeUnseenSessions())
+    val all = LagoonState(allServers = true, allUnseenSessions = setOf("a:same", "b:same"))
+    assertEquals(setOf("a:same", "b:same"), all.homeUnseenSessions())
+  }
+
+  @Test fun serverReadCandidatesRequireAConnectedViewCapableRootWithAResult() {
+    val sessions = listOf(
+      Session("root", "/repo", "Root", 10, idle = 20, viewed = 10),
+      Session("seen", "/repo", "Seen", 10, idle = 20, viewed = 20),
+      Session("other", "/repo", "Other", 10, idle = 20, viewed = 0),
+      Session("child", "/repo", "Child", 10, parentId = "root", idle = 20, viewed = 0))
+    val base = snapshot(a, TaskPhase.IDLE).copy(canSyncRead = true, sessions = sessions,
+      notices = listOf(SessionNotice("n", "root", 1, false)))
+    assertEquals(listOf("root"), base.serverReadCandidates().map { it.id })
+    // Local read is a separate axis: viewed notices still drive the server-side sync.
+    assertEquals(listOf("root"), base.copy(notices = base.notices.map { it.copy(viewed = true) })
+      .serverReadCandidates().map { it.id })
+    assertTrue(base.copy(canSyncRead = false).serverReadCandidates().isEmpty())
+    assertTrue(base.copy(connected = false).serverReadCandidates().isEmpty())
+  }
+
+  @Test fun localAllReadKeepsTheNotificationSlotOfAWaitingSession() {
+    val waiting = snapshot(a, TaskPhase.WAITING_QUESTION).copy(
+      permissions = listOf(PermissionRequest("p", "same", "/repo", "shell", "echo", emptyList())))
+    assertTrue(waiting.resultNotificationSessions(setOf("same")).isEmpty())
+    val running = waiting.copy(permissions = emptyList(), tasks = mapOf("same" to TaskState("same", TaskPhase.THINKING)))
+    assertEquals(setOf("same"), running.resultNotificationSessions(setOf("same")))
+  }
+
   @Test fun pendingMatchesListLevelActionsInTheAggregateProjection() {
     val raw = LagoonState(serverId = "a", projectId = "p", pendingOperations = setOf("a:p:sessions-more"))
     val aggregate = raw.copy(allServers = true).homeProjection()

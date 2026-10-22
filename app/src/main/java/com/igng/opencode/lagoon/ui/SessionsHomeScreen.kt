@@ -61,6 +61,12 @@ internal fun HomeScreen(
   var query by rememberSaveable(state.allServers, state.serverId) { mutableStateOf("") }
   var renaming by remember { mutableStateOf<Session?>(null) }
   var deleting by remember { mutableStateOf<Session?>(null) }
+  val hasUnread = state.homeUnseenSessions().isNotEmpty()
+  val serverReadCount = if (state.allServers) {
+    state.allServerSnapshots.values.sumOf { it.serverReadCandidates().size }
+  } else {
+    state.serverId?.let { state.allServerSnapshots[it] }?.serverReadCandidates()?.size ?: 0
+  }
   fun closeSearch() { searching = false; query = "" }
   BackHandler(enabled = searching) { closeSearch() }
   Box(Modifier.fillMaxSize()) {
@@ -72,19 +78,31 @@ internal fun HomeScreen(
            else -> state.scopeProjectId?.let { id -> state.projects.firstOrNull { it.id == id }?.name } ?: "全部会话"
          },
         onTitleClick = onProjects,
+        action = if (hasUnread) {
+          {
+            Text("全部已读", Modifier.clip(CircleShape).clickable(role = Role.Button) { controller.markAllRead() }
+              .padding(horizontal = 12.dp, vertical = 10.dp), maxLines = 1,
+              style = MiuixTheme.textStyles.body2.copy(color = MiuixTheme.colorScheme.primary))
+          }
+        } else null,
         menu = {
           Box {
             CircleIconButton(MiuixIcons.More, "更多", { menu = true })
-            MenuPopup(menu, { menu = false }, listOf(
-              MenuSection(HomeGrouping.entries.map { option ->
+            MenuPopup(menu, { menu = false }, buildList {
+              add(MenuSection(HomeGrouping.entries.map { option ->
                 MenuAction(option.label, selected = grouping == option) { grouping = option; preferences.edit().putString("homeGrouping", option.name).apply() }
-              }, title = "分组方式"),
-              MenuSection(listOf(
+              }, title = "分组方式"))
+              if (serverReadCount > 0 || state.serverReadPending) add(MenuSection(listOf(
+                MenuAction(if (state.serverReadPending) "正在同步服务端已读…" else "服务端已读 · $serverReadCount") {
+                  controller.markServerRead()
+                }
+              ), title = "已读同步"))
+              add(MenuSection(listOf(
                 MenuAction("搜索", MiuixIcons.Search) { searching = true },
                 MenuAction("已归档", ARCHIVE_ICON) { onPage(RootPage.ARCHIVED) },
                 MenuAction("设置", MiuixIcons.Settings) { onPage(RootPage.SETTINGS) }
-              ))
-            ))
+              )))
+            })
           }
         }
       )
@@ -126,9 +144,9 @@ private fun SearchTopBar(query: String, onQuery: (String) -> Unit, onClose: () -
   }
 }
 
-/** Fixed header: grid glyph + scope title with ⌄ on the left, a round ⋯ on the right. */
+/** Fixed header: grid glyph + scope title with ⌄ on the left, an optional one-tap read action, and ⋯. */
 @Composable
-private fun HomeTopBar(title: String, onTitleClick: () -> Unit, menu: @Composable () -> Unit) {
+private fun HomeTopBar(title: String, onTitleClick: () -> Unit, action: (@Composable () -> Unit)? = null, menu: @Composable () -> Unit) {
   Row(Modifier.fillMaxWidth().statusBarsPadding().heightIn(min = 64.dp).padding(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 4.dp),
     verticalAlignment = Alignment.CenterVertically) {
     Box(Modifier.weight(1f)) {
@@ -143,6 +161,7 @@ private fun HomeTopBar(title: String, onTitleClick: () -> Unit, menu: @Composabl
     }
     }
     Spacer(Modifier.width(8.dp))
+    if (action != null) { action(); Spacer(Modifier.width(2.dp)) }
     menu()
   }
 }

@@ -107,6 +107,86 @@ class ControllerRegressionTest {
     assertEquals(SessionStatus.COMPLETED, state.value.sessionStatus(session))
   }
 
+  @Test fun markingAllReadClearsTheLocalLedgerButKeepsLiveTasksRunning() {
+    val profile = ServerProfile("server", "Server", "https://server.example")
+    val session = Session("s", "/repo", "Title", 1)
+    val now = System.currentTimeMillis()
+    val store = ServerStore(memoryPreferences(), memoryPreferences(), { it }, { it })
+    val notices = listOf(SessionNotice("first", "s", now, false), SessionNotice("second", "other", now + 1, true))
+      .fold(emptyList<SessionNotice>()) { _, notice -> store.rememberNotice("server", notice) }
+    val (controller, state) = controller(api(MockWebServer()), LagoonState(profiles = listOf(profile),
+      serverId = "server", connected = true, sessions = listOf(session), notices = notices,
+      tasks = mapOf("s" to TaskState("s", TaskPhase.THINKING, since = now))))
+    put(controller, "store", store)
+    put(controller, "allSnapshots", mutableMapOf<String, ServerOverviewSnapshot>())
+    controller.markAllRead()
+    assertTrue(state.value.notices.all { it.viewed })
+    assertTrue(store.sessionNotices("server").all { it.viewed })
+    assertEquals(0, state.value.summary.completed)
+    assertEquals(0, state.value.summary.failed)
+    assertEquals(1, state.value.summary.running)
+    assertEquals("已将 2 个会话标记为已读", state.value.message)
+  }
+
+  @Test fun markingAllReadCoversEveryProjectedServerInAllMode() {
+    val profileA = ServerProfile("a", "A", "https://a.example")
+    val profileB = ServerProfile("b", "B", "https://b.example")
+    val now = System.currentTimeMillis()
+    val store = ServerStore(memoryPreferences(), memoryPreferences(), { it }, { it })
+    val aNotices = listOf(SessionNotice("a1", "sa", now, false), SessionNotice("a2", "sa2", now + 1, true))
+      .fold(emptyList<SessionNotice>()) { _, notice -> store.rememberNotice("a", notice) }
+    val bNotices = listOf(SessionNotice("b1", "sb", now, false))
+      .fold(emptyList<SessionNotice>()) { _, notice -> store.rememberNotice("b", notice) }
+    val aSnapshot = ServerOverviewSnapshot("a", profileA, connected = true,
+      sessions = listOf(Session("sa", "/repo", "A", 1)), notices = aNotices)
+    val bSnapshot = ServerOverviewSnapshot("b", profileB, connected = true,
+      sessions = listOf(Session("sb", "/repo", "B", 1)), notices = bNotices)
+    val (controller, state) = controller(api(MockWebServer()), LagoonState(profiles = listOf(profileA, profileB),
+      serverId = "a", homeServerId = "a", allServers = true, connected = true,
+      sessions = aSnapshot.sessions, notices = aNotices,
+      allServerSnapshots = mapOf("a" to aSnapshot, "b" to bSnapshot)))
+    put(controller, "store", store)
+    put(controller, "allSnapshots", linkedMapOf("a" to aSnapshot, "b" to bSnapshot))
+    controller.markAllRead()
+    assertTrue(state.value.notices.all { it.viewed })
+    assertTrue(state.value.allServerSnapshots.getValue("a").notices.all { it.viewed })
+    assertTrue(state.value.allServerSnapshots.getValue("b").notices.all { it.viewed })
+    assertTrue(store.sessionNotices("a").all { it.viewed })
+    assertTrue(store.sessionNotices("b").all { it.viewed })
+  }
+
+  @Test fun serverReadPostsTheExactIdleAndLeavesLocalUnreadAlone() = runBlocking {
+    MockWebServer().use { server ->
+      val paths = java.util.Collections.synchronizedList(mutableListOf<String>())
+      val bodies = java.util.Collections.synchronizedList(mutableListOf<String>())
+      server.dispatcher = object : Dispatcher() {
+        override fun dispatch(request: RecordedRequest): MockResponse {
+          paths += request.path.orEmpty()
+          if (request.path == "/api/session/s/view") {
+            bodies += request.body.readUtf8()
+            return MockResponse().setResponseCode(200).setBody("{}")
+          }
+          return MockResponse().setResponseCode(404)
+        }
+      }
+      val profile = ServerProfile("server", "Server", server.url("/").toString(), allowCleartext = true)
+      val session = Session("s", "/repo", "Title", 1, idle = 100, viewed = 10)
+      val notice = SessionNotice("n", "s", System.currentTimeMillis(), false)
+      val (controller, state) = controller(OpenCodeApi(profile, "fixture"),
+        LagoonState(profiles = listOf(profile), serverId = "server", connected = true,
+          sessions = listOf(session), notices = listOf(notice), capabilities = ApiCapabilities.BASELINE))
+      put(controller, "allSnapshots", mutableMapOf<String, ServerOverviewSnapshot>())
+      controller.markServerRead()
+      val job = controller.javaClass.getDeclaredField("serverReadJob").apply { isAccessible = true }.get(controller) as Job?
+      requireNotNull(job).join()
+      assertEquals(100L, state.value.sessions.single().viewed)
+      assertFalse("服务端已读是独立动作，不得顺带清掉本机未读", state.value.notices.single().viewed)
+      assertEquals(listOf("/api/session/s/view"), paths)
+      assertTrue(bodies.single().contains("\"idle\":100"))
+      assertFalse(state.value.serverReadPending)
+    }
+  }
+
   private fun v2Server(paths: MutableList<String>, sessionsBody: () -> String, active: () -> String, sessionBody: (String) -> String? = { null }): Dispatcher = object : Dispatcher() {
     override fun dispatch(request: RecordedRequest): MockResponse {
       paths += request.path.orEmpty()
