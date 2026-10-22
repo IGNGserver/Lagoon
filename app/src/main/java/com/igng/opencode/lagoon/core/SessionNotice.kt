@@ -40,3 +40,7 @@ internal fun List<SessionNotice>.pruned(now: Long): List<SessionNotice> =
 /** Marks the given entries of one session viewed. */
 internal fun List<SessionNotice>.viewObserved(session: String, ids: Set<String>): List<SessionNotice> =
   map { if (it.sessionId == session && it.id in ids) it.copy(viewed = true) else it }
+
+/** Marks every entry viewed; the home action applies this to a whole server ledger. */
+internal fun List<SessionNotice>.viewAllObserved(): List<SessionNotice> =
+  map { if (it.viewed) it else it.copy(viewed = true) }

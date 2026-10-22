@@ -14,11 +14,51 @@ internal fun LagoonState.serverSnapshots(): Map<String, ServerOverviewSnapshot> 
   val profile = server ?: return allServerSnapshots
   if (!connected && sessions.isEmpty() && tasks.isEmpty()) return allServerSnapshots
   return allServerSnapshots + (id to ServerOverviewSnapshot(id, profile, version = version, connected = connected,
+    canSyncRead = capabilities.sessionView != null,
     cached = cached, loading = loading, lastReadAt = lastContactAt, error = error, degraded = degraded,
     streamConnected = streamConnected, projects = projects, sessions = sessions, parents = parents, tasks = tasks,
     notices = notices, permissions = permissions, questions = questions, backgroundRunning = backgroundRunning,
     summary = summary, autoApprovalFailures = autoApprovalFailures, shells = shells))
 }
+
+/** The servers the home page is currently projecting: one server, or every monitored server in 全部 mode. */
+internal fun LagoonState.homeReadSnapshots(): Map<String, ServerOverviewSnapshot> {
+  val snapshots = serverSnapshots()
+  if (allServers) return snapshots
+  val id = homeServerId ?: serverId ?: return emptyMap()
+  return snapshots[id]?.let { mapOf(id to it) } ?: emptyMap()
+}
+
+/** Unread results the home button would clear. 全部 mode already uses server-scoped keys. */
+internal fun LagoonState.homeUnseenSessions(): Set<String> =
+  if (allServers) allUnseenSessions
+  else notices.filterNot { it.viewed }.map { it.sessionId }.toSet()
+
+/**
+ * Root sessions that produced a result this device recorded and whose latest finished execution has
+ * not been acknowledged on the server. Scoping to the ledger keeps the action tied to the results the
+ * user can see (and still works after local “全部已读” because viewed notices remain in the ledger).
+ */
+internal fun ServerOverviewSnapshot.serverReadCandidates(): List<Session> {
+  if (!connected || !canSyncRead) return emptyList()
+  val withResults = notices.map { it.sessionId }.toSet()
+  return sessions.filter { it.id in withResults && it.parentId == null && it.idle > 0 && it.viewed < it.idle }
+}
+
+/** Server-scoped candidates for the independent “服务端已读” action. */
+internal fun LagoonState.serverReadTargets(): Map<String, List<Session>> =
+  homeReadSnapshots().mapNotNull { (server, snapshot) ->
+    snapshot.serverReadCandidates().takeIf { it.isNotEmpty() }?.let { server to it }
+  }.toMap()
+
+/** Exact sessions whose notification slot currently belongs to an authorization/question reminder. */
+internal fun ServerOverviewSnapshot.waitingSessionIds(): Set<String> =
+  (permissions.map { it.sessionId } + questions.map { it.sessionId } +
+    tasks.filterValues { it.phase in TaskState.WAITING_PHASES }.keys).toSet()
+
+/** Result notifications a batch read may withdraw; attention slots always survive the sweep. */
+internal fun ServerOverviewSnapshot.resultNotificationSessions(sessions: Set<String>): Set<String> =
+  sessions - waitingSessionIds()
 
 internal fun ServerOverviewSnapshot.displaySummary(policy: PermissionPolicy, now: Long = System.currentTimeMillis()): TaskSummary {
   val stale = !connected && lastReadAt > 0 && now - lastReadAt > STALE_CONNECTION_TASK_MILLIS
@@ -42,6 +82,7 @@ fun LagoonState.homeProjection(): LagoonState {
       notices = snapshot.notices, knownParents = snapshot.parents, backgroundRunning = snapshot.backgroundRunning,
       summary = snapshot.displaySummary(permissionPolicy),
       autoApprovalFailures = snapshot.autoApprovalFailures, sessionId = null, projectId = null, scopeProjectId = null,
+      serverReadPending = serverReadPending,
       allServerSnapshots = snapshots)
   }
   val statuses = snapshots.values.flatMap { snapshot ->

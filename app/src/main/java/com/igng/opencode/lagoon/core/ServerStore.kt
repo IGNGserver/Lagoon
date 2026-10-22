@@ -115,6 +115,10 @@ class ServerStore internal constructor(private val preferences: SharedPreference
   fun viewNotices(server: String, session: String, ids: Set<String>): List<SessionNotice> = synchronized(taskLock) {
     sessionNotices(server).viewObserved(session, ids).also { writeNotices(server, it) }
   }
+  /** Atomically marks the server's whole result ledger viewed; results arriving afterwards stay unread. */
+  fun viewAllNotices(server: String): List<SessionNotice> = synchronized(taskLock) {
+    sessionNotices(server).viewAllObserved().also { writeNotices(server, it) }
+  }
   /** Keys of collapsed home sections (今天 / a project / 运行中 …) on this device. */
   fun collapsedSections(server: String): Set<String> = preferences.getStringSet("collapsedSections:$server", emptySet()).orEmpty().toSet()
   fun rememberCollapsedSections(server: String, keys: Set<String>) {

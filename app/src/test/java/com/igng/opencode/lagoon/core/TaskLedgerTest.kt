@@ -37,4 +37,17 @@ class TaskLedgerTest {
     assertTrue(store.claimNotification("server", task.copy(since = 200), "done"))
     assertTrue(store.claimNotification("other", task, "done"))
   }
+  @Test fun viewingAllResultsTouchesOnlyThatServerAndLateResultsStayUnread() {
+    val store = store()
+    val now = System.currentTimeMillis()
+    store.rememberNotice("server", SessionNotice("first", "s", now, false))
+    store.rememberNotice("server", SessionNotice("second", "other", now + 1, true))
+    store.rememberNotice("other", SessionNotice("third", "x", now, false))
+    store.viewAllNotices("server")
+    assertTrue(store.sessionNotices("server").all { it.viewed })
+    assertFalse(store.sessionNotices("other").single().viewed)
+    // A result recorded after the batch belongs to a newer run and must remain unread.
+    store.rememberNotice("server", SessionNotice("late", "s", now + 2, false))
+    assertFalse(store.sessionNotices("server").single { it.id == "late" }.viewed)
+  }
 }
