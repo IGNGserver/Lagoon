@@ -43,10 +43,12 @@ fun Session.displayTitle(): String {
  * One indicator per session, in the official client's priority: attention › running › unread failure ›
  * unread result › nothing. Attention and running include descendants; results belong to the root and
  * exist only while unread — a session that finished long ago, or that was already opened, shows nothing.
+ * [UNKNOWN] marks server-owned work whose last read is older than the island's offline TTL: it must
+ * not keep spinning as if the phone could still prove it is running.
  */
 enum class SessionStatus(val label: String) {
   WAITING_PERMISSION("等待授权"), WAITING_QUESTION("等待回答"), WAITING_SERVER("等待服务器处理"), RUNNING("运行中"), BACKGROUND_RUNNING("后台运行中"),
-  FAILED("失败"), COMPLETED("已完成"), NONE("")
+  FAILED("失败"), COMPLETED("已完成"), UNKNOWN("离线 · 状态未知"), NONE("")
 }
 
 fun sessionStatus(activeFamily: TaskState?, unseen: List<SessionNotice>, background: Boolean = false): SessionStatus = when {

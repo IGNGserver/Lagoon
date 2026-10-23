@@ -136,15 +136,22 @@ class TaskNotifications(private val context: Context) {
   /**
    * Server-wide summary. While tasks run or wait for the user it is an ongoing, promoted
    * notification (Android 16 Live Update: status bar chip / lock screen card); once everything has
-   * settled it is demoted to an ordinary, dismissible notification. The expanded Android 16 card
-   * uses the platform's segmented progress rail; the status chip remains intentionally compact.
+   * settled the summary is removed and the per-session result notifications carry the outcome. The
+   * expanded Android 16 card uses the platform's segmented progress rail; the status chip remains
+   * intentionally compact. On older systems the title carries the same compact count as the chip.
    */
   fun buildSummary(profile: ServerProfile, summary: TaskSummary, target: SessionTarget?): Notification {
     val content = LiveUpdateContent.of(summary)
     val active = content.stage == LiveUpdateStage.ACTIVE
+    // Android 15 and below have no Live Update chip, so the notification title is the only count
+    // surface many OEM status bars / AODs show. Use the same compact bucket string as the Android 16
+    // chip and put the readable full count in the body.
+    val legacy = Build.VERSION.SDK_INT < 36
+    val title = if (legacy && active) summary.shortText else content.title
+    val text = if (legacy && active) summary.countLine else content.text
     val builder = NotificationCompat.Builder(context, SUMMARY)
       .setSmallIcon(R.drawable.ic_notification).setLargeIcon(appIcon)
-      .setContentTitle(content.title).setContentText(content.text)
+      .setContentTitle(title).setContentText(text)
       .setSubText(profile.name)
       .setOngoing(active).setAutoCancel(!active)
       .setOnlyAlertOnce(true).setShowWhen(false)

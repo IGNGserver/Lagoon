@@ -62,7 +62,9 @@ internal class AllServersOverview(
   private val onEvent: (String, ServerEvent) -> Unit = { _, _ -> },
   private val onConnected: (String) -> Unit = {},
   /** Shared with the controller so a dead directory is remembered across every server connection. */
-  private val directoryHealth: DirectoryHealth = DirectoryHealth()
+  private val directoryHealth: DirectoryHealth = DirectoryHealth(),
+  /** A server stopped being monitored: its last snapshot must leave the global island count too. */
+  private val onSnapshotRemoved: (String) -> Unit = {}
 ) {
   private val jobs = mutableMapOf<String, Job>()
   private val locks = mutableMapOf<String, Mutex>()
@@ -146,6 +148,7 @@ internal class AllServersOverview(
     reconnectHints.remove(id)?.close()
     clients.remove(id); configurations.remove(id); locks.remove(id); snapshots.remove(id)
     handoffs.remove(id)
+    onSnapshotRemoved(id)
   }
 
   fun stop() {

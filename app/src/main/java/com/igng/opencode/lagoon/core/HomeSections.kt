@@ -59,13 +59,17 @@ object HomeSections {
         HomeSection("project:${project?.key ?: projectKey.ifBlank { "unassigned" }}", project?.name ?: "未归入项目", list)
       }
 
-  /** 需要处理 › 运行中 › 未读结果 › 其他, the order the official client ranks session indicators. */
+  /**
+   * 需要处理 › 运行中 › 未读结果 › 其他, the order the official client ranks session indicators.
+   * “等待服务器处理”也是需要处理的一类（只是等待的是服务端/电脑端），不再落到“其他”；
+   * 离线超时后无法证明仍在运行的服务端任务归入“其他”，但行内会显示“离线 · 状态未知”。
+   */
   fun byStatus(sessions: List<Session>, statuses: Map<String, SessionStatus>): List<HomeSection> {
     fun bucket(session: Session) = when (statuses[session.key] ?: SessionStatus.NONE) {
-      SessionStatus.WAITING_PERMISSION, SessionStatus.WAITING_QUESTION -> 0
+      SessionStatus.WAITING_PERMISSION, SessionStatus.WAITING_QUESTION, SessionStatus.WAITING_SERVER -> 0
       SessionStatus.RUNNING, SessionStatus.BACKGROUND_RUNNING -> 1
       SessionStatus.FAILED, SessionStatus.COMPLETED -> 2
-      SessionStatus.NONE, SessionStatus.WAITING_SERVER -> 3
+      SessionStatus.NONE, SessionStatus.UNKNOWN -> 3
     }
     val titles = listOf("需要处理", "运行中", "未读结果", "其他")
     return sessions.groupBy(::bucket).toSortedMap().map { (index, list) -> HomeSection("status:$index", titles[index], list) }

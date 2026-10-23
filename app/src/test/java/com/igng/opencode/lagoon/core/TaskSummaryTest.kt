@@ -140,6 +140,13 @@ class TaskSummaryTest {
     assertEquals("1跑·2完", runningAndCompleted.shortText)
   }
 
+  @Test fun countLineCarriesEveryBucketInShortTextOrder() {
+    val summary = TaskSummary(running = 2, completed = 1, waiting = 1, processing = 1, failed = 1)
+    assertEquals("2 运行中 · 1 未读完成 · 1 待回复 · 1 处理中 · 1 失败", summary.countLine)
+    // Baseline buckets are always present, even at zero, so the fallback title never hides them.
+    assertEquals("0 运行中 · 0 未读完成", TaskSummary.EMPTY.countLine)
+  }
+
   @Test fun fullSentenceOrderIsRunningCompletedWaitingFailed() {
     val summary = summarize(tasks(
       "a" to TaskPhase.THINKING,

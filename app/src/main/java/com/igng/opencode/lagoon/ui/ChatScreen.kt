@@ -296,7 +296,7 @@ fun DraftScreen(state: LagoonState, controller: LagoonController, onBack: () -> 
 @Composable
 private fun SessionSubtitle(state: LagoonState, session: Session) {
   // 子会话不在根聚合里：优先用该会话自己的实时任务，再退回根聚合 / 未读账本。
-  val own = state.presentedTasks[session.id]
+  val own = state.livePresentedTasks[session.id]
   val status = if (own != null) state.sessionStatus(session, mapOf(session.id to own)) else state.sessionStatus(session)
   val muted = MiuixTheme.colorScheme.onSurfaceVariantSummary
   when (status) {
@@ -305,7 +305,7 @@ private fun SessionSubtitle(state: LagoonState, session: Session) {
       Text("${status.label} · ", style = MiuixTheme.textStyles.footnote1.copy(color = if (status == SessionStatus.FAILED) MiuixColorTokens.Error else MiuixColorTokens.Warning))
     SessionStatus.BACKGROUND_RUNNING ->
       Text("${status.label} · ", style = MiuixTheme.textStyles.footnote1.copy(color = MiuixTheme.colorScheme.primary))
-    SessionStatus.WAITING_SERVER ->
+    SessionStatus.WAITING_SERVER, SessionStatus.UNKNOWN ->
       Text("${status.label} · ", style = MiuixTheme.textStyles.footnote1.copy(color = muted))
     else -> {}
   }

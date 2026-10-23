@@ -125,4 +125,53 @@ class ServerProjectionTest {
     assertFalse(aggregate.pending("create"))
   }
 
+  @Test fun archivedTasksStayInTheIslandButAreCountedAsHiddenFromHome() {
+    val running = Session("run", "/repo", "Running", 0, archived = true, serverId = "a")
+    val done = Session("done", "/repo", "Done", 0, archived = true, serverId = "a")
+    val snapshot = ServerOverviewSnapshot("a", a, connected = true, lastReadAt = 1, loading = false,
+      sessions = listOf(running, done),
+      tasks = mapOf("run" to TaskState("run", TaskPhase.THINKING)),
+      notices = listOf(SessionNotice("n-done", "done", 1, false)))
+    val state = LagoonState(profiles = listOf(a), allServers = true, allServerSnapshots = mapOf("a" to snapshot))
+
+    assertEquals(1, state.globalSummary.running)
+    assertEquals(1, state.globalSummary.completed)
+    assertEquals(2, state.archivedTaskCount())
+    // The island sees them; the home list's `visibleOnHome` still hides archived rows.
+    assertEquals(2, state.homeProjection().sessions.size)
+    assertTrue(HomeScope.roots(state.homeProjection().sessions, state.homeProjection().projects, null).isEmpty())
+  }
+
+  @Test fun staleServerWorkLeavesTheIslandAndTurnsHomeStatusUnknown() {
+    val session = Session("same", "/repo", "A", 0, serverId = "a")
+    val snapshot = ServerOverviewSnapshot("a", a, connected = false, loading = false,
+      lastReadAt = System.currentTimeMillis() - STALE_CONNECTION_TASK_MILLIS - 1_000,
+      sessions = listOf(session), tasks = mapOf("same" to TaskState("same", TaskPhase.THINKING)))
+    val state = LagoonState(profiles = listOf(a), allServers = true, allServerSnapshots = mapOf("a" to snapshot))
+
+    assertEquals(0, state.globalSummary.running)
+    assertEquals(SessionStatus.UNKNOWN, state.homeProjection().allSessionStatuses[session.key])
+  }
+
+  @Test fun pendingPermissionsSurviveTheOfflineTtlBecauseThePhoneStillHoldsThem() {
+    val request = PermissionRequest("p", "same", "/repo", "shell", "echo", emptyList())
+    val snapshot = ServerOverviewSnapshot("a", a, connected = false, loading = false,
+      lastReadAt = System.currentTimeMillis() - STALE_CONNECTION_TASK_MILLIS - 1_000,
+      sessions = listOf(Session("same", "/repo", "A", 0, serverId = "a")),
+      tasks = mapOf("same" to TaskState("same", TaskPhase.WAITING_PERMISSION)),
+      permissions = listOf(request))
+    val state = LagoonState(profiles = listOf(a), allServers = true, allServerSnapshots = mapOf("a" to snapshot))
+
+    assertEquals(1, state.globalSummary.waiting)
+    assertEquals(SessionStatus.WAITING_PERMISSION, state.homeProjection().allSessionStatuses.getValue(scopedKey("a", "same")))
+  }
+
+  @Test fun silentServerWorkIsNamedWhileTheSystemIslandOmitsIt() {
+    val silent = a.copy(notifications = false)
+    val state = LagoonState(profiles = listOf(silent), allServers = true,
+      allServerSnapshots = mapOf("a" to snapshot(silent, TaskPhase.THINKING)))
+
+    assertTrue(state.globalSummary.isEmpty)
+    assertEquals(listOf("A"), state.silentServersWithTasks())
+  }
 }

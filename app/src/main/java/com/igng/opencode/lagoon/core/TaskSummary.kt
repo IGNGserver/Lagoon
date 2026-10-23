@@ -55,6 +55,21 @@ data class TaskSummary(
     }
 
   /**
+   * 完整的一行计数，用于旧系统通知主行与首页全局任务总览。
+   *
+   * 与 [shortText] 使用完全相同的计数桶与顺序，但写成可读文案，避免旧系统只显示
+   * `contentTitle` 时把“待回复”或“已完成”数量漏掉。
+   */
+  val countLine: String
+    get() = buildString {
+      append("${running} 运行中")
+      append(" · ${completed} 未读完成")
+      if (waiting > 0) append(" · ${waiting} 待回复")
+      if (processing > 0) append(" · ${processing} 处理中")
+      if (failed > 0) append(" · ${failed} 失败")
+    }
+
+  /**
    * 极短胶囊文案（未展开状态展示）：
    * 必须同时展示运行中与已完成计数，例如：“0跑·1完”或“1跑·2完”；
    * 存在待处理或失败时追加：“·1待”或“·1败”。
