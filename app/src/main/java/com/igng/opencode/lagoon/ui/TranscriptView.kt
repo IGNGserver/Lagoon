@@ -663,6 +663,12 @@ internal fun VirtualText(text: String, modifier: Modifier = Modifier, highlight:
 
 @Composable
 internal fun AttachmentView(attachment: Attachment, onFile: (String) -> Unit) {
+  if (attachment.url == OMITTED_INLINE_DATA) {
+    // The device cache never keeps inline payloads; say so instead of rendering a broken attachment.
+    Text("${attachment.name.ifBlank { "附件" }} · 未缓存，联网刷新后显示",
+      style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
+    return
+  }
   val uriHandler = LocalUriHandler.current
   val dataImage = attachment.url.startsWith("data:image/") && attachment.url.length < 8_000_000
   val bitmap by produceState<android.graphics.Bitmap?>(null, attachment.url) {

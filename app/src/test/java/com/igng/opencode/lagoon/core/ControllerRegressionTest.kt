@@ -56,6 +56,7 @@ class ControllerRegressionTest {
     put(c,"store",ServerStore(preferences(),preferences(),{it},{it}));put(c,"cache",OfflineCache(context.getSharedPreferences("cache",0),{it},{it}));put(c,"sendMutex",kotlinx.coroutines.sync.Mutex()); put(c,"referenceMutex",kotlinx.coroutines.sync.Mutex()); put(c,"monitorRequested",mutableSetOf<String>()); put(c,"draftWrites",mutableMapOf<String,Job>()); put(c,"attentionJobs",mutableMapOf<String,Job>()); put(c,"waitingEventSeqAt",mutableMapOf<String,Long>())
     put(c, "resolvedPermissions", linkedSetOf<String>()); put(c,"backgroundSettles",mutableMapOf<String,Job>()); put(c,"directoryHealth",DirectoryHealth())
     put(c, "connectTrace", ConnectTrace()); put(c, "openTrace", ConnectTrace()); put(c, "transcriptMemory", TranscriptMemory()); put(c, "queuedSends", mutableListOf<Any>())
+    put(c, "storeDispatcher", Dispatchers.IO.limitedParallelism(1))
     return c to mutable
   }
   private fun api(s:MockWebServer) = OpenCodeApi(ServerProfile("server","Server",s.url("/").toString(),allowCleartext=true), "fixture")
@@ -816,4 +817,62 @@ class ControllerRegressionTest {
     assertEquals(listOf("m1"), rows.persistable().map { it.id })
   }
 
+  /** Wires a JDBC-backed transcript store and a live scope, as on a device with an OpenCode server. */
+  private fun withTranscriptStore(controller: LagoonController): TranscriptStore {
+    val store = testStore()
+    put(controller, "transcripts", store); put(controller, "transcriptSync", TranscriptSync(store))
+    put(controller, "scope", CoroutineScope(SupervisorJob() + Dispatchers.Unconfined))
+    return store
+  }
+  private suspend fun storeIdle(controller: LagoonController) {
+    val dispatcher = LagoonController::class.java.getDeclaredField("storeDispatcher").apply { isAccessible = true }.get(controller) as CoroutineDispatcher
+    withContext(dispatcher) { }
+  }
+
+  @Test fun openCodeTranscriptsAreKeptVerbatimAndPaintAfterAFailedRead() = runBlocking {
+    FakeTimelineServer().use { fake ->
+      fake.timeline += FakeTimelineServer.conversation(turns = 2, steps = 3)
+      val running = FakeTimelineServer.assistant("still going", completed = false)
+      fake.timeline += running
+      val api = fake.api()
+      val session = Session("ses", "/repo", "Task", 5)
+      val (controller, state) = controller(api, LagoonState(profiles = listOf(ServerProfile("server", "Server", "http://fake")),
+        serverId = "server", connected = true, sessions = listOf(session), sessionId = "ses"))
+      val store = withTranscriptStore(controller)
+      readTranscript(controller, api, session)
+      storeIdle(controller)
+      val stored = store.newest("server", "ses", 100)
+      // Everything settled is stored exactly as the server renders it; the running step is not.
+      assertEquals(fake.timeline.dropLast(1).map { it.toMessage() }, stored)
+      assertEquals(fake.timeline[fake.timeline.size - 2].getString("id"), store.info("server", "ses")!!.watermark)
+      assertTrue(store.info("server", "ses")!!.historyComplete)
+
+      fake.server.dispatcher = object : Dispatcher() { override fun dispatch(request: RecordedRequest) = MockResponse().setResponseCode(503) }
+      mutable(controller).value = state.value.copy(messages = emptyList())
+      readTranscript(controller, api, session)
+      assertTrue(state.value.cached)
+      assertEquals(stored.map { it.id }, state.value.messages.map { it.id })
+    }
+  }
+
+  @Test fun aSessionDeletedDuringTheReadIsNotWrittenBack() = runBlocking {
+    FakeTimelineServer(latencyMs = 200).use { fake ->
+      fake.timeline += FakeTimelineServer.conversation(turns = 1, steps = 2)
+      val api = fake.api()
+      val session = Session("ses", "/repo", "Task", 5)
+      val (controller, _) = controller(api, LagoonState(profiles = listOf(ServerProfile("server", "Server", "http://fake")),
+        serverId = "server", connected = true, sessions = listOf(session), sessionId = "ses"))
+      val store = withTranscriptStore(controller)
+      val read = async(Dispatchers.Default) { readTranscript(controller, api, session) }
+      delay(50)
+      store.delete("server", "ses")
+      read.await()
+      storeIdle(controller)
+      assertNull(store.info("server", "ses"))
+    }
+  }
+
+  @Suppress("UNCHECKED_CAST")
+  private fun mutable(controller: LagoonController) =
+    LagoonController::class.java.getDeclaredField("mutable").apply { isAccessible = true }.get(controller) as MutableStateFlow<LagoonState>
 }

@@ -39,6 +39,16 @@ interface HarnessClient {
 
   suspend fun messagesPage(id: String, cursor: String? = null, size: Int = 20): ApiPage<Message>
 
+  /**
+   * True when [messageRecords] returns each message's wire form and the protocol pages a stable,
+   * server-ordered timeline, so the device may keep a verified copy (see [TranscriptSync]).
+   */
+  val cacheableTranscripts: Boolean get() = false
+
+  /** [messagesPage] with each message's wire JSON when [cacheableTranscripts]; null `raw` otherwise. */
+  suspend fun messageRecords(id: String, cursor: String? = null, size: Int = 20): ApiPage<MessageRecord> =
+    messagesPage(id, cursor, size).let { page -> ApiPage(page.items.map { MessageRecord(it, null) }, page.next) }
+
   suspend fun inbox(id: String): List<Message>
 
   suspend fun activeSessions(): Set<String>
@@ -128,6 +138,9 @@ interface HarnessClient {
     const val HISTORY_PAGE = 200
   }
 }
+
+/** One timeline message and, when the protocol has one, its wire JSON exactly as the server sent it. */
+data class MessageRecord(val message: Message, val raw: org.json.JSONObject?)
 
 /** 按服务器类型创建对应的客户端。 */
 fun createHarnessClient(
