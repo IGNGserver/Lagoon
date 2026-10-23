@@ -1,5 +1,6 @@
 package com.igng.opencode.lagoon.core
 
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.runBlocking
@@ -49,6 +50,25 @@ class TranscriptOpenBenchmarkTest {
       val run = measure("旧路径 · 打开会话", server) { legacyOpen(api, "ses") }
       println(run)
       assertTrue("tool-heavy turns need extra sequential pages: $run", run.requests >= 2)
+    }
+  }
+
+  /** The transcript-cache path: verified stored run plus only what is new. */
+  @Test fun cachedOpenOfTheSameConversation() {
+    FakeTimelineServer(LATENCY_MS).use { server ->
+      server.timeline += FakeTimelineServer.conversation(turns = 40, steps = 30)
+      val api = server.api()
+      val sync = TranscriptSync(testStore(), Dispatchers.Unconfined)
+      val session = Session("ses", "/repo", "Task", updated = 1)
+      val legacy = measure("旧路径 · 打开会话", server) { legacyOpen(api, "ses") }
+      val first = measure("新路径 · 首次打开（无缓存）", server) { sync.open(api, "s", session).messages }
+      val unchanged = measure("新路径 · 再次打开（无新消息）", server) { sync.open(api, "s", session).messages }
+      server.timeline += FakeTimelineServer.conversation(turns = 1, steps = 30)
+      val changed = measure("新路径 · 再次打开（新增一轮 31 条）", server) { sync.open(api, "s", session.copy(updated = 2)).messages }
+      listOf(legacy, first, unchanged, changed).forEach(::println)
+      assertTrue("$first", first.requests <= 2 && first.bytes < legacy.bytes)
+      assertTrue("$unchanged", unchanged.requests == 1 && unchanged.bytes * 5 < legacy.bytes)
+      assertTrue("$changed", changed.requests == 1 && changed.millis < legacy.millis / 2)
     }
   }
 
