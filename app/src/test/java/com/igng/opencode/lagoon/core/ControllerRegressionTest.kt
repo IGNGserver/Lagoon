@@ -266,6 +266,79 @@ class ControllerRegressionTest {
     }
   }
 
+  @Test fun aDerivedSubagentWithoutAServerBaselineSettlesOnceItsSessionIsIdle() = runBlocking {
+    MockWebServer().use { server ->
+      val paths = java.util.Collections.synchronizedList(mutableListOf<String>())
+      server.dispatcher = v2Server(paths,
+        { """{"data":[{"id":"root","projectID":"p","location":{"directory":"/repo"},"time":{"created":1,"updated":200,"idle":200}}],"cursor":{}}""" },
+        { """{"data":{}}""" },
+        { path -> when (path) {
+          "/api/session/root" -> """{"data":{"id":"root","projectID":"p","outcome":"succeeded","location":{"directory":"/repo"},"time":{"created":1,"updated":200,"idle":200}}}"""
+          "/api/session/child" -> """{"data":{"id":"child","projectID":"p","parentID":"root","outcome":"succeeded","location":{"directory":"/repo"},"time":{"created":1,"updated":210,"idle":210}}}"""
+          else -> null
+        } })
+      val root = Session("root", "/repo", "Root", 200, projectId = "p", idle = 200, outcome = "succeeded")
+      // 子代理任务来自父会话的工具结果：没有服务端时间基线（activeAt = -1），旧实现让它永远收不了尾。
+      val child = Session("child", "/repo", "Child", 210, parentId = "root", projectId = "p", idle = 210, outcome = "succeeded")
+      val (controller, state) = controller(api(server), LagoonState(serverId = "server", connected = true,
+        sessions = listOf(root, child), knownParents = mapOf("child" to "root"),
+        tasks = mapOf(
+          "root" to TaskState("root", TaskPhase.THINKING, TaskState.BACKGROUND_DETAIL, since = 100, activeAt = 150, background = true),
+          "child" to TaskState("child", TaskPhase.SUBAGENT, since = 110, activeAt = -1))))
+      refresh(controller, controlOnly = true)
+      assertFalse("子会话已结束，派生任务不能再算后台工作", state.value.tasks["child"]?.active == true)
+      assertFalse("根会话必须按服务端结局收尾", state.value.tasks["root"]?.active == true)
+      assertEquals(SessionStatus.COMPLETED, state.value.sessionStatus(root))
+      assertEquals(0, state.value.summary.running)
+      assertEquals(1, state.value.summary.completed)
+    }
+  }
+
+  @Test fun staleTranscriptBackgroundMetadataCannotKeepAFinishedRootRunning() = runBlocking {
+    MockWebServer().use { server ->
+      var listChild = true
+      server.dispatcher = object : Dispatcher() {
+        override fun dispatch(request: RecordedRequest): MockResponse {
+          val url = request.requestUrl!!
+          val path = url.encodedPath
+          val body = when {
+            path == "/openapi.json" -> return MockResponse().setResponseCode(404)
+            path == "/api/info" -> """{"version":"2.0.22"}"""
+            path == "/api/project" -> "[]"
+            path == "/api/session/active" -> """{"data":{}}"""
+            path == "/api/session" && url.queryParameter("parentID") == "root" ->
+              if (listChild) """{"data":[{"id":"child","projectID":"p","parentID":"root","location":{"directory":"/repo"},"time":{"created":1,"updated":210,"idle":210}}],"cursor":{}}"""
+              else """{"data":[],"cursor":{}}"""
+            path == "/api/session" -> """{"data":[{"id":"root","projectID":"p","outcome":"succeeded","location":{"directory":"/repo"},"time":{"created":1,"updated":200,"idle":200}}],"cursor":{}}"""
+            path == "/api/session/root" -> """{"data":{"id":"root","projectID":"p","outcome":"succeeded","location":{"directory":"/repo"},"time":{"created":1,"updated":200,"idle":200}}}"""
+            path == "/api/session/child" -> """{"data":{"id":"child","projectID":"p","parentID":"root","location":{"directory":"/repo"},"time":{"created":1,"updated":210,"idle":210}}}"""
+            path == "/api/session/root/message" ->
+              """{"data":[{"id":"m","type":"assistant","time":{"created":100},"agent":"build","content":[{"type":"tool","id":"p","name":"task","state":{"status":"completed","metadata":{"status":"running","sessionID":"child"}}}]}],"cursor":{}}"""
+            else -> """{"data":[]}"""
+          }
+          return MockResponse().setBody(body)
+        }
+      }
+      val messages = listOf(Message("m", "assistant", 100, listOf(
+        MessagePart("p", "tool", tool = "task", target = "child", background = true))))
+      val (controller, state) = controller(api(server), LagoonState(serverId = "server", connected = true,
+        sessionId = "root", messages = messages))
+      // 第一次对账拿到 transcript 里的静态 background 元数据，按旧行为会先折算成“后台运行中”。
+      refresh(controller, controlOnly = true)
+      assertTrue(state.value.tasks["root"]?.background == true)
+      // 第二次对账拿到子会话的权威状态（active 为空、time.idle 已写入），必须收尾且不再被旧消息复活。
+      refresh(controller, controlOnly = true)
+      assertFalse("根会话不能在服务端已完成后继续显示后台运行", state.value.tasks["root"]?.active == true)
+      assertEquals(SessionStatus.COMPLETED, state.value.sessionStatus(state.value.sessions.first { it.id == "root" }))
+      assertEquals(0, state.value.summary.background)
+      // 子会话不再出现在目录里也必须记住它已收尾：仅靠旧 transcript 的静态元数据不能把它重新派生。
+      listChild = false
+      refresh(controller, controlOnly = true)
+      assertFalse(state.value.tasks["root"]?.active == true)
+      assertEquals(0, state.value.summary.background)
+    }
+  }
+
   @Test fun reconciliationRecoversAnActiveChildFromTheRootListingAndDoesNotTrustAStaleRootRun() = runBlocking {
     MockWebServer().use { server ->
       server.dispatcher = object : Dispatcher() {

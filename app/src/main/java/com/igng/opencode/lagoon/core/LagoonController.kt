@@ -225,7 +225,9 @@ class LagoonController private constructor(private val appContext: Context) {
     val observed = if (transcriptChildren.isEmpty() || transcriptParent == null) state else {
       val tasks = LinkedHashMap(state.tasks)
       transcriptChildren.forEach { (child, created) ->
-        if (tasks[child]?.active != true) tasks[child] = TaskState(child, TaskPhase.SUBAGENT, TaskState.RUNNING_DETAIL,
+        // 工具结果里的 `metadata.status="running"` 是返回当时的静态快照，不是实时状态。只补
+        // 未知的子任务：已有任务（尤其已收尾的墓碑）不能被旧 transcript 再次改回活跃。
+        if (tasks[child] == null) tasks[child] = TaskState(child, TaskPhase.SUBAGENT, TaskState.RUNNING_DETAIL,
           since = created.takeIf { it > 0 } ?: System.currentTimeMillis(), activeAt = -1L)
       }
       state.copy(tasks = tasks, knownParents = state.knownParents + transcriptChildren.keys.associateWith { transcriptParent })
@@ -1140,6 +1142,8 @@ class LagoonController private constructor(private val appContext: Context) {
         val effectiveTasks = previousTasks + states
         // 本次权威读取里，该会话自身子树是否仍有后台工作（后台 shell / 活跃子代理）。
         val hasWork = BackgroundWork.hasBackgroundWork(session.id, effectiveTasks, nextShells, parentMap)
+        // 子代理任务由父会话的工具结果/transcript 派生，没有服务端时间基线（activeAt = -1）。
+        val derivedChild = task != null && (task.phase == TaskPhase.SUBAGENT || parentMap[session.id] != null)
         val next = when {
           active == null -> task
           session.id in active -> TaskReducer.status(session.id, true, task, session.idle)
@@ -1155,13 +1159,22 @@ class LagoonController private constructor(private val appContext: Context) {
               activeAt = task.activeAt, background = true)
           // 不在前台活跃集合（/api/session/active）不等于本轮结束：转入后台的阻塞工具/子代理会让会话
           // 继续存活。只有服务端持久化的 time.idle 越过本轮基线、且自身子树没有后台工作时才权威收尾。
-          task?.active == true && task.background != true && task.activeAt >= 0 && session.idle > 0 && session.idle > task.activeAt && !hasWork ->
+          // 派生的子任务没有基线可比，但会话不在 active 且服务端已记录结束（time.idle > 0）同样说明
+          // 它已经停了——否则 -1 会让子任务永远无法收尾，把根会话永久钉在“后台运行中”。
+          task?.active == true && task.background != true && session.idle > 0 && !hasWork &&
+            ((task.activeAt >= 0 && session.idle > task.activeAt) || (task.activeAt < 0 && derivedChild)) ->
             TaskReducer.terminal(session.id, session.outcome, task)
           task?.active == true -> task
-          // 非活跃的任务不再作为常驻相位保留：终态结果只存在于未读账本（notices）。
-          else -> null
+          // 非活跃的任务不再作为常驻相位保留：终态结果只存在于未读账本（notices）。子会话例外：
+          // 留下终态墓碑，防止旧 transcript 的静态 background 元数据把它重新派生为活跃子任务。
+          else -> task?.takeIf { it.phase in TaskState.TERMINAL_PHASES && parentMap[session.id] != null }
         }
         if (next != null && next.phase != TaskPhase.IDLE) states[session.id] = next
+      }
+      // 子会话可能已经不在本页目录里：把之前收尾的子任务墓碑带过去，同样是为了让 transcript
+      // 兜底看到“这个子任务已经结束”，而不是每次界面重建都再折算回“后台运行中”。
+      previousTasks.forEach { (id, task) ->
+        if (id !in states && task.phase in TaskState.TERMINAL_PHASES && parentMap[id] != null) states[id] = task
       }
       // A successful read is authoritative; a failed one keeps the previous requests so a pending
       // approval is never silently dropped.
