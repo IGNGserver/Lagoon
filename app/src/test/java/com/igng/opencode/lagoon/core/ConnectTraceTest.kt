@@ -73,4 +73,18 @@ class ConnectTraceTest {
       assertTrue("elapsed=${elapsed}ms", elapsed < 4 * 150)
     }
   }
+
+  @Test fun payloadBytesAreCountedPerAttempt() = runBlocking {
+    MockWebServer().use { server ->
+      val body = """{"data":[],"padding":"${"x".repeat(5_000)}"}"""
+      server.enqueue(MockResponse().setBody(body))
+      val api = OpenCodeApi(ServerProfile("local", "Local", server.url("/").toString().trimEnd('/'), "opencode", allowCleartext = true), "secret")
+      val trace = ConnectTrace(clock = { now }, metrics = HttpMetrics)
+      trace.begin(1, "打开会话")
+      api.forms("/repo")
+      val report = trace.reports().first()
+      assertEquals(body.length.toLong(), report.bytes)
+      assertTrue(report.line(), report.line().contains("下行 4 KB"))
+    }
+  }
 }

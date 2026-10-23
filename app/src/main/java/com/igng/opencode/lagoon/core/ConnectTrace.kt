@@ -1,7 +1,14 @@
 package com.igng.opencode.lagoon.core
 
 import okhttp3.Interceptor
+import okhttp3.MediaType
+import okhttp3.ResponseBody
+import okio.Buffer
+import okio.BufferedSource
+import okio.ForwardingSource
+import okio.buffer
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
 /** 一次连接 / 打开会话里，用户能感知到的里程碑。只记第一次到达的时间。 */
 enum class ConnectMilestone(val label: String) {
@@ -25,13 +32,16 @@ data class ConnectReport(
   val elapsed: Map<ConnectMilestone, Long>,
   val requests: Int,
   val peakInFlight: Int,
-  val failure: String? = null
+  val failure: String? = null,
+  /** Response payload bytes the attempt read (after transparent decompression). */
+  val bytes: Long = 0
 ) {
   /** 单行可读摘要，供诊断信息复制与 logcat。 */
   fun line(): String = buildString {
     append(reason)
     ConnectMilestone.entries.forEach { milestone -> elapsed[milestone]?.let { append(" · ${milestone.label} ${it}ms") } }
     append(" · 请求 $requests / 并发峰值 $peakInFlight")
+    if (bytes > 0) append(" · 下行 ${formatBytes(bytes)}")
     failure?.let { append(" · 失败：$it") }
   }
 }
@@ -50,7 +60,7 @@ class ConnectTrace(
   private val metrics: HttpCounters = HttpMetrics,
   private val keep: Int = 6
 ) {
-  private class Attempt(val key: Long, val reason: String, val startedAt: Long, val requestBase: Int) {
+  private class Attempt(val key: Long, val reason: String, val startedAt: Long, val requestBase: Int, val byteBase: Long) {
     val elapsed = linkedMapOf<ConnectMilestone, Long>()
     var failure: String? = null
   }
@@ -61,7 +71,7 @@ class ConnectTrace(
   @Synchronized fun begin(key: Long, reason: String) {
     current?.let(::archive)
     metrics.resetPeak()
-    current = Attempt(key, reason, clock(), metrics.total())
+    current = Attempt(key, reason, clock(), metrics.total(), metrics.bytes())
   }
 
   /** Records [milestone] for the attempt bound to [key]; returns the elapsed time when it was the first mark. */
@@ -85,7 +95,8 @@ class ConnectTrace(
   @Synchronized fun reports(): List<ConnectReport> = listOfNotNull(current?.let(::report)) + history.reversed()
 
   private fun report(attempt: Attempt) = ConnectReport(attempt.reason, attempt.elapsed.toMap(),
-    (metrics.total() - attempt.requestBase).coerceAtLeast(0), metrics.peak(), attempt.failure)
+    (metrics.total() - attempt.requestBase).coerceAtLeast(0), metrics.peak(), attempt.failure,
+    (metrics.bytes() - attempt.byteBase).coerceAtLeast(0))
 
   private fun archive(attempt: Attempt) {
     history.addLast(report(attempt))
@@ -95,15 +106,20 @@ class ConnectTrace(
 
 /**
  * HTTP counters: every API client adds [interceptor], so the trace can report how many requests a
- * connection issued and how far the fan-out actually ran in parallel. Long-lived event streams are
- * not counted (they would pin the in-flight number).
+ * connection issued, how far the fan-out actually ran in parallel and how many payload bytes came
+ * back. Long-lived event streams are not counted (they would pin the in-flight number).
  */
 class HttpCounters {
   private val total = AtomicInteger()
   private val inFlight = AtomicInteger()
   private val peak = AtomicInteger()
+  private val bytes = AtomicLong()
 
-  val interceptor = Interceptor { chain -> track { chain.proceed(chain.request()) } }
+  val interceptor = Interceptor { chain ->
+    val response = track { chain.proceed(chain.request()) }
+    val body = response.body ?: return@Interceptor response
+    response.newBuilder().body(CountingBody(body, bytes)).build()
+  }
 
   fun <T> track(block: () -> T): T {
     total.incrementAndGet()
@@ -114,8 +130,27 @@ class HttpCounters {
 
   fun total(): Int = total.get()
   fun peak(): Int = peak.get()
+  fun bytes(): Long = bytes.get()
   fun resetPeak() { peak.set(inFlight.get()) }
 }
 
 /** The process-wide counters shared by every API client. */
 val HttpMetrics = HttpCounters()
+
+/** Counts the bytes a consumer actually reads; Content-Length is absent for chunked or gzip replies. */
+private class CountingBody(private val delegate: ResponseBody, private val counter: AtomicLong) : ResponseBody() {
+  private val source: BufferedSource by lazy {
+    object : ForwardingSource(delegate.source()) {
+      override fun read(sink: Buffer, byteCount: Long): Long = super.read(sink, byteCount).also { if (it > 0) counter.addAndGet(it) }
+    }.buffer()
+  }
+  override fun contentType(): MediaType? = delegate.contentType()
+  override fun contentLength(): Long = delegate.contentLength()
+  override fun source(): BufferedSource = source
+}
+
+internal fun formatBytes(value: Long): String = when {
+  value >= 1_048_576 -> String.format(java.util.Locale.ROOT, "%.1f MB", value / 1_048_576.0)
+  value >= 1024 -> "${value / 1024} KB"
+  else -> "$value B"
+}
