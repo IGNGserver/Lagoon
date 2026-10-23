@@ -50,6 +50,21 @@ internal class TranscriptSync(
   }
 
   /**
+   * [paint] plus where older history continues: stored rows first (readable offline), then the
+   * stored server cursor once the run is exhausted.
+   */
+  suspend fun paintWindow(server: String, session: String): Pair<List<Message>, String?> = withContext(io) {
+    val messages = paint(server, session)
+    val first = messages.firstOrNull() ?: return@withContext messages to null
+    val info = store.info(server, session)
+    messages to when {
+      store.hasOlder(server, session, first.id) -> localCursor(first.id)
+      info == null || info.historyComplete -> null
+      else -> info.olderCursor
+    }
+  }
+
+  /**
    * Prepends stored rows until [messages] starts exactly on a turn's prompt, as the official initial
    * window does, instead of in the middle of a reply. Runs on [io].
    */
@@ -165,8 +180,8 @@ internal class TranscriptSync(
     }
   }
 
-  /** Continues history older than the shown window: stored rows first, then the server. */
-  suspend fun loadOlder(client: HarnessClient, server: String, session: Session, cursor: String): Older {
+  /** Continues history older than the shown window: stored rows first (no network needed), then the server. */
+  suspend fun loadOlder(client: HarnessClient?, server: String, session: Session, cursor: String): Older {
     val localId = localId(cursor)
     if (localId != null) return withContext(io) {
       // The run was rebuilt under the open transcript: its stored cursor no longer continues from
@@ -182,8 +197,9 @@ internal class TranscriptSync(
       }
       Older(rows, next)
     }
+    val api = client ?: throw IllegalStateException("请先连接服务器")
     val epoch = store.epoch(server, session.id)
-    val page = client.messageRecords(session.id, cursor, HarnessClient.HISTORY_PAGE)
+    val page = api.messageRecords(session.id, cursor, HarnessClient.HISTORY_PAGE)
     val reachedStart = page.items.size < HarnessClient.HISTORY_PAGE
     val next = page.next.takeUnless { reachedStart }
     check(next != cursor) { "服务器返回了重复分页游标" }

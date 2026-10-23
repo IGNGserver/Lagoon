@@ -145,6 +145,8 @@ data class LagoonState(
     return pendingOperations.contains(key) || (serverId == null && pendingOperations.any { it.endsWith(":$action") })
   }
   fun resource(name: String): ResourceStatus = resources[name] ?: ResourceStatus()
+  /** The next older page is already on this device (the transcript store), readable without a connection. */
+  val olderFromDevice: Boolean get() = TranscriptSync.localId(messagesCursor) != null
   fun title(session: Session): String = session.displayTitle()
   val parents: Map<String, String> get() = knownParents + sessions.mapNotNull { it.parentId?.let { parent -> it.id to parent } }.toMap()
   /** Live (running / waiting) state of each session family, rolled up to its root. */
@@ -630,6 +632,10 @@ class LagoonController private constructor(private val appContext: Context) {
   private suspend fun cachedTranscript(serverId: String, sessionId: String): List<Message> = kotlinx.coroutines.withContext(storeDispatcher) {
     attempt { if (storesTranscripts(serverId)) transcriptSync!!.paint(serverId, sessionId) else cache.messages(serverId, sessionId) }.getOrDefault(emptyList())
   }
+  /** [cachedTranscript] plus where its older history continues (stored rows are readable offline). */
+  private suspend fun cachedTranscriptWindow(serverId: String, sessionId: String): Pair<List<Message>, String?> =
+    if (!storesTranscripts(serverId)) cachedTranscript(serverId, sessionId) to null
+    else kotlinx.coroutines.withContext(storeDispatcher) { attempt { transcriptSync!!.paintWindow(serverId, sessionId) }.getOrDefault(emptyList<Message>() to null) }
   /** False when the copy is known to be cut short; the store never truncates what it keeps. */
   private suspend fun cachedTranscriptComplete(serverId: String, sessionId: String): Boolean =
     if (storesTranscripts(serverId)) true else kotlinx.coroutines.withContext(storeDispatcher) { cache.messagesComplete(serverId, sessionId) }
@@ -867,9 +873,10 @@ class LagoonController private constructor(private val appContext: Context) {
         projects = projects, sessions = sessions, projectId = store.selectedProject(id) ?: projects.firstOrNull()?.id,
         sessionId = sessionId, messages = withPending(id, sessionId, emptyList()), catalogComplete = catalogComplete) }
       if (sessionId != null) {
-        val messages = cachedTranscript(id, sessionId)
+        val (messages, olderCursor) = cachedTranscriptWindow(id, sessionId)
         val messagesComplete = cachedTranscriptComplete(id, sessionId)
-        if (token == generation && state.value.serverId == id && state.value.sessionId == sessionId) mutable.update { withSummary(it.copy(messages = withPending(id, sessionId, messages), cacheComplete = messagesComplete, resources = mapOf("messages" to ResourceStatus(ResourceState.STALE, "离线缓存")))) }
+        if (token == generation && state.value.serverId == id && state.value.sessionId == sessionId) mutable.update { withSummary(it.copy(messages = withPending(id, sessionId, messages), cacheComplete = messagesComplete,
+          messagesCursor = olderCursor, resources = mapOf("messages" to ResourceStatus(ResourceState.STALE, "离线缓存")))) }
       }
     }
   }
@@ -1222,7 +1229,35 @@ class LagoonController private constructor(private val appContext: Context) {
       sessionCursors = listOfNotNull(page.next).associateBy { "" }, catalogComplete = page.next == null) }
     if (op.connectionCurrent(this)) cache.saveCatalog(op.serverId, state.value.projects, state.value.sessions, complete = state.value.catalogComplete)
   }
-  fun loadOlderMessages() = withSession("messages-more") { op, client, session ->
+  fun loadOlderMessages(): Job {
+    val cursor = state.value.messagesCursor
+    if (transcriptSync != null && TranscriptSync.localId(cursor) != null) return loadStoredOlderMessages(cursor!!)
+    return loadServerOlderMessages()
+  }
+  /** Older history the device already holds: no connection needed, so it also works offline. */
+  private fun loadStoredOlderMessages(cursor: String): Job {
+    val current = state.value
+    val serverId = current.serverId ?: return scope.launch { }
+    val session = current.session ?: return scope.launch { }
+    val revision = selectionRevision
+    val key = operationKey(serverId, session.id, current.projectId, "messages-more")
+    if (key in current.pendingOperations) return scope.launch { }
+    mutable.update { it.copy(pendingOperations = it.pendingOperations + key) }
+    return scope.launch {
+      try {
+        val older = transcriptSync!!.loadOlder(api, serverId, session, cursor)
+        if (state.value.serverId == serverId && selectionRevision == revision && state.value.messagesCursor == cursor) mutable.update {
+          it.copy(messages = (older.messages + it.messages).distinctBy { m -> m.id }, messagesCursor = older.next,
+            loadedOlderMessages = true, historyRevision = it.historyRevision + 1)
+        }
+      } catch (cancel: CancellationException) { throw cancel } catch (error: Exception) {
+        Diagnostics.warn("TranscriptSync", "读取本机历史失败", error)
+      } finally {
+        mutable.update { it.copy(pendingOperations = it.pendingOperations - key) }
+      }
+    }
+  }
+  private fun loadServerOlderMessages() = withSession("messages-more") { op, client, session ->
     val cursor = op.snapshot.messagesCursor ?: return@withSession
     val sync = transcriptSync?.takeIf { client.cacheableTranscripts }
     // Stored history first (no network), then the server; server pages extend the stored run.
@@ -1822,9 +1857,10 @@ class LagoonController private constructor(private val appContext: Context) {
       val serverId = state.value.serverId ?: return
       val revision = selectionRevision
       scope.launch {
-        val cachedMessages = cachedTranscript(serverId, id)
+        val (cachedMessages, olderCursor) = cachedTranscriptWindow(serverId, id)
+        val complete = storesTranscripts(serverId)
         if (state.value.serverId == serverId && selectionRevision == revision && cachedMessages.isNotEmpty()) openTrace.mark(revision, ConnectMilestone.CACHE_PAINT)
-        if (state.value.serverId == serverId && selectionRevision == revision) mutable.update { it.copy(messages = cachedMessages, cacheComplete = false,
+        if (state.value.serverId == serverId && selectionRevision == revision) mutable.update { it.copy(messages = cachedMessages, cacheComplete = complete, messagesCursor = olderCursor,
           resources = it.resources + ("messages" to ResourceStatus(if (cachedMessages.isEmpty()) ResourceState.ERROR else ResourceState.STALE, "离线缓存"))) }
       }
     } else {

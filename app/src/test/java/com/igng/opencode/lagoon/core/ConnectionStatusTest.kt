@@ -49,7 +49,7 @@ class ConnectionStatusTest {
 
   @Test fun cachedTranscriptBeingRefreshedIsAnnounced() {
     assertNull(banner(ConnectStage.READY, 0, transcriptFor = 100))
-    assertEquals("正在同步消息…", banner(ConnectStage.READY, 0, transcriptFor = 1_000)?.text)
+    assertEquals("正在同步最新消息…", banner(ConnectStage.READY, 0, transcriptFor = 1_000)?.text)
   }
 
   @Test fun transcriptMemoryIsBoundedAndKeepsTheNewestRows() {
