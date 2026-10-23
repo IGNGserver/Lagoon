@@ -134,7 +134,9 @@ internal fun Conversation(state: LagoonState, controller: LagoonController, modi
   LaunchedEffect(firstVisibleIndex) { if (firstVisibleIndex > 0) olderArmed = true }
   LaunchedEffect(firstVisibleIndex, olderArmed, state.messagesCursor, loadingOlder, state.connected, state.cached, follow) {
     // Trigger a little before the very top so the next page is already there when the reader arrives.
-    if (firstVisibleIndex <= 1 && olderArmed && !follow && state.connected && !state.cached && !loadingOlder && state.messagesCursor != null) {
+    // Stored history pages from the device, so it also loads while offline or showing a cached copy.
+    val readable = (state.connected && !state.cached) || state.olderFromDevice
+    if (firstVisibleIndex <= 1 && olderArmed && !follow && readable && !loadingOlder && state.messagesCursor != null) {
       val visibleItem = list.layoutInfo.visibleItemsInfo.firstOrNull { it.key != "older-loader" }
       if (visibleItem != null) {
         anchorKey = visibleItem.key

@@ -77,7 +77,7 @@ data class ConnectionBanner(val text: String, val tone: Tone, val retry: Boolean
         ConnectStage.READY -> when {
           !streamConnected && streamDownSince > 0 && now - streamDownSince >= STREAM_GRACE_MILLIS ->
             ConnectionBanner("实时同步恢复中…", Tone.WARNING, retry = true)
-          transcriptSyncing && now - transcriptSince >= QUIET_MILLIS -> ConnectionBanner("正在同步消息…", Tone.PROGRESS)
+          transcriptSyncing && now - transcriptSince >= QUIET_MILLIS -> ConnectionBanner("正在同步最新消息…", Tone.PROGRESS)
           else -> null
         }
       }

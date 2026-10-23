@@ -872,6 +872,25 @@ class ControllerRegressionTest {
     }
   }
 
+  @Test fun storedHistoryScrollsWithoutAConnection() = runBlocking {
+    MockWebServer().use { unreachable ->
+      val api = api(unreachable)
+      val timeline = FakeTimelineServer.conversation(turns = 30, steps = 9)
+      val session = Session("ses", "/repo", "Task", 5)
+      val (controller, state) = controller(api, LagoonState(profiles = listOf(ServerProfile("server", "Server", "http://fake")),
+        serverId = "server", connected = false, cached = true, sessions = listOf(session), sessionId = "ses"))
+      val store = withTranscriptStore(controller)
+      store.replace("server", "ses", store.epoch("server", "ses"), timeline.map(::record), olderCursor = null, complete = true, sessionUpdated = 5)
+      val (painted, cursor) = TranscriptSync(store).paintWindow("server", "ses")
+      mutable(controller).value = state.value.copy(messages = painted, messagesCursor = cursor)
+      assertTrue(state.value.olderFromDevice)
+      var guard = 0
+      while (state.value.messagesCursor != null && guard++ < 20) controller.loadOlderMessages().join()
+      assertEquals(timeline.map { it.toMessage() }, state.value.messages)
+      assertEquals("no request reached the server", 0, unreachable.requestCount)
+    }
+  }
+
   @Suppress("UNCHECKED_CAST")
   private fun mutable(controller: LagoonController) =
     LagoonController::class.java.getDeclaredField("mutable").apply { isAccessible = true }.get(controller) as MutableStateFlow<LagoonState>
