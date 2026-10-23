@@ -497,10 +497,16 @@ internal class AllServersOverview(
       }
       oldTasks.values.filter { it.active && it.sessionId !in active }.forEach { old ->
         val session = identityMap[old.sessionId] ?: sessions.firstOrNull { it.id == old.sessionId }
-        if (session == null || old.activeAt < 0 || session.idle <= old.activeAt) {
-          states[old.sessionId] = old
-        } else if (session.parentId == null && session.outcome != "interrupted" && !store.sessionNotices(id).coversRun(session.id, old.since)) {
-          newlyFinished += session to old.since
+        if (session == null) { states[old.sessionId] = old; return@forEach }
+        // 派生出的子代理任务没有服务端时间基线（activeAt = -1）：会话不在 active 且服务端已记录
+        // 结束（time.idle > 0）时它已经停了，不能因为 -1 就永久保留成“后台运行中”。
+        val derivedChild = old.phase == TaskPhase.SUBAGENT || session.parentId != null
+        val finished = session.idle > 0 &&
+          ((old.activeAt >= 0 && session.idle > old.activeAt) || (old.activeAt < 0 && derivedChild))
+        when {
+          !finished -> states[old.sessionId] = old
+          session.parentId == null && session.outcome != "interrupted" && !store.sessionNotices(id).coversRun(session.id, old.since) ->
+            newlyFinished += session to old.since
         }
       }
     }
