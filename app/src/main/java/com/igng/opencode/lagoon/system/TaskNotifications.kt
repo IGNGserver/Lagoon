@@ -145,10 +145,10 @@ class TaskNotifications(private val context: Context) {
     val active = content.stage == LiveUpdateStage.ACTIVE
     // Android 15 and below have no Live Update chip, so the notification title is the only count
     // surface many OEM status bars / AODs show. Use the same compact bucket string as the Android 16
-    // chip and put the readable full count in the body.
+    // chip and keep the priority headline in the body.
     val legacy = Build.VERSION.SDK_INT < 36
     val title = if (legacy && active) summary.shortText else content.title
-    val text = if (legacy && active) summary.countLine else content.text
+    val text = if (legacy && active) content.title else content.text
     val builder = NotificationCompat.Builder(context, SUMMARY)
       .setSmallIcon(R.drawable.ic_notification).setLargeIcon(appIcon)
       .setContentTitle(title).setContentText(text)
