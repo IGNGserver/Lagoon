@@ -288,12 +288,12 @@ class LagoonController private constructor(private val appContext: Context) {
   }
   private val store = ServerStore(appContext)
   private val cache = OfflineCache(appContext)
-  /** Verified on-device copy of OpenCode transcripts; its database opens on first use, off the main thread. */
-  private val transcripts: TranscriptStore? = TranscriptStore.get(appContext)
-  private val transcriptSync = transcripts?.let { TranscriptSync(it) }
   /** Transcript cache access runs one at a time in submission order: binding a server precedes reading it. */
   @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
   private val storeDispatcher = Dispatchers.IO.limitedParallelism(1)
+  /** Verified on-device copy of OpenCode transcripts; its database opens on first use, off the main thread. */
+  private val transcripts: TranscriptStore? = TranscriptStore.get(appContext)
+  private val transcriptSync = transcripts?.let { TranscriptSync(it, storeDispatcher) }
   private val notifications = TaskNotifications(appContext)
   private val attachmentImporter = AttachmentImporter(appContext)
   private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -557,14 +557,32 @@ class LagoonController private constructor(private val appContext: Context) {
     }
   }
   /**
-   * After a full read, the first page of the few most recent other conversations is fetched into
-   * memory, so opening one paints at once. OpenCode only (a DSH page read changes its live
-   * subscriptions), never on a metered network, and the server copy still replaces it on open.
+   * After a full read, the few most recent other conversations are brought up to date in the
+   * transcript store (or, without one, their first page is kept in memory), so opening one paints at
+   * once and verifies with a single small read. OpenCode only (a DSH page read changes its live
+   * subscriptions) and never on a metered network.
    */
   private fun prefetchTranscripts(token: Int, client: HarnessClient) {
     val current = state.value
     val serverId = current.serverId ?: return
     if (current.server?.kind != ServerKind.OPENCODE) return
+    val sync = transcriptSync?.takeIf { client.cacheableTranscripts }
+    if (sync != null) {
+      val candidates = current.sessions.filter { it.parentId == null && !it.archived && it.id != current.sessionId }.take(PREFETCH_SESSIONS)
+      if (candidates.isEmpty()) return
+      scope.launch {
+        val metered = attempt { (appContext.getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager).isActiveNetworkMetered }.getOrDefault(true)
+        if (metered) return@launch
+        for (session in candidates) {
+          if (token != generation) return@launch
+          // Already current in the store: nothing to read.
+          val info = kotlinx.coroutines.withContext(storeDispatcher) { attempt { transcripts?.info(serverId, session.id) }.getOrNull() }
+          if (info != null && session.updated > 0 && info.sessionUpdated == session.updated) continue
+          attempt { sync.open(client, serverId, session) }.onFailure { Diagnostics.warn("TranscriptSync", "预取会话失败", it) }
+        }
+      }
+      return
+    }
     val targets = current.sessions.asSequence()
       .filter { it.parentId == null && !it.archived && it.id != current.sessionId && transcriptMemory.get(serverId, it.id) == null }
       .take(PREFETCH_SESSIONS).toList()
@@ -1206,7 +1224,10 @@ class LagoonController private constructor(private val appContext: Context) {
   }
   fun loadOlderMessages() = withSession("messages-more") { op, client, session ->
     val cursor = op.snapshot.messagesCursor ?: return@withSession
-    val page = client.messagesPage(session.id, cursor, HarnessClient.HISTORY_PAGE)
+    val sync = transcriptSync?.takeIf { client.cacheableTranscripts }
+    // Stored history first (no network), then the server; server pages extend the stored run.
+    val page = if (sync != null) sync.loadOlder(client, op.serverId, session, cursor).let { ApiPage(it.messages, it.next) }
+      else client.messagesPage(session.id, cursor, HarnessClient.HISTORY_PAGE)
     check(page.next != cursor) { "服务器返回了重复分页游标" }
     op.commit { it.copy(messages = (page.items + it.messages).distinctBy { m -> m.id }, messagesCursor = page.next,
       loadedOlderMessages = true, historyRevision = it.historyRevision + 1) }
@@ -1829,13 +1850,18 @@ class LagoonController private constructor(private val appContext: Context) {
     var records: List<MessageRecord> = emptyList()
     // OpenCode returns `cursor.next` for every non-empty page; a short page is what marks the session start.
     var reachedStart = false
+    var opened: TranscriptSync.Window? = null
     val sync = transcriptSync?.takeIf { client.cacheableTranscripts }
     // Taken before the read: a deletion while it is in flight makes its write a no-op.
     val epoch = sync?.epoch(serverId, session.id) ?: 0L
     // The newest page of the projected timeline plus admitted-but-undelivered input, like the official
     // client's message and pending syncs.
     val (result, pending) = coroutineScope {
-      val page = async { attempt { client.messageRecords(session.id).let { nextCursor = it.next; records = it.items; reachedStart = it.items.size < HarnessClient.MESSAGE_PAGE; it.items.map(MessageRecord::message) } } }
+      val page = async { attempt {
+        // A cacheable conversation opens from its verified stored run plus only what is new on the server.
+        if (sync != null && initialWindow) sync.open(client, serverId, session).also { opened = it; nextCursor = it.olderCursor }.messages
+        else client.messageRecords(session.id).let { nextCursor = it.next; records = it.items; reachedStart = it.items.size < HarnessClient.MESSAGE_PAGE; it.items.map(MessageRecord::message) }
+      } }
       val inbox = async { attempt { client.inbox(session.id) } }
       page.await() to inbox.await().getOrDefault(emptyList())
     }
@@ -1845,7 +1871,7 @@ class LagoonController private constructor(private val appContext: Context) {
     val messages = result.map { first ->
       // Official initial window: keep pulling older pages until the oldest boundary is a whole turn,
       // so the first screen never starts mid-reply. Bounded so a refresh cannot burst unbounded.
-      val fetched = if (!initialWindow) first else {
+      val fetched = if (!initialWindow || opened != null) first else {
         val merged = first.toMutableList()
         var cursor = nextCursor
         var extra = 0
@@ -1874,11 +1900,14 @@ class LagoonController private constructor(private val appContext: Context) {
     }
     if (result.isSuccess) {
       if (sync == null) cache.saveMessages(serverId, session.id, messages.persistable(), complete = nextCursor == null)
-      else if (initialWindow) {
+      else if (opened == null) {
+        // A tail refresh: fold the newest page into the stored run (never across a gap).
         val window = records
         val older = nextCursor.takeUnless { reachedStart }
-        scope.launch(storeDispatcher) { attempt { sync.saveWindow(serverId, session.id, epoch, window, older, older == null, session.updated) } }
+        val start = reachedStart
+        scope.launch(storeDispatcher) { attempt { sync.absorb(serverId, session, epoch, window, older, start) } }
       }
+      opened?.let { Diagnostics.info("TranscriptSync", "打开会话 · ${it.outcome} · 请求 ${it.requests} · 新增 ${it.added}") }
     }
     if (!current()) return
     if (result.isSuccess) {

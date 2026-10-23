@@ -114,6 +114,8 @@ internal class TranscriptStore internal constructor(
       arrayOf(server, session, pos)) { it.string(0)!! to it.blob(1)!! }).asReversed()
   }
 
+  fun contains(server: String, session: String, id: String): Boolean = position(server, session, id) != null
+
   /** True when a stored message is older than [id]. */
   fun hasOlder(server: String, session: String, id: String): Boolean {
     val pos = position(server, session, id) ?: return false
