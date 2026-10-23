@@ -10,7 +10,8 @@
 - `core/TranscriptRows.kt`: 时间线行投影，对应官方 `packages/session-ui/src/timeline/projection.ts`（轮次分组、shell 独立成轮、通知行、中断分隔、只显示最后一条错误、撤销边界隐藏）。
 - `core/TaskSummary.kt`: 全服务器范围的任务计数（运行中 / 未读已完成 / 待回复 / 失败）与统一显示文案，供系统实时更新通知与 App 内任务状态共用。
 - `core/ServerStore.kt`: 服务器资料与 Keystore AES-GCM 凭据。
-- `core/OfflineCache.kt`: 加密离线缓存（catalog 与消息）。
+- `core/OfflineCache.kt`: 加密离线缓存（会话列表，以及 DSH 的消息快照）。
+- `core/TranscriptStore.kt` / `core/TranscriptSync.kt`: OpenCode 会话缓存。SQLite 保存服务器原始 JSON（只存已结束的消息、连续一段），打开会话先显示本机内容，再只读最新一页并与缓存核对后追加，对不上即重建；历史先从本机翻页。设计与正确性保证见 `docs/TRANSCRIPT_CACHE.md`。
 - `core/KeystoreCipher.kt`: `ServerStore`/`OfflineCache` 共用的 AndroidKeyStore AES-GCM 加解密。
 - `core/PairLink.kt`: 官方 `opencode pair` 链接解析（强制 HTTPS）。
 - `core/Http.kt` / `core/Diagnostics.kt`: 进程级 OkHttp 连接池/调度器；轻量日志。

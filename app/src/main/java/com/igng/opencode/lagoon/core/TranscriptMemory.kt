@@ -21,5 +21,7 @@ internal class TranscriptMemory(private val capacity: Int = 8, private val maxMe
 
   @Synchronized fun forget(serverId: String, sessionId: String) { entries.remove(key(serverId, sessionId)) }
 
+  @Synchronized fun clear() { entries.clear() }
+
   @Synchronized fun forgetServer(serverId: String) { entries.keys.removeAll { it.startsWith("$serverId\u0000") } }
 }
