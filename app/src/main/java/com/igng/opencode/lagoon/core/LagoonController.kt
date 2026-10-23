@@ -573,8 +573,7 @@ class LagoonController private constructor(private val appContext: Context) {
       val candidates = current.sessions.filter { it.parentId == null && !it.archived && it.id != current.sessionId }.take(PREFETCH_SESSIONS)
       if (candidates.isEmpty()) return
       scope.launch {
-        val metered = attempt { (appContext.getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager).isActiveNetworkMetered }.getOrDefault(true)
-        if (metered) return@launch
+        if (meteredNetwork()) return@launch
         for (session in candidates) {
           if (token != generation) return@launch
           // Already current in the store: nothing to read.
@@ -590,13 +589,44 @@ class LagoonController private constructor(private val appContext: Context) {
       .take(PREFETCH_SESSIONS).toList()
     if (targets.isEmpty()) return
     scope.launch {
-      val metered = attempt { (appContext.getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager).isActiveNetworkMetered }.getOrDefault(true)
-      if (metered) return@launch
+      if (meteredNetwork()) return@launch
       for (session in targets) {
         if (token != generation) return@launch
         val page = kotlinx.coroutines.withContext(Dispatchers.IO) { attempt { client.messagesPage(session.id) }.getOrNull() } ?: continue
         if (token == generation && transcriptMemory.get(serverId, session.id) == null) transcriptMemory.put(serverId, session.id, page.items)
       }
+    }
+  }
+  private fun meteredNetwork(): Boolean =
+    attempt { (appContext.getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager).isActiveNetworkMetered }.getOrDefault(true)
+  /**
+   * Opening only checks the newest page against the stored run. About once a week per conversation,
+   * on an unmetered network, the whole run is compared too; a difference drops it and the open
+   * conversation is read again from the server.
+   */
+  private fun scheduleFullCheck(sync: TranscriptSync, client: HarnessClient, serverId: String, session: Session, token: Int) {
+    scope.launch {
+      if (!sync.dueForFullCheck(serverId, session.id) || meteredNetwork()) return@launch
+      val matched = attempt { sync.verifyAll(client, serverId, session) }.getOrNull()
+      if (matched == false && token == generation && state.value.serverId == serverId && state.value.sessionId == session.id) {
+        transcriptMemory.forget(serverId, session.id)
+        selectSession(session.id)
+      }
+    }
+  }
+  /** Size of the on-device transcript copy, for settings; null when there is no store. */
+  internal suspend fun transcriptCacheUsage(): TranscriptStore.Usage? = transcripts?.let { store ->
+    kotlinx.coroutines.withContext(storeDispatcher) { attempt { store.usage() }.getOrNull() }
+  }
+  /** Drops every stored transcript (the server keeps them); conversations are read again on open. */
+  fun clearTranscriptCache(onCleared: () -> Unit = {}) {
+    transcriptMemory.clear()
+    scope.launch {
+      kotlinx.coroutines.withContext(storeDispatcher) {
+        attempt { transcripts?.clear() }
+        attempt { store.profiles().forEach { cache.deleteTranscripts(it.id) } }
+      }
+      onCleared()
     }
   }
   /** “立即重试” from the status strip: skip the backoff wait and read the server now. */
@@ -658,7 +688,7 @@ class LagoonController private constructor(private val appContext: Context) {
     scope.launch { show(cachedTranscript(serverId, sessionId)) }
   }
   /** Recent connection and conversation-open timings, one line each, for the copied diagnostics. */
-  fun connectionDiagnostics(): String = (connectTrace.reports() + openTrace.reports()).joinToString("\n") { it.line() }
+  fun connectionDiagnostics(): String = ((connectTrace.reports() + openTrace.reports()).map { it.line() } + listOfNotNull(transcriptSync?.statsLine())).joinToString("\n")
   private fun trace(token: Int, milestone: ConnectMilestone) {
     connectTrace.mark(token.toLong(), milestone)?.let { Diagnostics.info("ConnectTrace", "${milestone.label} ${it}ms") }
   }
@@ -1943,7 +1973,10 @@ class LagoonController private constructor(private val appContext: Context) {
         val start = reachedStart
         scope.launch(storeDispatcher) { attempt { sync.absorb(serverId, session, epoch, window, older, start) } }
       }
-      opened?.let { Diagnostics.info("TranscriptSync", "打开会话 · ${it.outcome} · 请求 ${it.requests} · 新增 ${it.added}") }
+      opened?.let {
+        Diagnostics.info("TranscriptSync", "打开会话 · ${it.outcome} · 请求 ${it.requests} · 新增 ${it.added}")
+        if (it.outcome == TranscriptSync.Outcome.VERIFIED || it.outcome == TranscriptSync.Outcome.CORRECTED) sync?.let { s -> scheduleFullCheck(s, client, serverId, session, token) }
+      }
     }
     if (!current()) return
     if (result.isSuccess) {

@@ -656,6 +656,15 @@ fun SettingsScreen(
           title = "服务与同步",
           summary = "服务：${state.version.ifBlank { "未知版本" }} · ${if (state.connected) "可连接" else "未连接"}\n实时同步：${if (state.streamConnected) "正常" else "恢复中"} · ${if (state.degraded || state.cached) "数据待更新" else "数据已同步"}"
         )
+        var cacheUsage by remember { mutableStateOf<String?>(null) }
+        LaunchedEffect(Unit) {
+          cacheUsage = controller.transcriptCacheUsage()?.let { "已保存 ${it.sessions} 个会话 · ${formatBytes(it.bytes)} / 上限 ${formatBytes(TranscriptStore.DEFAULT_BUDGET_BYTES)}" }
+        }
+        SuperArrow(
+          title = "清除会话缓存",
+          summary = (cacheUsage ?: "本机保存的会话内容") + "\n与服务器核对后使用；清除后打开会话时重新读取",
+          onClick = { controller.clearTranscriptCache { cacheUsage = "已清除" } }
+        )
         SuperArrow(
           title = "复制诊断信息",
           summary = "版本、系统、连接状态与各阶段耗时，不含凭据",

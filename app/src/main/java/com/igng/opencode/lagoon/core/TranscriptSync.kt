@@ -42,6 +42,26 @@ internal class TranscriptSync(
   /** An older page for [loadOlder]: oldest first, then where to continue (null once the session start is shown). */
   data class Older(val messages: List<Message>, val next: String?)
 
+  /** How opens and full checks turned out since the process started; copied into diagnostics. */
+  private val outcomes = java.util.concurrent.ConcurrentHashMap<Outcome, java.util.concurrent.atomic.AtomicInteger>()
+  private val fullChecks = java.util.concurrent.atomic.AtomicInteger()
+  private val fullCheckFailures = java.util.concurrent.atomic.AtomicInteger()
+
+  private fun record(window: Window): Window = window.also { outcomes.getOrPut(it.outcome) { java.util.concurrent.atomic.AtomicInteger() }.incrementAndGet() }
+
+  /** One line for the copied diagnostics. */
+  fun statsLine(): String {
+    fun count(outcome: Outcome) = outcomes[outcome]?.get() ?: 0
+    return "会话缓存：首次 ${count(Outcome.FRESH)} · 校验通过 ${count(Outcome.VERIFIED)} · 更正 ${count(Outcome.CORRECTED)} · 重建 ${count(Outcome.REBUILT)}" +
+      " · 完整校验 ${fullChecks.get()}（不一致 ${fullCheckFailures.get()}）"
+  }
+
+  /** True when the stored run of [session] has not been compared in full for [FULL_CHECK_INTERVAL_MS]. */
+  suspend fun dueForFullCheck(server: String, session: String): Boolean = withContext(io) {
+    val info = store.info(server, session) ?: return@withContext false
+    clock() - info.verifiedAt > FULL_CHECK_INTERVAL_MS
+  }
+
   /** The newest stored messages of one conversation, oldest first; empty when nothing is stored. */
   suspend fun paint(server: String, session: String, limit: Int = PAINT_WINDOW): List<Message> = withContext(io) {
     val messages = store.newest(server, session, limit)
@@ -104,7 +124,7 @@ internal class TranscriptSync(
   suspend fun open(client: HarnessClient, server: String, session: Session): Window {
     val epoch = store.epoch(server, session.id)
     val (info, stored) = withContext(io) { store.info(server, session.id).let { it to if (it == null) emptyList() else store.fingerprints(server, session.id) } }
-    if (info == null || stored.isEmpty()) return fresh(client, server, session, epoch)
+    if (info == null || stored.isEmpty()) return record(fresh(client, server, session, epoch))
     var requests = 0
     // An unchanged `time.updated` suggests nothing new: a short page is enough to confirm it.
     val headSize = if (session.updated > 0 && session.updated == info.sessionUpdated) HEAD_UNCHANGED else HEAD_CHANGED
@@ -122,7 +142,7 @@ internal class TranscriptSync(
     }
     val olderCursor = cursor.takeUnless { reachedStart }
     val plan = reconcile(window, olderCursor, reachedStart, info, stored, mayGap = false)
-    return withContext(io) { apply(server, session, epoch, plan, window, olderCursor, requests) }
+    return record(withContext(io) { apply(server, session, epoch, plan, window, olderCursor, requests) })
   }
 
   /**
@@ -169,10 +189,12 @@ internal class TranscriptSync(
     val matches = segment.size == stored.size && segment.zip(stored).all { (remote, local) ->
       remote.message.id == local.first && remote.raw?.let(::cacheRecord)?.fingerprint == local.second
     }
+    fullChecks.incrementAndGet()
     return withContext(io) {
       if (store.epoch(server, session.id) != epoch) return@withContext null
       if (matches) { store.markVerified(server, session.id, clock()); true }
       else {
+        fullCheckFailures.incrementAndGet()
         Diagnostics.warn("TranscriptSync", "完整校验发现缓存与服务器不一致，已丢弃该会话缓存")
         store.delete(server, session.id)
         false
@@ -341,6 +363,8 @@ internal class TranscriptSync(
     const val MAX_TURN_WIDEN = 10
     /** Pages of [HarnessClient.HISTORY_PAGE] one full comparison may read. */
     const val MAX_VERIFY_PAGES = 10
+    /** A stored run is compared in full at most this often (on unmetered networks, after an open). */
+    const val FULL_CHECK_INTERVAL_MS = 7L * 24 * 60 * 60 * 1000
 
     /** A prompt or a shell command: the first row of a turn in the official timeline. */
     fun isTurnRoot(message: Message) = message.role == "user" || message.role == "shell"

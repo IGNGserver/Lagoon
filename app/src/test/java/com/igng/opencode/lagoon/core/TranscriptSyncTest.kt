@@ -263,6 +263,23 @@ class TranscriptSyncTest {
     }
   }
 
+  @Test fun outcomesAndFullChecksAreCountedAndScheduled() = runBlocking {
+    var now = 1_000L
+    val clocked = TranscriptSync(store, Dispatchers.Unconfined, clock = { now })
+    FakeTimelineServer().use { server ->
+      server.timeline += conversation(turns = 2, steps = 2)
+      clocked.open(server.api(), "s", session())
+      clocked.open(server.api(), "s", session())
+      assertFalse("just read in full", clocked.dueForFullCheck("s", "ses"))
+      now += TranscriptSync.FULL_CHECK_INTERVAL_MS + 1
+      assertTrue(clocked.dueForFullCheck("s", "ses"))
+      assertEquals(true, clocked.verifyAll(server.api(), "s", session()))
+      assertFalse(clocked.dueForFullCheck("s", "ses"))
+      val line = clocked.statsLine()
+      assertTrue(line, line.contains("首次 1") && line.contains("校验通过 1") && line.contains("完整校验 1（不一致 0）"))
+    }
+  }
+
   @Test fun aSessionDeletedMidReadIsNotStored() = runBlocking {
     FakeTimelineServer().use { server ->
       server.timeline += conversation(turns = 2, steps = 2)
