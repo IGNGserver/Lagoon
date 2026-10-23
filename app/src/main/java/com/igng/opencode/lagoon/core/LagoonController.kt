@@ -157,10 +157,15 @@ data class LagoonState(
     return TaskSummary.merge(snapshots.filter { it.profile.notifications }.map { it.displaySummary(permissionPolicy) })
   }
   val globalSummaryTarget: SessionTarget? get() = globalSummary.items.firstOrNull()?.let { item -> item.serverId?.let { SessionTarget(it, item.sessionId) } }
-  val activeRootTasks: Map<String, TaskState> get() = TaskSummary.aggregate(presentedTasks.filterValues { it.active }, parents)
-  fun sessionStatus(session: Session, active: Map<String, TaskState> = activeRootTasks): SessionStatus =
-    if (allServers && serverId == null) allSessionStatuses[session.key] ?: SessionStatus.NONE
-    else sessionStatus(active[session.id], notices.unseenFor(session.id), session.id in backgroundRunning)
+  val activeRootTasks: Map<String, TaskState> get() = TaskSummary.aggregate(livePresentedTasks.filterValues { it.active }, parents)
+  fun sessionStatus(session: Session, active: Map<String, TaskState> = activeRootTasks): SessionStatus {
+    if (allServers && serverId == null) return allSessionStatuses[session.key] ?: SessionStatus.NONE
+    val unseen = notices.unseenFor(session.id)
+    val staleOwn = staleConnection && presentedTasks[session.id]?.active == true
+    val staleRoot = staleConnection && rawActiveRootTasks.containsKey(session.id)
+    if ((staleOwn || staleRoot) && active[session.id] == null && unseen.isEmpty()) return SessionStatus.UNKNOWN
+    return sessionStatus(active[session.id], unseen, session.id in backgroundRunning)
+  }
 }
 
 class LagoonController private constructor(private val appContext: Context) {
@@ -233,7 +238,7 @@ class LagoonController private constructor(private val appContext: Context) {
     // “后台运行中”= 根会话自身没有在跑，只有它派生的后台/子任务在跑（主线程在等后台任务），
     // 而不是“应用退到过后台”。后者会把所有正在运行的会话都误标成后台运行中。
     val background = TaskSummary.backgroundRoots(next.tasks, next.parents)
-    val summary = TaskSummary.of(next.presentedTasks, next.notices, next.parents, titles, background,
+    val summary = TaskSummary.of(next.livePresentedTasks, next.notices, next.parents, titles, background,
       serverId = next.serverId, serverName = next.server?.name)
     val targetId = active.values.firstOrNull { it.phase in TaskState.WAITING_PHASES }?.sessionId
       ?: next.notices.filter { !it.viewed && it.sessionId !in active }.maxByOrNull { it.time }?.sessionId
@@ -301,7 +306,7 @@ class LagoonController private constructor(private val appContext: Context) {
       if (id == state.value.serverId) trace(generation, ConnectMilestone.STREAM)
       if (id == state.value.serverId && api != null && connecting?.isActive != true) reconcileAfterStream()
     },
-    directoryHealth)
+    directoryHealth, ::acceptSnapshotRemoved)
   private var api: HarnessClient? = null
   private var stream: Job? = null
   private var generation = 0
@@ -373,6 +378,12 @@ class LagoonController private constructor(private val appContext: Context) {
   private fun scheduleBackgroundSync() {
     attempt { BackgroundSyncWorker.schedule(appContext, store.profiles().isNotEmpty()) }
       .onFailure { Diagnostics.warn("BackgroundSync", "无法安排后台定时刷新", it) }
+  }
+
+  /** A monitor was deliberately stopped: drop its stale tasks/notices from the global island. */
+  private fun acceptSnapshotRemoved(id: String) {
+    if (allSnapshots.remove(id) == null) return
+    mutable.update { it.copy(allServerSnapshots = allSnapshots.toMap()) }
   }
 
   /** Rebuilds the home/notification projection after one overview connection changes. */

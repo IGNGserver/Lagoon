@@ -49,6 +49,16 @@ class HomeSectionsTest {
     assertEquals(listOf("bg", "run"), sections.single().sessions.map { it.id })
   }
 
+  @Test fun waitingOnTheServerRanksWithNeedsAttention() {
+    val sections = HomeSections.byStatus(listOf(session("server", at(5, 8))), mapOf("server" to SessionStatus.WAITING_SERVER))
+    assertEquals(listOf("需要处理"), sections.map { it.title })
+  }
+
+  @Test fun unknownOfflineWorkFallsUnderTheRest() {
+    val sections = HomeSections.byStatus(listOf(session("offline", at(5, 8))), mapOf("offline" to SessionStatus.UNKNOWN))
+    assertEquals(listOf("其他"), sections.map { it.title })
+  }
+
   @Test fun pinnedSessionsLeadAndLeaveTheirSection() {
     val sessions = listOf(session("a", at(5, 8)), session("b", at(3, 8)))
     val sections = HomeSections.build(HomeGrouping.DATE, sessions, emptyList(), emptyMap(), pinned = setOf("b"), now = now, zone = zone)

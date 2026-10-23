@@ -284,4 +284,23 @@ class PersistentConnectionsTest {
     }
   }
 
+  @Test fun stoppingAMonitorDropsItsLastSnapshotFromTheAggregate() = runBlocking {
+    MockWebServer().use { server ->
+      server.dispatcher = dispatcher(AtomicInteger())
+      val store = store(); val profile = profile("a", server); store.save(profile, null)
+      val scope = CoroutineScope(coroutineContext + SupervisorJob())
+      val snapshots = ConcurrentHashMap<String, ServerOverviewSnapshot>()
+      val removed = mutableListOf<String>()
+      val manager = AllServersOverview(store, cache(), scope, { snapshots[it.serverId] = it },
+        onSnapshotRemoved = { removed += it })
+      try {
+        manager.start(listOf(profile))
+        awaitCondition { snapshots["a"]?.connected == true }
+        removed.clear()
+        manager.stop()
+        assertEquals(listOf("a"), removed)
+      } finally { scope.cancel() }
+    }
+  }
+
 }

@@ -24,12 +24,19 @@ import top.yukonga.miuix.kmp.utils.overScrollVertical
 internal fun ArchivedScreen(state: LagoonState, controller: LagoonController, onOpen: (SessionTarget) -> Unit, onBack: () -> Unit) {
   var deleting by remember { mutableStateOf<Session?>(null) }
   val archived = state.sessions.filter { it.parentId == null && it.archived }.sortedWith(sessionActivityOrder)
+  val active = remember(state.tasks, state.parents, state.permissionPolicy, state.autoApprovalFailures, state.connected, state.lastContactAt) { state.activeRootTasks }
+  val statuses = remember(state.sessions, state.notices, active, state.backgroundRunning, state.allSessionStatuses, state.allServers) {
+    state.sessions.associate { it.key to state.sessionStatus(it, active) }
+  }
+  val unseen = remember(state.notices, state.allUnseenSessions, state.allServers) {
+    if (state.allServers) state.allUnseenSessions else state.notices.filterNot { it.viewed }.map { it.sessionId }.toSet()
+  }
   val muted = MiuixTheme.colorScheme.onSurfaceVariantSummary
   Column(Modifier.fillMaxSize()) {
     PageTopBar("已归档", onBack)
     LazyColumn(Modifier.fillMaxSize().overScrollVertical(), contentPadding = PaddingValues(top = 4.dp, bottom = 48.dp)) {
       items(archived, key = { it.key }) { session ->
-        HomeSessionRow(session, SessionStatus.NONE, unseen = false,
+        HomeSessionRow(session, statuses[session.key] ?: SessionStatus.NONE, unseen = session.key in unseen,
           serverName = if (state.allServers) session.serverId?.let { id -> state.profiles.firstOrNull { it.id == id }?.name } else null,
           onClick = { (session.target ?: state.serverId?.let { SessionTarget(it, session.id) })?.let(onOpen) }, actions = buildList {
           if (!state.allServers && state.connected && state.capabilities.archive?.restorable == true) add(MenuAction("取消归档", UNARCHIVE_ICON) { controller.setArchived(session.id, false) })

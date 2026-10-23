@@ -28,6 +28,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.igng.opencode.lagoon.core.*
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import top.yukonga.miuix.kmp.basic.*
 import top.yukonga.miuix.kmp.extra.SuperDialog
@@ -107,6 +108,10 @@ internal fun HomeScreen(
         }
       )
       if (!searching) ServerChips(state, onSelectServer, onEditServer)
+      if (!searching) GlobalTaskStrip(state, controller, onArchived = {
+        controller.setAllServers(true)
+        onPage(RootPage.ARCHIVED)
+      })
       if (!state.allServers) ConnectionStrip(state, controller)
       Box(Modifier.weight(1f).fillMaxWidth()) {
         SessionList(state, controller, grouping, query.trim(), onOpen, onNewSession, onEditServer,
@@ -144,7 +149,52 @@ private fun SearchTopBar(query: String, onQuery: (String) -> Unit, onClose: () -
   }
 }
 
-/** Fixed header: grid glyph + scope title with ⌄ on the left, an optional one-tap read action, and ⋯. */
+/**
+ * The in-app counterpart of the system island. The island is server-wide and project-wide; the
+ * session list below is filtered (single server / one project / archived hidden), so this strip is
+ * the only place where the two scopes are visible next to each other. It uses the exact same
+ * `globalSummary` (notification-enabled servers, offline TTL applied) as the notification.
+ */
+@Composable
+private fun GlobalTaskStrip(state: LagoonState, controller: LagoonController, onArchived: () -> Unit) {
+  val now by produceState(System.currentTimeMillis()) { while (true) { delay(60_000); value = System.currentTimeMillis() } }
+  val summary = state.globalSummary
+  val archived = state.archivedTaskCount(now)
+  val silent = state.silentServersWithTasks(now)
+  if (summary.isEmpty && archived == 0 && silent.isEmpty()) return
+  val muted = MiuixTheme.colorScheme.onSurfaceVariantSummary
+  Column(
+    Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 4.dp),
+    verticalArrangement = Arrangement.spacedBy(2.dp)
+  ) {
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+      Text("全部服务器 · 全部项目", Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis,
+        style = MiuixTheme.textStyles.footnote2.copy(color = muted))
+      if (!state.allServers || state.scopeProjectId != null) {
+        Text("查看全部", Modifier.clip(CircleShape).clickable(role = Role.Button) {
+          controller.setScope(null)
+          controller.setAllServers(true)
+        }.padding(horizontal = 9.dp, vertical = 6.dp), maxLines = 1,
+          style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.primary))
+      }
+    }
+    if (!summary.isEmpty) Text(summary.countLine, maxLines = 2, overflow = TextOverflow.Ellipsis,
+      style = MiuixTheme.textStyles.footnote1.copy(fontWeight = FontWeight.Medium, color = MiuixTheme.colorScheme.onSurface))
+    if (archived > 0) {
+      Text("已归档会话另有 $archived 个任务 · 查看",
+        Modifier.clip(CircleShape).clickable(role = Role.Button) {
+          controller.setAllServers(true)
+          onArchived()
+        }.padding(vertical = 3.dp), maxLines = 2,
+        style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.primary))
+    }
+    if (silent.isNotEmpty()) {
+      Text("通知已关闭：${silent.joinToString("、")}（未计入灵动岛）", maxLines = 2, overflow = TextOverflow.Ellipsis,
+        style = MiuixTheme.textStyles.footnote2.copy(color = MiuixColorTokens.Warning))
+    }
+  }
+}
+
 @Composable
 private fun HomeTopBar(title: String, onTitleClick: () -> Unit, action: (@Composable () -> Unit)? = null, menu: @Composable () -> Unit) {
   Row(Modifier.fillMaxWidth().statusBarsPadding().heightIn(min = 64.dp).padding(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 4.dp),
@@ -259,8 +309,11 @@ private fun SessionList(
   val refreshScope = rememberCoroutineScope()
   val list = rememberLazyListState()
   val now by produceState(System.currentTimeMillis()) { while (true) { kotlinx.coroutines.delay(60_000); value = System.currentTimeMillis() } }
-  val active = remember(state.tasks, state.parents, state.permissionPolicy, state.autoApprovalFailures) { state.activeRootTasks }
-  val statuses = remember(state.sessions, state.notices, active, state.backgroundRunning, state.allSessionStatuses) { state.sessions.associate { it.key to state.sessionStatus(it, active) } }
+  val active = remember(state.tasks, state.parents, state.permissionPolicy, state.autoApprovalFailures, state.connected, state.lastContactAt, now) { state.activeRootTasks }
+  val statuses = remember(state.sessions, state.notices, active, state.backgroundRunning, state.allSessionStatuses, state.allServers, state.allServerSnapshots, state.permissionPolicy, state.autoApprovalFailures, now) {
+    if (state.allServers) state.allServerStatuses(now)
+    else state.sessions.associate { it.key to state.sessionStatus(it, active) }
+  }
   val unseen = remember(state.notices, state.allUnseenSessions, state.allServers) {
     if (state.allServers) state.allUnseenSessions else state.notices.filterNot { it.viewed }.map { it.sessionId }.toSet()
   }
@@ -361,7 +414,7 @@ internal fun HomeSessionRow(session: Session, status: SessionStatus, unseen: Boo
        if (status == SessionStatus.BACKGROUND_RUNNING) {
         Spacer(Modifier.width(8.dp))
          Text(status.label, style = MiuixTheme.textStyles.footnote1.copy(color = MiuixTheme.colorScheme.primary))
-       } else if (status == SessionStatus.WAITING_SERVER) {
+       } else if (status == SessionStatus.WAITING_SERVER || status == SessionStatus.UNKNOWN) {
          Spacer(Modifier.width(8.dp))
          Text(status.label, style = MiuixTheme.textStyles.footnote1.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
       } else if (status == SessionStatus.WAITING_PERMISSION || status == SessionStatus.WAITING_QUESTION) {
@@ -381,7 +434,7 @@ private fun StatusGlyph(status: SessionStatus, unseen: Boolean) {
       InfiniteProgressIndicator(color = MiuixTheme.colorScheme.primary, size = 16.dp, strokeWidth = 2.dp, orbitingDotSize = 2.dp)
     status == SessionStatus.BACKGROUND_RUNNING ->
       Icon(MiuixIcons.Info, status.label, Modifier.size(20.dp), tint = MiuixTheme.colorScheme.primary)
-    status == SessionStatus.WAITING_SERVER ->
+    status == SessionStatus.WAITING_SERVER || status == SessionStatus.UNKNOWN ->
       Icon(MiuixIcons.Info, status.label, Modifier.size(20.dp), tint = muted)
     status == SessionStatus.WAITING_PERMISSION || status == SessionStatus.WAITING_QUESTION ->
       Icon(MiuixIcons.Info, status.label, Modifier.size(20.dp), tint = MiuixColorTokens.Warning)
