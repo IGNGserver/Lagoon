@@ -337,11 +337,14 @@ class OpenCodeApi(
    * One page of the projected timeline, oldest first. The first page is the newest [size] messages
    * (official page size 20); [cursor] walks further back.
    */
-  override suspend fun messagesPage(id: String, cursor: String?, size: Int): ApiPage<Message> = withContext(Dispatchers.IO) {
+  override suspend fun messagesPage(id: String, cursor: String?, size: Int): ApiPage<Message> =
+    messageRecords(id, cursor, size).let { page -> ApiPage(page.items.map { it.message }, page.next) }
+  override val cacheableTranscripts: Boolean get() = true
+  override suspend fun messageRecords(id: String, cursor: String?, size: Int): ApiPage<MessageRecord> = withContext(Dispatchers.IO) {
     val query = mutableMapOf("limit" to size.toString())
     if (cursor == null) query["order"] = "desc" else query["cursor"] = cursor
     val page = obj(sessionPath(id, "/message"), query)
-    ApiPage(dataArray(page).objects().map { it.toMessage() }.asReversed(), page.obj("cursor").str("next").takeIf(String::isNotBlank))
+    ApiPage(dataArray(page).objects().map { MessageRecord(it.toMessage(), it) }.asReversed(), page.obj("cursor").str("next").takeIf(String::isNotBlank))
   }
   /** Durable input admitted but not yet delivered to the agent loop (`GET /api/session/{id}/inbox`). */
   override suspend fun inbox(id: String): List<Message> = withContext(Dispatchers.IO) {

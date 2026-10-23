@@ -84,6 +84,8 @@ dependencies {
   testImplementation("junit:junit:4.13.2")
   testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
   testImplementation("org.json:json:20240303")
+  // TranscriptStore's SQL runs against a real SQLite in JVM tests (Android's SQLiteDatabase is device-only).
+  testImplementation("org.xerial:sqlite-jdbc:3.46.1.0")
 }
 
 tasks.register("printReleaseApkPath") {

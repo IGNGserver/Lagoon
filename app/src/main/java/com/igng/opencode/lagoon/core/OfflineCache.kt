@@ -221,6 +221,21 @@ class OfflineCache internal constructor(
     }
   }
 
+  /** Drops every cached transcript of one server; its catalog stays. */
+  fun deleteTranscripts(serverId: String) {
+    synchronized(pendingLock) {
+      val matches = (index + preferences.all.keys + pending.keys + inFlight + nameSequence.keys).filter { it.startsWith("messages:$serverId:") }.toSet()
+      if (matches.isEmpty()) return
+      matches.forEach { name ->
+        pending.remove(name)
+        nextSequence(name)
+        preferences.edit().remove(name).apply()
+      }
+      index.removeAll(matches)
+      persistIndex()
+    }
+  }
+
   /** Drops the cached transcript for one session, used when the session is deleted server-side. */
   fun deleteMessages(serverId: String, sessionId: String) {
     val name = "messages:$serverId:$sessionId"
