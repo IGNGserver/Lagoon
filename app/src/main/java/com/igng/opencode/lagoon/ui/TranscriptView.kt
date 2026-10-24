@@ -48,11 +48,35 @@ import top.yukonga.miuix.kmp.icon.extended.Copy
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 import top.yukonga.miuix.kmp.theme.miuixCapsuleShape
 
-private val markdownCache = object : LinkedHashMap<String, Pair<String, List<MarkdownBlock>>>(32, 0.75f, true) {
-  override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Pair<String, List<MarkdownBlock>>>?) = size > 32
+/**
+ * Parsed Markdown per transcript row. Large enough for a long conversation's visible and recent rows –
+ * at 32 entries, scrolling back through history re-parsed rows on the main thread as they came into view.
+ */
+private val markdownCache = object : LinkedHashMap<String, Pair<String, List<MarkdownBlock>>>(256, 0.75f, true) {
+  override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Pair<String, List<MarkdownBlock>>>?) = size > MARKDOWN_CACHE_ROWS
 }
-private fun parsed(key: String, text: String): List<MarkdownBlock> = synchronized(markdownCache) {
-  markdownCache[key]?.takeIf { it.first == text }?.second ?: MarkdownBlocks.parse(text).also { markdownCache[key] = text to it }
+private const val MARKDOWN_CACHE_ROWS = 256
+private val MARKDOWN_KINDS = setOf("text", "process-output", "reasoning-body")
+private fun parsed(key: String, text: String): List<MarkdownBlock> {
+  synchronized(markdownCache) { markdownCache[key]?.takeIf { it.first == text }?.let { return it.second } }
+  // Parse outside the lock: a background warm-up of a long reply must not block a composition lookup.
+  val blocks = MarkdownBlocks.parse(text)
+  synchronized(markdownCache) { markdownCache[key] = text to blocks }
+  return blocks
+}
+
+/**
+ * Parses the newest Markdown rows off the main thread right after a rebuild, so composing them – a
+ * streamed reply grows on every rebuild – finds the blocks ready instead of parsing in the frame.
+ */
+private fun warmMarkdown(rows: List<TranscriptRow>) {
+  var budget = MARKDOWN_CACHE_ROWS / 2
+  for (index in rows.indices.reversed()) {
+    val row = rows[index]
+    if (row.kind !in MARKDOWN_KINDS || row.detailOf != null) continue
+    parsed(row.key, row.text)
+    if (--budget == 0) break
+  }
 }
 
 @Composable
@@ -69,7 +93,7 @@ internal fun Conversation(state: LagoonState, controller: LagoonController, modi
   val source by rememberUpdatedState(Triple(state.messages, working, revert))
   val rows by produceState(emptyList<TranscriptRow>()) {
     snapshotFlow { source }.conflate().collect { (messages, running, boundary) ->
-      value = withContext(Dispatchers.Default) { TranscriptRows.build(messages, working = running, revertMessageId = boundary) }
+      value = withContext(Dispatchers.Default) { TranscriptRows.build(messages, working = running, revertMessageId = boundary).also(::warmMarkdown) }
       delay(TranscriptScroll.ROWS_THROTTLE_MS)
     }
   }
@@ -571,7 +595,8 @@ internal fun ResourceHint(status: ResourceStatus, empty: String, explanation: St
 private fun annotated(spans: List<MarkdownSpan>): AnnotatedString {
   val primary = MiuixTheme.colorScheme.primary
   val chip = MiuixTheme.colorScheme.secondaryContainer
-  return buildAnnotatedString {
+  // Remembered per span list: rebuilt on every recomposition of every visible paragraph before.
+  return remember(spans, primary, chip) { buildAnnotatedString {
     spans.forEach { span ->
       val style = SpanStyle(
         fontWeight = if (span.bold) FontWeight.Bold else null,
@@ -583,7 +608,7 @@ private fun annotated(spans: List<MarkdownSpan>): AnnotatedString {
       if (span.href != null) withLink(LinkAnnotation.Url(span.href, TextLinkStyles(SpanStyle(color = primary, textDecoration = TextDecoration.Underline)))) { withStyle(style) { append(span.text) } }
       else withStyle(style) { append(span.text) }
     }
-  }
+  } }
 }
 
 @Composable

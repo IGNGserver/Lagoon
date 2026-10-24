@@ -76,7 +76,8 @@ class KeyboardScrollRegressionTest {
     assertTrue("列表状态必须留在列表和详情分支外", text.indexOf("val activityListState = rememberLazyListState()") < text.indexOf("if (latestSelected == null)"))
     assertTrue("返回先退出二级详情，再关闭操作层", text.contains("if (latestSelected != null && latestSelected.key != group.key) onBack() else onDismiss()"))
     assertTrue("操作层必须覆盖输入栏", text.contains("fillMaxHeight(0.74f)"))
-    assertTrue("详情需随服务器消息更新", text.contains("group.key, messages, working, revertMessageId"))
+    assertTrue("详情需随服务器消息更新", text.contains("rememberUpdatedState(Triple(messages, working, revertMessageId))") &&
+      text.contains("snapshotFlow { source }.conflate()"))
     assertTrue("工具附件必须显示在二级详情", text.contains("items(latestSelected.attachments"))
   }
 
