@@ -166,7 +166,10 @@ internal fun Conversation(state: LagoonState, controller: LagoonController, modi
   Box(modifier) {
     // Items are emitted newest first; reverseLayout draws index 0 at the bottom.
     LazyColumn(Modifier.fillMaxSize(), state = list, reverseLayout = true,
-      contentPadding = PaddingValues(horizontal = 20.dp, vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+      // While a task runs, the floating 「运行中」 pill sits over the bottom of the list; reserve its height so
+      // the newest line is not hidden under it (the reversed list keeps the bottom anchored when this changes).
+      contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 12.dp, bottom = if (task?.active == true) 60.dp else 12.dp),
+      verticalArrangement = Arrangement.spacedBy(8.dp)) {
       items(questions.asReversed(), key = { "question:${it.id}" }) { MiuixQuestionCard(it, controller, state.pending("question:${it.id}")) }
       items(permissions.asReversed(), key = { "permission:${it.id}" }) { MiuixPermissionCard(it, controller, state.pending("permission:${it.id}"), onModal) }
       items(mainRows.asReversed(), key = { it.key }, contentType = { it.kind }) { row ->
@@ -239,7 +242,7 @@ private fun TranscriptRowView(row: TranscriptRow, onFile: (String) -> Unit, onOp
     "meta" -> Row(Modifier.fillMaxWidth().padding(top = 2.dp), verticalAlignment = Alignment.CenterVertically) {
       row.copyText?.let { text ->
         val clipboard = LocalClipboardManager.current
-        IconButton(onClick = { clipboard.setText(AnnotatedString(text)) }, minWidth = 32.dp, minHeight = 32.dp) {
+        IconButton(onClick = { clipboard.setText(AnnotatedString(text)) }, minWidth = 40.dp, minHeight = 40.dp) {
           Icon(MiuixIcons.Copy, "复制回复", Modifier.size(18.dp), tint = MiuixTheme.colorScheme.onSurfaceVariantSummary)
         }
         Spacer(Modifier.width(6.dp))
@@ -429,7 +432,7 @@ internal fun DetailCode(title: String, text: String, readContent: Boolean = fals
   Column(Modifier.fillMaxWidth()) {
     if (title.isNotBlank()) Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
       Text(title, Modifier.weight(1f), style = MiuixTheme.textStyles.body2.copy(fontWeight = FontWeight.Medium))
-      if (copyText != null) IconButton(onClick = { clipboard.setText(AnnotatedString(copyText)) }, minWidth = 32.dp, minHeight = 32.dp) {
+      if (copyText != null) IconButton(onClick = { clipboard.setText(AnnotatedString(copyText)) }, minWidth = 40.dp, minHeight = 40.dp) {
         Icon(MiuixIcons.Copy, "复制$title", Modifier.size(16.dp), tint = MiuixTheme.colorScheme.onSurfaceVariantSummary)
       }
     }

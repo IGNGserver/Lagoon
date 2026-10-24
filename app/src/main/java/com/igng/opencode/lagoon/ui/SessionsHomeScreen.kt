@@ -20,6 +20,9 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
@@ -238,7 +241,7 @@ private fun ServerChips(state: LagoonState, onSelect: (ServerProfile?) -> Unit, 
         pressFeedbackType = PressFeedbackType.Sink,
         onClick = { onSelect(null) }
       ) {
-        Row(Modifier.height(40.dp), verticalAlignment = Alignment.CenterVertically) {
+        Row(Modifier.heightIn(min = 40.dp), verticalAlignment = Alignment.CenterVertically) {
           dot?.let { StatusDot(it); Spacer(Modifier.width(8.dp)) }
           Text("全部", style = MiuixTheme.textStyles.body2.copy(fontWeight = if (current) FontWeight.Medium else FontWeight.Normal,
             color = if (current) MiuixTheme.colorScheme.primary else MiuixTheme.colorScheme.onSurfaceVariantSummary))
@@ -270,7 +273,7 @@ private fun ServerChips(state: LagoonState, onSelect: (ServerProfile?) -> Unit, 
         onLongPress = { onEdit(profile) }
       ) {
         // A fixed height keeps Latin and CJK names on one baseline row.
-        Row(Modifier.height(40.dp), verticalAlignment = Alignment.CenterVertically) {
+        Row(Modifier.heightIn(min = 40.dp), verticalAlignment = Alignment.CenterVertically) {
           dot?.let { StatusDot(it); Spacer(Modifier.width(8.dp)) }
           Text(profile.name, Modifier.widthIn(max = 160.dp), maxLines = 1, overflow = TextOverflow.Ellipsis,
             style = MiuixTheme.textStyles.body2.copy(fontWeight = if (current) FontWeight.Medium else FontWeight.Normal,
@@ -286,7 +289,7 @@ private fun ServerChips(state: LagoonState, onSelect: (ServerProfile?) -> Unit, 
         pressFeedbackType = PressFeedbackType.Sink,
         onClick = { onEdit(null) }
       ) {
-        Row(Modifier.height(40.dp), verticalAlignment = Alignment.CenterVertically) {
+        Row(Modifier.heightIn(min = 40.dp), verticalAlignment = Alignment.CenterVertically) {
           Icon(MiuixIcons.Add, "添加服务器", Modifier.size(20.dp), tint = MiuixTheme.colorScheme.onSurfaceVariantSummary)
           if (state.profiles.isEmpty()) {
             Spacer(Modifier.width(4.dp))
@@ -326,17 +329,50 @@ private fun SessionList(
     }
   }
   val sections = remember(grouping, roots, state.projects, statuses, state.pinned, now) { HomeSections.build(grouping, roots, state.projects, statuses, state.pinned, now) }
+  // Running sessions move to the top as they report activity. While the reader touches or scrolls the
+  // list the order is held, so the row under the finger is still the one they meant when they lift it;
+  // statuses stay live. Moves then animate instead of jumping.
+  var touching by remember { mutableStateOf(false) }
+  val latestSections by rememberUpdatedState(sections)
+  var shownSections by remember { mutableStateOf(sections) }
+  LaunchedEffect(list) {
+    snapshotFlow { (touching || list.isScrollInProgress) to latestSections }.collect { (held, next) -> if (!held) shownSections = next }
+  }
+  // Grouping or the search changing is the reader's own action: show it at once.
+  LaunchedEffect(grouping, query) { shownSections = latestSections }
+  val visibleSections = if (touching || list.isScrollInProgress) shownSections else sections
+  // Older sessions load as the end of the list comes near; a failed page waits until the reader scrolls back.
+  val nearEnd by remember { derivedStateOf {
+    val info = list.layoutInfo
+    val last = info.visibleItemsInfo.lastOrNull()
+    last != null && last.index >= info.totalItemsCount - 4
+  } }
+  var attemptedCursors by remember { mutableStateOf<Map<String, String>?>(null) }
+  LaunchedEffect(nearEnd) { if (!nearEnd) attemptedCursors = null }
+  val loadingMore = state.pending("sessions-more")
+  LaunchedEffect(nearEnd, state.sessionCursors, loadingMore, query) {
+    if (nearEnd && query.isBlank() && !loadingMore && state.sessionCursors.isNotEmpty() && state.sessionCursors != attemptedCursors) {
+      attemptedCursors = state.sessionCursors
+      controller.loadMoreSessions()
+    }
+  }
   val muted = MiuixTheme.colorScheme.onSurfaceVariantSummary
 
   PullToRefresh(isRefreshing = refreshing, onRefresh = { refreshing = true; refreshScope.launch { controller.reload().join(); refreshing = false } },
     refreshTexts = listOf("下拉刷新", "松开刷新", "正在刷新…", "已刷新")) {
-    LazyColumn(Modifier.fillMaxSize().overScrollVertical(), state = list, contentPadding = PaddingValues(top = 4.dp, bottom = 120.dp)) {
+    LazyColumn(Modifier.fillMaxSize().overScrollVertical().pointerInput(Unit) {
+      awaitEachGesture {
+        awaitFirstDown(requireUnconsumed = false)
+        touching = true
+        try { do { val event = awaitPointerEvent() } while (event.changes.any { it.pressed }) } finally { touching = false }
+      }
+    }, state = list, contentPadding = PaddingValues(top = 4.dp, bottom = 120.dp)) {
       if (state.cached || state.degraded || !state.connected && !state.loading && state.profiles.isNotEmpty()) item(key = "sync") {
         Text(when { state.cached -> "离线缓存 · 下拉重试"; state.degraded -> "部分数据待同步 · 下拉重试"; else -> "尚未连接 · 点按重试" },
           style = MiuixTheme.textStyles.footnote1, color = MiuixColorTokens.Warning,
           modifier = Modifier.fillMaxWidth().clickable(role = Role.Button) { controller.reload() }.padding(horizontal = 24.dp, vertical = 8.dp))
       }
-      sections.forEach { section ->
+      visibleSections.forEach { section ->
         // While searching every match stays visible, whatever was collapsed.
         val collapsed = query.isBlank() && section.key in state.collapsedSections
         item(key = "section:${section.key}", contentType = "section") {
@@ -344,7 +380,7 @@ private fun SessionList(
         }
          if (!collapsed) items(section.sessions, key = { "session:${section.key}:${it.key}" }, contentType = { "session" }) { session ->
           val pinned = session.id in state.pinned
-          HomeSessionRow(session, statuses[session.key] ?: SessionStatus.NONE, session.key in unseen,
+          Box(Modifier.animateItem()) { HomeSessionRow(session, statuses[session.key] ?: SessionStatus.NONE, session.key in unseen,
             serverName = if (state.allServers) session.serverId?.let { id -> state.profiles.firstOrNull { it.id == id }?.name } else null,
             onClick = { (session.target ?: state.serverId?.let { SessionTarget(it, session.id) })?.let(onOpen) }, actions = { buildList {
             if (!state.allServers) {
@@ -353,10 +389,10 @@ private fun SessionList(
               if (state.connected && state.capabilities.archive != null) add(MenuAction("归档", ARCHIVE_ICON) { controller.setArchived(session.id, true) })
               if (state.connected && state.capabilities.deleteSession) add(MenuAction("删除", MiuixIcons.Delete, danger = true) { onDelete(session) })
             }
-          } })
+          } }) }
         }
       }
-      if (sections.isEmpty()) item(key = "empty") {
+      if (visibleSections.isEmpty()) item(key = "empty") {
         if (state.loading && query.isBlank()) SessionRowsSkeleton()
         else Column(Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 48.dp), horizontalAlignment = Alignment.CenterHorizontally) {
           Text(when { state.loading -> "正在读取会话…"; query.isNotBlank() -> "没有符合条件的会话"; state.connected -> "暂无会话"; state.profiles.isEmpty() -> "还没有服务器"; else -> "尚未连接" }, color = muted)
