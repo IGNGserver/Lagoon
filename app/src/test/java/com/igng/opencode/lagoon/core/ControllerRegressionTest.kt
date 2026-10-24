@@ -57,6 +57,7 @@ class ControllerRegressionTest {
     put(c, "resolvedPermissions", linkedSetOf<String>()); put(c,"backgroundSettles",mutableMapOf<String,Job>()); put(c,"directoryHealth",DirectoryHealth())
     put(c, "connectTrace", ConnectTrace()); put(c, "openTrace", ConnectTrace()); put(c, "transcriptMemory", TranscriptMemory()); put(c, "queuedSends", mutableListOf<Any>())
     put(c, "storeDispatcher", Dispatchers.IO.limitedParallelism(1))
+    put(c, "persistedTasks", HashMap<String, Any>())
     return c to mutable
   }
   private fun api(s:MockWebServer) = OpenCodeApi(ServerProfile("server","Server",s.url("/").toString(),allowCleartext=true), "fixture")

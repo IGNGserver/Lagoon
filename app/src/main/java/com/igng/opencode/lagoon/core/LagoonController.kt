@@ -137,7 +137,10 @@ data class LagoonState(
   val canQueueSend: Boolean get() = !connected && serverId != null && session != null &&
     connection.stage in setOf(ConnectStage.CONNECTING, ConnectStage.READING, ConnectStage.SYNCING, ConnectStage.RETRYING)
   val project: Project? get() = projects.firstOrNull { it.id == projectId }
-  val session: Session? get() = sessions.firstOrNull { it.id == sessionId }
+  // Derived maps below are cached per state instance (copy() makes a new one): the reducers read them
+  // once per task on every streamed event, and rebuilding each on every access made one event cost
+  // tasks × sessions.
+  val session: Session? by lazy(LazyThreadSafetyMode.PUBLICATION) { sessions.firstOrNull { it.id == sessionId } }
   val executionDirectory: String? get() = session?.directory ?: project?.directory
   /** 首页当前服务器可用的执行目录：项目 → 最近会话。用于未打开会话时也能按首页选中的服务器加载模型目录。 */
   val homeDirectory: String? get() = project?.directory ?: sessions.firstOrNull()?.directory
@@ -153,10 +156,10 @@ data class LagoonState(
   /** The next older page is already on this device (the transcript store), readable without a connection. */
   val olderFromDevice: Boolean get() = TranscriptSync.localId(messagesCursor) != null
   fun title(session: Session): String = session.displayTitle()
-  val parents: Map<String, String> get() = knownParents + sessions.mapNotNull { it.parentId?.let { parent -> it.id to parent } }.toMap()
+  val parents: Map<String, String> by lazy(LazyThreadSafetyMode.PUBLICATION) { knownParents + sessions.mapNotNull { it.parentId?.let { parent -> it.id to parent } }.toMap() }
   /** Live (running / waiting) state of each session family, rolled up to its root. */
-  val presentedTasks: Map<String, TaskState> get() = permissionPolicy.tasks(tasks, permissions, autoApprovalFailures)
-  val visiblePermissions: List<PermissionRequest> get() = permissions.filter { permissionPolicy.visible(it.id, autoApprovalFailures) }
+  val presentedTasks: Map<String, TaskState> by lazy(LazyThreadSafetyMode.PUBLICATION) { permissionPolicy.tasks(tasks, permissions, autoApprovalFailures) }
+  val visiblePermissions: List<PermissionRequest> by lazy(LazyThreadSafetyMode.PUBLICATION) { permissions.filter { permissionPolicy.visible(it.id, autoApprovalFailures) } }
   val globalSummary: TaskSummary get() {
     val snapshots = serverSnapshots().values
     if (snapshots.isEmpty()) return summary
@@ -226,7 +229,9 @@ class LagoonController private constructor(private val appContext: Context) {
     // child is running. Reconstruct those children from the loaded transcript as the official client
     // does; this also preserves more than one concurrent background child instead of one boolean.
     val transcriptParent = state.sessionId
-    val transcriptChildren = BackgroundWork.messageSubagents(transcriptParent, state.messages)
+    // Most updates change tasks, not the transcript: reuse the last scan while the message list is the same instance.
+    val transcriptChildren = subagentScan?.takeIf { it.first == transcriptParent && it.second === state.messages }?.third
+      ?: BackgroundWork.messageSubagents(transcriptParent, state.messages).also { subagentScan = Triple(transcriptParent, state.messages, it) }
     val observed = if (transcriptChildren.isEmpty() || transcriptParent == null) state else {
       val tasks = LinkedHashMap(state.tasks)
       transcriptChildren.forEach { (child, created) ->
@@ -239,10 +244,11 @@ class LagoonController private constructor(private val appContext: Context) {
     }
     val folded = BackgroundWork.fold(observed.tasks, observed.shells, observed.parents)
     val next = if (folded === observed.tasks) observed else observed.copy(tasks = folded)
-    next.serverId?.let { server -> next.tasks.values.forEach { store.rememberTask(server, it, next.parents[it.sessionId]) } }
+    next.serverId?.let { server -> next.tasks.values.forEach { persistTask(server, it, next.parents[it.sessionId]) } }
     val work = BackgroundWork.workRoots(next.tasks, next.shells, next.parents)
     next.tasks.values.filter { it.active && it.background && it.sessionId !in work }.forEach { scheduleBackgroundSettle(it.sessionId) }
-    val titles = next.sessions.associate { it.id to next.title(it) }
+    val titles = sessionTitles?.takeIf { it.first === next.sessions }?.second
+      ?: next.sessions.associate { it.id to next.title(it) }.also { sessionTitles = next.sessions to it }
     val active = next.activeRootTasks
     // “后台运行中”= 根会话自身没有在跑，只有它派生的后台/子任务在跑（主线程在等后台任务），
     // 而不是“应用退到过后台”。后者会把所有正在运行的会话都误标成后台运行中。
@@ -267,6 +273,24 @@ class LagoonController private constructor(private val appContext: Context) {
    * 新的 `session.execution.started` 会覆盖折算态，这里不会触发）。按会话持久化的结局写未读结果，
    * 与对账路径的 `transitionNotice` 同一口径。
    */
+
+  private var subagentScan: Triple<String?, List<Message>, Map<String, Long>>? = null
+  private var sessionTitles: Pair<List<Session>, Map<String, String>>? = null
+  /** Last task state this controller wrote per server/session, see [persistTask]. */
+  private val persistedTasks = HashMap<String, Pair<TaskState, String?>>()
+  /**
+   * Writes a task to the store only when it changed. Every streamed event moves [TaskState.activeAt]
+   * (the idle baseline); that alone is written at most every [TaskPersistence.ACTIVE_AT_INTERVAL_MS],
+   * instead of a JSON read and write of every task on every event on the main thread.
+   */
+  private fun persistTask(server: String, task: TaskState, parent: String?) {
+    val key = "$server\u0000${task.sessionId}"
+    val previous = persistedTasks[key]
+    if (!TaskPersistence.shouldWrite(previous?.first, previous?.second, task, parent)) return
+    store.rememberTask(server, task, parent)
+    persistedTasks[key] = task to parent
+  }
+
   private fun scheduleBackgroundSettle(root: String) {
     val server = state.value.serverId ?: return
     val key = "$server\u0000$root"
@@ -1222,6 +1246,7 @@ class LagoonController private constructor(private val appContext: Context) {
         if (active != null && id !in active && !BackgroundWork.hasBackgroundWork(id, states, nextShells, parentMap)) {
           states.remove(id)
           store.rememberTask(serverId, waiting.copy(phase = TaskPhase.IDLE, detail = ""), parentMap[id])
+          persistedTasks.remove("$serverId\u0000$id")
         }
         else states[id] = TaskState(id, TaskPhase.THINKING, TaskState.RUNNING_DETAIL, waiting.since, activeAt = waiting.activeAt, background = waiting.background)
       }
