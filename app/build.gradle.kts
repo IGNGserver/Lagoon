@@ -42,6 +42,11 @@ android {
       // A distributable build must never be debuggable; keep the debug key as a non-publishable
       // fallback so local `assembleRelease` still works without the production keystore.
       isDebuggable = false
+      // R8 shrinks and optimizes the release APK (Compose in particular runs markedly faster once
+      // optimized). Names stay readable – see proguard-rules.pro – so crash logs need no mapping file.
+      isMinifyEnabled = true
+      isShrinkResources = true
+      proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
       signingConfig = if (hasReleaseSigning) signingConfigs.getByName("release") else signingConfigs.getByName("debug")
     }
   }
