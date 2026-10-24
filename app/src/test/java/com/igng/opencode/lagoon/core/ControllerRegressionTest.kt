@@ -703,6 +703,33 @@ class ControllerRegressionTest {
     }
   }
 
+  /** Without a transcript store the server page is widened too: a page never ends the shown history mid-turn. */
+  @Test fun olderHistoryIsWidenedToAWholeTurn() = runBlocking {
+    MockWebServer().use { server ->
+      server.dispatcher = object : Dispatcher() { override fun dispatch(request: RecordedRequest): MockResponse {
+        val url = request.requestUrl!!
+        return when (url.encodedPath) {
+          "/api/info" -> MockResponse().setBody("""{"version":"2.0.22"}""")
+          "/api/session/s/message" -> when (url.queryParameter("cursor")) {
+            "older" -> MockResponse().setBody("""{"data":[{"id":"m2","type":"assistant","time":{"created":2,"completed":3},"content":[{"type":"text","text":"half"}]}],"cursor":{"next":"older2"}}""")
+            "older2" -> MockResponse().setBody("""{"data":[{"id":"m1","type":"user","time":{"created":1},"text":"a"}],"cursor":{"next":"older3"}}""")
+            else -> MockResponse().setBody("""{"data":[]}""")
+          }
+          else -> MockResponse().setBody("""{"data":[]}""")
+        }
+      } }
+      val api = api(server); api.health()
+      val session = Session("s", "/repo", "T", 0)
+      val (controller, state) = controller(api, LagoonState(serverId = "server", connected = true,
+        sessions = listOf(session), sessionId = "s", messages = listOf(Message("m4", "user", 4, emptyList())), messagesCursor = "older"))
+      controller.loadOlderMessages().join()
+      assertEquals(listOf("m1", "m2", "m4"), state.value.messages.map { it.id })
+      assertEquals("older3", state.value.messagesCursor)
+      val cursors = List(server.requestCount) { server.takeRequest() }.mapNotNull { it.requestUrl!!.queryParameter("cursor") }
+      assertEquals(listOf("older", "older2"), cursors)
+    }
+  }
+
   @Test fun replyPermissionTolerates404WhenAlreadySettledElsewhere() = runBlocking {
     MockWebServer().use { server ->
       server.dispatcher = object : Dispatcher() { override fun dispatch(request: RecordedRequest): MockResponse {

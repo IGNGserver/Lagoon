@@ -36,6 +36,33 @@ class TranscriptSyncTest {
     return messages
   }
 
+  /**
+   * Older pages – read from the server, or from the store after a reopen – are widened to whole turns
+   * like the initial window: a page starting mid-turn would re-key the split turn's rows once its prompt
+   * arrives, right where the reader is scrolling.
+   */
+  @Test fun olderPagesNeverStartMidTurn() = runBlocking {
+    FakeTimelineServer().use { server ->
+      // 38 messages per turn: neither 200-message pages nor the painted window line up with a prompt.
+      server.timeline += conversation(turns = 14, steps = 37)
+      repeat(2) { round ->
+        val window = sync.open(server.api(), "s", session())
+        assertFalse(needsOlderTurnRoot(window.messages))
+        var shown = window.messages
+        var cursor = window.olderCursor
+        var pages = 0
+        while (cursor != null && pages++ < 20) {
+          val page = sync.loadOlder(server.api(), "s", session(), cursor)
+          assertFalse("round $round page $pages starts mid-turn", needsOlderTurnRoot(page.messages))
+          shown = page.messages + shown
+          cursor = page.next
+        }
+        assertTrue("round $round paged at least once", pages > 0)
+        assertEquals(server.truth(), shown)
+      }
+    }
+  }
+
   @Test fun firstOpenReadsTheInitialWindowAndStoresItsSettledPart() = runBlocking {
     FakeTimelineServer().use { server ->
       server.timeline += conversation(turns = 3, steps = 4)
