@@ -1305,7 +1305,13 @@ class LagoonController private constructor(private val appContext: Context) {
     val sync = transcriptSync?.takeIf { client.cacheableTranscripts }
     // Stored history first (no network), then the server; server pages extend the stored run.
     val page = if (sync != null) sync.loadOlder(client, op.serverId, session, cursor).let { ApiPage(it.messages, it.next) }
-      else client.messagesPage(session.id, cursor, HarnessClient.HISTORY_PAGE)
+      else client.messagesPage(session.id, cursor, HarnessClient.HISTORY_PAGE).let { first ->
+        check(first.next != cursor) { "服务器返回了重复分页游标" }
+        // Same whole-turn rule as the initial window and the stored path (TranscriptSync.loadOlder).
+        widenOlderToTurn(first.items, first.next, TranscriptSync.MAX_TURN_WIDEN) { from ->
+          client.messagesPage(session.id, from, HarnessClient.HISTORY_PAGE).also { check(it.next != from) { "服务器返回了重复分页游标" } }.let { it.items to it.next }
+        }.let { (items, next) -> ApiPage(items, next) }
+      }
     check(page.next != cursor) { "服务器返回了重复分页游标" }
     op.commit { it.copy(messages = (page.items + it.messages).distinctBy { m -> m.id }, messagesCursor = page.next,
       loadedOlderMessages = true, historyRevision = it.historyRevision + 1) }

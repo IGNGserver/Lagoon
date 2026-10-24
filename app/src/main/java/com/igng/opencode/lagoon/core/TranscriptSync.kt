@@ -202,8 +202,19 @@ internal class TranscriptSync(
     }
   }
 
-  /** Continues history older than the shown window: stored rows first (no network needed), then the server. */
+  /**
+   * Continues history older than the shown window: stored rows first (no network needed), then the server.
+   * Like the initial window, a page never starts mid-turn: it is widened until it begins on a prompt.
+   */
   suspend fun loadOlder(client: HarnessClient?, server: String, session: Session, cursor: String): Older {
+    val first = olderPage(client, server, session, cursor)
+    val (messages, next) = widenOlderToTurn(first.messages, first.next, MAX_TURN_WIDEN) { from ->
+      olderPage(client, server, session, from).let { it.messages to it.next }
+    }
+    return Older(messages, next)
+  }
+
+  private suspend fun olderPage(client: HarnessClient?, server: String, session: Session, cursor: String): Older {
     val localId = localId(cursor)
     if (localId != null) return withContext(io) {
       // The run was rebuilt under the open transcript: its stored cursor no longer continues from
@@ -359,7 +370,7 @@ internal class TranscriptSync(
     const val MAX_INITIAL_PAGES = 3
     /** Page size used to find the start of the newest turn. */
     const val TURN_PAGE = 50
-    /** Stored pages added to the painted window so it starts on a whole turn. */
+    /** Pages added to the painted window or to an older page so it starts on a whole turn. */
     const val MAX_TURN_WIDEN = 10
     /** Pages of [HarnessClient.HISTORY_PAGE] one full comparison may read. */
     const val MAX_VERIFY_PAGES = 10

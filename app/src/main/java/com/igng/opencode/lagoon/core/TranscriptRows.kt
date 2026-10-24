@@ -80,7 +80,7 @@ object TranscriptRows {
       }
     }
     val rows = mutableListOf<TranscriptRow>()
-    leading.forEach { rows += noticeRow("lead", it) }
+    leading.forEach { rows += noticeRow(it) }
     var previousEnd = 0L
     turns.forEachIndexed { index, turn ->
       if (index == 0 || turn.created - previousEnd >= TIME_GAP_MS) rows += TranscriptRow("time:${turn.id}", "time", text = formatTime(turn.created))
@@ -110,6 +110,15 @@ object TranscriptRows {
    */
   private fun partRef(message: Message, index: Int, part: MessagePart): String = "${message.id}/${part.id.ifBlank { "#$index" }}"
 
+  /*
+   * Row keys. A turn is keyed by its prompt, but a history page that starts mid-turn first shows the
+   * turn keyed by its oldest loaded reply, and re-keys it once the prompt arrives. Rows that belong to
+   * one message or part (notices, process output, the answer, the turn's tail) are therefore keyed by
+   * that message or part, so they keep their key – and LazyColumn its scroll anchor – across that
+   * re-projection; only the turn's own grouping rows (time, activity group, thinking) use the turn key.
+   * History pages are also widened to whole turns ([widenOlderToTurn]), so the re-key itself is rare.
+   */
+
   /** LazyColumn rejects duplicate keys with a crash; never let server data reach it un-deduplicated. */
   private fun List<TranscriptRow>.withUniqueKeys(): List<TranscriptRow> {
     val seen = HashMap<String, Int>(size * 2)
@@ -119,10 +128,10 @@ object TranscriptRows {
     }
   }
 
-  private fun noticeRow(scope: String, message: Message): TranscriptRow {
+  private fun noticeRow(message: Message): TranscriptRow {
     val notice = message.notice ?: Notice("")
     val detail = listOf(notice.detail).plus(notice.items).filter(String::isNotBlank).joinToString("、")
-    return TranscriptRow("$scope:notice:${message.id}", "note", title = notice.label, text = detail,
+    return TranscriptRow("notice:${message.id}", "note", title = notice.label, text = detail,
       status = when { notice.error -> "error"; notice.running -> "running"; else -> "" }, target = notice.target)
   }
 
@@ -142,7 +151,7 @@ object TranscriptRows {
         copyText = text.takeIf { it.isNotBlank() }, status = if (user.queued) "queued" else "")
     }
     turn.shell?.let { shell ->
-      shell.parts.forEachIndexed { index, part -> rows += toolRows(turnKey, partRef(shell, index, part), part, expanded) }
+      shell.parts.forEachIndexed { index, part -> rows += toolRows(partRef(shell, index, part), part, expanded) }
     }
 
     val assistants = turn.entries.filter { it.role == "assistant" }
@@ -156,7 +165,7 @@ object TranscriptRows {
     }
     // Notices remain official one-line transcript records. They are not model output and should
     // not inflate the operation counter or become a fake tool row.
-    turn.entries.filter { it.role == "notice" }.forEach { body += noticeRow(turnKey, it) }
+    turn.entries.filter { it.role == "notice" }.forEach { body += noticeRow(it) }
     val lastActivity = entries.indexOfLast { (_, part) -> part.type in setOf("tool", "reasoning") }
     val nonFinal = assistants.filter { it.finish in setOf("tool-calls", "tool_calls") }.map { it.id }.toSet()
     val finalParts = entries.filterIndexed { index, (ref, part) ->
@@ -168,27 +177,28 @@ object TranscriptRows {
       // A running turn stays transparent: each process reply is shown inline and every consecutive
       // batch of operations becomes its own group whose calls remain visible while they execute.
       // Only finished turns collapse into the「共处理 N 个操作」summary.
-      body += runningTurnRows(turnKey, process, expanded)
+      body += runningTurnRows(process, expanded)
     } else if (process.isNotEmpty()) {
       body += toolGroupRows(turnKey, process, expanded)
     }
     if (finalParts.isNotEmpty()) {
       val text = finalParts.joinToString("\n\n") { it.second.text.trim() }
-      body += TranscriptRow("$turnKey:answer", "text", text = text)
+      body += TranscriptRow("answer:${finalParts.first().first}", "text", text = text)
     }
     val compaction = turn.entries.any { it.type == "compaction" }
     var dividerShown = false
     turn.entries.forEach { message ->
       if (message.interrupted() && !dividerShown) {
         dividerShown = true
-        if (!compaction) body += TranscriptRow("$turnKey:interrupted", "divider", text = "本轮已中断")
+        if (!compaction) body += TranscriptRow("interrupted:${message.id}", "divider", text = "本轮已中断")
       }
     }
     rows += body
 
     val last = assistants.lastOrNull()
-    if (working && last?.retry != null) rows += TranscriptRow("$turnKey:retry", "note", title = "正在重试", text = last.retry, status = "running")
-    else if (last?.error != null && !last.interrupted()) rows += TranscriptRow("$turnKey:error", "error", text = unwrapError(last.error))
+    // The turn's tail is keyed by its newest reply, which is the same whether or not the prompt is loaded.
+    if (working && last?.retry != null) rows += TranscriptRow("retry:${last.id}", "note", title = "正在重试", text = last.retry, status = "running")
+    else if (last?.error != null && !last.interrupted()) rows += TranscriptRow("error:${last.id}", "error", text = unwrapError(last.error))
     if (assistants.isNotEmpty()) {
       val finished = assistants.all { it.completedAt != null }
       val first = turn.user?.created ?: turn.created
@@ -202,13 +212,13 @@ object TranscriptRows {
         last?.let { formatTime(it.completedAt ?: it.created).substringAfter(' ') }
       ).filter { it.isNotBlank() }.joinToString(" · ")
       val copy = body.filter { it.kind == "text" }.joinToString("\n\n") { it.text }
-      rows += TranscriptRow("$turnKey:meta", "meta", meta = meta, copyText = copy.takeIf { it.isNotBlank() })
+      rows += TranscriptRow("meta:${last!!.id}", "meta", meta = meta, copyText = copy.takeIf { it.isNotBlank() })
     }
     if (!working) {
       val edits = assistants.flatMap { message -> message.parts.mapIndexed { index, part -> partRef(message, index, part) to part } }
         .filter { (_, it) -> it.tool in EDIT_TOOLS && (it.patch.isNotBlank() || it.files.isNotEmpty() || inputString(it, "path").isNotBlank()) }
       if (edits.isNotEmpty()) {
-        val key = "$turnKey:diff"
+        val key = "diff:${assistants.last().id}"
         val files = edits.flatMap { (_, edit) -> edit.files.ifEmpty { listOf(inputString(edit, "path")) } }.filter { it.isNotBlank() }.distinct()
         rows += TranscriptRow(key, "diff-summary", title = "本轮改动 ${files.size} 个文件", subtitle = files.take(3).joinToString("、") { it.substringAfterLast('/') })
         if (key in expanded) edits.take(MAX_DIFF_FILES).forEach { (ref, edit) ->
@@ -232,23 +242,22 @@ object TranscriptRows {
    * operations collapsed into one small「调用了 N 次工具」group. Calls and thinking stay folded —
    * only the process report is visible, exactly like a finished turn, and a group opens on tap.
    */
-  private fun runningTurnRows(turnKey: String, entries: List<Pair<String, MessagePart>>, expanded: Set<String>): List<TranscriptRow> {
+  private fun runningTurnRows(entries: List<Pair<String, MessagePart>>, expanded: Set<String>): List<TranscriptRow> {
     val rows = mutableListOf<TranscriptRow>()
     var index = 0
-    var batch = 0
     while (index < entries.size) {
       val (ref, part) = entries[index]
       if (part.type == "text") {
-        if (part.text.isNotBlank()) rows += TranscriptRow("$turnKey:process:$ref", "process-output", text = part.text, source = part)
+        if (part.text.isNotBlank()) rows += TranscriptRow("process:$ref", "process-output", text = part.text, source = part)
         index++
         continue
       }
       val group = mutableListOf<Pair<String, MessagePart>>()
       while (index < entries.size && entries[index].second.type != "text") { group += entries[index]; index++ }
       if (group.isEmpty()) { index++; continue }
-      batch++
       val tools = group.count { it.second.type == "tool" }
-      rows += activityGroupRows("$turnKey:batch:$batch", group, expanded,
+      // Keyed by the batch's first call: later calls join the batch without changing its key.
+      rows += activityGroupRows("batch:${group.first().first}", group, expanded,
         title = if (tools > 0) "调用了 $tools 次工具" else "思考中")
     }
     return rows
@@ -334,8 +343,8 @@ object TranscriptRows {
   }
 
   /** A standalone tool row, used for explicit shell turns; its body is shown only after [details] expands it. */
-  private fun toolRows(turnKey: String, ref: String, part: MessagePart, expanded: Set<String>): List<TranscriptRow> {
-    val key = "$turnKey:tool:$ref"
+  private fun toolRows(ref: String, part: MessagePart, expanded: Set<String>): List<TranscriptRow> {
+    val key = "tool:$ref"
     val (title, subtitle) = toolInfo(part)
     val row = TranscriptRow(key, "tool", title = title, subtitle = subtitle, args = toolArgs(part), status = part.status,
       attachments = part.attachments, target = part.target.takeIf { part.tool in SUBAGENT_TOOLS }, source = part)
