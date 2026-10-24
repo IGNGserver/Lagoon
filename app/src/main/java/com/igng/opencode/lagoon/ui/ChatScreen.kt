@@ -136,9 +136,9 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
             if (expanded) VirtualText(change.patch.ifBlank { change.after })
           } }
           ChatSheet.FILES -> FilesPanel(state, controller) { path -> controller.addReference(path); sheet = null }
-          ChatSheet.CHILDREN -> LazyColumn { items(state.children.distinctBy { it.id }, key = { it.id }) { child ->
+          ChatSheet.CHILDREN -> LazyColumn { val tasks = state.presentedTasks; items(state.children.distinctBy { it.id }, key = { it.id }) { child ->
             Card(Modifier.fillMaxWidth().padding(bottom = 8.dp), insideMargin = PaddingValues(14.dp), onClick = { sheet = null; onOpenChild(child.id) }) {
-               Text(state.title(child)); state.presentedTasks[child.id]?.takeIf { it.active }?.let { MiuixStatePill(it.phase) }
+               Text(state.title(child)); tasks[child.id]?.takeIf { it.active }?.let { MiuixStatePill(it.phase) }
             }
           } }
         }
@@ -327,9 +327,7 @@ internal fun DialogActions(cancel: String, onCancel: () -> Unit, confirm: String
 private fun ActionError(state: LagoonState, action: String) { state.resource("action:$action").takeIf { it.state == ResourceState.ERROR }?.error?.let { Text(it, color = MiuixColorTokens.Error) } }
 
 @Composable
-fun MiuixPermissionCard(request: PermissionRequest, controller: LagoonController, onModal: (Boolean) -> Unit = {}) {
-  val state by controller.state.collectAsState()
-  val pending = state.pending("permission:${request.id}")
+fun MiuixPermissionCard(request: PermissionRequest, controller: LagoonController, pending: Boolean, onModal: (Boolean) -> Unit = {}) {
   var confirmSave by rememberSaveable(request.id) { mutableStateOf(false) }
   DisposableEffect(confirmSave) { if (confirmSave) onModal(true); onDispose { if (confirmSave) onModal(false) } }
   if (confirmSave) {
@@ -403,9 +401,7 @@ fun MiuixPermissionCard(request: PermissionRequest, controller: LagoonController
 }
 
 @Composable
-fun MiuixQuestionCard(request: QuestionRequest, controller: LagoonController) {
-  val state by controller.state.collectAsState()
-  val pending = state.pending("question:${request.id}")
+fun MiuixQuestionCard(request: QuestionRequest, controller: LagoonController, pending: Boolean) {
   val answerSaver = remember(request.id) { Saver<List<List<String>>, String>(save = { rows -> org.json.JSONArray().apply { rows.forEach { put(org.json.JSONArray(it)) } }.toString() }, restore = { json ->
     val rows = org.json.JSONArray(json); (0 until rows.length()).map { i -> val row = rows.getJSONArray(i); (0 until row.length()).map { row.optString(it) } }
   }) }
@@ -558,12 +554,23 @@ private fun ChatComposer(
   onSend: (String, () -> Unit) -> Unit = { text, clear -> controller.send(text, state.serverId, state.sessionId, clear) },
   onServerFile: (() -> Unit)? = null
 ) {
-  var value by rememberSaveable(state.serverId, state.sessionId, stateSaver = TextFieldValue.Saver) { mutableStateOf(TextFieldValue(state.draft)) }
+  var value by rememberSaveable(state.serverId, state.sessionId, stateSaver = TextFieldValue.Saver) {
+    mutableStateOf(TextFieldValue(controller.draftFor(state.serverId, state.sessionId, state.draft)))
+  }
+  // Typing stays local (controller.typeDraft does not re-broadcast state); only an app-side set of the
+  // draft – restored, returned from the queue, cleared after a send – is adopted here. The applied
+  // signature is saved so a recreated composer keeps its restored text instead of the older state value.
+  var applied by rememberSaveable(state.serverId, state.sessionId) { mutableStateOf(state.draft to state.draftRevision) }
   var attachMenu by remember { mutableStateOf(false) }
   var focused by remember { mutableStateOf(false) }
   val images = rememberLauncherForActivityResult(ActivityResultContracts.PickMultipleVisualMedia(6)) { controller.addLocalAttachments(it) }
   val documents = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { controller.addLocalAttachments(it) }
-  LaunchedEffect(state.draft) { if (value.text != state.draft) value = TextFieldValue(state.draft, androidx.compose.ui.text.TextRange(state.draft.length)) }
+  LaunchedEffect(state.draft, state.draftRevision) {
+    val signature = state.draft to state.draftRevision
+    if (signature == applied) return@LaunchedEffect
+    applied = signature
+    if (value.text != state.draft) value = TextFieldValue(state.draft, androidx.compose.ui.text.TextRange(state.draft.length))
+  }
   DisposableEffect(attachMenu) { onModal(attachMenu); onDispose { onModal(false) } }
   val task = state.presentedTasks[state.sessionId]
   val sending = busy
@@ -611,7 +618,7 @@ private fun ChatComposer(
         Box(Modifier.weight(1f).heightIn(min = 44.dp, max = 168.dp).padding(horizontal = if (expanded) 10.dp else 2.dp, vertical = 11.dp),
           contentAlignment = Alignment.CenterStart) {
           if (value.text.isEmpty()) Text("描述你的任务…", color = muted, style = MiuixTheme.textStyles.body1, maxLines = 1)
-          BasicTextField(value, { next -> value = next; controller.updateDraft(next.text, state.serverId, state.sessionId) },
+          BasicTextField(value, { next -> value = next; controller.typeDraft(next.text, state.serverId, state.sessionId) },
             Modifier.fillMaxWidth().onFocusChanged { focused = it.isFocused },
             textStyle = MiuixTheme.textStyles.body1.copy(color = MiuixTheme.colorScheme.onSurface), cursorBrush = SolidColor(MiuixTheme.colorScheme.primary), maxLines = 6, readOnly = !interactive)
         }

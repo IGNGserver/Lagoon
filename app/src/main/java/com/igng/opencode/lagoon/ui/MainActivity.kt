@@ -37,6 +37,7 @@ import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
+import androidx.metrics.performance.JankStats
 import com.igng.opencode.lagoon.core.*
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeoutOrNull
@@ -70,6 +71,12 @@ class MainActivity : ComponentActivity() {
     lifecycle.addObserver(LifecycleEventObserver { _, event ->
       if (event == Lifecycle.Event.ON_START) controller.onForeground()
       else if (event == Lifecycle.Event.ON_STOP) controller.onBackground()
+    })
+    // Frame timing per page for the copied diagnostics (FrameStats); paused while not visible.
+    val jank = JankStats.createAndTrack(window) { frame -> FrameStats.record(frame.frameDurationUiNanos, frame.isJank) }
+    lifecycle.addObserver(LifecycleEventObserver { _, event ->
+      if (event == Lifecycle.Event.ON_RESUME) jank.isTrackingEnabled = true
+      else if (event == Lifecycle.Event.ON_PAUSE) jank.isTrackingEnabled = false
     })
     setContent {
       val state by controller.state.collectAsState()
@@ -187,7 +194,16 @@ class MainActivity : ComponentActivity() {
       // The real page a back gesture returns to, drawn under the outgoing one while the finger moves.
       val peekRoute = gesture?.peek?.takeIf { previewBack }
       val screenWidthPx = with(density) { LocalConfiguration.current.screenWidthDp.dp.roundToPx() }
-      SideEffect { navigator.screenWidth = screenWidthPx }
+      SideEffect {
+        navigator.screenWidth = screenWidthPx
+        FrameStats.page = when {
+          route.session == DRAFT_SESSION -> "新会话"
+          route.session != null -> "会话"
+          route.page == RootPage.ARCHIVED -> "已归档"
+          route.page == RootPage.SETTINGS -> "设置"
+          else -> "首页"
+        }
+      }
       LaunchedEffect(gesture?.id, gesture?.phase) {
         val current = gesture ?: return@LaunchedEffect
         when (current.phase) {

@@ -317,11 +317,15 @@ private fun SessionList(
   val unseen = remember(state.notices, state.allUnseenSessions, state.allServers) {
     if (state.allServers) state.allUnseenSessions else state.notices.filterNot { it.viewed }.map { it.sessionId }.toSet()
   }
-  val roots = HomeScope.roots(state.sessions, state.projects, state.scopeProjectId).filter { session ->
-    query.isBlank() || session.displayTitle().contains(query, true) ||
-      resolveSessionProject(session, state.projects)?.name?.contains(query, true) == true || session.directory.contains(query, true)
+  // Remembered on their inputs: the home list used to regroup on every state change (each streamed
+  // event of any open conversation), not only when sessions, statuses or the filter changed.
+  val roots = remember(state.sessions, state.projects, state.scopeProjectId, query) {
+    HomeScope.roots(state.sessions, state.projects, state.scopeProjectId).filter { session ->
+      query.isBlank() || session.displayTitle().contains(query, true) ||
+        resolveSessionProject(session, state.projects)?.name?.contains(query, true) == true || session.directory.contains(query, true)
+    }
   }
-  val sections = HomeSections.build(grouping, roots, state.projects, statuses, state.pinned, now)
+  val sections = remember(grouping, roots, state.projects, statuses, state.pinned, now) { HomeSections.build(grouping, roots, state.projects, statuses, state.pinned, now) }
   val muted = MiuixTheme.colorScheme.onSurfaceVariantSummary
 
   PullToRefresh(isRefreshing = refreshing, onRefresh = { refreshing = true; refreshScope.launch { controller.reload().join(); refreshing = false } },
@@ -342,14 +346,14 @@ private fun SessionList(
           val pinned = session.id in state.pinned
           HomeSessionRow(session, statuses[session.key] ?: SessionStatus.NONE, session.key in unseen,
             serverName = if (state.allServers) session.serverId?.let { id -> state.profiles.firstOrNull { it.id == id }?.name } else null,
-            onClick = { (session.target ?: state.serverId?.let { SessionTarget(it, session.id) })?.let(onOpen) }, actions = buildList {
+            onClick = { (session.target ?: state.serverId?.let { SessionTarget(it, session.id) })?.let(onOpen) }, actions = { buildList {
             if (!state.allServers) {
               add(MenuAction(if (pinned) "取消置顶" else "置顶", if (pinned) MiuixIcons.Unpin else MiuixIcons.Pin) { controller.togglePin(session.id) })
               if (state.connected && state.capabilities.supports(SessionAction.RENAME)) add(MenuAction("重命名", MiuixIcons.Rename) { onRename(session) })
               if (state.connected && state.capabilities.archive != null) add(MenuAction("归档", ARCHIVE_ICON) { controller.setArchived(session.id, true) })
               if (state.connected && state.capabilities.deleteSession) add(MenuAction("删除", MiuixIcons.Delete, danger = true) { onDelete(session) })
             }
-          })
+          } })
         }
       }
       if (sections.isEmpty()) item(key = "empty") {
@@ -395,13 +399,18 @@ internal val UNARCHIVE_ICON get() = MiuixIcons.Import
  */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-internal fun HomeSessionRow(session: Session, status: SessionStatus, unseen: Boolean, serverName: String? = null, onClick: () -> Unit, actions: List<MenuAction>) {
+internal fun HomeSessionRow(session: Session, status: SessionStatus, unseen: Boolean, serverName: String? = null, onClick: () -> Unit, actions: () -> List<MenuAction>) {
+  // Built only on long press: a list of actions (and their lambdas) per row per recomposition was waste.
+  var menuItems by remember { mutableStateOf(emptyList<MenuAction>()) }
   var menu by remember { mutableStateOf(false) }
   val haptics = LocalHapticFeedback.current
   val highlighted = unseen || status in setOf(SessionStatus.WAITING_PERMISSION, SessionStatus.WAITING_QUESTION)
   Box {
     Row(Modifier.fillMaxWidth().heightIn(min = 56.dp)
-      .combinedClickable(role = Role.Button, onClick = onClick, onLongClick = if (actions.isEmpty()) null else { { haptics.performHapticFeedback(HapticFeedbackType.LongPress); menu = true } })
+      .combinedClickable(role = Role.Button, onClick = onClick, onLongClick = {
+        val items = actions()
+        if (items.isNotEmpty()) { haptics.performHapticFeedback(HapticFeedbackType.LongPress); menuItems = items; menu = true }
+      })
       .padding(start = 20.dp, end = 24.dp, top = 12.dp, bottom = 12.dp), verticalAlignment = Alignment.CenterVertically) {
       Box(Modifier.size(24.dp), contentAlignment = Alignment.Center) { StatusGlyph(status, unseen) }
       Spacer(Modifier.width(12.dp))
@@ -422,7 +431,7 @@ internal fun HomeSessionRow(session: Session, status: SessionStatus, unseen: Boo
         Text(status.label, style = MiuixTheme.textStyles.footnote1.copy(color = MiuixColorTokens.Warning))
       }
     }
-    MenuPopup(menu, { menu = false }, listOf(MenuSection(actions)))
+    MenuPopup(menu, { menu = false }, listOf(MenuSection(menuItems)))
   }
 }
 
