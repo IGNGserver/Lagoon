@@ -36,6 +36,8 @@ import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.unit.dp
 import com.igng.opencode.lagoon.core.*
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.conflate
 import kotlinx.coroutines.withContext
 import top.yukonga.miuix.kmp.basic.*
 import top.yukonga.miuix.kmp.extra.SuperBottomSheet
@@ -168,10 +170,16 @@ private fun QoderActivityOverlay(
   onBack: () -> Unit,
   onDismiss: () -> Unit
 ) {
-  val content by produceState(group to emptyList<TranscriptRow>(), group.key, messages, working, revertMessageId) {
-    value = withContext(Dispatchers.Default) {
-      val latest = TranscriptRows.build(messages, working = working, revertMessageId = revertMessageId).firstOrNull { it.key == group.key } ?: group
-      latest to TranscriptRows.details(messages, group.key, working, revertMessageId)
+  // Throttled like the transcript: restarting on every streamed change cancelled the build before it
+  // finished, so an open activity list stopped updating while the turn was running.
+  val source by rememberUpdatedState(Triple(messages, working, revertMessageId))
+  val content by produceState(group to emptyList<TranscriptRow>(), group.key) {
+    snapshotFlow { source }.conflate().collect { (messages, working, revertMessageId) ->
+      value = withContext(Dispatchers.Default) {
+        val latest = TranscriptRows.build(messages, working = working, revertMessageId = revertMessageId).firstOrNull { it.key == group.key } ?: group
+        latest to TranscriptRows.details(messages, group.key, working, revertMessageId)
+      }
+      delay(TranscriptScroll.ROWS_THROTTLE_MS * 2)
     }
   }
   val (latestGroup, details) = content
