@@ -72,7 +72,12 @@ data class LagoonState(
   val previews: Map<String, SessionPreview> = emptyMap(), val resources: Map<String, ResourceStatus> = emptyMap(),
   val pendingOperations: Set<String> = emptySet(),
   val agentChanged: Boolean = false, val modelChanged: Boolean = false,
-  val draftSessions: Set<String> = emptySet(), val draft: String = "", val references: List<FileReference> = emptyList(),
+  /**
+   * [draft] is the composer text as last set by the app (restore, queued prompt returned, cleared after
+   * send), not every keystroke: typing stays in the composer and [LagoonController.typeDraft], so a key
+   * press never re-broadcasts the whole state. [draftRevision] increments on each such set.
+   */
+  val draftSessions: Set<String> = emptySet(), val draft: String = "", val draftRevision: Long = 0, val references: List<FileReference> = emptyList(),
   val cacheComplete: Boolean = true, val sessionCursors: Map<String, String> = emptyMap(), val messagesCursor: String? = null,
   val catalogComplete: Boolean = true, val loadedOlderMessages: Boolean = false,
   /** Increments once per successfully prepended older page; the transcript anchors on this, never on a streaming rebuild. */
@@ -338,6 +343,8 @@ class LagoonController private constructor(private val appContext: Context) {
   private var visibleConversation: Pair<String, String>? = null
   private val seenEvents = linkedSetOf<String>()
   private val draftWrites = mutableMapOf<String, Job>()
+  /** Server, session and text of the latest composer keystroke; see [typeDraft]. */
+  private var typedDraft: Triple<String, String, String>? = null
   /** An activity is started (ON_START…ON_STOP). The live stream runs only while foreground or monitoring. */
   @Volatile private var foreground = false
   /** [TaskMonitorService] keeps the process alive for running tasks; the stream may then run in background. */
@@ -553,7 +560,7 @@ class LagoonController private constructor(private val appContext: Context) {
   private fun restoreDraft(prompt: QueuedPrompt) {
     val current = state.value
     if (current.serverId == prompt.serverId && current.sessionId == prompt.sessionId) {
-      updateDraft(listOf(prompt.text, current.draft).filter(String::isNotBlank).joinToString("\n\n"))
+      updateDraft(listOf(prompt.text, liveDraft(current)).filter(String::isNotBlank).joinToString("\n\n"))
     } else {
       draftWrites.remove("${prompt.serverId}:${prompt.sessionId}")?.cancel()
       val stored = attempt { store.draft(prompt.serverId, prompt.sessionId) }.getOrDefault("")
@@ -1892,7 +1899,7 @@ class LagoonController private constructor(private val appContext: Context) {
     // 同一会话被重新选中（通知/深链）时保留输入框里的最新文字，避免回退尚未落盘（约 350ms 防抖）的输入。
     // 草稿与文件引用要经 Keystore 解密，放到 [restoreComposerInput] 异步填回：点开会话的第一帧不等它。
     val reselected = mutable.value.sessionId == id
-    val draft = if (reselected) mutable.value.draft else ""
+    val draft = if (reselected) liveDraft(mutable.value) else ""
     val references = if (reselected) mutable.value.references else emptyList()
     visibleConversation = null
     val offline = mutable.value.cached && !mutable.value.connected
@@ -1932,7 +1939,7 @@ class LagoonController private constructor(private val appContext: Context) {
     scope.launch {
       val (draft, references) = kotlinx.coroutines.withContext(Dispatchers.IO) { store.draft(serverId, sessionId) to store.references(serverId, sessionId) }
       if (selectionRevision != revision || state.value.serverId != serverId || state.value.sessionId != sessionId) return@launch
-      mutable.update { it.copy(draft = it.draft.ifEmpty { draft }, references = it.references.ifEmpty { references }) }
+      mutable.update { it.copy(draft = liveDraft(it).ifEmpty { draft }, references = it.references.ifEmpty { references }) }
     }
   }
   private suspend fun loadSession(session: Session, ancillary: Boolean = true, token: Int = generation, client: HarnessClient? = api) {
@@ -2128,12 +2135,39 @@ class LagoonController private constructor(private val appContext: Context) {
     val session = current.sessionId ?: return
     store.rememberConfiguration(server, session, SessionConfiguration(current.agent, current.model, current.agentChanged, current.modelChanged))
   }
+  /**
+   * Sets the composer text from the app side (queued prompt returned, cleared after a send): the
+   * composer adopts it through [LagoonState.draft] / [LagoonState.draftRevision].
+   */
   fun updateDraft(text: String, expectedServer: String? = state.value.serverId, expectedSession: String? = state.value.sessionId) {
     val current = state.value
     if (current.serverId != expectedServer || current.sessionId != expectedSession) return
     val server = current.serverId ?: return
     val session = current.sessionId ?: return
-    mutable.update { it.copy(draft = text, draftSessions = if (text.isBlank()) it.draftSessions - session else it.draftSessions + session) }
+    typedDraft = null
+    mutable.update { it.copy(draft = text, draftRevision = it.draftRevision + 1,
+      draftSessions = if (text.isBlank()) it.draftSessions - session else it.draftSessions + session) }
+    persistDraft(server, session, text)
+  }
+  /**
+   * One keystroke in the composer. The text is kept here and saved after a short pause; the state
+   * flow is only touched when the session gains or loses a draft (the home list marks those).
+   */
+  fun typeDraft(text: String, expectedServer: String?, expectedSession: String?) {
+    val current = state.value
+    if (current.serverId != expectedServer || current.sessionId != expectedSession) return
+    val server = current.serverId ?: return
+    val session = current.sessionId ?: return
+    typedDraft = Triple(server, session, text)
+    if ((session in current.draftSessions) == text.isBlank())
+      mutable.update { it.copy(draftSessions = if (text.isBlank()) it.draftSessions - session else it.draftSessions + session) }
+    persistDraft(server, session, text)
+  }
+  /** The composer text of [server]/[session] as typed, falling back to the last app-side [LagoonState.draft]. */
+  fun draftFor(server: String?, session: String?, fallback: String): String =
+    typedDraft?.takeIf { it.first == server && it.second == session }?.third ?: fallback
+  private fun liveDraft(current: LagoonState = state.value) = draftFor(current.serverId, current.sessionId, current.draft)
+  private fun persistDraft(server: String, session: String, text: String) {
     val key = "$server:$session"
     draftWrites.remove(key)?.cancel()
     draftWrites[key] = operationScope.launch(Dispatchers.IO) {
@@ -2492,7 +2526,7 @@ class LagoonController private constructor(private val appContext: Context) {
       referenceMutex.withLock { kotlinx.coroutines.withContext(Dispatchers.IO) { store.rememberReferences(op.serverId, session.id, emptyList()) } }
       store.rememberPreview(op.serverId, session.id, SessionPreview(SessionContent.CONTENT, text.take(300)))
       if (op.isCurrent(this)) {
-        if (state.value.draft == text) updateDraft("")
+        if (liveDraft() == text) updateDraft("")
         accepted?.invoke()
       }
       op.commitConnection { current -> withSummary(current.copy(

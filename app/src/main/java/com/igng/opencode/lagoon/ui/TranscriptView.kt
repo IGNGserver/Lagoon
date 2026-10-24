@@ -19,12 +19,12 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
@@ -143,8 +143,8 @@ internal fun Conversation(state: LagoonState, controller: LagoonController, modi
     // Items are emitted newest first; reverseLayout draws index 0 at the bottom.
     LazyColumn(Modifier.fillMaxSize(), state = list, reverseLayout = true,
       contentPadding = PaddingValues(horizontal = 20.dp, vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-      items(questions.asReversed(), key = { "question:${it.id}" }) { MiuixQuestionCard(it, controller) }
-      items(permissions.asReversed(), key = { "permission:${it.id}" }) { MiuixPermissionCard(it, controller, onModal) }
+      items(questions.asReversed(), key = { "question:${it.id}" }) { MiuixQuestionCard(it, controller, state.pending("question:${it.id}")) }
+      items(permissions.asReversed(), key = { "permission:${it.id}" }) { MiuixPermissionCard(it, controller, state.pending("permission:${it.id}"), onModal) }
       items(mainRows.asReversed(), key = { it.key }, contentType = { it.kind }) { row ->
         TranscriptRowView(row, onFile, onOpenChild, onActivityGroup)
       }
@@ -550,8 +550,9 @@ private fun DividerRow(label: String) {
 @Composable
 private fun ThinkingRow(text: String) {
   val transition = rememberInfiniteTransition(label = "thinking")
-  val alpha by transition.animateFloat(0.35f, 1f, infiniteRepeatable(tween(900), RepeatMode.Reverse), label = "alpha")
-  Text(text, style = MiuixTheme.textStyles.footnote1.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary), modifier = Modifier.alpha(alpha).padding(top = 4.dp))
+  val alpha = transition.animateFloat(0.35f, 1f, infiniteRepeatable(tween(900), RepeatMode.Reverse), label = "alpha")
+  // The pulse is read in the draw phase: reading it during composition recomposed the row every frame.
+  Text(text, style = MiuixTheme.textStyles.footnote1.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary), modifier = Modifier.graphicsLayer { this.alpha = alpha.value }.padding(top = 4.dp))
 }
 
 @Composable

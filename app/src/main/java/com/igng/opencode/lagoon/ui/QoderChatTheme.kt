@@ -6,6 +6,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
@@ -47,7 +48,8 @@ internal object QoderColors {
 internal fun QoderChatTheme(content: @Composable () -> Unit) {
   val base = MiuixTheme.colorScheme
   val dark = base.surface.luminance() < 0.3f
-  val colors = if (dark) base.copy(
+  // Remembered: a fresh copy on every recomposition invalidated every theme read in the chat subtree.
+  val colors = remember(base, dark) { if (dark) base.copy(
     background = QoderColors.canvas, surface = QoderColors.canvas,
     onSurface = QoderColors.text, onBackground = QoderColors.text,
     onSurfaceVariantSummary = QoderColors.secondary, onSurfaceSecondary = QoderColors.secondary,
@@ -58,7 +60,7 @@ internal fun QoderChatTheme(content: @Composable () -> Unit) {
   ) else base.copy(
     background = Color(0xFFFAFAF7), surface = Color(0xFFFAFAF7),
     secondaryContainer = Color(0xFFEAEAE4), onSurfaceVariantSummary = Color(0xFF72736C)
-  )
+  ) }
   MiuixTheme(colors = colors, textStyles = MiuixTheme.textStyles, content = content)
 }
 

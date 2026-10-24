@@ -30,8 +30,8 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
@@ -84,9 +84,10 @@ internal fun ConnectionStrip(state: LagoonState, controller: LagoonController, m
 @Composable
 internal fun LoadingSkeleton(rows: Int = 3, modifier: Modifier = Modifier) {
   val transition = rememberInfiniteTransition(label = "skeleton")
-  val alpha by transition.animateFloat(0.45f, 0.9f, infiniteRepeatable(tween(800), RepeatMode.Reverse), label = "alpha")
+  // Read in the draw phase only; see ThinkingRow.
+  val alpha = transition.animateFloat(0.45f, 0.9f, infiniteRepeatable(tween(800), RepeatMode.Reverse), label = "alpha")
   val fill = MiuixTheme.colorScheme.surfaceContainerHigh
-  Column(modifier.fillMaxWidth().alpha(alpha).semantics { liveRegion = LiveRegionMode.Polite },
+  Column(modifier.fillMaxWidth().graphicsLayer { this.alpha = alpha.value }.semantics { liveRegion = LiveRegionMode.Polite },
     verticalArrangement = Arrangement.spacedBy(14.dp)) {
     repeat(rows) { index ->
       Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -106,9 +107,10 @@ private fun Bar(color: androidx.compose.ui.graphics.Color, fraction: Float, heig
 @Composable
 internal fun SessionRowsSkeleton(rows: Int = 6) {
   val transition = rememberInfiniteTransition(label = "rows")
-  val alpha by transition.animateFloat(0.45f, 0.9f, infiniteRepeatable(tween(800), RepeatMode.Reverse), label = "alpha")
+  // Read in the draw phase only; see ThinkingRow.
+  val alpha = transition.animateFloat(0.45f, 0.9f, infiniteRepeatable(tween(800), RepeatMode.Reverse), label = "alpha")
   val fill = MiuixTheme.colorScheme.surfaceContainerHigh
-  Column(Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 12.dp).alpha(alpha),
+  Column(Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 12.dp).graphicsLayer { this.alpha = alpha.value },
     verticalArrangement = Arrangement.spacedBy(20.dp)) {
     repeat(rows) { index ->
       Row(verticalAlignment = Alignment.CenterVertically) {

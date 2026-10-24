@@ -91,9 +91,11 @@ internal data class MenuSection(val actions: List<MenuAction>, val title: String
  * dropdown placement but measures the bottom against the IME, flipping the menu above the anchor.
  */
 @Composable
-internal fun rememberImeAwarePopupPositionProvider(): PopupPositionProvider {
+internal fun rememberImeAwarePopupPositionProvider(active: Boolean = true): PopupPositionProvider {
   val density = LocalDensity.current
-  val imeBottom = WindowInsets.ime.getBottom(density)
+  // Only an open popup follows the keyboard. Every list row owns a closed menu, and reading the IME
+  // inset in all of them recomposed the whole list on every frame of the keyboard animation.
+  val imeBottom = if (active) WindowInsets.ime.getBottom(density) else 0
   return remember(imeBottom) {
     object : PopupPositionProvider {
       override fun calculatePosition(
@@ -144,7 +146,7 @@ internal fun rememberImeAwarePopupPositionProvider(): PopupPositionProvider {
 internal fun MenuPopup(show: Boolean, onDismiss: () -> Unit, sections: List<MenuSection>,
   alignment: PopupPositionProvider.Align = PopupPositionProvider.Align.End) {
   val visible = sections.filter { it.actions.isNotEmpty() }
-  val positionProvider = rememberImeAwarePopupPositionProvider()
+  val positionProvider = rememberImeAwarePopupPositionProvider(show)
   SuperListPopup(show = show, alignment = alignment, popupPositionProvider = positionProvider, onDismissRequest = onDismiss) {
     ListPopupColumn {
       visible.forEachIndexed { sectionIndex, section ->

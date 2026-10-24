@@ -25,12 +25,12 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
 /**
  * MIUIX 连续曲率平滑圆角（HyperOS Squircle Shape）
  */
-fun miuixSquircleShape(cornerRadius: Dp = 16.dp): Shape {
-  return RoundedRectangle(
-    cornerRadius = cornerRadius,
-    style = RoundedCornerStyle.Continuous
-  )
+fun miuixSquircleShape(cornerRadius: Dp = 16.dp): Shape = squircles.getOrPut(cornerRadius) {
+  RoundedRectangle(cornerRadius = cornerRadius, style = RoundedCornerStyle.Continuous)
 }
+
+/** One shape per radius: a new instance on every call made each background rebuild its outline. */
+private val squircles = java.util.concurrent.ConcurrentHashMap<Dp, Shape>()
 
 /**
  * MIUIX 语义色彩系统：
