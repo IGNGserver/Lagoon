@@ -855,7 +855,8 @@ class LagoonController private constructor(private val appContext: Context) {
       connect(target.serverId, sessionOverride = target.sessionId, preserveHome = true)
     } else if (state.value.sessions.any { it.id == target.sessionId }) selectSession(target.sessionId)
     else {
-      mutable.update { it.copy(sessionId = target.sessionId, messages = emptyList(), resources = mapOf("messages" to ResourceStatus(ResourceState.LOADING))) }
+      // 先清掉上一个会话的输入：随后的 selectSession 会把它当作"重新选中"而保留，并异步填回本会话的草稿。
+      mutable.update { it.copy(sessionId = target.sessionId, messages = emptyList(), draft = "", references = emptyList(), resources = mapOf("messages" to ResourceStatus(ResourceState.LOADING))) }
       resolveSession(target.sessionId) { if (state.value.serverId == target.serverId && state.value.sessionId == target.sessionId) selectSession(target.sessionId) }
     }
   }
@@ -1883,19 +1884,23 @@ class LagoonController private constructor(private val appContext: Context) {
     outgoing.sessionId?.takeIf { it != id && outgoing.provisionalMessageIds.isEmpty() }?.let { transcriptMemory.put(serverId, it, outgoing.messages.persistable()) }
     val configuration = store.configuration(serverId, id)
     // 同一会话被重新选中（通知/深链）时保留输入框里的最新文字，避免回退尚未落盘（约 350ms 防抖）的输入。
-    val draft = if (mutable.value.sessionId == id) mutable.value.draft else store.draft(serverId, id)
+    // 草稿与文件引用要经 Keystore 解密，放到 [restoreComposerInput] 异步填回：点开会话的第一帧不等它。
+    val reselected = mutable.value.sessionId == id
+    val draft = if (reselected) mutable.value.draft else ""
+    val references = if (reselected) mutable.value.references else emptyList()
     visibleConversation = null
     val offline = mutable.value.cached && !mutable.value.connected
     val messages = withPending(serverId, id, emptyList())
     mutable.update { withSummary(it.copy(projectId = project?.id, sessionId = id, messages = messages,
       agent = configuration.agent ?: session.agent, model = configuration.model ?: session.model,
       agentChanged = configuration.agentChanged, modelChanged = configuration.modelChanged,
-      draft = draft, references = store.references(serverId, id), loadedOlderMessages = false, messagesCursor = null, resources = mapOf("messages" to ResourceStatus(ResourceState.LOADING)),
+      draft = draft, references = references, loadedOlderMessages = false, messagesCursor = null, resources = mapOf("messages" to ResourceStatus(ResourceState.LOADING)),
       provisionalMessageIds = emptySet(), transcriptLoadingSince = if (offline) 0 else System.currentTimeMillis(),
       children = emptyList(), changes = emptyList(), files = emptyList(),
       searchResults = emptyList(), fileText = null, fileBinary = false)) }
     store.rememberLocation(project?.id, id)
     transcripts?.protectedSession = serverId to id
+    restoreComposerInput(serverId, id, selectionRevision)
     if (offline) {
       val serverId = state.value.serverId ?: return
       val revision = selectionRevision
@@ -1911,6 +1916,17 @@ class LagoonController private constructor(private val appContext: Context) {
       showCachedTranscript(serverId, id, selectionRevision)
       // Choices and the session transcript are independent; run them concurrently.
       scope.launch { coroutineScope { launch { loadChoices(session.directory, token) }; loadSession(session, token = token) } }
+    }
+  }
+  /**
+   * 解密并填回 [selectSession] 留空的草稿与文件引用。只填仍为空的字段：解密完成前用户已经输入或添加的
+   * 内容以用户为准；期间又切走了会话则丢弃结果。
+   */
+  private fun restoreComposerInput(serverId: String, sessionId: String, revision: Long) {
+    scope.launch {
+      val (draft, references) = kotlinx.coroutines.withContext(Dispatchers.IO) { store.draft(serverId, sessionId) to store.references(serverId, sessionId) }
+      if (selectionRevision != revision || state.value.serverId != serverId || state.value.sessionId != sessionId) return@launch
+      mutable.update { it.copy(draft = it.draft.ifEmpty { draft }, references = it.references.ifEmpty { references }) }
     }
   }
   private suspend fun loadSession(session: Session, ancillary: Boolean = true, token: Int = generation, client: HarnessClient? = api) {
