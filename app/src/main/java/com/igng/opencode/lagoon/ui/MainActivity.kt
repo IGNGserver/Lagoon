@@ -7,7 +7,6 @@ import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
 import androidx.activity.ComponentActivity
-import androidx.activity.compose.PredictiveBackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -39,10 +38,7 @@ import androidx.core.view.WindowCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import com.igng.opencode.lagoon.core.*
-import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import top.yukonga.miuix.kmp.basic.*
 import top.yukonga.miuix.kmp.extra.SuperBottomSheet
@@ -54,12 +50,22 @@ class MainActivity : ComponentActivity() {
   private var deepLink by mutableStateOf<Pair<String, String>?>(null)
   /** 已处理的深链目标（随实例状态保存）：旋转/改字体触发重建时不再重复跳回同一会话。 */
   private var handledDeepLink: String? = null
+  private lateinit var navigator: RootNavigator
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
     enableEdgeToEdge()
     handledDeepLink = savedInstanceState?.getString(KEY_HANDLED_DEEP_LINK)
     parseDeepLink(intent)
     val controller = LagoonController.get(this)
+    navigator = RootNavigator(
+      SessionNavigation(
+        savedInstanceState?.getString(KEY_NAV_PAGE)?.let { runCatching { RootPage.valueOf(it) }.getOrNull() } ?: RootPage.HOME,
+        savedInstanceState?.getStringArrayList(KEY_NAV_SESSIONS).orEmpty()
+      ),
+      if (savedInstanceState?.containsKey(KEY_NAV_SERVER) == true) savedInstanceState.getString(KEY_NAV_SERVER) else controller.state.value.serverId
+    )
+    // 先于 setContent 注册：优先级最低，键盘、MIUIX 弹层与各页面的 BackHandler 都排在它前面。
+    onBackPressedDispatcher.addCallback(navigator.callback)
     // Opening the app refreshes from the server; leaving it lets the live stream wind down.
     lifecycle.addObserver(LifecycleEventObserver { _, event ->
       if (event == Lifecycle.Event.ON_START) controller.onForeground()
@@ -74,9 +80,6 @@ class MainActivity : ComponentActivity() {
       val dark = themeMode == ThemeMode.DARK || themeMode == ThemeMode.SYSTEM && systemDark
       var previewBack by remember { mutableStateOf(preferences.getBoolean("previewBack", true)) }
       var refreshMode by remember { mutableStateOf(controller.currentRefreshMode()) }
-      var currentPage by rememberSaveable { mutableStateOf(RootPage.HOME) }
-      var sessionStack by rememberSaveable { mutableStateOf(emptyList<String>()) }
-      var navigationServer by rememberSaveable { mutableStateOf(state.serverId) }
       // The server sheet edits one profile (null = add a new one); switching happens on the home capsules.
        var showingServerForm by remember { mutableStateOf(false) }
        var editingServerId by remember { mutableStateOf<String?>(null) }
@@ -86,7 +89,6 @@ class MainActivity : ComponentActivity() {
        var showingModelManagement by remember { mutableStateOf(false) }
       // Each blank draft gets a fresh saveable scope so a sent draft never reappears.
       var draftNonce by rememberSaveable { mutableIntStateOf(0) }
-      var chatModal by remember { mutableStateOf(false) }
       var globalMessage by remember { mutableStateOf<String?>(null) }
       var globalMessageType by remember { mutableStateOf(MiuixToastType.INFO) }
        val holder = rememberSaveableStateHolder()
@@ -94,15 +96,14 @@ class MainActivity : ComponentActivity() {
        val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
       val focusManager = LocalFocusManager.current
       val density = LocalDensity.current
-      val keyboardOpen = WindowInsets.ime.getBottom(density) > 0
-      val navigation = SessionNavigation(currentPage, sessionStack)
-      val inChatDetail = sessionStack.isNotEmpty()
-      val route = navigation.route.copy(serverId = if (inChatDetail) navigationServer else null)
+      val inChatDetail = navigator.navigation.sessions.isNotEmpty()
+      val route = navigator.route
       fun openSession(target: SessionTarget, child: Boolean = false) {
         focusManager.clearFocus()
         if (state.session != null) snapshots["${state.serverId}:${state.sessionId}"] = state
-        navigationServer = target.serverId
-        sessionStack = SessionNavigation(currentPage, sessionStack).open(target.sessionId, child).sessions
+        // 先落栈（同步启用根返回回调），再打开会话：打开过程占住主线程也不会让返回落到系统。
+        navigator.server = target.serverId
+        navigator.navigate(navigator.navigation.open(target.sessionId, child))
         controller.openConversation(target)
       }
        fun openDraft() {
@@ -112,26 +113,28 @@ class MainActivity : ComponentActivity() {
         if (state.projects.isEmpty()) { globalMessage = "先添加一个项目"; globalMessageType = MiuixToastType.INFO; showingProjects = true; return }
         controller.beginDraft()
         draftNonce += 1
-         sessionStack = listOf(DRAFT_SESSION)
+         navigator.navigate(navigator.navigation.copy(sessions = listOf(DRAFT_SESSION)))
        }
-      fun openPage(page: RootPage) { focusManager.clearFocus(); val next = SessionNavigation(currentPage, sessionStack).push(page); currentPage = next.page; sessionStack = next.sessions }
+      fun openPage(page: RootPage) { focusManager.clearFocus(); navigator.navigate(navigator.navigation.push(page)) }
       fun editServer(profile: ServerProfile?) { editingServerId = profile?.id; showingServerForm = true }
-       fun goBack() {
-         focusManager.clearFocus()
-         val current = SessionNavigation(currentPage, sessionStack)
-         val next = current.back()
-         sessionStack = next.sessions; currentPage = next.page
-         next.sessions.lastOrNull()?.let(controller::selectSession)
-         if (leavesSession(current, next) && !state.allServers && state.homeServerId != null && state.homeServerId != state.serverId)
-           controller.connect(state.homeServerId!!)
-       }
+      fun goBack() = navigator.goBack()
+      SideEffect {
+        navigator.onBack = { from, to ->
+          focusManager.clearFocus()
+          to.sessions.lastOrNull()?.let(controller::selectSession)
+          val current = controller.state.value
+          val home = current.homeServerId
+          if (leavesSession(from, to) && !current.allServers && home != null && home != current.serverId) controller.connect(home)
+        }
+      }
       LaunchedEffect(state.serverId) {
-        if (navigationServer != state.serverId) { if (sessionStack.isEmpty()) snapshots.clear(); navigationServer = state.serverId }
+        if (navigator.server != state.serverId) { if (navigator.navigation.sessions.isEmpty()) snapshots.clear(); navigator.server = state.serverId }
       }
        LaunchedEffect(state.sessionId) {
         val id = state.sessionId
-         if (inChatDetail && id != null && sessionStack.lastOrNull() != id) {
-           sessionStack = if (state.session?.parentId == sessionStack.lastOrNull()) sessionStack + id else sessionStack.dropLast(1) + id
+        val stack = navigator.navigation.sessions
+         if (stack.isNotEmpty() && id != null && stack.last() != id) {
+           navigator.navigate(navigator.navigation.copy(sessions = if (state.session?.parentId == stack.last()) stack + id else stack.dropLast(1) + id))
          }
        }
        LaunchedEffect(pendingDraftTarget) {
@@ -147,7 +150,7 @@ class MainActivity : ComponentActivity() {
          if (connected) {
            if (controller.state.value.projects.any { it.id == target.second }) controller.selectProject(target.second)
            draftNonce += 1
-           sessionStack = listOf(DRAFT_SESSION)
+           navigator.navigate(navigator.navigation.copy(sessions = listOf(DRAFT_SESSION)))
          } else {
            globalMessage = "无法连接服务器，稍后重试"; globalMessageType = MiuixToastType.ERROR
          }
@@ -174,33 +177,25 @@ class MainActivity : ComponentActivity() {
          handledDeepLink = "$server:$session"
           if (state.profiles.none { it.id == server }) { globalMessage = "这个服务器已移除"; globalMessageType = MiuixToastType.ERROR; deepLink = null }
           else {
-            currentPage = RootPage.HOME; openSession(SessionTarget(server, session)); deepLink = null
+            navigator.navigate(SessionNavigation()); openSession(SessionTarget(server, session)); deepLink = null
           }
        }
       val backProgress = remember { Animatable(0f) }
-      var gestureActive by remember { mutableStateOf(false) }
-      var gestureRoute by remember { mutableStateOf<NavRoute?>(null) }
-      // 手势方向：页面朝手指来向移动（左边缘 +1 / 右边缘 -1）。
-      var backDirection by remember { mutableStateOf(1) }
+      // 手势由 navigator.callback 驱动；这里只按（手势编号, 相位）播放跟手、停留与回弹。
+      // 换键即取消上一段，旧手势的收尾既不会改写新手势的进度，也结束不了新手势（finish 校验编号）。
+      val gesture = navigator.gesture
       // The real page a back gesture returns to, drawn under the outgoing one while the finger moves.
-      var peekRoute by remember { mutableStateOf<NavRoute?>(null) }
+      val peekRoute = gesture?.peek?.takeIf { previewBack }
       val screenWidthPx = with(density) { LocalConfiguration.current.screenWidthDp.dp.roundToPx() }
-      PredictiveBackHandler(enabled = navigation.canGoBack && !keyboardOpen && !chatModal && !showingServerForm && !showingProjects && !showingModelManagement) { progress ->
-        gestureActive = true; gestureRoute = route
-        peekRoute = navigation.back().route.takeIf { previewBack && it.session == null }
-        try {
-          progress.collect { event ->
-            backDirection = backSwipeDirection(event.swipeEdge, event.touchX, screenWidthPx)
-            if (previewBack) backProgress.snapTo(event.progress.coerceIn(0f, 1f))
-          }
-          peekRoute = null
-          goBack()
+      SideEffect { navigator.screenWidth = screenWidthPx }
+      LaunchedEffect(gesture?.id, gesture?.phase) {
+        val current = gesture ?: return@LaunchedEffect
+        when (current.phase) {
+          BackPhase.ACTIVE -> { backProgress.snapTo(0f); if (previewBack) snapshotFlow { navigator.progress }.collect { backProgress.snapTo(it) } }
           // Leave the outgoing surface at its gesture position until its exit transition finishes.
-          delay(240); backProgress.snapTo(0f)
-        } catch (cancel: CancellationException) {
-          withContext(NonCancellable) { backProgress.animateTo(0f, spring(dampingRatio = 0.9f, stiffness = 500f)) }
-          throw cancel
-        } finally { gestureActive = false; peekRoute = null }
+          BackPhase.COMMITTED -> { delay(240); backProgress.snapTo(0f); navigator.finish(current.id) }
+          BackPhase.CANCELLED -> { backProgress.animateTo(0f, spring(dampingRatio = 0.9f, stiffness = 500f)); navigator.finish(current.id) }
+        }
       }
       LagoonMiuixTheme(dark) {
         Scaffold(
@@ -217,10 +212,10 @@ class MainActivity : ComponentActivity() {
                 else snapshots["${target.serverId}:${target.session}"] ?: state.copy(serverId = target.serverId, sessionId = target.session,
                   sessions = emptyList(), messages = emptyList(), draft = "")
               when {
-                target.session == DRAFT_SESSION -> DraftScreen(state, controller, onBack = { goBack() }, onModal = { if (active) chatModal = it }, interactive = active)
+                target.session == DRAFT_SESSION -> DraftScreen(state, controller, onBack = { goBack() }, onModal = {}, interactive = active)
                  target.session != null -> ChatScreen(displayed, controller, onBack = { goBack() }, onOpenChild = { child ->
                    controller.state.value.serverId?.let { server -> openSession(SessionTarget(server, child), child = controller.state.value.sessions.any { it.id == child }) }
-                 }, onModal = { if (active) chatModal = it }, interactive = active)
+                 }, onModal = {}, interactive = active)
                  target.page == RootPage.ARCHIVED -> ArchivedScreen(home, controller, onOpen = { openSession(it) }, onBack = { goBack() })
                  target.page == RootPage.SETTINGS -> SettingsScreen(state, controller, themeMode, { themeMode = it; preferences.edit().putString("themeMode", it.name).apply() }, previewBack, { previewBack = it; preferences.edit().putBoolean("previewBack", it).apply() }, refreshMode, { refreshMode = it; controller.setRefreshMode(it) }, {
                    if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
@@ -236,7 +231,7 @@ class MainActivity : ComponentActivity() {
             }
             peekRoute?.let { peek ->
               Box(Modifier.fillMaxSize().graphicsLayer {
-                if (gestureActive) translationX = -backDirection * (1f - backProgress.value) * size.width * 0.25f
+                translationX = -navigator.direction * (1f - backProgress.value) * size.width * 0.25f
               }.pointerInput(Unit) { awaitPointerEventScope { while (true) { awaitPointerEvent().changes.forEach { it.consume() } } } }) { Page(peek, active = false) }
             }
             AnimatedContent(route, transitionSpec = {
@@ -253,8 +248,8 @@ class MainActivity : ComponentActivity() {
             }, label = "navigation") { target ->
               val active = target == route
               Box(Modifier.fillMaxSize().graphicsLayer {
-                if (target == gestureRoute && gestureActive) {
-                  translationX = backDirection * backProgress.value * size.width * 0.28f
+                if (target == navigator.gesture?.route) {
+                  translationX = navigator.direction * backProgress.value * size.width * 0.28f
                   scaleX = 1f - backProgress.value * 0.04f; scaleY = scaleX
                   alpha = 1f - backProgress.value * 0.12f
                 }
@@ -279,7 +274,7 @@ class MainActivity : ComponentActivity() {
              if (showingAllDraftTarget) AllServersDraftTargetSheet(home, onSelect = { profile, project ->
                 showingAllDraftTarget = false
                 pendingDraftTarget = profile.id to project.id
-                navigationServer = profile.id
+                navigator.server = profile.id
                 controller.connect(profile.id, project.id, preserveHome = true)
              }, onDismiss = { showingAllDraftTarget = false })
             if (showingModelManagement) ModelManagementSheet(state, controller) { showingModelManagement = false }
@@ -292,6 +287,8 @@ class MainActivity : ComponentActivity() {
   override fun onSaveInstanceState(outState: Bundle) {
     super.onSaveInstanceState(outState)
     handledDeepLink?.let { outState.putString(KEY_HANDLED_DEEP_LINK, it) }
+    navigator.navigation.let { outState.putString(KEY_NAV_PAGE, it.page.name); outState.putStringArrayList(KEY_NAV_SESSIONS, ArrayList(it.sessions)) }
+    outState.putString(KEY_NAV_SERVER, navigator.server)
   }
   private fun parseDeepLink(intent: Intent?) {
     val uri = intent?.data ?: return
@@ -305,5 +302,8 @@ class MainActivity : ComponentActivity() {
 
   private companion object {
     const val KEY_HANDLED_DEEP_LINK = "handledDeepLink"
+    const val KEY_NAV_PAGE = "navPage"
+    const val KEY_NAV_SESSIONS = "navSessions"
+    const val KEY_NAV_SERVER = "navServer"
   }
 }
