@@ -5,7 +5,16 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.AnimatedVisibilityScope
+import androidx.compose.animation.EnterExitState
 import androidx.compose.animation.animateContentSize
+import androidx.compose.animation.core.CubicBezierEasing
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.*
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
@@ -108,7 +117,11 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
           })
         ChatComposer(state, controller, interactive, onModal = { composerModal = it }, onServerFile = { sheet = ChatSheet.FILES; controller.listFiles() })
       }
-      activityGroup?.let { group ->
+      // The last group stays composed while the overlay animates out.
+      val shownGroup = remember(state.serverId, state.sessionId) { arrayOfNulls<TranscriptRow>(1) }
+      activityGroup?.let { shownGroup[0] = it }
+      AnimatedVisibility(activityGroup != null, enter = fadeIn(tween(180)), exit = fadeOut(tween(200))) {
+        val group = shownGroup[0] ?: return@AnimatedVisibility
         QoderActivityOverlay(
           messages = state.messages,
           group = group,
@@ -157,7 +170,7 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
 
 /** Chat-level overlay: it covers the composer as in Qoder, while preserving the transcript behind it. */
 @Composable
-private fun QoderActivityOverlay(
+private fun AnimatedVisibilityScope.QoderActivityOverlay(
   messages: List<Message>,
   group: TranscriptRow,
   selected: TranscriptRow?,
@@ -187,11 +200,14 @@ private fun QoderActivityOverlay(
   // Kept outside the list/detail branch: returning from a detail must restore the reader's place.
   val activityListState = rememberLazyListState()
   val latestSelected = selected?.let { item -> if (item.key == group.key) latestGroup else details.firstOrNull { it.key == item.key } ?: item }
-  BackHandler(enabled = interactive) { if (latestSelected != null && latestSelected.key != group.key) onBack() else onDismiss() }
+  // Not while animating out: that back belongs to the conversation underneath.
+  BackHandler(enabled = interactive && transition.targetState == EnterExitState.Visible) { if (latestSelected != null && latestSelected.key != group.key) onBack() else onDismiss() }
   Box(Modifier.fillMaxSize()) {
     Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.58f))
       .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null, onClick = onDismiss))
     Column(Modifier.fillMaxWidth().fillMaxHeight(0.74f).align(Alignment.BottomCenter)
+      .animateEnterExit(enter = slideInVertically(tween(280, easing = CubicBezierEasing(0.2f, 0f, 0f, 1f))) { it / 3 },
+        exit = slideOutVertically(tween(200)) { it / 3 })
       .clip(androidx.compose.foundation.shape.RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp))
       .background(QoderColors.sheetColor).pointerInput(Unit) { detectTapGestures { } }.navigationBarsPadding()) {
       QoderSheetHandle()
@@ -694,7 +710,7 @@ private fun FileChip(name: String, detail: String, onRemove: () -> Unit) {
 
 @Composable
 private fun RemoveBadge(modifier: Modifier, onRemove: () -> Unit) {
-  Box(modifier.size(28.dp).clickable(onClick = onRemove), contentAlignment = Alignment.Center) {
+  Box(modifier.size(40.dp).clickable(onClick = onRemove), contentAlignment = Alignment.Center) {
     Box(Modifier.size(18.dp).clip(miuixCapsuleShape()).background(MiuixTheme.colorScheme.onSurface.copy(alpha = 0.55f)), contentAlignment = Alignment.Center) {
       Icon(MiuixIcons.Close, "移除", Modifier.size(12.dp), tint = MiuixTheme.colorScheme.surface)
     }

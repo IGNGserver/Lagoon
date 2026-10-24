@@ -3,8 +3,6 @@ package com.igng.opencode.lagoon.ui
 import androidx.compose.animation.*
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.spring
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -40,7 +38,7 @@ fun MiuixToastHost(
 ) {
   LaunchedEffect(message) {
     if (message != null) {
-      delay(2600)
+      delay(if (type == MiuixToastType.ERROR) 4_000 else 2_600)
       onDismiss()
     }
   }
@@ -66,13 +64,9 @@ fun MiuixToastHost(
       }
 
       Card(
-        modifier = Modifier
-          .padding(horizontal = 24.dp, vertical = 8.dp)
-          .clickable(
-            interactionSource = remember { MutableInteractionSource() },
-            indication = null,
-            onClick = onDismiss
-          ),
+        // Not clickable: the toast sits over the page header, and tapping it to dismiss used to eat the
+        // tap meant for the back / ⋯ button underneath for its whole lifetime.
+        modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp),
         cornerRadius = 14.dp,
         insideMargin = PaddingValues(horizontal = 16.dp, vertical = 10.dp),
         colors = CardDefaults.defaultColors(

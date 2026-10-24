@@ -88,12 +88,13 @@ class MainActivity : ComponentActivity() {
       var previewBack by remember { mutableStateOf(preferences.getBoolean("previewBack", true)) }
       var refreshMode by remember { mutableStateOf(controller.currentRefreshMode()) }
       // The server sheet edits one profile (null = add a new one); switching happens on the home capsules.
-       var showingServerForm by remember { mutableStateOf(false) }
-       var editingServerId by remember { mutableStateOf<String?>(null) }
-       var showingProjects by remember { mutableStateOf(false) }
-       var showingAllDraftTarget by remember { mutableStateOf(false) }
+       // Saveable: rotating or switching the system theme recreates the activity, which closed these sheets.
+       var showingServerForm by rememberSaveable { mutableStateOf(false) }
+       var editingServerId by rememberSaveable { mutableStateOf<String?>(null) }
+       var showingProjects by rememberSaveable { mutableStateOf(false) }
+       var showingAllDraftTarget by rememberSaveable { mutableStateOf(false) }
        var pendingDraftTarget by remember { mutableStateOf<Pair<String, String>?>(null) }
-       var showingModelManagement by remember { mutableStateOf(false) }
+       var showingModelManagement by rememberSaveable { mutableStateOf(false) }
       // Each blank draft gets a fresh saveable scope so a sent draft never reappears.
       var draftNonce by rememberSaveable { mutableIntStateOf(0) }
       var globalMessage by remember { mutableStateOf<String?>(null) }
