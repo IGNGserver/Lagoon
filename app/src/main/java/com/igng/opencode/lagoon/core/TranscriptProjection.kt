@@ -39,6 +39,29 @@ internal fun needsOlderTurnRoot(messages: List<Message>): Boolean {
   return boundary?.role == "assistant"
 }
 
+/**
+ * Extends an older history page ([messages], continuing at [next]) with further older pages until it
+ * starts on a whole turn, like the initial window. A page that splits a turn would be re-projected once
+ * the prompt arrives: the half turn's rows change shape and key right where the reader is scrolling.
+ * At most [maxPages] extra pages; a continuation that fails keeps what was already read (the cursor
+ * still points at it, so the next scroll resumes there).
+ */
+internal suspend fun <C : Any> widenOlderToTurn(messages: List<Message>, next: C?, maxPages: Int,
+  older: suspend (C) -> Pair<List<Message>, C?>): Pair<List<Message>, C?> {
+  var shown = messages
+  var cursor = next
+  var widened = 0
+  while (needsOlderTurnRoot(shown) && widened < maxPages) {
+    val from = cursor ?: break
+    val (more, after) = try { older(from) } catch (cancel: kotlinx.coroutines.CancellationException) { throw cancel } catch (error: Exception) { break }
+    shown = more + shown
+    cursor = after
+    if (more.isEmpty()) break
+    widened++
+  }
+  return shown to cursor
+}
+
 object TranscriptProjection {
   data class Result(val messages: List<Message>, val reconcile: Boolean = false)
 

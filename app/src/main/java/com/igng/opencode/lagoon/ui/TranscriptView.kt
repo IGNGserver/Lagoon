@@ -9,8 +9,6 @@ import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.*
 import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.gestures.scrollBy
-import androidx.compose.foundation.interaction.collectIsDraggedAsState
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -40,10 +38,9 @@ import androidx.compose.ui.unit.sp
 import com.igng.opencode.lagoon.core.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.conflate
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeoutOrNull
 import top.yukonga.miuix.kmp.basic.*
 import top.yukonga.miuix.kmp.icon.MiuixIcons
 import top.yukonga.miuix.kmp.icon.extended.ChevronForward
@@ -66,130 +63,108 @@ internal fun Conversation(state: LagoonState, controller: LagoonController, modi
   val task = state.presentedTasks[state.sessionId]
   val working = task?.active == true
   val revert = state.session?.revertMessageId
-  val rows by produceState(emptyList<TranscriptRow>(), state.messages, working, revert) {
-    delay(32)
-    value = withContext(Dispatchers.Default) { TranscriptRows.build(state.messages, working = working, revertMessageId = revert) }
+  // Throttled, not debounced: a restart-on-change delay starved the transcript while a reply streamed.
+  // The first change builds at once; later ones are conflated to the newest and built at most every
+  // ROWS_THROTTLE_MS, so streaming keeps updating the list.
+  val source by rememberUpdatedState(Triple(state.messages, working, revert))
+  val rows by produceState(emptyList<TranscriptRow>()) {
+    snapshotFlow { source }.conflate().collect { (messages, running, boundary) ->
+      value = withContext(Dispatchers.Default) { TranscriptRows.build(messages, working = running, revertMessageId = boundary) }
+      delay(TranscriptScroll.ROWS_THROTTLE_MS)
+    }
   }
-  // A brand-new conversation opens at the newest message; only a deliberate drag up opts out of following.
+  val mainRows = remember(rows) { rows.filter { it.detailOf == null } }
+  val permissions = state.visiblePermissions.filter { it.sessionId == state.sessionId }
+  val questions = state.questions.filter { it.sessionId == state.sessionId }
+
+  // The list is reversed (newest item at index 0, at the bottom edge). Older pages are appended at the
+  // far end, so loading history never moves what is on screen, and a growing newest item keeps its
+  // bottom edge pinned. LazyColumn keeps the bottom-most visible item in place on its own; no manual
+  // anchor bookkeeping, and the viewport shrinking for the keyboard keeps the newest message in view.
+  val slop = with(LocalDensity.current) { 48.dp.roundToPx() }
+  val atBottom by remember(slop) { derivedStateOf { TranscriptScroll.atBottom(list.firstVisibleItemIndex, list.firstVisibleItemScrollOffset, slop) } }
+  // A brand-new conversation opens at the newest message; only the reader moving away opts out of following.
   var follow by rememberSaveable { mutableStateOf(true) }
   var newContent by remember { mutableStateOf(false) }
-  var autoScroll by remember { mutableStateOf(false) }
-  val dragged by list.interactionSource.collectIsDraggedAsState()
-  val nearBottom by remember { derivedStateOf {
-    val info = list.layoutInfo; val last = info.visibleItemsInfo.lastOrNull()
-    last != null && last.index == info.totalItemsCount - 1 && last.offset + last.size <= info.viewportEndOffset + 40
-  } }
-  // Track the reader's intent while they actually move the list (drag or fling), not only mid-drag, so a
-  // fling to the top also stops following. Programmatic scrolls set [autoScroll] and are ignored.
-  LaunchedEffect(list.isScrollInProgress, dragged, nearBottom) {
-    if ((list.isScrollInProgress || dragged) && !autoScroll) follow = nearBottom
+  // The reader's intent is read only while the list actually moves (drag or fling); content changes never flip it.
+  LaunchedEffect(list.isScrollInProgress, atBottom) { if (list.isScrollInProgress) follow = atBottom }
+  LaunchedEffect(atBottom) { if (atBottom) newContent = false }
+  val sending = state.pending("send")
+  LaunchedEffect(sending) {
+    if (sending) { follow = true; newContent = false; list.scrollToItem(0) }
   }
-  // 行高会因工具状态、附件等变化：键里带上每个 part 的状态，否则“转圈→完成”不会触发回底。
+  // 行高会因工具状态、附件等变化：键里带上每个 part 的状态，否则“转圈→完成”不会被当作新内容。
   val contentKey = state.messages.lastOrNull()?.let { message ->
     message.id to message.parts.joinToString("|") { part -> "${part.status}:${part.text.length}:${part.output.length}:${part.attachments.size}" }
   }
-  val permissions = state.visiblePermissions.filter { it.sessionId == state.sessionId }
-  val questions = state.questions.filter { it.sessionId == state.sessionId }
-  // The exact number of LazyColumn items the data implies; the scroll effect waits for the list to lay
-  // out that many before landing, so the initial open does not scroll while `rows` are still empty.
-  val mainRows = rows.filter { it.detailOf == null }
-  val expectedItems = (if (state.cached) 1 else 0) +
-    (if (state.sessionId in state.backgroundRunning) 1 else 0) +
-    (if (state.messagesCursor != null) 1 else 0) +
-    (if (rows.isEmpty()) 1 else 0) + mainRows.size + permissions.size + questions.size
-  suspend fun scrollBottom() {
-    autoScroll = true
-    try {
-      withTimeoutOrNull(1_000) { snapshotFlow { list.layoutInfo.totalItemsCount }.first { it >= expectedItems && it > 0 } }
-      val count = list.layoutInfo.totalItemsCount
-      if (count > 0) { list.scrollToItem(count - 1); list.scrollBy(list.layoutInfo.viewportEndOffset.toFloat()) }
-    } finally { autoScroll = false }
+  val newestKey: Any? = questions.lastOrNull()?.let { "question:${it.id}" } ?: permissions.lastOrNull()?.let { "permission:${it.id}" }
+    ?: mainRows.lastOrNull()?.key
+  // A row inserted below the newest one would stay out of view (LazyColumn keeps the previous bottom item
+  // in place). While following, ask for index 0 before this frame is measured – the list still reports
+  // (0, 0) here, the new row is not laid out yet. Never during the reader's own drag or fling, which the
+  // request would cancel.
+  val pinned = remember { arrayOfNulls<Any>(1) }
+  SideEffect {
+    val signature = newestKey to contentKey
+    if (pinned[0] != signature) {
+      if (follow && !list.isScrollInProgress) list.requestScrollToItem(0)
+      pinned[0] = signature
+    }
   }
-  // Only a new message, a fresh send or the first successful layout moves the viewport. Expanding or
-  // collapsing a row never scrolls, so the row the reader is looking at keeps its place.
-  LaunchedEffect(contentKey, expectedItems, state.pending("send")) {
-    if (state.pending("send")) follow = true
-    // Never fight the reader's own drag/fling; only follow when they are at the bottom and idle.
-    if (!follow || dragged) { if (state.messages.isNotEmpty()) newContent = true; return@LaunchedEffect }
-    newContent = false
-    scrollBottom()
+  // Only the newest end counts as new content: an older page landing at the far end never lights the
+  // button. The first observed signature is the baseline, not news.
+  val seen = remember(state.sessionId) { arrayOfNulls<Any>(1) }
+  LaunchedEffect(newestKey, contentKey) {
+    val signature = newestKey to contentKey
+    if (seen[0] != null && seen[0] != signature && !follow && mainRows.isNotEmpty()) newContent = true
+    seen[0] = signature
   }
-  // 键盘弹出时列表视口变矮，最后几条会落到键盘后面；只有处于底部跟随模式时才自动回到底部（等布局收敛后再滚）。
-  val imeBottom = WindowInsets.ime.getBottom(LocalDensity.current)
-  LaunchedEffect(imeBottom > 0) {
-    if (imeBottom > 0 && follow) { delay(120); scrollBottom() }
-  }
-  // Standard history paging: reaching the very top pulls exactly ONE page, then stays disarmed until the
-  // reader scrolls away from the top and comes back. Anchoring by key keeps the viewport steady while the
-  // older page is inserted. This replaces the old `<= 1` check that re-triggered every frame and loaded
-  // the whole history in one go.
-  val loadingOlder = state.pending("messages-more")
-  val firstVisibleIndex by remember { derivedStateOf { list.firstVisibleItemIndex } }
-  var olderArmed by remember(state.sessionId) { mutableStateOf(true) }
-  var anchorKey by remember(state.sessionId) { mutableStateOf<Any?>(null) }
-  var anchorOffset by remember(state.sessionId) { mutableIntStateOf(0) }
-  var pendingRestoreAnchor by remember(state.sessionId) { mutableStateOf(false) }
-  var anchorRevision by remember(state.sessionId) { mutableIntStateOf(0) }
 
-  LaunchedEffect(firstVisibleIndex) { if (firstVisibleIndex > 0) olderArmed = true }
-  LaunchedEffect(firstVisibleIndex, olderArmed, state.messagesCursor, loadingOlder, state.connected, state.cached, follow) {
-    // Trigger a little before the very top so the next page is already there when the reader arrives.
-    // Stored history pages from the device, so it also loads while offline or showing a cached copy.
-    val readable = (state.connected && !state.cached) || state.olderFromDevice
-    if (firstVisibleIndex <= 1 && olderArmed && !follow && readable && !loadingOlder && state.messagesCursor != null) {
-      val visibleItem = list.layoutInfo.visibleItemsInfo.firstOrNull { it.key != "older-loader" }
-      if (visibleItem != null) {
-        anchorKey = visibleItem.key
-        anchorOffset = visibleItem.offset
-        anchorRevision = state.historyRevision
-        pendingRestoreAnchor = true
-      }
-      olderArmed = false
+  // History prefetch: once the oldest visible item is within about a screen of the far end, request the
+  // next page, whatever the follow state – a short conversation that does not fill the screen loads too.
+  // Stored history pages from the device, so it also loads while offline or showing a cached copy.
+  val loadingOlder = state.pending("messages-more")
+  val nearOldest by remember { derivedStateOf {
+    val info = list.layoutInfo
+    val last = info.visibleItemsInfo.lastOrNull()
+    last != null && TranscriptScroll.nearOldest(last.index, info.visibleItemsInfo.size, info.totalItemsCount)
+  } }
+  var attemptedCursor by remember(state.sessionId) { mutableStateOf<String?>(null) }
+  LaunchedEffect(nearOldest) { if (!nearOldest) attemptedCursor = null }
+  val readable = (state.connected && !state.cached) || state.olderFromDevice
+  val cursor = state.messagesCursor
+  LaunchedEffect(nearOldest, readable, loadingOlder, cursor, mainRows.isNotEmpty()) {
+    if (TranscriptScroll.shouldLoadOlder(nearOldest, readable, loadingOlder, cursor, attemptedCursor, mainRows.isNotEmpty())) {
+      attemptedCursor = cursor
       controller.loadOlderMessages()
     }
   }
-  // A failed page must not leave a stale anchor that a later streaming rebuild would restore.
-  LaunchedEffect(loadingOlder) {
-    if (!loadingOlder && pendingRestoreAnchor && state.historyRevision == anchorRevision) { pendingRestoreAnchor = false; anchorKey = null }
-  }
-
-  // Restore only after the older page actually landed. Keying on the rebuilt rows (and gating on the
-  // history revision) means a streaming update during the request can no longer clear the anchor —
-  // that premature clear was what made scrolling to the top stop working during a running turn.
-  // LazyListItemInfo.offset is negative once the anchor is scrolled off the top, while scrollToItem's
-  // scrollOffset is the forward (non-negative) amount, so negate it to land the row back in place.
-  LaunchedEffect(mainRows) {
-    if (!pendingRestoreAnchor || anchorKey == null || state.historyRevision == anchorRevision) return@LaunchedEffect
-    val position = mainRows.indexOfFirst { it.key == anchorKey }
-    if (position < 0) { pendingRestoreAnchor = false; anchorKey = null; return@LaunchedEffect }
-    val leading = (if (state.cached) 1 else 0) + (if (state.sessionId in state.backgroundRunning) 1 else 0) + (if (state.messagesCursor != null) 1 else 0)
-    list.scrollToItem(leading + position, -anchorOffset)
-    pendingRestoreAnchor = false
-    anchorKey = null
-  }
   Box(modifier) {
-    LazyColumn(Modifier.fillMaxSize(), state = list, contentPadding = PaddingValues(horizontal = 20.dp, vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-      if (state.cached) item { Text(if (state.cacheComplete) if (state.connected) "会话缓存 · 消息待同步" else "离线缓存 · 恢复连接后更新" else "离线缓存已截断，部分历史与长输出未保留", color = MiuixColorTokens.Warning, style = MiuixTheme.textStyles.footnote1) }
-      if (state.sessionId in state.backgroundRunning) item(key = "background-running") {
-        Text("任务正在后台运行中", color = MiuixTheme.colorScheme.primary, style = MiuixTheme.textStyles.footnote1)
+    // Items are emitted newest first; reverseLayout draws index 0 at the bottom.
+    LazyColumn(Modifier.fillMaxSize(), state = list, reverseLayout = true,
+      contentPadding = PaddingValues(horizontal = 20.dp, vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+      items(questions.asReversed(), key = { "question:${it.id}" }) { MiuixQuestionCard(it, controller) }
+      items(permissions.asReversed(), key = { "permission:${it.id}" }) { MiuixPermissionCard(it, controller, onModal) }
+      items(mainRows.asReversed(), key = { it.key }, contentType = { it.kind }) { row ->
+        TranscriptRowView(row, onFile, onOpenChild, onActivityGroup)
       }
-      if (state.messagesCursor != null) item(key = "older-loader") {
-        Box(Modifier.fillMaxWidth().padding(vertical = 10.dp), contentAlignment = Alignment.Center) {
+      if (rows.isEmpty()) item(key = "empty-hint") { ResourceHint(state.resource("messages"), "会话尚无消息", "在下方输入第一项任务。", controller::reload) }
+      // A fixed height, so the spinner appearing never changes the list's extent.
+      if (cursor != null) item(key = "older-loader") {
+        Box(Modifier.fillMaxWidth().height(40.dp), contentAlignment = Alignment.Center) {
           if (loadingOlder) InfiniteProgressIndicator(size = 20.dp, strokeWidth = 2.dp)
         }
       }
-      if (rows.isEmpty()) item { ResourceHint(state.resource("messages"), "会话尚无消息", "在下方输入第一项任务。", controller::reload) }
-      items(rows.filter { it.detailOf == null }, key = { it.key }, contentType = { it.kind }) { row ->
-        TranscriptRowView(row, onFile, onOpenChild, onActivityGroup)
+      if (state.sessionId in state.backgroundRunning) item(key = "background-running") {
+        Text("任务正在后台运行中", color = MiuixTheme.colorScheme.primary, style = MiuixTheme.textStyles.footnote1)
       }
-      items(permissions, key = { "permission:${it.id}" }) { MiuixPermissionCard(it, controller, onModal) }
-      items(questions, key = { "question:${it.id}" }) { MiuixQuestionCard(it, controller) }
+      if (state.cached) item(key = "cache-notice") { Text(if (state.cacheComplete) if (state.connected) "会话缓存 · 消息待同步" else "离线缓存 · 恢复连接后更新" else "离线缓存已截断，部分历史与长输出未保留", color = MiuixColorTokens.Warning, style = MiuixTheme.textStyles.footnote1) }
     }
     Column(Modifier.align(Alignment.BottomCenter).padding(bottom = 16.dp),
       horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(8.dp)) {
-      AnimatedVisibility(!nearBottom && rows.isNotEmpty()) {
+      AnimatedVisibility(!atBottom && rows.isNotEmpty()) {
         Box(Modifier.size(36.dp).clip(miuixCapsuleShape()).background(MiuixTheme.colorScheme.secondaryContainer)
-          .clickable { follow = true; newContent = false; scope.launch { scrollBottom() } }, contentAlignment = Alignment.Center) {
+          .clickable { follow = true; newContent = false; scope.launch { list.scrollToItem(0) } }, contentAlignment = Alignment.Center) {
           DropdownChevron(18.dp, tint = if (newContent) MiuixTheme.colorScheme.primary else MiuixTheme.colorScheme.onSurfaceVariantSummary,
             description = if (newContent) "有新消息，回到最新" else "回到底部")
         }
@@ -663,6 +638,65 @@ internal fun VirtualText(text: String, modifier: Modifier = Modifier, highlight:
   }
 }
 
+/**
+ * Inline (`data:image/…`) attachments, decoded off the main thread. The image's aspect ratio is read
+ * from a short prefix of the payload (the header), synchronously, so the row reserves its final height
+ * on first layout instead of growing when the decode lands – a row growing above the viewport shifted
+ * everything below it. Decoded bitmaps live in a small LRU keyed by a digest of the url, so scrolling
+ * back to an image does not decode it again.
+ */
+private object InlineImages {
+  /** Base64 characters read for the header: PNG/GIF/WebP sizes sit in the first bytes, JPEG's after any EXIF block. */
+  private const val HEADER_CHARS = 64 * 1024
+  private val bitmaps = object : android.util.LruCache<String, android.graphics.Bitmap>(
+    (Runtime.getRuntime().maxMemory() / 8).coerceAtMost(32L shl 20).toInt()) {
+    override fun sizeOf(key: String, value: android.graphics.Bitmap) = value.byteCount
+  }
+  private val aspects = object : LinkedHashMap<String, Float>(64, 0.75f, true) {
+    override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Float>?) = size > 256
+  }
+
+  /**
+   * A digest of [url] that does not walk a multi-megabyte payload on the main thread: its length, a
+   * strided sample of its characters and its tail.
+   */
+  fun key(url: String): String {
+    var hash = url.length.toLong()
+    val step = (url.length / 256).coerceAtLeast(1)
+    var index = 0
+    while (index < url.length) { hash = hash * 31 + url[index].code; index += step }
+    return "${url.length}:${java.lang.Long.toHexString(hash)}:${url.takeLast(32)}"
+  }
+
+  fun cached(key: String): android.graphics.Bitmap? = bitmaps.get(key)
+
+  /** Width / height, from the cache or the payload's header; null when the header cannot be read. */
+  fun aspect(key: String, url: String): Float? {
+    synchronized(aspects) { aspects[key] }?.let { return it }
+    val start = url.indexOf(',') + 1
+    if (start <= 0) return null
+    val length = (minOf(url.length - start, HEADER_CHARS) / 4) * 4
+    val ratio = runCatching {
+      val bytes = android.util.Base64.decode(url.substring(start, start + length), android.util.Base64.DEFAULT)
+      val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+      BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+      if (bounds.outWidth > 0 && bounds.outHeight > 0) bounds.outWidth.toFloat() / bounds.outHeight else null
+    }.getOrNull() ?: return null
+    synchronized(aspects) { aspects[key] = ratio }
+    return ratio
+  }
+
+  /** Decodes [url] (blocking; call off the main thread), downsampled to about 1024 px, and caches it. */
+  fun decode(key: String, url: String): android.graphics.Bitmap? = runCatching {
+    val bytes = android.util.Base64.decode(url.substringAfter(','), android.util.Base64.DEFAULT)
+    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }; BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+    if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return@runCatching null
+    synchronized(aspects) { aspects[key] = bounds.outWidth.toFloat() / bounds.outHeight }
+    val options = BitmapFactory.Options().apply { inSampleSize = (maxOf(bounds.outWidth, bounds.outHeight) / 1024).coerceAtLeast(1) }
+    BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
+  }.getOrNull()?.also { bitmaps.put(key, it) }
+}
+
 @Composable
 internal fun AttachmentView(attachment: Attachment, onFile: (String) -> Unit) {
   if (attachment.url == OMITTED_INLINE_DATA) {
@@ -673,17 +707,20 @@ internal fun AttachmentView(attachment: Attachment, onFile: (String) -> Unit) {
   }
   val uriHandler = LocalUriHandler.current
   val dataImage = attachment.url.startsWith("data:image/") && attachment.url.length < 8_000_000
-  val bitmap by produceState<android.graphics.Bitmap?>(null, attachment.url) {
-    if (dataImage) value = withContext(Dispatchers.IO) { runCatching {
-      val bytes = android.util.Base64.decode(attachment.url.substringAfter(','), android.util.Base64.DEFAULT)
-      val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }; BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
-      if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return@runCatching null
-      val options = BitmapFactory.Options().apply { inSampleSize = (maxOf(bounds.outWidth, bounds.outHeight) / 1024).coerceAtLeast(1) }
-      BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
-    }.getOrNull() }
+  val key = remember(attachment.url) { if (dataImage) InlineImages.key(attachment.url) else null }
+  val aspect = remember(key) { key?.let { InlineImages.aspect(it, attachment.url) } }
+  val bitmap by produceState(key?.let(InlineImages::cached), key) {
+    if (key != null && value == null) value = withContext(Dispatchers.IO) { InlineImages.decode(key, attachment.url) }
   }
+  val image = remember(bitmap) { bitmap?.asImageBitmap() }
+  val description = attachment.name.ifBlank { "图片附件" }
   Column(Modifier.fillMaxWidth()) {
-    bitmap?.let { Image(it.asImageBitmap(), attachment.name.ifBlank { "图片附件" }, Modifier.fillMaxWidth().heightIn(max = 280.dp)) }
+    if (aspect != null) BoxWithConstraints(Modifier.fillMaxWidth()) {
+      // The height the decoded image will take (full width, capped at 280dp), reserved up front.
+      val height = minOf(maxWidth / aspect, 280.dp)
+      if (image != null) Image(image, description, Modifier.fillMaxWidth().height(height))
+      else Box(Modifier.fillMaxWidth().height(height).background(MiuixTheme.colorScheme.secondaryContainer, miuixSquircleShape(10.dp)))
+    } else image?.let { Image(it, description, Modifier.fillMaxWidth().heightIn(max = 280.dp)) }
     TextButton(text = attachment.name.ifBlank { if (dataImage) "图片附件" else attachment.url.substringAfterLast('/').take(100).ifBlank { "附件" } }, onClick = {
       when { attachment.url.startsWith("http://") || attachment.url.startsWith("https://") -> runCatching { uriHandler.openUri(attachment.url) }
         !attachment.url.startsWith("data:") -> onFile(runCatching { java.net.URI(attachment.url).path }.getOrNull() ?: attachment.url) }

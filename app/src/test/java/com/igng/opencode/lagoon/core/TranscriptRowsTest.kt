@@ -270,6 +270,49 @@ class TranscriptRowsTest {
     assertUniqueKeys(TranscriptRows.build(listOf(user("u1", t0), answer, answer), setOf(summary.key)))
   }
 
+  /**
+   * A history page that starts mid-turn, then the older page that completes it: every row already on
+   * screen keeps its key, so LazyColumn keeps its scroll anchor. Only the split turn's grouping rows
+   * (its time separator, keyed by the turn) may be replaced; its answer, notices, process output and
+   * tail (meta/diff/error) are keyed by their own message or part.
+   */
+  @Test fun completingASplitTurnKeepsTheKeysOfRowsAlreadyShown() {
+    val messages = listOf(
+      user("u1", t0),
+      assistant("a1", t0 + 100, part("a1r", "reasoning", text = "想一想"), tool("a1t", "bash", input = """{"command":"ls"}"""), completedAt = t0 + 150),
+      Message("n1", "notice", t0 + 160, emptyList(), notice = Notice("切换智能体")),
+      assistant("a2", t0 + 200, part("a2p", "text", text = "中途说明"), tool("a2t", "edit", input = """{"filePath":"a.kt"}""", patch = "@@ -1 +1 @@"), completedAt = t0 + 250),
+      assistant("a3", t0 + 300, part("a3p", "text", text = "最终答案"), completedAt = t0 + 400),
+      user("u2", t0 + 60_000),
+      assistant("b1", t0 + 60_100, tool("b1t", "read", input = """{"filePath":"b.kt"}""", output = "x"), completedAt = t0 + 60_200),
+      assistant("b2", t0 + 60_300, part("b2p", "text", text = "第二轮答案"), completedAt = t0 + 60_400),
+      user("u3", t0 + 120_000),
+      assistant("c1", t0 + 120_100, part("c1p", "text", text = "进行中"), completedAt = null)
+    )
+    val full = TranscriptRows.build(messages, working = true)
+    val fullKeys = full.map { it.key }.toSet()
+    // Every possible mid-turn cut of the first two turns, finished or still running.
+    for (cut in 1 until messages.indexOfFirst { it.id == "u3" }) {
+      val half = TranscriptRows.build(messages.drop(cut), working = true)
+      val kept = half.filterNot { it.kind == "time" || it.kind == "tool-group" || it.kind == "thinking" }
+      val moved = kept.filter { it.key !in fullKeys }
+      assertTrue("cut at $cut re-keyed ${moved.map { it.key }}", moved.isEmpty())
+    }
+    // Rows of turns the cut did not touch are identical, not just equal in key.
+    val half = TranscriptRows.build(messages.drop(2), working = true)
+    val untouched = half.drop(half.indexOfFirst { it.key == "user:u2" })
+    assertTrue(untouched.size > 3)
+    untouched.forEach { row -> assertEquals(full.single { it.key == row.key }, row) }
+  }
+
+  @Test fun aRunningBatchKeepsItsKeyAsCallsJoinIt() {
+    val first = listOf(user("u1", t0), assistant("a1", t0 + 500, tool("t1", "bash", input = """{"command":"ls"}""", status = "running"), completedAt = null))
+    val key = TranscriptRows.build(first, working = true).single { it.kind == "tool-group" }.key
+    val grown = listOf(user("u1", t0), assistant("a1", t0 + 500, tool("t1", "bash", input = """{"command":"ls"}"""),
+      tool("t2", "read", input = """{"filePath":"a.kt"}""", status = "running"), completedAt = null))
+    assertEquals(key, TranscriptRows.build(grown, working = true).single { it.kind == "tool-group" }.key)
+  }
+
   @Test fun keysAreStableAcrossRebuildsSoExpansionSurvivesUpdates() {
     val first = listOf(user("u1", t0), assistant("a1", t0 + 500, part("a1#0", "reasoning", text = "r"), tool("call_1", "bash", input = """{"command":"ls"}""", output = "x")))
     val groupKey = TranscriptRows.build(first).single { it.kind == "tool-group" }.key
