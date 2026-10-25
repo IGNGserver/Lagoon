@@ -1,0 +1,3 @@
+User-agent: *
+Allow: /
+Sitemap: https://lagoon.igng.net/sitemap.xml
