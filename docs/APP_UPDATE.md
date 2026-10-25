@@ -10,19 +10,19 @@ Lagoon 的设置页提供“检查更新 → 下载并校验 → 系统安装器
 
 ## 更新源与版本选择
 
-- 数据源为 `IGNGserver/Lagoon` 的 GitHub Releases API（`/releases?per_page=30`），匿名访问，不携带任何令牌。
-- 不使用 `/releases/latest`：它只认正式版，而本项目默认发布 pre-release。
+- 数据源为仓库 `updates` 分支的静态清单 `https://raw.githubusercontent.com/IGNGserver/Lagoon/updates/updates.json`，设备直连且不携带令牌，不回退 GitHub API 或中枢。
+- 发布流程先生成包含完整资产与 SHA-256 的清单；清单规范见 [UPDATES.md](UPDATES.md)。
 - 客户端按 SemVer 2.0 比较版本，包含 `-alpha.N` / `-beta.N` / `-rc.N` 的优先级规则，例如 `0.3.0-rc.10 > 0.3.0-rc.9`、`0.3.0 > 0.3.0-rc.10`。
-- 默认“包含预发布版本”。关闭后只考虑正式版。设置保存于本机 `ui` SharedPreferences 的 `updatePrerelease`。
-- 跳过 draft；选择版本最高的、严格新于当前 `versionName` 的 release。若最高版本没有 `Lagoon-<version>.apk`，直接报错，不会静默退回到更旧的版本。
-- 请求带 `ETag` / `If-None-Match`，304 时复用本地响应；成功后缓存响应，避免重复点击造成 GitHub 匿名额度（每小时 60 次）浪费。
+- 用户可选正式/预发布通道，预发布包含正式版。旧 `updatePrerelease` 偏好迁移到本机 `ui` SharedPreferences 的 `updateChannel`。正式通道同时排除预发布标记与 SemVer 预发布后缀；切换通道不降级。
+- 跳过 draft 与不完整资产；先筛选完整匹配的 `Lagoon-<version>.apk`、正数大小和 SHA-256，再选择严格新于当前版本的最高可安装版本。清单如带 versionCode，也须严格增加。
+- 请求带 `ETag` / `If-None-Match`，304 时复用持久缓存。自动检查间隔六小时加最多十五分钟抖动；手动检查至少间隔六十秒。失败持久指数退避，尊重 Retry-After 和 X-RateLimit-Reset；重启、重试与切通道均不能绕过冷却。
 
 ## 下载与安装前校验
 
 APK 下载到应用内部缓存 `cache/updates/`，写入时使用 `.part` 文件，完成后依次校验：
 
 1. 文件大小与 GitHub 资产元数据 `size` 一致；
-2. GitHub 资产 `digest` 提供的 SHA-256 一致（旧资产没有 digest 时跳过此项）；
+2. 清单资产 `digest` 提供的 SHA-256 一致（缺失则不提供该候选）；
 3. APK 包名必须是 `com.igng.opencode.lagoon`；
 4. APK `versionName` 必须等于发布 tag 去掉 `v` 后的版本；
 5. APK `versionCode` 必须严格大于当前安装版本；
@@ -37,9 +37,9 @@ APK 下载到应用内部缓存 `cache/updates/`，写入时使用 `.part` 文�
 | 场景 | 行为 |
 |---|---|
 | 无网络 / DNS / 超时 | 显示“无法连接 GitHub”，保留已下载的安装包 |
-| GitHub 403/429 限流 | 提示稍后重试；ETag 缓存可减少请求 |
+| GitHub 403/429 限流 | 显示冷却状态并保存可重试时间，避免连续请求 |
 | 更新仓库或接口异常 | 显示 HTTP 状态，可手动重试 |
-| 新版本没有 APK | 报错，不回退到更旧版本 |
+| 新版本没有完整 APK | 不作为候选；选择当前通道中最高的完整适配版本 |
 | 大小 / SHA-256 不符 | 删除下载文件，停止安装 |
 | 包名或版本名不符 | 删除文件，停止安装 |
 | 签名不一致 | 删除文件，提示开发版/不同来源无法覆盖 |

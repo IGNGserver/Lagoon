@@ -29,13 +29,17 @@ class AppUpdateTest {
         put("browser_download_url", assetUrl
           ?: "https://github.com/IGNGserver/Lagoon/releases/download/$tag/$assetName")
         put("size", 10_229_763L)
+        put("state", "uploaded")
         if (digest != null) put("digest", digest)
       })
     })
   }
 
-  private fun releases(vararg items: JSONObject) = JSONArray().apply {
-    items.forEach { put(it) }
+  private fun releases(vararg items: JSONObject) = JSONObject().apply {
+    put("schemaVersion", 1)
+    put("repository", AppUpdateSource.REPOSITORY)
+    put("generatedAt", "2026-10-25T00:00:00Z")
+    put("releases", JSONArray().apply { items.forEach { put(it) } })
   }.toString()
 
   @Test fun semverOrdersPrereleaseIdentifiersAndStableVersions() {
@@ -46,6 +50,9 @@ class AppUpdateTest {
     assertEquals(1, AppVersion.compare("0.2.10", "0.2.9"))
     assertEquals(-1, AppVersion.compare("1.0.0-alpha", "1.0.0-alpha.1"))
     assertNull(AppVersion.compare("nightly", "0.3.0"))
+    assertNull(AppVersion.parse("01.0.0"))
+    assertNull(AppVersion.parse("1.0.0-rc.01"))
+    assertEquals(0, AppVersion.compare("1.0.0+one", "1.0.0+two"))
   }
 
   @Test fun picksHighestNewerReleaseIncludingPrereleases() {
@@ -93,13 +100,13 @@ class AppUpdateTest {
     assertFalse(release.prerelease)
   }
 
-  @Test fun newerReleaseWithoutAnApkFailsInsteadOfOfferingAnOlderVersion() {
+  @Test fun newerIncompleteReleaseDoesNotHideAnInstallableUpdate() {
     val check = AppReleases.parse(releases(
       release("v0.3.0-rc.4", assetName = null),
       release("v0.3.0-rc.3")
     ), currentVersion = "0.3.0-rc.2", includePrerelease = true)
 
-    assertEquals(AppUpdateCheck.Failed(AppUpdateFailure.NO_ASSET), check)
+    assertEquals("0.3.0-rc.3", (check as AppUpdateCheck.Available).release.version)
   }
 
   @Test fun skipsDrafts() {
@@ -116,23 +123,23 @@ class AppUpdateTest {
       release("v0.3.0-rc.5", assetUrl = "http://github.com/IGNGserver/Lagoon/releases/download/x.apk")
     ), currentVersion = "0.3.0-rc.4", includePrerelease = true)
 
-    assertEquals(AppUpdateCheck.Failed(AppUpdateFailure.INVALID_RESPONSE, "安装包地址不可信"), check)
+    assertEquals(AppUpdateCheck.UpToDate, check)
   }
 
-  @Test fun missingDigestIsAllowedBecauseApkSignatureIsStillCheckedBeforeInstall() {
+  @Test fun missingDigestIsNotInstallable() {
     val check = AppReleases.parse(releases(
       release("v0.3.0-rc.4", digest = null)
     ), currentVersion = "0.3.0-rc.3", includePrerelease = true)
 
-    assertNull((check as AppUpdateCheck.Available).release.sha256)
+    assertEquals(AppUpdateCheck.UpToDate, check)
   }
 
-  @Test fun oneUnusuallyNamedApkIsUsedAsALastResort() {
+  @Test fun wrongAssetNameIsNotAnInstallableUpdate() {
     val check = AppReleases.parse(releases(
       release("v0.3.0-rc.4", assetName = "Lagoon-universal.apk")
     ), currentVersion = "0.3.0-rc.3", includePrerelease = true)
 
-    assertEquals("Lagoon-universal.apk", (check as AppUpdateCheck.Available).release.assetName)
+    assertEquals(AppUpdateCheck.UpToDate, check)
   }
 
   @Test fun multipleUnexpectedApksAreAmbiguousAndRejected() {
@@ -145,7 +152,7 @@ class AppUpdateTest {
     })
     val check = AppReleases.parse(releases(item), "0.3.0-rc.3", includePrerelease = true)
 
-    assertEquals(AppUpdateCheck.Failed(AppUpdateFailure.NO_ASSET), check)
+    assertEquals(AppUpdateCheck.UpToDate, check)
   }
 
   @Test fun upToDateWhenCurrentVersionIsNewest() {
@@ -168,6 +175,32 @@ class AppUpdateTest {
     )
   }
 
+  @Test fun stableRejectsAnRcEvenWhenGithubFlagIsWrong() {
+    assertEquals(AppUpdateCheck.UpToDate, AppReleases.parse(releases(
+      release("v0.3.0-rc.4", prerelease = false)), "0.2.4", includePrerelease = false))
+  }
+
+  @Test fun equalOrLowerVersionCodeCannotBeSelected() {
+    val item = release("v0.3.0-rc.4")
+    item.getJSONArray("assets").getJSONObject(0).put("versionCode", 42)
+    assertEquals(AppUpdateCheck.UpToDate,
+      AppReleases.parse(releases(item), "0.3.0-rc.3", true, currentVersionCode = 42))
+  }
+  @Test fun cachedFeedCanBeReselectedAfterSwitchingToStableAndRejectsStaleInstall() {
+    val feed = releases(release("v0.3.0-rc.4"), release("v0.2.5"))
+    val preview = (AppReleases.parse(feed, "0.2.4", true) as AppUpdateCheck.Available).release
+    val stable = (AppReleases.parse(feed, "0.2.4", false) as AppUpdateCheck.Available).release
+    assertEquals("0.2.5", stable.version)
+    assertFalse(AppReleases.isAllowed(preview, "0.2.4", false))
+    assertTrue(AppReleases.isAllowed(stable, "0.2.4", false))
+  }
+
+  @Test fun foreignOrUnsupportedFeedsAreRejected() {
+    assertEquals(AppUpdateCheck.Failed(AppUpdateFailure.INVALID_RESPONSE),
+      AppReleases.parse(releases().replace("IGNGserver/Lagoon", "evil/other"), "0.2.4", false))
+    assertEquals(AppUpdateCheck.Failed(AppUpdateFailure.INVALID_RESPONSE),
+      AppReleases.parse(releases().replace("\"schemaVersion\":1", "\"schemaVersion\":2"), "0.2.4", false))
+  }
   @Test fun onlyHttpsGithubHostsAreTrustedForDownloads() {
     assertTrue(AppUpdateSource.isTrustedAssetUrl("https://github.com/IGNGserver/Lagoon/releases/download/v1/Lagoon-1.apk"))
     assertTrue(AppUpdateSource.isTrustedAssetUrl("https://release-assets.githubusercontent.com/x/Lagoon-1.apk"))

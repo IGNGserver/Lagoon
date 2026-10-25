@@ -8,6 +8,7 @@ data class AppRelease(
   val version: String,
   val tag: String,
   val prerelease: Boolean,
+  val versionCode: Long? = null,
   val publishedAt: String?,
   val notes: String,
   val pageUrl: String,
@@ -32,7 +33,7 @@ sealed interface AppUpdateCheck {
 fun AppUpdateFailure.userMessage(detail: String? = null): String {
   val base = when (this) {
     AppUpdateFailure.NETWORK -> "无法连接 GitHub，请检查网络后重试"
-    AppUpdateFailure.RATE_LIMITED -> "GitHub 接口暂时限流，请稍后再试"
+    AppUpdateFailure.RATE_LIMITED -> "更新检查暂时冷却，请稍后再试"
     AppUpdateFailure.NOT_FOUND -> "找不到 Lagoon 的发布页面"
     AppUpdateFailure.HTTP -> "更新服务返回异常"
     AppUpdateFailure.INVALID_RESPONSE -> "更新信息格式无法识别"
@@ -47,7 +48,7 @@ fun AppUpdateFailure.userMessage(detail: String? = null): String {
   }
   return when {
     detail.isNullOrBlank() -> base
-    this == AppUpdateFailure.HTTP || this == AppUpdateFailure.INVALID_RESPONSE ||
+    this == AppUpdateFailure.RATE_LIMITED || this == AppUpdateFailure.HTTP || this == AppUpdateFailure.INVALID_RESPONSE ||
       this == AppUpdateFailure.INVALID_APK || this == AppUpdateFailure.PACKAGE_MISMATCH ||
       this == AppUpdateFailure.VERSION_REGRESSION -> "$base（$detail）"
     else -> base
@@ -60,7 +61,7 @@ object AppVersion {
 
   // Tags may carry a leading v; build metadata is accepted but does not participate in ordering.
   private val pattern = Regex(
-    "^[vV]?(\\d+)\\.(\\d+)\\.(\\d+)(?:-([0-9A-Za-z.-]+))?(?:\\+[0-9A-Za-z.-]+)?$"
+    "^[vV]?(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-([0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*))?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$"
   )
 
   fun normalize(value: String): String {
@@ -76,7 +77,7 @@ object AppVersion {
     val rawPrerelease = match.groupValues[4]
     val prerelease = if (rawPrerelease.isEmpty()) null else {
       val identifiers = rawPrerelease.split('.')
-      if (identifiers.any { it.isEmpty() }) return null
+      if (identifiers.any { it.isEmpty() || it.length > 1 && it[0] == '0' && it.all(Char::isDigit) }) return null
       identifiers
     }
     return Parsed(major, minor, patch, prerelease)
@@ -96,8 +97,8 @@ object AppVersion {
     for (index in 0 until minOf(a.prerelease.size, b.prerelease.size)) {
       val leftPart = a.prerelease[index]
       val rightPart = b.prerelease[index]
-      val leftNumber = leftPart.toIntOrNull()
-      val rightNumber = rightPart.toIntOrNull()
+      val leftNumber = leftPart.takeIf { it.all(Char::isDigit) }?.toBigIntegerOrNull()
+      val rightNumber = rightPart.takeIf { it.all(Char::isDigit) }?.toBigIntegerOrNull()
       val order = when {
         leftNumber != null && rightNumber != null -> leftNumber.compareTo(rightNumber)
         // SemVer: numeric identifiers always have lower precedence than alphanumeric ones.
@@ -111,10 +112,10 @@ object AppVersion {
   }
 }
 
-/** GitHub appends `sha256:<hex>` to release assets; older uploads may not have one. */
+/** Repository-hosted feed: the publisher fills SHA-256 for every installable asset. */
 object AppUpdateSource {
   const val REPOSITORY = "IGNGserver/Lagoon"
-  const val API_URL = "https://api.github.com/repos/$REPOSITORY/releases?per_page=30"
+  const val API_URL = "https://raw.githubusercontent.com/$REPOSITORY/updates/updates.json"
 
   fun isTrustedAssetUrl(value: String): Boolean {
     val uri = runCatching { java.net.URI(value) }.getOrNull() ?: return false
@@ -129,33 +130,44 @@ object AppUpdateSource {
 }
 
 object AppReleases {
+  fun isAllowed(release: AppRelease, current: String, includePrerelease: Boolean): Boolean {
+    val parsed = AppVersion.parse(release.version) ?: return false
+    return (AppVersion.compare(release.version, current) ?: -1) > 0 &&
+      (includePrerelease || !release.prerelease && parsed.prerelease == null)
+  }
   private val digestPattern = Regex("^sha256:([0-9a-fA-F]{64})$")
 
   /**
    * Selects the highest newer release. Pre-releases are included only when [includePrerelease] is
-   * true. A newer release without the expected APK is a hard failure instead of silently offering
-   * an older version.
+   * true. Only complete, compatible APK assets participate in version selection.
    */
-  fun parse(json: String, currentVersion: String, includePrerelease: Boolean): AppUpdateCheck {
+  fun parse(json: String, currentVersion: String, includePrerelease: Boolean, currentVersionCode: Long = 0): AppUpdateCheck {
     if (AppVersion.parse(currentVersion) == null) {
       return AppUpdateCheck.Failed(AppUpdateFailure.UNRECOGNIZED_VERSION)
     }
-    val array = runCatching { JSONArray(json) }.getOrElse {
-      return AppUpdateCheck.Failed(AppUpdateFailure.INVALID_RESPONSE)
-    }
-
+    val array = runCatching {
+      val feed = JSONObject(json)
+      require(feed.opt("schemaVersion") == 1 && feed.getString("repository") == AppUpdateSource.REPOSITORY)
+      require(validGeneratedAt(feed.getString("generatedAt")))
+      feed.getJSONArray("releases")
+    }.getOrElse { return AppUpdateCheck.Failed(AppUpdateFailure.INVALID_RESPONSE) }
     var highest: JSONObject? = null
     var highestVersion: String? = null
     var highestPrerelease = false
     for (index in 0 until array.length()) {
       val item = array.optJSONObject(index) ?: continue
       if (item.optBoolean("draft", false)) continue
-      val prerelease = item.optBoolean("prerelease", false)
-      if (prerelease && !includePrerelease) continue
       val tag = item.optString("tag_name").trim()
       if (tag.isEmpty()) continue
       val version = AppVersion.normalize(tag)
-      if (AppVersion.parse(version) == null) continue
+      val parsedVersion = AppVersion.parse(version) ?: continue
+      val prerelease = item.optBoolean("prerelease", false) || parsedVersion.prerelease != null
+      if (prerelease && !includePrerelease) continue
+      val apk = findAsset(item.optJSONArray("assets"), version) ?: continue
+      val assetCode = positiveInteger(apk, "versionCode")
+      if (apk.optString("state") != "uploaded" || (positiveInteger(apk, "size") ?: 0) !in 1..200L * 1024 * 1024 || parseDigest(apk) == null ||
+          !apk.optString("browser_download_url").startsWith("https://github.com/${AppUpdateSource.REPOSITORY}/releases/download/$tag/") ||
+          (apk.has("versionCode") && (assetCode == null || assetCode <= currentVersionCode))) continue
       val order = AppVersion.compare(version, currentVersion) ?: continue
       if (order <= 0) continue
       val previousOrder = highestVersion?.let { AppVersion.compare(version, it) }
@@ -175,11 +187,12 @@ object AppReleases {
     if (!AppUpdateSource.isTrustedAssetUrl(assetUrl)) {
       return AppUpdateCheck.Failed(AppUpdateFailure.INVALID_RESPONSE, "安装包地址不可信")
     }
-    val size = asset.optLong("size", 0L).takeIf { it > 0 }
+    val size = positiveInteger(asset, "size")
     val release = AppRelease(
       version = version,
       tag = candidate.optString("tag_name").trim(),
-      prerelease = candidate.optBoolean("prerelease", false),
+      prerelease = highestPrerelease,
+      versionCode = positiveInteger(asset, "versionCode"),
       publishedAt = candidate.optString("published_at").trim().takeIf { it.isNotEmpty() },
       notes = candidate.optString("body", ""),
       pageUrl = candidate.optString("html_url").trim(),
@@ -194,16 +207,14 @@ object AppReleases {
   private fun findAsset(assets: JSONArray?, version: String): JSONObject? {
     if (assets == null) return null
     val expected = "Lagoon-$version.apk"
-    val apkAssets = mutableListOf<JSONObject>()
     for (index in 0 until assets.length()) {
       val asset = assets.optJSONObject(index) ?: continue
-      val name = asset.optString("name").trim()
-      if (name == expected) return asset
-      if (name.startsWith("Lagoon-") && name.endsWith(".apk")) apkAssets += asset
+      if (asset.optString("name").trim() == expected) return asset
     }
-    // One unambiguous APK with an unexpected name is still usable after package and signature checks.
-    return apkAssets.singleOrNull()
+    return null
   }
+  private fun positiveInteger(value: JSONObject, key: String): Long? =
+    (value.opt(key) as? Number)?.toString()?.toLongOrNull()?.takeIf { it > 0 }
 
   private fun parseDigest(asset: JSONObject): String? {
     if (!asset.has("digest") || asset.isNull("digest")) return null
