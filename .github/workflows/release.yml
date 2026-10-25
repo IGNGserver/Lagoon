@@ -225,6 +225,12 @@ jobs:
             exit 1
           fi
 
+      - name: 触发官网自动部署
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: gh api "repos/${GITHUB_REPOSITORY}/dispatches" -f event_type=release-published
+
       - name: 发布结果提示
         if: failure()
         shell: bash

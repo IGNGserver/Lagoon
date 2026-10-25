@@ -1,0 +1,578 @@
+<!doctype html>
+<html lang="zh-CN" class="no-js">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Lagoon — 原生 Android 的 coding agent 控制端</title>
+  <meta name="description" content="Lagoon 是面向 coding agent 的原生 Android 控制端，首发支持 OpenCode 2.x：直连你自己的服务器，在手机上查看会话、下达任务、处理授权与提问，任务状态实时浮现在系统通知里。">
+  <meta name="theme-color" content="#030816">
+  <meta name="color-scheme" content="dark">
+  <meta name="msvalidate.01" content="B411826ACAE5C5CD20EA5574C3F8A6E4">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="Lagoon — Agent 在远方深潜，进度在掌心浮现">
+  <meta property="og:description" content="原生 Android 的 coding agent 控制端。直连你自己的 OpenCode 2.x 服务器，无需第三方中转。">
+  <link rel="canonical" href="https://lagoon.igng.net/">
+  <meta property="og:url" content="https://lagoon.igng.net/">
+  <meta property="og:image" content="https://lagoon.igng.net/assets/img/og.jpg">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:locale" content="zh_CN">
+  <meta name="twitter:card" content="summary_large_image">
+  <link rel="icon" href="assets/img/favicon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="apple-touch-icon.png">
+  <link rel="preload" href="assets/fonts/sora-latin-var.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="assets/css/main.css">
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "SoftwareApplication",
+    "name": "Lagoon",
+    "applicationCategory": "DeveloperApplication",
+    "operatingSystem": "Android 8.0+",
+    "softwareVersion": "0.2.4",
+    "downloadUrl": "https://github.com/IGNGserver/opencode-lagoon/releases/download/v0.2.4/Lagoon-0.2.4.apk",
+    "codeRepository": "https://github.com/IGNGserver/opencode-lagoon",
+    "description": "面向 coding agent 的原生 Android 控制端，首发支持 OpenCode 2.x 服务端。"
+  }
+  </script>
+</head>
+<body>
+  <svg width="0" height="0" class="sprite" aria-hidden="true" focusable="false">
+    <defs>
+      <linearGradient id="markGrad" x1="8" y1="40" x2="42" y2="8" gradientUnits="userSpaceOnUse">
+        <stop offset="0" stop-color="#4f5bea"/>
+        <stop offset="1" stop-color="#59d2e6"/>
+      </linearGradient>
+    </defs>
+    <symbol id="mark" viewBox="0 0 48 48">
+      <path d="M35 13C32.9 10.8 29.8 9.5 26.2 9.5H20C13.9 9.5 9 14.4 9 20.5V27.5C9 33.6 13.9 38.5 20 38.5H28.5C32.2 38.5 35.4 36.7 37.3 33.8" fill="none" stroke="url(#markGrad)" stroke-width="5.5" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M33.5 22H37.5L43 27.5L37.5 33H33.5L39 27.5Z" fill="#59d2e6"/>
+      <circle cx="39" cy="9" r="3" fill="#52e0c4"/>
+    </symbol>
+    <symbol id="i-github" viewBox="0 0 24 24"><path fill="currentColor" d="M12 2a10 10 0 0 0-3.16 19.49c.5.09.68-.22.68-.48v-1.7c-2.78.6-3.37-1.34-3.37-1.34-.45-1.16-1.11-1.47-1.11-1.47-.91-.62.07-.6.07-.6 1 .07 1.53 1.03 1.53 1.03.9 1.52 2.34 1.08 2.91.83.09-.65.35-1.09.63-1.34-2.22-.25-4.55-1.11-4.55-4.94 0-1.09.39-1.98 1.03-2.68-.1-.25-.45-1.27.1-2.64 0 0 .84-.27 2.75 1.02a9.5 9.5 0 0 1 5 0c1.91-1.29 2.75-1.02 2.75-1.02.55 1.37.2 2.39.1 2.64.64.7 1.03 1.59 1.03 2.68 0 3.84-2.34 4.68-4.57 4.93.36.31.68.92.68 1.85v2.74c0 .27.18.58.69.48A10 10 0 0 0 12 2Z"/></symbol>
+    <symbol id="i-down" viewBox="0 0 24 24"><path d="M12 4v13m-6-6 6 6 6-6M5 20h14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M5 12h14m-6-6 6 6-6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="3" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2" fill="none" stroke="currentColor" stroke-width="1.8"/></symbol>
+    <symbol id="i-warn" viewBox="0 0 24 24"><path d="M12 3 22 20H2Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M12 9.5v4.5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="17" r="1.1" fill="currentColor"/></symbol>
+  </svg>
+
+  <canvas id="ocean" aria-hidden="true"></canvas>
+  <div class="ocean-fallback" aria-hidden="true"></div>
+  <div class="grain" aria-hidden="true"></div>
+
+  <a class="skip-link" href="#main">跳到正文</a>
+
+  <header class="nav" data-nav>
+    <a class="nav__brand" href="#surface" aria-label="Lagoon 首页">
+      <svg class="nav__mark" aria-hidden="true"><use href="#mark"/></svg>
+      <span>Lagoon</span>
+    </a>
+    <nav class="nav__links" aria-label="页面导航">
+      <a href="#connect">连接</a>
+      <a href="#session">会话</a>
+      <a href="#live">实时更新</a>
+      <a href="#depths">能力</a>
+      <a href="#roadmap">航道图</a>
+    </nav>
+    <a class="nav__cta" href="#download">下载</a>
+    <button class="nav__menu" type="button" aria-expanded="false" aria-controls="mobile-menu" data-menu-toggle>
+      <span class="sr-only">打开导航</span><i></i><i></i>
+    </button>
+    <div class="nav__sheet" id="mobile-menu" data-menu hidden>
+      <a href="#connect">连接</a>
+      <a href="#session">会话</a>
+      <a href="#live">实时更新</a>
+      <a href="#depths">能力</a>
+      <a href="#roadmap">航道图</a>
+      <a href="#download">下载 v0.2.4</a>
+    </div>
+  </header>
+
+  <aside class="depth" aria-hidden="true" data-depth-gauge>
+    <div class="depth__rail"><div class="depth__fill"></div></div>
+    <div class="depth__marks"></div>
+    <div class="depth__readout"><span data-depth-value>0</span><small>m</small></div>
+  </aside>
+
+  <main id="main">
+
+    <!-- ============ 0 m · Surface ============ -->
+    <section class="hero" id="surface" data-depth="0" data-label="海面">
+      <div class="hero__copy">
+        <p class="eyebrow"><span class="eyebrow__depth">0 m</span>原生 Android · coding agent 控制端</p>
+        <h1 class="hero__title">
+          <span class="line"><span>Agent 在远方深潜，</span></span>
+          <span class="line"><span>进度在<em class="shimmer">掌心浮现</em>。</span></span>
+        </h1>
+        <p class="hero__lede">
+          Lagoon 直连你自己的 <strong>OpenCode 2.x</strong> 服务器——在手机上查看会话、继续下达任务、处理授权与提问。
+          任务状态会浮现在通知与系统实时更新里，全程无需第三方中转。
+        </p>
+        <div class="hero__actions">
+          <a class="btn btn--primary" href="https://github.com/IGNGserver/opencode-lagoon/releases/download/v0.2.4/Lagoon-0.2.4.apk" data-magnetic>
+            <svg aria-hidden="true"><use href="#i-down"/></svg>
+            <span>下载 v0.2.4<small>APK · 10 MB · Android 8.0+</small></span>
+          </a>
+          <a class="btn btn--glass" href="https://github.com/IGNGserver/opencode-lagoon" data-magnetic>
+            <svg aria-hidden="true"><use href="#i-github"/></svg>
+            <span>查看源码</span>
+          </a>
+        </div>
+        <ul class="hero__facts" aria-label="版本信息">
+          <li><b>正式版</b> v0.2.4 · 2026-10-12</li>
+          <li><b class="is-preview">预览版</b> v0.2.5-rc.4 · 2026-10-14</li>
+        </ul>
+      </div>
+
+      <div class="hero__stage" data-tilt-stage>
+        <div class="orbit orbit--a" aria-hidden="true"></div>
+        <div class="orbit orbit--b" aria-hidden="true"></div>
+        <div class="float-tag float-tag--a" aria-hidden="true"><i class="pulse"></i>SSE 实时事件流</div>
+        <div class="float-tag float-tag--b" aria-hidden="true"><svg><use href="#i-warn"/></svg>需确认关键操作</div>
+        <div class="float-tag float-tag--c" aria-hidden="true"><code>lagoon://</code>深链直达会话</div>
+
+        <figure class="phone" data-tilt aria-label="Lagoon 会话首页界面示意">
+          <div class="phone__body">
+            <div class="phone__edge" aria-hidden="true"></div>
+            <div class="phone__screen screen-home" data-home>
+              <div class="sb">
+                <span class="sb__time">9:41</span>
+                <span class="sb__pill" data-home-pill><i class="spin-mini"></i><b data-home-short>2跑·1完·1待</b></span>
+                <span class="sb__icons" aria-hidden="true"><i class="sig"></i><i class="bat"></i></span>
+              </div>
+              <div class="home-top">
+                <span class="home-top__title">全部会话 <i class="chev"></i></span>
+                <span class="circ" aria-hidden="true"><i></i><i></i><i></i></span>
+              </div>
+              <div class="chips">
+                <span class="chip is-on"><i class="ok"></i>我的 OpenCode</span>
+                <span class="chip">工作站</span>
+                <span class="chip chip--add">＋</span>
+              </div>
+              <div class="grp">今天 <i class="chev"></i></div>
+              <ul class="rows">
+                <li class="row is-bold" data-row="a"><i class="st st--run"></i><span>重构离线缓存的截断策略</span></li>
+                <li class="row is-bold" data-row="b"><i class="st st--wait"></i><span>升级 Gradle 版本目录</span><em>待授权</em></li>
+                <li class="row is-bold" data-row="c"><i class="st st--unread"></i><span>修复 SSE 重连后的计数</span></li>
+                <li class="row" data-row="d"><i class="st st--run"></i><span>为通知深链补充回归测试</span></li>
+                <li class="row"><i class="st"></i><span>整理 v0.2.4 发布说明</span></li>
+              </ul>
+              <div class="grp">昨天 <i class="chev"></i></div>
+              <ul class="rows">
+                <li class="row"><i class="st"></i><span>排查子会话父链汇总</span></li>
+                <li class="row"><i class="st"></i><span>对齐官方时间线投影规则</span></li>
+                <li class="row"><i class="st"></i><span>新会话</span></li>
+              </ul>
+              <span class="fab" aria-hidden="true">＋</span>
+              <span class="gesture" aria-hidden="true"></span>
+            </div>
+          </div>
+          <div class="phone__glare" aria-hidden="true"></div>
+        </figure>
+        <figcaption class="stage-note">界面示意 · 依据 v0.2.4 实际布局重绘，数据为演示内容</figcaption>
+      </div>
+
+      <a class="scroll-cue" href="#connect" aria-label="向下浏览"><span></span></a>
+    </section>
+
+    <!-- ============ 18 m · Connect ============ -->
+    <section class="section connect" id="connect" data-depth="18" data-label="连接">
+      <header class="section__head reveal">
+        <p class="eyebrow"><span class="eyebrow__depth">−18 m</span>连接</p>
+        <h2>一根直连的光纤，<br>中间没有任何中转站。</h2>
+        <p class="section__lede">手机直接与你的 OpenCode 服务端建立连接：REST 读写加上全局 SSE 事件流。
+          v0.2.0 起已彻底移除 FCM 推送与伴随服务，凭据只留在你自己的手机里。</p>
+      </header>
+
+      <div class="currents reveal" data-currents>
+        <div class="currents__toolbar" role="group" aria-label="版本对比">
+          <button type="button" class="seg is-on" data-mode="stable" aria-pressed="true">正式版 v0.2.4</button>
+          <button type="button" class="seg" data-mode="preview" aria-pressed="false">预览版 v0.2.5-rc</button>
+        </div>
+        <div class="currents__canvas">
+          <svg class="currents__svg" viewBox="0 -60 800 572" role="img" aria-labelledby="currents-title currents-desc">
+            <title id="currents-title">手机与多台 OpenCode 服务器的连接示意</title>
+            <desc id="currents-desc">正式版只实时监控当前服务器；预览版同时保持全部已配置服务器的连接。</desc>
+            <defs>
+              <linearGradient id="threadGrad" x1="0" y1="1" x2="0" y2="0">
+                <stop offset="0" stop-color="#52e0c4"/>
+                <stop offset="1" stop-color="#5e6bff"/>
+              </linearGradient>
+              <radialGradient id="orbGrad" cx="35%" cy="30%" r="75%">
+                <stop offset="0" stop-color="#bff6ff" stop-opacity=".9"/>
+                <stop offset=".35" stop-color="#59d2e6" stop-opacity=".35"/>
+                <stop offset="1" stop-color="#4752d6" stop-opacity=".12"/>
+              </radialGradient>
+              <filter id="soft" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="6"/></filter>
+            </defs>
+            <g data-threads></g>
+            <g data-packets></g>
+            <g data-nodes></g>
+            <g class="cur-phone" transform="translate(400 452)">
+              <rect x="-26" y="-48" width="52" height="96" rx="13" class="cur-phone__body"/>
+              <rect x="-21" y="-42" width="42" height="84" rx="9" class="cur-phone__screen"/>
+              <use href="#mark" x="-12" y="-14" width="24" height="24"/>
+            </g>
+          </svg>
+          <p class="currents__status" aria-live="polite" data-currents-status>点按任一服务器节点，切换当前服务器。</p>
+        </div>
+        <ul class="currents__facts">
+          <li><b>直连端点</b><span>填写服务器地址，或直接粘贴 <code>opencode pair</code> 输出的官方配对链接（强制 HTTPS）。</span></li>
+          <li><b>Keystore 加密</b><span>密码与会话 Cookie 由 Android Keystore AES-GCM 保护；请求绑定固定 origin，禁止跨源重定向转发凭据。</span></li>
+          <li><b>断线自动对账</b><span>SSE 断开后自动重连，并重新读取控制状态补齐断线期间的变化。</span></li>
+          <li><b>明文需显式授权</b><span>建议走 HTTPS 或可信 VPN；局域网 HTTP 必须在该服务器资料中明确开启。</span></li>
+        </ul>
+      </div>
+    </section>
+
+    <!-- ============ 46 m · Session ============ -->
+    <section class="section story" id="session" data-depth="46" data-label="会话">
+      <header class="section__head reveal">
+        <p class="eyebrow"><span class="eyebrow__depth">−46 m</span>会话</p>
+        <h2>离开电脑，<br>对话不必中断。</h2>
+        <p class="section__lede">时间线按官方客户端规则投影：轮次分组、工具折叠、只显示最后一条错误。下滑看看一次任务在 Lagoon 里如何展开。</p>
+      </header>
+
+      <div class="story__grid">
+        <ol class="story__steps">
+          <li class="step" data-step="1">
+            <span class="step__n">01</span>
+            <h3>在手机上下达任务</h3>
+            <p>选择项目、Agent 与模型，输入任务或斜杠命令（经服务端 <code>/command</code> 执行），也可以附上图片和文件。</p>
+          </li>
+          <li class="step" data-step="2">
+            <span class="step__n">02</span>
+            <h3>过程收成一条轨迹</h3>
+            <p>每个用户轮次的工具调用收拢为「共处理 N 个操作」。展开即可查看命令与输出、读写路径、编辑前后文本与思考过程。</p>
+          </li>
+          <li class="step" data-step="3">
+            <span class="step__n">03</span>
+            <h3>授权与提问，就地处理</h3>
+            <p>Agent 需要执行关键动作时，直接在手机上「允许一次」或「拒绝」；只有服务端给出保存范围时才提供「始终允许」。问答表单同样可以直接填写。</p>
+          </li>
+          <li class="step" data-step="4">
+            <span class="step__n">04</span>
+            <h3>运行中，也能继续引导</h3>
+            <p>任务运行时仍可继续发送消息来引导当前轮次，或随时停止。消息由客户端生成 id，断线时只用同一 id 重试一次。</p>
+          </li>
+          <li class="step" data-step="5">
+            <span class="step__n">05</span>
+            <h3>子会话、改动与文件</h3>
+            <p>右上角 ⋯ 收纳子任务、代码改动与文件浏览搜索；重命名、置顶、删除都在手边。</p>
+          </li>
+        </ol>
+
+        <div class="story__sticky">
+          <figure class="phone phone--chat" data-chat-phone aria-label="Lagoon 聊天界面示意">
+            <div class="phone__body">
+              <div class="phone__edge" aria-hidden="true"></div>
+              <div class="phone__screen screen-chat" data-chat data-at="1">
+                <div class="sb sb--chat"><span class="sb__time">9:42</span><span class="sb__icons" aria-hidden="true"><i class="sig"></i><i class="bat"></i></span></div>
+                <div class="chat-top">
+                  <span class="qc" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M15 5 8 12l7 7"/></svg></span>
+                  <div class="chat-top__title"><b>重构离线缓存的截断策略</b><small>opencode-lagoon · build</small></div>
+                  <span class="qc" data-more aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></svg></span>
+                </div>
+                <div class="chat-body">
+                  <div class="msg-user" data-show="1">缓存超限时保留最新的消息，并把会话标记为“不完整”，别再让旧缓存冒充完整会话。</div>
+                  <div class="trace" data-show="2">
+                    <button type="button" class="trace__head" tabindex="-1"><span class="trace__icon"></span>共处理 6 个操作<i class="chev"></i></button>
+                    <ol class="trace__list">
+                      <li><span>读取</span><code>core/OfflineCache.kt</code></li>
+                      <li><span>搜索</span><code>"truncate" · 4 处</code></li>
+                      <li><span>编辑</span><code>OfflineCache.kt <ins>+38</ins> <del>−12</del></code></li>
+                      <li><span>运行</span><code>./gradlew :app:testDebugUnitTest</code></li>
+                    </ol>
+                  </div>
+                  <div class="msg-ai" data-show="2">已改为按预算从最新消息向前保留，超限时写入 <code>truncated</code> 标记，首页会显示“缓存已截断”。接下来跑一遍单元测试确认。</div>
+                  <div class="perm" data-show="3">
+                    <p class="perm__title"><svg><use href="#i-warn"/></svg>需确认关键操作</p>
+                    <p class="perm__lead">OpenCode 正在请求执行动作：</p>
+                    <pre class="perm__cmd">bash  ./gradlew :app:testDebugUnitTest</pre>
+                    <div class="perm__actions"><span class="pb pb--ghost">拒绝</span><span class="pb pb--ghost">始终允许</span><span class="pb pb--solid" data-allow>允许一次</span></div>
+                  </div>
+                  <div class="msg-user msg-user--late" data-show="4">顺便把截断阈值写进设置页说明。</div>
+                  <div class="running" data-show="4"><i class="spin-mini"></i>运行中 · <span data-elapsed>1 分 12 秒</span></div>
+                </div>
+                <div class="composer">
+                  <span class="composer__plus" aria-hidden="true">＋</span>
+                  <span class="composer__field" data-composer>描述你的任务…</span>
+                  <span class="composer__btn" data-composer-btn aria-hidden="true"></span>
+                </div>
+                <div class="sheet" data-show="5">
+                  <span class="sheet__grip"></span>
+                  <p class="sheet__title">会话操作</p>
+                  <ul>
+                    <li><b>子任务（2）</b><span>explore · general</span></li>
+                    <li><b>改动（3）</b><span>OfflineCache.kt · +38 −12</span></li>
+                    <li><b>文件</b><span>浏览与搜索工程文件</span></li>
+                    <li><b>重命名</b></li>
+                    <li class="danger"><b>删除</b></li>
+                  </ul>
+                </div>
+                <span class="gesture" aria-hidden="true"></span>
+              </div>
+            </div>
+            <div class="phone__glare" aria-hidden="true"></div>
+          </figure>
+          <div class="story__dots" aria-hidden="true"><i data-dot="1"></i><i data-dot="2"></i><i data-dot="3"></i><i data-dot="4"></i><i data-dot="5"></i></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ 80 m · Live ============ -->
+    <section class="section live" id="live" data-depth="80" data-label="实时更新">
+      <header class="section__head reveal">
+        <p class="eyebrow"><span class="eyebrow__depth">−80 m</span>实时更新</p>
+        <h2>像生物荧光一样，<br>状态会自己亮起来。</h2>
+        <p class="section__lede">Android 16 上，服务器总览以系统「实时更新」常驻状态栏胶囊与锁屏，只在有任务运行或待处理时上岛。
+          外观完全交给系统绘制，Lagoon 只按标准格式提供内容，不写任何厂商私有字段。</p>
+      </header>
+
+      <div class="live__grid reveal" data-live>
+        <div class="live__device">
+          <div class="live__os" role="group" aria-label="系统版本">
+            <button type="button" class="seg is-on" data-os="16" aria-pressed="true">Android 16</button>
+            <button type="button" class="seg" data-os="15" aria-pressed="false">Android 15 及以下</button>
+          </div>
+          <div class="shade">
+            <div class="shade__bar">
+              <span>9:41</span>
+              <span class="shade__pill" data-live-pill><i></i><b data-live-short>1跑·0完</b></span>
+              <span class="sb__icons" aria-hidden="true"><i class="sig"></i><i class="bat"></i></span>
+            </div>
+            <div class="notif" data-live-card>
+              <div class="notif__head">
+                <svg class="notif__icon" aria-hidden="true"><use href="#mark"/></svg>
+                <span>Lagoon</span><span class="notif__dot">·</span><span data-live-server>我的 OpenCode</span>
+                <span class="notif__stage" data-live-stage>进行中</span>
+              </div>
+              <p class="notif__title" data-live-title>1 个任务运行中</p>
+              <p class="notif__text" data-live-text>1个运行中，0个已完成</p>
+              <div class="notif__track" data-live-track aria-hidden="true"></div>
+              <ul class="notif__lines" data-live-lines></ul>
+            </div>
+            <p class="shade__empty" data-live-empty hidden>没有需要展示的内容 · 通知已移除</p>
+          </div>
+          <p class="live__caption" data-live-caption>示意图：系统表面的字体、配色与布局以设备实际绘制为准。</p>
+        </div>
+
+        <div class="live__panel">
+          <p class="live__panel-title">模拟一台服务器上的任务</p>
+          <div class="live__controls">
+            <button type="button" class="ctl" data-act="start"><span>＋</span>开始新任务</button>
+            <button type="button" class="ctl" data-act="ask"><span>?</span>请求授权</button>
+            <button type="button" class="ctl" data-act="answer"><span>✓</span>处理授权</button>
+            <button type="button" class="ctl" data-act="complete"><span>●</span>完成一个</button>
+            <button type="button" class="ctl" data-act="fail"><span>✕</span>失败一个</button>
+            <button type="button" class="ctl" data-act="read"><span>◎</span>打开会话（已读）</button>
+          </div>
+          <dl class="live__stages">
+            <div data-stage-row="ACTIVE"><dt>进行中</dt><dd>有任务运行或待处理：常驻并申请提升为实时更新，胶囊显示 <code>x跑·y完</code>。</dd></div>
+            <div data-stage-row="SETTLED"><dt>已结束</dt><dd>只剩未读的完成 / 失败：降级为可划掉的普通通知，不再常驻岛上。</dd></div>
+            <div data-stage-row="EMPTY"><dt>空</dt><dd>全部已读：移除通知。打开会话即视为已读，计数随之下降。</dd></div>
+          </dl>
+          <p class="live__foot">计数口径统一为「运行中 / 未读已完成 / 待回复 / 失败」。分段轨道表达任务组成，而不是虚构的完成百分比；Android 15 及以下使用普通通知与不确定进度条。</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ 120 m · Depths ============ -->
+    <section class="section depths" id="depths" data-depth="120" data-label="能力">
+      <header class="section__head reveal">
+        <p class="eyebrow"><span class="eyebrow__depth">−120 m</span>能力 · 正式版 v0.2.4</p>
+        <h2>在深水区，<br>细节都在。</h2>
+      </header>
+
+      <div class="bento">
+        <article class="cell cell--wide reveal" data-glass>
+          <div class="cell__art art-servers" aria-hidden="true">
+            <span class="srv is-on"><i></i>我的 OpenCode</span><span class="srv"><i></i>工作站</span><span class="srv srv--add">＋</span>
+          </div>
+          <h3>多服务器资料</h3>
+          <p>保存多台服务器，胶囊一键切换。支持 Basic Auth、官方 <code>opencode pair</code> 配对链接，认证失败不会保存资料。</p>
+        </article>
+        <article class="cell reveal" data-glass>
+          <div class="cell__art art-group" aria-hidden="true"><span>日期</span><span class="is-on">项目</span><span>状态</span></div>
+          <h3>项目与会话</h3>
+          <p>按日期、项目或状态分组，可置顶、搜索、重命名与归档；只显示主会话，子代理归入所属会话。</p>
+        </article>
+        <article class="cell reveal" data-glass>
+          <div class="cell__art art-model" aria-hidden="true"><span>build</span><b>›</b><span>模型</span></div>
+          <h3>Agent 与模型</h3>
+          <p>切换 Agent 与模型，并可在设置中过滤模型下拉框只显示常用项。</p>
+        </article>
+        <article class="cell reveal" data-glass>
+          <div class="cell__art art-cmd" aria-hidden="true"><code>/</code><span>review</span><span>init</span></div>
+          <h3>斜杠命令</h3>
+          <p>命令经服务端 <code>/command</code> 执行，与桌面端行为一致；随版本变化的接口按实例 <code>/openapi.json</code> 选择。</p>
+        </article>
+        <article class="cell reveal" data-glass>
+          <div class="cell__art art-diff" aria-hidden="true"><i class="add"></i><i class="add"></i><i class="del"></i><i></i><i class="add"></i></div>
+          <h3>改动与文件</h3>
+          <p>查看子会话、代码改动，浏览与搜索工程文件；Markdown 表格、代码高亮与复制一应俱全。</p>
+        </article>
+        <article class="cell cell--tall reveal" data-glass>
+          <div class="cell__art art-lock" aria-hidden="true"><svg viewBox="0 0 64 64"><rect x="14" y="28" width="36" height="26" rx="8"/><path d="M22 28v-6a10 10 0 0 1 20 0v6"/><circle cx="32" cy="41" r="3"/></svg></div>
+          <h3>加密离线缓存</h3>
+          <p>项目目录与消息加密缓存在本机，离线也能翻阅。过期或局部失败的数据会被明确标记，且不能用于发送操作。</p>
+        </article>
+        <article class="cell reveal" data-glass>
+          <div class="cell__art art-bg" aria-hidden="true"><i></i><i></i><i></i></div>
+          <h3>后台监控</h3>
+          <p>有任务运行时由前台服务保持实时同步；WorkManager 每 15 分钟做一次权威读取，补记已结束的运行。</p>
+        </article>
+        <article class="cell cell--wide reveal" data-glass>
+          <div class="cell__art art-squircle" aria-hidden="true"><i></i><i></i><i></i></div>
+          <h3>HyperOS / MIUIX 设计语言</h3>
+          <p>Kotlin + Jetpack Compose 原生实现：连续曲率 Squircle、科技蓝语义调色板，默认跟随系统深浅色，支持预见式返回与 <code>lagoon://</code> 深链接。</p>
+        </article>
+      </div>
+    </section>
+
+    <!-- ============ 160 m · Roadmap ============ -->
+    <section class="section roadmap" id="roadmap" data-depth="160" data-label="航道图">
+      <header class="section__head reveal">
+        <p class="eyebrow"><span class="eyebrow__depth">−160 m</span>航道图</p>
+        <h2>哪些已经抵达，<br>哪些仍在航行。</h2>
+        <p class="section__lede">Lagoon 处于快速迭代期。下面严格区分已发布的正式版、可抢先体验的预览版与尚未承诺时间的规划方向。</p>
+      </header>
+
+      <div class="lanes">
+        <article class="lane lane--stable reveal">
+          <p class="lane__tag"><i></i>已发布 · 正式版</p>
+          <h3>v0.2.4</h3>
+          <p class="lane__date">2026-10-12 · GitHub Latest</p>
+          <ul>
+            <li>OpenCode 2.x 服务端（以 <code>/api/info</code> 识别版本，1.x 已不再支持）</li>
+            <li>项目、会话、子会话、改动与文件浏览</li>
+            <li>异步任务、运行中继续发送、停止、权限与表单处理</li>
+            <li>Android 16 系统实时更新与分段状态轨道；旧系统普通通知回退</li>
+            <li>加密离线缓存、Keystore 凭据、SSE 自动重连</li>
+          </ul>
+        </article>
+        <article class="lane lane--preview reveal">
+          <p class="lane__tag"><i></i>预览中 · Pre-release</p>
+          <h3>v0.2.5-rc.4</h3>
+          <p class="lane__date">2026-10-14 · 尚未在真机完成验收</p>
+          <ul>
+            <li>“全部服务器”模式：并行连接所有已配置服务器，聚合会话、运行中任务与未读结果</li>
+            <li>持续连接：首页筛选与打开对话不再中断其他服务器的监控</li>
+            <li>手机本地开关：“不显示授权窗口”与“自动授权（仅允许一次）”，默认关闭</li>
+            <li>刷新、离线缓存、多服务器通知归因等一系列可靠性修复</li>
+          </ul>
+        </article>
+        <article class="lane lane--future reveal">
+          <p class="lane__tag"><i></i>规划方向 · 未承诺时间</p>
+          <h3>更多 harness</h3>
+          <p class="lane__date">定位：面向多种 coding agent harness 的通用控制端</p>
+          <ul>
+            <li>在 OpenCode 2.x 之外，持续扩展适配更多 coding agent harness</li>
+            <li>具体支持哪些 harness、何时发布，以产品仓库的 Release 为准</li>
+          </ul>
+        </article>
+      </div>
+
+      <aside class="boundary reveal">
+        <h3>验收边界</h3>
+        <p>每个版本都经过 Android 单元测试与 CI 构建，但这只能证明代码可编译和有限的 API / 状态逻辑。真实服务端版本、SSE 断线恢复与 Android 16 实时更新提升，仍需在你的服务器与设备上验收。Android 15+ 的 dataSync 前台服务有运行时长限制，Lagoon 不承诺无限后台保活。</p>
+      </aside>
+    </section>
+
+    <!-- ============ 200 m · Download ============ -->
+    <section class="section download" id="download" data-depth="200" data-label="下载">
+      <div class="download__art" aria-hidden="true">
+        <picture>
+          <source srcset="assets/img/mark-surface.webp" type="image/webp">
+          <img src="assets/img/mark-surface.jpg" alt="" width="1800" height="1125" loading="lazy" decoding="async">
+        </picture>
+      </div>
+      <header class="section__head reveal">
+        <p class="eyebrow"><span class="eyebrow__depth">−200 m</span>下载</p>
+        <h2>从这里开始下潜。</h2>
+      </header>
+
+      <div class="download__grid">
+        <div class="dl-card reveal" data-glass>
+          <p class="dl-card__tag">正式版 · 推荐</p>
+          <p class="dl-card__name">Lagoon <span>v0.2.4</span></p>
+          <dl class="dl-card__meta">
+            <div><dt>安装包</dt><dd><code>Lagoon-0.2.4.apk</code></dd></div>
+            <div><dt>大小</dt><dd>10.0 MB</dd></div>
+            <div><dt>系统</dt><dd>Android 8.0 及以上</dd></div>
+            <div><dt>服务端</dt><dd>OpenCode 2.x</dd></div>
+          </dl>
+          <a class="btn btn--primary btn--block" href="https://github.com/IGNGserver/opencode-lagoon/releases/download/v0.2.4/Lagoon-0.2.4.apk" data-magnetic>
+            <svg aria-hidden="true"><use href="#i-down"/></svg><span>下载 APK</span>
+          </a>
+          <p class="dl-card__alt">
+            <a href="https://github.com/IGNGserver/opencode-lagoon/releases/tag/v0.2.5-rc.4">抢先体验预览版 v0.2.5-rc.4 <svg aria-hidden="true"><use href="#i-arrow"/></svg></a>
+            <a href="https://github.com/IGNGserver/opencode-lagoon/releases">全部版本与发布说明 <svg aria-hidden="true"><use href="#i-arrow"/></svg></a>
+          </p>
+          <p class="dl-card__note">预览版与正式版使用同一套稳定签名。从 OpenCode Lagoon 旧版本升级时，应用标识 <code>com.igng.opencode.lagoon</code> 与签名保持不变，可直接覆盖安装。</p>
+        </div>
+
+        <ol class="steps reveal">
+          <li>
+            <span class="steps__n">1</span>
+            <div>
+              <h3>准备服务端</h3>
+              <p>运行 OpenCode 2.x 服务端并启用 Basic Auth；或者在电脑上生成官方配对链接，免去手动填写密码：</p>
+              <div class="cmd"><code data-copy-src>opencode pair</code><button type="button" class="cmd__copy" data-copy aria-label="复制命令"><svg aria-hidden="true"><use href="#i-copy"/></svg><span data-copy-label>复制</span></button></div>
+            </div>
+          </li>
+          <li>
+            <span class="steps__n">2</span>
+            <div>
+              <h3>添加服务器</h3>
+              <p>在 Lagoon 中填写服务器地址（如 <code>https://oc.example.com</code>）或粘贴配对链接。手机无法通过 localhost 访问电脑，请使用电脑的局域网 IP、HTTPS 域名或可信 VPN。</p>
+            </div>
+          </li>
+          <li>
+            <span class="steps__n">3</span>
+            <div>
+              <h3>开始一次会话</h3>
+              <p>选择项目，描述你的任务。之后就可以把电脑留在原地，让进度在掌心浮现。</p>
+            </div>
+          </li>
+        </ol>
+      </div>
+
+      <div class="faq reveal">
+        <details>
+          <summary>需要中转服务器或推送服务吗？</summary>
+          <p>不需要。手机直接连接你的 OpenCode 服务端；自 v0.2.0 起已移除 FCM 与伴随服务，后台通知由本机前台服务监听事件流后在本地发出。</p>
+        </details>
+        <details>
+          <summary>支持 OpenCode 1.x 或其他 harness 吗？</summary>
+          <p>目前只支持 OpenCode 2.x（1.x 已不再支持）。适配更多 coding agent harness 是规划方向，尚无承诺的发布时间。</p>
+        </details>
+        <details>
+          <summary>我的凭据和数据存在哪里？</summary>
+          <p>服务器密码与会话 Cookie 经 Android Keystore 加密保存在手机上；离线缓存同样加密存放在本机。除你自己配置的服务器外，Lagoon 没有任何云端服务接收这些数据。</p>
+        </details>
+        <details>
+          <summary>为什么有时收不到后台通知？</summary>
+          <p>Android 会限制后台运行：强行停止应用、系统清理以及 Android 15+ 对 dataSync 前台服务的时长限制都可能中断监听。Lagoon 会在回到前台或定时任务时重新对账，但不承诺无限后台保活。</p>
+        </details>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div class="footer__brand">
+      <svg aria-hidden="true"><use href="#mark"/></svg>
+      <div><b>Lagoon</b><span>原生 Android 的 coding agent 控制端</span></div>
+    </div>
+    <nav class="footer__links" aria-label="外部链接">
+      <a href="https://github.com/IGNGserver/opencode-lagoon">产品仓库</a>
+      <a href="https://github.com/IGNGserver/opencode-lagoon/releases">发布说明</a>
+      <a href="https://github.com/IGNGserver/opencode-lagoon/issues">反馈问题</a>
+      <a href="https://github.com/IGNGserver/lagoon-website">官网源码</a>
+    </nav>
+    <p class="footer__note">Lagoon 是独立开发的第三方客户端；OpenCode 名称归其项目所有。界面图均为依据实际布局重绘的示意，数据为演示内容。</p>
+  </footer>
+
+  <script type="module" src="assets/js/main.js"></script>
+</body>
+</html>

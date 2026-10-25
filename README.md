@@ -1,5 +1,7 @@
 # Lagoon
 
+> 官网与下载入口：<https://lagoon.igng.net/>
+
 面向多种 coding agent harness 的原生 Android 移动控制端。Kotlin + Jetpack Compose 界面采用小米 HyperOS / MIUIX 设计规范，引入连续曲率 Squircle、科技蓝语义调色板。App 首发支持用户自己的 OpenCode 2.x Server，现已适配 DeepSeek Harness（`dsh web` 实例），直连端点，无需第三方中转服务；未来将持续扩展适配更多 harness。
 
 ## 功能
