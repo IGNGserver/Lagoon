@@ -11,7 +11,8 @@ import java.util.zip.GZIPOutputStream
  * manifest are always revalidated so a new release is picked up on the next load. Any other path that
  * is not a file is a client-side route and gets `index.html`.
  */
-class StaticFiles(private val root: Path) {
+class StaticFiles(webRoot: Path) {
+  private val root: Path = webRoot.toAbsolutePath().normalize()
   private class Cached(val modified: Long, val bytes: ByteArray, val gzip: ByteArray?)
 
   private val cache = ConcurrentHashMap<Path, Cached>()

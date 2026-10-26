@@ -1,0 +1,13 @@
+# Only what the hub image needs: Gradle wrapper and scripts, shared/, hub/, web/, contract/.
+**/node_modules
+**/dist
+**/build
+**/.gradle
+**/.kotlin
+.git
+app
+website
+docs
+scripts
+*.md
+!web/**/*.md

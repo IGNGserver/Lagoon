@@ -41,8 +41,8 @@ class TlsSetup private constructor(val context: SSLContext, val port: Int, val s
         .map { it as X509Certificate }
       require(chain.isNotEmpty()) { "LAGOON_TLS_CERT 中没有证书" }
       val pem = Files.readString(keyPath)
-      require("BEGIN PRIVATE KEY" in pem) { "LAGOON_TLS_KEY 必须是 PKCS#8 格式（-----BEGIN PRIVATE KEY-----）" }
-      val der = Base64.getMimeDecoder().decode(pem.substringAfter("-----BEGIN PRIVATE KEY-----").substringBefore("-----END PRIVATE KEY-----"))
+      require("BEGIN PRIVATE KEY" in pem) { "LAGOON_TLS_KEY 必须是 PKCS#8 格式（-----BEGIN PRIVATE KEY-----）" } // gitleaks:allow (PEM header marker, not a key)
+      val der = Base64.getMimeDecoder().decode(pem.substringAfter("-----BEGIN PRIVATE KEY-----").substringBefore("-----END PRIVATE KEY-----")) // gitleaks:allow (PEM header marker, not a key)
       val key: PrivateKey = listOf("EC", "RSA", "Ed25519").firstNotNullOfOrNull { algorithm ->
         runCatching { KeyFactory.getInstance(algorithm).generatePrivate(PKCS8EncodedKeySpec(der)) }.getOrNull()
       } ?: error("无法解析 LAGOON_TLS_KEY 私钥")

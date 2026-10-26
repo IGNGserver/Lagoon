@@ -149,8 +149,9 @@ Lagoon Hub（hub/，Kotlin/JVM，单容器）
 | POST | `/questions/{rid}` | `{answers: string[][]}`；`/questions/{rid}/reject` 拒绝 |
 | GET | `/choices?directory=` | `{agents, commands, models}` |
 | GET | `/files?directory=&path=&session=` · `/file?…` · `/search?directory=&query=&session=` | 文件浏览 |
-| GET | `/browse?path=` | 添加项目用的目录选择器 |
-| POST | `/projects` | `{directory}`；`DELETE /projects/{pid}` |
+| GET | `/browse?path=` · `/browse/search?path=&query=` | 添加项目用的目录选择器与目录搜索 |
+| POST | `/projects` | `{directory}`；`DELETE /projects/{pid}`。DSH 只列出已有工作区，未列出的目录直接按目录登记 |
+| POST | `/refresh` | 立即连接（未开启自动连接时）并对账一次 |
 | POST | `/read` | 本服务器未读结果全部标记已读，并在支持时同步服务端 `time.viewed` |
 
 ### 偏好与推送
@@ -180,6 +181,7 @@ deploy/                    Dockerfile、compose.yaml、示例反向代理配置
 
 - Android：`./gradlew :app:testDebugUnitTest :app:assembleDebug`（行为不变的回归保护）。
 - 中枢：`./gradlew :hub:test`——MockWebServer 假 OpenCode/DSH、鉴权与退避、存储原子写、推送加密（RFC 8291 附录测试向量）、会话增量、`TranscriptRows` 黄金样例。
-- 网页：`pnpm lint && pnpm typecheck && pnpm test && pnpm build`（Vitest，含 `TranscriptRows` 黄金样例）。
+- 网页：`pnpm lint && pnpm typecheck && pnpm test && pnpm build`（Vitest，含 `TranscriptRows` 黄金样例 `contract/transcript-rows.json`）。
+- 无 Android SDK 时用 `LAGOON_HUB_ONLY=1` 只配置中枢工程（容器构建与 CI 的中枢任务都这样做）。
 - 镜像：CI 构建 amd64/arm64 并在容器内跑健康检查。
 - 必须在真实环境验收：iOS 26 Safari 主屏 PWA（安装、推送、键盘、safe-area）、安卓 Chrome PWA（安装、推送与通知按钮）、桌面 Chrome/Safari/Firefox；两种 harness 各跑通发送、停止、审批、问答、文件、改动。
