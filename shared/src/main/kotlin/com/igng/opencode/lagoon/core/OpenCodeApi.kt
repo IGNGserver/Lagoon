@@ -1,6 +1,5 @@
 package com.igng.opencode.lagoon.core
 
-import android.util.Base64
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
@@ -487,7 +486,7 @@ class OpenCodeApi(
       .objects().map { item -> FileNode(item.str("path"), item.str("type")) }
   override suspend fun fileContent(directory: String, path: String, session: Session?): FileContent {
     val (bytes, contentType) = requestBytes("api/fs/read/${encodedPath(path)}", locationQuery(directory))
-    return if (!isTextFile(path, contentType)) FileContent("binary", Base64.encodeToString(bytes, Base64.NO_WRAP))
+    return if (!isTextFile(path, contentType)) FileContent("binary", java.util.Base64.getEncoder().encodeToString(bytes))
     else FileContent("text", bytes.toString(Charsets.UTF_8))
   }
   override suspend fun searchFiles(directory: String, query: String, session: Session?): List<String> =

@@ -1,0 +1,31 @@
+# Lagoon hub. Save as compose.yaml, set a password, then: docker compose up -d
+# Full guide: https://github.com/IGNGserver/Lagoon/blob/main/deploy/README.md
+services:
+  lagoon-hub:
+    image: ghcr.io/igngserver/lagoon-hub:${LAGOON_TAG:-latest}
+    container_name: lagoon-hub
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+      # - "8443:8443"    # HTTPS listener, when LAGOON_TLS or LAGOON_TLS_CERT is set
+    environment:
+      # Access password; weak passwords are allowed. Leave empty to set it in the browser with the
+      # one-time code printed in `docker compose logs lagoon-hub`.
+      LAGOON_PASSWORD: ${LAGOON_PASSWORD:-}
+      # HTTPS option A: behind a reverse proxy that terminates TLS (Caddy, Nginx, Cloudflare Tunnel…)
+      # LAGOON_TRUST_PROXY: "true"
+      # HTTPS option B: a self-signed local CA created on first start; install its certificate on each device
+      # LAGOON_TLS: self-signed
+      # LAGOON_TLS_HOSTS: 192.168.1.10,hub.lan
+      # HTTPS option C: your own certificate (PEM, PKCS#8 key), mounted read-only below
+      # LAGOON_TLS_CERT: /certs/fullchain.pem
+      # LAGOON_TLS_KEY: /certs/privkey.pem
+    volumes:
+      - lagoon-data:/data
+      # - ./certs:/certs:ro
+    # Lets the hub reach a harness on this same machine as host.docker.internal.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  lagoon-data:

@@ -1,0 +1,219 @@
+@import "tailwindcss";
+
+/* Dark mode follows html[data-theme], which the app sets from the system or the user's choice. */
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+
+@font-face {
+  font-family: "JetBrains Mono";
+  src: url("/fonts/jetbrains-mono-latin-var.woff2") format("woff2");
+  font-weight: 100 800;
+  font-display: swap;
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+2000-206F, U+2212;
+}
+
+/*
+ * Lagoon tokens: the Android client's MIUIX / HyperOS palette (technology blue, grouped cards on a grey
+ * canvas) for lists and settings, and its warm neutral Qoder palette for the conversation.
+ */
+:root {
+  color-scheme: light;
+  --bg: #f7f7f7;
+  --surface: #ffffff;
+  --surface-2: #f0f0f0;
+  --surface-3: #e6e6e6;
+  --text: #1a1a1a;
+  --text-2: #8a8a8a;
+  --text-3: #b8b8b8;
+  --primary: #3482ff;
+  --on-primary: #ffffff;
+  --primary-subtle: rgba(52, 130, 255, 0.12);
+  --divider: rgba(0, 0, 0, 0.08);
+  --success: #246d46;
+  --warning: #82581f;
+  --warning-subtle: rgba(178, 120, 30, 0.12);
+  --error: #a23932;
+  --error-subtle: rgba(162, 57, 50, 0.1);
+  --scrim: rgba(0, 0, 0, 0.32);
+
+  --chat-bg: #fafaf7;
+  --chat-text: #1b1b18;
+  --chat-text-2: #72736c;
+  --chat-faint: #a3a49c;
+  --bubble: #eaeae4;
+  --sheet: #f5f5f2;
+  --input: #f0f0eb;
+  --code: #e8e8e3;
+  --chat-success: #357c56;
+
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-left: env(safe-area-inset-left, 0px);
+  --safe-right: env(safe-area-inset-right, 0px);
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #000000;
+  --surface: #1c1c1c;
+  --surface-2: #2a2a2a;
+  --surface-3: #363636;
+  --text: #f2f2f2;
+  --text-2: #9a9a9a;
+  --text-3: #5c5c5c;
+  --primary: #3a8bff;
+  --on-primary: #ffffff;
+  --primary-subtle: rgba(58, 139, 255, 0.18);
+  --divider: rgba(255, 255, 255, 0.08);
+  --success: #91ceaa;
+  --warning: #e4be86;
+  --warning-subtle: rgba(228, 190, 134, 0.14);
+  --error: #e7aea6;
+  --error-subtle: rgba(231, 174, 166, 0.12);
+  --scrim: rgba(0, 0, 0, 0.6);
+
+  --chat-bg: #0d0d0b;
+  --chat-text: #dadbd5;
+  --chat-text-2: #96978f;
+  --chat-faint: #73746d;
+  --bubble: #292a25;
+  --sheet: #1b1a17;
+  --input: #171813;
+  --code: #343431;
+  --chat-success: #77b894;
+}
+
+@theme inline {
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-surface-3: var(--surface-3);
+  --color-text: var(--text);
+  --color-text-2: var(--text-2);
+  --color-text-3: var(--text-3);
+  --color-primary: var(--primary);
+  --color-on-primary: var(--on-primary);
+  --color-primary-subtle: var(--primary-subtle);
+  --color-divider: var(--divider);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-warning-subtle: var(--warning-subtle);
+  --color-error: var(--error);
+  --color-error-subtle: var(--error-subtle);
+  --color-scrim: var(--scrim);
+  --color-chat: var(--chat-bg);
+  --color-chat-text: var(--chat-text);
+  --color-chat-text-2: var(--chat-text-2);
+  --color-chat-faint: var(--chat-faint);
+  --color-bubble: var(--bubble);
+  --color-sheet: var(--sheet);
+  --color-input: var(--input);
+  --color-code: var(--code);
+  --color-chat-success: var(--chat-success);
+  --font-sans: -apple-system, BlinkMacSystemFont, "MiSans", "HarmonyOS Sans SC", "PingFang SC", "Noto Sans SC", "Segoe UI", "Microsoft YaHei", Roboto, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, "Noto Sans Mono CJK SC", monospace;
+}
+
+html, body, #root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -webkit-tap-highlight-color: transparent;
+  overscroll-behavior: none;
+  text-size-adjust: 100%;
+}
+
+button, [role="button"] {
+  -webkit-user-select: none;
+  user-select: none;
+  touch-action: manipulation;
+}
+
+/* HyperOS continuous-curvature corners where the browser can draw them; plain rounding elsewhere. */
+@supports (corner-shape: squircle) {
+  .squircle {
+    corner-shape: squircle;
+  }
+}
+
+.safe-top { padding-top: var(--safe-top); }
+.safe-bottom { padding-bottom: var(--safe-bottom); }
+.safe-x { padding-left: var(--safe-left); padding-right: var(--safe-right); }
+
+.scroll-area {
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+}
+
+.row-pad { content-visibility: auto; contain-intrinsic-size: auto 64px; }
+
+@keyframes lagoon-spin { to { transform: rotate(360deg); } }
+.spin { animation: lagoon-spin 0.9s linear infinite; }
+
+@keyframes lagoon-pulse { 0%, 100% { opacity: 0.35; } 50% { opacity: 1; } }
+.pulse { animation: lagoon-pulse 1.4s ease-in-out infinite; }
+
+@keyframes lagoon-shimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
+.shimmer-text {
+  background: linear-gradient(90deg, var(--chat-text-2) 25%, var(--chat-text) 50%, var(--chat-text-2) 75%);
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: lagoon-shimmer 2.2s linear infinite;
+}
+
+@keyframes lagoon-sheet-in { from { transform: translateY(100%); } to { transform: translateY(0); } }
+@keyframes lagoon-fade-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes lagoon-pop-in { from { opacity: 0; transform: scale(0.97); } to { opacity: 1; transform: none; } }
+@keyframes lagoon-page-in { from { transform: translateX(24px); opacity: 0.6; } to { transform: none; opacity: 1; } }
+.page-in { animation: lagoon-page-in 0.22s cubic-bezier(0.2, 0.8, 0.2, 1); }
+.fade-in { animation: lagoon-fade-in 0.18s ease-out; }
+
+@media (prefers-reduced-motion: reduce) {
+  .page-in, .fade-in, .spin, .pulse, .shimmer-text { animation: none; }
+}
+
+/* Rendered Markdown in the conversation. */
+.markdown { line-height: 1.65; overflow-wrap: anywhere; }
+.markdown > :first-child { margin-top: 0; }
+.markdown > :last-child { margin-bottom: 0; }
+.markdown p, .markdown ul, .markdown ol, .markdown pre, .markdown blockquote, .markdown table { margin: 0.6em 0; }
+.markdown ul { list-style: disc; padding-left: 1.4em; }
+.markdown ol { list-style: decimal; padding-left: 1.4em; }
+.markdown li + li { margin-top: 0.2em; }
+.markdown h1, .markdown h2, .markdown h3, .markdown h4 { font-weight: 600; margin: 1em 0 0.4em; line-height: 1.35; }
+.markdown h1 { font-size: 1.3em; }
+.markdown h2 { font-size: 1.18em; }
+.markdown h3, .markdown h4 { font-size: 1.05em; }
+.markdown a { color: var(--primary); text-decoration: underline; text-underline-offset: 2px; }
+.markdown code { font-family: var(--font-mono); font-size: 0.88em; background: var(--code); border-radius: 6px; padding: 0.1em 0.35em; }
+.markdown pre { background: var(--code); border-radius: 12px; padding: 12px 14px; overflow-x: auto; font-size: 0.85em; line-height: 1.5; }
+.markdown pre code { background: none; padding: 0; font-size: inherit; }
+.markdown blockquote { border-left: 3px solid var(--divider); padding-left: 0.8em; color: var(--chat-text-2); }
+.markdown table { border-collapse: collapse; display: block; overflow-x: auto; font-size: 0.92em; }
+.markdown th, .markdown td { border: 1px solid var(--divider); padding: 0.35em 0.6em; text-align: left; }
+.markdown hr { border: none; border-top: 1px solid var(--divider); margin: 1em 0; }
+
+.code-block { font-family: var(--font-mono); font-size: 12.5px; line-height: 1.55; white-space: pre-wrap; word-break: break-word; }
+.diff-add { background: rgba(53, 124, 86, 0.16); }
+.diff-del { background: rgba(162, 57, 50, 0.14); }
+.diff-hunk { color: var(--primary); }
+
+/* highlight.js tokens on the chat palette. */
+.hljs-keyword, .hljs-selector-tag, .hljs-built_in, .hljs-type { color: #7b5cd6; }
+.hljs-string, .hljs-attr, .hljs-template-variable, .hljs-addition { color: #2f7d4f; }
+.hljs-number, .hljs-literal, .hljs-symbol { color: #b4561d; }
+.hljs-comment, .hljs-quote { color: var(--chat-faint); font-style: italic; }
+.hljs-title, .hljs-function .hljs-title, .hljs-section { color: #2d6fd6; }
+.hljs-deletion { color: var(--error); }
+[data-theme="dark"] .hljs-keyword, [data-theme="dark"] .hljs-selector-tag, [data-theme="dark"] .hljs-built_in, [data-theme="dark"] .hljs-type { color: #b9a2f5; }
+[data-theme="dark"] .hljs-string, [data-theme="dark"] .hljs-attr, [data-theme="dark"] .hljs-addition { color: #8fcb9f; }
+[data-theme="dark"] .hljs-number, [data-theme="dark"] .hljs-literal, [data-theme="dark"] .hljs-symbol { color: #e3a26f; }
+[data-theme="dark"] .hljs-title, [data-theme="dark"] .hljs-section { color: #7fb0ff; }

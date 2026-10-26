@@ -1164,7 +1164,9 @@ class DshApi(
       when (type) {
         "step/start" -> stepOf(data).let { if (it.started == 0L) it.started = time }
         "step/end" -> stepOf(data).ended = time
-        "user/message" -> users += time to data
+        // DSH also writes model-facing context (runtime / time snapshots) as user messages; only the
+        // user's own prompts (`source.kind` = user, or no source on older hosts) are timeline rows.
+        "user/message" -> if (data.obj("source").str("kind").let { it.isBlank() || it == "user" }) users += time to data
         "assistant/message" -> {
           val step = stepOf(data)
           for (block in data.obj("message").arr("content").objects()) {

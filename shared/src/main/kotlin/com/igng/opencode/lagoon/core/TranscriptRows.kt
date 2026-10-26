@@ -5,6 +5,9 @@ import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 
+/** Id prefix of “等待连接后发送” rows; they exist only on this device and are never cached. */
+internal const val PENDING_PREFIX = "pending:"
+
 /** One expandable body line of a tool/change row. */
 data class ToolSection(val label: String, val text: String, val code: Boolean = true, val copyText: String? = null)
 

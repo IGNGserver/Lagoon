@@ -7,7 +7,7 @@ import org.json.JSONObject
 import java.util.UUID
 
 class ServerStore internal constructor(private val preferences: SharedPreferences, private val secrets: SharedPreferences,
-  private val encryptValue: (String) -> String, private val decryptValue: (String) -> String) {
+  private val encryptValue: (String) -> String, private val decryptValue: (String) -> String) : OverviewStore {
   constructor(context: Context) : this(context.getSharedPreferences("servers", Context.MODE_PRIVATE),
     context.getSharedPreferences("secrets", Context.MODE_PRIVATE),
     KeystoreCipher("lagoon-server-passwords", legacyAlias = "opencode-lagoon-server-passwords")::encrypt,
@@ -29,15 +29,15 @@ class ServerStore internal constructor(private val preferences: SharedPreference
     val taskLock = Any()
   }
 
-  fun taskStates(id: String): Map<String, TaskState> = preferences.all.filterKeys { it.startsWith("taskState:$id:") }
+  override fun taskStates(id: String): Map<String, TaskState> = preferences.all.filterKeys { it.startsWith("taskState:$id:") }
     .mapNotNull { (key, raw) -> runCatching {
       val json = JSONObject(raw as String); val session = key.removePrefix("taskState:$id:")
       session to TaskState(session, TaskPhase.valueOf(json.str("phase")), json.str("detail"), json.optLong("since"),
         json.optLong("finished").takeIf { it > 0 }, json.optLong("activeAt", -1), json.optBoolean("background"))
     }.getOrNull() }.toMap()
-  fun taskParents(id: String): Map<String, String> = preferences.all.filterKeys { it.startsWith("taskParent:$id:") }
+  override fun taskParents(id: String): Map<String, String> = preferences.all.filterKeys { it.startsWith("taskParent:$id:") }
     .mapKeys { it.key.removePrefix("taskParent:$id:") }.mapValues { it.value as? String ?: "" }.filterValues(String::isNotBlank)
-  fun rememberParents(id: String, sessions: List<Session>) {
+  override fun rememberParents(id: String, sessions: List<Session>) {
     val editor = preferences.edit()
     sessions.forEach { session ->
       val key = "taskParent:$id:${session.id}"
@@ -45,7 +45,7 @@ class ServerStore internal constructor(private val preferences: SharedPreference
     }
     editor.apply()
   }
-  fun rememberTask(id: String, state: TaskState, parent: String? = null, observedAt: Long = System.currentTimeMillis(), durable: Boolean = false): TaskState = synchronized(taskLock) {
+  override fun rememberTask(id: String, state: TaskState, parent: String?, observedAt: Long, durable: Boolean): TaskState = synchronized(taskLock) {
     val key = "taskState:$id:${state.sessionId}"
     val previous = runCatching { JSONObject(preferences.getString(key, "")!!).let { json -> TaskState(state.sessionId, TaskPhase.valueOf(json.str("phase")), json.str("detail"), json.optLong("since"), json.optLong("finished").takeIf { it > 0 }, json.optLong("activeAt", -1), json.optBoolean("background")) } }.getOrNull()
     val lastObserved = preferences.getLong("taskTime:$id:${state.sessionId}", 0)
@@ -85,7 +85,7 @@ class ServerStore internal constructor(private val preferences: SharedPreference
    * “已完成/失败” states plus per-session read markers. Drop both; keep only runs this device saw still
    * running (they turn into unread results when found finished), unless they are older than the ledger TTL.
    */
-  fun migrateTaskLedger(id: String, now: Long = System.currentTimeMillis()) = synchronized(taskLock) {
+  override fun migrateTaskLedger(id: String, now: Long) = synchronized(taskLock) {
     if (preferences.getInt("taskLedgerVersion:$id", 0) >= 2) return@synchronized
     val ttl = 30L * 24 * 60 * 60 * 1000
     val states = taskStates(id)
@@ -97,7 +97,7 @@ class ServerStore internal constructor(private val preferences: SharedPreference
     editor.putInt("taskLedgerVersion:$id", 2).commit()
   }
 
-  fun sessionNotices(server: String, now: Long = System.currentTimeMillis()): List<SessionNotice> = synchronized(taskLock) {
+  override fun sessionNotices(server: String, now: Long): List<SessionNotice> = synchronized(taskLock) {
     runCatching { JSONArray(preferences.getString("sessionNotices:$server", "[]")).objects().map {
       SessionNotice(it.str("id"), it.str("session"), it.optLong("time"), it.optBoolean("error"), it.optBoolean("viewed"))
     }.pruned(now) }.getOrDefault(emptyList())
@@ -107,7 +107,7 @@ class ServerStore internal constructor(private val preferences: SharedPreference
       put(JSONObject().put("id", it.id).put("session", it.sessionId).put("time", it.time).put("error", it.error).put("viewed", it.viewed))
     } }.toString()).apply()
   }
-  fun rememberNotice(server: String, notice: SessionNotice, now: Long = System.currentTimeMillis()): List<SessionNotice> = synchronized(taskLock) {
+  override fun rememberNotice(server: String, notice: SessionNotice, now: Long): List<SessionNotice> = synchronized(taskLock) {
     val current = sessionNotices(server, now)
     val next = if (current.any { it.id == notice.id }) current else (current + notice).pruned(now)
     writeNotices(server, next); next
@@ -136,7 +136,7 @@ class ServerStore internal constructor(private val preferences: SharedPreference
   }
 
   /** 自动刷新频率（标准 / 更快）；缺省「更快」。 */
-  fun refreshMode(): RefreshMode = runCatching {
+  override fun refreshMode(): RefreshMode = runCatching {
     RefreshMode.valueOf(preferences.getString("refreshMode", RefreshMode.FAST.name)!!)
   }.getOrDefault(RefreshMode.FAST)
   fun rememberRefreshMode(mode: RefreshMode) {
@@ -147,7 +147,7 @@ class ServerStore internal constructor(private val preferences: SharedPreference
   fun homeServerId(): String? = preferences.getString("homeServer", null) ?: selectedId()
   fun rememberHomeServer(id: String) { preferences.edit().putString("homeServer", id).apply() }
   /** The all-servers switch is separate from the last single-server selection. */
-  fun permissionPolicy(): PermissionPolicy = PermissionPolicy(preferences.getBoolean("hidePermissions", false), preferences.getBoolean("autoApprovePermissions", false))
+  override fun permissionPolicy(): PermissionPolicy = PermissionPolicy(preferences.getBoolean("hidePermissions", false), preferences.getBoolean("autoApprovePermissions", false))
   fun rememberPermissionPolicy(policy: PermissionPolicy) {
     preferences.edit().putBoolean("hidePermissions", policy.hide).putBoolean("autoApprovePermissions", policy.autoApprove).apply()
   }
@@ -210,7 +210,7 @@ class ServerStore internal constructor(private val preferences: SharedPreference
    * Project directories registered on this device, newest first. The server's own project list is
    * never imported automatically: the user adds a project by resolving a remote directory.
    */
-  fun localProjects(id: String): List<Project> = runCatching {
+  override fun localProjects(id: String): List<Project> = runCatching {
     JSONArray(preferences.getString("directories:$id", "[]")).objects().mapNotNull { item ->
       val directory = item.str("directory").ifBlank { item.str("path") }
       if (directory.isBlank()) null else Project(item.str("id").ifBlank { normalizedDirectory(directory) }, directory,
@@ -286,7 +286,7 @@ class ServerStore internal constructor(private val preferences: SharedPreference
     if (text.isBlank()) secrets.edit().remove(key).apply()
     else secrets.edit().putString(key, encryptValue(text.take(100_000))).apply()
   }
-  fun forgetSession(server: String, session: String) {
+  override fun forgetSession(server: String, session: String) {
     synchronized(taskLock) { writeNotices(server, sessionNotices(server).filterNot { it.sessionId == session }) }
     val editor = preferences.edit()
     listOf("preview", "configuration", "taskRead", "taskState", "taskParent", "taskTime", "notification").forEach { editor.remove("$it:$server:$session") }
@@ -295,7 +295,7 @@ class ServerStore internal constructor(private val preferences: SharedPreference
   }
   fun deviceId(): String = preferences.getString("deviceId", null) ?: UUID.randomUUID().toString().also { preferences.edit().putString("deviceId", it).apply() }
 
-  fun credentials(id: String): ServerCredentials {
+  override fun credentials(id: String): ServerCredentials {
     val profile = profiles().firstOrNull { it.id == id }
     val fallback = profile?.username ?: "opencode"
     return try {
@@ -359,7 +359,7 @@ class ServerStore internal constructor(private val preferences: SharedPreference
    * 只更新已保存凭据里的会话 Cookie（DSH 换到新 Cookie 或旧 Cookie 被拒）。[url] 是签发该 Cookie
    * 时的服务器地址：资料已改到别的地址时丢弃，绝不把旧地址的 Cookie 绑到新地址上。
    */
-  fun rememberCookie(id: String, url: String, cookie: String) {
+  override fun rememberCookie(id: String, url: String, cookie: String) {
     val profile = profiles().firstOrNull { it.id == id } ?: return
     if (profile.url != url) return
     val current = credentials(id)

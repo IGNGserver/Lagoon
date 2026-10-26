@@ -1,10 +1,10 @@
 # Lagoon repository
 
 Collaboration: collaborative
-Validation: `ANDROID_HOME=/home/lvziw/Android/Sdk ./gradlew :app:testDebugUnitTest :app:assembleDebug`; website changes also run `node website/scripts/build-site.mjs && python3 website/scripts/check-site.py website/dist` (set `GITHUB_TOKEN` to avoid the anonymous API limit).
+Validation: `ANDROID_HOME=/home/lvziw/Android/Sdk ./gradlew :app:testDebugUnitTest :app:assembleDebug :hub:test`; for `web/`: `pnpm install --frozen-lockfile && pnpm lint && pnpm typecheck && pnpm test && pnpm build` (CI workflow `中枢与网页` also builds the hub image); website changes also run `node website/scripts/build-site.mjs && python3 website/scripts/check-site.py website/dist` (set `GITHUB_TOKEN` to avoid the anonymous API limit).
 Release: use `.github/workflows/release.yml`. If the user does not specify a release type, publish a pre-release. Every release tag must include a Chinese update note at `docs/releases/<tag>.md`; see `docs/RELEASE_POLICY.md`.
 
-Lagoon is a native Android coding agent harness client, launching with OpenCode 2.x server support and architected for multiple harnesses. Keep server data authoritative and keep credentials out of source control. Local foreground monitoring notifies on task completion and attention requests.
+Lagoon is a native Android coding agent harness client (OpenCode 2.x and DeepSeek Harness), plus since v3 a self-hosted hub (`hub/`, docker compose) that serves a PWA web client (`web/`). Platform-neutral Kotlin lives in `shared/` and is compiled into both the app and the hub. Keep server data authoritative and keep credentials out of source control. Local foreground monitoring notifies on task completion and attention requests.
 
 ## Website
 

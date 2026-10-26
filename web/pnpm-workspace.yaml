@@ -1,0 +1,4 @@
+# Only install releases that have been public for at least two weeks.
+minimumReleaseAge: 20160
+onlyBuiltDependencies:
+  - esbuild

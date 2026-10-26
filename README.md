@@ -4,6 +4,14 @@
 
 面向多种 coding agent harness 的原生 Android 移动控制端。Kotlin + Jetpack Compose 界面采用小米 HyperOS / MIUIX 设计规范，引入连续曲率 Squircle、科技蓝语义调色板。App 首发支持用户自己的 OpenCode 2.x Server，现已适配 DeepSeek Harness（`dsh web` 实例），直连端点，无需第三方中转服务；未来将持续扩展适配更多 harness。
 
+## Lagoon 中枢与网页端（v3）
+
+在任意一台机器上用 docker compose 部署 Lagoon 中枢，就能在电脑或手机浏览器里连接、监控和控制各台开发机上的 harness，网页可以安装为 PWA 并接收任务推送。中枢替浏览器保持连接、保存凭据，只有一个访问密码（允许弱密码）。安卓客户端仍然直连开发机，不依赖中枢。
+
+- 部署：[`deploy/README.md`](deploy/README.md)，镜像 `ghcr.io/igngserver/lagoon-hub`（amd64 / arm64）；
+- 设计与接口契约：[`docs/HUB_DESIGN.md`](docs/HUB_DESIGN.md)；
+- 代码：`hub/`（Kotlin/JVM 中枢）、`web/`（React + TypeScript 网页）、`shared/`（安卓与中枢共用的协议适配、模型与任务归约）。
+
 ## 功能
 
 - 首发支持 OpenCode 2.x 服务端（`/api/*` 接口，以 `/api/info` 识别版本；1.x 已不再支持）；多服务器连接、Basic Auth/官方 pair 链接、Android Keystore 保护的密码与会话 Cookie、离线缓存、SSE 自动重连
@@ -15,6 +23,15 @@
 - 应用内检查更新：设置页按 SemVer 选择 GitHub 上的正式版或预发布版，下载后校验大小、SHA-256、包名、版本码与签名，再交给系统安装器覆盖安装；首次安装会引导开启“安装未知应用”
 
 ## 本地构建
+
+中枢与网页（不需要 Android SDK）：
+
+```sh
+LAGOON_HUB_ONLY=1 ./gradlew :hub:test :hub:installDist
+cd web && pnpm install --frozen-lockfile && pnpm lint && pnpm typecheck && pnpm test && pnpm build
+```
+
+Android：
 
 需要 JDK 17+、Android SDK Platform 36。执行：
 

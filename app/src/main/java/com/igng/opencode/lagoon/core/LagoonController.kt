@@ -2727,9 +2727,6 @@ private data class QueuedPrompt(val serverId: String, val sessionId: String, val
   fun row() = Message(messageId, "user", created, listOf(MessagePart("$messageId:text", "text", text = text)), queued = true, type = "user")
 }
 
-/** Id prefix of “等待连接后发送” rows; they exist only on this device and are never cached. */
-internal const val PENDING_PREFIX = "pending:"
-
 /** Rows that may be written to the transcript cache: everything except local pending prompts. */
 internal fun List<Message>.persistable(): List<Message> = filterNot { it.id.startsWith(PENDING_PREFIX) }
 
