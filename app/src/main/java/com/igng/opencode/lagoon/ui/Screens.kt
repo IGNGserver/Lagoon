@@ -435,7 +435,14 @@ fun SettingsScreen(
   val updater = remember(context) { AppUpdater.get(context) }
   val update by updater.state.collectAsState()
   val updatePreferences = remember(context) { context.getSharedPreferences("ui", Context.MODE_PRIVATE) }
-  var includePrerelease by remember { mutableStateOf(updatePreferences.getBoolean("updatePrerelease", true)) }
+  var includePrerelease by remember {
+    val saved = updatePreferences.getString("updateChannel", null)
+    val preview = when (saved) { "stable" -> false; "preview" -> true
+      else -> updatePreferences.getBoolean("updatePrerelease", true) }
+    updatePreferences.edit { putString("updateChannel", if (preview) "preview" else "stable") }
+    mutableStateOf(preview)
+  }
+  LaunchedEffect(updater) { updater.check(includePrerelease, automatic = true) }
   var installAllowed by remember { mutableStateOf(context.packageManager.canRequestPackageInstalls()) }
   var pendingInstall by rememberSaveable { mutableStateOf(false) }
   var showReleaseNotes by rememberSaveable { mutableStateOf(false) }
@@ -471,7 +478,7 @@ fun SettingsScreen(
     }
     pendingInstall = false
     installAllowed = true
-    val uri = updater.installerUri(apk)
+    val uri = updater.installerUri(apk) ?: return
     val intent = Intent(Intent.ACTION_VIEW).apply {
       setDataAndType(uri, "application/vnd.android.package-archive")
       addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
@@ -623,15 +630,14 @@ fun SettingsScreen(
         )
         HorizontalDivider()
         SuperSwitch(
-          title = "包含预发布版本",
-          summary = if (includePrerelease) "包含 rc / beta 等预发布版；关闭后只检查正式版" else "只检查正式版；rc / beta 不会提示",
+          title = "预发布通道",
+          summary = if (includePrerelease) "包含正式版与 rc / beta；只升级，不降级" else "正式通道：只检查正式版，只升级，不降级",
           checked = includePrerelease,
           enabled = update.phase != AppUpdatePhase.DOWNLOADING && update.phase != AppUpdatePhase.CHECKING,
           onCheckedChange = { enabled ->
             includePrerelease = enabled
-            updatePreferences.edit { putBoolean("updatePrerelease", enabled) }
-            updater.clearResult()
-            updater.check(enabled, force = true)
+            updatePreferences.edit { putString("updateChannel", if (enabled) "preview" else "stable") }
+            updater.selectChannel(enabled)
           }
         )
         HorizontalDivider()
@@ -640,7 +646,7 @@ fun SettingsScreen(
           includePrerelease = includePrerelease,
           installAllowed = installAllowed,
           onCheck = { updater.check(includePrerelease) },
-          onRetryCheck = { updater.check(includePrerelease, force = true) },
+          onRetryCheck = { updater.check(includePrerelease) },
           onDownload = { updater.download() },
           onCancel = { updater.cancelDownload() },
           onInstall = { requestInstall() },

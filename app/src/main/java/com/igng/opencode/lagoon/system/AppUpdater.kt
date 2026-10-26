@@ -14,6 +14,9 @@ import com.igng.opencode.lagoon.core.AppUpdateFailure
 import com.igng.opencode.lagoon.core.AppUpdateSource
 import com.igng.opencode.lagoon.core.AppVersion
 import com.igng.opencode.lagoon.core.SharedHttp
+import com.igng.opencode.lagoon.core.UpdateFetchPolicy
+import com.igng.opencode.lagoon.core.MAX_UPDATE_FEED_BYTES
+import com.igng.opencode.lagoon.core.readUpdateFeed
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -66,12 +69,16 @@ class AppUpdater private constructor(private val context: Context) {
     }
 
     private const val UPDATE_DIR = "updates"
-    private const val CHECK_DEBOUNCE_MS = 5_000L
   }
 
   private val updateDir = File(context.cacheDir, UPDATE_DIR)
-  private val releasesCache = File(updateDir, "releases.json")
-  private val etagCache = File(updateDir, "releases.etag")
+  private val feedDir = File(context.filesDir, "update-feed")
+  private val releasesCache = File(feedDir, "updates.json")
+  private val etagCache = File(feedDir, "updates.etag")
+  private val preferences = context.getSharedPreferences("update-policy", Context.MODE_PRIVATE)
+  private var fetchPolicy = UpdateFetchPolicy(
+    preferences.getLong("attempt", 0), preferences.getLong("automatic", 0),
+    preferences.getLong("retry", 0), preferences.getInt("failures", 0).coerceIn(0, 16))
   private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
   private val apiClient = OkHttpClient.Builder()
     .connectionPool(SharedHttp.connectionPool)
@@ -87,12 +94,18 @@ class AppUpdater private constructor(private val context: Context) {
     }
     chain.proceed(chain.request())
   }.build()
+  @Volatile private var selectedIncludePrerelease = context.getSharedPreferences("ui", Context.MODE_PRIVATE).let {
+    when (it.getString("updateChannel", null)) {
+      "stable" -> false
+      "preview" -> true
+      else -> it.getBoolean("updatePrerelease", true)
+    }
+  }
   private val _state = MutableStateFlow(AppUpdateState())
   val state: StateFlow<AppUpdateState> = _state.asStateFlow()
   private var checkJob: Job? = null
   private var downloadJob: Job? = null
   @Volatile private var activeDownloadCall: Call? = null
-  private var lastCheckAttemptAt = 0L
   @Volatile private var cachedBody: String? = null
   @Volatile private var cachedEtag: String? = null
 
@@ -106,11 +119,21 @@ class AppUpdater private constructor(private val context: Context) {
     }
   }
 
-  fun check(includePrerelease: Boolean, force: Boolean = false) {
-    if (checkJob?.isActive == true || downloadJob?.isActive == true) return
+  @Synchronized
+  fun check(includePrerelease: Boolean, automatic: Boolean = false) {
+    if (selectedIncludePrerelease != includePrerelease) selectChannel(includePrerelease)
+    if (checkJob?.isCompleted == false || downloadJob?.isCompleted == false) return
     val now = System.currentTimeMillis()
-    if (!force && now - lastCheckAttemptAt < CHECK_DEBOUNCE_MS) return
-    lastCheckAttemptAt = now
+    val allowed = fetchPolicy.allowedAt(automatic)
+    if (now < allowed) {
+      if (_state.value.release == null && cachedBody() != null) selectChannel(includePrerelease)
+      if (!automatic) _state.update { it.copy(failure = AppUpdateFailure.RATE_LIMITED,
+        failureDetail = "请在 ${(allowed - now + 999) / 1000} 秒后重试") }
+      return
+    }
+    // Even an explicit retry cannot bypass a persisted server or local cooldown.
+    fetchPolicy = fetchPolicy.attempted(now)
+    savePolicy()
     _state.update {
       it.copy(
         phase = AppUpdatePhase.CHECKING,
@@ -120,7 +143,10 @@ class AppUpdater private constructor(private val context: Context) {
       )
     }
     checkJob = scope.launch {
-      val result = fetchReleases(includePrerelease, useConditional = true)
+      val fetched = fetchReleases(includePrerelease)
+      synchronized(this@AppUpdater) {
+      val result = if (fetched is AppUpdateCheck.Failed) fetched else
+        cachedBody()?.let { AppReleases.parse(it, currentVersionName(), selectedIncludePrerelease, currentVersionCode()) } ?: fetched
       val current = _state.value
       when (result) {
         is AppUpdateCheck.Available -> {
@@ -164,12 +190,14 @@ class AppUpdater private constructor(private val context: Context) {
           )
         }
       }
+      }
     }
   }
 
+  @Synchronized
   fun download() {
-    val release = _state.value.release ?: return
-    if (downloadJob?.isActive == true) return
+    val release = _state.value.release?.takeIf { AppReleases.isAllowed(it, currentVersionName(), selectedIncludePrerelease) } ?: return
+    if (downloadJob?.isCompleted == false || checkJob?.isCompleted == false) return
     updateDir.mkdirs()
     val part = File(updateDir, "Lagoon-${release.version}.apk.part")
     val target = File(updateDir, "Lagoon-${release.version}.apk")
@@ -215,6 +243,9 @@ class AppUpdater private constructor(private val context: Context) {
                   output.write(buffer, 0, count)
                   digest.update(buffer, 0, count)
                   copied += count
+                  if (copied > 200L * 1024 * 1024 || release.assetSize?.let { copied > it } == true) {
+                    throw DownloadFailure(AppUpdateFailure.SIZE_MISMATCH)
+                  }
                   val percent = total?.let { length -> ((copied * 100) / length).toInt() }
                   if (percent != lastPercent) {
                     lastPercent = percent ?: -1
@@ -235,7 +266,7 @@ class AppUpdater private constructor(private val context: Context) {
                 }
                 if (copied <= 0L) throw DownloadFailure(AppUpdateFailure.SIZE_MISMATCH)
                 val actualDigest = digest.digest().joinToString("") { byte -> "%02x".format(byte) }
-                if (release.sha256 != null && !actualDigest.equals(release.sha256, ignoreCase = true)) {
+                if (release.sha256 == null || !actualDigest.equals(release.sha256, ignoreCase = true)) {
                   throw DownloadFailure(AppUpdateFailure.DIGEST_MISMATCH)
                 }
               }
@@ -341,16 +372,10 @@ class AppUpdater private constructor(private val context: Context) {
     downloadJob?.cancel()
   }
 
-  /** Drops the previous channel's result and APK before an immediate re-check. */
-  fun clearResult() {
-    if (checkJob?.isActive == true || downloadJob?.isActive == true) return
-    withoutDownload(_state.value)
-    _state.value = AppUpdateState()
-    lastCheckAttemptAt = 0L
-  }
-
   /** Returns the verified APK, or null if cache cleanup removed it (the UI can download again). */
   fun readyApk(): File? {
+    val release = _state.value.release ?: return null
+    if (!AppReleases.isAllowed(release, currentVersionName(), selectedIncludePrerelease)) return null
     val path = _state.value.apkPath ?: return null
     val file = File(path)
     if (file.isFile) return file
@@ -365,63 +390,82 @@ class AppUpdater private constructor(private val context: Context) {
     return null
   }
 
-  fun installerUri(apk: File): Uri =
-    FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", apk)
+  @Synchronized
+  fun installerUri(apk: File): Uri? {
+    val ready = readyApk() ?: return null
+    if (ready.absolutePath != apk.absolutePath) return null
+    return FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", apk)
+  }
 
-  private fun fetchReleases(includePrerelease: Boolean, useConditional: Boolean): AppUpdateCheck {
-    val etag = if (useConditional) cachedEtag() else null
-    val request = Request.Builder()
-      .url(AppUpdateSource.API_URL)
-      .header("Accept", "application/vnd.github+json")
-      .header("X-GitHub-Api-Version", "2022-11-28")
+  @Synchronized
+  fun selectChannel(includePrerelease: Boolean) {
+    selectedIncludePrerelease = includePrerelease
+    context.getSharedPreferences("ui", Context.MODE_PRIVATE).edit()
+      .putString("updateChannel", if (includePrerelease) "preview" else "stable").apply()
+    if (downloadJob?.isCompleted == false) cancelDownload()
+    val base = withoutDownload(_state.value)
+    val result = cachedBody()?.let { AppReleases.parse(it, currentVersionName(), includePrerelease, currentVersionCode()) }
+    _state.value = base.copy(
+      phase = if (checkJob?.isCompleted == false) AppUpdatePhase.CHECKING else
+        if (result is AppUpdateCheck.Available) AppUpdatePhase.AVAILABLE else AppUpdatePhase.IDLE,
+      release = (result as? AppUpdateCheck.Available)?.release,
+      failure = null, failureDetail = null)
+  }
+
+  private fun savePolicy() {
+    preferences.edit().putLong("attempt", fetchPolicy.lastAttempt)
+      .putLong("automatic", fetchPolicy.nextAutomatic).putLong("retry", fetchPolicy.retryAt)
+      .putInt("failures", fetchPolicy.failures).apply()
+  }
+
+  private fun fetchReleases(includePrerelease: Boolean): AppUpdateCheck {
+    val now = System.currentTimeMillis()
+    val validCache = cachedBody()?.takeIf {
+      val result = AppReleases.parse(it, currentVersionName(), includePrerelease, currentVersionCode())
+      result !is AppUpdateCheck.Failed || result.failure != AppUpdateFailure.INVALID_RESPONSE
+    }
+    val request = Request.Builder().url(AppUpdateSource.API_URL)
+      .header("Accept", "application/json")
       .header("User-Agent", "Lagoon-Android/${currentVersionName()}")
-      .apply { etag?.let { header("If-None-Match", it) } }
+      .apply { if (validCache != null) cachedEtag()?.let { header("If-None-Match", it) } }
       .build()
     return try {
       apiClient.newCall(request).execute().use { response ->
-        when {
-          response.code == 304 -> {
-            val body = cachedBody()
-            if (body == null) {
-              fetchReleases(includePrerelease, useConditional = false)
-            } else {
-              val parsed = AppReleases.parse(body, currentVersionName(), includePrerelease)
-              if (parsed is AppUpdateCheck.Failed && parsed.failure == AppUpdateFailure.INVALID_RESPONSE) {
-                // A damaged cache must not pin the next checks to the same 304 forever.
-                cachedBody = null
-                cachedEtag = null
-                releasesCache.delete()
-                etagCache.delete()
-                fetchReleases(includePrerelease, useConditional = false)
-              } else parsed
-            }
+        if (response.code != 304 && !response.isSuccessful) {
+          fetchPolicy = fetchPolicy.failed(now, response.header("Retry-After"), response.header("X-RateLimit-Reset"))
+          savePolicy()
+          when {
+            response.code == 429 || response.code == 403 &&
+              (response.header("Retry-After") != null || response.header("X-RateLimit-Remaining") == "0") ->
+              AppUpdateCheck.Failed(AppUpdateFailure.RATE_LIMITED, "请在 ${(fetchPolicy.retryAt - now + 999) / 1000} 秒后重试")
+            response.code == 404 -> AppUpdateCheck.Failed(AppUpdateFailure.NOT_FOUND)
+            else -> AppUpdateCheck.Failed(AppUpdateFailure.HTTP, "HTTP ${response.code}")
           }
-          response.code == 429 ||
-            (response.code == 403 && response.header("X-RateLimit-Remaining") == "0") ->
-            AppUpdateCheck.Failed(AppUpdateFailure.RATE_LIMITED)
-          response.code == 404 -> AppUpdateCheck.Failed(AppUpdateFailure.NOT_FOUND)
-          !response.isSuccessful -> AppUpdateCheck.Failed(AppUpdateFailure.HTTP, "HTTP ${response.code}")
-          else -> {
-            val body = response.body?.string()
-            if (body.isNullOrBlank()) {
-              AppUpdateCheck.Failed(AppUpdateFailure.INVALID_RESPONSE)
-            } else {
-              saveCache(body, response.header("ETag"))
-              AppReleases.parse(body, currentVersionName(), includePrerelease)
-            }
+        } else {
+          val body = if (response.code == 304) validCache.orEmpty() else response.body?.let { data -> data.byteStream().use { readUpdateFeed(it, data.contentLength()) } }.orEmpty()
+          val result = AppReleases.parse(body, currentVersionName(), includePrerelease, currentVersionCode())
+          if (result is AppUpdateCheck.Failed) {
+            fetchPolicy = fetchPolicy.failed(now)
+          } else {
+            saveCache(body, if (response.code == 304) cachedEtag() else response.header("ETag"))
+            fetchPolicy = fetchPolicy.succeeded(now, kotlin.random.Random.nextLong(15 * 60_000L + 1))
           }
+          savePolicy()
+          result
         }
       }
     } catch (cancel: CancellationException) {
       throw cancel
-    } catch (_: IOException) {
-      AppUpdateCheck.Failed(AppUpdateFailure.NETWORK)
     } catch (_: Exception) {
-      AppUpdateCheck.Failed(AppUpdateFailure.INVALID_RESPONSE)
+      fetchPolicy = fetchPolicy.failed(now)
+      savePolicy()
+      AppUpdateCheck.Failed(AppUpdateFailure.NETWORK)
     }
   }
-
   private fun verifyApk(apk: File, release: AppRelease) {
+    if (!AppReleases.isAllowed(release, currentVersionName(), selectedIncludePrerelease)) {
+      throw DownloadFailure(AppUpdateFailure.INVALID_APK, "当前通道已变更，请重新检查更新")
+    }
     val flags = packageFlags()
     val packageManager = context.packageManager
     val archive = packageManager.getPackageArchiveInfo(apk.absolutePath, flags)
@@ -434,7 +478,7 @@ class AppUpdater private constructor(private val context: Context) {
       throw DownloadFailure(AppUpdateFailure.INVALID_APK, "APK 版本为 ${archiveVersion ?: "未知"}")
     }
     val archiveCode = versionCode(archive)
-    if (archiveCode <= currentVersionCode()) {
+    if (archiveCode <= currentVersionCode() || (release.versionCode != null && archiveCode != release.versionCode)) {
       throw DownloadFailure(AppUpdateFailure.VERSION_REGRESSION, "APK versionCode=$archiveCode")
     }
     val archiveSigners = signerDigests(archive)
@@ -490,14 +534,14 @@ class AppUpdater private constructor(private val context: Context) {
 
   private fun cachedBody(): String? {
     cachedBody?.let { return it }
-    val text = runCatching { releasesCache.takeIf { it.isFile }?.readText() }.getOrNull()
+    val text = runCatching { releasesCache.takeIf { it.isFile && it.length() <= MAX_UPDATE_FEED_BYTES }?.inputStream()?.use { readUpdateFeed(it) } }.getOrNull()
     cachedBody = text
     return text
   }
 
   private fun cachedEtag(): String? {
     cachedEtag?.let { return it }
-    val text = runCatching { etagCache.takeIf { it.isFile }?.readText()?.trim() }.getOrNull()
+    val text = runCatching { etagCache.takeIf { it.isFile && it.length() <= 4096 }?.readText()?.trim() }.getOrNull()
       ?.takeIf { it.isNotEmpty() }
     cachedEtag = text
     return text
@@ -507,8 +551,8 @@ class AppUpdater private constructor(private val context: Context) {
     cachedBody = body
     cachedEtag = etag
     runCatching {
-      updateDir.mkdirs()
-      val bodyTemp = File(updateDir, "releases.json.tmp")
+      feedDir.mkdirs()
+      val bodyTemp = File(feedDir, "updates.json.tmp")
       bodyTemp.writeText(body)
       if (!bodyTemp.renameTo(releasesCache)) {
         bodyTemp.copyTo(releasesCache, overwrite = true)
@@ -517,7 +561,7 @@ class AppUpdater private constructor(private val context: Context) {
       if (etag == null) {
         etagCache.delete()
       } else {
-        val etagTemp = File(updateDir, "releases.etag.tmp")
+        val etagTemp = File(feedDir, "updates.etag.tmp")
         etagTemp.writeText(etag)
         if (!etagTemp.renameTo(etagCache)) {
           etagTemp.copyTo(etagCache, overwrite = true)
