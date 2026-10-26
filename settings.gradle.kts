@@ -7,3 +7,4 @@ dependencyResolutionManagement {
 }
 rootProject.name = "Lagoon"
 include(":app")
+include(":hub")
