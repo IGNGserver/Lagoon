@@ -7,6 +7,7 @@ import { build, chunks, details, type TranscriptRow } from "./rows";
 interface ContractCase {
   name: string;
   working: boolean;
+  unverified?: boolean;
   revertMessageId: string;
   details: string;
   expanded: string[];
@@ -19,7 +20,7 @@ const contract = JSON.parse(readFileSync(fileURLToPath(new URL("../../../contrac
 describe("TranscriptRows contract (shared with the Kotlin original)", () => {
   it.each(contract.cases.map((c) => [c.name, c] as const))("%s", (_, c) => {
     const revert = c.revertMessageId || null;
-    const rows = c.details ? details(c.messages, c.details, c.working, revert) : build(c.messages, new Set(c.expanded), c.working, revert);
+    const rows = c.details ? details(c.messages, c.details, c.working, revert, c.unverified) : build(c.messages, new Set(c.expanded), c.working, revert, c.unverified);
     expect(rows.map(({ source: _source, ...rest }) => rest)).toEqual(c.rows);
   });
 });

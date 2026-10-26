@@ -49,12 +49,26 @@ class TranscriptProjectionTest {
     assertEquals(listOf("src/a.kt"), tool.files); assertEquals("@@ -1 +1 @@", tool.patch)
   }
 
-  @Test fun aShellCommandWithANonZeroExitIsAFailure() {
+  @Test fun aShellCommandWithANonZeroExitKeepsDiagnosticsWithoutFailingTheGroup() {
     val done = listOf(Message("msg_a", "assistant", 1, emptyList(), type = "assistant"))
       .apply("session.tool.input.started", """{"sessionID":"s","assistantMessageID":"msg_a","id":"call_1","name":"shell"}""")
       .apply("session.tool.called", """{"sessionID":"s","assistantMessageID":"msg_a","id":"call_1","input":{"command":"false"},"executed":true}""")
       .apply("session.tool.success", """{"sessionID":"s","assistantMessageID":"msg_a","id":"call_1","content":[{"type":"text","text":""}],"metadata":{"exit":1},"executed":true}""")
     assertEquals("error", done.single().parts.single().status)
+    assertEquals("退出码 1", done.single().parts.single().error)
+    assertNull(done.single().error)
+    val group = TranscriptRows.build(done).single { it.kind == "tool-group" }
+    assertEquals("warning", group.status)
+    assertEquals("含 1 条异常命令", group.subtitle)
+    assertTrue(TranscriptRows.details(done, group.key).any { it.kind == "tool-body" && it.title == "错误" && it.text == "退出码 1" })
+
+    val continuing = done
+      .apply("session.tool.input.started", """{"sessionID":"s","assistantMessageID":"msg_a","id":"call_2","name":"read"}""")
+      .apply("session.tool.called", """{"sessionID":"s","assistantMessageID":"msg_a","id":"call_2","input":{"path":"a.kt"},"executed":true}""")
+    val running = TranscriptRows.build(continuing, working = true)
+    assertEquals("running", running.single { it.kind == "tool-group" }.status)
+    assertEquals("含 1 条异常命令", running.single { it.kind == "tool-group" }.subtitle)
+    assertTrue(running.none { it.kind == "error" })
   }
 
   @Test fun instructionUpdatesBecomeNoticesNeverReplies() {
@@ -114,6 +128,46 @@ class TranscriptProjectionTest {
     val existing = listOf(Message("m1", "user", 1, emptyList()), Message("local", "user", 2, emptyList()))
     val merged = mergeTranscript(existing, listOf(Message("m1", "user", 1, emptyList())), listOf(Message("queued", "user", 3, emptyList())))
     assertEquals(listOf("m1", "local", "queued"), merged.map { it.id })
+  }
+
+  @Test fun aLateReadPreservesChangedMessagesButStillAdmitsServerCorrectionsAndNewIds() {
+    val prompt = Message("u", "user", 1, listOf(MessagePart("u:text", "text", text = "prompt")))
+    val assistant = Message("a", "assistant", 2, listOf(
+      MessagePart("a:text:0", "text", text = "partial"), MessagePart("call", "tool", tool = "read", status = "running")))
+    val start = listOf(prompt, assistant)
+    val live = start
+      .apply("session.text.delta", """{"sessionID":"s","assistantMessageID":"a","delta":" answer"}""")
+      .apply("session.tool.success", """{"sessionID":"s","assistantMessageID":"a","id":"call","content":[{"type":"text","text":"done"}]}""")
+    val corrected = prompt.copy(parts = listOf(MessagePart("u:text", "text", text = "server correction")))
+    val discovered = Message("new", "user", 3, emptyList())
+    val fetched = listOf(corrected, assistant, discovered)
+    val merged = mergeTranscript(live, fetched, readStart = start.associateBy { it.id })
+    assertEquals(listOf(corrected, live.last(), discovered), merged)
+    assertEquals("partial answer", merged[1].parts[0].text)
+    assertEquals("completed", merged[1].parts[1].status)
+    // The UI merge must not mutate the wire-derived values later used by TranscriptSync.absorb.
+    assertEquals("running", fetched[1].parts[1].status)
+    assertEquals("partial", fetched[1].parts[0].text)
+  }
+
+  @Test fun aSecondMergeAtCommitProtectsEventsAfterTheFirstMerge() {
+    val start = listOf(Message("a", "assistant", 1, listOf(MessagePart("a:text:0", "text", text = "start"))))
+    val baseline = start.associateBy { it.id }
+    val fetched = start.map { it.copy(parts = listOf(MessagePart("a:text:0", "text", text = "http"))) }
+    val prepared = mergeTranscript(start, fetched, readStart = baseline)
+    val later = start.apply("session.text.delta", """{"sessionID":"s","assistantMessageID":"a","delta":" live"}""") +
+      Message("local", "user", 2, emptyList())
+    val committed = mergeTranscript(later, prepared, readStart = baseline)
+    assertEquals(later, committed)
+    // On the next read this entry is unchanged: the server can reconcile it instead of being starved.
+    assertEquals("http", mergeTranscript(committed, fetched, readStart = committed.associateBy { it.id }).first().parts.single().text)
+  }
+
+  @Test fun sameIdCreatedWhileAnInitialReadIsWideningKeepsItsLiveVersion() {
+    val fetched = Message("a", "assistant", 2, listOf(MessagePart("a:text:0", "text", text = "old")))
+    val live = listOf(fetched).apply("session.text.delta", """{"sessionID":"s","assistantMessageID":"a","delta":" new"}""")
+    val older = Message("u", "user", 1, emptyList())
+    assertEquals(listOf(older, live.single()), mergeTranscript(live, listOf(older, fetched), readStart = emptyMap()))
   }
 
   @Test fun needsOlderTurnRootOnlyWhenTheWindowStartsMidTurn() {

@@ -140,7 +140,7 @@ class PersistentConnectionsTest {
       val base = dispatcher(streams)
       server.dispatcher = object : Dispatcher() {
         override fun dispatch(request: RecordedRequest): MockResponse = when (request.requestUrl!!.encodedPath) {
-          "/api/permission/request" -> {
+          "/api/session/s/permission" -> {
             readStarted.countDown()
             MockResponse().setBody("""{"data":[{"id":"p","sessionID":"s","action":"shell","resources":["echo hi"]}]}""")
               .setBodyDelay(700, java.util.concurrent.TimeUnit.MILLISECONDS)
@@ -240,6 +240,31 @@ class PersistentConnectionsTest {
         active.set(activePage(emptyList()))
         manager.refreshAll()
         awaitCondition { snapshots["a"]?.sessions?.none { it.id == "s" } == true }
+      } finally { manager.stop(); scope.cancel() }
+    }
+  }
+
+  @Test fun anOfflineColdStartNeverTreatsPersistedRunningAsAFreshClaim() = runBlocking {
+    MockWebServer().use { server ->
+      server.dispatcher = object : Dispatcher() {
+        override fun dispatch(request: RecordedRequest) = MockResponse().setResponseCode(503)
+      }
+      val store = store(); val profile = profile("a", server)
+      store.save(profile, null)
+      store.rememberTask("a", TaskState("s", TaskPhase.THINKING, since = 100, background = true))
+      val cache = cache()
+      cache.saveCatalog("a", emptyList(), listOf(Session("s", "/repo", "Old task", 1, serverId = "a")))
+      val scope = CoroutineScope(coroutineContext + SupervisorJob())
+      val snapshots = ConcurrentHashMap<String, ServerOverviewSnapshot>()
+      val manager = AllServersOverview(store, cache, scope, { snapshots[it.serverId] = it })
+      try {
+        manager.start(listOf(profile))
+        awaitCondition { snapshots["a"]?.error != null }
+        val snapshot = snapshots.getValue("a")
+        assertTrue(snapshot.tasks.getValue("s").uncertain)
+        assertEquals(0L, snapshot.lastReadAt)
+        assertEquals(0, snapshot.displaySummary(PermissionPolicy()).running)
+        assertEquals(SessionStatus.UNKNOWN, LagoonState(allServerSnapshots = mapOf("a" to snapshot)).allServerStatuses()[scopedKey("a", "s")])
       } finally { manager.stop(); scope.cancel() }
     }
   }

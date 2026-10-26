@@ -51,6 +51,9 @@ interface HarnessClient {
 
   suspend fun inbox(id: String): List<Message>
 
+  /** Includes admitted internal inputs (e.g. compaction/move) which have no transcript row. */
+  suspend fun hasPendingInput(id: String): Boolean = inbox(id).isNotEmpty()
+
   suspend fun activeSessions(): Set<String>
 
   suspend fun shells(directory: String): List<ShellJob>

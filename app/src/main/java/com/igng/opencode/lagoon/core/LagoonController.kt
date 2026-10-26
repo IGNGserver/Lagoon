@@ -171,8 +171,8 @@ data class LagoonState(
   fun sessionStatus(session: Session, active: Map<String, TaskState> = activeRootTasks): SessionStatus {
     if (allServers && serverId == null) return allSessionStatuses[session.key] ?: SessionStatus.NONE
     val unseen = notices.unseenFor(session.id)
-    val staleOwn = staleConnection && presentedTasks[session.id]?.active == true
-    val staleRoot = staleConnection && rawActiveRootTasks.containsKey(session.id)
+    val staleOwn = (staleConnection || presentedTasks[session.id]?.uncertain == true) && presentedTasks[session.id]?.active == true
+    val staleRoot = (staleConnection || tasks.values.any { it.uncertain }) && rawActiveRootTasks.containsKey(session.id)
     if ((staleOwn || staleRoot) && active[session.id] == null && unseen.isEmpty()) return SessionStatus.UNKNOWN
     return sessionStatus(active[session.id], unseen, session.id in backgroundRunning)
   }
@@ -205,10 +205,6 @@ class LagoonController private constructor(private val appContext: Context) {
     private const val MAX_SHELL_DIRECTORIES = 8
     /** shell 归属会话不在目录页时，最多补读多少个会话身份来解析父链。 */
     private const val MAX_SHELL_SESSIONS = 12
-    /** 对账时为仍活跃的根会话补拉后代，避免事件丢失后只剩根而丢掉父子关系。 */
-    private const val MAX_BACKGROUND_CHILD_ROOTS = 24
-    private const val MAX_BACKGROUND_CHILD_SESSIONS = 100
-    private const val MAX_BACKGROUND_CHILD_DEPTH = 8
     /** 后台工作结束后等待服务端唤醒的宽限期；超时仍无新执行才按会话结局收尾。 */
     private const val BACKGROUND_SETTLE_MILLIS = 10_000L
     /** 目录读取失败时旧 shell 条目的最长保留时间，避免事件丢失后“后台运行中”僵死。 */
@@ -232,21 +228,15 @@ class LagoonController private constructor(private val appContext: Context) {
     // Most updates change tasks, not the transcript: reuse the last scan while the message list is the same instance.
     val transcriptChildren = subagentScan?.takeIf { it.first == transcriptParent && it.second === state.messages }?.third
       ?: BackgroundWork.messageSubagents(transcriptParent, state.messages).also { subagentScan = Triple(transcriptParent, state.messages, it) }
-    val observed = if (transcriptChildren.isEmpty() || transcriptParent == null) state else {
-      val tasks = LinkedHashMap(state.tasks)
-      transcriptChildren.forEach { (child, created) ->
-        // 工具结果里的 `metadata.status="running"` 是返回当时的静态快照，不是实时状态。只补
-        // 未知的子任务：已有任务（尤其已收尾的墓碑）不能被旧 transcript 再次改回活跃。
-        if (tasks[child] == null) tasks[child] = TaskState(child, TaskPhase.SUBAGENT, TaskState.RUNNING_DETAIL,
-          since = created.takeIf { it > 0 } ?: System.currentTimeMillis(), activeAt = -1L)
-      }
-      state.copy(tasks = tasks, knownParents = state.knownParents + transcriptChildren.keys.associateWith { transcriptParent })
-    }
+    // Historical metadata discovers identities, not live claims. Only events and authoritative
+    // reads may create running tasks; reopening an old transcript must never start a spinner.
+    val observed = if (transcriptChildren.isEmpty() || transcriptParent == null) state else
+      state.copy(knownParents = state.knownParents + transcriptChildren.keys.associateWith { transcriptParent })
     val folded = BackgroundWork.fold(observed.tasks, observed.shells, observed.parents)
     val next = if (folded === observed.tasks) observed else observed.copy(tasks = folded)
     next.serverId?.let { server -> next.tasks.values.forEach { persistTask(server, it, next.parents[it.sessionId]) } }
     val work = BackgroundWork.workRoots(next.tasks, next.shells, next.parents)
-    next.tasks.values.filter { it.active && it.background && it.sessionId !in work }.forEach { scheduleBackgroundSettle(it.sessionId) }
+    next.tasks.values.filter { it.active && !it.uncertain && it.background && it.sessionId !in work }.forEach { scheduleBackgroundSettle(it.sessionId) }
     val titles = sessionTitles?.takeIf { it.first === next.sessions }?.second
       ?: next.sessions.associate { it.id to next.title(it) }.also { sessionTitles = next.sessions to it }
     val active = next.activeRootTasks
@@ -309,15 +299,8 @@ class LagoonController private constructor(private val appContext: Context) {
     val task = current.tasks[root] ?: return
     if (!task.active || !task.background) return
     if (BackgroundWork.hasBackgroundWork(root, current.tasks, current.shells, current.parents)) return
-    val session = current.sessions.firstOrNull { it.id == root } ?: return
-    mutable.update { previous ->
-      val live = previous.tasks[root]
-      if (live == null || !live.active || !live.background) previous
-      else withSummary(previous.copy(tasks = previous.tasks + (root to TaskReducer.terminal(root, session.outcome, live))))
-    }
-    if (!state.value.notices.coversRun(root, task.since)) {
-      session.transitionNotice(task.since)?.let { notice -> recordNotice(server, session, notice, task.since) }
-    }
+    // An empty local map after a dropped stream is not proof of completion. Re-read before settling.
+    scope.launch { attempt { loadAll(generation, controlOnly = true, followUp = false) } }
   }
   private val store = ServerStore(appContext)
   private val cache = OfflineCache(appContext)
@@ -388,6 +371,9 @@ class LagoonController private constructor(private val appContext: Context) {
   private var serverReadJob: Job? = null
   /** 等待态事件的单调序号：对账只在读取期间没有新的等待事件时才清除等待态，避免事件/对读竞态造成抖动。 */
   private var waitingEventSeq = 0L
+  /** Execution/shell lifecycle events fence older HTTP snapshots (not token/delta events). */
+  private var workRevision = 0L
+  private var childDiscovery: ChildDiscovery? = null
   private val waitingEventSeqAt = mutableMapOf<String, Long>()
   private val resolvedPermissions = linkedSetOf<String>()
   /** Field timing of connect / reconnect / refresh attempts, keyed by [generation]. */
@@ -854,7 +840,7 @@ class LagoonController private constructor(private val appContext: Context) {
       connection = ConnectionStatus(ConnectStage.CONNECTING, System.currentTimeMillis()),
       agent = configuration.agent, model = configuration.model, agentChanged = configuration.agentChanged, modelChanged = configuration.modelChanged,
       draft = rememberedSession?.let { store.draft(id, it) }.orEmpty(), references = rememberedSession?.let { store.references(id, it) }.orEmpty(),
-      tasks = snapshot?.tasks ?: store.taskStates(id), knownParents = store.taskParents(id), notices = store.sessionNotices(id), collapsedSections = store.collapsedSections(id), pinned = store.pinnedSessions(id),
+      tasks = snapshot?.tasks ?: TaskReconciliation.restored(store.taskStates(id)), knownParents = store.taskParents(id), notices = store.sessionNotices(id), collapsedSections = store.collapsedSections(id), pinned = store.pinnedSessions(id),
       pendingAttachments = previous.pendingAttachments,
       modelOverrides = store.modelOverrides(id), modelVisibilityConfigured = store.modelVisibilityConfigured(id),
       modelVariants = store.modelVariants(id), recentModels = store.recentModels(id), scopeProjectId = store.scope(id)) }
@@ -949,6 +935,7 @@ class LagoonController private constructor(private val appContext: Context) {
     val requestSequence = ++catalogSequence
     // 读取开始时的等待态事件序号：读取期间到达的 permission/form 事件不能被这次（更早的）读取结果清除。
     val readWaitingSeq = waitingEventSeq
+    val readWorkRevision = workRevision
     // 本设备认为仍在运行的会话；读取后用于判断哪些需要重新拉取会话信息（取得权威 outcome/time.idle）。
     val previousActiveIds = state.value.tasks.filterValues { it.active }.keys.toSet()
     val serverId = state.value.serverId ?: return
@@ -1000,14 +987,21 @@ class LagoonController private constructor(private val appContext: Context) {
       }
     }
     // Active sessions (often subagent children) may be older than the first page. Keep their identity and parent chain.
-    val missingIds = (active.orEmpty() + listOfNotNull(state.value.sessionId, store.selectedSession(serverId)))
+    val transcriptChildren = BackgroundWork.messageSubagents(state.value.sessionId, state.value.messages).keys
+    val missingIds = (active.orEmpty() + transcriptChildren + state.value.permissions.map { it.sessionId } +
+      state.value.questions.map { it.sessionId } + listOfNotNull(state.value.sessionId, store.selectedSession(serverId)))
       .filter { id -> sessions.none { it.id == id } && state.value.sessions.none { it.id == id } }.distinct()
     // 本设备认为仍在运行、但既不在前台活跃集合、也不在本页目录里的会话：重新读取其会话信息，取得
     // 服务端持久化的 outcome/time.idle，用来给漏掉终止事件的一轮做权威收尾（含转入后台的子代理）。
     val staleActiveIds = previousActiveIds.filter { id -> active.orEmpty().none { it == id } && sessions.none { it.id == id } }.distinct()
     val extraSessions = mutableListOf<Session>()
+    val deletedSessions = mutableSetOf<String>()
     (missingIds + staleActiveIds).distinct().take(100).chunked(4).forEach { batch ->
-      extraSessions += coroutineScope { batch.map { id -> async { attempt { findSession(client, id) }.getOrNull() } }.awaitAll().filterNotNull().map { scoped(serverId, it) } }
+      val reads = coroutineScope { batch.map { id -> async { id to attempt { client.session(id).takeIf { it.id == id } } } }.awaitAll() }
+      reads.forEach { (id, result) ->
+        result.getOrNull()?.let { extraSessions += scoped(serverId, it) }
+        if (active != null && (result.exceptionOrNull() as? ApiException)?.status == 404 && id !in active) deletedSessions += id
+      }
       if (token != generation || requestSequence != catalogSequence) return
     }
     // An active child may refer to a root outside the catalog page. Fetch the ancestry so both
@@ -1034,7 +1028,7 @@ class LagoonController private constructor(private val appContext: Context) {
     // Pending requests, read like the official client: permissions per session, forms per location.
     // A directory whose recent read failed (typically a deleted worktree answering 500) is skipped
     // until its retry window opens, so one dead directory cannot degrade the whole list forever.
-    val waitingCandidates = (active.orEmpty() + state.value.permissions.map { it.sessionId } + listOfNotNull(state.value.sessionId))
+    val waitingCandidates = (active.orEmpty() + state.value.permissions.map { it.sessionId } + state.value.questions.map { it.sessionId } + listOfNotNull(state.value.sessionId))
       .distinct().mapNotNull { identities[it] }
     val skippedPermissionSessions = waitingCandidates.filter { directoryHealth.isDown(it.directory) }.map { it.id }.toSet()
     val readableCandidates = waitingCandidates.filterNot { it.id in skippedPermissionSessions }
@@ -1051,39 +1045,28 @@ class LagoonController private constructor(private val appContext: Context) {
     // `/api/session/active` and the event stream can both omit a child identity after a reconnect.
     // A persisted live root is enough to discover its descendants through the authoritative child
     // listing; those identities then supply the parent map used by the task reducer below.
-    val knownParents = store.taskParents(serverId) + identities.values.mapNotNull { session ->
+    val knownParents = state.value.parents + store.taskParents(serverId) + identities.values.mapNotNull { session ->
       session.parentId?.let { session.id to it }
     }
-    val candidateIds = previousActiveIds + active.orEmpty() + state.value.backgroundRunning
+    val candidateIds = previousActiveIds + active.orEmpty() + state.value.backgroundRunning + transcriptChildren
     val candidateRoots = candidateIds.map { BackgroundWork.rootOf(it, knownParents) }.toSet()
     // A root present in the authoritative foreground set is already running itself; querying its
     // children would only add catalog traffic and cannot change the background classification.
-    var childFrontier = identities.values.filter { it.id in candidateRoots && it.parentId == null && active?.contains(it.id) != true }
-    val inspectedChildren = mutableSetOf<String>()
-    var childBudget = MAX_BACKGROUND_CHILD_SESSIONS
-    var childDepth = 0
-    while (childFrontier.isNotEmpty() && childDepth++ < MAX_BACKGROUND_CHILD_DEPTH && childBudget > 0) {
-      val batch = childFrontier.filter { inspectedChildren.add(it.id) }.take(MAX_BACKGROUND_CHILD_ROOTS)
-      if (batch.isEmpty()) break
-      val listed = coroutineScope { batch.map { session -> async { attempt { client.children(session) } } }.awaitAll() }
-        .flatMap { it.getOrDefault(emptyList()) }.distinctBy { it.id }
-      if (token != generation || requestSequence != catalogSequence) return
-      val additions = listed.filter { it.id.isNotBlank() && it.id !in identities }.take(childBudget)
-      additions.forEach { identities[it.id] = it }
-      extraSessions += additions
-      childBudget -= additions.size
-      childFrontier = listed.filter { it.id !in inspectedChildren }
-    }
+    val childRead = TaskReconciliation.children(client,
+      identities.values.filter { it.id in candidateRoots && it.parentId == null && active?.contains(it.id) != true }, knownParents,
+      childDiscovery ?: ChildDiscovery().also { childDiscovery = it })
+    if (token != generation || requestSequence != catalogSequence) return
+    childRead.sessions.forEach { identities[it.id] = it }
+    extraSessions += childRead.sessions
     if (!fetchMissingParents()) return
     // 运行中的 shell 作业：后台 shell 不是会话，不在 /api/session/active 里，冷启动/断线后只能从
     // `GET /api/shell` 读到。目录列表以本机项目优先，其次是最新活跃会话的执行目录（上限防请求风暴）。
-    val shellDirectories = (projects.map { it.directory } +
-      active.orEmpty().mapNotNull { identities[it]?.directory } +
-      (sessions + extraSessions).map { it.directory })
-      .filter(String::isNotBlank).distinctBy(::normalizedDirectory)
-      .filterNot { directoryHealth.isDown(it) }.take(MAX_SHELL_DIRECTORIES)
+    val shellDirectories = TaskReconciliation.shellDirectories(state.value.tasks, state.value.shells,
+      identities.values.toList(), projects, active.orEmpty() + transcriptChildren, MAX_SHELL_DIRECTORIES)
+      .filterNot { directoryHealth.isDown(it) }
     val shellResults = coroutineScope { shellDirectories.map { directory -> async { directory to attempt { client.shells(directory) } } }.awaitAll() }
     if (token != generation || requestSequence != catalogSequence) return
+    if (readWorkRevision != workRevision) return
     val refreshedShellDirectories = mutableSetOf<String>()
     val freshShells = linkedMapOf<String, ShellJob>()
     shellResults.forEach { (directory, result) ->
@@ -1110,6 +1093,7 @@ class LagoonController private constructor(private val appContext: Context) {
     // after the shell-specific identity fetch as well as before it.
     if (!fetchMissingParents()) return
     // Pending requests, read like the official client: permissions per session, forms per location.
+    val inboxRead = PendingInputs.read(client, identities.values.toList(), state.value.tasks, active)
     // Only a running session can be waiting on the user.
     // Pending requests, read like the official client: permissions per session, forms per location.
     // A directory whose recent read failed (typically a deleted worktree answering 500) is skipped
@@ -1129,8 +1113,10 @@ class LagoonController private constructor(private val appContext: Context) {
     sweptPermissions.forEach { (directory, result) -> if (result.isSuccess) directoryHealth.succeeded(directory) else directoryHealth.failed(directory) }
     formResults.forEach { (directory, result) -> if (result.isSuccess) directoryHealth.succeeded(directory) else directoryHealth.failed(directory) }
     if (token != generation || requestSequence != catalogSequence) return
+    if (readWorkRevision != workRevision) return
     val failedPermissionSessions = permissionResults.filter { it.second.isFailure }.map { it.first }.toSet() + skippedPermissionSessions
     val failedFormDirs = formResults.filter { it.second.isFailure }.map { normalizedDirectory(it.first) }.toSet()
+    val verifiedFormDirs = formResults.filter { it.second.isSuccess }.map { normalizedDirectory(it.first) }.toSet()
     val permissions = (permissionResults.mapNotNull { it.second.getOrNull() }.flatten() +
       sweptPermissions.mapNotNull { it.second.getOrNull() }.flatten()).distinctBy { it.id }
     val questions = formResults.mapNotNull { it.second.getOrNull() }.flatten().distinctBy { it.id }
@@ -1140,10 +1126,14 @@ class LagoonController private constructor(private val appContext: Context) {
     val activeIds = active.orEmpty()
     val activeDirectories = activeIds.mapNotNull { identities[it]?.directory }.map(::normalizedDirectory).toSet()
     val degraded = activeResult.isFailure ||
+      state.value.tasks.values.any { task -> task.active && identities[task.sessionId]?.let {
+        normalizedDirectory(it.directory) !in refreshedShellDirectories
+      } != false } ||
       permissionResults.any { it.second.isFailure && (it.first in activeIds || normalizedDirectory(identities[it.first]?.directory.orEmpty()) in activeDirectories) } ||
       formResults.any { it.second.isFailure && normalizedDirectory(it.first) in activeDirectories }
     if (degraded) Diagnostics.warn("LagoonController", "部分状态读取失败，保留上次可信状态", activeResult.exceptionOrNull())
 
+    deletedSessions.forEach { store.forgetTask(serverId, it) }
     val storedTasks = store.taskStates(serverId)
     var finishedRuns = emptyList<Pair<Session, Long>>()
     // 本次读取前已知的待处理项，用于识别事件流可能漏掉的新权限/表单。
@@ -1156,73 +1146,38 @@ class LagoonController private constructor(private val appContext: Context) {
       val keptShells = previous.shells.filter { (_, job) ->
         normalizedDirectory(job.directory) !in refreshedShellDirectories && now - job.observedAt < SHELL_TTL_MILLIS
       }
-      val nextShells = keptShells + freshShells.mapValues { (_, job) -> job.copy(observedAt = now) }
-      val previousTasks = previous.tasks + storedTasks.filter { (id, task) -> previous.tasks[id]?.let { old -> task.since > old.since || (task.finishedAt ?: 0) > (old.finishedAt ?: 0) } ?: true }
+      val nextShells = (keptShells + freshShells.mapValues { (_, job) -> job.copy(observedAt = now) })
+        .filterValues { it.sessionId !in deletedSessions }
+      val previousTasks = (previous.tasks + storedTasks.filter { (id, task) -> previous.tasks[id]?.let { old -> task.since > old.since || (task.finishedAt ?: 0) > (old.finishedAt ?: 0) } ?: true }) - deletedSessions
       val nextSessions = (sessions + extraSessions + previous.sessions.filter {
         // A session this device saw running, or one with an unread result, never silently drops out;
         // neither do rows loaded through “加载更多” while the catalog has more pages.
         it.id in active.orEmpty() || it.id == previous.sessionId || previousTasks[it.id]?.active == true ||
           previous.notices.unseenFor(it.id).isNotEmpty() || page.next != null
-        }).map { scoped(serverId, it) }.distinctBy { it.id }.sortedWith(sessionActivityOrder)
+        }).filterNot { it.id in deletedSessions }.map { scoped(serverId, it) }.distinctBy { it.id }.sortedWith(sessionActivityOrder)
       val parentMap = store.taskParents(serverId) + nextSessions.mapNotNull { s -> s.parentId?.let { s.id to it } }
-      // Only live state is carried; finished runs live in the unread ledger, never as a permanent phase.
-      val states = mutableMapOf<String, TaskState>()
-      // 先子后父：父会话判断“子树是否还有后台工作”时，必须看到子会话本次是否已收尾。
-      nextSessions.sortedByDescending { BackgroundWork.depth(it.id, parentMap) }.forEach { session ->
-        val task = previousTasks[session.id]
-        // 已处理会话的新状态覆盖旧值；未处理的会话仍按上次状态保守看待。
-        val effectiveTasks = previousTasks + states
-        // 本次权威读取里，该会话自身子树是否仍有后台工作（后台 shell / 活跃子代理）。
-        val hasWork = BackgroundWork.hasBackgroundWork(session.id, effectiveTasks, nextShells, parentMap)
-        // 子代理任务由父会话的工具结果/transcript 派生，没有服务端时间基线（activeAt = -1）。
-        val derivedChild = task != null && (task.phase == TaskPhase.SUBAGENT || parentMap[session.id] != null)
-        val next = when {
-          active == null -> task
-          session.id in active -> TaskReducer.status(session.id, true, task, session.idle)
-          // 折算出的后台任务：权威读取确认后台工作已结束（子代理/ shell 都不在了）时收尾；否则保留
-          // “后台运行中”。SSE 路径的折算态不在这里收尾，交给宽限任务等唤醒（settleBackgroundRun）。
-          task?.active == true && task.background == true && !hasWork ->
-            TaskReducer.terminal(session.id, session.outcome, task)
-          // 根执行可能因事件丢失仍保留旧的前台 active 状态；只要权威 active 列表已排除它、
-          // 且同一子树仍有后台工作，就必须先转成折算态，不能让旧根状态遮住后台任务。
-          task?.active == true && !task.background && session.id !in active && hasWork &&
-            task.phase in TaskState.RUNNING_PHASES ->
-            TaskState(session.id, TaskPhase.THINKING, TaskState.BACKGROUND_DETAIL, task.since,
-              activeAt = task.activeAt, background = true)
-          // 不在前台活跃集合（/api/session/active）不等于本轮结束：转入后台的阻塞工具/子代理会让会话
-          // 继续存活。只有服务端持久化的 time.idle 越过本轮基线、且自身子树没有后台工作时才权威收尾。
-          // 派生的子任务没有基线可比，但会话不在 active 且服务端已记录结束（time.idle > 0）同样说明
-          // 它已经停了——否则 -1 会让子任务永远无法收尾，把根会话永久钉在“后台运行中”。
-          task?.active == true && task.background != true && session.idle > 0 && !hasWork &&
-            ((task.activeAt >= 0 && session.idle > task.activeAt) || (task.activeAt < 0 && derivedChild)) ->
-            TaskReducer.terminal(session.id, session.outcome, task)
-          task?.active == true -> task
-          // 非活跃的任务不再作为常驻相位保留：终态结果只存在于未读账本（notices）。子会话例外：
-          // 留下终态墓碑，防止旧 transcript 的静态 background 元数据把它重新派生为活跃子任务。
-          else -> task?.takeIf { it.phase in TaskState.TERMINAL_PHASES && parentMap[session.id] != null }
-        }
-        if (next != null && next.phase != TaskPhase.IDLE) states[session.id] = next
+      val unresolvedOwners = nextShells.values.any {
+        it.sessionId !in identities || BackgroundWork.rootOf(it.sessionId, parentMap) !in identities
       }
-      // 子会话可能已经不在本页目录里：把之前收尾的子任务墓碑带过去，同样是为了让 transcript
-      // 兜底看到“这个子任务已经结束”，而不是每次界面重建都再折算回“后台运行中”。
-      previousTasks.forEach { (id, task) ->
-        if (id !in states && task.phase in TaskState.TERMINAL_PHASES && parentMap[id] != null) states[id] = task
-      }
+      val states = TaskReconciliation.reconcile(previousTasks, nextSessions, active, nextShells, parentMap,
+        (sessions + extraSessions).map { it.id }.toSet(), refreshedShellDirectories, deletedSessions,
+        childRead.incompleteRoots + if (unresolvedOwners) candidateRoots else emptySet(), inboxRead).toMutableMap()
       // A successful read is authoritative; a failed one keeps the previous requests so a pending
       // approval is never silently dropped.
       val readIds = waitingCandidates.map { it.id }.toSet()
       val changedWhileReading = waitingEventSeqAt.filterValues { it > readWaitingSeq }.keys
-      val keptPermissions = previous.permissions.filter { it.sessionId !in readIds || it.sessionId in failedPermissionSessions || it.sessionId in changedWhileReading }
-      val fetchedPermissions = permissions.filterNot { it.sessionId in changedWhileReading || it.id in resolvedPermissions }
+      val keptPermissions = previous.permissions.filter { it.sessionId !in deletedSessions && (it.sessionId !in readIds || it.sessionId in failedPermissionSessions || it.sessionId in changedWhileReading) }
+      val fetchedPermissions = permissions.filterNot { it.sessionId in deletedSessions || it.sessionId in changedWhileReading || it.id in resolvedPermissions }
       val nextPermissions = allOverview?.pending(serverId, (fetchedPermissions + keptPermissions).distinctBy { it.id })
         ?: (fetchedPermissions + keptPermissions).distinctBy { it.id }
-      val keptQuestions = previous.questions.filter { active == null || normalizedDirectory(it.directory) in failedFormDirs || it.sessionId in changedWhileReading }
-      val fetchedQuestions = questions.filterNot { it.sessionId in changedWhileReading || it.id in resolvedPermissions }
+      val keptQuestions = previous.questions.filter { it.sessionId !in deletedSessions && (normalizedDirectory(it.directory) !in verifiedFormDirs || it.sessionId in changedWhileReading) }
+      val fetchedQuestions = questions.filterNot { it.sessionId in deletedSessions || it.sessionId in changedWhileReading || it.id in resolvedPermissions }
       val nextQuestions = (fetchedQuestions + keptQuestions).distinctBy { it.id }
       fun waitingState(sessionId: String, phase: TaskPhase, detail: String): TaskState {
         val previousTask = previousTasks[sessionId]
         return TaskState(sessionId, phase, detail, previousTask?.since ?: System.currentTimeMillis(),
-          activeAt = previousTask?.activeAt ?: -1L, background = previousTask?.background == true)
+          activeAt = previousTask?.activeAt ?: -1L, background = previousTask?.background == true,
+          pendingInput = states[sessionId]?.pendingInput == true)
       }
       nextPermissions.forEach { states[it.sessionId] = waitingState(it.sessionId, TaskPhase.WAITING_PERMISSION, "等待权限确认") }
       nextQuestions.forEach { states[it.sessionId] = waitingState(it.sessionId, TaskPhase.WAITING_QUESTION, "等待你的回答") }
@@ -1243,12 +1198,14 @@ class LagoonController private constructor(private val appContext: Context) {
       resolvedWaitingIds = resolvedWaiting
       resolvedWaiting.forEach { id ->
         val waiting = states[id]!!
-        if (active != null && id !in active && !BackgroundWork.hasBackgroundWork(id, states, nextShells, parentMap)) {
+        if (active != null && id !in active && !waiting.pendingInput && !waiting.uncertain &&
+          !BackgroundWork.hasBackgroundWork(id, states, nextShells, parentMap)) {
           states.remove(id)
           store.rememberTask(serverId, waiting.copy(phase = TaskPhase.IDLE, detail = ""), parentMap[id])
           persistedTasks.remove("$serverId\u0000$id")
         }
-        else states[id] = TaskState(id, TaskPhase.THINKING, TaskState.RUNNING_DETAIL, waiting.since, activeAt = waiting.activeAt, background = waiting.background)
+        else states[id] = waiting.copy(phase = if (waiting.pendingInput) TaskPhase.WAITING_SERVER else TaskPhase.THINKING,
+          detail = if (waiting.pendingInput) "等待服务器处理" else TaskState.RUNNING_DETAIL)
       }
       // Roots whose family this device saw running and that an authoritative read now shows idle.
       val wasActive = TaskSummary.aggregate(previousTasks.filterValues { it.active }, parentMap)
@@ -1480,6 +1437,12 @@ class LagoonController private constructor(private val appContext: Context) {
    */
   private fun handleEvent(event: ServerEvent) {
     val props = event.properties
+    if (event.type.startsWith("session.execution.") || event.type.startsWith("shell.") ||
+      event.type in setOf("session.deleted", "session.synthetic", "session.error", "session.idle", "session.status") ||
+      BackgroundWork.backgroundSubagentId(event.type, props) != null) {
+      workRevision++
+      childDiscovery = null
+    }
     if (event.type == "permission.asked" && props.str("id") in resolvedPermissions) return
     val sessionId = props.sessionEventId(event.type)
     val known = mutable.value.sessions.firstOrNull { it.id == sessionId }
@@ -1498,7 +1461,7 @@ class LagoonController private constructor(private val appContext: Context) {
         if (pending && after.phase !in TaskState.TERMINAL_PHASES) after = TaskState(sessionId,
           if (pendingPermission) TaskPhase.WAITING_PERMISSION else TaskPhase.WAITING_QUESTION,
           if (pendingPermission) "等待权限确认" else "等待你的回答", before?.since ?: System.currentTimeMillis(),
-          activeAt = before?.activeAt ?: -1L, background = before?.background == true)
+          activeAt = before?.activeAt ?: -1L, background = before?.background == true, pendingInput = before?.pendingInput == true)
         val next = after
         val enteringTerminal = next.phase in TERMINAL_PHASES && before?.phase !in TERMINAL_PHASES
         mutable.update { current -> withSummary(current.copy(tasks = current.tasks + (sessionId to next))) }
@@ -1583,12 +1546,15 @@ class LagoonController private constructor(private val appContext: Context) {
           store.forgetSession(server, sessionId)
           attempt { notifications.cancel(server, sessionId) }
         }
-        mutable.update { it.copy(
+        persistedTasks.remove("${state.value.serverId}\u0000$sessionId")
+        mutable.update { withSummary(it.copy(
           sessions = it.sessions.filterNot { session -> session.id == sessionId },
           tasks = it.tasks - sessionId,
+          knownParents = it.knownParents - sessionId,
+          shells = it.shells.filterValues { shell -> shell.sessionId != sessionId },
           permissions = it.permissions.filterNot { request -> request.sessionId == sessionId },
           questions = it.questions.filterNot { request -> request.sessionId == sessionId },
-          notices = it.notices.filterNot { notice -> notice.sessionId == sessionId }) }
+          notices = it.notices.filterNot { notice -> notice.sessionId == sessionId })) }
       }
       "project.updated" -> {
         val project = props.toProject()
@@ -1620,7 +1586,7 @@ class LagoonController private constructor(private val appContext: Context) {
     if (sessionId.isNotBlank() && backgroundChild != null) {
       mutable.update { current ->
         val previous = current.tasks[backgroundChild]
-        val child = if (previous?.active == true) previous else TaskState(backgroundChild, TaskPhase.SUBAGENT,
+        val child = if (previous?.active == true || previous?.phase in TaskState.TERMINAL_PHASES) previous!! else TaskState(backgroundChild, TaskPhase.SUBAGENT,
           TaskState.RUNNING_DETAIL, since = event.created.takeIf { it > 0 } ?: System.currentTimeMillis(), activeAt = -1L)
         withSummary(current.copy(tasks = current.tasks + (backgroundChild to child),
           knownParents = current.knownParents + (backgroundChild to sessionId)))
@@ -1629,7 +1595,12 @@ class LagoonController private constructor(private val appContext: Context) {
     if (event.type in setOf("session.execution.succeeded", "session.execution.failed") && !familyActive(sessionId)) recordResultNotice(event, sessionId)
     if (sessionId.isNotBlank() && sessionId == mutable.value.sessionId) {
       val projected = TranscriptProjection.apply(mutable.value.messages, event)
-      if (projected != null && projected.messages !== mutable.value.messages) mutable.update { it.copy(messages = projected.messages, resources = it.resources + ("messages" to ResourceStatus(ResourceState.READY))) }
+      if (projected != null && projected.messages !== mutable.value.messages) {
+        val before = mutable.value.messages.associateBy { it.id }
+        val liveIds = projected.messages.filter { before[it.id] != it }.map { it.id }.toSet()
+        mutable.update { it.copy(messages = projected.messages, provisionalMessageIds = it.provisionalMessageIds - liveIds,
+          resources = it.resources + ("messages" to ResourceStatus(ResourceState.READY))) }
+      }
        if (projected?.reconcile == true && messageRefresh?.isActive != true) {
          mutable.value.session?.let { session ->
            val token = generation
@@ -1640,7 +1611,10 @@ class LagoonController private constructor(private val appContext: Context) {
     // Apply this after transcript projection so the completion notice prevents the history-derived
     // fallback above from immediately recreating the child task.
     BackgroundWork.completedSubagentId(event.type, props)?.let { child ->
-      mutable.update { current -> withSummary(current.copy(tasks = current.tasks - child)) }
+      mutable.update { current -> withSummary(current.copy(tasks = current.tasks + (child to
+        TaskReducer.terminal(child, when (props.obj("metadata").str("state")) {
+          "error" -> "failed"; "cancelled" -> "interrupted"; else -> "succeeded"
+        }, current.tasks[child])))) }
     }
   }
 
@@ -1973,6 +1947,12 @@ class LagoonController private constructor(private val appContext: Context) {
     val revision = selectionRevision
     val requestSequence = ++messageSequence
     fun current() = token == generation && revision == selectionRevision && state.value.sessionId == session.id && state.value.executionDirectory == session.directory && requestSequence == messageSequence
+    // Capture before any HTTP/cache suspension, not after the page returns. Live events replace
+    // immutable Message values, letting us protect only the IDs that changed during this read.
+    val readStart = state.value.messages.associateBy { it.id }
+    fun liveMessages(snapshot: LagoonState) = snapshot.messages.filter { message ->
+      message.id !in snapshot.provisionalMessageIds || readStart[message.id]?.let { message != it } == true
+    }
     val showingCache = state.value.provisionalMessageIds.isNotEmpty()
     if (current() && (state.value.messages.isEmpty() || showingCache)) mutable.update { it.copy(resources = it.resources + ("messages" to ResourceStatus(ResourceState.LOADING)),
       transcriptLoadingSince = it.transcriptLoadingSince.takeIf { since -> since > 0 } ?: System.currentTimeMillis()) }
@@ -1999,8 +1979,6 @@ class LagoonController private constructor(private val appContext: Context) {
       page.await() to inbox.await().getOrDefault(emptyList())
     }
     if (token != generation) return
-    // Cache-painted rows are replaced by the server page; rows streamed in meanwhile are kept.
-    val previousMessages = state.value.provisionalMessageIds.let { provisional -> state.value.messages.filterNot { it.id in provisional } }
     val messages = result.map { first ->
       // Official initial window: keep pulling older pages until the oldest boundary is a whole turn,
       // so the first screen never starts mid-reply. Bounded so a refresh cannot burst unbounded.
@@ -2022,7 +2000,8 @@ class LagoonController private constructor(private val appContext: Context) {
       }
       // Merge by id so a tail refresh keeps older pages the reader already loaded and any
       // streaming/optimistic entry the server page has not caught up with yet.
-      withPending(serverId, session.id, mergeTranscript(previousMessages.takeIf { current() }.orEmpty(), fetched, pending))
+      // Sample after widening as well: same-ID events may arrive during any older-page request.
+      withPending(serverId, session.id, mergeTranscript(liveMessages(state.value).takeIf { current() }.orEmpty(), fetched, pending, readStart))
     }.getOrElse { error ->
       // Shown in place (“保留上次数据 · …”); a transcript read failure is not a global error toast.
       Diagnostics.warn("LagoonController", "会话消息读取失败", error)
@@ -2034,7 +2013,8 @@ class LagoonController private constructor(private val appContext: Context) {
     if (result.isSuccess) {
       if (sync == null) cache.saveMessages(serverId, session.id, messages.persistable(), complete = nextCursor == null)
       else if (opened == null) {
-        // A tail refresh: fold the newest page into the stored run (never across a gap).
+        // Store the actual wire page, not the live-protected UI projection (never across a gap).
+        // It may predate an SSE completion; a later authoritative refresh corrects that stored copy.
         val window = records
         val older = nextCursor.takeUnless { reachedStart }
         val start = reachedStart
@@ -2050,14 +2030,18 @@ class LagoonController private constructor(private val appContext: Context) {
       trace(token, ConnectMilestone.TRANSCRIPT)
       openTrace.mark(revision, ConnectMilestone.TRANSCRIPT)?.let { Diagnostics.info("ConnectTrace", "打开会话 · 会话内容 ${it}ms") }
     }
-    val preview = messages.sessionPreview()
-    if (result.isSuccess) store.rememberPreview(serverId, session.id, preview)
-    if (result.isSuccess) transcriptMemory.put(serverId, session.id, messages.persistable())
-    val latestAgent = messages.asReversed().firstNotNullOfOrNull { it.agent } ?: session.agent
-    val latestModel = messages.asReversed().firstNotNullOfOrNull { it.model } ?: session.model
     // 缓存完整性标志解密+解析缓存体，不能放在主线程的状态提交里。
     val cachedComplete = if (result.isSuccess) true else cachedTranscriptComplete(serverId, session.id)
-    mutable.update { withSummary(it.copy(messages = withPending(serverId, session.id, messages), cached = result.isFailure, messagesCursor = if (it.loadedOlderMessages) it.messagesCursor else nextCursor, cacheComplete = cachedComplete,
+    if (!current()) return
+    mutable.update {
+      if (!current()) return@update it
+      // Reconcile inside the atomic update too: cache reads and a retried state CAS must not
+      // commit the earlier snapshot over a later delta, tool completion, or newly loaded page.
+      val committed = withPending(serverId, session.id, mergeTranscript(liveMessages(it), messages, pending, readStart))
+      val preview = committed.sessionPreview()
+      val latestAgent = committed.asReversed().firstNotNullOfOrNull { message -> message.agent } ?: session.agent
+      val latestModel = committed.asReversed().firstNotNullOfOrNull { message -> message.model } ?: session.model
+      withSummary(it.copy(messages = committed, cached = result.isFailure, messagesCursor = if (it.loadedOlderMessages) it.messagesCursor else nextCursor, cacheComplete = cachedComplete,
       provisionalMessageIds = emptySet(), transcriptLoadingSince = 0,
       previews = it.previews + (session.id to preview),
       agent = if (it.agentChanged) it.agent else latestAgent,
@@ -2066,7 +2050,13 @@ class LagoonController private constructor(private val appContext: Context) {
       },
       modelChanged = it.modelChanged || (!it.modelChanged && latestModel != null && it.modelCatalog.isNotEmpty() &&
         normalizeModelVariant(serverId, latestModel, it.modelCatalog).variant != latestModel.variant),
-       resources = it.resources + ("messages" to ResourceStatus(if (result.isSuccess) { if (messages.none { message -> message.isDisplayable }) ResourceState.EMPTY else ResourceState.READY } else ResourceState.STALE))) ) }
+       resources = it.resources + ("messages" to ResourceStatus(if (result.isSuccess) { if (committed.none { message -> message.isDisplayable }) ResourceState.EMPTY else ResourceState.READY } else ResourceState.STALE))) ) }
+    if (!current()) return
+    if (result.isSuccess) {
+      val committed = state.value.messages
+      store.rememberPreview(serverId, session.id, committed.sessionPreview())
+      transcriptMemory.put(serverId, session.id, committed.persistable())
+    }
     // Opening a session never infers a result from its history: “已完成” exists only in the ledger.
     if (ancillary) {
       // Children and diff are independent; fetch in parallel (one round trip when connected).
@@ -2543,6 +2533,11 @@ class LagoonController private constructor(private val appContext: Context) {
         onFailed?.invoke()
         throw error
       }
+      // Admission starts a separate pending-input claim, not a continuation of an obsolete run.
+      workRevision++
+      childDiscovery = null
+      op.commitConnection { current -> withSummary(current.copy(tasks = current.tasks +
+        (session.id to PendingInputs.accepted(session.id, current.tasks[session.id], session.idle)))) }
       if (attachments.isNotEmpty()) {
         mutable.update { it.copy(pendingAttachments = it.pendingAttachments + (attachmentKey(session.id) to it.pendingAttachments[attachmentKey(session.id)].orEmpty().filterNot { item -> item in attachments })) }
         kotlinx.coroutines.withContext(Dispatchers.IO) { attachmentImporter.discard(attachments) }
@@ -2555,7 +2550,6 @@ class LagoonController private constructor(private val appContext: Context) {
         accepted?.invoke()
       }
       op.commitConnection { current -> withSummary(current.copy(
-        tasks = if (current.tasks[session.id]?.active == true) current.tasks else current.tasks + (session.id to TaskState(session.id, TaskPhase.THINKING, TaskState.RUNNING_DETAIL, activeAt = session.idle)),
         previews = current.previews + (session.id to SessionPreview(SessionContent.CONTENT, text.take(300))))) }
       op.commit { it.copy(agentChanged = false, modelChanged = false, references = emptyList()) }
     }
@@ -2566,6 +2560,7 @@ class LagoonController private constructor(private val appContext: Context) {
   }
   fun abort() = withSession("abort") { op, client, session ->
     client.abort(session)
+    workRevision++
     op.commitConnection { withSummary(it.copy(tasks = it.tasks + (session.id to TaskState(session.id, TaskPhase.ABORTED, "任务已停止", it.tasks[session.id]?.since ?: System.currentTimeMillis(), System.currentTimeMillis())))) }
   }
   /** Renames [target] (a session id from the home list) or, by default, the open session. */

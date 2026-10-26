@@ -20,7 +20,7 @@ internal fun ServerOverviewSnapshot.isStale(now: Long = System.currentTimeMillis
 /** Server-owned active work (running / waiting on the server) after applying the offline TTL. */
 internal fun ServerOverviewSnapshot.liveTasks(now: Long = System.currentTimeMillis()): Map<String, TaskState> =
   if (isStale(now)) tasks.filterValues { it.phase !in TaskState.RUNNING_PHASES && it.phase != TaskPhase.WAITING_SERVER }
-  else tasks
+  else tasks.filterValues { !it.uncertain }
 
 internal fun ServerOverviewSnapshot.liveBackground(now: Long = System.currentTimeMillis()): Set<String> =
   if (isStale(now)) emptySet() else backgroundRunning
@@ -58,7 +58,7 @@ fun ServerOverviewSnapshot.sessionStatuses(policy: PermissionPolicy, now: Long =
   val active = TaskSummary.aggregate(policy.tasks(live, permissions, autoApprovalFailures).filterValues { it.active }, parents)
   // Roots whose only activity was server-owned work dropped by the offline TTL must stop spinning,
   // but they are not "idle" either: mark them unknown until an authoritative read returns.
-  val staleRoots = if (isStale(now)) {
+  val staleRoots = if (isStale(now) || tasks.values.any { it.uncertain }) {
     TaskSummary.aggregate(policy.tasks(tasks, permissions, autoApprovalFailures).filterValues { it.active }, parents).keys - active.keys
   } else emptySet()
   val background = liveBackground(now)

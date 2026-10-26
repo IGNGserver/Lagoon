@@ -147,7 +147,7 @@ data class TaskState(
   /**
    * 服务端时间基线：本轮开始时会话的 `time.idle`（由前台读取得到）或 `session.execution.started`
    * 的 `created`。对账时若 `会话.time.idle > activeAt`，说明本轮已结束。−1 表示未知（例如旧版本持久化的
-   * 任务、或刚发送还没拿到服务端信号），此时不用对账收尾，只认终止事件。
+   * 任务、或刚发送还没拿到服务端信号）；此时对账需核实活跃集合、子任务与 shell，不能只比时间。
    */
   val activeAt: Long = -1,
   /**
@@ -156,7 +156,11 @@ data class TaskState(
    * “后台运行中”，直到后台工作完成、服务端重新唤醒 AI（新的 `session.execution.started`）。
    * 旧的“用户显式转后台”合成消息标记也仍会置位这里（[TaskReducer.BACKGROUND_MARKER]）。
    */
-  val background: Boolean = false
+  val background: Boolean = false,
+  /** Last-known activity whose relevant server reads failed or were incomplete; not a live claim. */
+  val uncertain: Boolean = false,
+  /** The server admitted input which has not yet been verified absent from its inbox. */
+  val pendingInput: Boolean = false
 ) {
   val active: Boolean get() = when (phase) {
     TaskPhase.THINKING, TaskPhase.TOOL, TaskPhase.SUBAGENT, TaskPhase.TESTING, TaskPhase.WAITING_PERMISSION, TaskPhase.WAITING_QUESTION, TaskPhase.WAITING_SERVER -> true
@@ -455,14 +459,17 @@ object TaskReducer {
    */
   fun status(sessionId: String, foreground: Boolean, previous: TaskState? = null, idleBaseline: Long = -1): TaskState = when {
     // WAITING 具有粘性：服务器仍在执行时不因一次通用“活跃”读取降级，避免权限/表单抖动。
-    foreground && previous?.phase in TaskState.WAITING_PHASES -> previous!!
+    foreground && previous?.phase in TaskState.WAITING_PHASES -> previous!!.copy(
+      phase = if (previous.pendingInput && previous.phase == TaskPhase.WAITING_SERVER) TaskPhase.THINKING else previous.phase,
+      detail = if (previous.pendingInput && previous.phase == TaskPhase.WAITING_SERVER) TaskState.RUNNING_DETAIL else previous.detail,
+      background = false, uncertain = false)
     foreground -> {
       val continuing = previous?.active == true
       TaskState(sessionId, if (continuing) previous!!.phase else TaskPhase.THINKING, TaskState.RUNNING_DETAIL,
         if (continuing) previous!!.since else System.currentTimeMillis(),
         activeAt = if (continuing && previous!!.activeAt >= 0) previous!!.activeAt else idleBaseline,
         // 会话自身在执行中一律是“运行中”；后台工作只在其 settle 后决定是否折算为“后台运行中”。
-        background = false)
+        background = false, pendingInput = previous?.pendingInput == true)
     }
     previous?.active == true -> previous!!
     previous?.phase in TaskState.TERMINAL_PHASES -> previous!!
@@ -485,7 +492,8 @@ object TaskReducer {
 
   private fun running(sessionId: String, phase: TaskPhase, previous: TaskState?, since: Long, at: Long): TaskState? =
     if (previous?.phase in TaskState.TERMINAL_PHASES || previous?.phase in TaskState.WAITING_PHASES) previous
-    else TaskState(sessionId, phase, TaskState.RUNNING_DETAIL, since, activeAt = at, background = previous?.background == true)
+    else TaskState(sessionId, phase, TaskState.RUNNING_DETAIL, since, activeAt = at, background = previous?.background == true,
+      pendingInput = previous?.pendingInput == true)
 
   private fun waiting(sessionId: String, phase: TaskPhase, detail: String, previous: TaskState?, since: Long): TaskState =
     TaskState(sessionId, phase, detail, since, activeAt = previous?.activeAt ?: -1L, background = previous?.background == true)
@@ -507,8 +515,11 @@ object TaskReducer {
     backgroundWork: Boolean = false): TaskState? {
     val since = previous?.since ?: System.currentTimeMillis()
     val at = timestamp.takeIf { it > 0 } ?: System.currentTimeMillis()
-    return when (type) {
-      "session.execution.started" -> status(sessionId, true, previous?.takeIf { it.active }, at).copy(background = false)
+    val next = when (type) {
+      "session.execution.started" -> status(sessionId, true, previous?.takeIf { it.active }, at).let {
+        if (it.pendingInput) it.copy(phase = TaskPhase.THINKING, detail = TaskState.RUNNING_DETAIL, background = false)
+        else it.copy(background = false)
+      }
       // 后台工作未完成时，根执行 settle 不代表会话结束：继续显示“后台运行中”，等后台完成唤醒 AI。
       // [backgroundWork] 是控制器按官方算法派生的实时结果（后台 shell / 子代理），[previous.background]
       // 保留“用户显式转后台”合成消息的标记路径。
@@ -558,5 +569,8 @@ object TaskReducer {
       }
       else -> null
     }
+    return if (previous?.pendingInput == true && next?.phase in TaskState.TERMINAL_PHASES)
+      previous.copy(phase = TaskPhase.WAITING_SERVER, detail = "等待服务器处理", background = false, uncertain = false)
+    else next?.copy(pendingInput = previous?.pendingInput == true)
   }
 }

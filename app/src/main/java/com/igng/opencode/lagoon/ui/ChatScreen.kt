@@ -126,7 +126,8 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
           messages = state.messages,
           group = group,
           selected = activityItem,
-          working = state.tasks[state.sessionId]?.active == true,
+          working = state.livePresentedTasks[state.sessionId]?.active == true,
+          unverified = state.livePresentedTasks[state.sessionId]?.active != true || state.cached || !state.connected,
           revertMessageId = session.revertMessageId,
           interactive = interactive,
           onOpenChild = { activityItem = null; activityGroup = null; onOpenChild(it) },
@@ -175,6 +176,7 @@ private fun AnimatedVisibilityScope.QoderActivityOverlay(
   group: TranscriptRow,
   selected: TranscriptRow?,
   working: Boolean,
+  unverified: Boolean,
   revertMessageId: String?,
   interactive: Boolean,
   onOpenChild: (String) -> Unit,
@@ -185,12 +187,14 @@ private fun AnimatedVisibilityScope.QoderActivityOverlay(
 ) {
   // Throttled like the transcript: restarting on every streamed change cancelled the build before it
   // finished, so an open activity list stopped updating while the turn was running.
-  val source by rememberUpdatedState(Triple(messages, working, revertMessageId))
+  val source by rememberUpdatedState(Triple(messages, working to unverified, revertMessageId))
   val content by produceState(group to emptyList<TranscriptRow>(), group.key) {
-    snapshotFlow { source }.conflate().collect { (messages, working, revertMessageId) ->
+    snapshotFlow { source }.conflate().collect { (messages, activity, revertMessageId) ->
+      val (working, unverified) = activity
       value = withContext(Dispatchers.Default) {
-        val latest = TranscriptRows.build(messages, working = working, revertMessageId = revertMessageId).firstOrNull { it.key == group.key } ?: group
-        latest to TranscriptRows.details(messages, group.key, working, revertMessageId)
+        val latest = TranscriptRows.build(messages, working = working, revertMessageId = revertMessageId, unverified = unverified).firstOrNull { it.key == group.key }
+          ?: if (unverified && group.status in setOf("running", "pending")) group.copy(status = "unverified") else group
+        latest to TranscriptRows.details(messages, group.key, working, revertMessageId, unverified)
       }
       delay(TranscriptScroll.ROWS_THROTTLE_MS * 2)
     }
@@ -199,7 +203,10 @@ private fun AnimatedVisibilityScope.QoderActivityOverlay(
   val sections = remember(details) { qoderSections(details) }
   // Kept outside the list/detail branch: returning from a detail must restore the reader's place.
   val activityListState = rememberLazyListState()
-  val latestSelected = selected?.let { item -> if (item.key == group.key) latestGroup else details.firstOrNull { it.key == item.key } ?: item }
+  val latestSelected = selected?.let { item ->
+    val latest = if (item.key == group.key) latestGroup else details.firstOrNull { it.key == item.key } ?: item
+    if (unverified && latest.status in setOf("running", "pending")) latest.copy(status = "unverified") else latest
+  }
   // Not while animating out: that back belongs to the conversation underneath.
   BackHandler(enabled = interactive && transition.targetState == EnterExitState.Visible) { if (latestSelected != null && latestSelected.key != group.key) onBack() else onDismiss() }
   Box(Modifier.fillMaxSize()) {

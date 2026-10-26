@@ -2656,5 +2656,72 @@
         "bodyOf": null
       }
     ]
+  },
+  {
+    "name": "failed calls summarize diagnostics without failing the turn",
+    "working": false, "unverified": false, "expanded": [], "revertMessageId": "", "details": "",
+    "messages": [{
+      "id": "msg_30", "role": "assistant", "created": 1767225601000, "completedAt": 1767225606000,
+      "agent": "build", "model": {"providerId": "anthropic", "modelId": "claude", "label": "Claude"},
+      "finish": "stop", "queued": false, "type": "assistant", "notice": null,
+      "parts": [
+        {"id": "failed_shell", "type": "tool", "text": "", "tool": "bash", "title": "", "status": "error", "input": "false", "output": "", "path": "", "error": "exit 1", "patch": "", "files": [], "mime": "", "attachments": [], "background": false},
+        {"id": "failed_read", "type": "tool", "text": "", "tool": "read", "title": "", "status": "error", "input": "{\"path\":\"/missing\"}", "output": "", "path": "", "error": "not found", "patch": "", "files": [], "mime": "", "attachments": [], "background": false}
+      ]
+    }],
+    "rows": [
+      {"key": "time:msg_30", "kind": "time", "title": "", "subtitle": "", "args": [], "status": "", "text": "1月1日 00:00", "attachments": [], "meta": "", "copyText": null, "target": null, "detailOf": null, "bodyOf": null},
+      {"key": "turn:msg_30:activities", "kind": "tool-group", "title": "共处理 2 个操作", "subtitle": "含 1 条异常命令、1 条异常调用", "args": [], "status": "warning", "text": "", "attachments": [], "meta": "1 个Shell、1 个读取", "copyText": null, "target": null, "detailOf": null, "bodyOf": null},
+      {"key": "meta:msg_30", "kind": "meta", "title": "", "subtitle": "", "args": [], "status": "", "text": "", "attachments": [], "meta": "build · Claude · 用时 5 秒 · 00:00", "copyText": null, "target": null, "detailOf": null, "bodyOf": null}
+    ]
+  },{
+    "name": "cached active calls are unverified rather than live",
+    "working": true, "unverified": true, "expanded": [], "revertMessageId": "", "details": "",
+    "messages": [{
+      "id": "msg_31", "role": "assistant", "created": 1767225601000,
+      "agent": "build", "model": {"providerId": "anthropic", "modelId": "claude", "label": "Claude"},
+      "queued": false, "type": "assistant", "notice": null,
+      "parts": [
+        {"id": "cached_thought", "type": "reasoning", "text": "等结果", "tool": "", "title": "", "status": "running", "input": "", "output": "", "path": "", "error": "", "patch": "", "files": [], "mime": "", "attachments": [], "background": false},
+        {"id": "cached_shell", "type": "tool", "text": "", "tool": "bash", "title": "", "status": "running", "input": "test", "output": "", "path": "", "error": "", "patch": "", "files": [], "mime": "", "attachments": [], "background": false}
+      ]
+    }],
+    "rows": [
+      {"key": "time:msg_31", "kind": "time", "title": "", "subtitle": "", "args": [], "status": "", "text": "1月1日 00:00", "attachments": [], "meta": "", "copyText": null, "target": null, "detailOf": null, "bodyOf": null},
+      {"key": "turn:msg_31:activities", "kind": "tool-group", "title": "共处理 2 个操作", "subtitle": "test", "args": [], "status": "unverified", "text": "", "attachments": [], "meta": "1 个Shell、1 个思考", "copyText": null, "target": null, "detailOf": null, "bodyOf": null},
+      {"key": "meta:msg_31", "kind": "meta", "title": "", "subtitle": "", "args": [], "status": "", "text": "", "attachments": [], "meta": "build · Claude · 00:00", "copyText": null, "target": null, "detailOf": null, "bodyOf": null}
+    ]
+  },{
+    "name": "unverified activity details keep cached statuses neutral",
+    "working": true, "unverified": true, "expanded": [], "revertMessageId": "", "details": "turn:msg_31:activities",
+    "messages": [{
+      "id": "msg_31", "role": "assistant", "created": 1767225601000,
+      "agent": "build", "model": {"providerId": "anthropic", "modelId": "claude", "label": "Claude"},
+      "queued": false, "type": "assistant", "notice": null,
+      "parts": [
+        {"id": "cached_thought", "type": "reasoning", "text": "等结果", "tool": "", "title": "", "status": "running", "input": "", "output": "", "path": "", "error": "", "patch": "", "files": [], "mime": "", "attachments": [], "background": false},
+        {"id": "cached_shell", "type": "tool", "text": "", "tool": "bash", "title": "", "status": "running", "input": "test", "output": "", "path": "", "error": "", "patch": "", "files": [], "mime": "", "attachments": [], "background": false}
+      ]
+    }],
+    "rows": [
+      {"key": "turn:msg_31:activities:msg_31/cached_thought", "kind": "reasoning", "title": "深度思考", "subtitle": "", "args": [], "status": "unverified", "text": "", "attachments": [], "meta": "", "copyText": null, "target": null, "detailOf": "turn:msg_31:activities", "bodyOf": null},
+      {"key": "turn:msg_31:activities:msg_31/cached_thought:body:0", "kind": "reasoning-body", "title": "", "subtitle": "", "args": [], "status": "", "text": "等结果", "attachments": [], "meta": "", "copyText": null, "target": null, "detailOf": "turn:msg_31:activities", "bodyOf": "turn:msg_31:activities:msg_31/cached_thought"},
+      {"key": "turn:msg_31:activities:msg_31/cached_shell", "kind": "tool", "title": "命令行", "subtitle": "test", "args": [], "status": "unverified", "text": "", "attachments": [], "meta": "", "copyText": null, "target": null, "detailOf": "turn:msg_31:activities", "bodyOf": null},
+      {"key": "turn:msg_31:activities:msg_31/cached_shell:命令:0", "kind": "tool-body", "title": "命令", "subtitle": "", "args": [], "status": "", "text": "test", "attachments": [], "meta": "", "copyText": "test", "target": null, "detailOf": "turn:msg_31:activities", "bodyOf": "turn:msg_31:activities:msg_31/cached_shell"}
+    ]
+  },{
+    "name": "cached standalone shell is unverified",
+    "working": false, "unverified": true, "expanded": [], "revertMessageId": "", "details": "",
+    "messages": [{
+      "id": "msg_32", "role": "shell", "created": 1767225601000, "model": null,
+      "queued": false, "type": "shell", "notice": null,
+      "parts": [
+        {"id": "cached_shell", "type": "tool", "text": "", "tool": "shell", "title": "", "status": "pending", "input": "test", "output": "", "path": "", "error": "", "patch": "", "files": [], "mime": "", "attachments": [], "background": false}
+      ]
+    }],
+    "rows": [
+      {"key": "time:msg_32", "kind": "time", "title": "", "subtitle": "", "args": [], "status": "", "text": "1月1日 00:00", "attachments": [], "meta": "", "copyText": null, "target": null, "detailOf": null, "bodyOf": null},
+      {"key": "tool:msg_32/cached_shell", "kind": "tool", "title": "命令行", "subtitle": "test", "args": [], "status": "unverified", "text": "", "attachments": [], "meta": "", "copyText": null, "target": null, "detailOf": null, "bodyOf": null}
+    ]
   }
 ]}

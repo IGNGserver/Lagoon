@@ -59,9 +59,10 @@ export function ChatPage({ serverId, sessionId }: { serverId: string; sessionId:
   }, [serverId, sessionId, server?.notices]);
 
   const task = server?.tasks[sessionId];
-  const working = task?.active === true;
+  const working = task?.active === true && task.uncertain !== true && server?.statuses[sessionId] !== "UNKNOWN";
+  const unverified = !working || !server?.connected || server.cached;
   const messages = conversation?.messages ?? NO_MESSAGES;
-  const rows = useMemo(() => build(messages, new Set(), working, session?.revertMessageId ?? null), [messages, working, session?.revertMessageId]);
+  const rows = useMemo(() => build(messages, new Set(), working, session?.revertMessageId ?? null, unverified), [messages, working, session?.revertMessageId, unverified]);
   const choices = useChoices(serverId, session?.directory, !!session && server?.connected === true);
   const root = server && session ? rootOf(server, session.id) : sessionId;
   const permissions = server?.permissions.filter((it) => server && rootOf(server, it.sessionId) === root) ?? [];
@@ -174,7 +175,7 @@ export function ChatPage({ serverId, sessionId }: { serverId: string; sessionId:
       </div>
 
       <Sheet open={group != null} onOpenChange={(open) => !open && setGroup(null)} title={group?.title || "操作记录"} chat wide>
-        {group && <ActivityDetails messages={messages} group={group} working={working} revert={session.revertMessageId ?? null} onOpenChild={(id) => { setGroup(null); openChild(id); }} />}
+        {group && <ActivityDetails messages={messages} group={group} working={working} unverified={unverified} revert={session.revertMessageId ?? null} onOpenChild={(id) => { setGroup(null); openChild(id); }} />}
       </Sheet>
       <FilesSheet open={sheet === "files"} onOpenChange={(open) => !open && setSheet(null)} serverId={serverId} directory={session.directory} sessionId={session.id}
         onReference={(path) => setReferences((current) => (current.includes(path) ? current : [...current, path]))} />
@@ -188,8 +189,8 @@ export function ChatPage({ serverId, sessionId }: { serverId: string; sessionId:
 
 const NO_MESSAGES: Message[] = [];
 
-function ActivityDetails({ messages, group, working, revert, onOpenChild }: { messages: Message[]; group: TranscriptRow; working: boolean; revert: string | null; onOpenChild: (id: string) => void }) {
-  const rows = useMemo(() => details(messages, group.key, working, revert), [messages, group.key, working, revert]);
+function ActivityDetails({ messages, group, working, unverified, revert, onOpenChild }: { messages: Message[]; group: TranscriptRow; working: boolean; unverified: boolean; revert: string | null; onOpenChild: (id: string) => void }) {
+  const rows = useMemo(() => details(messages, group.key, working, revert, unverified), [messages, group.key, working, revert, unverified]);
   if (rows.length === 0) return <Empty title={group.status === "running" ? "等待服务器输出…" : "此操作没有正文"} />;
   return <DetailRows rows={rows} onOpenChild={onOpenChild} />;
 }

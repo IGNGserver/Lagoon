@@ -10,6 +10,7 @@ import com.igng.opencode.lagoon.core.TranscriptRows
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
 
@@ -31,18 +32,30 @@ class TranscriptRowsContractTest {
       val case = fixture.getJSONObject(i)
       val actual = evaluate(Case(case.getString("name"), messages(case.getJSONArray("messages")),
         strings(case.getJSONArray("expanded")).toSet(), case.getBoolean("working"),
-        case.optString("revertMessageId").ifBlank { null }, case.optString("details").ifBlank { null }))
+        case.optString("revertMessageId").ifBlank { null }, case.optString("details").ifBlank { null }, case.optBoolean("unverified")))
       assertEquals(case.getString("name"), case.getJSONArray("rows").toString(2), actual.getJSONArray("rows").toString(2))
     }
   }
 
+  @Test fun failedCallDetailsKeepRawDiagnosticsBehindTheWarningSummary() {
+    val case = cases().first { it.name == "failed calls summarize diagnostics without failing the turn" }
+    val group = TranscriptRows.build(case.messages).single { it.kind == "tool-group" }
+    assertEquals("warning", group.status)
+    assertEquals("含 1 条异常命令、1 条异常调用", group.subtitle)
+    val details = TranscriptRows.details(case.messages, group.key)
+    assertEquals(2, details.count { it.kind == "tool" && it.status == "error" })
+    assertTrue(details.any { it.kind == "tool-body" && it.text == "exit 1" })
+    assertTrue(details.any { it.kind == "tool-body" && it.text == "not found" })
+  }
+
   private class Case(val name: String, val messages: List<Message>, val expanded: Set<String> = emptySet(), val working: Boolean = false,
-    val revert: String? = null, val details: String? = null)
+    val revert: String? = null, val details: String? = null, val unverified: Boolean = false)
 
   private fun evaluate(case: Case): JSONObject {
-    val rows = if (case.details != null) TranscriptRows.details(case.messages, case.details, case.working, case.revert)
-      else TranscriptRows.build(case.messages, case.expanded, case.working, case.revert)
+    val rows = if (case.details != null) TranscriptRows.details(case.messages, case.details, case.working, case.revert, case.unverified)
+      else TranscriptRows.build(case.messages, case.expanded, case.working, case.revert, case.unverified)
     return JSONObject().put("name", case.name).put("working", case.working).put("revertMessageId", case.revert ?: "")
+      .put("unverified", case.unverified)
       .put("details", case.details ?: "").put("expanded", JSONArray(case.expanded.sorted()))
       .put("messages", JSONArray(case.messages.map(Codec::message))).put("rows", JSONArray(rows.map(::row)))
   }
@@ -92,6 +105,16 @@ class TranscriptRowsContractTest {
         error = """Error: {"error":{"message":"上下文过长","type":"context_length"}}"""),
       user("msg_26", 3 * 60 * 60 * 1000L + 20_000, "排队的消息", queued = true)
     )
+    val failedCalls = listOf(assistant("msg_30", 1_000, listOf(
+      MessagePart("failed_shell", "tool", tool = "bash", status = "error", input = "false", error = "exit 1"),
+      MessagePart("failed_read", "tool", tool = "read", status = "error", input = """{"path":"/missing"}""", error = "not found")
+    )))
+    val cachedCalls = listOf(assistant("msg_31", 1_000, listOf(
+      MessagePart("cached_thought", "reasoning", text = "等结果", status = "running"),
+      MessagePart("cached_shell", "tool", tool = "bash", status = "running", input = "test")
+    ), completed = null, finish = null))
+    val cachedShell = listOf(Message("msg_32", "shell", base + 1_000,
+      listOf(MessagePart("cached_shell", "tool", tool = "shell", status = "pending", input = "test")), type = "shell"))
     return listOf(
       Case("finished turn collapses into one activity group", finished),
       Case("finished turn with activity and diff expanded", finished, setOf("turn:msg_1:activities", "diff:msg_2")),
@@ -100,7 +123,12 @@ class TranscriptRowsContractTest {
       Case("running batch expanded", running, setOf("batch:msg_11/call_sh"), working = true),
       Case("shell turn, notices, interruption, errors and queued input", mixed),
       Case("revert boundary hides later messages", mixed, revert = "msg_24"),
-      Case("expanded shell tool", mixed, setOf("tool:msg_21/msg_21:shell"))
+      Case("expanded shell tool", mixed, setOf("tool:msg_21/msg_21:shell")),
+      Case("failed calls summarize diagnostics without failing the turn", failedCalls),
+      Case("cached active calls are unverified rather than live", cachedCalls, working = true, unverified = true),
+      Case("unverified activity details keep cached statuses neutral", cachedCalls, working = true,
+        details = "turn:msg_31:activities", unverified = true),
+      Case("cached standalone shell is unverified", cachedShell, unverified = true)
     )
   }
 

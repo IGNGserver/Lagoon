@@ -14,13 +14,20 @@ import org.json.JSONObject
  * Merges a freshly fetched page into the loaded transcript by message id, keeping ascending
  * `created` order. A tail refresh must never drop pages the reader already pulled in, and an
  * optimistic/streaming entry the server page has not caught up with yet must survive too. The
- * server copy wins for the same id; [pending] items are only added when absent.
+ * server copy wins for the same id, unless [readStart] shows that the current entry changed while
+ * the read was in flight. This is per message: a streaming tail must not prevent untouched server
+ * corrections or newly fetched history from landing. [pending] items are only added when absent.
+ * Message values and their parts are immutable, so a request-start map is a sufficient baseline.
  */
-internal fun mergeTranscript(existing: List<Message>, fetched: List<Message>, pending: List<Message> = emptyList()): List<Message> {
+internal fun mergeTranscript(existing: List<Message>, fetched: List<Message>, pending: List<Message> = emptyList(),
+  readStart: Map<String, Message>? = null): List<Message> {
   if (existing.isEmpty()) return (fetched + pending).distinctBy { it.id }
   val merged = LinkedHashMap<String, Message>(existing.size + fetched.size)
   existing.forEach { merged[it.id] = it }
-  fetched.forEach { merged[it.id] = it }
+  fetched.forEach { message ->
+    val current = merged[message.id]
+    if (readStart == null || current == null || current == readStart[message.id]) merged[message.id] = message
+  }
   pending.forEach { if (!merged.containsKey(it.id)) merged[it.id] = it }
   // Stable sort: equal timestamps keep their insertion order (older pages first, then fresh tail).
   return merged.values.sortedBy { it.created }
