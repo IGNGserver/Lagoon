@@ -75,6 +75,7 @@ internal class AllServersOverview(
   private val approvers = mutableMapOf<String, PermissionAutoApprover>()
   private val snapshots = mutableMapOf<String, ServerOverviewSnapshot>()
   private val handoffs = mutableMapOf<String, ServerOverviewSnapshot>()
+  private val childDiscoveries = mutableMapOf<String, ChildDiscovery>()
   /** The collecting job of each server's live event stream, so it can be dropped on purpose. */
   private val liveStreams = mutableMapOf<String, Job>()
 
@@ -148,6 +149,7 @@ internal class AllServersOverview(
     reconnectHints.remove(id)?.close()
     clients.remove(id); configurations.remove(id); locks.remove(id); snapshots.remove(id)
     handoffs.remove(id)
+    childDiscoveries.remove(id)
     onSnapshotRemoved(id)
   }
 
@@ -170,7 +172,7 @@ internal class AllServersOverview(
       .distinctBy { normalizedDirectory(it.directory) }
       .map { it.copy(serverId = id) }
     val cachedSessions = cachedCatalog?.second.orEmpty().map { it.copy(serverId = id) }
-    val cachedTasks = store.taskStates(id)
+    val cachedTasks = TaskReconciliation.restored(store.taskStates(id))
     val cachedParents = store.taskParents(id)
     val cachedNotices = store.sessionNotices(id)
     val cachedTitles = cachedSessions.associate { it.id to it.displayTitle() }
@@ -233,7 +235,7 @@ internal class AllServersOverview(
       val next = lock.withLock {
         val previous = snapshot
         try {
-          read(profile, client, previous)
+          read(profile, client, previous) { revision == waitingRevision }
         } catch (cancel: CancellationException) {
           throw cancel
         } catch (error: Exception) {
@@ -291,6 +293,9 @@ internal class AllServersOverview(
                     while (seenEvents.size > 512) seenEvents.remove(seenEvents.first())
                   }
                   val props = event.properties
+                  if (event.type.startsWith("session.execution.") || event.type.startsWith("shell.") ||
+                    event.type in setOf("session.deleted", "session.synthetic", "session.error", "session.idle", "session.status") ||
+                    BackgroundWork.backgroundSubagentId(event.type, props) != null) childDiscoveries.remove(id)
                   val sessionId = props.sessionEventId(event.type)
                   if (event.type == "permission.asked" && approver.pending(listOf(props.toPermission(event.directory))).isEmpty()) return@collect
                   val before = snapshot.tasks[sessionId]
@@ -336,8 +341,10 @@ internal class AllServersOverview(
                       store.forgetSession(id, sessionId)
                       snapshot = snapshot.copy(
                         sessions = snapshot.sessions.filterNot { it.id == sessionId },
-                        tasks = snapshot.tasks - sessionId,
-                        parents = snapshot.parents - sessionId,
+                         tasks = snapshot.tasks - sessionId,
+                         parents = snapshot.parents - sessionId,
+                         shells = snapshot.shells.filterValues { it.sessionId != sessionId },
+                         notices = snapshot.notices.filterNot { it.sessionId == sessionId },
                         permissions = snapshot.permissions.filterNot { it.sessionId == sessionId },
                         questions = snapshot.questions.filterNot { it.sessionId == sessionId })
                     }
@@ -345,10 +352,24 @@ internal class AllServersOverview(
                       waitingRevision++
                       snapshot = snapshot.copy(shells = snapshot.shells + (job.id to job))
                     }
-                    if (event.type in setOf("shell.exited", "shell.deleted")) {
+                     if (event.type in setOf("shell.exited", "shell.deleted")) {
                       waitingRevision++
-                      snapshot = snapshot.copy(shells = snapshot.shells - props.str("id"))
-                    }
+                       snapshot = snapshot.copy(shells = snapshot.shells - props.str("id"))
+                     }
+                     BackgroundWork.backgroundSubagentId(event.type, props)?.let { child ->
+                       waitingRevision++
+                       val old = snapshot.tasks[child]
+                       val task = old?.takeIf { it.active || it.phase in TaskState.TERMINAL_PHASES }
+                         ?: TaskState(child, TaskPhase.SUBAGENT, TaskState.RUNNING_DETAIL, activeAt = -1)
+                       snapshot = snapshot.copy(tasks = snapshot.tasks + (child to task), parents = snapshot.parents + (child to sessionId))
+                     }
+                     BackgroundWork.completedSubagentId(event.type, props)?.let { child ->
+                       waitingRevision++
+                       snapshot = snapshot.copy(tasks = snapshot.tasks + (child to TaskReducer.terminal(child,
+                         when (props.obj("metadata").str("state")) {
+                           "error" -> "failed"; "cancelled" -> "interrupted"; else -> "succeeded"
+                         }, snapshot.tasks[child])))
+                     }
                     snapshot = snapshot.copy(tasks = BackgroundWork.fold(snapshot.tasks, snapshot.shells, snapshot.parents))
                     snapshot = reconcileWaiting(snapshot, resolvedSessions, resolvedFormSessions = resolvedFormSessions)
                     val session = snapshot.sessions.firstOrNull { it.id == sessionId }
@@ -391,7 +412,8 @@ internal class AllServersOverview(
     }
   }
 
-  private suspend fun read(profile: ServerProfile, client: HarnessClient, previous: ServerOverviewSnapshot): ServerOverviewSnapshot {
+  private suspend fun read(profile: ServerProfile, client: HarnessClient, previous: ServerOverviewSnapshot,
+    unchanged: () -> Boolean): ServerOverviewSnapshot {
     val id = profile.id
     val version = client.health()
     val projects = store.localProjects(id).map { it.copy(serverId = id) }
@@ -404,15 +426,27 @@ internal class AllServersOverview(
     val identityMap = (previous.sessions + listed).associateBy { it.id }.toMutableMap()
     /** Ids fetched as ancestors/owners this round: those rows must survive the ghost-session prune. */
     val fetchedIds = mutableSetOf<String>()
+    val deletedSessions = mutableSetOf<String>()
     fun fetched(session: Session) { identityMap[session.id] = session; fetchedIds += session.id }
     val missing = (active.orEmpty().filterNot(identityMap::containsKey) + previous.tasks.filterValues { it.active }.keys.filter { old -> listed.none { it.id == old } }).distinct()
     if (missing.isNotEmpty()) {
       missing.chunked(4).forEach { batch -> coroutineScope {
-        batch.map { sessionId ->
-          async { attempt { client.session(sessionId) }.getOrNull()?.copy(serverId = id) }
-        }.forEach { deferred -> deferred.await()?.let(::fetched) }
+        batch.map { sessionId -> async { sessionId to attempt { client.session(sessionId) } } }.forEach { deferred ->
+          val (sessionId, result) = deferred.await()
+          result.getOrNull()?.copy(serverId = id)?.let(::fetched)
+          if (active != null && (result.exceptionOrNull() as? ApiException)?.status == 404 && sessionId !in active) deletedSessions += sessionId
+        }
       } }
     }
+    val oldTasks = previous.tasks + store.taskStates(id).filter { (sessionId, stored) ->
+      previous.tasks[sessionId]?.let { old -> stored.since > old.since || (stored.finishedAt ?: 0) > (old.finishedAt ?: 0) } ?: true
+    }
+    val knownParents = store.taskParents(id) + identityMap.values.mapNotNull { it.parentId?.let { parent -> it.id to parent } }
+    val candidateRoots = (oldTasks.filterValues { it.active }.keys + active.orEmpty()).map { BackgroundWork.rootOf(it, knownParents) }.toSet()
+    val childRead = TaskReconciliation.children(client, identityMap.values.filter {
+      it.parentId == null && it.id in candidateRoots && it.id !in active.orEmpty() && it.id !in deletedSessions
+    }, knownParents, childDiscoveries.getOrPut(id) { ChildDiscovery() })
+    childRead.sessions.forEach { fetched(it.copy(serverId = id)) }
 
     // Pending requests: per-session reads for sessions that can actually be waiting (the active set
     // and any session with a known pending request). The location sweep only runs for the
@@ -442,14 +476,15 @@ internal class AllServersOverview(
       batch.map { directory -> async { directory to attempt { client.forms(directory) } } }.awaitAll()
     } }
     formResults.forEach { (directory, result) -> if (result.isSuccess) directoryHealth.succeeded(directory) else directoryHealth.failed(directory) }
-    val successfulSessionDirs = sessionPermissionResults.filter { it.second.isSuccess }.mapNotNull { identityMap[it.first]?.directory }.map(::normalizedDirectory).toSet()
+    val successfulPermissionSessions = sessionPermissionResults.filter { it.second.isSuccess }.map { it.first }.toSet()
     val successfulSweepDirs = sweepPermissionResults.filter { it.second.isSuccess }.map { normalizedDirectory(it.first) }.toSet()
-    val verifiedPermissionDirs = successfulSessionDirs + successfulSweepDirs
     val permissions = (sessionPermissionResults.flatMap { it.second.getOrDefault(emptyList()) } +
       sweepPermissionResults.flatMap { it.second.getOrDefault(emptyList()) } +
-      previous.permissions.filter { normalizedDirectory(it.directory) !in verifiedPermissionDirs }).distinctBy { it.id }
+      previous.permissions.filter { it.sessionId !in successfulPermissionSessions && normalizedDirectory(it.directory) !in successfulSweepDirs }).distinctBy { it.id }
+      .filterNot { it.sessionId in deletedSessions }
     val successfulFormDirs = formResults.filter { it.second.isSuccess }.map { normalizedDirectory(it.first) }.toSet()
     val questions = (formResults.flatMap { it.second.getOrDefault(emptyList()) } + previous.questions.filter { normalizedDirectory(it.directory) !in successfulFormDirs }).distinctBy { it.id }
+      .filterNot { it.sessionId in deletedSessions }
 
     // Requests can be parked on sessions absent from session.active. Resolve their identities too,
     // including child ancestry, before projecting them onto the home/notification root.
@@ -457,25 +492,28 @@ internal class AllServersOverview(
       coroutineScope { batch.map { session -> async { attempt { client.session(session) }.getOrNull()?.copy(serverId = id) } }
         .forEach { deferred -> deferred.await()?.let(::fetched) } }
     }
-    var parentRounds = 0
-    while (parentRounds++ < MAX_PARENT_ROUNDS) {
-      val parentIds = identityMap.values.mapNotNull { it.parentId }.filterNot(identityMap::containsKey).distinct().take(MAX_PARENT_FETCH)
-      if (parentIds.isEmpty()) break
-      coroutineScope { parentIds.map { parent -> async { attempt { client.session(parent) }.getOrNull()?.copy(serverId = id) } }
-        .forEach { deferred -> deferred.await()?.let(::fetched) } }
+    val attemptedParents = mutableSetOf<String>()
+    suspend fun fetchParents() {
+      var parentRounds = 0
+      while (parentRounds++ < MAX_PARENT_ROUNDS) {
+        val parentIds = identityMap.values.mapNotNull { it.parentId }.filter { it !in identityMap && attemptedParents.add(it) }.distinct().take(MAX_PARENT_FETCH)
+        if (parentIds.isEmpty()) break
+        coroutineScope { parentIds.map { parent -> async { attempt { client.session(parent) }.getOrNull()?.copy(serverId = id) } }
+          .forEach { deferred -> deferred.await()?.let(::fetched) } }
+      }
     }
-    val oldTasks = previous.tasks + store.taskStates(id)
+    fetchParents()
     val unseenNoticeSessions = store.sessionNotices(id).filterNot { it.viewed }.map { it.sessionId }.toSet()
     // Drop ghost sessions: rows the server no longer lists and that nothing local still refers to
     // (active tasks, unread results, or an identity fetched as an ancestor this round). Without
     // this, a session deleted from another client stayed on the all-servers home forever.
-    val sessions = identityMap.values.filter { session ->
-      session.id in listedIds || session.id in activeIds || session.id in fetchedIds ||
-        oldTasks[session.id]?.active == true || session.id in unseenNoticeSessions
+    fun visibleSessions() = identityMap.values.filter { session ->
+      session.id !in deletedSessions && (session.id in listedIds || session.id in activeIds || session.id in fetchedIds ||
+        oldTasks[session.id]?.active == true || session.id in unseenNoticeSessions)
     }.sortedWith(sessionActivityOrder)
-    val parentMap = store.taskParents(id) + sessions.mapNotNull { session -> session.parentId?.let { session.id to it } }
-    val shellDirectories = (projects.map { it.directory } + identityMap.values.map { it.directory })
-      .filter(String::isNotBlank).distinctBy(::normalizedDirectory).filterNot { directoryHealth.isDown(it) }.take(8)
+    var sessions = visibleSessions()
+    val shellDirectories = TaskReconciliation.shellDirectories(oldTasks, previous.shells,
+      sessions, projects, activeIds).filterNot { directoryHealth.isDown(it) }
     val shellResults = coroutineScope { shellDirectories.map { directory ->
       async { directory to attempt { client.shells(directory) } }
     }.map { it.await() } }
@@ -483,54 +521,53 @@ internal class AllServersOverview(
     val successfulShellDirs = shellResults.filter { it.second.isSuccess }.map { normalizedDirectory(it.first) }.toSet()
     val shells = previous.shells.filter { (_, shell) -> normalizedDirectory(shell.directory) !in successfulShellDirs && now() - shell.observedAt < 300_000 }
       .plus(shellResults.flatMap { it.second.getOrDefault(emptyList()) }.associate { it.id to it.copy(observedAt = now()) })
-    val states = linkedMapOf<String, TaskState>()
-    val newlyFinished = mutableListOf<Pair<Session, Long>>()
-    if (active == null) {
-      oldTasks.values.filter { it.active }.forEach { states[it.sessionId] = it }
-    } else {
-      active.forEach { sessionId ->
-        val session = identityMap[sessionId]
-        val old = oldTasks[sessionId]
-        states[sessionId] = old?.takeIf { it.active }?.let { running ->
-          if (running.activeAt >= 0) running else running.copy(activeAt = session?.idle ?: -1L)
-        } ?: TaskState(sessionId, TaskPhase.THINKING, TaskState.RUNNING_DETAIL, activeAt = session?.idle ?: -1L)
-      }
-      oldTasks.values.filter { it.active && it.sessionId !in active }.forEach { old ->
-        val session = identityMap[old.sessionId] ?: sessions.firstOrNull { it.id == old.sessionId }
-        if (session == null) { states[old.sessionId] = old; return@forEach }
-        // 派生出的子代理任务没有服务端时间基线（activeAt = -1）：会话不在 active 且服务端已记录
-        // 结束（time.idle > 0）时它已经停了，不能因为 -1 就永久保留成“后台运行中”。
-        val derivedChild = old.phase == TaskPhase.SUBAGENT || session.parentId != null
-        val finished = session.idle > 0 &&
-          ((old.activeAt >= 0 && session.idle > old.activeAt) || (old.activeAt < 0 && derivedChild))
-        when {
-          !finished -> states[old.sessionId] = old
-          session.parentId == null && session.outcome != "interrupted" && !store.sessionNotices(id).coversRun(session.id, old.since) ->
-            newlyFinished += session to old.since
-        }
-      }
+      .filterValues { it.sessionId !in deletedSessions }
+    // A discovered shell can belong to a child absent from the root catalog. Resolve it before
+    // deciding which family still has work; otherwise its real root can be falsely completed.
+    shells.values.map { it.sessionId }.filterNot(identityMap::containsKey).distinct().take(100).chunked(4).forEach { batch ->
+      coroutineScope { batch.map { owner -> async { attempt { client.session(owner) }.getOrNull()?.copy(serverId = id) } }
+        .forEach { deferred -> deferred.await()?.let(::fetched) } }
     }
+    fetchParents()
+    sessions = visibleSessions()
+    val parentMap = (store.taskParents(id) + sessions.mapNotNull { session -> session.parentId?.let { session.id to it } }) - deletedSessions
+    val unresolvedOwners = shells.values.any {
+      it.sessionId !in identityMap || BackgroundWork.rootOf(it.sessionId, parentMap) !in identityMap
+    }
+    val inboxRead = PendingInputs.read(client, sessions, oldTasks, active)
+    val states = TaskReconciliation.reconcile(oldTasks, sessions, active, shells, parentMap,
+      listedIds + fetchedIds, successfulShellDirs, deletedSessions,
+      childRead.incompleteRoots + if (unresolvedOwners) candidateRoots else emptySet(), inboxRead).toMutableMap()
 
     permissions.forEach { request ->
       val old = oldTasks[request.sessionId]
-      states[request.sessionId] = TaskState(request.sessionId, TaskPhase.WAITING_PERMISSION, "等待权限确认", old?.since ?: now(), activeAt = old?.activeAt ?: -1L)
+      states[request.sessionId] = TaskState(request.sessionId, TaskPhase.WAITING_PERMISSION, "等待权限确认", old?.since ?: now(),
+        activeAt = old?.activeAt ?: -1L, pendingInput = states[request.sessionId]?.pendingInput == true)
     }
     questions.forEach { request ->
       val old = oldTasks[request.sessionId]
-      states[request.sessionId] = TaskState(request.sessionId, TaskPhase.WAITING_QUESTION, "等待你的回答", old?.since ?: now(), activeAt = old?.activeAt ?: -1L)
+      states[request.sessionId] = TaskState(request.sessionId, TaskPhase.WAITING_QUESTION, "等待你的回答", old?.since ?: now(),
+        activeAt = old?.activeAt ?: -1L, pendingInput = states[request.sessionId]?.pendingInput == true)
     }
     val folded = BackgroundWork.fold(states, shells, parentMap)
+    val wasActive = TaskSummary.aggregate(oldTasks.filterValues { it.active && it.sessionId !in deletedSessions }, parentMap)
+    val stillActive = TaskSummary.aggregate(folded.filterValues { it.active }, parentMap)
+    val newlyFinished = if (active == null) emptyList() else sessions.filter {
+      it.parentId == null && it.id in wasActive && it.id !in stillActive
+    }.map { it to wasActive.getValue(it.id).since }
     // A view may have selected this server while these HTTP reads were suspended. Its richer
     // reducer now owns the writes; an older overview read must not invent results or overwrite it.
-    if (selectedServer() == id) return previous
-    val notices = (store.sessionNotices(id) + newlyFinished.mapNotNull { (session, since) -> session.transitionNotice(since) }).distinctBy { it.id }
+    if (selectedServer() == id || !unchanged()) return previous
+    deletedSessions.forEach { store.forgetTask(id, it) }
+    val notices = (store.sessionNotices(id) + newlyFinished.filterNot { (session, since) -> store.sessionNotices(id).coversRun(session.id, since) }
+      .mapNotNull { (session, since) -> session.transitionNotice(since) }).distinctBy { it.id }
     val background = TaskSummary.backgroundRoots(folded, parentMap)
     val titles = sessions.associate { it.id to it.displayTitle() }
     val summary = TaskSummary.of(folded, notices, parentMap, titles, background, serverId = id, serverName = profile.name)
     // Only failures that can hide currently relevant state count as degraded. Failures for idle
     // sessions' directories (deleted worktrees) are handled by the directory backoff above.
     val activeDirectories = activeIds.mapNotNull { identityMap[it]?.directory }.map(::normalizedDirectory).toSet()
-    val degraded = activeResult.isFailure ||
+    val degraded = activeResult.isFailure || folded.values.any { it.active && it.uncertain } ||
       sessionPermissionResults.any { it.second.isFailure && (it.first in activeIds || normalizedDirectory(identityMap[it.first]?.directory.orEmpty()) in activeDirectories) } ||
       formResults.any { it.second.isFailure && normalizedDirectory(it.first) in activeDirectories }
     if (degraded) Diagnostics.warn("AllServers", "服务器 ${profile.name} 部分状态读取失败")
@@ -555,7 +592,7 @@ internal class AllServersOverview(
       summary = summary,
       shells = shells
     ),
-      identityMap.values.filter { normalizedDirectory(it.directory) in verifiedPermissionDirs }.map { it.id }.toSet(),
+      successfulPermissionSessions + identityMap.values.filter { normalizedDirectory(it.directory) in successfulSweepDirs }.map { it.id },
       active?.toSet(),
       identityMap.values.filter { normalizedDirectory(it.directory) in successfulFormDirs }.map { it.id }.toSet()
     )
@@ -576,7 +613,8 @@ internal class AllServersOverview(
         snapshot.permissions.any { it.sessionId == id } -> task.copy(phase = TaskPhase.WAITING_PERMISSION, detail = "等待权限确认")
         (id in verified && task.phase == TaskPhase.WAITING_PERMISSION) ||
           (id in resolvedFormSessions && task.phase == TaskPhase.WAITING_QUESTION) ->
-          if (active != null && id !in active && !BackgroundWork.hasBackgroundWork(id, snapshot.tasks, snapshot.shells, snapshot.parents))
+          if (task.pendingInput) task.copy(phase = TaskPhase.WAITING_SERVER, detail = "等待服务器处理")
+          else if (active != null && id !in active && !task.uncertain && !BackgroundWork.hasBackgroundWork(id, snapshot.tasks, snapshot.shells, snapshot.parents))
             task.copy(phase = TaskPhase.IDLE, detail = "")
           else task.copy(phase = TaskPhase.THINKING, detail = TaskState.RUNNING_DETAIL)
         else -> task

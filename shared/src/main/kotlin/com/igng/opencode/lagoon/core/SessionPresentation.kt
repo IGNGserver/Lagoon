@@ -48,7 +48,7 @@ fun Session.displayTitle(): String {
  */
 enum class SessionStatus(val label: String) {
   WAITING_PERMISSION("等待授权"), WAITING_QUESTION("等待回答"), WAITING_SERVER("等待服务器处理"), RUNNING("运行中"), BACKGROUND_RUNNING("后台运行中"),
-  FAILED("失败"), COMPLETED("已完成"), UNKNOWN("离线 · 状态未知"), NONE("")
+  FAILED("失败"), COMPLETED("已完成"), UNKNOWN("状态待确认"), NONE("")
 }
 
 fun sessionStatus(activeFamily: TaskState?, unseen: List<SessionNotice>, background: Boolean = false): SessionStatus = when {

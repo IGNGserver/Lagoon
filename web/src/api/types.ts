@@ -61,6 +61,8 @@ export interface TaskState {
   since: number;
   finishedAt?: number;
   background: boolean;
+  uncertain: boolean;
+  pendingInput: boolean;
   active: boolean;
 }
 

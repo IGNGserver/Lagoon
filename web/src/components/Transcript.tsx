@@ -1,4 +1,4 @@
-import { AlertTriangle, Check, ChevronRight, Copy, FileText, Loader2, X } from "lucide-react";
+import { AlertTriangle, Check, ChevronRight, Copy, FileText, Info, Loader2, X } from "lucide-react";
 import { memo, useState, type ReactNode } from "react";
 import type { Attachment } from "@/api/types";
 import { highlight, renderMarkdown } from "@/lib/markdown";
@@ -27,6 +27,8 @@ export const Markdown = memo(function Markdown({ text, className }: { text: stri
 export function ToolStatus({ status }: { status: string }) {
   if (status === "running" || status === "pending") return <Loader2 size={15} className="spin shrink-0 text-chat-text-2" />;
   if (status === "error") return <X size={15} className="shrink-0 text-error" />;
+  if (status === "warning") return <AlertTriangle size={15} className="shrink-0 text-warning" />;
+  if (status === "unverified") return <Info size={15} className="shrink-0 text-chat-faint" />;
   return <Check size={15} className="shrink-0 text-chat-success" />;
 }
 

@@ -33,7 +33,7 @@ class ServerStore internal constructor(private val preferences: SharedPreference
     .mapNotNull { (key, raw) -> runCatching {
       val json = JSONObject(raw as String); val session = key.removePrefix("taskState:$id:")
       session to TaskState(session, TaskPhase.valueOf(json.str("phase")), json.str("detail"), json.optLong("since"),
-        json.optLong("finished").takeIf { it > 0 }, json.optLong("activeAt", -1), json.optBoolean("background"))
+        json.optLong("finished").takeIf { it > 0 }, json.optLong("activeAt", -1), json.optBoolean("background"), json.optBoolean("uncertain"), json.optBoolean("pendingInput"))
     }.getOrNull() }.toMap()
   override fun taskParents(id: String): Map<String, String> = preferences.all.filterKeys { it.startsWith("taskParent:$id:") }
     .mapKeys { it.key.removePrefix("taskParent:$id:") }.mapValues { it.value as? String ?: "" }.filterValues(String::isNotBlank)
@@ -47,14 +47,14 @@ class ServerStore internal constructor(private val preferences: SharedPreference
   }
   override fun rememberTask(id: String, state: TaskState, parent: String?, observedAt: Long, durable: Boolean): TaskState = synchronized(taskLock) {
     val key = "taskState:$id:${state.sessionId}"
-    val previous = runCatching { JSONObject(preferences.getString(key, "")!!).let { json -> TaskState(state.sessionId, TaskPhase.valueOf(json.str("phase")), json.str("detail"), json.optLong("since"), json.optLong("finished").takeIf { it > 0 }, json.optLong("activeAt", -1), json.optBoolean("background")) } }.getOrNull()
+    val previous = runCatching { JSONObject(preferences.getString(key, "")!!).let { json -> TaskState(state.sessionId, TaskPhase.valueOf(json.str("phase")), json.str("detail"), json.optLong("since"), json.optLong("finished").takeIf { it > 0 }, json.optLong("activeAt", -1), json.optBoolean("background"), json.optBoolean("uncertain"), json.optBoolean("pendingInput")) } }.getOrNull()
     val lastObserved = preferences.getLong("taskTime:$id:${state.sessionId}", 0)
     if (observedAt < lastObserved) return@synchronized previous ?: state
     val next = if (previous != null && state.active && !previous.active && state.since <= previous.since)
       state.copy(since = observedAt, finishedAt = null) else state
     if (previous != next || parent != preferences.getString("taskParent:$id:${state.sessionId}", null)) {
       val editor = preferences.edit().putString(key, JSONObject().put("phase", next.phase.name).put("detail", next.detail)
-        .put("since", next.since).put("finished", next.finishedAt).put("activeAt", next.activeAt).put("background", next.background).toString()).putLong("taskTime:$id:${state.sessionId}", observedAt)
+        .put("since", next.since).put("finished", next.finishedAt).put("activeAt", next.activeAt).put("background", next.background).put("uncertain", next.uncertain).put("pendingInput", next.pendingInput).toString()).putLong("taskTime:$id:${state.sessionId}", observedAt)
       if (parent != null) editor.putString("taskParent:$id:${state.sessionId}", parent)
       if (previous?.since != next.since || previous?.phase !in setOf(TaskPhase.COMPLETED, TaskPhase.FAILED) && next.phase in setOf(TaskPhase.COMPLETED, TaskPhase.FAILED))
         editor.remove("taskRead:$id:${state.sessionId}")
@@ -286,10 +286,17 @@ class ServerStore internal constructor(private val preferences: SharedPreference
     if (text.isBlank()) secrets.edit().remove(key).apply()
     else secrets.edit().putString(key, encryptValue(text.take(100_000))).apply()
   }
-  override fun forgetSession(server: String, session: String) {
+  /** Retire activity after an authoritative 404 without destroying unsent composer content. */
+  override fun forgetTask(server: String, session: String) {
     synchronized(taskLock) { writeNotices(server, sessionNotices(server).filterNot { it.sessionId == session }) }
     val editor = preferences.edit()
-    listOf("preview", "configuration", "taskRead", "taskState", "taskParent", "taskTime", "notification").forEach { editor.remove("$it:$server:$session") }
+    listOf("taskRead", "taskState", "taskParent", "taskTime", "notification").forEach { editor.remove("$it:$server:$session") }
+    editor.apply()
+  }
+  override fun forgetSession(server: String, session: String) {
+    forgetTask(server, session)
+    val editor = preferences.edit()
+    listOf("preview", "configuration").forEach { editor.remove("$it:$server:$session") }
     editor.apply()
     secrets.edit().remove("draft:$server:$session").remove("references:$server:$session").remove("preview:$server:$session").apply()
   }

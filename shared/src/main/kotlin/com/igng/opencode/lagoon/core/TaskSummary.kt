@@ -99,7 +99,7 @@ data class TaskSummary(
       serverId: String? = null,
       serverName: String? = null
     ): TaskSummary {
-      val active = aggregate(tasks.filterValues { it.active }, parents)
+      val active = aggregate(tasks.filterValues { it.active && !it.uncertain }, parents)
       val results = notices.filterNot { it.viewed || it.sessionId in active }.groupBy { it.sessionId }.map { (session, unseen) ->
         val latest = unseen.maxBy { it.time }
         TaskState(session, if (unseen.any { it.error }) TaskPhase.FAILED else TaskPhase.COMPLETED, since = latest.time, finishedAt = latest.time)

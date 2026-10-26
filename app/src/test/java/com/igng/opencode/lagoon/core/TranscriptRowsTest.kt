@@ -371,6 +371,153 @@ class TranscriptRowsTest {
     assertEquals(listOf("completed", "running"), groups.map { it.status })
   }
 
+  @Test fun unverifiedCachedActivityHasNoRunningOrCompletedProjectionForActiveParts() {
+    val active = listOf(
+      tool("t1", "bash", input = """{"command":"pwd"}""", output = "cached output", status = "running"),
+      tool("t2", "read", status = "pending"),
+      part("r1", "reasoning", text = "cached reasoning", status = "running"),
+      part("r2", "reasoning", text = "queued reasoning", status = "pending")
+    )
+    val messages = listOf(user("u1", t0), assistant("a1", t0 + 500, *active.toTypedArray(), completedAt = null))
+    val rows = TranscriptRows.build(messages, working = false, unverified = true)
+    val group = rows.single { it.kind == "tool-group" }
+    assertEquals("unverified", group.status)
+    val expanded = TranscriptRows.build(messages, setOf(group.key), unverified = true)
+    val details = TranscriptRows.details(messages, group.key, unverified = true)
+    assertEquals(expanded.filter { it.detailOf == group.key }, details)
+    val headers = details.filter { it.kind in setOf("tool", "reasoning") }
+    assertEquals(4, headers.size)
+    assertTrue(headers.all { it.status == "unverified" })
+    assertEquals(active, headers.map { it.source })
+    assertEquals(listOf("running", "pending", "running", "pending"), messages.last().parts.map { it.status })
+    assertTrue(details.any { it.kind == "tool-body" && it.text == "cached output" })
+    assertTrue(details.any { it.kind == "reasoning-body" && it.text == "cached reasoning" })
+    assertTrue((rows + expanded + details).none { it.status in setOf("running", "pending") || it.kind == "thinking" })
+  }
+
+  @Test fun verifiedActiveToolsKeepTheirSpinnerStatusesEvenWhenWorkingIsFalse() {
+    val messages = listOf(user("u1", t0), assistant("a1", t0 + 500,
+      tool("t1", "bash", status = "running"), tool("t2", "read", status = "pending"),
+      part("r1", "reasoning", text = "thinking", status = "running"), completedAt = null))
+    for (working in listOf(false, true)) {
+      val group = TranscriptRows.build(messages, working = working).single { it.kind == "tool-group" }
+      assertEquals("running", group.status)
+      val details = TranscriptRows.details(messages, group.key, working = working)
+      assertEquals(listOf("running", "pending", "running"), details.filter { it.bodyOf == null }.map { it.status })
+    }
+  }
+
+  @Test fun unverifiedActivityPreservesCompletedCallsWarningSummariesAndTrueErrors() {
+    val diagnostic = "Error: command failed"
+    val failed = part("t1", "tool", tool = "bash", status = "error", error = diagnostic)
+    val done = tool("t2", "read")
+    val pending = tool("t3", "read", status = "pending")
+    val messages = listOf(user("u1", t0), assistant("a1", t0 + 500, failed, done, pending, completedAt = null)
+      .copy(error = "Error: provider unavailable", errorType = "provider"))
+    val rows = TranscriptRows.build(messages, unverified = true)
+    val group = rows.single { it.kind == "tool-group" }
+    assertEquals("unverified", group.status)
+    assertEquals("含 1 条异常命令", group.subtitle)
+    assertEquals("provider unavailable", rows.single { it.kind == "error" }.text)
+    val details = TranscriptRows.details(messages, group.key, unverified = true)
+    assertEquals(listOf("error", "completed", "unverified"), details.filter { it.kind == "tool" }.map { it.status })
+    assertEquals(listOf(failed, done, pending), details.filter { it.kind == "tool" }.map { it.source })
+    assertEquals(diagnostic, details.single { it.title == "错误" }.text)
+    val finished = listOf(user("u1", t0), assistant("a1", t0 + 500, failed, done))
+    assertEquals(TranscriptRows.build(finished), TranscriptRows.build(finished, unverified = true))
+  }
+
+  @Test fun unverifiedStandaloneShellDoesNotPretendToRunOrFinish() {
+    val active = tool("t1", "bash", input = """{"command":"pwd"}""", status = "running")
+    val messages = listOf(Message("sh1", "shell", t0, listOf(active)))
+    val row = TranscriptRows.build(messages, unverified = true).single { it.kind == "tool" }
+    assertEquals("unverified", row.status)
+    assertEquals(active, row.source)
+    assertTrue(TranscriptRows.details(messages, row.key, unverified = true).any { it.text == "pwd" })
+    assertEquals("running", TranscriptRows.build(messages).single { it.kind == "tool" }.status)
+  }
+
+  @Test fun unverifiedOverridesWorkingWithoutInventingLivePlaceholderOrRetry() {
+    assertTrue(TranscriptRows.build(listOf(user("u1", t0)), working = true, unverified = true).none { it.kind == "thinking" })
+    val messages = listOf(user("u1", t0), assistant("a1", t0 + 500,
+      tool("t1", "bash", status = "running"), completedAt = null).copy(retry = "cached retry"))
+    val rows = TranscriptRows.build(messages, working = true, unverified = true)
+    assertEquals("unverified", rows.single { it.kind == "tool-group" }.status)
+    assertTrue(rows.none { it.status in setOf("running", "pending") || it.kind == "thinking" })
+  }
+
+  @Test fun completedGroupSummarizesCommandFailureButDetailsKeepTheRawDiagnostic() {
+    val diagnostic = "Error: {\"message\":\"退出码 1\"}"
+    val failed = part("t1", "tool", tool = "bash", input = """{"command":"false"}""",
+      output = "command output", status = "error", error = diagnostic)
+    val messages = listOf(user("u1", t0), assistant("a1", t0 + 500, failed))
+    val rows = TranscriptRows.build(messages)
+    val group = rows.single { it.kind == "tool-group" }
+    assertEquals("warning", group.status)
+    assertEquals("含 1 条异常命令", group.subtitle)
+    assertEquals("1 个Shell", group.meta)
+    assertTrue(rows.none { it.kind == "error" })
+
+    val details = TranscriptRows.details(messages, group.key)
+    val tool = details.single { it.kind == "tool" }
+    assertEquals("error", tool.status)
+    assertEquals(failed, tool.source)
+    val error = details.single { it.kind == "tool-body" && it.title == "错误" }
+    assertEquals(diagnostic, error.text)
+    assertEquals(diagnostic, error.copyText)
+    assertEquals(tool.key, error.bodyOf)
+    assertTrue(details.any { it.title == "输出" && it.text == "command output" })
+  }
+
+  @Test fun groupCountsCommandAndOtherToolFailuresWithoutPreviewingTheirErrors() {
+    val messages = listOf(user("u1", t0), assistant("a1", t0 + 500,
+      part("t1", "tool", tool = "shell", status = "error", error = "退出码 1"),
+      part("t2", "tool", tool = "execute", status = "error"),
+      part("t3", "tool", tool = "read", status = "error", error = "private diagnostic"),
+      tool("t4", "bash")))
+    val group = TranscriptRows.build(messages).single { it.kind == "tool-group" }
+    assertEquals("warning", group.status)
+    assertEquals("含 2 条异常命令、1 条异常调用", group.subtitle)
+
+    val onlyRead = listOf(user("u1", t0), assistant("a1", t0 + 500,
+      part("t1", "tool", tool = "read", status = "error", error = "not found")))
+    assertEquals("含 1 条异常调用", TranscriptRows.build(onlyRead).single { it.kind == "tool-group" }.subtitle)
+  }
+
+  @Test fun aLargeActiveGroupStaysRunningDespiteHistoricalCommandFailures() {
+    val tools = (1..129).map { index ->
+      part("t$index", "tool", tool = "bash", status = if (index == 1) "error" else "completed",
+        error = if (index == 1) "退出码 1" else "")
+    } + tool("t130", "read", status = "running")
+    val messages = listOf(user("u1", t0), assistant("a1", t0 + 500, *tools.toTypedArray(), completedAt = null))
+    val rows = TranscriptRows.build(messages, working = true)
+    val group = rows.single { it.kind == "tool-group" }
+    assertEquals("调用了 130 次工具", group.title)
+    assertEquals("running", group.status)
+    assertEquals("含 1 条异常命令", group.subtitle)
+    assertTrue(rows.none { it.kind == "error" })
+    assertEquals(130, TranscriptRows.details(messages, group.key, working = true).count { it.kind == "tool" })
+  }
+
+  @Test fun completedFailedBatchDoesNotTurnRedWhileALaterBatchRuns() {
+    val messages = listOf(user("u1", t0), assistant("a1", t0 + 500,
+      part("t1", "tool", tool = "bash", status = "error", error = "退出码 1"),
+      part("p1", "text", text = "继续检查"),
+      tool("t2", "read", status = "pending"), completedAt = null))
+    val groups = TranscriptRows.build(messages, working = true).filter { it.kind == "tool-group" }
+    assertEquals(listOf("warning", "running"), groups.map { it.status })
+    assertEquals("含 1 条异常命令", groups.first().subtitle)
+  }
+
+  @Test fun neutralToolFailureSummaryDoesNotHideATrueAssistantError() {
+    val messages = listOf(user("u1", t0), assistant("a1", t0 + 500,
+      part("t1", "tool", tool = "bash", status = "error", error = "退出码 1"))
+      .copy(error = "Error: provider unavailable", errorType = "provider"))
+    val rows = TranscriptRows.build(messages)
+    assertEquals("warning", rows.single { it.kind == "tool-group" }.status)
+    assertEquals("provider unavailable", rows.single { it.kind == "error" }.text)
+  }
+
   @Test fun openingOneGroupDoesNotIncludeAnotherTurnsDetailsOrNotices() {
     val messages = listOf(user("u1", t0), assistant("a1", t0 + 1, tool("t1", "bash", input = """{"command":"pwd"}""")),
       notice("n1", t0 + 2, "skill", """"skill":"test","name":"testing","text":"private instructions" """),

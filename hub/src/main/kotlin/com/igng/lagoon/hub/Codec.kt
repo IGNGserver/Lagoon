@@ -80,6 +80,7 @@ object Codec {
   fun task(task: TaskState): JSONObject = JSONObject()
     .put("sessionId", task.sessionId).put("phase", task.phase.name).put("detail", task.detail).put("since", task.since)
     .putOpt("finishedAt", task.finishedAt).put("background", task.background).put("active", task.active)
+    .put("uncertain", task.uncertain).put("pendingInput", task.pendingInput)
 
   fun notice(notice: SessionNotice): JSONObject = JSONObject()
     .put("id", notice.id).put("sessionId", notice.sessionId).put("time", notice.time).put("error", notice.error).put("viewed", notice.viewed)

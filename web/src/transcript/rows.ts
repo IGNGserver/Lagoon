@@ -98,7 +98,7 @@ class Turn {
   constructor(readonly id: string, readonly created: number, readonly user: Message | null = null, readonly shell: Message | null = null) {}
 }
 
-export function build(messages: Message[], expanded: Set<string> = new Set(), working = false, revertMessageId: string | null = null): TranscriptRow[] {
+export function build(messages: Message[], expanded: Set<string> = new Set(), working = false, revertMessageId: string | null = null, unverified = false): TranscriptRow[] {
   const visible = messages.filter((it) => messageDisplayable(it) && (revertMessageId == null || it.id < revertMessageId));
   const turns: Turn[] = [];
   const users = new Set<string>();
@@ -139,17 +139,17 @@ export function build(messages: Message[], expanded: Set<string> = new Set(), wo
     if (index === 0 || turn.created - previousEnd >= TIME_GAP_MS) rows.push(row(`time:${turn.id}`, "time", { text: formatTime(turn.created) }));
     const members = [turn.user, turn.shell, ...turn.entries].filter((it): it is Message => it != null);
     previousEnd = Math.max(...members.map((it) => it.completedAt ?? it.created));
-    rows.push(...turnRows(turn, `turn:${turn.id}`, expanded, working && index === turns.length - 1));
+    rows.push(...turnRows(turn, `turn:${turn.id}`, expanded, working && !unverified && index === turns.length - 1, unverified));
   });
   return withUniqueKeys(rows);
 }
 
 /** Rows of one expandable group, for the detail sheet: the group's items and, opened, their bodies. */
-export function details(messages: Message[], key: string, working = false, revertMessageId: string | null = null): TranscriptRow[] {
+export function details(messages: Message[], key: string, working = false, revertMessageId: string | null = null, unverified = false): TranscriptRow[] {
   if (isBlank(key)) return [];
-  const first = build(messages, new Set([key]), working, revertMessageId);
+  const first = build(messages, new Set([key]), working, revertMessageId, unverified);
   const children = new Set(first.filter((it) => it.detailOf === key).map((it) => it.key));
-  const rows = children.size === 0 ? first : build(messages, new Set([key, ...children]), working, revertMessageId);
+  const rows = children.size === 0 ? first : build(messages, new Set([key, ...children]), working, revertMessageId, unverified);
   return rows.filter((it) => it.detailOf === key);
 }
 
@@ -180,7 +180,7 @@ function interrupted(message: Message): boolean {
   return type != null && (type.includes("abort") || type.includes("interrupt"));
 }
 
-function turnRows(turn: Turn, turnKey: string, expanded: Set<string>, working: boolean): TranscriptRow[] {
+function turnRows(turn: Turn, turnKey: string, expanded: Set<string>, working: boolean, unverified: boolean): TranscriptRow[] {
   const rows: TranscriptRow[] = [];
   const user = turn.user;
   if (user) {
@@ -198,7 +198,7 @@ function turnRows(turn: Turn, turnKey: string, expanded: Set<string>, working: b
     }));
   }
   const shell = turn.shell;
-  if (shell) shell.parts.forEach((part, index) => rows.push(...toolRows(partRef(shell, index, part), part, expanded)));
+  if (shell) shell.parts.forEach((part, index) => rows.push(...toolRows(partRef(shell, index, part), part, expanded, unverified)));
 
   const assistants = turn.entries.filter((it) => it.role === "assistant");
   const body: TranscriptRow[] = [];
@@ -214,7 +214,7 @@ function turnRows(turn: Turn, turnKey: string, expanded: Set<string>, working: b
   const finalRefs = new Set(finalParts.map(([ref]) => ref));
   const process = entries.filter(([ref]) => !finalRefs.has(ref));
   if (working) body.push(...runningTurnRows(process, expanded));
-  else if (process.length > 0) body.push(...toolGroupRows(turnKey, process, expanded));
+  else if (process.length > 0) body.push(...toolGroupRows(turnKey, process, expanded, unverified));
   if (finalParts.length > 0) {
     const text = finalParts.map(([, part]) => part.text.trim()).join("\n\n");
     body.push(row(`answer:${finalParts[0][0]}`, "text", { text }));
@@ -286,20 +286,24 @@ function runningTurnRows(entries: [string, MessagePart][], expanded: Set<string>
   return rows;
 }
 
-function toolGroupRows(turnKey: string, entries: [string, MessagePart][], expanded: Set<string>): TranscriptRow[] {
-  return activityGroupRows(`${turnKey}:activities`, entries, expanded, `共处理 ${entries.filter(([, it]) => it.type !== "text").length} 个操作`);
+function toolGroupRows(turnKey: string, entries: [string, MessagePart][], expanded: Set<string>, unverified: boolean): TranscriptRow[] {
+  return activityGroupRows(`${turnKey}:activities`, entries, expanded, `共处理 ${entries.filter(([, it]) => it.type !== "text").length} 个操作`, unverified);
 }
 
-function activityGroupRows(key: string, entries: [string, MessagePart][], expanded: Set<string>, title: string): TranscriptRow[] {
+function activityGroupRows(key: string, entries: [string, MessagePart][], expanded: Set<string>, title: string, unverified = false): TranscriptRow[] {
   const tools = entries.filter(([, it]) => it.type === "tool").map(([, it]) => it);
   const reasonings = entries.filter(([, it]) => it.type === "reasoning").map(([, it]) => it);
-  const status = tools.some((it) => ACTIVE_STATUSES.has(it.status)) || reasonings.some((it) => ACTIVE_STATUSES.has(it.status)) ? "running"
-    : tools.some((it) => it.status === "error") ? "error" : "completed";
+  const failed = tools.filter((it) => it.status === "error");
+  const status = tools.some((it) => ACTIVE_STATUSES.has(it.status)) || reasonings.some((it) => ACTIVE_STATUSES.has(it.status)) ? (unverified ? "unverified" : "running")
+    : failed.length > 0 ? "warning" : "completed";
   const counts = new Map<string, number>();
   for (const tool of tools) counts.set(toolCategory(tool), (counts.get(toolCategory(tool)) ?? 0) + 1);
   const summary = [...[...counts].map(([label, count]) => `${count} 个${label}`), ...(reasonings.length > 0 ? [`${reasonings.length} 个思考`] : [])].join("、");
-  const failed = tools.find((it) => it.status === "error" && !isBlank(it.error));
-  const preview = failed ? unwrapError(failed.error).slice(0, 140) : tools.length === 1 ? toolInfo(tools[0])[1] : "";
+  const commands = failed.filter((it) => SHELL_TOOLS.has(it.tool)).length;
+  const preview = failed.length > 0 ? `含 ${[
+    ...(commands > 0 ? [`${commands} 条异常命令`] : []),
+    ...(failed.length > commands ? [`${failed.length - commands} 条异常调用`] : []),
+  ].join("、")}` : tools.length === 1 ? toolInfo(tools[0])[1] : "";
   const single = tools.length === 1 && SUBAGENT_TOOLS.has(tools[0].tool) ? tools[0].target ?? null : null;
   const head = row(key, "tool-group", { title, subtitle: preview, meta: summary, status, target: single });
   if (!expanded.has(key)) return [head];
@@ -308,7 +312,7 @@ function activityGroupRows(key: string, entries: [string, MessagePart][], expand
     const occurrence = entries.slice(0, position).filter(([other]) => other === ref).length;
     const itemKey = `${key}:${ref}${occurrence === 0 ? "" : `~${occurrence + 1}`}`;
     if (part.type === "reasoning") {
-      children.push(row(itemKey, "reasoning", { title: "深度思考", status: part.status, detailOf: key, source: part }));
+      children.push(row(itemKey, "reasoning", { title: "深度思考", status: rowStatus(part, unverified), detailOf: key, source: part }));
       chunks(part.text.trim()).forEach((chunk, index) => children.push(row(`${itemKey}:body:${index}`, "reasoning-body", { text: chunk, detailOf: key, bodyOf: itemKey })));
     } else if (part.type === "text") {
       children.push(row(itemKey, "process-output", { text: part.text, detailOf: key, source: part }));
@@ -319,7 +323,7 @@ function activityGroupRows(key: string, entries: [string, MessagePart][], expand
     } else {
       const [toolTitle, subtitle] = toolInfo(part);
       children.push(row(itemKey, "tool", {
-        title: toolTitle, subtitle, args: toolArgs(part), status: part.status, attachments: part.attachments,
+        title: toolTitle, subtitle, args: toolArgs(part), status: rowStatus(part, unverified), attachments: part.attachments,
         target: SUBAGENT_TOOLS.has(part.tool) ? part.target ?? null : null, detailOf: key, source: part,
       }));
       for (const section of toolSections(part)) {
@@ -349,11 +353,15 @@ function toolCategory(part: MessagePart): string {
   }
 }
 
-function toolRows(ref: string, part: MessagePart, expanded: Set<string>): TranscriptRow[] {
+function rowStatus(part: MessagePart, unverified: boolean): string {
+  return unverified && ACTIVE_STATUSES.has(part.status) ? "unverified" : part.status;
+}
+
+function toolRows(ref: string, part: MessagePart, expanded: Set<string>, unverified: boolean): TranscriptRow[] {
   const key = `tool:${ref}`;
   const [title, subtitle] = toolInfo(part);
   const head = row(key, "tool", {
-    title, subtitle, args: toolArgs(part), status: part.status, attachments: part.attachments,
+    title, subtitle, args: toolArgs(part), status: rowStatus(part, unverified), attachments: part.attachments,
     target: SUBAGENT_TOOLS.has(part.tool) ? part.target ?? null : null, source: part,
   });
   if (!expanded.has(key)) return [head];

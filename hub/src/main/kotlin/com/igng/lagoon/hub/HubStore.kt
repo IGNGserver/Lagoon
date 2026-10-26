@@ -213,12 +213,14 @@ class HubStore(private val dataDir: Path, private val box: SecretBox, private va
     notices[server] = next; scheduleState(); next
   }
 
-  override fun forgetSession(server: String, session: String) = synchronized(lock) {
+  override fun forgetTask(server: String, session: String) = synchronized(lock) {
     notices[server] = notices[server].orEmpty().filterNot { it.sessionId == session }
     tasks[server]?.remove(session)
     parents[server]?.remove(session)
     scheduleState()
   }
+
+  override fun forgetSession(server: String, session: String) = forgetTask(server, session)
 
   // ---- Last catalog per server, painted while a cold monitor reads the live one ----
 
@@ -470,7 +472,8 @@ object Decode {
   fun task(session: String, json: JSONObject): TaskState? {
     val phase = Codec.phase(json.optString("phase")) ?: return null
     return TaskState(session, phase, json.optString("detail"), json.optLong("since"),
-      json.optLong("finishedAt").takeIf { it > 0 }, json.optLong("activeAt", -1), json.optBoolean("background"))
+      json.optLong("finishedAt").takeIf { it > 0 }, json.optLong("activeAt", -1), json.optBoolean("background"),
+      uncertain = json.optBoolean("uncertain"), pendingInput = json.optBoolean("pendingInput"))
   }
 
   fun notices(array: JSONArray?): List<SessionNotice> = objects(array).mapNotNull {

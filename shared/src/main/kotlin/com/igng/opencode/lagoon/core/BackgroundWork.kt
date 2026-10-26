@@ -117,7 +117,11 @@ object BackgroundWork {
       // 根自身真正在跑（前台运行）时不折算；它 settle 后由 [TaskReducer] 重新判断。
       if (existing?.let { it.active && !it.background } == true) return@forEach
       val folded = TaskState(root, TaskPhase.THINKING, TaskState.BACKGROUND_DETAIL,
-        since = existing?.since ?: now, activeAt = existing?.activeAt ?: -1L, background = true)
+        since = existing?.since ?: now, activeAt = existing?.activeAt ?: -1L, background = true,
+        pendingInput = existing?.pendingInput == true,
+        uncertain = existing?.uncertain == true || tasks.values.any {
+          it.active && it.uncertain && rootOf(it.sessionId, parents) == root
+        })
       if (existing != folded) {
         result[root] = folded
         changed = true

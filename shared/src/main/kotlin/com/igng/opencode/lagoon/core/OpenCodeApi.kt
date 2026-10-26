@@ -349,6 +349,9 @@ class OpenCodeApi(
   override suspend fun inbox(id: String): List<Message> = withContext(Dispatchers.IO) {
     dataArray(obj(sessionPath(id, "/inbox"))).objects().mapNotNull { it.toInboxMessage() }
   }
+  override suspend fun hasPendingInput(id: String): Boolean = withContext(Dispatchers.IO) {
+    dataArray(obj(sessionPath(id, "/inbox"))).length() > 0
+  }
   /** Sessions whose foreground drain this server currently owns; every other session is idle. */
   override suspend fun activeSessions(): Set<String> {
     val json = withContext(Dispatchers.IO) { jsonObject(request("GET", "api/session/active")) }

@@ -63,8 +63,10 @@ object TranscriptRows {
   /**
    * [revertMessageId] is the session's staged revert boundary: like the official timeline, messages
    * at or after it are hidden until the revert is cleared or committed.
+   * [unverified] means cached active statuses cannot establish live work. Only their presentation
+   * changes; authoritative parts, completed calls and errors remain untouched.
    */
-  fun build(messages: List<Message>, expanded: Set<String> = emptySet(), working: Boolean = false, revertMessageId: String? = null): List<TranscriptRow> {
+  fun build(messages: List<Message>, expanded: Set<String> = emptySet(), working: Boolean = false, revertMessageId: String? = null, unverified: Boolean = false): List<TranscriptRow> {
     val visible = messages.filter { it.isDisplayable && (revertMessageId == null || it.id < revertMessageId) }
     val turns = mutableListOf<Turn>()
     val users = mutableSetOf<String>()
@@ -88,7 +90,7 @@ object TranscriptRows {
     turns.forEachIndexed { index, turn ->
       if (index == 0 || turn.created - previousEnd >= TIME_GAP_MS) rows += TranscriptRow("time:${turn.id}", "time", text = formatTime(turn.created))
       previousEnd = (listOfNotNull(turn.user, turn.shell) + turn.entries).maxOf { it.completedAt ?: it.created }
-      rows += turnRows(turn, "turn:${turn.id}", expanded, working && index == turns.lastIndex)
+      rows += turnRows(turn, "turn:${turn.id}", expanded, working && !unverified && index == turns.lastIndex, unverified)
     }
     return rows.withUniqueKeys()
   }
@@ -98,11 +100,11 @@ object TranscriptRows {
    * 的条目（工具调用 / 思考 / 改动文件）一并展开，取出带 [TranscriptRow.detailOf] 的行。条目正文由
    * [TranscriptRow.bodyOf] 指回条目头，半屏窗口默认折叠正文，点击条目才显示。
    */
-  fun details(messages: List<Message>, key: String, working: Boolean = false, revertMessageId: String? = null): List<TranscriptRow> {
+  fun details(messages: List<Message>, key: String, working: Boolean = false, revertMessageId: String? = null, unverified: Boolean = false): List<TranscriptRow> {
     if (key.isBlank()) return emptyList()
-    val first = build(messages, setOf(key), working, revertMessageId)
+    val first = build(messages, setOf(key), working, revertMessageId, unverified)
     val children = first.filter { it.detailOf == key }.map { it.key }.toSet()
-    val rows = if (children.isEmpty()) first else build(messages, setOf(key) + children, working, revertMessageId)
+    val rows = if (children.isEmpty()) first else build(messages, setOf(key) + children, working, revertMessageId, unverified)
     return rows.filter { it.detailOf == key }
   }
 
@@ -142,7 +144,7 @@ object TranscriptRows {
   private fun Message.interrupted(): Boolean = finish == "aborted" ||
     errorType?.lowercase()?.let { it.contains("abort") || it.contains("interrupt") } == true
 
-  private fun turnRows(turn: Turn, turnKey: String, expanded: Set<String>, working: Boolean): List<TranscriptRow> {
+  private fun turnRows(turn: Turn, turnKey: String, expanded: Set<String>, working: Boolean, unverified: Boolean): List<TranscriptRow> {
     val rows = mutableListOf<TranscriptRow>()
     turn.user?.let { user ->
       val text = user.parts.filter { it.type == "text" }.joinToString("\n") { it.text }.trim()
@@ -154,7 +156,7 @@ object TranscriptRows {
         copyText = text.takeIf { it.isNotBlank() }, status = if (user.queued) "queued" else "")
     }
     turn.shell?.let { shell ->
-      shell.parts.forEachIndexed { index, part -> rows += toolRows(partRef(shell, index, part), part, expanded) }
+      shell.parts.forEachIndexed { index, part -> rows += toolRows(partRef(shell, index, part), part, expanded, unverified) }
     }
 
     val assistants = turn.entries.filter { it.role == "assistant" }
@@ -182,7 +184,7 @@ object TranscriptRows {
       // Only finished turns collapse into the「共处理 N 个操作」summary.
       body += runningTurnRows(process, expanded)
     } else if (process.isNotEmpty()) {
-      body += toolGroupRows(turnKey, process, expanded)
+      body += toolGroupRows(turnKey, process, expanded, unverified)
     }
     if (finalParts.isNotEmpty()) {
       val text = finalParts.joinToString("\n\n") { it.second.text.trim() }
@@ -270,18 +272,19 @@ object TranscriptRows {
    * One stable activity group per user turn, including intermediate text in chronological order.
    * Process output is visible in the activity list; tool/reasoning bodies are second-level details.
    */
-  private fun toolGroupRows(turnKey: String, entries: List<Pair<String, MessagePart>>, expanded: Set<String>): List<TranscriptRow> =
-    activityGroupRows("$turnKey:activities", entries, expanded, "共处理 ${entries.count { it.second.type != "text" }} 个操作")
+  private fun toolGroupRows(turnKey: String, entries: List<Pair<String, MessagePart>>, expanded: Set<String>, unverified: Boolean): List<TranscriptRow> =
+    activityGroupRows("$turnKey:activities", entries, expanded, "共处理 ${entries.count { it.second.type != "text" }} 个操作", unverified)
 
   /** A collapsed operation group: a one-line summary, and its calls/bodies only after [expanded]. */
-  private fun activityGroupRows(key: String, entries: List<Pair<String, MessagePart>>, expanded: Set<String>, title: String): List<TranscriptRow> {
+  private fun activityGroupRows(key: String, entries: List<Pair<String, MessagePart>>, expanded: Set<String>, title: String, unverified: Boolean = false): List<TranscriptRow> {
     val tools = entries.filter { it.second.type == "tool" }.map { it.second }
     val reasonings = entries.filter { it.second.type == "reasoning" }.map { it.second }
+    val failed = tools.filter { it.status == "error" }
     // Only calls that are actually executing spin. A running turn used to force every batch to
     // "running", so finished calls showed the spinner too and read as still working.
     val status = when {
-      tools.any { it.status in ACTIVE_STATUSES } || reasonings.any { it.status in ACTIVE_STATUSES } -> "running"
-      tools.any { it.status == "error" } -> "error"
+      tools.any { it.status in ACTIVE_STATUSES } || reasonings.any { it.status in ACTIVE_STATUSES } -> if (unverified) "unverified" else "running"
+      failed.isNotEmpty() -> "warning"
       else -> "completed"
     }
     val counts = LinkedHashMap<String, Int>()
@@ -290,8 +293,15 @@ object TranscriptRows {
       counts.forEach { (label, count) -> add("$count 个$label") }
       if (reasonings.isNotEmpty()) add("${reasonings.size} 个思考")
     }.joinToString("、")
-    val errorText = tools.firstOrNull { it.status == "error" && it.error.isNotBlank() }?.let { unwrapError(it.error) }
-    val preview = errorText?.take(140) ?: tools.singleOrNull()?.let { toolInfo(it).second }.orEmpty()
+    // Command failures are diagnostics within the turn, not an assistant/session failure. Keep the
+    // raw error in the individual tool details; a collapsed group only reports how many calls failed.
+    val preview = if (failed.isNotEmpty()) {
+      val commands = failed.count { it.tool in SHELL_TOOLS }
+      buildList {
+        if (commands > 0) add("$commands 条异常命令")
+        if (failed.size > commands) add("${failed.size - commands} 条异常调用")
+      }.joinToString("、", prefix = "含 ")
+    } else tools.singleOrNull()?.let { toolInfo(it).second }.orEmpty()
     val row = TranscriptRow(key, "tool-group", title = title, subtitle = preview, meta = summary, status = status,
       target = tools.singleOrNull()?.takeIf { it.tool in SUBAGENT_TOOLS }?.target)
     if (key !in expanded) return listOf(row)
@@ -301,7 +311,7 @@ object TranscriptRows {
       val itemKey = "$key:$ref" + if (occurrence == 0) "" else "~${occurrence + 1}"
       if (part.type == "reasoning") {
         val text = part.text.trim()
-        children += TranscriptRow(itemKey, "reasoning", title = "深度思考", status = part.status, detailOf = key, source = part)
+        children += TranscriptRow(itemKey, "reasoning", title = "深度思考", status = part.rowStatus(unverified), detailOf = key, source = part)
         reasoningBodies(key, itemKey, text).forEach { children += it }
       } else if (part.type == "text") {
         children += TranscriptRow(itemKey, "process-output", text = part.text, detailOf = key, source = part)
@@ -311,7 +321,7 @@ object TranscriptRows {
         children += TranscriptRow(itemKey, "attachment", attachments = listOf(Attachment(part.path, part.mime, part.title)), detailOf = key, source = part)
       } else {
         val (title, subtitle) = toolInfo(part)
-        children += TranscriptRow(itemKey, "tool", title = title, subtitle = subtitle, args = toolArgs(part), status = part.status,
+        children += TranscriptRow(itemKey, "tool", title = title, subtitle = subtitle, args = toolArgs(part), status = part.rowStatus(unverified),
           attachments = part.attachments, target = part.target.takeIf { part.tool in SUBAGENT_TOOLS }, detailOf = key, source = part)
         toolSections(part).flatMap { section ->
           MarkdownBlocks.chunks(section.text).mapIndexed { index, chunk ->
@@ -345,11 +355,13 @@ object TranscriptRows {
     else -> part.tool.ifBlank { "工具" }
   }
 
+  private fun MessagePart.rowStatus(unverified: Boolean): String = if (unverified && status in ACTIVE_STATUSES) "unverified" else status
+
   /** A standalone tool row, used for explicit shell turns; its body is shown only after [details] expands it. */
-  private fun toolRows(ref: String, part: MessagePart, expanded: Set<String>): List<TranscriptRow> {
+  private fun toolRows(ref: String, part: MessagePart, expanded: Set<String>, unverified: Boolean): List<TranscriptRow> {
     val key = "tool:$ref"
     val (title, subtitle) = toolInfo(part)
-    val row = TranscriptRow(key, "tool", title = title, subtitle = subtitle, args = toolArgs(part), status = part.status,
+    val row = TranscriptRow(key, "tool", title = title, subtitle = subtitle, args = toolArgs(part), status = part.rowStatus(unverified),
       attachments = part.attachments, target = part.target.takeIf { part.tool in SUBAGENT_TOOLS }, source = part)
     return listOf(row) + if (key !in expanded) emptyList() else toolSections(part).flatMap { section ->
       MarkdownBlocks.chunks(section.text).mapIndexed { index, chunk ->

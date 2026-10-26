@@ -9,8 +9,8 @@ enum class HomeGrouping(val label: String) { DATE("日期"), PROJECT("项目"), 
 data class HomeSection(val key: String, val title: String, val sessions: List<Session>)
 
 /**
- * Sections of the home list. Input sessions keep their activity order inside every section; grouping
- * never reorders them (a waiting or running session only changes its icon, see docs/HOME_REDESIGN.md).
+ * Sections of the home list. Input sessions keep their activity order inside every section;
+ * date grouping places live work in 今天 without changing server timestamps.
  * Pinned sessions are this device's choice and are lifted into a leading 置顶 section.
  */
 object HomeSections {
@@ -25,27 +25,42 @@ object HomeSections {
   ): List<HomeSection> {
     val (top, rest) = sessions.partition { it.id in pinned }
     val sections = when (grouping) {
-      HomeGrouping.DATE -> byDate(rest, now, zone)
+      HomeGrouping.DATE -> byDate(rest, now, zone, statuses)
       HomeGrouping.PROJECT -> byProject(rest, projects)
       HomeGrouping.STATUS -> byStatus(rest, statuses)
     }
     return listOfNotNull(top.takeIf { it.isNotEmpty() }?.let { HomeSection("pinned", "置顶", it) }) + sections
   }
 
-  /** 今天 / 昨天 / 近 7 天 / 近 30 天 / 更早, by local calendar day of the last activity. */
-  fun byDate(sessions: List<Session>, now: Long, zone: ZoneId = ZoneId.systemDefault()): List<HomeSection> {
+  /**
+   * 今天 / 昨天 / 近 7 天 / 近 30 天 / 更早, by local calendar day of the last activity.
+   * Running (including background) and waiting for permission, an answer, or the server are live
+   * tasks and belong to 今天. Unknown/offline, finished, failed and idle work keeps its real date.
+   * This is only a presentation bucket: timestamps and activity order within a section stay intact.
+   */
+  fun byDate(
+    sessions: List<Session>, now: Long, zone: ZoneId = ZoneId.systemDefault(),
+    statuses: Map<String, SessionStatus> = emptyMap()
+  ): List<HomeSection> {
     val today = Instant.ofEpochMilli(now).atZone(zone).toLocalDate()
-    fun bucket(session: Session): Pair<String, String> {
+    fun bucket(session: Session): Int {
+      when (statuses[session.key]) {
+        SessionStatus.RUNNING, SessionStatus.BACKGROUND_RUNNING,
+        SessionStatus.WAITING_PERMISSION, SessionStatus.WAITING_QUESTION, SessionStatus.WAITING_SERVER -> return 0
+        else -> Unit
+      }
       val day = Instant.ofEpochMilli(session.activityAt).atZone(zone).toLocalDate()
       return when {
-        !day.isBefore(today) -> "today" to "今天"
-        day == today.minusDays(1) -> "yesterday" to "昨天"
-        day.isAfter(today.minusDays(7)) -> "week" to "近 7 天"
-        day.isAfter(today.minusDays(30)) -> "month" to "近 30 天"
-        else -> "earlier" to "更早"
+        !day.isBefore(today) -> 0
+        day == today.minusDays(1) -> 1
+        day.isAfter(today.minusDays(7)) -> 2
+        day.isAfter(today.minusDays(30)) -> 3
+        else -> 4
       }
     }
-    return sessions.groupBy(::bucket).map { (key, list) -> HomeSection("date:${key.first}", key.second, list) }
+    val keys = listOf("today", "yesterday", "week", "month", "earlier")
+    val titles = listOf("今天", "昨天", "近 7 天", "近 30 天", "更早")
+    return sessions.groupBy(::bucket).toSortedMap().map { (index, list) -> HomeSection("date:${keys[index]}", titles[index], list) }
   }
 
   /**
@@ -62,7 +77,7 @@ object HomeSections {
   /**
    * 需要处理 › 运行中 › 未读结果 › 其他, the order the official client ranks session indicators.
    * “等待服务器处理”也是需要处理的一类（只是等待的是服务端/电脑端），不再落到“其他”；
-   * 离线超时后无法证明仍在运行的服务端任务归入“其他”，但行内会显示“离线 · 状态未知”。
+   * 无法核实的旧运行态归入“其他”，行内显示“状态待确认”。
    */
   fun byStatus(sessions: List<Session>, statuses: Map<String, SessionStatus>): List<HomeSection> {
     fun bucket(session: Session) = when (statuses[session.key] ?: SessionStatus.NONE) {

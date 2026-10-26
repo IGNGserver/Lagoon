@@ -9,7 +9,7 @@ internal val LagoonState.staleConnection: Boolean
 internal val LagoonState.livePresentedTasks: Map<String, TaskState>
   get() = if (staleConnection) presentedTasks.filterValues {
     it.phase !in TaskState.RUNNING_PHASES && it.phase != TaskPhase.WAITING_SERVER
-  } else presentedTasks
+  } else presentedTasks.filterValues { !it.uncertain }
 
 /** Root families this phone last knew as active, before the offline TTL is applied. */
 internal val LagoonState.rawActiveRootTasks: Map<String, TaskState>

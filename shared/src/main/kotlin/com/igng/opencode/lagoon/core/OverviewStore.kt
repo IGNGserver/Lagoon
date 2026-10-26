@@ -19,6 +19,8 @@ interface OverviewStore {
   fun migrateTaskLedger(id: String, now: Long = System.currentTimeMillis())
   fun sessionNotices(server: String, now: Long = System.currentTimeMillis()): List<SessionNotice>
   fun rememberNotice(server: String, notice: SessionNotice, now: Long = System.currentTimeMillis()): List<SessionNotice>
+  /** Retires task, parent and result ledgers without deleting local session drafts or queued input. */
+  fun forgetTask(server: String, session: String)
   fun forgetSession(server: String, session: String)
 }
 

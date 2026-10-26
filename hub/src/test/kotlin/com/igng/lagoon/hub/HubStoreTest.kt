@@ -49,6 +49,34 @@ class HubStoreTest {
     }
   }
 
+  @Test fun reconciliationFlagsSurviveCodecAndStoreRoundTrips() {
+    val now = System.currentTimeMillis()
+    val states = listOf(false, true).flatMap { uncertain ->
+      listOf(false, true).map { pendingInput ->
+        TaskState("s-$uncertain-$pendingInput", TaskPhase.WAITING_SERVER, "等待服务器处理", since = now,
+          uncertain = uncertain, pendingInput = pendingInput)
+      }
+    }
+    HubStore(dir, box).use { store ->
+      states.forEach { state ->
+        val json = Codec.task(state)
+        assertEquals(state.uncertain, json.getBoolean("uncertain"))
+        assertEquals(state.pendingInput, json.getBoolean("pendingInput"))
+        assertEquals(state, Decode.task(state.sessionId, json))
+        store.rememberTask("a", state, observedAt = now)
+      }
+    }
+    HubStore(dir, box).use { store ->
+      assertEquals(states.associateBy { it.sessionId }, store.taskStates("a"))
+    }
+  }
+
+  @Test fun olderTaskJsonDefaultsToVerifiedWithNoPendingInput() {
+    val state = TaskState("s", TaskPhase.THINKING, since = 100)
+    val json = Codec.task(state).apply { remove("uncertain"); remove("pendingInput") }
+    assertEquals(state, Decode.task("s", json))
+  }
+
   @Test fun rememberedCookiesAreBoundToTheAddressTheyWereMintedFor() {
     HubStore(dir, box).use { store ->
       val dsh = profile.copy(kind = ServerKind.DSH, username = "dsh")
@@ -91,6 +119,38 @@ class HubStoreTest {
       assertTrue(store.sessionNotices("a").all { it.viewed })
       store.forgetSession("a", "s2")
       assertEquals(listOf("n1"), store.sessionNotices("a").map { it.id })
+    }
+  }
+
+  @Test fun forgettingATaskRetiresOnlyItsServerScopedLedgersAndPersists() {
+    val now = System.currentTimeMillis()
+    HubStore(dir, box).use { store ->
+      store.addProject("a", Project("p", "/repo", "repo"))
+      store.rememberCatalog("a", emptyList(), listOf(Session("s", "/repo", "Task", now)))
+      store.rememberTask("a", TaskState("s", TaskPhase.THINKING), parent = "root")
+      store.rememberTask("a", TaskState("other", TaskPhase.THINKING), parent = "root")
+      store.rememberTask("b", TaskState("s", TaskPhase.THINKING), parent = "other-root")
+      store.rememberNotice("a", SessionNotice("n", "s", now, false))
+      store.rememberNotice("a", SessionNotice("other-n", "other", now, false))
+      store.rememberNotice("b", SessionNotice("n", "s", now, false))
+      store.forgetTask("a", "s")
+      assertFalse(store.taskStates("a").containsKey("s"))
+      assertFalse(store.taskParents("a").containsKey("s"))
+      assertEquals(listOf("other-n"), store.sessionNotices("a").map { it.id })
+    }
+    HubStore(dir, box).use { store ->
+      assertEquals(setOf("other"), store.taskStates("a").keys)
+      assertEquals(mapOf("other" to "root"), store.taskParents("a"))
+      assertEquals(listOf("other-n"), store.sessionNotices("a").map { it.id })
+      assertEquals(setOf("s"), store.taskStates("b").keys)
+      assertEquals(mapOf("s" to "other-root"), store.taskParents("b"))
+      assertEquals(listOf("n"), store.sessionNotices("b").map { it.id })
+      assertEquals("/repo", store.localProjects("a").single().directory)
+      assertEquals("s", store.catalog("a")!!.second.single().id)
+      store.forgetSession("a", "other")
+      assertTrue(store.taskStates("a").isEmpty())
+      assertTrue(store.taskParents("a").isEmpty())
+      assertTrue(store.sessionNotices("a").isEmpty())
     }
   }
 

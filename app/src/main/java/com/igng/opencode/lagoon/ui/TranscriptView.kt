@@ -84,16 +84,18 @@ internal fun Conversation(state: LagoonState, controller: LagoonController, modi
   onOpenChild: (String) -> Unit = {}, onActivityGroup: (TranscriptRow) -> Unit = {}) {
   val list = rememberLazyListState()
   val scope = rememberCoroutineScope()
-  val task = state.presentedTasks[state.sessionId]
+  val unverified = state.livePresentedTasks[state.sessionId]?.active != true || state.cached || !state.connected
+  val task = state.livePresentedTasks[state.sessionId]?.takeUnless { unverified }
   val working = task?.active == true
   val revert = state.session?.revertMessageId
   // Throttled, not debounced: a restart-on-change delay starved the transcript while a reply streamed.
   // The first change builds at once; later ones are conflated to the newest and built at most every
   // ROWS_THROTTLE_MS, so streaming keeps updating the list.
-  val source by rememberUpdatedState(Triple(state.messages, working, revert))
+  val source by rememberUpdatedState(Triple(state.messages, working to unverified, revert))
   val rows by produceState(emptyList<TranscriptRow>()) {
-    snapshotFlow { source }.conflate().collect { (messages, running, boundary) ->
-      value = withContext(Dispatchers.Default) { TranscriptRows.build(messages, working = running, revertMessageId = boundary).also(::warmMarkdown) }
+    snapshotFlow { source }.conflate().collect { (messages, activity, boundary) ->
+      val (running, unverified) = activity
+      value = withContext(Dispatchers.Default) { TranscriptRows.build(messages, working = running, revertMessageId = boundary, unverified = unverified).also(::warmMarkdown) }
       delay(TranscriptScroll.ROWS_THROTTLE_MS)
     }
   }
@@ -182,7 +184,7 @@ internal fun Conversation(state: LagoonState, controller: LagoonController, modi
           if (loadingOlder) InfiniteProgressIndicator(size = 20.dp, strokeWidth = 2.dp)
         }
       }
-      if (state.sessionId in state.backgroundRunning) item(key = "background-running") {
+       if (working && state.sessionId in state.backgroundRunning) item(key = "background-running") {
         Text("任务正在后台运行中", color = MiuixTheme.colorScheme.primary, style = MiuixTheme.textStyles.footnote1)
       }
       if (state.cached) item(key = "cache-notice") { Text(if (state.cacheComplete) if (state.connected) "会话缓存 · 消息待同步" else "离线缓存 · 恢复连接后更新" else "离线缓存已截断，部分历史与长输出未保留", color = MiuixColorTokens.Warning, style = MiuixTheme.textStyles.footnote1) }
@@ -321,6 +323,7 @@ private fun GroupRow(row: TranscriptRow, onClick: () -> Unit) {
       if (row.subtitle.isNotBlank()) Text(row.subtitle, maxLines = 1, overflow = TextOverflow.Ellipsis,
         style = MiuixTheme.textStyles.footnote1.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
     }
+    if (row.status == "unverified") { UnverifiedStatus(); Spacer(Modifier.width(8.dp)) }
     if (running) { InfiniteProgressIndicator(color = MiuixColorTokens.Primary, size = 15.dp, strokeWidth = 1.5.dp); Spacer(Modifier.width(8.dp)) }
     Text("›", style = MiuixTheme.textStyles.title4.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
   }
@@ -336,6 +339,7 @@ private fun QoderSummaryRow(row: TranscriptRow, onClick: () -> Unit) {
       if (row.subtitle.isNotBlank()) Text(row.subtitle, maxLines = 1, overflow = TextOverflow.Ellipsis,
         style = MiuixTheme.textStyles.footnote1.copy(color = if (error) MiuixColorTokens.Error else MiuixTheme.colorScheme.onSurfaceVariantSummary))
     }
+    if (row.status == "unverified") { UnverifiedStatus(); Spacer(Modifier.width(8.dp)) }
     if (running) { InfiniteProgressIndicator(color = QoderColors.successColor, size = 16.dp, strokeWidth = 1.5.dp); Spacer(Modifier.width(8.dp)) }
     QoderIcon(QoderGlyph.CHEVRON, Modifier.size(18.dp), MiuixTheme.colorScheme.onSurfaceVariantSummary)
   }
@@ -384,6 +388,7 @@ internal fun QoderActivityItem(
             overflow = TextOverflow.Ellipsis,
             style = MiuixTheme.textStyles.footnote1.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
           )
+          if (header.status == "unverified") UnverifiedStatus()
         }
         if (clickable) QoderIcon(QoderGlyph.CHEVRON, Modifier.padding(top = 9.dp).size(18.dp), MiuixTheme.colorScheme.onSurfaceVariantSummary)
       }
@@ -403,6 +408,7 @@ private fun TimelineMarker(status: String, kind: String, hasNext: Boolean) {
     Box(Modifier.padding(top = 6.dp).size(26.dp), contentAlignment = Alignment.Center) {
       when {
         status == "error" -> QoderIcon(QoderGlyph.ERROR, color = QoderColors.error)
+        status == "unverified" -> Text("?", color = MiuixTheme.colorScheme.onSurfaceVariantSummary, style = MiuixTheme.textStyles.body1)
         status in setOf("running", "pending") -> InfiniteProgressIndicator(color = QoderColors.successColor, size = 20.dp, strokeWidth = 2.dp)
         kind == "reasoning" -> QoderIcon(QoderGlyph.THINK)
         else -> QoderIcon(QoderGlyph.CHECK, color = QoderColors.successColor)
@@ -506,6 +512,11 @@ private fun NoticeRow(row: TranscriptRow, onOpenChild: (String) -> Unit) {
     } else Spacer(Modifier.weight(1f))
     if (target != null) Text("›", style = MiuixTheme.textStyles.body1.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
   }
+}
+
+@Composable
+private fun UnverifiedStatus() {
+  Text("状态待核实", color = MiuixTheme.colorScheme.onSurfaceVariantSummary, style = MiuixTheme.textStyles.footnote2)
 }
 
 @Composable

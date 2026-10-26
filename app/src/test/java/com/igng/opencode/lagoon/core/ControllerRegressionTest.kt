@@ -295,6 +295,136 @@ class ControllerRegressionTest {
     }
   }
 
+  @Test fun aShellExitDuringAnOlderReadCannotResurrectTheJob() = runBlocking {
+    MockWebServer().use { server ->
+      val reading = java.util.concurrent.CountDownLatch(1)
+      var oldRead = true
+      val base = v2Server(mutableListOf(),
+        { """{"data":[{"id":"root","location":{"directory":"/repo"},"outcome":"succeeded","time":{"updated":200,"idle":200}}],"cursor":{}}""" },
+        { """{"data":{}}""" })
+      server.dispatcher = object : Dispatcher() {
+        override fun dispatch(request: RecordedRequest): MockResponse {
+          if (request.requestUrl!!.encodedPath != "/api/shell") return base.dispatch(request)
+          return if (oldRead) {
+            reading.countDown()
+            MockResponse().setBody("""{"data":[{"id":"sh","status":"running","metadata":{"sessionID":"root"},"time":{"started":100}}]}""")
+              .setBodyDelay(350, TimeUnit.MILLISECONDS)
+          } else MockResponse().setBody("""{"data":[]}""")
+        }
+      }
+      val root = Session("root", "/repo", "Root", 200, idle = 200, outcome = "succeeded")
+      val job = ShellJob("sh", "root", "sleep", 100, "/repo")
+      val (controller, state) = controller(api(server), LagoonState(serverId = "server", connected = true,
+        sessions = listOf(root), tasks = mapOf("root" to TaskState("root", TaskPhase.THINKING, since = 100, background = true)), shells = mapOf("sh" to job)))
+      val pending = async { refresh(controller) }
+      assertTrue(withContext(Dispatchers.IO) { reading.await(5, TimeUnit.SECONDS) })
+      LagoonController::class.java.getDeclaredMethod("handleEvent", ServerEvent::class.java).apply { isAccessible = true }
+        .invoke(controller, ServerEvent("exit", "/repo", "shell.exited", org.json.JSONObject().put("id", "sh"), 210))
+      pending.await()
+      assertTrue("旧的 shell HTTP 响应不能覆盖更新的退出事件", state.value.shells.isEmpty())
+      oldRead = false
+      refresh(controller)
+      assertFalse(state.value.tasks["root"]?.active == true)
+    }
+  }
+
+  @Test fun backgroundGraceExpiryRechecksTheServerInsteadOfAssumingCompletion() = runBlocking {
+    MockWebServer().use { server ->
+      server.dispatcher = v2Server(mutableListOf(),
+        { """{"data":[{"id":"root","location":{"directory":"/repo"},"time":{"updated":200,"idle":200}}],"cursor":{}}""" },
+        { """{"data":{"root":{"type":"running"}}}""" })
+      val (controller, state) = controller(api(server), LagoonState(serverId = "server", connected = true,
+        sessions = listOf(Session("root", "/repo", "Root", 200)),
+        tasks = mapOf("root" to TaskState("root", TaskPhase.THINKING, since = 100, background = true))))
+      val scope = CoroutineScope(coroutineContext + SupervisorJob())
+      put(controller, "scope", scope)
+      try {
+        LagoonController::class.java.getDeclaredMethod("settleBackgroundRun", String::class.java, String::class.java)
+          .apply { isAccessible = true }.invoke(controller, "server", "root")
+        scope.coroutineContext[Job]!!.children.toList().joinAll()
+        assertTrue(state.value.tasks.getValue("root").active)
+        assertFalse(state.value.tasks.getValue("root").background)
+        assertTrue(state.value.notices.isEmpty())
+      } finally { scope.cancel() }
+    }
+  }
+
+  @Test fun supportedIdleAndErrorEventsAlsoFenceOlderForegroundReads() = runBlocking {
+    listOf("session.error", "session.idle", "session.status").forEach { type -> MockWebServer().use { server ->
+      val reading = java.util.concurrent.CountDownLatch(1)
+      val base = v2Server(mutableListOf(),
+        { """{"data":[{"id":"root","location":{"directory":"/repo"},"time":{"updated":200,"idle":200}}],"cursor":{}}""" },
+        { """{"data":{}}""" })
+      server.dispatcher = object : Dispatcher() {
+        override fun dispatch(request: RecordedRequest): MockResponse {
+          if (request.requestUrl!!.encodedPath != "/api/session/active") return base.dispatch(request)
+          reading.countDown()
+          return MockResponse().setBody("""{"data":{"root":{"type":"running"}}}""").setBodyDelay(300, TimeUnit.MILLISECONDS)
+        }
+      }
+      val (controller, state) = controller(api(server), LagoonState(serverId = "server", connected = true,
+        sessions = listOf(Session("root", "/repo", "Root", 200)),
+        tasks = mapOf("root" to TaskState("root", TaskPhase.THINKING, since = 100))))
+      val pending = async { refresh(controller) }
+      assertTrue(withContext(Dispatchers.IO) { reading.await(5, TimeUnit.SECONDS) })
+      val props = org.json.JSONObject().put("sessionID", "root").put("status", org.json.JSONObject().put("type", "idle"))
+      LagoonController::class.java.getDeclaredMethod("handleEvent", ServerEvent::class.java).apply { isAccessible = true }
+        .invoke(controller, ServerEvent(type, "/repo", type, props, 210))
+      pending.await()
+      assertFalse("$type 不能被旧的前台读取覆盖", state.value.tasks.getValue("root").active)
+    } }
+  }
+
+  @Test fun questionsOnInactiveUnselectedSessionsAreVerifiedByTheirOwnLocation() = runBlocking {
+    listOf(false, true).forEach { formsSucceed -> MockWebServer().use { server ->
+      val formReads = java.util.concurrent.atomic.AtomicInteger()
+      val base = v2Server(mutableListOf(),
+        { """{"data":[{"id":"root","location":{"directory":"/repo"},"time":{"updated":200,"idle":200}}],"cursor":{}}""" },
+        { """{"data":{}}""" })
+      server.dispatcher = object : Dispatcher() {
+        override fun dispatch(request: RecordedRequest): MockResponse {
+          if (request.requestUrl!!.encodedPath != "/api/form") return base.dispatch(request)
+          formReads.incrementAndGet()
+          return if (formsSucceed) MockResponse().setBody("""{"data":[]}""") else MockResponse().setResponseCode(500)
+        }
+      }
+      val owner = Session("owner", "/other", "Other", 1)
+      val question = QuestionRequest("q", "owner", "/other", emptyList())
+      val (controller, state) = controller(api(server), LagoonState(serverId = "server", connected = true,
+        sessions = listOf(Session("root", "/repo", "Root", 200), owner), questions = listOf(question)))
+      refresh(controller)
+      assertTrue("非当前会话的表单目录也必须核实", formReads.get() > 0)
+      assertEquals(if (formsSucceed) emptyList<QuestionRequest>() else listOf(question), state.value.questions)
+    } }
+  }
+
+  @Test fun aConfirmedDeletedChildIsRemovedFromMemoryAndTheTaskLedger() = runBlocking {
+    MockWebServer().use { server ->
+      val base = v2Server(mutableListOf(),
+        { """{"data":[{"id":"root","location":{"directory":"/repo"},"outcome":"succeeded","time":{"updated":200,"idle":200}}],"cursor":{}}""" },
+        { """{"data":{}}""" })
+      server.dispatcher = object : Dispatcher() {
+        override fun dispatch(request: RecordedRequest) = if (request.requestUrl!!.encodedPath == "/api/session/child")
+          MockResponse().setResponseCode(404) else base.dispatch(request)
+      }
+      val child = TaskState("child", TaskPhase.SUBAGENT, since = 100)
+      val store = ServerStore(memoryPreferences(), memoryPreferences(), { it }, { it })
+      store.rememberTask("server", child, "root")
+      val (controller, state) = controller(api(server), LagoonState(serverId = "server", connected = true,
+        sessions = listOf(Session("root", "/repo", "Root", 200), Session("child", "/repo", "Child", 1, parentId = "root")),
+        knownParents = mapOf("child" to "root"), tasks = mapOf("child" to child,
+          "root" to TaskState("root", TaskPhase.THINKING, since = 100, background = true))))
+      put(controller, "store", store)
+      refresh(controller)
+      assertNull(state.value.tasks["child"])
+      assertNull(store.taskStates("server")["child"])
+      assertFalse(state.value.tasks["root"]?.active == true)
+      assertTrue(state.value.sessions.none { it.id == "child" })
+      refresh(controller)
+      assertFalse("二次对账也不能从持久化记录复活", state.value.tasks["root"]?.active == true)
+    }
+  }
+
   @Test fun staleTranscriptBackgroundMetadataCannotKeepAFinishedRootRunning() = runBlocking {
     MockWebServer().use { server ->
       var listChild = true
@@ -324,13 +454,13 @@ class ControllerRegressionTest {
         MessagePart("p", "tool", tool = "task", target = "child", background = true))))
       val (controller, state) = controller(api(server), LagoonState(serverId = "server", connected = true,
         sessionId = "root", messages = messages))
-      // 第一次对账拿到 transcript 里的静态 background 元数据，按旧行为会先折算成“后台运行中”。
+      // 历史消息只发现待核实的身份，不能先创建虚假的运行态。
       refresh(controller, controlOnly = true)
-      assertTrue(state.value.tasks["root"]?.background == true)
+      assertFalse(state.value.tasks["root"]?.active == true)
       // 第二次对账拿到子会话的权威状态（active 为空、time.idle 已写入），必须收尾且不再被旧消息复活。
       refresh(controller, controlOnly = true)
       assertFalse("根会话不能在服务端已完成后继续显示后台运行", state.value.tasks["root"]?.active == true)
-      assertEquals(SessionStatus.COMPLETED, state.value.sessionStatus(state.value.sessions.first { it.id == "root" }))
+      assertEquals(SessionStatus.NONE, state.value.sessionStatus(state.value.sessions.first { it.id == "root" }))
       assertEquals(0, state.value.summary.background)
       // 子会话不再出现在目录里也必须记住它已收尾：仅靠旧 transcript 的静态元数据不能把它重新派生。
       listChild = false
@@ -476,6 +606,9 @@ class ControllerRegressionTest {
       val(c,state)=controller(api(s),LagoonState(serverId="server",connected=true,projects=listOf(Project("a","/a","A"),Project("b","/b","B")),projectId="a",sessions=listOf(Session("sa","/a","A",0)),sessionId="sa",tasks=mapOf("sa" to TaskState("sa",TaskPhase.THINKING))))
       refresh(c, controlOnly=false)
       assertTrue(state.value.degraded);assertTrue(state.value.sessions.any{it.id=="sa"});assertEquals(TaskPhase.THINKING,state.value.tasks["sa"]?.phase);assertEquals("sa",state.value.sessionId)
+      assertTrue(state.value.tasks.getValue("sa").uncertain)
+      assertEquals(SessionStatus.UNKNOWN, state.value.sessionStatus(state.value.sessions.first { it.id == "sa" }))
+      assertEquals(0, state.value.summary.running)
     }
   }
   @Test fun permissionsAreReadPerRunningSessionAndSurviveReconciliation() = runBlocking {
