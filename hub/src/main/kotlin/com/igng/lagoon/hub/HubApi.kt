@@ -13,12 +13,14 @@ import com.igng.opencode.lagoon.core.MessageIds
 import com.igng.opencode.lagoon.core.MessagePart
 import com.igng.opencode.lagoon.core.PairLinkResolver
 import com.igng.opencode.lagoon.core.PermissionPolicy
+import com.igng.opencode.lagoon.core.Project
 import com.igng.opencode.lagoon.core.RefreshMode
 import com.igng.opencode.lagoon.core.ServerCredentials
 import com.igng.opencode.lagoon.core.ServerKind
 import com.igng.opencode.lagoon.core.ServerProfile
 import com.igng.opencode.lagoon.core.Session
 import com.igng.opencode.lagoon.core.createHarnessClient
+import com.igng.opencode.lagoon.core.normalizedDirectory
 import com.igng.opencode.lagoon.core.profileCredentials
 import com.igng.opencode.lagoon.core.referenceMime
 import com.igng.opencode.lagoon.core.serverReadCandidates
@@ -505,7 +507,11 @@ class HubApi(
       val sid = call.param("sid")
       val directory = call.json().optString("directory").ifBlank { throw HttpError(400, "directory-required", "请选择目录") }
       val project = runtime.run {
-        val resolved = client(sid).projectAt(directory) ?: throw HttpError(400, "project-unresolved", "服务器没有解析出这个目录对应的项目")
+        // DSH only lists directories it already has workspaces for, yet starts sessions in any directory.
+        val resolved = client(sid).projectAt(directory)
+          ?: if (store.profile(sid)?.kind == ServerKind.DSH) Project(normalizedDirectory(directory), directory.trimEnd('/').ifBlank { directory },
+            directory.trimEnd('/').substringAfterLast('/').ifBlank { directory })
+          else throw HttpError(400, "project-unresolved", "服务器没有解析出这个目录对应的项目")
         val projects = store.addProject(sid, resolved)
         patch(sid) { it.copy(projects = projects.map { p -> p.copy(serverId = sid) }) }
         projects.first()

@@ -30,4 +30,7 @@ application {
 tasks.withType<Test>().configureEach {
   // Contract fixtures shared with the web client live in the repository.
   workingDir = rootDir
+  // Timeline times in the shared contract are written in UTC.
+  systemProperty("user.timezone", "UTC")
+  environment("UPDATE_CONTRACT", System.getenv("UPDATE_CONTRACT") ?: "")
 }

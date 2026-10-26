@@ -272,6 +272,9 @@ class DshApiTest {
               val id = frame.getString("streamId")
               val records = JSONArray().apply {
                 put(JSONObject("""{"type":"event","event":{"type":"user/message","seq":2,"time":1000,"data":{"content":[{"type":"text","text":"你好"}],"source":{"kind":"user"},"role":"user","id":"u1"}}}"""))
+                // Injected model context is not something the user said.
+                put(JSONObject("""{"type":"event","event":{"type":"user/message","seq":2,"time":1001,"data":{"content":[{"type":"text","text":"Current runtime context."}],"source":{"kind":"runtime-context","form":"snapshot"},"role":"user","id":"u2"}}}"""))
+                put(JSONObject("""{"type":"event","event":{"type":"user/message","seq":2,"time":1002,"data":{"content":[{"type":"text","text":"Time sampled"}],"source":{"kind":"time-context"},"role":"user","id":"u3"}}}"""))
                 put(JSONObject("""{"type":"event","event":{"type":"step/start","seq":3,"time":1000,"data":{"turn":1,"step":1}}}"""))
                 put(JSONObject("""{"type":"event","event":{"type":"assistant/message","seq":4,"time":1100,"data":{"turn":1,"step":1,"message":{"role":"assistant","content":[{"type":"reasoning","text":"想一想"},{"type":"text","text":"你好！"}]}}}}"""))
                 put(JSONObject("""{"type":"event","event":{"type":"tool/call","seq":5,"time":1150,"data":{"turn":1,"step":1,"callId":"c1","name":"bash","arguments":"{\"command\":\"ls\"}"}}}"""))
