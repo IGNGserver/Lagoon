@@ -54,8 +54,8 @@ data class ServerOverviewSnapshot(
  * permission events. A per-server mutex prevents an event burst from creating overlapping reads.
  */
 internal class AllServersOverview(
-  private val store: ServerStore,
-  private val cache: OfflineCache,
+  private val store: OverviewStore,
+  private val cache: CatalogCache,
   private val scope: CoroutineScope,
   private val onSnapshot: (ServerOverviewSnapshot) -> Unit,
   private val selectedServer: () -> String? = { null },

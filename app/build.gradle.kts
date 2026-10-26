@@ -51,6 +51,8 @@ android {
     }
   }
   buildFeatures { compose = true }
+  // Platform-neutral sources (harness protocols, models, reducers, projections) shared with the hub.
+  sourceSets { getByName("main") { kotlin.srcDir("../shared/src/main/kotlin") } }
   compileOptions {
     sourceCompatibility = JavaVersion.VERSION_17
     targetCompatibility = JavaVersion.VERSION_17

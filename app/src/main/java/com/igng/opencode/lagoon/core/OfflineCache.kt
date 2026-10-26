@@ -16,7 +16,7 @@ class OfflineCache internal constructor(
   private val encrypt: (String) -> String,
   private val decrypt: (String) -> String,
   private val writes: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-) {
+) : CatalogCache {
   constructor(context: Context) : this(context.getSharedPreferences("offline_cache", Context.MODE_PRIVATE),
     KeystoreCipher("lagoon-offline-cache", legacyAlias = "opencode-lagoon-offline-cache")::encrypt,
     KeystoreCipher("lagoon-offline-cache", legacyAlias = "opencode-lagoon-offline-cache")::decrypt)
@@ -129,7 +129,7 @@ class OfflineCache internal constructor(
         .toString()
     }
   }
-  fun catalog(serverId: String): Pair<List<Project>, List<Session>>? {
+  override fun catalog(serverId: String): Pair<List<Project>, List<Session>>? {
     val raw = read("catalog:$serverId") ?: return null
     return try {
     val data = JSONObject(raw)

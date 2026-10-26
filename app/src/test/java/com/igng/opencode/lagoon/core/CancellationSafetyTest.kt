@@ -24,7 +24,10 @@ class CancellationSafetyTest {
 
   private fun source(name: String): String = listOf(
     File("app/src/main/java/com/igng/opencode/lagoon/$name"),
-    File("src/main/java/com/igng/opencode/lagoon/$name")
+    File("src/main/java/com/igng/opencode/lagoon/$name"),
+    // Platform-neutral sources live in the shared source set compiled into both the app and the hub.
+    File("shared/src/main/kotlin/com/igng/opencode/lagoon/$name"),
+    File("../shared/src/main/kotlin/com/igng/opencode/lagoon/$name")
   ).firstOrNull { it.isFile }?.readText()
     ?: error("找不到源文件：$name（工作目录 ${File(".").absolutePath}）")
 
