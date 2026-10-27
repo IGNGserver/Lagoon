@@ -22,6 +22,8 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
+import java.util.UUID
 import org.json.JSONObject
 
 internal fun operationKey(server: String?, session: String?, project: String?, action: String): String {
@@ -178,6 +180,9 @@ data class LagoonState(
   }
 }
 
+/** What one hub import did; [unreachable] names servers saved without a successful connection test. */
+data class HubImportResult(val added: Int, val updated: Int, val removed: Int, val unreachable: List<String>)
+
 class LagoonController private constructor(private val appContext: Context) {
   companion object {
     private val TERMINAL_PHASES = setOf(TaskPhase.COMPLETED, TaskPhase.FAILED)
@@ -193,6 +198,8 @@ class LagoonController private constructor(private val appContext: Context) {
     fun get(context: Context): LagoonController = instance ?: synchronized(this) {
       instance ?: LagoonController(context.applicationContext).also { instance = it }
     }
+    /** How long one imported server may take to answer its connection test before it is saved untested. */
+    private const val IMPORT_TEST_TIMEOUT_MS = 8_000L
     /** Upper bound of running sessions whose pending permissions are read in one reconciliation. */
     private const val MAX_REQUEST_SESSIONS = 24
     /** Extra pages the initial load may pull so the first screen starts on a whole turn (official behaviour). */
@@ -768,6 +775,69 @@ class LagoonController private constructor(private val appContext: Context) {
     allOverview.start(store.profiles(), include = setOfNotNull(if (connect) profile.id else state.value.serverId))
     if (connect) connect(profile.id, preserveHome = state.value.allServers)
   }
+  /** The hub last imported from, so 从中枢同步 can run without asking for the link again. */
+  fun hubTarget(): HubImportTarget? = store.hubTarget()
+
+  /** Reads one export from [target] and compares it with the servers on this device. */
+  suspend fun previewHubImport(target: HubImportTarget): ImportPlan {
+    val export = HubExportClient.fetch(target)
+    return planHubImport(export, store.profiles(), store.hubLinks(), store::credentials)
+  }
+
+  /**
+   * Applies the ticked lines ([selected] indexes into [plan]'s items). Every server is tested first, in
+   * parallel and briefly, so a DSH token is exchanged for a cookie right away; one the phone cannot reach
+   * is saved anyway — the hub could reach it and the monitor keeps retrying — and is listed in the result.
+   */
+  suspend fun applyHubImport(target: HubImportTarget, plan: ImportPlan, selected: Set<Int>): HubImportResult {
+    val chosen = plan.items.filterIndexed { index, item -> index in selected && item.selectable }
+    val saves = chosen.mapNotNull { item ->
+      val incoming = item.incoming ?: return@mapNotNull null
+      val profile = importedProfile(item) { UUID.randomUUID().toString() } ?: return@mapNotNull null
+      val previous = item.local?.let { store.credentials(it.id) } ?: ServerCredentials(profile.username)
+      // The hub's cookie only comes along for its own address; otherwise keep this device's one for the same address.
+      val credentials = profileCredentials(item.local?.url, profile.url, previous, incoming.credentials.username,
+        incoming.credentials.password, incoming.credentials.cookie.takeIf(String::isNotEmpty))
+      Triple(item, profile, credentials)
+    }
+    val tested = coroutineScope {
+      saves.map { (item, profile, credentials) ->
+        async {
+          var minted: String? = null
+          val reachable = withTimeoutOrNull(IMPORT_TEST_TIMEOUT_MS) {
+            try { testServer(profile, credentials) { minted = it }; true }
+            catch (error: Exception) {
+              if (error is CancellationException) throw error
+              Diagnostics.warn("LagoonController", "导入的服务器暂时连不上：${profile.name}", error)
+              false
+            }
+          } == true
+          ImportedServer(item, profile, credentials.copy(cookie = minted ?: credentials.cookie), reachable)
+        }
+      }.awaitAll()
+    }
+    tested.forEach { imported ->
+      store.save(imported.profile, imported.credentials.password, imported.credentials.cookie, imported.credentials.username)
+      store.rememberHubLink(imported.profile.id, HubLink(plan.hubId, imported.item.incoming!!.hubServerId))
+    }
+    val removed = chosen.filter { it.action == ImportAction.REMOVED }.mapNotNull { it.local?.id }
+    removed.forEach(::deleteServer)
+    store.rememberHubTarget(target)
+
+    mutable.update { it.copy(profiles = store.profiles()) }
+    scheduleBackgroundSync()
+    allOverview.start(store.profiles(), include = setOfNotNull(state.value.serverId))
+    val current = state.value.serverId
+    when {
+      current == null -> tested.firstOrNull()?.let { connect(it.profile.id) }
+      tested.any { it.profile.id == current } -> connect(current, preserveHome = state.value.allServers)
+    }
+    return HubImportResult(added = tested.count { it.item.local == null }, updated = tested.count { it.item.local != null },
+      removed = removed.size, unreachable = tested.filterNot { it.reachable }.map { it.profile.name })
+  }
+
+  private class ImportedServer(val item: ImportItem, val profile: ServerProfile, val credentials: ServerCredentials, val reachable: Boolean)
+
   fun deleteServer(id: String) {
     notifications.cancelSummary(id)
     // The global summary id is shared now; cancel the per-session results/attention of this server.

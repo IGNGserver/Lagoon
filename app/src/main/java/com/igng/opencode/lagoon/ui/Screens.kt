@@ -446,6 +446,9 @@ fun SettingsScreen(
   var installAllowed by remember { mutableStateOf(context.packageManager.canRequestPackageInstalls()) }
   var pendingInstall by rememberSaveable { mutableStateOf(false) }
   var showReleaseNotes by rememberSaveable { mutableStateOf(false) }
+  var importingFromHub by rememberSaveable { mutableStateOf(false) }
+  // Read again after each import so the entry shows the hub just used.
+  val hubTarget = remember(importingFromHub) { controller.hubTarget() }
   LaunchedEffect(update.release?.version) { showReleaseNotes = false }
   // 只展示系统标准实时更新的状态；不检测任何厂商通道。检测放到 IO 线程执行。
   var notificationsEnabled by remember { mutableStateOf(true) }
@@ -531,6 +534,11 @@ fun SettingsScreen(
           )
         }
         SuperArrow(title = "添加服务器", summary = "OpenCode 地址 / pair 链接，或 DeepSeek Harness 令牌", onClick = { onEditServer(null) })
+        SuperArrow(
+          title = "从中枢导入",
+          summary = hubTarget?.let { "再次同步 ${it.hubUrl}" } ?: "粘贴中枢网页给出的导入链接，一次导入全部服务器",
+          onClick = { importingFromHub = true }
+        )
         SuperArrow(
           title = "模型显示",
           summary = when {
@@ -689,6 +697,8 @@ fun SettingsScreen(
   }
 
   val releaseForNotes = update.release
+  if (importingFromHub) HubImportModal(controller) { importingFromHub = false }
+
   if (showReleaseNotes && releaseForNotes != null) {
     SuperBottomSheet(
       title = "Lagoon ${releaseForNotes.version} 更新说明",
