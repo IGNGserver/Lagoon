@@ -252,7 +252,9 @@ class HubApiTest {
     cookie = ""
     val nonce = HubExportCrypto.nonce()
     val raw = export(key, nonce = nonce).use { it.body!!.string() }
-    assertFalse("凭据不得以明文出现在响应里", raw.contains("pw"))
+    // The sealed envelope only contains version/iv/data. Checking short plaintext fragments such
+    // as "pw" is flaky: random base64 can contain them.
+    assertFalse("凭据不得以明文出现在响应里", raw.contains("\"secret\"") || raw.contains("\"password\""))
     val exported = HubExportCodec.decode(JSONObject(HubExportCrypto.open(key, nonce, JSONObject(raw))))
     val server = exported.servers.single()
     assertEquals(id, server.hubServerId)
