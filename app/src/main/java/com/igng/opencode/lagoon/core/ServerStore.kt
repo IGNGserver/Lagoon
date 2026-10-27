@@ -300,6 +300,33 @@ class ServerStore internal constructor(private val preferences: SharedPreference
     editor.apply()
     secrets.edit().remove("draft:$server:$session").remove("references:$server:$session").remove("preview:$server:$session").apply()
   }
+  /** Which hub server each imported profile follows, by local profile id. */
+  fun hubLinks(): Map<String, HubLink> = runCatching {
+    val json = JSONObject(preferences.getString("hubLinks", "{}") ?: "{}")
+    json.keys().asSequence().mapNotNull { id ->
+      val item = json.optJSONObject(id) ?: return@mapNotNull null
+      val hub = item.str("hubId"); val server = item.str("hubServerId")
+      if (hub.isBlank() || server.isBlank()) null else id to HubLink(hub, server)
+    }.toMap()
+  }.getOrDefault(emptyMap())
+
+  fun rememberHubLink(id: String, link: HubLink?) {
+    val json = runCatching { JSONObject(preferences.getString("hubLinks", "{}") ?: "{}") }.getOrDefault(JSONObject())
+    if (link == null) json.remove(id) else json.put(id, JSONObject().put("hubId", link.hubId).put("hubServerId", link.hubServerId))
+    check(preferences.edit().putString("hubLinks", json.toString()).commit()) { "无法保存导入来源，请重试" }
+  }
+
+  /** The hub last imported from, so 从中枢同步 does not ask for the key again. The key is encrypted like server credentials. */
+  fun hubTarget(): HubImportTarget? = runCatching {
+    val json = JSONObject(decryptValue(secrets.getString("hubImport", null) ?: return null))
+    HubAccessKey.parse(json.str("key"))?.let { HubImportTarget(json.str("hubUrl"), it) }
+  }.getOrNull()
+
+  fun rememberHubTarget(target: HubImportTarget?) {
+    val encoded = target?.let { encryptValue(JSONObject().put("hubUrl", it.hubUrl).put("key", it.key.encoded).toString()) }
+    check(secrets.edit().putString("hubImport", encoded).commit()) { "无法保存中枢接入信息，请重试" }
+  }
+
   fun deviceId(): String = preferences.getString("deviceId", null) ?: UUID.randomUUID().toString().also { preferences.edit().putString("deviceId", it).apply() }
 
   override fun credentials(id: String): ServerCredentials {
@@ -396,6 +423,7 @@ class ServerStore internal constructor(private val preferences: SharedPreference
     val secretPrefixes = listOf("draft", "references", "preview").map { "$it:$id:" }
     secrets.all.keys.filter { key -> secretPrefixes.any(key::startsWith) }.forEach(encrypted::remove)
     encrypted.apply()
+    if (hubLinks().containsKey(id)) rememberHubLink(id, null)
     if (selectedId() == id) select("", null, null)
   }
 }
