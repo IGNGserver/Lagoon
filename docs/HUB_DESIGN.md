@@ -1,6 +1,6 @@
 # Lagoon 中枢（Hub）与网页端设计
 
-v3.0.0 新增「Lagoon 中枢」：用户在任意一台机器上用 docker compose 部署一个容器，打开网页（或把它安装成 PWA）即可像 Android 客户端一样连接、监控、控制各台开发机上的 harness（OpenCode 2.x / DeepSeek Harness）。Android 客户端仍然直连开发机，不依赖中枢。
+v3.0.0 新增「Lagoon 中枢」：用户在任意一台机器上用 docker compose 部署一个容器，打开网页（或把它安装成 PWA）即可像 Android 客户端一样连接、监控、控制各台开发机上的 harness（OpenCode 2.x / DeepSeek Harness）。Android 客户端仍然直连开发机，不依赖中枢；但可以用中枢签发的「客户端接入密钥」一次性导入中枢里配置好的服务器（§3「客户端接入」、§7）。
 
 ## 1. 为什么中枢必须是后端
 
@@ -57,6 +57,15 @@ Lagoon Hub（hub/，Kotlin/JVM，单容器）
 - 安全提示写入部署文档：中枢掌握所有开发机的 harness 凭据，而 harness 能执行 shell。密码被猜中等同开发机被远程执行。建议只在局域网、VPN（Tailscale 等）或带额外访问控制的反向代理后暴露。
 - harness 凭据在 `/data` 中用 AES-256-GCM 加密，密钥是同卷的 `secret.key`。这能防“只泄露状态文件”，防不了整卷被拿走。
 
+### 客户端接入（导出服务器给其他客户端）
+
+- 设置页「客户端接入」生成接入密钥 `lgk1.<id>.<secret>`（`secret` 32 字节，base64url），附带备注名；完整密钥只在生成时显示一次，同时给出导入链接 `<中枢地址>/#key=lgk1.…`（密钥在 fragment 里，浏览器不会把它发给服务器）。密钥可逐个吊销，列表显示最近使用时间与来源地址。最多 50 个。
+- 密钥只授权一件事：导出全部服务器资料**连同凭据**（OpenCode 密码、DSH 启动令牌/签名密钥、可用时的 Cookie）。它不能登录网页、不能操作会话；但拿到凭据等同能在开发机上执行命令，所以它和访问密码一样敏感。「退出所有设备」不影响接入密钥，需要单独吊销。
+- 密钥本身不上网：客户端用 `HKDF-SHA256(secret, salt="lagoon-hub-export", info="lagoon-export-v1 auth")` 派生的密钥对 `lagoon-export-v1\n<id>\n<ts>\n<nonce>` 做 HMAC；中枢用 `info="lagoon-export-v1 enc"` 派生的密钥以 AES-256-GCM 加密导出内容（AAD 为 `lagoon-export-v1\n<id>\n<nonce>`）。因此经 HTTP 访问的局域网中枢，旁听或篡改流量的人既读不到凭据也伪造不了导出内容；手机也不必信任自签名证书。HTTPS 仍然推荐。
+- 签名错误或密钥不存在按登录失败计入同一套退避；`ts` 与中枢时间相差超过 10 分钟拒绝；同一 nonce 在窗口内只接受一次。
+- 每台服务器可设「客户端访问地址」（`clientUrl`）：中枢自己的地址只在容器里可用（`host.docker.internal`、容器名、`localhost`）时，导出用它代替。地址的 origin 与中枢自己的不同时不导出 Cookie（Cookie 按地址绑定），只导出密码/令牌/密钥，由客户端重新换取。导出内容对仍只在容器内可用的地址标记 `localOnly`，客户端据此提示用户改地址。
+- 中枢首次启动生成持久的 `hubId`（写入 `state.json`）；客户端用 `(hubId, hubServerId)` 识别“以前从这个中枢导入过的同一台服务器”，再次导入时就地更新而不是重复添加。
+
 ## 4. 传输与部署
 
 - 中枢默认监听 HTTP `:8080`（用户明确允许 HTTP）。
@@ -112,7 +121,18 @@ Lagoon Hub（hub/，Kotlin/JVM，单容器）
 | DELETE | `/servers/{id}` | 删除资料、凭据与账本 |
 | POST | `/servers/parse` | `{text}` → 识别 dsh 启动链接 / opencode pair 链接 / 普通地址 |
 
-`profile` 字段与 Android `ServerProfile` 一致：`id name url username autoConnect notifications allowCleartext kind dshAuth`。
+`profile` 字段与 Android `ServerProfile` 一致：`id name url username autoConnect notifications allowCleartext kind dshAuth`，另有中枢独有的 `clientUrl`（客户端访问地址，可空；PUT/POST 时缺省表示沿用，空串表示清除）与只读的 `hasSecret`。
+
+### 客户端接入
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/client-keys` | `{keys:[{id, label, created, lastUsed, lastAddress}]}`（不含密钥） |
+| POST | `/client-keys` | `{label}` → `{key, secret}`；`secret` 是完整密钥，只此一次 |
+| DELETE | `/client-keys/{id}` | 吊销 |
+| POST | `/client/export` | **不需要登录 Cookie**。`{keyId, ts, nonce, mac}` → `{version:1, iv, data}`；解密后是 `{version:1, hubId, exportedAt, servers:[{hubServerId, name, url, username, kind, dshAuth, allowCleartext, autoConnect, notifications, credentialUsername, secret, cookie, localOnly}]}`。401 密钥无效/已吊销，400 `clock-skew`，409 `replayed`，429 退避 |
+
+格式、签名与加解密在 `shared/…/HubExport.kt`，中枢与 Android 编译的是同一份；`HubExportTest` 带 HKDF（RFC 5869）与签名的固定向量，两端测试断言同一个值。
 
 ### 状态与事件流
 

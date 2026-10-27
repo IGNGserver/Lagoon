@@ -1,5 +1,9 @@
 package com.igng.lagoon.hub
 
+import com.igng.opencode.lagoon.core.HubAccessKey
+import com.igng.opencode.lagoon.core.HubExport
+import com.igng.opencode.lagoon.core.HubExportCodec
+import com.igng.opencode.lagoon.core.HubExportCrypto
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -221,6 +225,74 @@ class HubApiTest {
     json("DELETE", "/api/v1/servers/$id")
     assertEquals(0, json("GET", "/api/v1/servers").getJSONArray("servers").length())
     assertEquals(404, call("GET", "/api/v1/servers/$id/sessions").use { it.code })
+  }
+
+  private fun export(key: HubAccessKey, now: Long = System.currentTimeMillis(), nonce: String = HubExportCrypto.nonce()): Response {
+    val body = HubExportCrypto.request(key, now, nonce).toString().toRequestBody("application/json".toMediaType())
+    return http.newCall(Request.Builder().url(url("/api/v1/client/export")).post(body).build()).execute()
+  }
+
+  private fun openExport(key: HubAccessKey, nonce: String = HubExportCrypto.nonce()): HubExport = export(key, nonce = nonce).use { response ->
+    val text = response.body!!.string()
+    assertEquals(text, 200, response.code)
+    HubExportCodec.decode(JSONObject(HubExportCrypto.open(key, nonce, JSONObject(text))))
+  }
+
+  @Test fun anAccessKeyExportsTheServersEncrypted() {
+    login()
+    val id = addServer()
+    val created = json("POST", "/api/v1/client-keys", JSONObject().put("label", "Pixel"))
+    val key = HubAccessKey.parse(created.getString("secret"))!!
+    assertEquals(key.id, created.getJSONObject("key").getString("id"))
+    // The list never shows the secret again.
+    val listed = json("GET", "/api/v1/client-keys")
+    assertEquals("Pixel", listed.getJSONArray("keys").getJSONObject(0).getString("label"))
+    assertFalse(listed.toString().contains(created.getString("secret").substringAfterLast('.')))
+
+    cookie = ""
+    val nonce = HubExportCrypto.nonce()
+    val raw = export(key, nonce = nonce).use { it.body!!.string() }
+    assertFalse("凭据不得以明文出现在响应里", raw.contains("pw"))
+    val exported = HubExportCodec.decode(JSONObject(HubExportCrypto.open(key, nonce, JSONObject(raw))))
+    val server = exported.servers.single()
+    assertEquals(id, server.hubServerId)
+    assertEquals("pw", server.credentials.password)
+    assertEquals(harness.url("/").toString().trimEnd('/'), server.profile.url)
+    assertTrue(server.localOnly)
+
+    login()
+    assertEquals(exported.hubId, openExport(key).hubId)
+    assertTrue(json("GET", "/api/v1/client-keys").getJSONArray("keys").getJSONObject(0).getLong("lastUsed") > 0)
+  }
+
+  @Test fun exportsRefuseForgedReplayedStaleAndRevokedRequests() {
+    login()
+    val key = HubAccessKey.parse(json("POST", "/api/v1/client-keys", JSONObject().put("label", "Pixel")).getString("secret"))!!
+    assertEquals(401, export(HubAccessKey(key.id, HubAccessKey.generate().secret)).use { it.code })
+    assertEquals(401, export(HubAccessKey("zzzz2222", key.secret)).use { it.code })
+    val nonce = HubExportCrypto.nonce()
+    assertEquals(200, export(key, nonce = nonce).use { it.code })
+    assertEquals(409, export(key, nonce = nonce).use { it.code })
+    assertEquals(400, export(key, now = System.currentTimeMillis() - HubExportCrypto.MAX_SKEW_MS - 60_000).use { it.code })
+    json("DELETE", "/api/v1/client-keys/${key.id}")
+    assertEquals(401, export(key).use { it.code })
+    assertEquals(400, call("POST", "/api/v1/client-keys", JSONObject().put("label", " ")).use { it.code })
+  }
+
+  @Test fun theClientAddressReplacesTheHubsOwnAndDropsItsCookie() {
+    login()
+    val id = addServer()
+    val saved = json("PUT", "/api/v1/servers/$id", JSONObject().put("profile", json("GET", "/api/v1/servers").getJSONArray("servers")
+      .getJSONObject(0).put("clientUrl", "https://dev.example.com/")))
+    assertEquals("https://dev.example.com", saved.getJSONObject("profile").getString("clientUrl"))
+    assertEquals(400, call("PUT", "/api/v1/servers/$id", JSONObject().put("profile", saved.getJSONObject("profile").put("clientUrl", "dev.example.com"))).use { it.code })
+    val key = HubAccessKey.parse(json("POST", "/api/v1/client-keys", JSONObject().put("label", "Pixel")).getString("secret"))!!
+    val server = openExport(key).servers.single()
+    assertEquals("https://dev.example.com", server.profile.url)
+    assertFalse(server.profile.allowCleartext)
+    assertFalse(server.localOnly)
+    assertEquals("pw", server.credentials.password)
+    assertEquals("", server.credentials.cookie)
   }
 
   companion object {

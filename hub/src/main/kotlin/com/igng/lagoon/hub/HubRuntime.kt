@@ -177,7 +177,7 @@ class HubRuntime(private val store: HubStore, private val streams: StreamRegistr
     val policy = store.permissionPolicy()
     val tasks = policy.tasks(snapshot.liveTasks(now), snapshot.permissions, snapshot.autoApprovalFailures)
     return JSONObject()
-      .put("serverId", serverId).put("profile", Codec.profile(profile)).put("hasSecret", store.hasSecret(serverId))
+      .put("serverId", serverId).put("profile", store.profileJson(profile)).put("hasSecret", store.hasSecret(serverId))
       .put("monitored", serverId in monitored).put("version", snapshot.version).put("connected", snapshot.connected)
       .put("cached", snapshot.cached).put("loading", snapshot.loading).put("lastReadAt", snapshot.lastReadAt)
       .put("error", snapshot.error ?: JSONObject.NULL).put("degraded", snapshot.degraded).put("streamConnected", snapshot.streamConnected)

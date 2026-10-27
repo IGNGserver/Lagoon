@@ -1,5 +1,6 @@
 package com.igng.lagoon.hub
 
+import com.igng.opencode.lagoon.core.HubAccessKey
 import com.igng.opencode.lagoon.core.Project
 import com.igng.opencode.lagoon.core.ServerCredentials
 import com.igng.opencode.lagoon.core.ServerKind
@@ -39,6 +40,31 @@ class HubStoreTest {
     }
     // Secrets never reach the state file in clear text.
     assertFalse(Files.readString(dir.resolve("state.json")).contains("pw"))
+  }
+
+  @Test fun theHubIdentityClientKeysAndClientAddressesSurviveARestart() {
+    val key = HubAccessKey.generate()
+    val hubId = HubStore(dir, box).use { store ->
+      store.saveServer(profile, ServerCredentials("opencode", "pw"), clientUrl = "https://dev.example.com")
+      store.addClientKey(key, "Pixel")
+      store.touchClientKey(key.id, 99, "10.0.0.9")
+      store.hubId
+    }
+    assertTrue(hubId.isNotBlank())
+    HubStore(dir, box).use { store ->
+      assertEquals(hubId, store.hubId)
+      assertEquals("https://dev.example.com", store.clientUrl("a"))
+      assertEquals(key, store.clientKey(key.id))
+      assertEquals("10.0.0.9", store.clientKeys().single().lastAddress)
+      // Saving without a client address keeps it; an empty one clears it.
+      store.saveServer(profile, ServerCredentials("opencode", "pw"))
+      assertEquals("https://dev.example.com", store.clientUrl("a"))
+      store.saveServer(profile, ServerCredentials("opencode", "pw"), clientUrl = "")
+      assertEquals("", store.clientUrl("a"))
+      assertTrue(store.removeClientKey(key.id))
+      assertEquals(null, store.clientKey(key.id))
+    }
+    assertFalse(Files.readString(dir.resolve("state.json")).contains(key.encoded.substringAfterLast('.')))
   }
 
   @Test fun credentialsDoNotFollowAProfileToAnotherAddress() {
