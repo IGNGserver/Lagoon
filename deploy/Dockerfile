@@ -38,7 +38,7 @@ ENV LAGOON_DATA_DIR=/data LAGOON_WEB_ROOT=/app/web LAGOON_VERSION=${LAGOON_VERSI
     JAVA_OPTS="-XX:MaxRAMPercentage=75 -XX:+UseSerialGC -Xss512k"
 USER lagoon
 VOLUME /data
-EXPOSE 8080 8443
+EXPOSE 25246
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-  CMD ["bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/${LAGOON_PORT:-8080} && printf 'GET /healthz HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q ok <&3"]
+  CMD ["bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/${LAGOON_PORT:-25246} && printf 'GET /healthz HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q ok <&3"]
 ENTRYPOINT ["/app/hub/bin/lagoon-hub"]

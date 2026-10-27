@@ -103,16 +103,16 @@ jobs:
       - name: 启动容器并检查登录页与健康状态
         run: |
           set -euo pipefail
-          docker run -d --name hub -p 8080:8080 -e LAGOON_PASSWORD=ci lagoon-hub:ci
+          docker run -d --name hub -p 25246:25246 -e LAGOON_PASSWORD=ci lagoon-hub:ci
           for i in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:8080/healthz >/dev/null; then break; fi
+            if curl -fsS http://127.0.0.1:25246/healthz >/dev/null; then break; fi
             sleep 1
           done
-          curl -fsS http://127.0.0.1:8080/healthz
-          curl -fsS http://127.0.0.1:8080/ | grep -q '<div id="root">'
-          curl -fsS http://127.0.0.1:8080/manifest.webmanifest | grep -q '"display": "standalone"'
-          curl -fsS http://127.0.0.1:8080/api/v1/auth/status | grep -q '"authenticated":false'
-          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/api/v1/state)" = 401
+          curl -fsS http://127.0.0.1:25246/healthz
+          curl -fsS http://127.0.0.1:25246/ | grep -q '<div id="root">'
+          curl -fsS http://127.0.0.1:25246/manifest.webmanifest | grep -q '"display": "standalone"'
+          curl -fsS http://127.0.0.1:25246/api/v1/auth/status | grep -q '"authenticated":false'
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:25246/api/v1/state)" = 401
           docker inspect --format '{{.State.Health.Status}}' hub || true
 
       - name: 容器日志

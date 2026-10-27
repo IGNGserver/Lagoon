@@ -1,7 +1,7 @@
 # Caddy in front of the hub: a real certificate for hub.example.com, HTTP/2 to the browser.
 # In compose.yaml set LAGOON_TRUST_PROXY: "true" so the hub honours X-Forwarded-Proto.
 hub.example.com {
-	reverse_proxy lagoon-hub:8080 {
+	reverse_proxy lagoon-hub:25246 {
 		# Event streams must not be buffered.
 		flush_interval -1
 	}

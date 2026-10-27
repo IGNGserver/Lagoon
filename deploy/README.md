@@ -17,7 +17,7 @@ Lagoon 中枢是一个容器：它替浏览器连接你的开发机（OpenCode 2
    docker compose logs lagoon-hub | grep 初始化码
    ```
 
-3. 浏览器打开 `http://<这台机器的 IP>:8080`，登录后「添加服务器」：
+3. 浏览器打开 `http://<这台机器的 IP>:25246`，登录后「添加服务器」：
    - OpenCode：填开发机上 `opencode serve` 的地址与 Basic Auth 密码，或粘贴 `opencode pair` 的配对链接；
    - DeepSeek Harness：在开发机运行 `dsh web --host <开发机局域网 IP> --no-open`，把打印的整条启动链接粘贴进地址栏，地址和令牌会自动拆开。
 
@@ -28,7 +28,7 @@ Lagoon 中枢是一个容器：它替浏览器连接你的开发机（OpenCode 2
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `LAGOON_PASSWORD` | 空 | 访问密码，允许弱密码。设置后以它为准，网页内不能修改；修改后所有设备需重新登录。 |
-| `LAGOON_PORT` | `8080` | HTTP 端口 |
+| `LAGOON_PORT` | `25246` | HTTP 端口 |
 | `LAGOON_TRUST_PROXY` | `false` | 在反向代理后面时设为 `true`，以识别 `X-Forwarded-Proto` / `X-Forwarded-For` |
 | `LAGOON_TLS` | 空 | 设为 `self-signed` 时自建本地证书颁发机构并监听 HTTPS |
 | `LAGOON_TLS_HOSTS` | 空 | 自签名证书包含的 IP / 域名，逗号分隔，例如 `192.168.1.10,hub.lan` |
