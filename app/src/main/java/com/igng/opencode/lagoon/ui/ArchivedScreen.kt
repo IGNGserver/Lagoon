@@ -36,7 +36,9 @@ internal fun ArchivedScreen(state: LagoonState, controller: LagoonController, on
     PageTopBar("已归档", onBack)
     LazyColumn(Modifier.fillMaxSize().overScrollVertical(), contentPadding = PaddingValues(top = 4.dp, bottom = 48.dp)) {
       items(archived, key = { it.key }) { session ->
-        HomeSessionRow(session, statuses[session.key] ?: SessionStatus.NONE, unseen = session.key in unseen,
+        val background = if (state.allServers) session.serverId?.let { id -> state.allServerSnapshots[id]?.backgroundRunning?.contains(session.id) } == true
+          else state.backgroundRunning.contains(session.id)
+        HomeSessionRow(session, statuses[session.key] ?: SessionStatus.NONE, unseen = session.key in unseen, background = background,
           serverName = if (state.allServers) session.serverId?.let { id -> state.profiles.firstOrNull { it.id == id }?.name } else null,
           onClick = { (session.target ?: state.serverId?.let { SessionTarget(it, session.id) })?.let(onOpen) }, actions = { buildList {
           if (!state.allServers && state.connected && state.capabilities.archive?.restorable == true) add(MenuAction("取消归档", UNARCHIVE_ICON) { controller.setArchived(session.id, false) })

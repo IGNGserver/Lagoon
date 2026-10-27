@@ -251,7 +251,7 @@ class PersistentConnectionsTest {
       }
       val store = store(); val profile = profile("a", server)
       store.save(profile, null)
-      store.rememberTask("a", TaskState("s", TaskPhase.THINKING, since = 100, background = true))
+      store.rememberTask("a", TaskState("s", TaskPhase.THINKING, since = 100))
       val cache = cache()
       cache.saveCatalog("a", emptyList(), listOf(Session("s", "/repo", "Old task", 1, serverId = "a")))
       val scope = CoroutineScope(coroutineContext + SupervisorJob())

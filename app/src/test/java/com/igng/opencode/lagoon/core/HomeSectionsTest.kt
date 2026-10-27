@@ -27,7 +27,7 @@ class HomeSectionsTest {
   }
 
   @Test fun oldLiveTasksBelongToTodayWithoutChangingTheirActivity() {
-    val live = listOf(SessionStatus.RUNNING, SessionStatus.BACKGROUND_RUNNING, SessionStatus.WAITING_PERMISSION,
+    val live = listOf(SessionStatus.RUNNING, SessionStatus.WAITING_PERMISSION,
       SessionStatus.WAITING_QUESTION, SessionStatus.WAITING_SERVER)
     val sessions = live.mapIndexed { index, status -> session(status.name, at(5, 9) - (40 + index) * 86_400_000L) }
     val timestamps = sessions.map { it.activityAt }
@@ -58,13 +58,13 @@ class HomeSectionsTest {
   @Test fun promotedTodaySectionLeadsOlderBucketsAndPreservesActivityOrder() {
     val sessions = listOf(session("yesterday", at(4, 23)), session("week", at(1, 12)),
       session("running", now - 10 * 86_400_000L), session("month", now - 11 * 86_400_000L),
-      session("background", now - 40 * 86_400_000L), session("earlier", now - 41 * 86_400_000L))
-    val statuses = mapOf("running" to SessionStatus.RUNNING, "background" to SessionStatus.BACKGROUND_RUNNING)
+      session("earlier", now - 41 * 86_400_000L))
+    val statuses = mapOf("running" to SessionStatus.RUNNING)
 
     val sections = HomeSections.build(HomeGrouping.DATE, sessions, emptyList(), statuses, now = now, zone = zone)
 
     assertEquals(listOf("date:today", "date:yesterday", "date:week", "date:month", "date:earlier"), sections.map { it.key })
-    assertEquals(listOf("running", "background"), sections.first().sessions.map { it.id })
+    assertEquals(listOf("running"), sections.first().sessions.map { it.id })
     assertEquals(listOf("month"), sections[3].sessions.map { it.id })
   }
 
@@ -122,13 +122,6 @@ class HomeSectionsTest {
     val sections = HomeSections.byStatus(sessions, statuses)
     assertEquals(listOf("需要处理", "运行中", "未读结果", "其他"), sections.map { it.title })
     assertEquals(listOf("done", "fail"), sections[2].sessions.map { it.id })
-  }
-
-  @Test fun backgroundRunningRanksWithRunning() {
-    val sessions = listOf(session("bg", at(5, 8)), session("run", at(5, 7)))
-    val sections = HomeSections.byStatus(sessions, mapOf("bg" to SessionStatus.BACKGROUND_RUNNING, "run" to SessionStatus.RUNNING))
-    assertEquals(listOf("运行中"), sections.map { it.title })
-    assertEquals(listOf("bg", "run"), sections.single().sessions.map { it.id })
   }
 
   @Test fun waitingOnTheServerRanksWithNeedsAttention() {

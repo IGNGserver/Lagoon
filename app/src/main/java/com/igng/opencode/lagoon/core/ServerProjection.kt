@@ -13,7 +13,7 @@ internal val LagoonState.livePresentedTasks: Map<String, TaskState>
 
 /** Root families this phone last knew as active, before the offline TTL is applied. */
 internal val LagoonState.rawActiveRootTasks: Map<String, TaskState>
-  get() = TaskSummary.aggregate(presentedTasks.filterValues { it.active }, parents)
+  get() = SessionActivityRules.rootStates(presentedTasks.filterValues { it.active }, parents)
 
 /** The local conversation overrides its own snapshot, never another server's state. */
 internal fun LagoonState.serverSnapshots(): Map<String, ServerOverviewSnapshot> {
@@ -96,7 +96,7 @@ internal fun LagoonState.archivedTaskCount(now: Long = System.currentTimeMillis(
   serverSnapshots().values.sumOf { snapshot ->
     val archived = snapshot.sessions.filter { it.parentId == null && it.archived }.map { it.id }.toSet()
     if (archived.isEmpty()) return@sumOf 0
-    val active = TaskSummary.aggregate(
+    val active = SessionActivityRules.rootStates(
       permissionPolicy.tasks(snapshot.liveTasks(now), snapshot.permissions, snapshot.autoApprovalFailures).filterValues { it.active },
       snapshot.parents
     ).keys

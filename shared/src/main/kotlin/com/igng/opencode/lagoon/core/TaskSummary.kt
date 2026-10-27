@@ -30,8 +30,6 @@ data class TaskSummary(
   val waiting: Int = 0,
   val failed: Int = 0,
   val items: List<TaskSummaryItem> = emptyList(),
-  /** 其中在应用处于后台时仍在运行的根会话数（用于“后台运行中”文案）。 */
-  val background: Int = 0,
   /** Work blocked on the server with no phone-local approval prompt. */
   val processing: Int = 0
 ) {
@@ -86,8 +84,9 @@ data class TaskSummary(
     val EMPTY = TaskSummary()
 
     /**
-     * Running/waiting come from live task state rolled up to each root; completed/failed count the
-     * roots that have an unread result in [notices]. A root that is running again counts only as running.
+     * Running comes from each root's own execution; waiting may roll up from a descendant that needs
+     * the user. A running descendant is background activity, not a root run. Completed/failed count
+     * the roots that have an unread result in [notices]; a root running again counts only as running.
      * @param titles 会话标题映射表，用于生成 items。
      */
     fun of(
@@ -95,11 +94,12 @@ data class TaskSummary(
       notices: List<SessionNotice> = emptyList(),
       parents: Map<String, String> = emptyMap(),
       titles: Map<String, String> = emptyMap(),
-      backgroundRoots: Set<String> = emptySet(),
       serverId: String? = null,
       serverName: String? = null
     ): TaskSummary {
-      val active = aggregate(tasks.filterValues { it.active && !it.uncertain }, parents)
+      // Root execution only: a running child is background activity, not the root's status. A
+      // descendant that waits on the user still rolls up because it needs an answer.
+      val active = SessionActivityRules.rootStates(tasks.filterValues { it.active && !it.uncertain }, parents)
       val results = notices.filterNot { it.viewed || it.sessionId in active }.groupBy { it.sessionId }.map { (session, unseen) ->
         val latest = unseen.maxBy { it.time }
         TaskState(session, if (unseen.any { it.error }) TaskPhase.FAILED else TaskPhase.COMPLETED, since = latest.time, finishedAt = latest.time)
@@ -109,14 +109,10 @@ data class TaskSummary(
       var completed = 0
       var waiting = 0
       var failed = 0
-      var background = 0
       var processing = 0
       for (task in rootTasks.values) {
         when (task.phase) {
-          in TaskState.RUNNING_PHASES -> {
-            running += 1
-            if (task.sessionId in backgroundRoots) background += 1
-          }
+          in TaskState.RUNNING_PHASES -> running += 1
           TaskPhase.WAITING_PERMISSION, TaskPhase.WAITING_QUESTION -> waiting += 1
           TaskPhase.WAITING_SERVER -> processing += 1
           TaskPhase.COMPLETED -> completed += 1
@@ -148,7 +144,6 @@ data class TaskSummary(
         waiting = waiting,
         failed = failed,
         items = sortedTasks,
-        background = background,
         processing = processing
       )
     }
@@ -165,33 +160,8 @@ data class TaskSummary(
         waiting = summaries.sumOf { it.waiting },
         failed = summaries.sumOf { it.failed },
         items = items,
-        background = summaries.sumOf { it.background },
         processing = summaries.sumOf { it.processing }
       )
-    }
-
-    /**
-     * 根会话里“主线程没在跑、只有它派生的任务在跑”的那些，或主线程已把阻塞工具/子代理转入后台
-     * （[TaskState.background]）的那些：这才是“后台运行中”（主线程在等后台任务）。
-     * 不用“应用是否退到过后台”判断，否则前台正常运行的会话会被误标成后台。
-     */
-    fun backgroundRoots(tasks: Map<String, TaskState>, parents: Map<String, String>): Set<String> {
-      val activeRoots = aggregate(tasks.filterValues { it.active }, parents)
-      return activeRoots.keys.filter { root -> tasks[root]?.active != true || tasks[root]?.background == true }.toSet()
-    }
-
-    fun aggregate(tasks: Map<String, TaskState>, parents: Map<String, String>): Map<String, TaskState> {
-      fun root(id: String): String {
-        var current = id
-        val seen = mutableSetOf<String>()
-        while (seen.add(current)) current = parents[current] ?: return current
-        return id
-      }
-      return tasks.values.groupBy { root(it.sessionId) }.mapValues { (id, values) ->
-        // 同优先级时优先折算出的后台任务：同一家族里“后台任务运行中”的明细比子任务的“运行中”更能
-        // 说明根会话为什么还活着。
-        values.maxWith(compareBy<TaskState> { priority(it) }.thenBy { it.background }).copy(sessionId = id)
-      }
     }
 
     private fun priority(task: TaskState): Int = priority(task.phase)

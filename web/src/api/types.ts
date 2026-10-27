@@ -71,7 +71,6 @@ export interface TaskState {
   detail: string;
   since: number;
   finishedAt?: number;
-  background: boolean;
   uncertain: boolean;
   pendingInput: boolean;
   active: boolean;
@@ -133,7 +132,6 @@ export interface TaskSummary {
   completed: number;
   waiting: number;
   failed: number;
-  background: number;
   processing: number;
   text?: string;
   countLine: string;
@@ -152,7 +150,7 @@ export interface Capabilities {
 }
 
 export type SessionStatus =
-  | "WAITING_PERMISSION" | "WAITING_QUESTION" | "WAITING_SERVER" | "RUNNING" | "BACKGROUND_RUNNING"
+  | "WAITING_PERMISSION" | "WAITING_QUESTION" | "WAITING_SERVER" | "RUNNING"
   | "FAILED" | "COMPLETED" | "UNKNOWN" | "NONE";
 
 /** One saved server as the hub watches it. */

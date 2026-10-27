@@ -42,11 +42,7 @@ data class LiveUpdateContent(
       val stage = stageOf(summary)
       val title = when {
         summary.waiting > 0 -> "${summary.waiting} 个任务待你处理"
-        summary.running > 0 -> when {
-          summary.background <= 0 -> "${summary.running} 个任务运行中"
-          summary.background >= summary.running -> "${summary.running} 个任务在后台运行中"
-          else -> "${summary.running} 个任务运行中（${summary.background} 个在后台）"
-        }
+        summary.running > 0 -> "${summary.running} 个任务运行中"
         summary.processing > 0 -> "${summary.processing} 个任务等待服务器处理"
         summary.failed > 0 && summary.completed > 0 -> "${summary.completed} 个已完成，${summary.failed} 个失败"
         summary.failed > 0 -> "${summary.failed} 个任务失败"

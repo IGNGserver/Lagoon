@@ -51,7 +51,7 @@ export function resolveSessionProject(session: Session, projects: Project[]): Pr
 
 export const STATUS_LABELS: Record<SessionStatus, string> = {
   WAITING_PERMISSION: "等待授权", WAITING_QUESTION: "等待回答", WAITING_SERVER: "等待服务器处理", RUNNING: "运行中",
-  BACKGROUND_RUNNING: "后台运行中", FAILED: "失败", COMPLETED: "已完成", UNKNOWN: "状态待确认", NONE: "",
+  FAILED: "失败", COMPLETED: "已完成", UNKNOWN: "状态待确认", NONE: "",
 };
 
 export const statusOf = (server: ServerView, sessionId: string): SessionStatus => server.statuses[sessionId] ?? "NONE";
@@ -106,7 +106,7 @@ export function homeSections(grouping: HomeGrouping, entries: HomeEntry[], pinne
     } else {
       const status = statusOf(entry.server, entry.session.id);
       const bucket = status === "WAITING_PERMISSION" || status === "WAITING_QUESTION" || status === "WAITING_SERVER" ? 0
-        : status === "RUNNING" || status === "BACKGROUND_RUNNING" ? 1 : status === "FAILED" || status === "COMPLETED" ? 2 : 3;
+        : status === "RUNNING" ? 1 : status === "FAILED" || status === "COMPLETED" ? 2 : 3;
       push(`status:${bucket}`, ["需要处理", "运行中", "未读结果", "其他"][bucket], entry);
     }
   }

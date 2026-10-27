@@ -79,7 +79,7 @@ object Codec {
   /** [TaskState.activeAt] is a reconciliation baseline that moves on every streamed event; the UI never reads it. */
   fun task(task: TaskState): JSONObject = JSONObject()
     .put("sessionId", task.sessionId).put("phase", task.phase.name).put("detail", task.detail).put("since", task.since)
-    .putOpt("finishedAt", task.finishedAt).put("background", task.background).put("active", task.active)
+    .putOpt("finishedAt", task.finishedAt).put("active", task.active)
     .put("uncertain", task.uncertain).put("pendingInput", task.pendingInput)
 
   fun notice(notice: SessionNotice): JSONObject = JSONObject()
@@ -98,7 +98,7 @@ object Codec {
 
   fun summary(summary: TaskSummary): JSONObject = JSONObject()
     .put("running", summary.running).put("completed", summary.completed).put("waiting", summary.waiting).put("failed", summary.failed)
-    .put("background", summary.background).put("processing", summary.processing).putOpt("text", summary.text).put("countLine", summary.countLine)
+    .put("processing", summary.processing).putOpt("text", summary.text).put("countLine", summary.countLine)
     .put("items", array(summary.items.map {
       JSONObject().put("sessionId", it.sessionId).put("title", it.title).put("phase", it.phase.name).put("detail", it.detail)
         .putOpt("serverId", it.serverId).putOpt("serverName", it.serverName).put("since", it.since)

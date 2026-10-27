@@ -8,14 +8,15 @@
 - `core/Models.kt`: 数据模型、`Session.Message.Info` 解析（user / assistant / shell / 通知类记录 / 隐藏记录）与 `TaskReducer` 任务阶段归约。
 - `core/TranscriptProjection.kt`: 打开的会话的实时事件投影，对应官方 `packages/client/src/solid/data.ts` 的事件归约（`session.step.*`、`session.text.*`、`session.tool.*`、inbox、revert、compaction 等）。
 - `core/TranscriptRows.kt`: 时间线行投影，对应官方 `packages/session-ui/src/timeline/projection.ts`（轮次分组、shell 独立成轮、通知行、中断分隔、只显示最后一条错误、撤销边界隐藏）。
-- `core/TaskSummary.kt`: 全服务器范围的任务计数（运行中 / 未读已完成 / 待回复 / 失败）与统一显示文案，供系统实时更新通知与 App 内任务状态共用。
+- `core/TaskSummary.kt`: 全服务器范围的任务计数（运行中 / 未读已完成 / 待回复 / 失败）与统一显示文案，供系统实时更新通知与 App 内任务状态共用。`core/SessionActivity.kt` 把“根会话自己的执行”和“后台 shell / 子会话活动”分开：子会话运行不会计入 `running`，只产生列表低调标记与会话内面板；子会话等待权限/回答仍汇总为根会话的待处理。
+- `core/ShellOutput.kt` + `core/HarnessClient.kt`: 后台 shell 的状态与输出读取（OpenCode `GET /api/shell/{id}` / `{id}/output`），按绝对字节游标只保留最近 64KB；不支持该路由的 harness 返回空并由 UI 隐藏入口。
 - `core/ServerStore.kt`: 服务器资料与 Keystore AES-GCM 凭据。
 - `core/OfflineCache.kt`: 加密离线缓存（会话列表，以及 DSH 的消息快照）。
 - `core/TranscriptStore.kt` / `core/TranscriptSync.kt`: OpenCode 会话缓存。SQLite 保存服务器原始 JSON（只存已结束的消息、连续一段），打开会话先显示本机内容，再只读最新一页并与缓存核对后追加，对不上即重建；历史先从本机翻页。设计与正确性保证见 `docs/TRANSCRIPT_CACHE.md`。
 - `core/KeystoreCipher.kt`: `ServerStore`/`OfflineCache` 共用的 AndroidKeyStore AES-GCM 加解密。
 - `core/PairLink.kt`: 官方 `opencode pair` 链接解析（强制 HTTPS）。
 - `core/Http.kt` / `core/Diagnostics.kt`: 进程级 OkHttp 连接池/调度器；轻量日志。
-- `ui/`: 小米 HyperOS / MIUIX 组件页面与不同消息 Part 的渲染；信息架构主线为 Server → Project/Directory → Session → Conversation，结构对齐 Qoder：没有底部 Dock，「会话」首页是唯一根页面（范围标题、服务器胶囊、当前服务器任务概览、按日期 / 项目 / 状态分组的列表、悬浮新建按钮）；任务概览展示运行中、未读完成、待回复、失败计数及最需关注的任务，状态不新鲜时明确提示；已归档、设置等低频页面从首页 ⋯ 整页推入；Chat 是会话主界面（工具调用为可展开的紧凑轨迹，子任务 / 改动 / 文件在右上角 ⋯）。`MainActivity` 负责页面栈、预见式返回（露出真实的上一页）与深链。
+- `ui/`: 小米 HyperOS / MIUIX 组件页面与不同消息 Part 的渲染；信息架构主线为 Server → Project/Directory → Session → Conversation，结构对齐 Qoder：没有底部 Dock，「会话」首页是唯一根页面（范围标题、服务器胶囊、当前服务器任务概览、按日期 / 项目 / 状态分组的列表、悬浮新建按钮）；任务概览展示运行中、未读完成、待回复、失败计数及最需关注的任务，状态不新鲜时明确提示；已归档、设置等低频页面从首页 ⋯ 整页推入；Chat 是会话主界面（工具调用为可展开的紧凑轨迹；输入框上方有安静的后台活动胶囊，⋯ 内有「子会话与后台」面板，可看后台命令输出、运行中/历史子会话；子会话只读并带状态栏与返回父会话）。`MainActivity` 负责页面栈、预见式返回（露出真实的上一页）与深链。
 - `system/`: 通知 Channel、Android Live Updates 请求、任务前台服务与通知操作。全服务器任务总览沿用统一口径（`core/TaskSummary.kt`）：`TaskNotifications.buildSummary` 生成单条 ongoing 的 Live Update 通知（`setRequestPromotedOngoing` + `setShortCriticalText`），并由 `LagoonController` 在状态变化时统一发布；`system/LiveUpdateSupport.kt` 只探测标准实时更新的可用状态，供设置页展示（不写任何厂商私有 extras，详见 `docs/LIVE_UPDATES.md`）。
 - `core/AppUpdate.kt` / `system/AppUpdater.kt`: GitHub Releases 检查与 APK 自更新。SemVer（含 rc）比较、预发布通道筛选、ETag 缓存、流式下载、大小 / SHA-256 / 包名 / versionCode / 签名证书校验；只有通过校验且位于 `cache/updates/` 的 APK 会通过 FileProvider 交给系统安装器，详见 `docs/APP_UPDATE.md`。
 - `docs/task-event-contract.json`: Android `TaskReducer` 遵守的任务阶段归约契约。
@@ -25,7 +26,7 @@
 1. 设置 OpenCode Server Basic Auth，使用 HTTPS URL 添加服务器；确认认证失败不会保存资料。
 2. 从手机发送任务，检查消息、工具折叠、停止、SSE 重连后状态一致；确认系统实时更新显示「运行中 / 未读已完成 / 待回复 / 失败」计数，且打开会话后已完成计数下降。
 3. 触发 permission 和 question；分别从 App 与系统通知操作，检查服务器继续执行。
-4. 检查子会话、Diff、文件浏览；测试新建、运行中继续发送、斜杠命令、重命名、删除等会话操作。
+4. 检查子会话、Diff、文件浏览；测试新建、运行中继续发送、斜杠命令、重命名、删除等会话操作。让 AI 完成后仍有后台 shell / 子会话运行：首页应显示蓝点 + 低调小圆环，灵动岛不保持“运行中”；打开「子会话与后台」能看命令输出与子会话实时状态（含历史），子会话页面无输入框且可返回父会话。
 5. 在 Android 16 设备检查实时更新提升与设置页「任务通知」状态；Android 15 及以下确认普通通知照常显示，首页概览中的计数、优先任务和过期状态提示正确；关闭通知权限后仍可在应用首页查看任务概览。
 6. 添加 DeepSeek Harness（`dsh web --host <本机 IP> --no-open`）：粘贴整条启动链接，确认地址与令牌自动拆开、令牌错误不保存资料；强杀 App 并重启 dsh 后仍能直接连上（落盘 Cookie 复用，不需要新令牌）；用签名密钥模式添加同一实例，确认无需启动链接即可连接、改错一个字符会提示重新配对；连接后断网/切换 Wi-Fi 再恢复，事件流与打开的会话自动续上、断线期间被别处回答的审批自动消失；发送任务后检查实时流式文本、工具轨迹、停止（`session/cancel`）、审批与问答回应；检查文件浏览、文件搜索、在没有会话的目录添加项目、图片与文本附件、Agent 预设切换、改动列表、后台任务状态与 `/compact` 命令；确认会话菜单显示「分叉 / 归档」而没有「删除」，审批卡片没有「始终允许」。
 7. 设置 → 版本与更新：检查更新、切换预发布通道、下载进度与取消、首次安装的“安装未知应用”授权、系统安装器覆盖安装；断网、签名不一致、`versionCode` 不升时确认会明确拒绝。

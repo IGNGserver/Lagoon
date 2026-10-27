@@ -32,7 +32,7 @@ internal object PendingInputs {
   }
 
   fun accepted(id: String, previous: TaskState?, idle: Long, now: Long = System.currentTimeMillis()): TaskState {
-    val executing = previous?.active == true && !previous.background && !previous.uncertain && previous.phase in TaskState.RUNNING_PHASES
+    val executing = previous?.active == true && !previous.uncertain && previous.phase in TaskState.RUNNING_PHASES
     return if (executing) previous!!.copy(pendingInput = true)
     else TaskState(id, TaskPhase.WAITING_SERVER, "等待服务器处理", since = now, activeAt = idle, pendingInput = true)
   }

@@ -32,8 +32,11 @@ class ServerStore internal constructor(private val preferences: SharedPreference
   override fun taskStates(id: String): Map<String, TaskState> = preferences.all.filterKeys { it.startsWith("taskState:$id:") }
     .mapNotNull { (key, raw) -> runCatching {
       val json = JSONObject(raw as String); val session = key.removePrefix("taskState:$id:")
+      // Legacy versions folded background shells/children into a synthetic THINKING task; it is not
+      // a server execution claim and must not resurrect a spinner after the upgrade.
+      if (json.optBoolean("background")) return@mapNotNull null
       session to TaskState(session, TaskPhase.valueOf(json.str("phase")), json.str("detail"), json.optLong("since"),
-        json.optLong("finished").takeIf { it > 0 }, json.optLong("activeAt", -1), json.optBoolean("background"), json.optBoolean("uncertain"), json.optBoolean("pendingInput"))
+        json.optLong("finished").takeIf { it > 0 }, json.optLong("activeAt", -1), json.optBoolean("uncertain"), json.optBoolean("pendingInput"))
     }.getOrNull() }.toMap()
   override fun taskParents(id: String): Map<String, String> = preferences.all.filterKeys { it.startsWith("taskParent:$id:") }
     .mapKeys { it.key.removePrefix("taskParent:$id:") }.mapValues { it.value as? String ?: "" }.filterValues(String::isNotBlank)
@@ -47,14 +50,14 @@ class ServerStore internal constructor(private val preferences: SharedPreference
   }
   override fun rememberTask(id: String, state: TaskState, parent: String?, observedAt: Long, durable: Boolean): TaskState = synchronized(taskLock) {
     val key = "taskState:$id:${state.sessionId}"
-    val previous = runCatching { JSONObject(preferences.getString(key, "")!!).let { json -> TaskState(state.sessionId, TaskPhase.valueOf(json.str("phase")), json.str("detail"), json.optLong("since"), json.optLong("finished").takeIf { it > 0 }, json.optLong("activeAt", -1), json.optBoolean("background"), json.optBoolean("uncertain"), json.optBoolean("pendingInput")) } }.getOrNull()
+    val previous = runCatching { JSONObject(preferences.getString(key, "")!!).let { json -> TaskState(state.sessionId, TaskPhase.valueOf(json.str("phase")), json.str("detail"), json.optLong("since"), json.optLong("finished").takeIf { it > 0 }, json.optLong("activeAt", -1), json.optBoolean("uncertain"), json.optBoolean("pendingInput")) } }.getOrNull()
     val lastObserved = preferences.getLong("taskTime:$id:${state.sessionId}", 0)
     if (observedAt < lastObserved) return@synchronized previous ?: state
     val next = if (previous != null && state.active && !previous.active && state.since <= previous.since)
       state.copy(since = observedAt, finishedAt = null) else state
     if (previous != next || parent != preferences.getString("taskParent:$id:${state.sessionId}", null)) {
       val editor = preferences.edit().putString(key, JSONObject().put("phase", next.phase.name).put("detail", next.detail)
-        .put("since", next.since).put("finished", next.finishedAt).put("activeAt", next.activeAt).put("background", next.background).put("uncertain", next.uncertain).put("pendingInput", next.pendingInput).toString()).putLong("taskTime:$id:${state.sessionId}", observedAt)
+        .put("since", next.since).put("finished", next.finishedAt).put("activeAt", next.activeAt).put("uncertain", next.uncertain).put("pendingInput", next.pendingInput).toString()).putLong("taskTime:$id:${state.sessionId}", observedAt)
       if (parent != null) editor.putString("taskParent:$id:${state.sessionId}", parent)
       if (previous?.since != next.since || previous?.phase !in setOf(TaskPhase.COMPLETED, TaskPhase.FAILED) && next.phase in setOf(TaskPhase.COMPLETED, TaskPhase.FAILED))
         editor.remove("taskRead:$id:${state.sessionId}")
@@ -129,12 +132,6 @@ class ServerStore internal constructor(private val preferences: SharedPreference
   fun rememberPinnedSessions(server: String, ids: Set<String>) {
     preferences.edit().putStringSet("pinned:$server", ids.toSet()).apply()
   }
-  /** 曾在应用处于后台时仍在运行的根会话；回到前台后保留到该轮结束。 */
-  fun backgroundRunning(server: String): Set<String> = preferences.getStringSet("backgroundRunning:$server", emptySet()).orEmpty().toSet()
-  fun rememberBackgroundRunning(server: String, ids: Set<String>) {
-    preferences.edit().putStringSet("backgroundRunning:$server", ids.toSet()).apply()
-  }
-
   /** 自动刷新频率（标准 / 更快）；缺省「更快」。 */
   override fun refreshMode(): RefreshMode = runCatching {
     RefreshMode.valueOf(preferences.getString("refreshMode", RefreshMode.FAST.name)!!)

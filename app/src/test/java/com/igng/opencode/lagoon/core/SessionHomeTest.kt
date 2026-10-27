@@ -52,7 +52,7 @@ class SessionHomeTest {
     // A historical outcome and a child's result are not “已完成”: only an unread root result is.
     assertEquals(SessionStatus.NONE, idle.sessionStatus(root))
     val running = idle.copy(tasks = mapOf("child" to TaskState("child", TaskPhase.THINKING)))
-    assertEquals(SessionStatus.RUNNING, running.sessionStatus(root))
+    assertEquals(SessionStatus.NONE, running.sessionStatus(root))
     val waiting = running.copy(tasks = mapOf("child" to TaskState("child", TaskPhase.WAITING_QUESTION)))
     assertEquals(SessionStatus.WAITING_QUESTION, waiting.sessionStatus(root))
     val unseen = idle.copy(notices = listOf(SessionNotice("result", "root", System.currentTimeMillis(), false)))
@@ -61,14 +61,15 @@ class SessionHomeTest {
     assertEquals(SessionStatus.NONE, idle.copy(notices = unseen.notices.map { it.copy(viewed = true) }).sessionStatus(root))
   }
 
-  @Test fun waitingOnBackgroundTasksShowsAsBackgroundRunningAndAttentionStillWins() {
-    // backgroundRunning 现在只表示“主线程空闲、在等后台/子任务”，由 TaskSummary.backgroundRoots 计算。
+  @Test fun aRunningChildIsNotTheRootStatusButItsQuestionStillIs() {
     val root = Session("root", "/repo", "Root", 1)
-    val waitingOnBackground = LagoonState(sessions = listOf(root), tasks = mapOf("root" to TaskState("root", TaskPhase.THINKING)), backgroundRunning = setOf("root"))
-    assertEquals(SessionStatus.BACKGROUND_RUNNING, waitingOnBackground.sessionStatus(root))
-    // 需要处理优先于“后台运行中”。
-    val waiting = waitingOnBackground.copy(tasks = mapOf("root" to TaskState("root", TaskPhase.WAITING_QUESTION)))
-    assertEquals(SessionStatus.WAITING_QUESTION, waiting.sessionStatus(root))
+    val child = Session("child", "/repo", "Child", 1, parentId = "root")
+    val childRunning = LagoonState(sessions = listOf(root, child), tasks = mapOf("child" to TaskState("child", TaskPhase.THINKING)),
+      backgroundRunning = setOf("root"))
+    // Background activity is a marker; the root has no live execution of its own.
+    assertEquals(SessionStatus.NONE, childRunning.sessionStatus(root))
+    val childWaiting = childRunning.copy(tasks = mapOf("child" to TaskState("child", TaskPhase.WAITING_QUESTION)))
+    assertEquals(SessionStatus.WAITING_QUESTION, childWaiting.sessionStatus(root))
   }
 
   @Test fun modernEventsRetainExecutionTimestampAndInterruptedRunsCreateNoUnreadResult() {
@@ -91,6 +92,14 @@ class SessionHomeTest {
     assertEquals(110L, session.updated)
     assertEquals(100L, session.created)
     assertEquals("direct", JSONObject("""{"id":"direct","parentID":"root"}""").sessionEventId("session.created"))
+  }
+
+  @Test fun lineageUsesKnownParentsAndFallsBackToTheSessionItself() {
+    val state = LagoonState(sessions = listOf(Session("root", "/repo", "Root", 1), Session("child", "/repo", "Child", 2, parentId = "root")),
+      knownParents = mapOf("child" to "root", "grandchild" to "child"))
+    assertEquals(listOf("root", "child"), state.lineage("child"))
+    assertEquals(listOf("root", "child", "grandchild"), state.lineage("grandchild"))
+    assertEquals(listOf("missing"), LagoonState().lineage("missing"))
   }
 
   @Test fun persistedUnreadLedgerDeduplicatesReplayAndOnlyReadsTheObservedResult() {

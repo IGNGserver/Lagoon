@@ -26,25 +26,26 @@ class TaskSummaryTest {
     assertTrue(summarize(tasks("a" to TaskPhase.IDLE, "b" to TaskPhase.DISCONNECTED)).isEmpty)
   }
 
-  @Test fun backgroundRootsAreCountedSeparatelyFromRunning() {
-    val live = mapOf("a" to TaskState("a", TaskPhase.THINKING), "b" to TaskState("b", TaskPhase.TOOL))
-    val summary = TaskSummary.of(live, backgroundRoots = setOf("a"))
-    assertEquals(2, summary.running)
-    assertEquals(1, summary.background)
+  @Test fun aRunningChildIsBackgroundActivityNotRootRunning() {
+    val tasks = mapOf(
+      "root" to TaskState("root", TaskPhase.COMPLETED, since = 10),
+      "child" to TaskState("child", TaskPhase.TOOL, since = 20)
+    )
+    val summary = TaskSummary.of(tasks, parents = mapOf("child" to "root"))
+    assertEquals(0, summary.running)
+    assertEquals(setOf("root"), SessionActivityRules.backgroundRoots(tasks, emptyMap(), mapOf("child" to "root")))
   }
 
-  @Test fun onlyRootsWaitingOnADescendantAreBackground() {
-    // idleRoot 自己的主线程没跑，只有子任务在跑 → 后台运行中；自己的主线程在跑的一律是前台运行中。
+  @Test fun aWaitingChildRollsUpAsAttentionButARunningOneDoesNot() {
+    val parents = mapOf("child" to "root", "other" to "root")
     val tasks = mapOf(
-      "self" to TaskState("self", TaskPhase.THINKING),
-      "child" to TaskState("child", TaskPhase.TOOL),
-      "idleRoot" to TaskState("idleRoot", TaskPhase.IDLE),
-      "grandchild" to TaskState("grandchild", TaskPhase.THINKING)
+      "root" to TaskState("root", TaskPhase.COMPLETED),
+      "child" to TaskState("child", TaskPhase.WAITING_QUESTION),
+      "other" to TaskState("other", TaskPhase.THINKING)
     )
-    val parents = mapOf("child" to "idleRoot", "grandchild" to "self")
-    assertEquals(setOf("idleRoot"), TaskSummary.backgroundRoots(tasks, parents))
-    // A foreground-started run is never background, even once a descendant joins it.
-    assertFalse(TaskSummary.backgroundRoots(tasks, parents).contains("self"))
+    val summary = TaskSummary.of(tasks, parents = parents)
+    assertEquals(0, summary.running)
+    assertEquals(1, summary.waiting)
   }
 
   @Test fun alwaysShowsRunningAndCompletedBaseline() {

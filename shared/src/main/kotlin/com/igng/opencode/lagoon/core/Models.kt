@@ -133,7 +133,7 @@ data class ShellJob(
   val command: String,
   val started: Long,
   val directory: String,
-  /** 本机观测时间：目录读取失败时用于过期旧条目，避免事件丢失后“后台运行中”僵死。 */
+  /** 本机观测时间：目录读取失败时用于过期旧条目，避免失效的 shell 一直留在后台面板里。 */
   val observedAt: Long = System.currentTimeMillis()
 )
 
@@ -150,13 +150,6 @@ data class TaskState(
    * 任务、或刚发送还没拿到服务端信号）；此时对账需核实活跃集合、子任务与 shell，不能只比时间。
    */
   val activeAt: Long = -1,
-  /**
-   * 该会话所属家族仍有“根执行结束后会重新唤醒会话”的后台工作：运行中的后台 shell、或仍在执行的
-   * 子代理会话。此时即使根执行已经 settle（或已由 [BackgroundWork.fold] 折算），也应继续显示
-   * “后台运行中”，直到后台工作完成、服务端重新唤醒 AI（新的 `session.execution.started`）。
-   * 旧的“用户显式转后台”合成消息标记也仍会置位这里（[TaskReducer.BACKGROUND_MARKER]）。
-   */
-  val background: Boolean = false,
   /** Last-known activity whose relevant server reads failed or were incomplete; not a live claim. */
   val uncertain: Boolean = false,
   /** The server admitted input which has not yet been verified absent from its inbox. */
@@ -170,8 +163,6 @@ data class TaskState(
   companion object {
     /** The single user-facing label for every running phase (thinking/tool/subagent/testing alike). */
     const val RUNNING_DETAIL = "运行中"
-    /** Detail shown while a backgrounded tool/subagent keeps the session alive after its own run settled. */
-    const val BACKGROUND_DETAIL = "后台任务运行中"
     /** Phases where the agent is actively working, without an outstanding user prompt. */
     val RUNNING_PHASES: Set<TaskPhase> = setOf(TaskPhase.THINKING, TaskPhase.TOOL, TaskPhase.SUBAGENT, TaskPhase.TESTING)
     /** Phases waiting on a user decision. */
@@ -448,9 +439,6 @@ internal fun JSONObject.toShellJob(directory: String): ShellJob? {
 object TaskReducer {
   private val TEST_COMMAND = Regex("(?i)(test|gradle|pytest|vitest|jest)")
 
-  /** 服务端把阻塞工具/子代理转入后台时写入会话的合成消息标记（`session.synthetic`）。 */
-  private const val BACKGROUND_MARKER = "backgrounded work is still unfinished"
-
   /**
    * 前台活跃读取（`/api/session/active`）只覆盖前台运行，**不在其中不等于本轮结束**：转入后台的
    * 阻塞工具/子代理会让会话继续存活，但其 execution 已经 settle。因此这里只在 [foreground]=true 时
@@ -462,14 +450,13 @@ object TaskReducer {
     foreground && previous?.phase in TaskState.WAITING_PHASES -> previous!!.copy(
       phase = if (previous.pendingInput && previous.phase == TaskPhase.WAITING_SERVER) TaskPhase.THINKING else previous.phase,
       detail = if (previous.pendingInput && previous.phase == TaskPhase.WAITING_SERVER) TaskState.RUNNING_DETAIL else previous.detail,
-      background = false, uncertain = false)
+      uncertain = false)
     foreground -> {
       val continuing = previous?.active == true
       TaskState(sessionId, if (continuing) previous!!.phase else TaskPhase.THINKING, TaskState.RUNNING_DETAIL,
         if (continuing) previous!!.since else System.currentTimeMillis(),
         activeAt = if (continuing && previous!!.activeAt >= 0) previous!!.activeAt else idleBaseline,
-        // 会话自身在执行中一律是“运行中”；后台工作只在其 settle 后决定是否折算为“后台运行中”。
-        background = false, pendingInput = previous?.pendingInput == true)
+        pendingInput = previous?.pendingInput == true)
     }
     previous?.active == true -> previous!!
     previous?.phase in TaskState.TERMINAL_PHASES -> previous!!
@@ -483,74 +470,61 @@ object TaskReducer {
   fun terminal(sessionId: String, outcome: String?, previous: TaskState?): TaskState {
     val since = previous?.since ?: System.currentTimeMillis()
     val finishedAt = previous?.activeAt?.takeIf { it > 0 } ?: System.currentTimeMillis()
+    val pendingInput = previous?.pendingInput == true
     return when (outcome) {
-      "failed" -> TaskState(sessionId, TaskPhase.FAILED, "执行失败", since, finishedAt)
-      "interrupted" -> TaskState(sessionId, TaskPhase.ABORTED, "任务已停止", since, finishedAt)
-      else -> TaskState(sessionId, TaskPhase.COMPLETED, "任务已完成", since, finishedAt)
+      "failed" -> TaskState(sessionId, TaskPhase.FAILED, "执行失败", since, finishedAt, pendingInput = pendingInput)
+      "interrupted" -> TaskState(sessionId, TaskPhase.ABORTED, "任务已停止", since, finishedAt, pendingInput = pendingInput)
+      else -> TaskState(sessionId, TaskPhase.COMPLETED, "任务已完成", since, finishedAt, pendingInput = pendingInput)
     }
   }
 
   private fun running(sessionId: String, phase: TaskPhase, previous: TaskState?, since: Long, at: Long): TaskState? =
     if (previous?.phase in TaskState.TERMINAL_PHASES || previous?.phase in TaskState.WAITING_PHASES) previous
-    else TaskState(sessionId, phase, TaskState.RUNNING_DETAIL, since, activeAt = at, background = previous?.background == true,
+    else TaskState(sessionId, phase, TaskState.RUNNING_DETAIL, since, activeAt = at,
       pendingInput = previous?.pendingInput == true)
 
   private fun waiting(sessionId: String, phase: TaskPhase, detail: String, previous: TaskState?, since: Long): TaskState =
-    TaskState(sessionId, phase, detail, since, activeAt = previous?.activeAt ?: -1L, background = previous?.background == true)
+    TaskState(sessionId, phase, detail, since, activeAt = previous?.activeAt ?: -1L,
+      pendingInput = previous?.pendingInput == true)
 
-  /** 显式 idle 信号（`session.idle` / `session.status` idle）：权威收尾一轮；后台工作未完成时保持运行。 */
-  private fun idle(sessionId: String, previous: TaskState?, backgroundWork: Boolean): TaskState? = when {
+  /** 显式 idle 信号（`session.idle` / `session.status` idle）：权威收尾本轮根执行。 */
+  private fun idle(sessionId: String, previous: TaskState?): TaskState? = when {
     previous == null -> null
-    previous.background -> previous
-    // 后台工作派生（官方 background 算法）显示还有 shell/子会话在跑：折算为“后台运行中”而不是收尾。
-    backgroundWork -> TaskState(sessionId, TaskPhase.THINKING, TaskState.BACKGROUND_DETAIL, previous.since,
-      activeAt = previous.activeAt.takeIf { it > 0 } ?: System.currentTimeMillis(), background = true)
     previous.active -> TaskState(sessionId, TaskPhase.COMPLETED, "任务已完成", previous.since,
-      previous.activeAt.takeIf { it > 0 } ?: System.currentTimeMillis())
+      previous.activeAt.takeIf { it > 0 } ?: System.currentTimeMillis(), pendingInput = previous.pendingInput)
     else -> null
   }
 
   /** Reduces one `/api/event` frame; null means the event does not change the task phase. */
-  fun event(sessionId: String, type: String, properties: JSONObject, previous: TaskState?, timestamp: Long = 0,
-    backgroundWork: Boolean = false): TaskState? {
+  fun event(sessionId: String, type: String, properties: JSONObject, previous: TaskState?, timestamp: Long = 0): TaskState? {
     val since = previous?.since ?: System.currentTimeMillis()
     val at = timestamp.takeIf { it > 0 } ?: System.currentTimeMillis()
     val next = when (type) {
       "session.execution.started" -> status(sessionId, true, previous?.takeIf { it.active }, at).let {
-        if (it.pendingInput) it.copy(phase = TaskPhase.THINKING, detail = TaskState.RUNNING_DETAIL, background = false)
-        else it.copy(background = false)
+        if (it.pendingInput) it.copy(phase = TaskPhase.THINKING, detail = TaskState.RUNNING_DETAIL)
+        else it
       }
-      // 后台工作未完成时，根执行 settle 不代表会话结束：继续显示“后台运行中”，等后台完成唤醒 AI。
-      // [backgroundWork] 是控制器按官方算法派生的实时结果（后台 shell / 子代理），[previous.background]
-      // 保留“用户显式转后台”合成消息的标记路径。
-      "session.execution.succeeded" -> if (backgroundWork || previous?.background == true)
-        TaskState(sessionId, TaskPhase.THINKING, TaskState.BACKGROUND_DETAIL, since, activeAt = at, background = true)
-        else TaskState(sessionId, TaskPhase.COMPLETED, "任务已完成", since, at)
+      // 根执行 settle 就是本轮结束。后台 shell / 子会话是独立活动，不把它重新变成“运行中”。
+      "session.execution.succeeded" -> TaskState(sessionId, TaskPhase.COMPLETED, "任务已完成", since, at)
       "session.execution.failed" -> TaskState(sessionId, TaskPhase.FAILED, properties.errorText("error").ifBlank { "执行失败" }, since, at)
       // A shutdown keeps the execution claim; the restarted server resumes the same turn.
       "session.execution.interrupted" -> if (properties.str("reason") == "shutdown") previous
         else TaskState(sessionId, TaskPhase.ABORTED, "任务已停止", since, at)
       "session.status" -> when (properties.obj("status").str("type")) {
         "busy", "retry" -> running(sessionId, TaskPhase.THINKING, previous, since, at)
-        "idle" -> idle(sessionId, previous, backgroundWork)
+        "idle" -> idle(sessionId, previous)
         else -> previous
       }
-      "session.idle" -> idle(sessionId, previous, backgroundWork)
+      "session.idle" -> idle(sessionId, previous)
       "session.error" -> TaskState(sessionId, TaskPhase.FAILED,
         properties.errorMessage().ifBlank { "执行失败" }, since, at)
-      // 服务端把阻塞工具/子代理转入后台时写入的合成消息：标记后台工作，直到后台完成重新唤醒 AI。
-      "session.synthetic" -> {
-        val marker = properties.str("text").contains(BACKGROUND_MARKER, ignoreCase = true)
-        val running = previous?.active == true
-        if (!marker) null
-        else TaskState(sessionId, if (running) previous!!.phase else TaskPhase.THINKING,
-          if (running) previous!!.detail else TaskState.BACKGROUND_DETAIL, since, activeAt = at, background = true)
-      }
+      // 服务端“后台工作尚未完成”的合成消息只影响时间线，不再改变根会话的执行状态。
+      "session.synthetic" -> null
       "permission.asked" -> waiting(sessionId, TaskPhase.WAITING_PERMISSION, "等待权限确认", previous, since)
       "form.created" -> waiting(sessionId, TaskPhase.WAITING_QUESTION, "等待你的回答", previous, since)
       "permission.replied", "form.replied", "form.cancelled" ->
         if (previous?.phase in TaskState.WAITING_PHASES)
-          TaskState(sessionId, TaskPhase.THINKING, TaskState.RUNNING_DETAIL, since, activeAt = at, background = previous!!.background)
+          TaskState(sessionId, TaskPhase.THINKING, TaskState.RUNNING_DETAIL, since, activeAt = at)
         else previous
       "session.step.started", "session.reasoning.started", "session.text.started", "session.retry.scheduled" ->
         running(sessionId, TaskPhase.THINKING, previous, since, at)
@@ -570,7 +544,7 @@ object TaskReducer {
       else -> null
     }
     return if (previous?.pendingInput == true && next?.phase in TaskState.TERMINAL_PHASES)
-      previous.copy(phase = TaskPhase.WAITING_SERVER, detail = "等待服务器处理", background = false, uncertain = false)
+      previous.copy(phase = TaskPhase.WAITING_SERVER, detail = "等待服务器处理", uncertain = false)
     else next?.copy(pendingInput = previous?.pendingInput == true)
   }
 }

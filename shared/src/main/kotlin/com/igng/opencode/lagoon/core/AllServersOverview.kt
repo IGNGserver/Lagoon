@@ -39,6 +39,7 @@ data class ServerOverviewSnapshot(
   val notices: List<SessionNotice> = emptyList(),
   val permissions: List<PermissionRequest> = emptyList(),
   val questions: List<QuestionRequest> = emptyList(),
+  /** Roots whose own execution is idle but whose family still has running shells/children. */
   val backgroundRunning: Set<String> = emptySet(),
   val summary: TaskSummary = TaskSummary.EMPTY,
   val autoApprovalFailures: Set<String> = emptySet(),
@@ -176,7 +177,7 @@ internal class AllServersOverview(
     val cachedParents = store.taskParents(id)
     val cachedNotices = store.sessionNotices(id)
     val cachedTitles = cachedSessions.associate { it.id to it.displayTitle() }
-    val cachedBackground = TaskSummary.backgroundRoots(cachedTasks, cachedParents)
+    val cachedBackground = SessionActivityRules.backgroundRoots(cachedTasks, emptyMap(), cachedParents)
     var snapshot = ServerOverviewSnapshot(
       id,
       profile,
@@ -188,7 +189,7 @@ internal class AllServersOverview(
       tasks = cachedTasks,
       notices = cachedNotices,
       backgroundRunning = cachedBackground,
-      summary = TaskSummary.of(cachedTasks, cachedNotices, cachedParents, cachedTitles, cachedBackground,
+      summary = TaskSummary.of(cachedTasks, cachedNotices, cachedParents, cachedTitles,
         serverId = id, serverName = profile.name)
     )
     val lock = locks.getOrPut(id) { Mutex() }
@@ -300,8 +301,7 @@ internal class AllServersOverview(
                   if (event.type == "permission.asked" && approver.pending(listOf(props.toPermission(event.directory))).isEmpty()) return@collect
                   val before = snapshot.tasks[sessionId]
                   if (selectedServer() != id && sessionId.isNotBlank()) {
-                    val backgroundWork = BackgroundWork.hasBackgroundWork(sessionId, snapshot.tasks, snapshot.shells, snapshot.parents)
-                    TaskReducer.event(sessionId, event.type, props, before, event.created, backgroundWork)?.let { task ->
+                    TaskReducer.event(sessionId, event.type, props, before, event.created)?.let { task ->
                       waitingRevision++
                       snapshot = snapshot.copy(tasks = snapshot.tasks + (sessionId to task))
                     }
@@ -370,11 +370,10 @@ internal class AllServersOverview(
                            "error" -> "failed"; "cancelled" -> "interrupted"; else -> "succeeded"
                          }, snapshot.tasks[child])))
                      }
-                    snapshot = snapshot.copy(tasks = BackgroundWork.fold(snapshot.tasks, snapshot.shells, snapshot.parents))
                     snapshot = reconcileWaiting(snapshot, resolvedSessions, resolvedFormSessions = resolvedFormSessions)
                     val session = snapshot.sessions.firstOrNull { it.id == sessionId }
                     if (event.type in setOf("session.execution.succeeded", "session.execution.failed") && session?.parentId == null && session != null &&
-                      TaskSummary.aggregate(snapshot.tasks.filterValues { it.active }, snapshot.parents)[sessionId] == null &&
+                      snapshot.tasks[sessionId]?.active != true &&
                       !snapshot.notices.coversRun(sessionId, before?.since ?: event.created)) {
                       val notice = SessionNotice("event:${event.id.ifBlank { "$sessionId:${event.created}" }}", sessionId,
                         event.created.takeIf { it > 0 } ?: now(), event.type == "session.execution.failed")
@@ -536,7 +535,7 @@ internal class AllServersOverview(
     }
     val inboxRead = PendingInputs.read(client, sessions, oldTasks, active)
     val states = TaskReconciliation.reconcile(oldTasks, sessions, active, shells, parentMap,
-      listedIds + fetchedIds, successfulShellDirs, deletedSessions,
+      identityMap.keys + fetchedIds, successfulShellDirs, deletedSessions,
       childRead.incompleteRoots + if (unresolvedOwners) candidateRoots else emptySet(), inboxRead).toMutableMap()
 
     permissions.forEach { request ->
@@ -549,9 +548,9 @@ internal class AllServersOverview(
       states[request.sessionId] = TaskState(request.sessionId, TaskPhase.WAITING_QUESTION, "等待你的回答", old?.since ?: now(),
         activeAt = old?.activeAt ?: -1L, pendingInput = states[request.sessionId]?.pendingInput == true)
     }
-    val folded = BackgroundWork.fold(states, shells, parentMap)
-    val wasActive = TaskSummary.aggregate(oldTasks.filterValues { it.active && it.sessionId !in deletedSessions }, parentMap)
-    val stillActive = TaskSummary.aggregate(folded.filterValues { it.active }, parentMap)
+    val folded = states
+    val wasActive = SessionActivityRules.rootStates(oldTasks.filterValues { it.active && it.sessionId !in deletedSessions }, parentMap)
+    val stillActive = SessionActivityRules.rootStates(folded.filterValues { it.active }, parentMap)
     val newlyFinished = if (active == null) emptyList() else sessions.filter {
       it.parentId == null && it.id in wasActive && it.id !in stillActive
     }.map { it to wasActive.getValue(it.id).since }
@@ -561,9 +560,9 @@ internal class AllServersOverview(
     deletedSessions.forEach { store.forgetTask(id, it) }
     val notices = (store.sessionNotices(id) + newlyFinished.filterNot { (session, since) -> store.sessionNotices(id).coversRun(session.id, since) }
       .mapNotNull { (session, since) -> session.transitionNotice(since) }).distinctBy { it.id }
-    val background = TaskSummary.backgroundRoots(folded, parentMap)
+    val background = SessionActivityRules.backgroundRoots(folded, shells, parentMap)
     val titles = sessions.associate { it.id to it.displayTitle() }
-    val summary = TaskSummary.of(folded, notices, parentMap, titles, background, serverId = id, serverName = profile.name)
+    val summary = TaskSummary.of(folded, notices, parentMap, titles, serverId = id, serverName = profile.name)
     // Only failures that can hide currently relevant state count as degraded. Failures for idle
     // sessions' directories (deleted worktrees) are handled by the directory backoff above.
     val activeDirectories = activeIds.mapNotNull { identityMap[it]?.directory }.map(::normalizedDirectory).toSet()
@@ -614,17 +613,17 @@ internal class AllServersOverview(
         (id in verified && task.phase == TaskPhase.WAITING_PERMISSION) ||
           (id in resolvedFormSessions && task.phase == TaskPhase.WAITING_QUESTION) ->
           if (task.pendingInput) task.copy(phase = TaskPhase.WAITING_SERVER, detail = "等待服务器处理")
-          else if (active != null && id !in active && !task.uncertain && !BackgroundWork.hasBackgroundWork(id, snapshot.tasks, snapshot.shells, snapshot.parents))
+          else if (active != null && id !in active && !task.uncertain)
             task.copy(phase = TaskPhase.IDLE, detail = "")
           else task.copy(phase = TaskPhase.THINKING, detail = TaskState.RUNNING_DETAIL)
         else -> task
       }
     }
     val visible = store.permissionPolicy().tasks(tasks, snapshot.permissions, snapshot.autoApprovalFailures)
-    val background = TaskSummary.backgroundRoots(tasks, snapshot.parents)
+    val background = SessionActivityRules.backgroundRoots(tasks, snapshot.shells, snapshot.parents)
     val live = tasks.filterValues { it.phase != TaskPhase.IDLE }
     return snapshot.copy(tasks = live, backgroundRunning = background,
-      summary = TaskSummary.of(visible, snapshot.notices, snapshot.parents, snapshot.sessions.associate { it.id to it.displayTitle() }, background, snapshot.serverId, snapshot.profile.name))
+      summary = TaskSummary.of(visible, snapshot.notices, snapshot.parents, snapshot.sessions.associate { it.id to it.displayTitle() }, snapshot.serverId, snapshot.profile.name))
   }
 
   private suspend fun <T> attempt(block: suspend () -> T): Result<T> = try {

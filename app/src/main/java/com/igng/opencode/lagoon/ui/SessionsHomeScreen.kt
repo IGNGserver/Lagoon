@@ -380,7 +380,10 @@ private fun SessionList(
         }
          if (!collapsed) items(section.sessions, key = { "session:${section.key}:${it.key}" }, contentType = { "session" }) { session ->
           val pinned = session.id in state.pinned
+          val background = if (state.allServers) session.serverId?.let { id -> state.allServerSnapshots[id]?.backgroundRunning?.contains(session.id) } == true
+            else state.backgroundRunning.contains(session.id)
           Box(Modifier.animateItem()) { HomeSessionRow(session, statuses[session.key] ?: SessionStatus.NONE, session.key in unseen,
+            background = background,
             serverName = if (state.allServers) session.serverId?.let { id -> state.profiles.firstOrNull { it.id == id }?.name } else null,
             onClick = { (session.target ?: state.serverId?.let { SessionTarget(it, session.id) })?.let(onOpen) }, actions = { buildList {
             if (!state.allServers) {
@@ -435,7 +438,7 @@ internal val UNARCHIVE_ICON get() = MiuixIcons.Import
  */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-internal fun HomeSessionRow(session: Session, status: SessionStatus, unseen: Boolean, serverName: String? = null, onClick: () -> Unit, actions: () -> List<MenuAction>) {
+internal fun HomeSessionRow(session: Session, status: SessionStatus, unseen: Boolean, background: Boolean = false, serverName: String? = null, onClick: () -> Unit, actions: () -> List<MenuAction>) {
   // Built only on long press: a list of actions (and their lambdas) per row per recomposition was waste.
   var menuItems by remember { mutableStateOf(emptyList<MenuAction>()) }
   var menu by remember { mutableStateOf(false) }
@@ -456,10 +459,11 @@ internal fun HomeSessionRow(session: Session, status: SessionStatus, unseen: Boo
          serverName?.let { Text(it, maxLines = 1, overflow = TextOverflow.Ellipsis,
            style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary)) }
        }
-       if (status == SessionStatus.BACKGROUND_RUNNING) {
-        Spacer(Modifier.width(8.dp))
-         Text(status.label, style = MiuixTheme.textStyles.footnote1.copy(color = MiuixTheme.colorScheme.primary))
-       } else if (status == SessionStatus.WAITING_SERVER || status == SessionStatus.UNKNOWN) {
+       if (background && status != SessionStatus.RUNNING) {
+         Spacer(Modifier.width(8.dp))
+         BackgroundMarker()
+       }
+       if (status == SessionStatus.WAITING_SERVER || status == SessionStatus.UNKNOWN) {
          Spacer(Modifier.width(8.dp))
          Text(status.label, style = MiuixTheme.textStyles.footnote1.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
       } else if (status == SessionStatus.WAITING_PERMISSION || status == SessionStatus.WAITING_QUESTION) {
@@ -477,8 +481,6 @@ private fun StatusGlyph(status: SessionStatus, unseen: Boolean) {
   when {
     status == SessionStatus.RUNNING ->
       InfiniteProgressIndicator(color = MiuixTheme.colorScheme.primary, size = 16.dp, strokeWidth = 2.dp, orbitingDotSize = 2.dp)
-    status == SessionStatus.BACKGROUND_RUNNING ->
-      Icon(MiuixIcons.Info, status.label, Modifier.size(20.dp), tint = MiuixTheme.colorScheme.primary)
     status == SessionStatus.WAITING_SERVER || status == SessionStatus.UNKNOWN ->
       Icon(MiuixIcons.Info, status.label, Modifier.size(20.dp), tint = muted)
     status == SessionStatus.WAITING_PERMISSION || status == SessionStatus.WAITING_QUESTION ->
@@ -486,6 +488,18 @@ private fun StatusGlyph(status: SessionStatus, unseen: Boolean) {
     status == SessionStatus.FAILED -> Box(Modifier.size(8.dp).background(MiuixColorTokens.Error, CircleShape))
     unseen || status == SessionStatus.COMPLETED -> Box(Modifier.size(8.dp).background(MiuixTheme.colorScheme.primary, CircleShape))
     else -> Box(Modifier.size(6.dp).background(muted.copy(alpha = 0.3f), CircleShape))
+  }
+}
+
+/**
+ * A deliberately quiet marker: the session's own execution is finished, but its family still has a
+ * running shell or child session. It never replaces the unread dot and never animates.
+ */
+@Composable
+private fun BackgroundMarker() {
+  val muted = MiuixTheme.colorScheme.onSurfaceVariantSummary
+  Box(Modifier.size(7.dp).clip(CircleShape).background(muted.copy(alpha = 0.38f))) {
+    Box(Modifier.fillMaxSize().padding(2.dp).clip(CircleShape).background(MiuixTheme.colorScheme.surface))
   }
 }
 

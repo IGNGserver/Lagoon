@@ -155,7 +155,7 @@ Lagoon Hub（hub/，Kotlin/JVM，单容器）
   - 每 25 秒一行注释心跳。
 - `PUT /streams/{streamId}/watch`：`{conversations:[{serverId, sessionId}]}` 替换本流订阅的会话集合。
 
-`ServerSnapshot` 字段沿用 `ServerOverviewSnapshot`：`serverId profile version connected cached loading lastReadAt error degraded streamConnected canSyncRead projects sessions parents tasks notices permissions questions backgroundRunning summary autoApprovalFailures`。
+`ServerSnapshot` 字段沿用 `ServerOverviewSnapshot`：`serverId profile version connected cached loading lastReadAt error degraded streamConnected canSyncRead projects sessions parents tasks notices permissions questions backgroundRunning summary autoApprovalFailures`。`backgroundRunning` 只表示“根执行已结束、家族仍有运行中的 shell/子会话”的列表标记，不参与 `summary.running`。
 
 ### 会话与操作（`/servers/{sid}` 下）
 
@@ -173,6 +173,8 @@ Lagoon Hub（hub/，Kotlin/JVM，单容器）
 | POST | `/sessions/{id}/view` | 标记已读（本地账本 + 服务端 `time.viewed`） |
 | DELETE | `/sessions/{id}` | 删除 |
 | GET | `/sessions/{id}/children` · `/diff` | 子会话、改动 |
+| GET | `/shells/{id}/output?directory=&cursor=&limit=` | 后台命令输出（绝对字节游标，`status/exit` 随页返回） |
+| DELETE | `/shells/{id}?directory=` | 停止并移除后台命令 |
 | POST | `/permissions/{rid}` | `{reply: "once" | "always" | "reject"}` |
 | POST | `/questions/{rid}` | `{answers: string[][]}`；`/questions/{rid}/reject` 拒绝 |
 | GET | `/choices?directory=` | `{agents, commands, models}` |

@@ -7,8 +7,6 @@ export function StatusGlyph({ status, unseen }: { status: SessionStatus; unseen:
   switch (status) {
     case "RUNNING":
       return <Spinner size={16} />;
-    case "BACKGROUND_RUNNING":
-      return <Info size={18} className="text-primary" />;
     case "WAITING_SERVER":
     case "UNKNOWN":
       return <Info size={18} className="text-text-2" />;

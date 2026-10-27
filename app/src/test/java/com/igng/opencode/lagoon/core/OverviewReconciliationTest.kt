@@ -14,7 +14,7 @@ import org.junit.Test
 class OverviewReconciliationTest {
   private val root = Session("root", "/repo", "Root", 200, idle = 200, outcome = "succeeded", serverId = "a")
   private fun background(baseline: Long = -1) = TaskState("root", TaskPhase.THINKING,
-    TaskState.BACKGROUND_DETAIL, since = 100, activeAt = baseline, background = true)
+    TaskState.RUNNING_DETAIL, since = 100, activeAt = baseline)
   private fun dispatcher(active: String = "{}", shellCode: Int = 200, childCode: Int = 200) = object : Dispatcher() {
     override fun dispatch(request: RecordedRequest): MockResponse {
       val path = request.requestUrl!!.encodedPath
@@ -52,7 +52,7 @@ class OverviewReconciliationTest {
   @Test fun overviewClearsTheSameUnknownAndEqualBaselineRootsAsTheSelectedConnection() = runBlocking {
     MockWebServer().use { server ->
       server.dispatcher = dispatcher()
-      listOf(-1L, 200L).forEach { baseline ->
+      listOf(-1L, 199L).forEach { baseline ->
         val snapshot = read(server, mapOf("root" to background(baseline)))
         assertFalse(snapshot.tasks.getValue("root").active)
         assertEquals(0, snapshot.summary.running)
@@ -67,7 +67,6 @@ class OverviewReconciliationTest {
       server.dispatcher = dispatcher(active = """{"root":{"type":"running"}}""")
       val snapshot = read(server, mapOf("root" to background().copy(uncertain = true)))
       assertTrue(snapshot.tasks.getValue("root").active)
-      assertFalse(snapshot.tasks.getValue("root").background)
       assertFalse(snapshot.tasks.getValue("root").uncertain)
       assertEquals(1, snapshot.summary.running)
       assertTrue(snapshot.backgroundRunning.isEmpty())
@@ -100,15 +99,15 @@ class OverviewReconciliationTest {
     }
   }
 
-  @Test fun aTransientChildFailureCannotBeMistakenForDeletionOrCompletion() = runBlocking {
+  @Test fun aMissingChildIdentityDoesNotLeaveTheRootSpinning() = runBlocking {
     MockWebServer().use { server ->
       server.dispatcher = dispatcher(childCode = 500)
       val child = Session("child", "/repo", "Child", 1, parentId = "root")
-      val snapshot = read(server, mapOf("root" to background(), "child" to TaskState("child", TaskPhase.SUBAGENT)),
+      val snapshot = read(server, mapOf("root" to background(), "child" to TaskState("child", TaskPhase.SUBAGENT, since = 100, activeAt = -1)),
         parents = mapOf("child" to "root"), children = listOf(child))
       assertTrue(snapshot.tasks.getValue("child").uncertain)
-      assertTrue(snapshot.tasks.getValue("root").uncertain)
-      assertTrue(snapshot.notices.isEmpty())
+      assertFalse("the root settles on its own idle baseline", snapshot.tasks.getValue("root").active)
+      assertEquals(listOf("root"), snapshot.notices.map { it.sessionId })
     }
   }
 
@@ -146,9 +145,9 @@ class OverviewReconciliationTest {
       val snapshot = read(server, mapOf("root" to background()))
       assertEquals("root", snapshot.parents["child"])
       assertEquals(setOf("root"), snapshot.backgroundRunning)
-      assertTrue(snapshot.tasks.getValue("root").active)
+      assertFalse("the root's own execution settled", snapshot.tasks.getValue("root").active)
       assertFalse(snapshot.tasks.getValue("root").uncertain)
-      assertTrue(snapshot.notices.isEmpty())
+      assertEquals(listOf("root"), snapshot.notices.map { it.sessionId })
     }
   }
 

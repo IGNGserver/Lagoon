@@ -19,6 +19,7 @@ import com.igng.opencode.lagoon.core.ServerCredentials
 import com.igng.opencode.lagoon.core.ServerKind
 import com.igng.opencode.lagoon.core.ServerProfile
 import com.igng.opencode.lagoon.core.Session
+import com.igng.opencode.lagoon.core.TaskReconciliation
 import com.igng.opencode.lagoon.core.createHarnessClient
 import com.igng.opencode.lagoon.core.normalizedDirectory
 import com.igng.opencode.lagoon.core.profileCredentials
@@ -345,8 +346,39 @@ class HubApi(
       call.ok()
     }
     router.get("/api/v1/servers/{sid}/sessions/{id}/children") { call ->
-      val children = runtime.run { val sid = call.param("sid"); client(sid).children(session(sid, call.param("id"))) }
+      val sid = call.param("sid")
+      // Discover the whole descendant tree (bounded), so finished/historical grandchildren remain
+      // available after the direct child closes; the web panel also shows their terminal state.
+      val children = runtime.run {
+        val id = call.param("id")
+        TaskReconciliation.children(client(sid), listOf(session(sid, id)), snapshot(sid)?.parents.orEmpty()).sessions
+      }
       call.respond(JSONObject().put("sessions", Codec.array(children.map(Codec::session))))
+    }
+    router.get("/api/v1/servers/{sid}/shells/{id}/output") { call ->
+      val sid = call.param("sid")
+      val id = call.param("id")
+      val directory = call.queryParam("directory") ?: runtime.snapshot(sid)?.shells?.get(id)?.directory
+        ?: throw HttpError(400, "directory-required", "缺少命令目录")
+      val cursor = call.queryParam("cursor")?.toLongOrNull()
+      val limit = call.queryParam("limit")?.toIntOrNull()?.coerceIn(1, HarnessClient.SHELL_OUTPUT_PAGE)
+      val result = runtime.run {
+        val client = client(sid)
+        val info = client.shellInfo(id, directory)
+        val page = client.shellOutput(id, directory, cursor, limit ?: HarnessClient.SHELL_OUTPUT_PAGE)
+          ?: throw HttpError(404, "shell-output-unavailable", "该服务器不支持查看后台输出")
+        JSONObject().put("output", page.output).put("cursor", page.cursor).put("size", page.size)
+          .put("truncated", page.truncated).put("status", info?.status ?: "unknown").put("exit", info?.exit ?: JSONObject.NULL)
+      }
+      call.respond(result)
+    }
+    router.delete("/api/v1/servers/{sid}/shells/{id}") { call ->
+      val sid = call.param("sid")
+      val id = call.param("id")
+      val directory = call.queryParam("directory") ?: runtime.snapshot(sid)?.shells?.get(id)?.directory
+        ?: throw HttpError(400, "directory-required", "缺少命令目录")
+      runtime.run { client(sid).removeShell(id, directory) }
+      call.ok()
     }
     router.get("/api/v1/servers/{sid}/sessions/{id}/diff") { call ->
       val changes = runtime.run { val sid = call.param("sid"); client(sid).diff(session(sid, call.param("id"))) }

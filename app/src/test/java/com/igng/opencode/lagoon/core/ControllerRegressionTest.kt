@@ -54,7 +54,7 @@ class ControllerRegressionTest {
     put(c,"operationScope",CoroutineScope(SupervisorJob()+Dispatchers.Unconfined))
     put(c,"scope",CoroutineScope(Job().apply { cancel() }+Dispatchers.Default))
     put(c,"store",ServerStore(preferences(),preferences(),{it},{it}));put(c,"cache",OfflineCache(context.getSharedPreferences("cache",0),{it},{it}));put(c,"sendMutex",kotlinx.coroutines.sync.Mutex()); put(c,"referenceMutex",kotlinx.coroutines.sync.Mutex()); put(c,"monitorRequested",mutableSetOf<String>()); put(c,"draftWrites",mutableMapOf<String,Job>()); put(c,"attentionJobs",mutableMapOf<String,Job>()); put(c,"waitingEventSeqAt",mutableMapOf<String,Long>())
-    put(c, "resolvedPermissions", linkedSetOf<String>()); put(c,"backgroundSettles",mutableMapOf<String,Job>()); put(c,"directoryHealth",DirectoryHealth())
+    put(c, "resolvedPermissions", linkedSetOf<String>()); put(c,"directoryHealth",DirectoryHealth())
     put(c, "connectTrace", ConnectTrace()); put(c, "openTrace", ConnectTrace()); put(c, "transcriptMemory", TranscriptMemory()); put(c, "queuedSends", mutableListOf<Any>())
     put(c, "storeDispatcher", Dispatchers.IO.limitedParallelism(1))
     put(c, "persistedTasks", HashMap<String, Any>())
@@ -245,25 +245,26 @@ class ControllerRegressionTest {
     }
   }
 
-  @Test fun aChildRunRollsUpToOneRootResultAndNeverMarksTheChild() = runBlocking {
+  @Test fun aChildRunDoesNotMakeItsRootRunningAndTheRootResultRemainsUnread() = runBlocking {
     MockWebServer().use { server ->
       val paths = java.util.Collections.synchronizedList(mutableListOf<String>())
-      var running = true
-      server.dispatcher = v2Server(paths, { """{"data":[{"id":"root","projectID":"p","location":{"directory":"/repo"},"time":{"created":1,"updated":20}}],"cursor":{}}""" },
-        { if (running) """{"data":{"child":{"type":"running"}}}""" else """{"data":{}}""" },
-        { path -> if (path == "/api/session/child" && !running) """{"data":{"id":"child","projectID":"p","parentID":"root","location":{"directory":"/repo"},"time":{"created":1,"updated":30,"idle":30}}}""" else null })
-      val root = Session("root", "/repo", "Root", 20, projectId = "p")
+      server.dispatcher = v2Server(paths,
+        { """{"data":[{"id":"root","projectID":"p","outcome":"succeeded","location":{"directory":"/repo"},"time":{"created":1,"updated":20,"idle":20}}],"cursor":{}}""" },
+        { """{"data":{"child":{"type":"running"}}}""" },
+        { path -> if (path == "/api/session/child") """{"data":{"id":"child","projectID":"p","parentID":"root","location":{"directory":"/repo"},"time":{"created":1,"updated":30}}}""" else null })
+      val root = Session("root", "/repo", "Root", 20, projectId = "p", idle = 20, outcome = "succeeded")
       val child = Session("child", "/repo", "Child", 20, parentId = "root", projectId = "p")
-      val (controller, state) = controller(api(server), LagoonState(serverId = "server", connected = true, sessions = listOf(root, child)))
+      val (controller, state) = controller(api(server), LagoonState(serverId = "server", connected = true,
+        sessions = listOf(root, child), knownParents = mapOf("child" to "root"),
+        tasks = mapOf("root" to TaskState("root", TaskPhase.THINKING, since = 10, activeAt = 10),
+          "child" to TaskState("child", TaskPhase.THINKING, since = 11))))
       refresh(controller, controlOnly = true)
-      // 主线程（root 自身）没有在跑，只有子任务在跑 → 后台运行中（而不是普通运行中）。
-      assertEquals(SessionStatus.BACKGROUND_RUNNING, state.value.sessionStatus(root))
-      assertEquals(1, state.value.summary.running)
-      assertEquals(1, state.value.summary.background)
-      running = false
-      refresh(controller, controlOnly = true)
+      assertTrue("the child is still running", state.value.tasks["child"]?.active == true)
+      assertEquals("the root's own execution is finished", SessionStatus.COMPLETED, state.value.sessionStatus(root))
+      assertEquals(0, state.value.summary.running)
+      assertEquals(1, state.value.summary.completed)
+      assertTrue(state.value.backgroundRunning.contains("root"))
       assertEquals(listOf("root"), state.value.notices.map { it.sessionId })
-      assertEquals(SessionStatus.COMPLETED, state.value.sessionStatus(root))
     }
   }
 
@@ -284,7 +285,7 @@ class ControllerRegressionTest {
       val (controller, state) = controller(api(server), LagoonState(serverId = "server", connected = true,
         sessions = listOf(root, child), knownParents = mapOf("child" to "root"),
         tasks = mapOf(
-          "root" to TaskState("root", TaskPhase.THINKING, TaskState.BACKGROUND_DETAIL, since = 100, activeAt = 150, background = true),
+          "root" to TaskState("root", TaskPhase.THINKING, TaskState.RUNNING_DETAIL, since = 100, activeAt = 150),
           "child" to TaskState("child", TaskPhase.SUBAGENT, since = 110, activeAt = -1))))
       refresh(controller, controlOnly = true)
       assertFalse("子会话已结束，派生任务不能再算后台工作", state.value.tasks["child"]?.active == true)
@@ -315,7 +316,7 @@ class ControllerRegressionTest {
       val root = Session("root", "/repo", "Root", 200, idle = 200, outcome = "succeeded")
       val job = ShellJob("sh", "root", "sleep", 100, "/repo")
       val (controller, state) = controller(api(server), LagoonState(serverId = "server", connected = true,
-        sessions = listOf(root), tasks = mapOf("root" to TaskState("root", TaskPhase.THINKING, since = 100, background = true)), shells = mapOf("sh" to job)))
+        sessions = listOf(root), tasks = mapOf("root" to TaskState("root", TaskPhase.THINKING, since = 100)), shells = mapOf("sh" to job)))
       val pending = async { refresh(controller) }
       assertTrue(withContext(Dispatchers.IO) { reading.await(5, TimeUnit.SECONDS) })
       LagoonController::class.java.getDeclaredMethod("handleEvent", ServerEvent::class.java).apply { isAccessible = true }
@@ -328,24 +329,27 @@ class ControllerRegressionTest {
     }
   }
 
-  @Test fun backgroundGraceExpiryRechecksTheServerInsteadOfAssumingCompletion() = runBlocking {
+  @Test fun aRunningShellDoesNotKeepTheRootExecutionAlive() = runBlocking {
     MockWebServer().use { server ->
-      server.dispatcher = v2Server(mutableListOf(),
-        { """{"data":[{"id":"root","location":{"directory":"/repo"},"time":{"updated":200,"idle":200}}],"cursor":{}}""" },
-        { """{"data":{"root":{"type":"running"}}}""" })
+      val base = v2Server(mutableListOf(),
+        { """{"data":[{"id":"root","location":{"directory":"/repo"},"outcome":"succeeded","time":{"updated":200,"idle":200}}],"cursor":{}}""" },
+        { """{"data":{}}""" })
+      server.dispatcher = object : Dispatcher() {
+        override fun dispatch(request: RecordedRequest): MockResponse =
+          if (request.requestUrl!!.encodedPath == "/api/shell")
+            MockResponse().setBody("""{"data":[{"id":"sh","status":"running","command":"sleep","metadata":{"sessionID":"root"},"time":{"started":100}}]}""")
+          else base.dispatch(request)
+      }
+      val root = Session("root", "/repo", "Root", 200, idle = 200, outcome = "succeeded")
       val (controller, state) = controller(api(server), LagoonState(serverId = "server", connected = true,
-        sessions = listOf(Session("root", "/repo", "Root", 200)),
-        tasks = mapOf("root" to TaskState("root", TaskPhase.THINKING, since = 100, background = true))))
-      val scope = CoroutineScope(coroutineContext + SupervisorJob())
-      put(controller, "scope", scope)
-      try {
-        LagoonController::class.java.getDeclaredMethod("settleBackgroundRun", String::class.java, String::class.java)
-          .apply { isAccessible = true }.invoke(controller, "server", "root")
-        scope.coroutineContext[Job]!!.children.toList().joinAll()
-        assertTrue(state.value.tasks.getValue("root").active)
-        assertFalse(state.value.tasks.getValue("root").background)
-        assertTrue(state.value.notices.isEmpty())
-      } finally { scope.cancel() }
+        sessions = listOf(root),
+        tasks = mapOf("root" to TaskState("root", TaskPhase.THINKING, since = 100, activeAt = 100)),
+        shells = mapOf("sh" to ShellJob("sh", "root", "sleep", 100, "/repo"))))
+      refresh(controller, controlOnly = true)
+      assertFalse("the root settled even though the shell is still running", state.value.tasks["root"]?.active == true)
+      assertTrue(state.value.backgroundRunning.contains("root"))
+      assertEquals(1, state.value.summary.completed)
+      assertEquals(0, state.value.summary.running)
     }
   }
 
@@ -413,7 +417,7 @@ class ControllerRegressionTest {
       val (controller, state) = controller(api(server), LagoonState(serverId = "server", connected = true,
         sessions = listOf(Session("root", "/repo", "Root", 200), Session("child", "/repo", "Child", 1, parentId = "root")),
         knownParents = mapOf("child" to "root"), tasks = mapOf("child" to child,
-          "root" to TaskState("root", TaskPhase.THINKING, since = 100, background = true))))
+          "root" to TaskState("root", TaskPhase.THINKING, since = 100))))
       put(controller, "store", store)
       refresh(controller)
       assertNull(state.value.tasks["child"])
@@ -461,12 +465,12 @@ class ControllerRegressionTest {
       refresh(controller, controlOnly = true)
       assertFalse("根会话不能在服务端已完成后继续显示后台运行", state.value.tasks["root"]?.active == true)
       assertEquals(SessionStatus.NONE, state.value.sessionStatus(state.value.sessions.first { it.id == "root" }))
-      assertEquals(0, state.value.summary.background)
+      assertEquals(0, state.value.summary.running)
       // 子会话不再出现在目录里也必须记住它已收尾：仅靠旧 transcript 的静态元数据不能把它重新派生。
       listChild = false
       refresh(controller, controlOnly = true)
       assertFalse(state.value.tasks["root"]?.active == true)
-      assertEquals(0, state.value.summary.background)
+      assertEquals(0, state.value.summary.running)
     }
   }
 
@@ -482,21 +486,21 @@ class ControllerRegressionTest {
             "/api/session/child" -> MockResponse().setResponseCode(404)
             "/api/session" -> if (url.queryParameter("parentID") == "root")
               MockResponse().setBody("""{"data":[{"id":"child","parentID":"root","location":{"directory":"/repo"},"time":{"created":1,"updated":20}}],"cursor":{}}""")
-            else MockResponse().setBody("""{"data":[{"id":"root","location":{"directory":"/repo"},"time":{"created":1,"updated":20}}],"cursor":{}}""")
+            else MockResponse().setBody("""{"data":[{"id":"root","location":{"directory":"/repo"},"outcome":"succeeded","time":{"created":1,"updated":20,"idle":20}}],"cursor":{}}""")
             else -> MockResponse().setBody("""{"data":[]}""")
           }
         }
       }
-      val root = Session("root", "/repo", "Root", 20)
+      val root = Session("root", "/repo", "Root", 20, idle = 20, outcome = "succeeded")
       val (controller, state) = controller(api(server), LagoonState(serverId = "server", connected = true,
         projects = listOf(Project("p", "/repo", "Repo")), sessions = listOf(root),
-        tasks = mapOf("root" to TaskState("root", TaskPhase.THINKING, since = 10, activeAt = -1))))
+        tasks = mapOf("root" to TaskState("root", TaskPhase.THINKING, since = 10, activeAt = 10))))
       refresh(controller, controlOnly = true)
 
       assertEquals("root", state.value.parents["child"])
       assertTrue(state.value.tasks["child"]?.active == true)
-      assertTrue(state.value.tasks["root"]?.background == true)
-      assertEquals(SessionStatus.BACKGROUND_RUNNING, state.value.sessionStatus(root))
+      assertTrue(state.value.backgroundRunning.contains("root"))
+      assertNotEquals(SessionStatus.RUNNING, state.value.sessionStatus(root))
     }
   }
 

@@ -17,7 +17,7 @@
 
 - 服务器范围：所有开启通知的已监视服务器；关闭通知的服务器不进入系统灵动岛（应用内首页会列出并标注）。
 - 项目范围：全部项目；首页项目/服务器筛选只影响列表，不影响灵动岛。
-- 会话范围：按根会话折算。一个根会话下的多个子代理/后台 shell 只计为一个运行任务；未读结果只由根会话产生。
+- 会话范围：只按根会话自己的执行折算。一个根会话下的多个子代理/后台 shell 不会把根会话计为运行中，也不会让灵动岛保持活跃；它们只在首页留低调标记、在会话内提供后台面板。未读结果只由根会话产生。
 - 未读结果：来自本机通知账本，不等于通知栏里当前可见的完成通知数；归档会话的未读结果仍计入灵动岛。
 - 离线：服务器断开超过 15 分钟后，仍属于服务端执行的运行中/等待服务器处理任务不再计入灵动岛，首页显示“离线 · 状态未知”；待授权/待回答请求仍保留，因为手机已经持有这些请求。
 
@@ -30,7 +30,7 @@
 | 阶段 | 条件 | 通知形态 |
 |---|---|---|
 | `ACTIVE` | 有运行中、等待处理或等待服务器处理的任务 | ongoing + `setRequestPromotedOngoing(true)` + `setShortCriticalText("2跑·1完")`，即系统实时更新（上岛） |
-| `SETTLED` | 只剩未读的完成 / 失败 | 移除总览；结果通知由每会话通道保留 |
+| `SETTLED` | 只剩未读的完成 / 失败 | 移除岛；结果通知由每会话通道保留。若家族仍有后台活动，前台监控服务用同一条通知槽显示低优先级、不提升的“后台任务进行中” |
 | `EMPTY` | 无内容 | 移除通知 |
 
 - 用户划掉总览后（`deleteIntent` → `NotificationActionReceiver`），在阶段不变期间不再重发；阶段一变（例如全部结束、或有新任务开始）就重新展示。
@@ -53,7 +53,7 @@
 - `core/LiveUpdateContent.kt`：阶段判定、标题 / 正文 / 展开文案、胶囊短文案、点击落点、划掉后的重发规则。
 - `core/LiveUpdateProgress.kt`：把统一任务计数归一化为平台无关的状态分段与焦点位置，避免把没有服务端依据的任务数伪装成百分比。
 - `core/ServerProjection.kt`：`displaySummary` / `allServerStatuses` 共用离线 TTL、通知开关与根会话折算；`archivedTaskCount` / `silentServersWithTasks` 为首页全局任务行提供范围说明。
-- `system/TaskNotifications.kt`：`buildSummary` / `showSummary` 按阶段构建总览；Android 16+ 使用 `NotificationCompat.ProgressStyle`，旧系统使用完整计数标题、`BigTextStyle` 与不确定进度条；单会话通知不申请提升。
+- `system/TaskNotifications.kt`：`buildSummary` / `showSummary` 按阶段构建总览，`buildBackgroundSummary` 为仅有后台活动的监控条（`IMPORTANCE_LOW`，不申请提升）；Android 16+ 使用 `NotificationCompat.ProgressStyle`，旧系统使用完整计数标题、`BigTextStyle` 与不确定进度条；单会话通知不申请提升。
 - `ui/SessionsHomeScreen.kt`：首页「全部服务器 · 全部项目」任务行与灵动岛同源，并在下方列出归档任务/通知关闭服务器的差异；列表本身仍按首页筛选显示。
 - `system/SummaryDismissals.kt`：按总览 id 记录用户划掉总览时的阶段。
 - `system/LiveUpdateSupport.kt`：探测标准实时更新在本机的可用状态，供设置页展示。

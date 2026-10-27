@@ -7,14 +7,14 @@ class TaskReconciliationTest {
   private val root = Session("root", "/repo", "Root", 200, idle = 200, outcome = "succeeded")
   private val child = Session("child", "/repo", "Child", 210, parentId = "root", idle = 210)
   private fun background(baseline: Long = -1) = TaskState("root", TaskPhase.THINKING,
-    TaskState.BACKGROUND_DETAIL, since = 100, activeAt = baseline, background = true)
+    TaskState.RUNNING_DETAIL, since = 100, activeAt = baseline)
   private fun read(tasks: Map<String, TaskState>, sessions: List<Session> = listOf(root),
     active: Set<String>? = emptySet(), directories: Set<String> = setOf("/repo"),
     verified: Set<String> = sessions.map { it.id }.toSet(), deleted: Set<String> = emptySet()) =
     TaskReconciliation.reconcile(tasks, sessions, active, emptyMap(), mapOf("child" to "root"), verified, directories, deleted, now = 20_000)
 
   @Test fun foldedRootsSettleWithAnUnknownOrEqualBaseline() {
-    listOf(-1L, 200L).forEach { baseline ->
+    listOf(-1L, 199L).forEach { baseline ->
       val task = read(mapOf("root" to background(baseline))).getValue("root")
       assertFalse(task.active)
       assertEquals(TaskPhase.COMPLETED, task.phase)
@@ -31,7 +31,6 @@ class TaskReconciliationTest {
   @Test fun freshForegroundActivityClearsBackgroundAndUncertaintyButKeepsPrompts() {
     listOf(TaskPhase.THINKING, TaskPhase.WAITING_PERMISSION).forEach { phase ->
       val states = read(mapOf("root" to background().copy(phase = phase, uncertain = true)), active = setOf("root"))
-      assertFalse(states.getValue("root").background)
       assertFalse(states.getValue("root").uncertain)
       assertEquals(phase, states.getValue("root").phase)
     }
@@ -127,7 +126,6 @@ class TaskReconciliationTest {
 
   @Test fun acceptedInputCannotInheritOrCompleteAnObsoleteBackgroundRun() {
     val accepted = PendingInputs.accepted("root", background().copy(uncertain = true), root.idle, now = 20_000)
-    assertFalse(accepted.background)
     assertTrue(accepted.pendingInput)
     assertEquals(TaskPhase.WAITING_SERVER, accepted.phase)
     assertEquals(20_000L, accepted.since)
@@ -143,7 +141,6 @@ class TaskReconciliationTest {
     assertTrue(terminal.pendingInput)
     val started = TaskReducer.status("root", true, accepted, root.idle)
     assertEquals(TaskPhase.THINKING, started.phase)
-    assertFalse(started.background)
   }
 
   @Test fun obsoleteCachedTerminalChildrenDoNotBlockACompleteFreshSweep() {
@@ -153,15 +150,12 @@ class TaskReconciliationTest {
     assertFalse(states.getValue("root").active)
   }
 
-  @Test fun aRetainedShellWithoutAPreviousRootIsNotAFreshRunningClaim() {
+  @Test fun aShellWithoutAPreviousRootIsOnlyBackgroundActivity() {
     val shell = ShellJob("sh", "root", "sleep", 1, "/repo")
     val states = TaskReconciliation.reconcile(emptyMap(), listOf(root), emptySet(), mapOf("sh" to shell),
       emptyMap(), setOf("root"), emptySet())
-    assertTrue(states.getValue("root").uncertain)
+    assertNull(states["root"])
     assertEquals(0, TaskSummary.of(states).running)
-    val fresh = TaskReconciliation.reconcile(states, listOf(root), emptySet(), mapOf("sh" to shell),
-      emptyMap(), setOf("root"), setOf("/repo"))
-    assertFalse(fresh.getValue("root").uncertain)
-    assertEquals(1, TaskSummary.of(fresh).running)
+    assertEquals(setOf("root"), SessionActivityRules.backgroundRoots(states, mapOf("sh" to shell), emptyMap()))
   }
 }

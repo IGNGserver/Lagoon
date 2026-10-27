@@ -534,9 +534,11 @@ object Decode {
   }
 
   fun task(session: String, json: JSONObject): TaskState? {
+    // Legacy background-folded tasks are not execution claims; drop them instead of spinning forever.
+    if (json.optBoolean("background")) return null
     val phase = Codec.phase(json.optString("phase")) ?: return null
     return TaskState(session, phase, json.optString("detail"), json.optLong("since"),
-      json.optLong("finishedAt").takeIf { it > 0 }, json.optLong("activeAt", -1), json.optBoolean("background"),
+      json.optLong("finishedAt").takeIf { it > 0 }, json.optLong("activeAt", -1),
       uncertain = json.optBoolean("uncertain"), pendingInput = json.optBoolean("pendingInput"))
   }
 

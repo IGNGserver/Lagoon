@@ -1,5 +1,5 @@
 import { ChevronLeft, File, Folder, Search } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { enc, errorText, get, serverPath, sessionPath } from "@/api/http";
 import type { FileChange, FileContent, FileNode, Session, TaskState } from "@/api/types";
 import { languageOf } from "@/lib/markdown";
@@ -52,21 +52,109 @@ export function ChangesSheet({ open, onOpenChange, serverId, sessionId }: { open
   );
 }
 
-export function ChildrenSheet({ open, onOpenChange, serverId, sessionId, tasks, onOpen }: {
-  open: boolean; onOpenChange: (open: boolean) => void; serverId: string; sessionId: string; tasks: Record<string, TaskState>; onOpen: (id: string) => void;
+type ShellView = { id: string; sessionId: string; command: string; started: number; directory: string };
+
+export function ChildrenSheet({ open, onOpenChange, serverId, sessionId, tasks, shells = [], onOpen, onShell }: {
+  open: boolean; onOpenChange: (open: boolean) => void; serverId: string; sessionId: string; tasks: Record<string, TaskState>;
+  shells?: ShellView[]; onOpen: (id: string) => void; onShell?: (shell: ShellView) => void;
 }) {
   const { data, error, loading, reload } = useLoad(open ? () => get<{ sessions: Session[] }>(`${sessionPath(serverId, sessionId)}/children`).then((it) => it.sessions) : null, [open, serverId, sessionId]);
+  const empty = !!data && data.length === 0 && shells.length === 0;
   return (
-    <Sheet open={open} onOpenChange={onOpenChange} title="子任务" chat>
-      <Status loading={loading} error={error} empty={!!data && data.length === 0} reload={reload} emptyText="暂无子任务" />
-      <div className="space-y-2">
-        {data?.map((child) => (
-          <button key={child.id} type="button" onClick={() => { onOpenChange(false); onOpen(child.id); }}
+    <Sheet open={open} onOpenChange={onOpenChange} title="子会话与后台" chat>
+      <Status loading={loading} error={error} empty={empty} reload={reload} emptyText="暂无子会话或后台任务" />
+      {shells.length > 0 && <div className="mb-3 space-y-2">
+        <div className="px-1 text-[12.5px] text-text-2">后台命令</div>
+        {shells.map((shell) => (
+          <button key={shell.id} type="button" onClick={() => onShell?.(shell)}
             className="squircle flex w-full items-center gap-3 rounded-2xl bg-bubble px-4 py-3 text-left">
-            <span className="min-w-0 flex-1 truncate text-[15px]">{displayTitle(child)}</span>
-            {tasks[child.id]?.active && <span className="flex shrink-0 items-center gap-1.5 text-[12.5px] text-primary"><Spinner size={12} />运行中</span>}
+            <span className="min-w-0 flex-1 truncate font-mono text-[13px]">{shell.command.split("\n")[0]}</span>
+            <span className="flex shrink-0 items-center gap-1.5 text-[12.5px] text-primary"><Spinner size={12} />运行中</span>
           </button>
         ))}
+      </div>}
+      {!!data?.length && <div className="px-1 pb-2 text-[12.5px] text-text-2">子会话</div>}
+      <div className="space-y-2">
+        {data?.map((child) => {
+          const task = tasks[child.id];
+          const label = task?.active ? "运行中" : child.outcome === "failed" ? "失败" : child.outcome === "interrupted" ? "已中断" : child.outcome === "succeeded" || child.idle > 0 ? "已完成" : "状态待确认";
+          return (
+            <button key={child.id} type="button" onClick={() => { onOpenChange(false); onOpen(child.id); }}
+              className="squircle flex w-full items-center gap-3 rounded-2xl bg-bubble px-4 py-3 text-left">
+              <span className="min-w-0 flex-1">
+                <span className="block truncate text-[15px]">{displayTitle(child)}</span>
+                <span className="block truncate text-[12px] text-text-2">{label}{child.agent ? ` · ${child.agent}` : ""}</span>
+              </span>
+              {task?.active && <Spinner size={12} />}
+            </button>
+          );
+        })}
+      </div>
+    </Sheet>
+  );
+}
+
+/** Live tail of one background shell, polled through the hub's byte-cursor output route. */
+export function ShellOutputSheet({ open, onOpenChange, serverId, shell }: {
+  open: boolean; onOpenChange: (open: boolean) => void; serverId: string; shell: ShellView | null;
+}) {
+  const [text, setText] = useState("");
+  const [status, setStatus] = useState("running");
+  const [error, setError] = useState<string | null>(null);
+  const [omitted, setOmitted] = useState(false);
+  const scroller = useRef<HTMLDivElement>(null);
+  const shellId = shell?.id;
+  const shellDirectory = shell?.directory;
+
+  useEffect(() => {
+    if (!open || !shellId || !shellDirectory) return;
+    let alive = true;
+    let cursor: number | undefined;
+    let timer: number | undefined;
+    setText(""); setStatus("running"); setError(null); setOmitted(false);
+    const url = (cursor: number | undefined, limit: number) =>
+      `${serverPath(serverId)}/shells/${enc(shellId)}/output?directory=${enc(shellDirectory)}${cursor === undefined ? "" : `&cursor=${cursor}`}&limit=${limit}`;
+    const load = async () => {
+      try {
+        if (cursor === undefined) {
+          const head = await get<{ size: number }>(`${serverPath(serverId)}/shells/${enc(shellId)}/output?directory=${enc(shellDirectory)}&cursor=9223372036854775807&limit=1`);
+          cursor = Math.max(0, head.size - 65536);
+          setOmitted(cursor > 0);
+        }
+        const page = await get<{ output: string; cursor: number; size: number; status: string; truncated: boolean; exit?: number | null }>(url(cursor, 65536));
+        if (!alive) return;
+        cursor = page.cursor;
+        setText((previous) => (previous + page.output).slice(-65536));
+        setStatus(page.status);
+        setError(null);
+        if (page.truncated) setOmitted(true);
+        requestAnimationFrame(() => { if (scroller.current) scroller.current.scrollTop = scroller.current.scrollHeight; });
+        if (page.cursor < page.size) timer = window.setTimeout(load, 0);
+        else if (page.status === "running") timer = window.setTimeout(load, 1000);
+      } catch (failure) {
+        if (alive) setError(errorText(failure, "读取后台输出失败"));
+      }
+    };
+    void load();
+    return () => { alive = false; if (timer) window.clearTimeout(timer); };
+  }, [open, serverId, shellId, shellDirectory]);
+
+  async function stop() {
+    if (!shell) return;
+    try { await fetch(`${serverPath(serverId)}/shells/${enc(shell.id)}?directory=${enc(shell.directory)}`, { method: "DELETE", credentials: "same-origin" }); }
+    catch (failure) { setError(errorText(failure, "停止命令失败")); }
+  }
+
+  return (
+    <Sheet open={open} onOpenChange={onOpenChange} title={shell?.command.split("\n")[0] || "后台命令"} chat wide>
+      <div className="mb-2 flex items-center gap-2 text-[12.5px] text-text-2">
+        <span className="flex-1">{status === "running" ? "运行中" : status === "timeout" ? "已超时" : status === "killed" ? "已停止" : "已结束"}</span>
+        {status === "running" && <Button size="sm" variant="ghost" onClick={() => void stop()}>停止</Button>}
+      </div>
+      {error && <div className="mb-2 text-[12.5px] text-error">{error}</div>}
+      {omitted && <div className="mb-2 text-[12px] text-text-2">仅显示最近 64KB 输出</div>}
+      <div ref={scroller} className="max-h-[60vh] overflow-auto rounded-xl bg-code p-3 font-mono text-[12px] leading-5 whitespace-pre-wrap">
+        {text || (error ? "" : "正在读取输出…")}
       </div>
     </Sheet>
   );
