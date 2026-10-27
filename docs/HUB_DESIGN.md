@@ -76,7 +76,7 @@ Lagoon Hub（hub/，Kotlin/JVM，单容器）
 
 ## 4. 传输与部署
 
-- 中枢默认监听 HTTP `:8080`（用户明确允许 HTTP）。
+- 中枢默认监听 HTTP `:25246`（用户明确允许 HTTP）。
 - PWA 安装、Service Worker、Web Push 是浏览器强制要求安全上下文的能力：经 `http://局域网IP` 访问时网页功能完整，但不能安装、不能收推送（`localhost` 除外）。提供三种 HTTPS 方式：
   1. **反向代理**（推荐）：Caddy / Nginx / Cloudflare Tunnel / Tailscale Serve 终止 TLS，中枢设置 `LAGOON_TRUST_PROXY=true` 以识别 `X-Forwarded-Proto`；
   2. **自带证书**：`LAGOON_TLS_CERT` / `LAGOON_TLS_KEY`（PEM）后中枢同时监听 HTTPS `:8443`；

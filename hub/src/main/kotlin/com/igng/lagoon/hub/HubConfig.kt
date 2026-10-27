@@ -27,7 +27,7 @@ data class HubConfig(
         dataDir = Path.of(value("LAGOON_DATA_DIR") ?: "/data"),
         webRoot = Path.of(value("LAGOON_WEB_ROOT") ?: "/app/web"),
         bind = value("LAGOON_BIND") ?: "0.0.0.0",
-        port = port("LAGOON_PORT", 8080),
+        port = port("LAGOON_PORT", 25246),
         // Weak passwords are allowed on purpose; only emptiness is rejected (empty means “not configured”).
         password = env["LAGOON_PASSWORD"]?.takeIf(String::isNotEmpty),
         trustProxy = flag("LAGOON_TRUST_PROXY", false),

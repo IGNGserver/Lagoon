@@ -30,7 +30,7 @@ export default defineConfig({
   build: { target: "es2022", sourcemap: false, chunkSizeWarningLimit: 900 },
   server: {
     port: 5173,
-    proxy: { "/api": { target: process.env.LAGOON_HUB ?? "http://127.0.0.1:8080", changeOrigin: false } },
+    proxy: { "/api": { target: process.env.LAGOON_HUB ?? "http://127.0.0.1:25246", changeOrigin: false } },
   },
   test: { environment: "node", include: ["src/**/*.test.ts"] },
 });
