@@ -1,10 +1,11 @@
-import { Bell, Download, KeyRound, LogOut, Monitor, Plus, Server, ShieldCheck, Smartphone } from "lucide-react";
+import { Bell, Download, KeyRound, LogOut, Monitor, Plus, Server, ShieldCheck, Smartphone, TabletSmartphone } from "lucide-react";
 import { useEffect, useState } from "react";
-import { enc, errorText, get, post, put } from "@/api/http";
+import { del, enc, errorText, get, post, put } from "@/api/http";
 import { live } from "@/api/live";
-import type { AuthStatus, ModelInfo, ServerView } from "@/api/types";
+import type { AuthStatus, ClientKey, ModelInfo, ServerView } from "@/api/types";
 import { StatusDot } from "@/components/StatusGlyph";
 import { Button, ConfirmDialog, ListGroup, ListItem, PageHeader, SegmentedControl, Sheet, Spinner, Switch, TextField } from "@/components/ui";
+import { importLink, keySummary } from "@/lib/clientAccess";
 import { serverEditPath, back, navigate } from "@/lib/router";
 import { canInstall, currentSubscription, disablePush, enablePush, install, isIos, isStandalone, onInstallChange, pushSupport, testPush } from "@/lib/pwa";
 import { useShallow } from "zustand/react/shallow";
@@ -45,6 +46,7 @@ export function SettingsPage() {
             <ListItem icon={Plus} title="添加服务器" summary="OpenCode 地址 / pair 链接，或 DeepSeek Harness 启动链接" chevron onClick={() => navigate(serverEditPath(null))} />
           </ListGroup>
 
+          <ClientAccessSettings />
           <PushSettings />
           <InstallSettings />
 
@@ -100,6 +102,81 @@ export function SettingsPage() {
           useStore.getState().setAuth({ ...auth!, authenticated: false });
         }} />
     </div>
+  );
+}
+
+/** Access keys that let the Android app import this hub's servers with their credentials. */
+function ClientAccessSettings() {
+  const toast = useStore((state) => state.toast);
+  const [keys, setKeys] = useState<ClientKey[] | null>(null);
+  const [creating, setCreating] = useState(false);
+  const [revoking, setRevoking] = useState<ClientKey | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const load = () => get<{ keys: ClientKey[] }>("/client-keys").then((it) => setKeys(it.keys)).catch(() => setKeys([]));
+  useEffect(() => { void load(); }, []);
+
+  return (
+    <>
+      <ListGroup title="客户端接入" footer="在 Lagoon Android 客户端「设置 → 从中枢导入」粘贴导入链接，即可一次导入这里的全部服务器（含凭据）。导入内容用密钥加密，HTTP 访问也不会在网络上暴露凭据；密钥与访问密码一样敏感，不用了请吊销。">
+        {keys == null && <ListItem title="正在读取…" trailing={<Spinner />} />}
+        {keys?.map((key) => (
+          <ListItem key={key.id} icon={TabletSmartphone} title={key.label} summary={keySummary(key)} onClick={() => setRevoking(key)} />
+        ))}
+        <ListItem icon={Plus} title="新建接入密钥" summary="为一台设备生成导入链接" chevron onClick={() => setCreating(true)} />
+      </ListGroup>
+      {creating && <ClientKeySheet onClose={() => { setCreating(false); void load(); }} />}
+      <ConfirmDialog open={revoking != null} onOpenChange={(open) => !open && setRevoking(null)} title={`吊销「${revoking?.label ?? ""}」？`}
+        confirm="吊销" danger busy={busy} message="吊销后这把密钥不能再导入。已经导入到设备上的服务器不受影响。"
+        onConfirm={async () => {
+          if (!revoking) return;
+          setBusy(true);
+          try { await del(`/client-keys/${enc(revoking.id)}`); setRevoking(null); void load(); }
+          catch (error) { toast(errorText(error), "error"); }
+          finally { setBusy(false); }
+        }} />
+    </>
+  );
+}
+
+function ClientKeySheet({ onClose }: { onClose: () => void }) {
+  const toast = useStore((state) => state.toast);
+  const [label, setLabel] = useState("");
+  const [secret, setSecret] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const link = secret ? importLink(window.location.origin, secret) : "";
+
+  const copy = (text: string) => {
+    if (!navigator.clipboard) { toast("当前页面不能直接复制，请长按或拖选上面的文字复制", "error"); return; }
+    void navigator.clipboard.writeText(text).then(() => toast("已复制"), () => toast("复制失败，请手动选择复制", "error"));
+  };
+
+  return (
+    <Sheet open onOpenChange={(open) => !open && !busy && onClose()} title={secret ? "导入链接" : "新建接入密钥"}
+      footer={secret ? <Button block onClick={() => copy(link)}>复制导入链接</Button> : (
+        <Button block disabled={busy || !label.trim()} onClick={async () => {
+          setBusy(true); setError(null);
+          try { setSecret((await post<{ secret: string }>("/client-keys", { label: label.trim() })).secret); }
+          catch (failure) { setError(errorText(failure)); }
+          finally { setBusy(false); }
+        }}>{busy ? <Spinner className="text-on-primary" /> : "生成"}</Button>
+      )}>
+      {secret ? (
+        <div className="space-y-3">
+          <p className="px-1 text-[14px] leading-relaxed text-text-2">在设备上打开 Lagoon「设置 → 从中枢导入」，粘贴下面的导入链接。<span className="text-error">链接只显示这一次</span>，关闭后无法再查看。</p>
+          <p className="select-all break-all rounded-2xl bg-surface-2 px-4 py-3 font-mono text-[13px] text-text">{link}</p>
+          <p className="px-1 text-[13px] leading-relaxed text-text-3">链接里的地址取自当前网页地址；设备需要能访问这个地址。如果设备要用别的地址访问中枢，在客户端里改填中枢地址，密钥部分（lgk1. 开头）保持不变。</p>
+          <Button variant="secondary" block onClick={() => copy(secret)}>只复制密钥</Button>
+        </div>
+      ) : (
+        <div className="space-y-4">
+          <TextField label="备注" value={label} onChange={(e) => setLabel(e.target.value)} placeholder="例如 我的 Pixel" maxLength={60} autoFocus
+            hint="用于在列表中区分设备；每台设备建议单独一把密钥，便于吊销。" />
+          {error && <p className="px-1 text-[14px] text-error">{error}</p>}
+        </div>
+      )}
+    </Sheet>
   );
 }
 
