@@ -456,6 +456,29 @@ class OpenCodeApiTest {
     }
   }
 
+  @Test fun shellInfoAndOutputUseTheLocationScopedByteCursorRoutes() = runBlocking {
+    MockWebServer().use { server ->
+      server.enqueue(MockResponse().setBody("""{"data":{"id":"sh_1","status":"running","command":"make","metadata":{"sessionID":"ses_1"},"time":{"started":5}}}"""))
+      server.enqueue(MockResponse().setBody("""{"data":{"output":"line\n","cursor":10,"size":20,"truncated":false}}"""))
+      val api = api(server)
+      val info = api.shellInfo("sh_1", "/repo")!!
+      assertEquals("make", info.command)
+      assertTrue(info.running)
+      val output = api.shellOutput("sh_1", "/repo", cursor = 5, limit = 20)!!
+      assertEquals("line\n", output.output)
+      assertEquals(10L, output.cursor)
+      assertEquals(20L, output.size)
+      val first = server.takeRequest()
+      assertEquals("/api/shell/sh_1", first.requestUrl?.encodedPath)
+      assertEquals("/repo", first.requestUrl?.queryParameter("location[directory]"))
+      val second = server.takeRequest()
+      assertEquals("/api/shell/sh_1/output", second.requestUrl?.encodedPath)
+      assertEquals("5", second.requestUrl?.queryParameter("cursor"))
+      assertEquals("20", second.requestUrl?.queryParameter("limit"))
+      assertEquals("/repo", second.requestUrl?.queryParameter("location[directory]"))
+    }
+  }
+
   @Test fun aSilentEventStreamFailsInsteadOfLookingConnectedForever() = runBlocking {
     MockWebServer().use { server ->
       // One event, then the connection goes quiet without closing: a half-open socket.

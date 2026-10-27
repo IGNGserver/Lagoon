@@ -2,8 +2,8 @@ import { Archive, ArchiveRestore, ArrowDown, Copy, FileDiff, Folder, GitFork, Li
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { enc, errorText, get, post, sessionPath } from "@/api/http";
 import { live } from "@/api/live";
-import type { Message, Session } from "@/api/types";
-import { ChangesSheet, ChildrenSheet, FilesSheet } from "@/components/ChatSheets";
+import type { Message, Session, TaskState } from "@/api/types";
+import { ChangesSheet, ChildrenSheet, FilesSheet, ShellOutputSheet } from "@/components/ChatSheets";
 import { Composer, type ComposerSubmit } from "@/components/Composer";
 import { PermissionCard, QuestionCard } from "@/components/Requests";
 import { DeleteDialog, RenameDialog, setArchived } from "@/components/SessionDialogs";
@@ -28,7 +28,8 @@ export function ChatPage({ serverId, sessionId }: { serverId: string; sessionId:
   const toast = useStore((state) => state.toast);
   const [fetched, setFetched] = useState<Session | null>(null);
   const [missing, setMissing] = useState(false);
-  const [sheet, setSheet] = useState<"files" | "changes" | "children" | null>(null);
+  const [sheet, setSheet] = useState<"files" | "changes" | "children" | "shell" | null>(null);
+  const [shell, setShell] = useState<{ id: string; sessionId: string; command: string; started: number; directory: string } | null>(null);
   const [group, setGroup] = useState<TranscriptRow | null>(null);
   const [renaming, setRenaming] = useState(false);
   const [deleting, setDeleting] = useState(false);
@@ -65,6 +66,8 @@ export function ChatPage({ serverId, sessionId }: { serverId: string; sessionId:
   const rows = useMemo(() => build(messages, new Set(), working, session?.revertMessageId ?? null, unverified), [messages, working, session?.revertMessageId, unverified]);
   const choices = useChoices(serverId, session?.directory, !!session && server?.connected === true);
   const root = server && session ? rootOf(server, session.id) : sessionId;
+  const familyShells = server?.shells.filter((shell) => rootOf(server, shell.sessionId) === root) ?? [];
+  const background = !!server && !working && (server.backgroundRunning.includes(root) || familyShells.length > 0);
   const permissions = server?.permissions.filter((it) => server && rootOf(server, it.sessionId) === root) ?? [];
   const questions = server?.questions.filter((it) => server && rootOf(server, it.sessionId) === root) ?? [];
   const latest = [...messages].reverse();
@@ -168,10 +171,16 @@ export function ChatPage({ serverId, sessionId }: { serverId: string; sessionId:
           </div>
         )} />
       <div className="mx-auto w-full max-w-[860px]">
-        <Composer serverId={serverId} draftKey={draftKey(serverId, sessionId)} choiceKey={choiceKey(serverId, sessionId)} choices={choices}
-          ready={server.connected && !server.cached} offlineHint={offlineHint} running={working} defaultAgent={defaultAgent} defaultModel={defaultModel}
-          references={references} onRemoveReference={(path) => setReferences((current) => current.filter((it) => it !== path))}
-          onServerFile={() => setSheet("files")} onSubmit={submit} onStop={stop} />
+        {session.parentId ? <ChildBar session={session} task={task} onBack={() => back()} /> : <>
+          {background && <button type="button" onClick={() => setSheet("children")}
+            className="mx-4 mb-1 flex items-center gap-2 rounded-full bg-bubble px-3 py-1.5 text-[13px] text-text-2">
+            <Spinner size={12} />后台{familyShells.length > 0 ? ` · ${familyShells.length} 个命令` : ""} · 查看
+          </button>}
+          <Composer serverId={serverId} draftKey={draftKey(serverId, sessionId)} choiceKey={choiceKey(serverId, sessionId)} choices={choices}
+            ready={server.connected && !server.cached} offlineHint={offlineHint} running={working} defaultAgent={defaultAgent} defaultModel={defaultModel}
+            references={references} onRemoveReference={(path) => setReferences((current) => current.filter((it) => it !== path))}
+            onServerFile={() => setSheet("files")} onSubmit={submit} onStop={stop} />
+        </>}
       </div>
 
       <Sheet open={group != null} onOpenChange={(open) => !open && setGroup(null)} title={group?.title || "操作记录"} chat wide>
@@ -180,9 +189,29 @@ export function ChatPage({ serverId, sessionId }: { serverId: string; sessionId:
       <FilesSheet open={sheet === "files"} onOpenChange={(open) => !open && setSheet(null)} serverId={serverId} directory={session.directory} sessionId={session.id}
         onReference={(path) => setReferences((current) => (current.includes(path) ? current : [...current, path]))} />
       <ChangesSheet open={sheet === "changes"} onOpenChange={(open) => !open && setSheet(null)} serverId={serverId} sessionId={session.id} />
-      <ChildrenSheet open={sheet === "children"} onOpenChange={(open) => !open && setSheet(null)} serverId={serverId} sessionId={session.id} tasks={server.tasks} onOpen={openChild} />
+      <ChildrenSheet open={sheet === "children"} onOpenChange={(open) => !open && setSheet(null)} serverId={serverId} sessionId={session.id}
+        tasks={server.tasks} shells={familyShells} onOpen={openChild}
+        onShell={(value) => { setShell(value); setSheet("shell"); }} />
+      <ShellOutputSheet open={sheet === "shell"} onOpenChange={(open) => { if (!open) { setSheet(null); setShell(null); } }} serverId={serverId} shell={shell} />
       {renaming && <RenameDialog serverId={serverId} session={session} onClose={() => setRenaming(false)} />}
       {deleting && <DeleteDialog serverId={serverId} session={session} onClose={() => setDeleting(false)} onDeleted={() => back()} />}
+    </div>
+  );
+}
+
+function ChildBar({ session, task, onBack }: { session: Session; task: TaskState | undefined; onBack: () => void }) {
+  const waiting = task?.active === true && (task.phase === "WAITING_PERMISSION" || task.phase === "WAITING_QUESTION" || task.phase === "WAITING_SERVER");
+  const phase = task?.active ? (waiting ? "等待处理" : "运行中")
+    : session.outcome === "failed" ? "失败" : session.outcome === "interrupted" ? "已中断"
+      : session.outcome === "succeeded" || session.idle > 0 ? "已完成" : "状态待确认";
+  return (
+    <div className="mx-3 mb-2 flex items-center gap-3 rounded-2xl bg-bubble px-4 py-2.5 text-[13px]">
+      {task?.active && <Spinner size={13} />}
+      <span className="min-w-0 flex-1">
+        <span className="block text-chat-text">{phase}{session.agent ? ` · ${session.agent}` : ""}</span>
+        <span className="block text-[12px] text-text-2">子会话只读</span>
+      </span>
+      <Button size="sm" variant="ghost" onClick={onBack}>返回父会话</Button>
     </div>
   );
 }

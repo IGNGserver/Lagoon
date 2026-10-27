@@ -45,7 +45,7 @@ object HomeSections {
     val today = Instant.ofEpochMilli(now).atZone(zone).toLocalDate()
     fun bucket(session: Session): Int {
       when (statuses[session.key]) {
-        SessionStatus.RUNNING, SessionStatus.BACKGROUND_RUNNING,
+        SessionStatus.RUNNING,
         SessionStatus.WAITING_PERMISSION, SessionStatus.WAITING_QUESTION, SessionStatus.WAITING_SERVER -> return 0
         else -> Unit
       }
@@ -82,7 +82,7 @@ object HomeSections {
   fun byStatus(sessions: List<Session>, statuses: Map<String, SessionStatus>): List<HomeSection> {
     fun bucket(session: Session) = when (statuses[session.key] ?: SessionStatus.NONE) {
       SessionStatus.WAITING_PERMISSION, SessionStatus.WAITING_QUESTION, SessionStatus.WAITING_SERVER -> 0
-      SessionStatus.RUNNING, SessionStatus.BACKGROUND_RUNNING -> 1
+      SessionStatus.RUNNING -> 1
       SessionStatus.FAILED, SessionStatus.COMPLETED -> 2
       SessionStatus.NONE, SessionStatus.UNKNOWN -> 3
     }

@@ -40,17 +40,22 @@ class TaskNotifications(private val context: Context) {
     const val ATTENTION = "task_attention"
     const val COMPLETED = "task_completed"
     const val SUMMARY = "task_summary"
+    const val BACKGROUND = "task_background"
     const val ALL_SERVERS_ID = "__all_servers__"
     val ALL_PROFILE = ServerProfile(ALL_SERVERS_ID, "全部服务器", "")
     fun notificationId(serverId: String, sessionId: String): Int = "${serverId}:$sessionId".hashCode() and 0x7fffffff
     /** One server-wide island/summary notification per server. */
     fun summaryId(serverId: String): Int = "summary:$serverId".hashCode() and 0x7fffffff
+    /** Low-key background monitor notification; a separate id keeps its low-importance channel stable. */
+    fun backgroundId(serverId: String): Int = "background:$serverId".hashCode() and 0x7fffffff
   }
   init {
     manager.createNotificationChannel(NotificationChannel(RUNNING, "正在运行", NotificationManager.IMPORTANCE_DEFAULT))
     manager.createNotificationChannel(NotificationChannel(ATTENTION, "需要处理", NotificationManager.IMPORTANCE_HIGH))
     manager.createNotificationChannel(NotificationChannel(COMPLETED, "任务结果", NotificationManager.IMPORTANCE_DEFAULT))
     manager.createNotificationChannel(NotificationChannel(SUMMARY, "任务总览", NotificationManager.IMPORTANCE_DEFAULT))
+    // Background-only work must not own the island: this channel is deliberately low importance.
+    manager.createNotificationChannel(NotificationChannel(BACKGROUND, "后台任务", NotificationManager.IMPORTANCE_LOW))
   }
   private fun allowed(): Boolean = Build.VERSION.SDK_INT < 33 || ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
   private fun open(serverId: String, sessionId: String): PendingIntent {
@@ -223,15 +228,44 @@ class TaskNotifications(private val context: Context) {
     return PendingIntent.getBroadcast(context, summaryId(serverId), intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
   }
 
-  fun showSummary(profile: ServerProfile, summary: TaskSummary, target: SessionTarget?) {
+  /**
+   * A quiet, non-promoted notification for background-only work. It keeps the process/SSE alive
+   * when the app is away, but never asks Android for the Live Update/island slot.
+   */
+  fun buildBackgroundSummary(profile: ServerProfile, targets: List<SessionTarget>): Notification {
+    val first = targets.firstOrNull()
+    val builder = NotificationCompat.Builder(context, BACKGROUND)
+      .setSmallIcon(R.drawable.ic_notification).setLargeIcon(appIcon)
+      .setContentTitle("后台活动")
+      .setContentText(if (targets.size == 1) "子会话或命令仍在运行" else "${targets.size} 个会话还有后台活动")
+      .setSubText(profile.name)
+      .setOngoing(true).setAutoCancel(false).setOnlyAlertOnce(true).setShowWhen(false)
+      .setSilent(true)
+      .setCategory(NotificationCompat.CATEGORY_STATUS)
+      .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
+    first?.let { builder.setContentIntent(open(it.serverId, it.sessionId)) }
+    return builder.build()
+  }
+
+  /** Refresh the low-key monitor when only the background target list changed. */
+  fun updateBackground(profile: ServerProfile, targets: List<SessionTarget>) {
+    if (!allowed() || !profile.notifications || targets.isEmpty()) return
+    manager.notify(backgroundId(profile.id), buildBackgroundSummary(profile, targets))
+  }
+
+  fun showSummary(profile: ServerProfile, summary: TaskSummary, target: SessionTarget?, background: List<SessionTarget> = emptyList()) {
     val stage = LiveUpdateContent.stageOf(summary)
     // 只有进行中的任务上岛。全部结束后不再保留任何总览通知：结果交给每会话的完成/失败通知，
-    // 这样通知中心在空闲时不会留一条“N 已完成”的汇总。
+    // 这样通知中心在空闲时不会留一条“N 已完成”的汇总。若家族仍有后台活动，改发独立的低优先级
+    // 监控条（不申请提升，因此不会进入灵动岛），避免占用总览通知槽。
     if (stage != LiveUpdateStage.ACTIVE) {
       SummaryDismissals.clear(context, profile.id)
       manager.cancel(summaryId(profile.id))
+      if (background.isNotEmpty()) manager.notify(backgroundId(profile.id), buildBackgroundSummary(profile, background))
+      else manager.cancel(backgroundId(profile.id))
       return
     }
+    manager.cancel(backgroundId(profile.id))
     val dismissed = SummaryDismissals.stage(context, profile.id)
     // 用户划掉后，只要阶段没变就不重发；阶段一变（例如此轮结束又重新开始）再展示。
     if (!allowed() || !profile.notifications || !LiveUpdateContent.shouldPost(stage, dismissed)) {
@@ -241,6 +275,7 @@ class TaskNotifications(private val context: Context) {
     manager.notify(summaryId(profile.id), buildSummary(profile, summary, target))
   }
   fun cancelSummary(serverId: String) = manager.cancel(summaryId(serverId))
+  fun cancelBackground(serverId: String) = manager.cancel(backgroundId(serverId))
 
   /** 打开系统「实时更新 / 提升为常驻通知」授权页（Android 16+）。 */
   fun promotedNotificationSettingsIntent(): Intent? {

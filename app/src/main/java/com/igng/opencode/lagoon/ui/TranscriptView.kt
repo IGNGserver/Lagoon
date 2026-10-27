@@ -184,9 +184,6 @@ internal fun Conversation(state: LagoonState, controller: LagoonController, modi
           if (loadingOlder) InfiniteProgressIndicator(size = 20.dp, strokeWidth = 2.dp)
         }
       }
-       if (working && state.sessionId in state.backgroundRunning) item(key = "background-running") {
-        Text("任务正在后台运行中", color = MiuixTheme.colorScheme.primary, style = MiuixTheme.textStyles.footnote1)
-      }
       if (state.cached) item(key = "cache-notice") { Text(if (state.cacheComplete) if (state.connected) "会话缓存 · 消息待同步" else "离线缓存 · 恢复连接后更新" else "离线缓存已截断，部分历史与长输出未保留", color = MiuixColorTokens.Warning, style = MiuixTheme.textStyles.footnote1) }
     }
     Column(Modifier.align(Alignment.BottomCenter).padding(bottom = 16.dp),

@@ -8,7 +8,7 @@ internal object TaskPersistence {
   fun shouldWrite(previous: TaskState?, previousParent: String?, next: TaskState, parent: String?): Boolean {
     if (previous == null || previousParent != parent) return true
     if (previous == next) return false
-    // Anything but the baseline moving forward (phase, detail, since, finish, background) is written at once.
+    // Anything but the baseline moving forward (phase, detail, since, finish) is written at once.
     if (previous.copy(activeAt = next.activeAt) != next) return true
     return next.activeAt < previous.activeAt || next.activeAt - previous.activeAt >= ACTIVE_AT_INTERVAL_MS
   }

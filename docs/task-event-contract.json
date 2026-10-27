@@ -17,7 +17,7 @@
     { "name": "execution start runs",
       "type": "session.execution.started", "data": { "sessionID": "s" },
       "previous": null, "expectedPhase": "THINKING" },
-    { "name": "execution success completes",
+    { "name": "execution success completes even with background work",
       "type": "session.execution.succeeded", "data": { "sessionID": "s" },
       "previous": "THINKING", "expectedPhase": "COMPLETED" },
     { "name": "execution failure fails",

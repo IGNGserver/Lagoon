@@ -23,6 +23,8 @@ internal data class SessionNavigation(val page: RootPage = RootPage.HOME, val se
   val canGoBack get() = sessions.isNotEmpty() || page != RootPage.HOME
   val route get() = NavRoute(page, sessions.lastOrNull(), sessions.size + if (page == RootPage.HOME) 0 else 1)
   fun open(id: String, child: Boolean = false) = copy(sessions = if (child && sessions.isNotEmpty()) sessions.takeWhile { it != id } + id else listOf(id))
+  /** Replace the chat stack with an authoritative parent chain (siblings share the same depth). */
+  fun openLineage(lineage: List<String>) = copy(sessions = lineage.filter(String::isNotBlank))
   /** Opening a page from the home ⋯ menu always starts from 会话, never on top of a chat. */
   fun push(next: RootPage) = SessionNavigation(next)
   fun back() = if (sessions.isNotEmpty()) copy(sessions = sessions.dropLast(1)) else SessionNavigation()

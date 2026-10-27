@@ -46,6 +46,12 @@ class SessionNavigationTest {
     val nav = SessionNavigation().open("parent").open("child", true).open("parent", true)
     assertEquals(listOf("parent"), nav.sessions)
   }
+  @Test fun authoritativeLineageKeepsSiblingsAtTheSameDepth() {
+    val nav = SessionNavigation().openLineage(listOf("root", "child", "grandchild"))
+    assertEquals(listOf("root", "child", "grandchild"), nav.sessions)
+    assertEquals(listOf("root", "sibling"), nav.openLineage(listOf("root", "sibling")).sessions)
+  }
+
   @Test fun routeDepthCountsPagesAndChats() {
     assertEquals(1, SessionNavigation().open("s1").route.depth)
     assertEquals(1, SessionNavigation(RootPage.SETTINGS).route.depth)

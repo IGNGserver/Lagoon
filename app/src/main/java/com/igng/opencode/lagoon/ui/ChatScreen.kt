@@ -24,6 +24,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.Saver
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -42,7 +43,9 @@ import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.igng.opencode.lagoon.core.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -58,7 +61,7 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
 import top.yukonga.miuix.kmp.theme.miuixCapsuleShape
 import top.yukonga.miuix.kmp.theme.miuixShape
 
-private enum class ChatSheet { CHANGES, FILES, CHILDREN }
+private enum class ChatSheet { CHANGES, FILES, ACTIVITY }
 
 @Composable
 fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> Unit, onOpenChild: (String) -> Unit, onModal: (Boolean) -> Unit, interactive: Boolean = true) {
@@ -71,9 +74,10 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
   var requestModal by remember { mutableStateOf(false) }
   var activityGroup by remember(state.serverId, state.sessionId) { mutableStateOf<TranscriptRow?>(null) }
   var activityItem by remember(state.serverId, state.sessionId) { mutableStateOf<TranscriptRow?>(null) }
+  val activity = remember(state.sessions, state.presentedTasks, state.shells, state.parents, state.sessionId) { state.sessionActivity() }
   val focusManager = LocalFocusManager.current
   val keyboard = LocalSoftwareKeyboardController.current
-  val modal = sheet != null || menu || rename || delete || composerModal || requestModal || activityGroup != null
+  val modal = sheet != null || menu || rename || delete || composerModal || requestModal || activityGroup != null || state.shellOutput != null
   DisposableEffect(modal) { onModal(modal); onDispose { onModal(false) } }
   fun openFile(path: String) { sheet = ChatSheet.FILES; controller.readFile(path) }
   if (session == null) {
@@ -84,7 +88,7 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
   // 分叉与删除按 harness 能力显示（DSH 没有消息级撤销与删除，用分叉与归档代替）。
   val menuSections = listOf(
     MenuSection(buildList {
-      add(MenuAction("子任务（${state.children.size}）", MiuixIcons.MindMap) { sheet = ChatSheet.CHILDREN })
+      add(MenuAction("子会话与后台（${activity.subSessions.size + activity.shells.size}）", MiuixIcons.MindMap) { sheet = ChatSheet.ACTIVITY })
       if (state.capabilities.diff) add(MenuAction("改动（${state.changes.size}）", MiuixIcons.Merge) { sheet = ChatSheet.CHANGES })
       add(MenuAction("文件", MiuixIcons.Folder) { sheet = ChatSheet.FILES; controller.listFiles() })
     }),
@@ -115,7 +119,11 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
             activityGroup = it
             activityItem = it.takeIf { row -> row.kind == "tool" }
           })
-        ChatComposer(state, controller, interactive, onModal = { composerModal = it }, onServerFile = { sheet = ChatSheet.FILES; controller.listFiles() })
+        if (session.parentId != null) ChildSessionBar(state, session, onBack)
+        else {
+          if (activity.hasActive) SessionActivityChip(activity) { sheet = ChatSheet.ACTIVITY }
+          ChatComposer(state, controller, interactive, onModal = { composerModal = it }, onServerFile = { sheet = ChatSheet.FILES; controller.listFiles() })
+        }
       }
       // The last group stays composed while the overlay animates out.
       val shownGroup = remember(state.serverId, state.sessionId) { arrayOfNulls<TranscriptRow>(1) }
@@ -140,8 +148,8 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
     }
   }
   sheet?.let { which ->
-    val resource = when (which) { ChatSheet.CHANGES -> "changes"; ChatSheet.FILES -> "files"; ChatSheet.CHILDREN -> "children" }
-    SuperBottomSheet(title = when (which) { ChatSheet.CHANGES -> "代码改动"; ChatSheet.FILES -> "文件"; ChatSheet.CHILDREN -> "子任务" }, show = true, onDismissRequest = { sheet = null }) {
+    val resource = when (which) { ChatSheet.CHANGES -> "changes"; ChatSheet.FILES -> "files"; ChatSheet.ACTIVITY -> "children" }
+    SuperBottomSheet(title = when (which) { ChatSheet.CHANGES -> "代码改动"; ChatSheet.FILES -> "文件"; ChatSheet.ACTIVITY -> "子会话与后台" }, show = true, onDismissRequest = { sheet = null }) {
       Column(Modifier.fillMaxWidth().fillMaxHeight(0.72f).padding(vertical = 8.dp)) {
         if (which != ChatSheet.FILES) ResourceHint(state.resource(resource), "暂无记录", retry = controller::reload)
         when (which) {
@@ -152,20 +160,191 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
             if (expanded) VirtualText(change.patch.ifBlank { change.after })
           } }
           ChatSheet.FILES -> FilesPanel(state, controller) { path -> controller.addReference(path); sheet = null }
-          ChatSheet.CHILDREN -> LazyColumn { val tasks = state.presentedTasks; items(state.children.distinctBy { it.id }, key = { it.id }) { child ->
-            Card(Modifier.fillMaxWidth().padding(bottom = 8.dp), insideMargin = PaddingValues(14.dp), onClick = { sheet = null; onOpenChild(child.id) }) {
-               Text(state.title(child)); tasks[child.id]?.takeIf { it.active }?.let { MiuixStatePill(it.phase) }
-            }
-          } }
+          ChatSheet.ACTIVITY -> ActivityPanel(state, activity, controller,
+            onOpenChild = { sheet = null; onOpenChild(it) },
+            onOpenShell = { sheet = null; controller.openShellOutput(it) })
         }
       }
     }
   }
+  ShellOutputSheet(state, controller)
   if (rename) RenameSessionDialog(state, controller, session) { rename = false }
   if (delete) SuperDialog(title = "删除此会话？", show = true, onDismissRequest = { if (!state.pending("delete")) delete = false }) {
     Column { Text("会话消息将从服务器永久删除。\n${state.title(session)}"); ActionError(state, "delete")
       DialogActions("取消", { delete = false }, if (state.pending("delete")) "删除中…" else "永久删除", !state.pending("delete"), danger = true) { controller.deleteSession { delete = false; onBack() } }
     }
+  }
+}
+
+/** A quiet entry point above the composer for work that outlives the current reply. */
+@Composable
+private fun SessionActivityChip(activity: SessionActivity, onClick: () -> Unit) {
+  val parts = buildList {
+    if (activity.activeSubSessions > 0) add("${activity.activeSubSessions} 个子会话")
+    if (activity.shells.isNotEmpty()) add("${activity.shells.size} 个命令")
+  }
+  Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 4.dp)) {
+    Row(Modifier.clip(miuixCapsuleShape()).background(MiuixTheme.colorScheme.secondaryContainer)
+      .clickable(role = Role.Button, onClick = onClick).padding(horizontal = 12.dp, vertical = 6.dp),
+      verticalAlignment = Alignment.CenterVertically) {
+      InfiniteProgressIndicator(color = MiuixTheme.colorScheme.primary, size = 12.dp, strokeWidth = 1.5.dp, orbitingDotSize = 1.5.dp)
+      Spacer(Modifier.width(6.dp))
+      Text("后台 · ${parts.joinToString(" · ")}", style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
+    }
+  }
+}
+
+/** The child-session footer: live status and a way back, with no composer (official subagents are read-only). */
+@Composable
+private fun ChildSessionBar(state: LagoonState, session: Session, onBack: () -> Unit) {
+  val task = state.livePresentedTasks[session.id]
+  val waiting = task?.phase in TaskState.WAITING_PHASES
+  val phase = when {
+    task?.active == true -> when (task.phase) {
+      TaskPhase.WAITING_PERMISSION -> "等待授权"
+      TaskPhase.WAITING_QUESTION -> "等待回答"
+      TaskPhase.WAITING_SERVER -> "等待服务器处理"
+      else -> "运行中"
+    }
+    session.outcome == "failed" -> "失败"
+    session.outcome == "interrupted" -> "已中断"
+    session.outcome == "succeeded" || session.idle > 0 -> "已完成"
+    else -> "状态待确认"
+  }
+  val started = task?.since?.takeIf { it > 0 } ?: session.created
+  val ended = task?.finishedAt?.takeIf { it > 0 } ?: session.idle.takeIf { it > 0 }
+  val now by produceState(System.currentTimeMillis(), session.id, task?.since) {
+    while (true) { value = System.currentTimeMillis(); delay(1_000) }
+  }
+  val elapsed = ((ended ?: now) - started).coerceAtLeast(0)
+  Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp)
+    .clip(miuixShape(16.dp)).background(MiuixTheme.colorScheme.secondaryContainer).padding(horizontal = 12.dp, vertical = 8.dp),
+    verticalAlignment = Alignment.CenterVertically) {
+    val active = task?.active == true
+    if (active) InfiniteProgressIndicator(color = MiuixTheme.colorScheme.primary, size = 14.dp, strokeWidth = 1.5.dp)
+    else Icon(MiuixIcons.Info, phase, Modifier.size(16.dp),
+      tint = if (phase == "失败") MiuixColorTokens.Error else MiuixTheme.colorScheme.onSurfaceVariantSummary)
+    Spacer(Modifier.width(8.dp))
+    Column(Modifier.weight(1f)) {
+      Text("$phase · ${durationText(elapsed)}", style = MiuixTheme.textStyles.footnote2.copy(
+        color = if (waiting) MiuixColorTokens.Warning else MiuixTheme.colorScheme.onSurface))
+      Text(listOfNotNull(session.agent, session.model?.label).joinToString(" · ").ifBlank { "子会话" },
+        style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary), maxLines = 1, overflow = TextOverflow.Ellipsis)
+    }
+    TextButton(text = "返回父会话", onClick = onBack)
+  }
+}
+
+/** Background commands and the whole child-session family, including finished sessions. */
+@Composable
+private fun ActivityPanel(state: LagoonState, activity: SessionActivity, controller: LagoonController,
+  onOpenChild: (String) -> Unit, onOpenShell: (ShellJob) -> Unit) {
+  var now by remember(activity) { mutableStateOf(System.currentTimeMillis()) }
+  LaunchedEffect(activity) { while (true) { now = System.currentTimeMillis(); delay(1_000) } }
+  Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState())) {
+    if (activity.shells.isNotEmpty()) {
+      Text("后台命令", Modifier.padding(horizontal = 4.dp, vertical = 8.dp), style = MiuixTheme.textStyles.footnote1.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
+      activity.shells.forEach { job ->
+        Row(Modifier.fillMaxWidth().clip(miuixShape(12.dp)).clickable { onOpenShell(job) }
+          .padding(horizontal = 10.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+          Icon(MiuixIcons.Info, "后台命令", Modifier.size(18.dp), tint = MiuixTheme.colorScheme.primary)
+          Spacer(Modifier.width(10.dp))
+          Column(Modifier.weight(1f)) {
+            Text(job.command.lineSequence().firstOrNull().orEmpty().ifBlank { "shell" }, maxLines = 1, overflow = TextOverflow.Ellipsis,
+              style = MiuixTheme.textStyles.body2.copy(fontFamily = FontFamily.Monospace))
+            Text("运行中 · ${durationText(now - job.started)}", style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
+          }
+          TextButton(text = "输出", onClick = { onOpenShell(job) })
+        }
+      }
+    }
+    if (activity.subSessions.isNotEmpty()) {
+      Text("子会话", Modifier.padding(horizontal = 4.dp, vertical = 8.dp), style = MiuixTheme.textStyles.footnote1.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
+      activity.subSessions.forEach { entry ->
+        val session = entry.session
+        val label = session.displayTitle().let { if (it == "子会话" && session.agent != null) "${session.agent} 子会话" else it }
+        Row(Modifier.fillMaxWidth().clip(miuixShape(12.dp)).clickable { onOpenChild(session.id) }
+          .padding(start = (10 + (entry.depth - 1).coerceAtLeast(0) * 14).dp, end = 10.dp, top = 8.dp, bottom = 8.dp),
+          verticalAlignment = Alignment.CenterVertically) {
+          if (entry.active) InfiniteProgressIndicator(color = if (entry.phase in setOf(SubSessionPhase.WAITING_PERMISSION, SubSessionPhase.WAITING_QUESTION, SubSessionPhase.WAITING_SERVER)) MiuixColorTokens.Warning else MiuixTheme.colorScheme.primary, size = 14.dp, strokeWidth = 1.5.dp)
+          else Icon(MiuixIcons.MindMap, "子会话", Modifier.size(16.dp), tint = if (entry.phase == SubSessionPhase.FAILED) MiuixColorTokens.Error else MiuixTheme.colorScheme.onSurfaceVariantSummary)
+          Spacer(Modifier.width(8.dp))
+          Column(Modifier.weight(1f)) {
+            Text(label, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MiuixTheme.textStyles.body2.copy(
+              fontWeight = if (entry.active) FontWeight.Medium else FontWeight.Normal))
+            val elapsed = ((entry.ended ?: now) - entry.started).coerceAtLeast(0)
+            Text("${subSessionLabel(entry.phase)} · ${durationText(elapsed)}${entry.session.agent?.let { " · $it" } ?: ""}",
+              style = MiuixTheme.textStyles.footnote2.copy(color = when (entry.phase) {
+                SubSessionPhase.FAILED -> MiuixColorTokens.Error
+                SubSessionPhase.WAITING_PERMISSION, SubSessionPhase.WAITING_QUESTION, SubSessionPhase.WAITING_SERVER -> MiuixColorTokens.Warning
+                else -> MiuixTheme.colorScheme.onSurfaceVariantSummary
+              }), maxLines = 1, overflow = TextOverflow.Ellipsis)
+          }
+          DropdownChevron(16.dp, MiuixTheme.colorScheme.onSurfaceVariantSummary, "打开子会话")
+        }
+      }
+    }
+    if (activity.shells.isEmpty() && activity.subSessions.isEmpty()) {
+      ResourceHint(state.resource("children"), "暂无后台任务或子会话", "后台命令和子代理会话会显示在这里", controller::reload)
+    }
+  }
+}
+
+private fun subSessionLabel(phase: SubSessionPhase): String = when (phase) {
+  SubSessionPhase.RUNNING -> "运行中"
+  SubSessionPhase.WAITING_PERMISSION -> "等待授权"
+  SubSessionPhase.WAITING_QUESTION -> "等待回答"
+  SubSessionPhase.WAITING_SERVER -> "等待服务器处理"
+  SubSessionPhase.COMPLETED -> "已完成"
+  SubSessionPhase.FAILED -> "失败"
+  SubSessionPhase.INTERRUPTED -> "已中断"
+  SubSessionPhase.UNKNOWN -> "状态待确认"
+}
+
+/** Live output for one background shell, polled from the server's byte-cursor output route. */
+@Composable
+private fun ShellOutputSheet(state: LagoonState, controller: LagoonController) {
+  val output = state.shellOutput ?: return
+  val scroll = rememberScrollState()
+  LaunchedEffect(output.text) { scroll.animateScrollTo(scroll.maxValue) }
+  SuperBottomSheet(title = output.command.lineSequence().firstOrNull().orEmpty().ifBlank { "后台命令" },
+    show = true, onDismissRequest = { controller.closeShellOutput() }) {
+    Column(Modifier.fillMaxWidth().fillMaxHeight(0.78f).padding(vertical = 8.dp)) {
+      Row(Modifier.fillMaxWidth().padding(horizontal = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+        val snapshot = output.snapshot
+        Text(when {
+          output.loading -> "正在读取输出…"
+          snapshot == null -> "状态待确认"
+          snapshot.running -> "运行中"
+          snapshot.status == "timeout" -> "已超时"
+          snapshot.status == "killed" -> "已停止"
+          snapshot.exit != null -> "已结束 · 退出码 ${snapshot.exit}"
+          else -> "已结束"
+        }, Modifier.weight(1f), style = MiuixTheme.textStyles.footnote1.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
+        if (snapshot?.running == true) state.shells[output.shellId]?.let { job ->
+          TextButton(text = "停止", onClick = { controller.stopShell(job) })
+        }
+      }
+      output.error?.let { Text(it, color = MiuixColorTokens.Error, style = MiuixTheme.textStyles.footnote2) }
+      if (output.omitted) Text("仅显示最近 64KB 输出", style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
+      Box(Modifier.weight(1f).fillMaxWidth().padding(top = 8.dp).clip(miuixShape(12.dp)).background(QoderColors.codeColor)) {
+        SelectionContainer {
+          Text(output.text.ifBlank { if (output.loading) "正在读取输出…" else "暂无输出" },
+            Modifier.fillMaxSize().verticalScroll(scroll).padding(12.dp),
+            fontFamily = FontFamily.Monospace, fontSize = 12.sp,
+            color = MiuixTheme.colorScheme.onSurface)
+        }
+      }
+    }
+  }
+}
+
+private fun durationText(millis: Long): String {
+  val seconds = (millis / 1000).coerceAtLeast(0)
+  return when {
+    seconds < 60 -> "${seconds} 秒"
+    seconds < 3600 -> "${seconds / 60} 分 ${seconds % 60} 秒"
+    else -> "${seconds / 3600} 时 ${(seconds % 3600) / 60} 分"
   }
 }
 
@@ -334,8 +513,6 @@ private fun SessionSubtitle(state: LagoonState, session: Session) {
     SessionStatus.RUNNING -> { InfiniteProgressIndicator(color = MiuixTheme.colorScheme.primary, size = 12.dp, strokeWidth = 1.5.dp, orbitingDotSize = 1.5.dp); Spacer(Modifier.width(6.dp)) }
     SessionStatus.WAITING_PERMISSION, SessionStatus.WAITING_QUESTION, SessionStatus.FAILED ->
       Text("${status.label} · ", style = MiuixTheme.textStyles.footnote1.copy(color = if (status == SessionStatus.FAILED) MiuixColorTokens.Error else MiuixColorTokens.Warning))
-    SessionStatus.BACKGROUND_RUNNING ->
-      Text("${status.label} · ", style = MiuixTheme.textStyles.footnote1.copy(color = MiuixTheme.colorScheme.primary))
     SessionStatus.WAITING_SERVER, SessionStatus.UNKNOWN ->
       Text("${status.label} · ", style = MiuixTheme.textStyles.footnote1.copy(color = muted))
     else -> {}

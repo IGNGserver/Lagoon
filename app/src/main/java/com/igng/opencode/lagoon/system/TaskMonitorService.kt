@@ -9,6 +9,7 @@ import android.os.IBinder
 import com.igng.opencode.lagoon.core.LagoonController
 import com.igng.opencode.lagoon.core.LiveUpdateContent
 import com.igng.opencode.lagoon.core.LiveUpdateStage
+import com.igng.opencode.lagoon.core.SessionTarget
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -27,28 +28,61 @@ class TaskMonitorService : Service() {
   private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
   private var monitor: Job? = null
   private var settle: Job? = null
+  private var lastBackgroundTargets: List<SessionTarget> = emptyList()
   override fun onBind(intent: Intent?): IBinder? = null
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
     val controller = LagoonController.get(this)
     val notifications = TaskNotifications(this)
-    val summary = controller.state.value.globalSummary
-    val notification = if (summary.isEmpty) notifications.buildConnecting()
-      else notifications.buildSummary(TaskNotifications.ALL_PROFILE, summary, controller.state.value.globalSummaryTarget)
-    val id = TaskNotifications.summaryId(TaskNotifications.ALL_SERVERS_ID)
-    if (Build.VERSION.SDK_INT >= 29) startForeground(id, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
-    else startForeground(id, notification)
+    val initial = controller.state.value
+    val summary = initial.globalSummary
+    val background = initial.globalBackgroundTargets
+    lastBackgroundTargets = background
+    val notification = when {
+      summary.isEmpty && background.isEmpty() -> notifications.buildConnecting()
+      LiveUpdateContent.stageOf(summary) == LiveUpdateStage.ACTIVE ->
+        notifications.buildSummary(TaskNotifications.ALL_PROFILE, summary, initial.globalSummaryTarget)
+      background.isNotEmpty() -> notifications.buildBackgroundSummary(TaskNotifications.ALL_PROFILE, background)
+      else -> notifications.buildConnecting()
+    }
+    var foregroundId = if (LiveUpdateContent.stageOf(summary) == LiveUpdateStage.ACTIVE)
+      TaskNotifications.summaryId(TaskNotifications.ALL_SERVERS_ID)
+    else TaskNotifications.backgroundId(TaskNotifications.ALL_SERVERS_ID)
+    if (Build.VERSION.SDK_INT >= 29) startForeground(foregroundId, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+    else startForeground(foregroundId, notification)
     if (monitor == null) {
       controller.setMonitoring(true)
       monitor = scope.launch {
         controller.state.collect { state ->
-          if (LiveUpdateContent.stageOf(state.globalSummary) == LiveUpdateStage.ACTIVE) {
+          val active = LiveUpdateContent.stageOf(state.globalSummary) == LiveUpdateStage.ACTIVE
+          val background = state.globalBackgroundCount > 0
+          if (active || background) {
+            val desired = if (active) TaskNotifications.summaryId(TaskNotifications.ALL_SERVERS_ID)
+              else TaskNotifications.backgroundId(TaskNotifications.ALL_SERVERS_ID)
+            if (background && !active && state.globalBackgroundTargets != lastBackgroundTargets) {
+              notifications.updateBackground(TaskNotifications.ALL_PROFILE, state.globalBackgroundTargets)
+              lastBackgroundTargets = state.globalBackgroundTargets
+            }
+            if (desired != foregroundId) {
+              val next = if (active) notifications.buildSummary(TaskNotifications.ALL_PROFILE, state.globalSummary, state.globalSummaryTarget)
+                else notifications.buildBackgroundSummary(TaskNotifications.ALL_PROFILE, state.globalBackgroundTargets)
+              if (Build.VERSION.SDK_INT >= 29) startForeground(desired, next, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+              else startForeground(desired, next)
+              if (active) notifications.cancelBackground(TaskNotifications.ALL_SERVERS_ID)
+              else notifications.cancelSummary(TaskNotifications.ALL_SERVERS_ID)
+              foregroundId = desired
+            }
+          }
+          if (active || background) {
             settle?.cancel(); settle = null
           } else if (settle == null) {
             // Tool-step gaps and reconnect bootstrap must not remove/recreate the island.
             settle = scope.launch {
               delay(4000)
-              if (LiveUpdateContent.stageOf(controller.state.value.globalSummary) != LiveUpdateStage.ACTIVE) {
-                stopForeground(STOP_FOREGROUND_DETACH)
+              val current = controller.state.value
+              if (LiveUpdateContent.stageOf(current.globalSummary) != LiveUpdateStage.ACTIVE && current.globalBackgroundCount == 0) {
+                // Remove the foreground notification as well: a background-only monitor must not
+                // leave a low-key notification behind after its work ends.
+                stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
               }
             }

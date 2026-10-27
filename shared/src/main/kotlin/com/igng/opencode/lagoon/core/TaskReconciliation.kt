@@ -36,7 +36,8 @@ internal object TaskReconciliation {
       val family = (BackgroundWork.familyOf(id, parents) - deleted).filter {
         it == id || states[it]?.active == true || it in verifiedSessions
       }.toSet()
-      val work = BackgroundWork.hasBackgroundWork(id, states, shells, parents)
+      // A running shell/child makes the root's background *activity* visible, but it is not proof
+      // that the root's own execution is still running. The root settles on its own idle baseline.
       val confirmedWork = active != null && (family.any { it != id && it in active } || shells.values.any {
         it.sessionId in family && normalizedDirectory(it.directory) in verifiedShellDirectories
       })
@@ -50,33 +51,17 @@ internal object TaskReconciliation {
           (old.activeAt < 0 && (child || now - old.since >= 10_000)))
       states[id] = when {
         old.pendingInput && id in inbox.verified && !confirmedWork -> old.copy(phase = TaskPhase.WAITING_SERVER,
-          detail = "等待服务器处理", background = false, uncertain = false)
-        confirmedWork && old.phase in TaskState.RUNNING_PHASES -> old.copy(phase = TaskPhase.THINKING,
-          detail = TaskState.BACKGROUND_DETAIL, background = true, uncertain = false)
+          detail = "等待服务器处理", uncertain = false)
         !verified -> old.copy(uncertain = true)
-        work && old.phase in TaskState.RUNNING_PHASES -> old.copy(phase = TaskPhase.THINKING,
-          detail = TaskState.BACKGROUND_DETAIL, background = true,
-          uncertain = states.values.any { it.sessionId != id && it.sessionId in family && it.active && it.uncertain })
-        !work && (old.background || finished) -> TaskReducer.terminal(id, session?.outcome, old)
+        finished -> TaskReducer.terminal(id, session?.outcome, old)
         // No positive running claim and no usable terminal baseline: retain the retry hint, but
         // don't invent either completion or an indefinitely running foreground execution.
-        else -> old.copy(uncertain = now - old.since >= 10_000 &&
-          (old.phase in TaskState.RUNNING_PHASES || old.phase == TaskPhase.WAITING_SERVER))
+        else -> old.copy(uncertain = now - old.since >= 10_000 && old.phase in TaskState.RUNNING_PHASES)
       }
     }
-    // Keep child terminal records: historical tool metadata must not resurrect completed work.
-    val folded = BackgroundWork.fold(states.filterValues {
-      it.active || it.sessionId in parents || previous[it.sessionId]?.active == true
-    }, shells, parents)
-    return folded.mapValues { (id, task) ->
-      if (!task.background || !task.active) task else {
-        val family = BackgroundWork.familyOf(id, parents)
-        val confirmed = family.any { it in active.orEmpty() } || shells.values.any {
-          it.sessionId in family && normalizedDirectory(it.directory) in verifiedShellDirectories
-        }
-        task.copy(uncertain = !confirmed)
-      }
-    }
+    // Keep live states and terminal child records (historical tool metadata must not resurrect
+    // completed work). Root results live in the unread ledger, not as permanent task phases.
+    return states.filterValues { it.active || it.sessionId in parents || previous[it.sessionId]?.active == true }
   }
 
   /** A failed/unfinished sweep is unknown; the scanner resumes it on the following poll. */

@@ -111,7 +111,9 @@ class MainActivity : ComponentActivity() {
         if (state.session != null) snapshots["${state.serverId}:${state.sessionId}"] = state
         // 先落栈（同步启用根返回回调），再打开会话：打开过程占住主线程也不会让返回落到系统。
         navigator.server = target.serverId
-        navigator.navigate(navigator.navigation.open(target.sessionId, child))
+        val lineage = controller.state.value.lineage(target.sessionId)
+        navigator.navigate(if (lineage != null) navigator.navigation.openLineage(lineage)
+          else navigator.navigation.open(target.sessionId, child))
         controller.openConversation(target)
       }
        fun openDraft() {
@@ -142,7 +144,9 @@ class MainActivity : ComponentActivity() {
         val id = state.sessionId
         val stack = navigator.navigation.sessions
          if (stack.isNotEmpty() && id != null && stack.last() != id) {
-           navigator.navigate(navigator.navigation.copy(sessions = if (state.session?.parentId == stack.last()) stack + id else stack.dropLast(1) + id))
+           val lineage = controller.state.value.lineage(id)
+           navigator.navigate(if (lineage != null) navigator.navigation.openLineage(lineage)
+             else navigator.navigation.copy(sessions = if (state.session?.parentId == stack.last()) stack + id else stack.dropLast(1) + id))
          }
        }
        LaunchedEffect(pendingDraftTarget) {
@@ -231,7 +235,7 @@ class MainActivity : ComponentActivity() {
               when {
                 target.session == DRAFT_SESSION -> DraftScreen(state, controller, onBack = { goBack() }, onModal = {}, interactive = active)
                  target.session != null -> ChatScreen(displayed, controller, onBack = { goBack() }, onOpenChild = { child ->
-                   controller.state.value.serverId?.let { server -> openSession(SessionTarget(server, child), child = controller.state.value.sessions.any { it.id == child }) }
+                   controller.state.value.serverId?.let { server -> openSession(SessionTarget(server, child), child = true) }
                  }, onModal = {}, interactive = active)
                  target.page == RootPage.ARCHIVED -> ArchivedScreen(home, controller, onOpen = { openSession(it) }, onBack = { goBack() })
                  target.page == RootPage.SETTINGS -> SettingsScreen(state, controller, themeMode, { themeMode = it; preferences.edit().putString("themeMode", it.name).apply() }, previewBack, { previewBack = it; preferences.edit().putBoolean("previewBack", it).apply() }, refreshMode, { refreshMode = it; controller.setRefreshMode(it) }, {

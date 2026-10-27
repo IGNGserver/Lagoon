@@ -52,28 +52,23 @@ class SessionExperienceTest {
     assertEquals(permission, TaskReducer.status("s", true, permission))
   }
 
-  @Test fun backgroundedWorkKeepsTheSessionRunningUntilItWakesTheAgentAgain() {
+  @Test fun backgroundedWorkDoesNotKeepTheRootExecutionRunning() {
     val started = TaskReducer.event("s", "session.execution.started", JSONObject("{}"), null, 100)!!
     assertTrue(started.active)
-    val backgrounded = TaskReducer.event("s", "session.synthetic",
-      JSONObject("""{"sessionID":"s","text":"The backgrounded work is still unfinished. Move on to other work."}"""), started, 120)!!
-    assertTrue(backgrounded.background)
-    // 根执行 settle 不代表会话结束：后台工作还在跑。
-    val settled = TaskReducer.event("s", "session.execution.succeeded", JSONObject("{}"), backgrounded, 130)!!
-    assertTrue(settled.active)
-    assertTrue(settled.background)
-    // 后台完成重新唤醒 AI（新的 execution.started）后清除后台标记，最终正常收尾。
-    val resumed = TaskReducer.event("s", "session.execution.started", JSONObject("{}"), settled, 200)!!
-    assertFalse(resumed.background)
-    assertEquals(TaskPhase.COMPLETED, TaskReducer.event("s", "session.execution.succeeded", JSONObject("{}"), resumed, 240)!!.phase)
+    // The synthetic “backgrounded work is still unfinished” message is timeline-only now.
+    assertNull(TaskReducer.event("s", "session.synthetic",
+      JSONObject("""{"sessionID":"s","text":"The backgrounded work is still unfinished. Move on to other work."}"""), started, 120))
+    val settled = TaskReducer.event("s", "session.execution.succeeded", JSONObject("{}"), started, 130)!!
+    assertEquals(TaskPhase.COMPLETED, settled.phase)
+    assertFalse(settled.active)
   }
 
-  @Test fun aSessionWithBackgroundedWorkCountsAsBackgroundRunning() {
+  @Test fun aSettledRootWithARunningChildIsOnlyABackgroundMarker() {
     val parents = mapOf("child" to "root")
-    val childRunning = mapOf("root" to TaskState("root", TaskPhase.COMPLETED), "child" to TaskState("child", TaskPhase.THINKING))
-    assertEquals(setOf("root"), TaskSummary.backgroundRoots(childRunning, parents))
-    val sameSession = mapOf("root" to TaskState("root", TaskPhase.THINKING, background = true))
-    assertEquals(setOf("root"), TaskSummary.backgroundRoots(sameSession, emptyMap()))
+    val tasks = mapOf("root" to TaskState("root", TaskPhase.COMPLETED), "child" to TaskState("child", TaskPhase.THINKING))
+    assertEquals(setOf("root"), SessionActivityRules.backgroundRoots(tasks, emptyMap(), parents))
+    assertTrue(SessionActivityRules.rootStates(tasks, parents).isEmpty())
+    assertEquals(0, TaskSummary.of(tasks, parents = parents).running)
   }
 
   @Test fun anActiveReadNeverDowngradesAPendingPrompt() {

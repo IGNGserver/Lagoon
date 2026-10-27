@@ -371,6 +371,20 @@ class OpenCodeApi(
   override suspend fun shells(directory: String): List<ShellJob> =
     dataArray(obj("api/shell", locationQuery(directory))).objects().mapNotNull { it.toShellJob(directory) }
 
+  override suspend fun shellInfo(id: String, directory: String): ShellSnapshot? =
+    dataObject(obj("api/shell/${segment(id)}", locationQuery(directory))).toShellSnapshot(directory)
+
+  override suspend fun shellOutput(id: String, directory: String, cursor: Long?, limit: Int): ShellOutput? {
+    val query = locationQuery(directory).toMutableMap()
+    if (cursor != null) query["cursor"] = cursor.toString()
+    query["limit"] = limit.toString()
+    return dataObject(obj("api/shell/${segment(id)}/output", query)).toShellOutput()
+  }
+
+  override suspend fun removeShell(id: String, directory: String) {
+    request("DELETE", "api/shell/${segment(id)}", locationQuery(directory))
+  }
+
   override suspend fun createSession(directory: String, title: String): Session =
     dataObject(requestObject("POST", "api/session", JSONObject().put("location", JSONObject().put("directory", directory)).apply {
       if (title.isNotBlank()) put("title", title.trim())

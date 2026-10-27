@@ -58,6 +58,18 @@ interface HarnessClient {
 
   suspend fun shells(directory: String): List<ShellJob>
 
+  /**
+   * One shell command including its terminal status. OpenCode exposes this as `GET /api/shell/{id}`;
+   * harnesses without a shell route return null and the UI hides the output action.
+   */
+  suspend fun shellInfo(id: String, directory: String): ShellSnapshot? = null
+
+  /** Captured output page at an absolute byte cursor. Null when the harness has no shell output route. */
+  suspend fun shellOutput(id: String, directory: String, cursor: Long? = null, limit: Int = SHELL_OUTPUT_PAGE): ShellOutput? = null
+
+  /** Terminate/remove a shell command and its retained output. */
+  suspend fun removeShell(id: String, directory: String) = Unit
+
   suspend fun createSession(directory: String, title: String): Session
 
   suspend fun renameSession(session: Session, title: String)
@@ -139,6 +151,9 @@ interface HarnessClient {
 
     /** 一次历史回补（向更早方向）的默认条数。 */
     const val HISTORY_PAGE = 200
+
+    /** 后台 shell 输出一次读取的字节数；界面只保留最近一页，避免长任务占满内存。 */
+    const val SHELL_OUTPUT_PAGE = 64 * 1024
   }
 }
 

@@ -23,6 +23,6 @@ class TaskPersistenceTest {
   @Test fun phaseChangeIsWrittenAtOnce() {
     val done = TaskState("s", TaskPhase.COMPLETED, "任务已完成", since = 1_000, finishedAt = 10_500, activeAt = 10_500)
     assertTrue(TaskPersistence.shouldWrite(running, null, done, null))
-    assertTrue(TaskPersistence.shouldWrite(running, null, running.copy(background = true, activeAt = 10_100), null))
+    assertTrue(TaskPersistence.shouldWrite(running, null, running.copy(phase = TaskPhase.TOOL, activeAt = 10_100), null))
   }
 }
