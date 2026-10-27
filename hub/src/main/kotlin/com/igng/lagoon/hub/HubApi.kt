@@ -27,6 +27,7 @@ import com.igng.opencode.lagoon.core.serverReadCandidates
 import com.igng.opencode.lagoon.core.sessionActivityOrder
 import com.igng.opencode.lagoon.core.widenOlderToTurn
 import kotlinx.coroutines.async
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import org.json.JSONArray
@@ -45,9 +46,10 @@ class HubApi(
   private val version: String
 ) {
   private val choicesCache = ConcurrentHashMap<String, Pair<Long, JSONObject>>()
+  private val clientAccess = ClientAccess(store, auth)
 
-  /** Routes reachable without a session. */
-  val publicPaths = setOf("/api/v1/auth/status", "/api/v1/auth/login", "/api/v1/auth/setup", "/api/v1/tls/cert")
+  /** Routes reachable without a session; the export authorizes itself with a client access key. */
+  val publicPaths = setOf("/api/v1/auth/status", "/api/v1/auth/login", "/api/v1/auth/setup", "/api/v1/tls/cert", ClientAccess.EXPORT_PATH)
 
   fun register(router: Router) {
     authRoutes(router)
@@ -55,6 +57,7 @@ class HubApi(
     sessionRoutes(router)
     workspaceRoutes(router)
     preferenceRoutes(router)
+    clientAccess.register(router)
   }
 
   // ---- Access password ----
@@ -139,7 +142,7 @@ class HubApi(
 
   private fun serverRoutes(router: Router) {
     router.get("/api/v1/servers") { call ->
-      call.respond(JSONObject().put("servers", Codec.array(store.profiles().map { Codec.profile(it).put("hasSecret", store.hasSecret(it.id)) })))
+      call.respond(JSONObject().put("servers", Codec.array(store.profiles().map(store::profileJson))))
     }
     router.post("/api/v1/servers/parse") { call -> call.respond(parse(call.json().optString("text"))) }
     router.post("/api/v1/servers") { call -> saveServer(call, UUID.randomUUID().toString(), creating = true) }
@@ -194,6 +197,7 @@ class HubApi(
     val existing = store.profile(id)
     if (!creating && existing == null) throw HttpError(404, "server-not-found", "服务器不存在")
     val secret = body.optString("secret").takeIf { body.has("secret") && !body.isNull("secret") }
+    val clientUrl = if (input.has("clientUrl")) clientAddress(input.optString("clientUrl")) else null
     val requested = Codec.profileFrom(input, id).let { profile ->
       val dsh = profile.kind == ServerKind.DSH
       profile.copy(name = profile.name.ifBlank { profile.kind.label },
@@ -220,11 +224,21 @@ class HubApi(
       val client = createHarnessClient(profile, credentials) { minted = it }
       val serverVersion = client.health()
       client.projects()
-      store.saveServer(profile, credentials.copy(cookie = minted ?: credentials.cookie))
+      store.saveServer(profile, credentials.copy(cookie = minted ?: credentials.cookie), clientUrl)
       profileChanged(profile)
       profile to serverVersion
     }
-    call.respond(JSONObject().put("profile", Codec.profile(result.first).put("hasSecret", store.hasSecret(id))).put("version", result.second))
+    call.respond(JSONObject().put("profile", store.profileJson(result.first)).put("version", result.second))
+  }
+
+  /** The optional address other clients use for a server; empty clears it. */
+  private fun clientAddress(value: String): String {
+    val url = value.trim().trimEnd('/')
+    if (url.isEmpty()) return ""
+    if (!url.startsWith("http://", true) && !url.startsWith("https://", true) || url.toHttpUrlOrNull() == null) {
+      throw HttpError(400, "client-url-invalid", "客户端访问地址必须以 http:// 或 https:// 开头")
+    }
+    return url
   }
 
   private fun validateAddress(profile: ServerProfile) {

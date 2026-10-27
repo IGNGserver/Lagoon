@@ -2,6 +2,7 @@ package com.igng.lagoon.hub
 
 import com.igng.opencode.lagoon.core.CatalogCache
 import com.igng.opencode.lagoon.core.Diagnostics
+import com.igng.opencode.lagoon.core.HubAccessKey
 import com.igng.opencode.lagoon.core.OverviewStore
 import com.igng.opencode.lagoon.core.PermissionPolicy
 import com.igng.opencode.lagoon.core.Project
@@ -20,12 +21,16 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.nio.file.Files
 import java.nio.file.Path
+import java.util.UUID
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 
 /** A hashed browser session; the raw token only ever exists in the cookie. */
 data class LoginSession(val hash: String, val created: Long, val lastSeen: Long, val label: String)
+
+/** A client access key (its secret sealed) and when and from where it last exported the servers. */
+data class ClientKey(val id: String, val sealedSecret: String, val label: String, val created: Long, val lastUsed: Long = 0, val lastAddress: String = "")
 
 /** One browser's Web Push subscription. */
 data class PushSubscription(val endpoint: String, val p256dh: String, val auth: String, val label: String, val created: Long)
@@ -47,6 +52,10 @@ class HubStore(private val dataDir: Path, private val box: SecretBox, private va
   private val profiles = mutableListOf<ServerProfile>()
   /** Sealed `{origin, username, password, cookie}` per server. */
   private val credentials = mutableMapOf<String, String>()
+  /** The address other clients should use for a server when the hub's own one only works inside its container. */
+  private val clientUrls = mutableMapOf<String, String>()
+  private val clientKeys = mutableMapOf<String, ClientKey>()
+  private var instanceId = ""
   private val projects = mutableMapOf<String, List<Project>>()
   private val tasks = mutableMapOf<String, MutableMap<String, StoredTask>>()
   private val parents = mutableMapOf<String, MutableMap<String, String>>()
@@ -70,17 +79,25 @@ class HubStore(private val dataDir: Path, private val box: SecretBox, private va
   init {
     Files.createDirectories(dataDir)
     load()
+    if (instanceId.isEmpty()) {
+      instanceId = UUID.randomUUID().toString()
+      writeState()
+    }
   }
+
+  /** This hub's stable identity; clients use it to recognize servers they imported from it before. */
+  val hubId: String get() = synchronized(lock) { instanceId }
 
   // ---- Profiles and credentials ----
 
   fun profiles(): List<ServerProfile> = synchronized(lock) { profiles.toList() }
   fun profile(id: String): ServerProfile? = synchronized(lock) { profiles.firstOrNull { it.id == id } }
 
-  /** Saves [profile] with the credentials that were just verified against it. */
-  fun saveServer(profile: ServerProfile, next: ServerCredentials) = synchronized(lock) {
+  /** Saves [profile] with the credentials that were just verified against it; a null [clientUrl] keeps the current one. */
+  fun saveServer(profile: ServerProfile, next: ServerCredentials, clientUrl: String? = null) = synchronized(lock) {
     val index = profiles.indexOfFirst { it.id == profile.id }
     if (index >= 0) profiles[index] = profile else profiles += profile
+    clientUrl?.let { if (it.isBlank()) clientUrls.remove(profile.id) else clientUrls[profile.id] = it }
     if (next.password.isEmpty() && next.cookie.isEmpty()) credentials.remove(profile.id)
     else credentials[profile.id] = box.seal(JSONObject().put("origin", credentialOrigin(profile.url)).put("username", next.username)
       .put("password", next.password).put("cookie", next.cookie).toString())
@@ -89,7 +106,7 @@ class HubStore(private val dataDir: Path, private val box: SecretBox, private va
 
   fun deleteServer(id: String) = synchronized(lock) {
     profiles.removeAll { it.id == id }
-    credentials.remove(id); projects.remove(id); tasks.remove(id); parents.remove(id); notices.remove(id); catalogs.remove(id)
+    credentials.remove(id); clientUrls.remove(id); projects.remove(id); tasks.remove(id); parents.remove(id); notices.remove(id); catalogs.remove(id)
     persistNow(); scheduleCatalog()
   }
 
@@ -109,6 +126,11 @@ class HubStore(private val dataDir: Path, private val box: SecretBox, private va
   }
 
   fun hasSecret(id: String): Boolean = synchronized(lock) { credentials.containsKey(id) }
+
+  fun clientUrl(id: String): String = synchronized(lock) { clientUrls[id].orEmpty() }
+
+  /** A server as the web client sees it: the profile, whether a secret is stored, and its client address. */
+  fun profileJson(profile: ServerProfile): JSONObject = Codec.profile(profile).put("hasSecret", hasSecret(profile.id)).put("clientUrl", clientUrl(profile.id))
 
   override fun rememberCookie(id: String, url: String, cookie: String) = synchronized(lock) {
     val profile = profiles.firstOrNull { it.id == id } ?: return
@@ -267,6 +289,32 @@ class HubStore(private val dataDir: Path, private val box: SecretBox, private va
     if (logins.values.removeAll { it.lastSeen < olderThan }) scheduleState()
   }
 
+  // ---- Client access keys ----
+
+  fun clientKeys(): List<ClientKey> = synchronized(lock) { clientKeys.values.sortedByDescending { it.created } }
+
+  fun addClientKey(key: HubAccessKey, label: String): ClientKey = synchronized(lock) {
+    if (clientKeys.size >= MAX_CLIENT_KEYS) throw IllegalStateException("接入密钥已达 $MAX_CLIENT_KEYS 个，请先吊销不用的密钥")
+    val record = ClientKey(key.id, box.seal(key.encoded), label.trim().take(60), clock())
+    clientKeys[key.id] = record
+    persistNow()
+    record
+  }
+
+  /** The key behind [id], or null when it does not exist (any more). */
+  fun clientKey(id: String): HubAccessKey? = synchronized(lock) {
+    val record = clientKeys[id] ?: return null
+    runCatching { HubAccessKey.parse(box.open(record.sealedSecret)) }.getOrNull()
+  }
+
+  fun removeClientKey(id: String): Boolean = synchronized(lock) { (clientKeys.remove(id) != null).also { if (it) persistNow() } }
+
+  fun touchClientKey(id: String, now: Long, address: String) = synchronized(lock) {
+    val record = clientKeys[id] ?: return
+    clientKeys[id] = record.copy(lastUsed = now, lastAddress = address.take(64))
+    scheduleState()
+  }
+
   // ---- Web Push ----
 
   fun vapid(): Pair<String, String>? = synchronized(lock) {
@@ -341,8 +389,14 @@ class HubStore(private val dataDir: Path, private val box: SecretBox, private va
 
   private fun stateJson(): JSONObject = JSONObject()
     .put("version", 1)
+    .put("hubId", instanceId)
     .put("profiles", Codec.array(profiles.map(Codec::profile)))
     .put("credentials", JSONObject(credentials as Map<*, *>))
+    .put("clientUrls", JSONObject(clientUrls as Map<*, *>))
+    .put("clientKeys", Codec.array(clientKeys.values.map {
+      JSONObject().put("id", it.id).put("secret", it.sealedSecret).put("label", it.label).put("created", it.created)
+        .put("lastUsed", it.lastUsed).put("lastAddress", it.lastAddress)
+    }))
     .put("projects", JSONObject().apply { projects.forEach { (id, list) -> put(id, Codec.array(list.map(Codec::project))) } })
     .put("tasks", JSONObject().apply {
       tasks.forEach { (id, map) ->
@@ -378,13 +432,14 @@ class HubStore(private val dataDir: Path, private val box: SecretBox, private va
   }
 
   private fun clearAll() {
-    profiles.clear(); credentials.clear(); projects.clear(); tasks.clear(); parents.clear(); notices.clear()
+    instanceId = ""; profiles.clear(); credentials.clear(); clientUrls.clear(); clientKeys.clear(); projects.clear(); tasks.clear(); parents.clear(); notices.clear()
     passwordHash = null; logins.clear(); vapidPublic = null; vapidPrivateSealed = null; subscriptions.clear()
     policy = PermissionPolicy(); refresh = RefreshMode.FAST; ui = JSONObject()
   }
 
   private fun applyState(json: JSONObject) {
     val now = clock()
+    instanceId = json.optString("hubId").trim()
     json.optJSONArray("profiles")?.let { list ->
       for (i in 0 until list.length()) list.optJSONObject(i)?.let { item ->
         val id = item.optString("id")
@@ -392,6 +447,14 @@ class HubStore(private val dataDir: Path, private val box: SecretBox, private va
       }
     }
     json.optJSONObject("credentials")?.let { map -> map.keys().forEach { credentials[it] = map.optString(it) } }
+    json.optJSONObject("clientUrls")?.let { map -> map.keys().forEach { id -> map.optString(id).takeIf(String::isNotBlank)?.let { clientUrls[id] = it } } }
+    json.optJSONArray("clientKeys")?.let { list ->
+      for (i in 0 until list.length()) list.optJSONObject(i)?.let {
+        val id = it.optString("id"); val secret = it.optString("secret")
+        if (id.isNotBlank() && secret.isNotBlank()) clientKeys[id] = ClientKey(id, secret, it.optString("label"), it.optLong("created"),
+          it.optLong("lastUsed"), it.optString("lastAddress"))
+      }
+    }
     json.optJSONObject("projects")?.let { map -> map.keys().forEach { projects[it] = Decode.projects(map.optJSONArray(it)) } }
     json.optJSONObject("tasks")?.let { map ->
       map.keys().forEach { server ->
@@ -447,6 +510,7 @@ class HubStore(private val dataDir: Path, private val box: SecretBox, private va
     const val MAX_CATALOG_SESSIONS = 200
     const val MAX_LOGINS = 50
     const val MAX_SUBSCRIPTIONS = 50
+    const val MAX_CLIENT_KEYS = 50
   }
 }
 
