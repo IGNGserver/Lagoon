@@ -22,6 +22,7 @@ export function ServerEditorPage({ id }: { id: string | null }) {
   const [secret, setSecret] = useState("");
   const [dshAuth, setDshAuth] = useState<DshAuthMode>(existing?.dshAuth ?? "token");
   const [allowCleartext, setAllowCleartext] = useState(existing?.allowCleartext ?? false);
+  const [clientUrl, setClientUrl] = useState(existing?.clientUrl ?? "");
   const [autoConnect, setAutoConnect] = useState(existing?.autoConnect ?? true);
   const [notifications, setNotifications] = useState(existing?.notifications ?? true);
   const [busy, setBusy] = useState(false);
@@ -34,6 +35,7 @@ export function ServerEditorPage({ id }: { id: string | null }) {
     if (!existing) return;
     setKind(existing.kind); setName(existing.name); setUrl(existing.url); setUsername(existing.kind === "opencode" ? existing.username : "opencode");
     setDshAuth(existing.dshAuth); setAllowCleartext(existing.allowCleartext); setAutoConnect(existing.autoConnect); setNotifications(existing.notifications);
+    setClientUrl(existing.clientUrl ?? "");
   }, [existing?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const dsh = kind === "dsh";
@@ -64,6 +66,7 @@ export function ServerEditorPage({ id }: { id: string | null }) {
     const profile: Partial<ServerProfile> = {
       name: name.trim() || (dsh ? "DeepSeek Harness" : "OpenCode"), url: url.trim().replace(/\/+$/, ""), username: dsh ? "dsh" : username.trim() || "opencode",
       kind, dshAuth: dsh ? dshAuth : "token", allowCleartext: http && allowCleartext, autoConnect, notifications,
+      clientUrl: clientUrl.trim().replace(/\/+$/, ""),
     };
     const body = { profile, ...(secret || !existing ? { secret: dsh ? secret.trim() : secret } : {}) };
     try {
@@ -118,6 +121,9 @@ export function ServerEditorPage({ id }: { id: string | null }) {
                   ? "~/.dsh/.credentials.yaml 里 client-connection/browser-session 记录的 secret（43 个字符），相当于这台 dsh 的长期密码。"
                   : "启动链接里 token= 后面的字符；只用来换 Cookie，默认 30 天有效。") : "OpenCode Server 的 Basic Auth 密码。"} />
             )}
+            <TextField label="客户端访问地址（可选）" value={clientUrl} inputMode="url" autoCapitalize="off" autoCorrect="off" spellCheck={false}
+              onChange={(e) => setClientUrl(e.target.value)} placeholder="例如 http://192.168.1.100:4096"
+              hint="手机等客户端从中枢导入这台服务器时使用的地址。上面的地址只在中枢容器里可用（host.docker.internal、容器名）时填写；留空则沿用上面的地址。" />
           </div>
           <ListGroup className="mt-6">
             {http && <ListItem title="允许明文连接" summary="HTTP 不加密，凭据与消息在网络中可见；只在可信局域网中开启" trailing={<Switch checked={allowCleartext} onChange={setAllowCleartext} label="允许明文连接" />} />}

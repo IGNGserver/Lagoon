@@ -17,6 +17,17 @@ export interface ServerProfile {
   kind: ServerKind;
   dshAuth: DshAuthMode;
   hasSecret?: boolean;
+  /** The address other clients (the Android app) use when the hub's own one only works inside its container. */
+  clientUrl?: string;
+}
+
+/** A client access key as the hub lists it; the full key is only shown when it is created. */
+export interface ClientKey {
+  id: string;
+  label: string;
+  created: number;
+  lastUsed: number;
+  lastAddress: string;
 }
 
 export interface ModelChoice {
