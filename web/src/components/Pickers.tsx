@@ -1,4 +1,4 @@
-import { Check, Search } from "lucide-react";
+import { Ok, Search } from "@/components/icons";
 import { useMemo, useState } from "react";
 import type { AgentChoice, ModelChoice, ModelInfo } from "@/api/types";
 import { modelKey, useVisibleModels } from "@/lib/choices";
@@ -88,7 +88,7 @@ function Option({ title, detail, selected, onClick }: { title: string; detail?: 
         <span className="block truncate text-[15px] text-chat-text">{title}</span>
         {detail && <span className="block truncate text-[12.5px] text-chat-text-2">{detail}</span>}
       </span>
-      {selected && <Check size={17} className="shrink-0 text-chat-text" />}
+      {selected && <Ok size={17} className="shrink-0 text-chat-text" />}
     </button>
   );
 }

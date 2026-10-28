@@ -1,9 +1,11 @@
-import { AlertTriangle, Check, ChevronRight, Copy, FileText, Info, Loader2, X } from "lucide-react";
+import {
+  Copy, File, Info, Ok, QoderCheck, QoderChevron, QoderError, QoderWarning,
+} from "@/components/icons";
 import { memo, useState, type ReactNode } from "react";
 import type { Attachment } from "@/api/types";
 import { highlight, renderMarkdown } from "@/lib/markdown";
 import type { TranscriptRow } from "@/transcript/rows";
-import { cx } from "./ui";
+import { Spinner, cx } from "./ui";
 
 export function copyText(text: string) {
   void navigator.clipboard?.writeText(text).catch(() => undefined);
@@ -15,7 +17,7 @@ function CopyButton({ text, label = "复制" }: { text: string; label?: string }
     <button type="button" aria-label={label} title={label}
       onClick={() => { copyText(text); setDone(true); window.setTimeout(() => setDone(false), 1200); }}
       className="inline-flex size-7 items-center justify-center rounded-full text-chat-faint hover:bg-bubble hover:text-chat-text">
-      {done ? <Check size={14} /> : <Copy size={14} />}
+      {done ? <Ok size={14} /> : <Copy size={14} />}
     </button>
   );
 }
@@ -25,11 +27,11 @@ export const Markdown = memo(function Markdown({ text, className }: { text: stri
 });
 
 export function ToolStatus({ status }: { status: string }) {
-  if (status === "running" || status === "pending") return <Loader2 size={15} className="spin shrink-0 text-chat-text-2" />;
-  if (status === "error") return <X size={15} className="shrink-0 text-error" />;
-  if (status === "warning") return <AlertTriangle size={15} className="shrink-0 text-warning" />;
+  if (status === "running" || status === "pending") return <Spinner size={15} className="shrink-0 text-chat-text-2" />;
+  if (status === "error") return <QoderError size={15} className="shrink-0 text-error" />;
+  if (status === "warning") return <QoderWarning size={15} className="shrink-0 text-warning" />;
   if (status === "unverified") return <Info size={15} className="shrink-0 text-chat-faint" />;
-  return <Check size={15} className="shrink-0 text-chat-success" />;
+  return <QoderCheck size={15} className="shrink-0 text-chat-success" />;
 }
 
 export function Attachments({ items }: { items: Attachment[] }) {
@@ -40,7 +42,7 @@ export function Attachments({ items }: { items: Attachment[] }) {
         <img key={item.url} src={item.url} alt={item.name || "图片"} className="squircle max-h-40 max-w-[220px] rounded-xl object-cover" />
       ) : (
         <span key={item.url} className="squircle inline-flex max-w-[240px] items-center gap-1.5 rounded-xl bg-code px-2.5 py-1.5 text-[12.5px] text-chat-text-2">
-          <FileText size={14} className="shrink-0" /><span className="truncate">{item.name || item.url.substring(item.url.lastIndexOf("/") + 1)}</span>
+          <File size={14} className="shrink-0" /><span className="truncate">{item.name || item.url.substring(item.url.lastIndexOf("/") + 1)}</span>
         </span>
       ))}
     </div>
@@ -101,10 +103,10 @@ export const TranscriptRowView = memo(function TranscriptRowView({ row, onOpenGr
       return (
         <button type="button" onClick={() => onOpenGroup(row)}
           className="group my-1 flex w-full items-center gap-2 rounded-xl py-1.5 text-left text-[14px] text-chat-text-2 hover:text-chat-text">
-          {row.kind === "tool-group" ? <ToolStatus status={row.status} /> : <FileText size={15} className="shrink-0" />}
+          {row.kind === "tool-group" ? <ToolStatus status={row.status} /> : <File size={15} className="shrink-0" />}
           <span className="shrink-0 font-medium">{row.title}</span>
           {(row.subtitle || row.meta) && <span className="min-w-0 truncate text-chat-faint">{row.subtitle || row.meta}</span>}
-          <ChevronRight size={15} className="ml-auto shrink-0 opacity-60 group-hover:opacity-100" />
+          <QoderChevron size={15} className="ml-auto shrink-0 opacity-60 group-hover:opacity-100" />
         </button>
       );
     case "tool":
@@ -113,13 +115,13 @@ export const TranscriptRowView = memo(function TranscriptRowView({ row, onOpenGr
           <ToolStatus status={row.status} />
           <span className="shrink-0 font-medium">{row.title}</span>
           <span className="min-w-0 truncate font-mono text-[12.5px] text-chat-faint">{row.subtitle}</span>
-          <ChevronRight size={15} className="ml-auto shrink-0 opacity-60" />
+          <QoderChevron size={15} className="ml-auto shrink-0 opacity-60" />
         </button>
       );
     case "note":
       return (
         <div className={cx("flex items-center justify-center gap-1.5 py-1.5 text-center text-[12.5px]", row.status === "error" ? "text-error" : "text-chat-faint")}>
-          {row.status === "running" && <Loader2 size={12} className="spin" />}
+          {row.status === "running" && <Spinner size={12} />}
           <span>{row.title}{row.text && ` · ${row.text}`}</span>
           {row.target && <button type="button" className="text-primary" onClick={() => onOpenChild(row.target!)}>查看</button>}
         </div>
@@ -135,7 +137,7 @@ export const TranscriptRowView = memo(function TranscriptRowView({ row, onOpenGr
     case "error":
       return (
         <div className="squircle my-2 flex gap-2 rounded-2xl bg-error-subtle px-3.5 py-2.5 text-[14px] text-error">
-          <AlertTriangle size={16} className="mt-0.5 shrink-0" /><span className="[overflow-wrap:anywhere]">{row.text}</span>
+          <QoderWarning size={16} className="mt-0.5 shrink-0" /><span className="[overflow-wrap:anywhere]">{row.text}</span>
         </div>
       );
     case "meta":
@@ -172,11 +174,11 @@ export function DetailRows({ rows, onOpenChild }: { rows: TranscriptRow[]; onOpe
       case "diff-file":
         items.push(
           <button key={row.key} type="button" onClick={() => toggle(row.key)} className="flex w-full items-center gap-2 py-2.5 text-left text-[14px]">
-            {row.kind === "diff-file" ? <FileText size={15} className="shrink-0 text-chat-text-2" /> : <ToolStatus status={row.kind === "reasoning" && row.status !== "running" ? "completed" : row.status} />}
+            {row.kind === "diff-file" ? <File size={15} className="shrink-0 text-chat-text-2" /> : <ToolStatus status={row.kind === "reasoning" && row.status !== "running" ? "completed" : row.status} />}
             <span className="shrink-0 font-medium">{row.title}</span>
             <span className="min-w-0 flex-1 truncate font-mono text-[12.5px] text-chat-faint">{[row.subtitle, ...row.args].filter(Boolean).join(" ")}</span>
             {row.target && <span role="button" tabIndex={0} className="shrink-0 text-[12.5px] text-primary" onClick={(event) => { event.stopPropagation(); onOpenChild(row.target!); }}>打开子会话</span>}
-            <ChevronRight size={15} className={cx("shrink-0 text-chat-faint transition-transform", open.has(row.key) && "rotate-90")} />
+            <QoderChevron size={15} className={cx("shrink-0 text-chat-faint transition-transform", open.has(row.key) && "rotate-90")} />
           </button>,
         );
         if (row.attachments.length > 0 && open.has(row.key)) items.push(<div key={`${row.key}:files`} className="pl-7"><Attachments items={row.attachments} /></div>);

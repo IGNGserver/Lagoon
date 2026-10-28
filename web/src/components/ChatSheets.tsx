@@ -1,4 +1,4 @@
-import { ChevronLeft, File, Folder, Search } from "lucide-react";
+import { Back, File, Folder, Search } from "@/components/icons";
 import { useEffect, useRef, useState } from "react";
 import { enc, errorText, get, serverPath, sessionPath } from "@/api/http";
 import type { FileChange, FileContent, FileNode, Session, TaskState } from "@/api/types";
@@ -194,7 +194,7 @@ export function FilesSheet({ open, onOpenChange, serverId, directory, sessionId,
       {file ? (
         <div>
           <div className="mb-2 flex items-center gap-1">
-            <IconButton icon={ChevronLeft} label="返回列表" tone="chat" onClick={() => setFile(null)} />
+            <IconButton icon={Back} label="返回列表" tone="chat" onClick={() => setFile(null)} />
             <span className="min-w-0 flex-1 truncate font-mono text-[13px] text-chat-text-2">{file}</span>
           </div>
           <Status loading={content.loading} error={content.error} empty={false} reload={content.reload} emptyText="" />

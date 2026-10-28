@@ -1,4 +1,4 @@
-import { ArchiveRestore } from "lucide-react";
+import { UnarchiveIcon } from "@/components/icons";
 import { setArchived } from "@/components/SessionDialogs";
 import { StatusGlyph } from "@/components/StatusGlyph";
 import { Empty, IconButton, PageHeader } from "@/components/ui";
@@ -28,7 +28,7 @@ export function ArchivedPage() {
                   </span>
                 </button>
                 {server.capabilities.restore && server.connected && (
-                  <IconButton icon={ArchiveRestore} label="取消归档" className="mr-2" onClick={() => void setArchived(server.serverId, session.id, false)} />
+                  <IconButton icon={UnarchiveIcon} label="取消归档" className="mr-2" onClick={() => void setArchived(server.serverId, session.id, false)} />
                 )}
               </div>
             ))}

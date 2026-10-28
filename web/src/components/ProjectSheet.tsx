@@ -1,4 +1,6 @@
-import { ChevronLeft, Folder, FolderPlus, LayoutGrid, MoreHorizontal, Search, Trash2 } from "lucide-react";
+import {
+  AddFolder, Back, Delete, Folder, GridView, More, Search,
+} from "@/components/icons";
 import { useEffect, useMemo, useState } from "react";
 import { del, enc, errorText, get, post, serverPath } from "@/api/http";
 import type { FileNode, ServerView } from "@/api/types";
@@ -37,7 +39,7 @@ export function ProjectSheet({ open, onOpenChange }: { open: boolean; onOpenChan
           {all.length > 1 && (
             <button type="button" onClick={() => choose(null, null)}
               className={cx("squircle flex w-full items-center gap-3 rounded-2xl px-4 py-3.5 text-left", homeServer == null ? "bg-primary-subtle text-primary" : "bg-surface-2")}>
-              <LayoutGrid size={20} /> <span className="flex-1 text-[16px]">全部服务器</span>
+              <GridView size={20} /> <span className="flex-1 text-[16px]">全部服务器</span>
             </button>
           )}
           {shown.map((server) => {
@@ -62,7 +64,7 @@ export function ProjectSheet({ open, onOpenChange }: { open: boolean; onOpenChan
                   ))}
                   <button type="button" disabled={!server.connected} onClick={() => setBrowsing(server)}
                     className="flex w-full items-center gap-3 px-4 py-3.5 text-left text-primary disabled:opacity-45">
-                    <FolderPlus size={20} /><span className="text-[15.5px]">添加项目</span>
+                    <AddFolder size={20} /><span className="text-[15.5px]">添加项目</span>
                   </button>
                 </div>
               </section>
@@ -88,8 +90,8 @@ function ProjectRow({ label, detail, count, selected, onClick, onRemove }: {
         <span className="text-[13px] text-text-2">{count}</span>
       </button>
       {onRemove && (
-        <Menu trigger={<IconButton icon={MoreHorizontal} label="项目操作" className="mr-1" />}
-          sections={[{ items: [{ label: "从列表移除", icon: Trash2, danger: true, onSelect: onRemove }] }]} />
+        <Menu trigger={<IconButton icon={More} label="项目操作" className="mr-1" />}
+          sections={[{ items: [{ label: "从列表移除", icon: Delete, danger: true, onSelect: onRemove }] }]} />
       )}
     </div>
   );
@@ -156,7 +158,7 @@ function DirectoryBrowser({ server, onBack, onAdded }: { server: ServerView; onB
   return (
     <div className="space-y-3">
       <div className="flex items-center gap-1">
-        <IconButton icon={ChevronLeft} label="返回项目列表" onClick={onBack} />
+        <IconButton icon={Back} label="返回项目列表" onClick={onBack} />
         <div className="scroll-area flex min-w-0 flex-1 items-center gap-0.5 overflow-x-auto whitespace-nowrap text-[13.5px]">
           {path && crumbs(path).map(([label, target], index) => (
             <span key={target} className="flex items-center">
