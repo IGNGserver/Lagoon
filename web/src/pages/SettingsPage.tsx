@@ -7,7 +7,7 @@ import { StatusDot } from "@/components/StatusGlyph";
 import { Button, ConfirmDialog, ListGroup, ListItem, PageHeader, SegmentedControl, Sheet, Spinner, Switch, TextField } from "@/components/ui";
 import { importLink, keySummary } from "@/lib/clientAccess";
 import { serverEditPath, back, navigate } from "@/lib/router";
-import { canInstall, currentSubscription, disablePush, enablePush, install, isIos, isStandalone, onInstallChange, pushSupport, testPush } from "@/lib/pwa";
+import { canInstall, currentSubscription, disablePush, enablePush, getNotifiedServers, install, isIos, isStandalone, onInstallChange, pushSupport, setServerNotified, testPush } from "@/lib/pwa";
 import { useShallow } from "zustand/react/shallow";
 import { servers as serverList, useStore, type ThemeMode } from "@/store";
 
@@ -181,10 +181,12 @@ function ClientKeySheet({ onClose }: { onClose: () => void }) {
 }
 
 function PushSettings() {
+  const all = useStore(useShallow(serverList));
   const support = pushSupport();
   const toast = useStore((state) => state.toast);
   const [subscribed, setSubscribed] = useState<boolean | null>(null);
   const [busy, setBusy] = useState(false);
+  const [notifiedMap, setNotifiedMap] = useState<Record<string, boolean>>(() => getNotifiedServers());
   useEffect(() => { void currentSubscription().then((it) => setSubscribed(it != null)).catch(() => setSubscribed(false)); }, []);
   const permission = "Notification" in window ? Notification.permission : "default";
 
@@ -193,7 +195,13 @@ function PushSettings() {
   else if (support === "needs-install") footer = "iPhone / iPad 需要先在 Safari 中「分享 → 添加到主屏幕」，再从主屏幕打开 Lagoon 开启推送。";
   else if (support === "unsupported") footer = "当前浏览器不支持网页推送。";
   else if (permission === "denied") footer = "通知权限已被拒绝，请在系统或浏览器设置中允许本站通知。";
+  else if (subscribed && all.length > 0) footer = "针对当前浏览器/PWA应用配置接收哪些服务器的推送。开启后，任务完成、失败或等待处理时会在此设备弹出通知。";
   else footer = "任务完成、失败，或等待授权、等待回答时推送到本设备。中枢需要能访问浏览器厂商的推送服务。";
+
+  const toggleServer = (serverId: string, on: boolean) => {
+    setServerNotified(serverId, on);
+    setNotifiedMap({ ...notifiedMap, [serverId]: on });
+  };
 
   return (
     <ListGroup title="推送通知" footer={footer}>
@@ -209,6 +217,36 @@ function PushSettings() {
           }
         }} />
       )} />
+      {subscribed && all.length > 0 && (
+        <>
+          <div className="px-4 pt-3 pb-1 text-[12px] font-medium tracking-wider text-text-3 uppercase">
+            允许通知的服务器与 Harness
+          </div>
+          {all.map((server) => {
+            const isNotified = notifiedMap[server.serverId] !== false;
+            const harnessLabel = server.profile.kind === "dsh" ? "DeepSeek Harness" : "OpenCode";
+            return (
+              <ListItem
+                key={server.serverId}
+                title={(
+                  <span className="flex items-center gap-2">
+                    <StatusDot tone={server.connected && server.streamConnected ? "ok" : server.connected || server.loading ? "busy" : "off"} />
+                    {server.profile.name}
+                  </span>
+                )}
+                summary={`${harnessLabel}${server.version && server.version !== "DeepSeek Harness" ? ` ${server.version}` : ""} · ${server.profile.url}`}
+                trailing={(
+                  <Switch
+                    checked={isNotified}
+                    label={`接收 ${server.profile.name} 的通知`}
+                    onChange={(on) => toggleServer(server.serverId, on)}
+                  />
+                )}
+              />
+            );
+          })}
+        </>
+      )}
       {subscribed && <ListItem title="发送测试推送" onClick={async () => {
         try { await testPush(); toast("已发送，稍等片刻"); } catch (error) { toast(errorText(error), "error"); }
       }} />}

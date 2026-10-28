@@ -24,7 +24,6 @@ export function ServerEditorPage({ id }: { id: string | null }) {
   const [allowCleartext, setAllowCleartext] = useState(existing?.allowCleartext ?? false);
   const [clientUrl, setClientUrl] = useState(existing?.clientUrl ?? "");
   const [autoConnect, setAutoConnect] = useState(existing?.autoConnect ?? true);
-  const [notifications, setNotifications] = useState(existing?.notifications ?? true);
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
@@ -34,7 +33,7 @@ export function ServerEditorPage({ id }: { id: string | null }) {
   useEffect(() => {
     if (!existing) return;
     setKind(existing.kind); setName(existing.name); setUrl(existing.url); setUsername(existing.kind === "opencode" ? existing.username : "opencode");
-    setDshAuth(existing.dshAuth); setAllowCleartext(existing.allowCleartext); setAutoConnect(existing.autoConnect); setNotifications(existing.notifications);
+    setDshAuth(existing.dshAuth); setAllowCleartext(existing.allowCleartext); setAutoConnect(existing.autoConnect);
     setClientUrl(existing.clientUrl ?? "");
   }, [existing?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -65,7 +64,7 @@ export function ServerEditorPage({ id }: { id: string | null }) {
     setResult(null);
     const profile: Partial<ServerProfile> = {
       name: name.trim() || (dsh ? "DeepSeek Harness" : "OpenCode"), url: url.trim().replace(/\/+$/, ""), username: dsh ? "dsh" : username.trim() || "opencode",
-      kind, dshAuth: dsh ? dshAuth : "token", allowCleartext: http && allowCleartext, autoConnect, notifications,
+      kind, dshAuth: dsh ? dshAuth : "token", allowCleartext: http && allowCleartext, autoConnect, notifications: existing?.notifications ?? true,
       clientUrl: clientUrl.trim().replace(/\/+$/, ""),
     };
     const body = { profile, ...(secret || !existing ? { secret: dsh ? secret.trim() : secret } : {}) };
@@ -128,7 +127,6 @@ export function ServerEditorPage({ id }: { id: string | null }) {
           <ListGroup className="mt-6">
             {http && <ListItem title="允许明文连接" summary="HTTP 不加密，凭据与消息在网络中可见；只在可信局域网中开启" trailing={<Switch checked={allowCleartext} onChange={setAllowCleartext} label="允许明文连接" />} />}
             <ListItem title="自动连接" summary="中枢常驻监控这台服务器；关闭后只在网页打开它时连接" trailing={<Switch checked={autoConnect} onChange={setAutoConnect} label="自动连接" />} />
-            <ListItem title="推送通知" summary="任务完成、失败或等待处理时推送" trailing={<Switch checked={notifications} onChange={setNotifications} label="推送通知" />} />
           </ListGroup>
           {result && <p className="mx-5 mb-3 text-[14px] text-error">{result}</p>}
           <div className="mx-4 space-y-3">
