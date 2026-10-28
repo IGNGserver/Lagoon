@@ -120,19 +120,22 @@ export function setBadge(count: number): void {
 }
 
 let waitingWorker: ServiceWorker | null = null;
+let updateRequested = false;
 const updateListeners = new Set<() => void>();
 export const updateReady = () => waitingWorker != null;
 export const onUpdateReady = (listener: () => void) => { updateListeners.add(listener); return () => { updateListeners.delete(listener); }; };
 export function applyUpdate(): void {
+  updateRequested = true;
   waitingWorker?.postMessage({ type: "skip-waiting" });
 }
 
 /** Registers the service worker; a new release waits until the user chooses to reload. */
 export function registerServiceWorker(): void {
   if (!("serviceWorker" in navigator) || !window.isSecureContext || import.meta.env.DEV) return;
+  const hadController = Boolean(navigator.serviceWorker.controller);
   let reloading = false;
   navigator.serviceWorker.addEventListener("controllerchange", () => {
-    if (reloading) return;
+    if (!hadController || !updateRequested || reloading) return;
     reloading = true;
     window.location.reload();
   });

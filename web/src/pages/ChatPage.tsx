@@ -37,7 +37,18 @@ export function ChatPage({ serverId, sessionId }: { serverId: string; sessionId:
   const [deleting, setDeleting] = useState(false);
   const [references, setReferences] = useState<string[]>([]);
 
-  const session = server?.sessions.find((it) => it.id === sessionId) ?? fetched;
+  const resolved = server?.sessions.find((it) => it.id === sessionId) ?? fetched;
+  const lastSession = useRef<Session | null>(resolved);
+  if (lastSession.current?.id !== sessionId) {
+    lastSession.current = resolved;
+  } else if (resolved) {
+    lastSession.current = resolved;
+  }
+  const session = resolved ?? (lastSession.current?.id === sessionId ? lastSession.current : null);
+
+  const lastServer = useRef<typeof server>(server);
+  if (server) lastServer.current = server;
+  const activeServer = server ?? lastServer.current;
 
   // Sessions outside the live catalog (children, older history) are read once.
   useEffect(() => {
@@ -108,17 +119,17 @@ export function ChatPage({ serverId, sessionId }: { serverId: string; sessionId:
     try { await post(`${sessionPath(serverId, sessionId)}/abort`); } catch (error) { toast(errorText(error), "error"); }
   }
 
-  if (!server) {
+  if (!activeServer) {
     return loaded ? <Missing text="服务器不存在或已移除" /> : <div className="flex h-full items-center justify-center bg-chat"><Spinner size={22} /></div>;
   }
   if (!session) {
     return missing ? <Missing text="会话尚未加载或已关闭" /> : <div className="flex h-full items-center justify-center bg-chat"><Spinner size={22} /></div>;
   }
 
-  const caps = server.capabilities;
+  const caps = activeServer.capabilities;
   const pinned = pinnedIds?.includes(session.id) ?? false;
-  const status = session.parentId ? null : statusOf(server, session.id);
-  const project = resolveSessionProject(session, server.projects);
+  const status = session.parentId ? null : statusOf(activeServer, session.id);
+  const project = resolveSessionProject(session, activeServer.projects);
   const menu: { items: MenuItem[] }[] = [
     { items: [
       { label: "子任务", icon: SubtaskIcon, onSelect: () => setSheet("children") },
@@ -144,10 +155,10 @@ export function ChatPage({ serverId, sessionId }: { serverId: string; sessionId:
     ] },
   ];
 
-  const offlineHint = !server.connected ? "离线 · 草稿保留，恢复连接后可发送" : server.cached ? "消息未同步，刷新后可发送" : null;
+  const offlineHint = !activeServer.connected ? "离线 · 草稿保留，恢复连接后可发送" : activeServer.cached ? "消息未同步，刷新后可发送" : null;
   const subtitle = [
     status && status !== "NONE" ? STATUS_LABELS[status] : working ? "运行中" : null,
-    server.profile.name,
+    activeServer.profile.name,
     project?.name,
   ].filter(Boolean).join(" · ");
 
@@ -179,7 +190,7 @@ export function ChatPage({ serverId, sessionId }: { serverId: string; sessionId:
             <Spinner size={12} />后台{familyShells.length > 0 ? ` · ${familyShells.length} 个命令` : ""} · 查看
           </button>}
           <Composer serverId={serverId} draftKey={draftKey(serverId, sessionId)} choiceKey={choiceKey(serverId, sessionId)} choices={choices}
-            ready={server.connected && !server.cached} offlineHint={offlineHint} running={working} defaultAgent={defaultAgent} defaultModel={defaultModel}
+            ready={activeServer.connected && !activeServer.cached} offlineHint={offlineHint} running={working} defaultAgent={defaultAgent} defaultModel={defaultModel}
             references={references} onRemoveReference={(path) => setReferences((current) => current.filter((it) => it !== path))}
             onServerFile={() => setSheet("files")} onSubmit={submit} onStop={stop} />
         </>}
@@ -192,7 +203,7 @@ export function ChatPage({ serverId, sessionId }: { serverId: string; sessionId:
         onReference={(path) => setReferences((current) => (current.includes(path) ? current : [...current, path]))} />
       <ChangesSheet open={sheet === "changes"} onOpenChange={(open) => !open && setSheet(null)} serverId={serverId} sessionId={session.id} />
       <ChildrenSheet open={sheet === "children"} onOpenChange={(open) => !open && setSheet(null)} serverId={serverId} sessionId={session.id}
-        tasks={server.tasks} shells={familyShells} onOpen={openChild}
+        tasks={activeServer.tasks} shells={familyShells} onOpen={openChild}
         onShell={(value) => { setShell(value); setSheet("shell"); }} />
       <ShellOutputSheet open={sheet === "shell"} onOpenChange={(open) => { if (!open) { setSheet(null); setShell(null); } }} serverId={serverId} shell={shell} />
       {renaming && <RenameDialog serverId={serverId} session={session} onClose={() => setRenaming(false)} />}

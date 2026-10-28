@@ -64,7 +64,14 @@ export function Composer({ serverId, draftKey, choiceKey, choices, ready, offlin
   useEffect(() => { setChoice(readLocal<Choice>(choiceKey, { agent: null, model: null })); }, [choiceKey]);
   useEffect(() => {
     const timer = window.setTimeout(() => writeLocal(draftKey, text), 300);
-    return () => window.clearTimeout(timer);
+    const flush = () => writeLocal(draftKey, text);
+    window.addEventListener("beforeunload", flush);
+    document.addEventListener("visibilitychange", flush);
+    return () => {
+      window.clearTimeout(timer);
+      window.removeEventListener("beforeunload", flush);
+      document.removeEventListener("visibilitychange", flush);
+    };
   }, [text, draftKey]);
 
   const updateChoice = (next: Choice) => { setChoice(next); writeLocal(choiceKey, next.agent || next.model ? next : null); };

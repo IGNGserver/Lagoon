@@ -173,7 +173,7 @@ export function HomePage() {
       {current && !searching && <ConnectionHint server={current} />}
 
       <div className="scroll-area min-h-0 flex-1 pb-28">
-        {!loaded ? (
+        {!loaded && all.length === 0 ? (
           <div className="flex justify-center py-16"><Spinner size={22} /></div>
         ) : all.length === 0 ? (
           <Empty title="还没有服务器" detail="添加一台运行 OpenCode 或 DeepSeek Harness 的开发机，中枢会替你保持连接。"
