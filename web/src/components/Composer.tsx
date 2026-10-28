@@ -1,4 +1,6 @@
-import { ArrowUp, Bot, ChevronDown, FileText, FolderOpen, Image as ImageIcon, Paperclip, Plus, Square, X } from "lucide-react";
+import {
+  AgentIcon, AttachmentIcon, ChevronForward, Close, File, Folder, Image as MiuixImage, QoderPlus, QoderSend, QoderStop,
+} from "@/components/icons";
 import { useEffect, useRef, useState, type ClipboardEvent, type KeyboardEvent } from "react";
 import type { ModelChoice } from "@/api/types";
 import { importFile, type PendingAttachment } from "@/lib/attachments";
@@ -123,22 +125,22 @@ export function Composer({ serverId, draftKey, choiceKey, choices, ready, offlin
 
   const attachButton = (
     <Menu align="start" trigger={<button type="button" aria-label="添加图片或文件" disabled={sending}
-      className="inline-flex size-10 shrink-0 items-center justify-center rounded-full text-chat-text hover:bg-bubble disabled:opacity-40"><Plus size={22} /></button>}
+      className="inline-flex size-10 shrink-0 items-center justify-center rounded-full text-chat-text hover:bg-bubble disabled:opacity-40"><QoderPlus size={22} /></button>}
       sections={[{ items: [
-        { label: "图片", icon: ImageIcon, onSelect: () => imageInput.current?.click() },
-        { label: "本机文件", icon: Paperclip, onSelect: () => fileInput.current?.click() },
-        ...(onServerFile ? [{ label: "服务器文件", icon: FolderOpen, onSelect: onServerFile }] : []),
+        { label: "图片", icon: MiuixImage, onSelect: () => imageInput.current?.click() },
+        { label: "本机文件", icon: AttachmentIcon, onSelect: () => fileInput.current?.click() },
+        ...(onServerFile ? [{ label: "服务器文件", icon: Folder, onSelect: onServerFile }] : []),
       ] }]} />
   );
   const sendButton = running && !hasContent && onStop ? (
     <button type="button" aria-label="停止" disabled={stopping} onClick={async () => { setStopping(true); await onStop(); setStopping(false); }}
       className="inline-flex size-10 shrink-0 items-center justify-center rounded-full bg-code text-chat-text">
-      {stopping ? <Spinner size={16} /> : <Square size={14} fill="currentColor" />}
+      {stopping ? <Spinner size={16} /> : <QoderStop size={14} />}
     </button>
   ) : (
     <button type="button" aria-label="发送" disabled={!canSend} onClick={send}
       className={cx("inline-flex size-10 shrink-0 items-center justify-center rounded-full transition-colors", canSend ? "bg-chat-text text-chat" : "bg-code text-chat-faint")}>
-      {sending ? <Spinner size={16} /> : <ArrowUp size={20} strokeWidth={2.2} />}
+      {sending ? <Spinner size={16} /> : <QoderSend size={20} />}
     </button>
   );
 
@@ -182,7 +184,7 @@ export function Composer({ serverId, draftKey, choiceKey, choices, ready, offlin
           <div className="flex items-center gap-1 pt-0.5">
             {attachButton}
             <div className="flex min-w-0 flex-1 items-center gap-1.5">
-              <Pill onClick={() => setAgentPicker(true)}><Bot size={15} className="shrink-0" /><span className="truncate">{agentLabel}</span></Pill>
+              <Pill onClick={() => setAgentPicker(true)}><AgentIcon size={15} className="shrink-0" /><span className="truncate">{agentLabel}</span></Pill>
               <Pill onClick={() => setModelPicker(true)} className="min-w-0"><span className="truncate">{model?.label ?? "模型"}</span>
                 {model?.variant && <span className="shrink-0 text-chat-faint">· {modelInfo?.variants.find((it) => it.id === model.variant)?.label ?? model.variant}</span>}</Pill>
             </div>
@@ -202,7 +204,7 @@ export function Composer({ serverId, draftKey, choiceKey, choices, ready, offlin
 function Pill({ children, onClick, className }: { children: React.ReactNode; onClick: () => void; className?: string }) {
   return (
     <button type="button" onClick={onClick} className={cx("squircle inline-flex h-8 max-w-[45%] items-center gap-1 rounded-full bg-bubble px-3 text-[13px] text-chat-text", className)}>
-      {children}<ChevronDown size={13} className="shrink-0 text-chat-faint" />
+      {children}<ChevronForward size={13} className="shrink-0 rotate-90 text-chat-faint" />
     </button>
   );
 }
@@ -210,7 +212,7 @@ function Pill({ children, onClick, className }: { children: React.ReactNode; onC
 function Chip({ name, detail, onRemove }: { name: string; detail: string; onRemove: () => void }) {
   return (
     <span className="squircle relative inline-flex h-14 shrink-0 items-center gap-2 rounded-xl bg-bubble px-3 pr-6">
-      <FileText size={18} className="text-chat-text-2" />
+      <File size={18} className="text-chat-text-2" />
       <span className="flex flex-col">
         <span className="max-w-36 truncate text-[13px] text-chat-text">{name}</span>
         <span className="text-[11.5px] text-chat-text-2">{detail}</span>
@@ -223,7 +225,7 @@ function Chip({ name, detail, onRemove }: { name: string; detail: string; onRemo
 function RemoveBadge({ onClick }: { onClick: () => void }) {
   return (
     <button type="button" aria-label="移除" onClick={onClick} className="absolute -right-1 -top-1 inline-flex size-5 items-center justify-center rounded-full bg-chat-text text-chat">
-      <X size={12} />
+      <Close size={12} />
     </button>
   );
 }

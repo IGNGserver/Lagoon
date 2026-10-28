@@ -1,4 +1,6 @@
-import { Archive, ArchiveRestore, ArrowDown, Copy, FileDiff, Folder, GitFork, ListTree, MoreHorizontal, Pencil, Pin, PinOff, Trash2, Undo2 } from "lucide-react";
+import {
+  ArchiveIcon, Copy, Delete, DiffIcon, Folder, ForkIcon, More, Pin, QoderDown, Rename, SubtaskIcon, Undo, UnarchiveIcon, Unpin,
+} from "@/components/icons";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { enc, errorText, get, post, sessionPath } from "@/api/http";
 import { live } from "@/api/live";
@@ -119,26 +121,26 @@ export function ChatPage({ serverId, sessionId }: { serverId: string; sessionId:
   const project = resolveSessionProject(session, server.projects);
   const menu: { items: MenuItem[] }[] = [
     { items: [
-      { label: "子任务", icon: ListTree, onSelect: () => setSheet("children") },
-      ...(caps.diff ? [{ label: "改动", icon: FileDiff, onSelect: () => setSheet("changes") }] : []),
+      { label: "子任务", icon: SubtaskIcon, onSelect: () => setSheet("children") },
+      ...(caps.diff ? [{ label: "改动", icon: DiffIcon, onSelect: () => setSheet("changes") }] : []),
       { label: "文件", icon: Folder, onSelect: () => setSheet("files") },
     ] },
     { items: [
-      { label: pinned ? "取消置顶" : "置顶", icon: pinned ? PinOff : Pin, onSelect: () => updateUi((ui) => {
+      { label: pinned ? "取消置顶" : "置顶", icon: pinned ? Unpin : Pin, onSelect: () => updateUi((ui) => {
         const list = ui.pinned?.[serverId] ?? [];
         return { ...ui, pinned: { ...ui.pinned, [serverId]: pinned ? list.filter((it) => it !== session.id) : [session.id, ...list] } };
       }) },
-      ...(caps.rename ? [{ label: "重命名", icon: Pencil, onSelect: () => setRenaming(true) }] : []),
-      ...(caps.fork ? [{ label: "分叉", icon: GitFork, onSelect: async () => {
+      ...(caps.rename ? [{ label: "重命名", icon: Rename, onSelect: () => setRenaming(true) }] : []),
+      ...(caps.fork ? [{ label: "分叉", icon: ForkIcon, onSelect: async () => {
         try {
           const result = await post<{ session: Session }>(`${sessionPath(serverId, session.id)}/fork`);
           navigate(chatPath(serverId, result.session.id));
         } catch (error) { toast(errorText(error), "error"); }
       } }] : []),
-      ...(caps.archive && !session.archived ? [{ label: "归档", icon: Archive, onSelect: async () => { if (await setArchived(serverId, session.id, true)) back(); } }] : []),
-      ...(caps.archive && caps.restore && session.archived ? [{ label: "取消归档", icon: ArchiveRestore, onSelect: () => void setArchived(serverId, session.id, false) }] : []),
+      ...(caps.archive && !session.archived ? [{ label: "归档", icon: ArchiveIcon, onSelect: async () => { if (await setArchived(serverId, session.id, true)) back(); } }] : []),
+      ...(caps.archive && caps.restore && session.archived ? [{ label: "取消归档", icon: UnarchiveIcon, onSelect: () => void setArchived(serverId, session.id, false) }] : []),
       { label: "复制会话链接", icon: Copy, onSelect: () => { void navigator.clipboard?.writeText(window.location.href); toast("已复制"); } },
-      ...(caps.delete ? [{ label: "删除", icon: Trash2, danger: true, onSelect: () => setDeleting(true) }] : []),
+      ...(caps.delete ? [{ label: "删除", icon: Delete, danger: true, onSelect: () => setDeleting(true) }] : []),
     ] },
   ];
 
@@ -152,10 +154,10 @@ export function ChatPage({ serverId, sessionId }: { serverId: string; sessionId:
   return (
     <div className="flex h-full min-h-0 flex-col bg-chat text-chat-text">
       <PageHeader title={displayTitle(session)} subtitle={subtitle} onBack={() => back()} className="bg-chat"
-        actions={<Menu trigger={<IconButton icon={MoreHorizontal} label="会话操作" tone="chat" />} sections={menu} />} />
+        actions={<Menu trigger={<IconButton icon={More} label="会话操作" tone="chat" />} sections={menu} />} />
       {session.revertMessageId && caps.unrevert && (
         <div className="flex items-center gap-2 bg-warning-subtle px-4 py-2 text-[13px] text-warning">
-          <Undo2 size={15} /><span className="flex-1">已撤销部分消息</span>
+          <Undo size={15} /><span className="flex-1">已撤销部分消息</span>
           <Button size="sm" variant="ghost" onClick={async () => {
             try { await post(`${sessionPath(serverId, session.id)}/unrevert`); } catch (error) { toast(errorText(error), "error"); }
           }}>恢复撤销</Button>
@@ -301,7 +303,7 @@ function Timeline({ rows, loading, error, hasOlder, loadingOlder, onLoadOlder, o
       {!atBottom && (
         <button type="button" aria-label="回到底部" onClick={() => { const element = scroller.current; if (element) { stick.current = true; element.scrollTo({ top: element.scrollHeight, behavior: "smooth" }); } }}
           className={cx("absolute bottom-3 left-1/2 inline-flex size-10 -translate-x-1/2 items-center justify-center rounded-full bg-sheet text-chat-text shadow-md ring-1 ring-divider")}>
-          <ArrowDown size={18} />
+          <QoderDown size={18} />
         </button>
       )}
     </div>

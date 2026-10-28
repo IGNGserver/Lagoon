@@ -1,4 +1,4 @@
-import { AlertCircle, Info } from "lucide-react";
+import { Info } from "@/components/icons";
 import type { SessionStatus } from "@/api/types";
 import { Spinner, cx } from "./ui";
 
@@ -12,7 +12,7 @@ export function StatusGlyph({ status, unseen }: { status: SessionStatus; unseen:
       return <Info size={18} className="text-text-2" />;
     case "WAITING_PERMISSION":
     case "WAITING_QUESTION":
-      return <AlertCircle size={18} className="text-warning" />;
+      return <Info size={18} className="text-warning" />;
     case "FAILED":
       return <span className="block size-2 rounded-full bg-error" />;
     default:

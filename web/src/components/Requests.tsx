@@ -1,4 +1,4 @@
-import { AlertCircle, ShieldAlert } from "lucide-react";
+import { Info, QoderWarning } from "@/components/icons";
 import { useMemo, useState } from "react";
 import { enc, errorText, post, serverPath } from "@/api/http";
 import type { PermissionRequest, QuestionPrompt, QuestionRequest } from "@/api/types";
@@ -29,7 +29,7 @@ export function PermissionCard({ serverId, request }: { serverId: string; reques
   return (
     <div className={cx("squircle rounded-[22px] p-4", dangerous ? "bg-warning-subtle" : "bg-sheet")}>
       <div className="flex items-center gap-2 text-[13px]">
-        <ShieldAlert size={16} className="text-warning" />
+        <QoderWarning size={16} className="text-warning" />
         <span className="font-medium text-warning">{dangerous ? "需确认关键操作" : "等待操作授权"}</span>
         <span className="ml-auto font-semibold text-primary">{request.action || "操作"}</span>
       </div>
@@ -131,7 +131,7 @@ export function QuestionCard({ serverId, request }: { serverId: string; request:
 
   return (
     <div className="squircle rounded-[22px] bg-sheet p-4">
-      <div className="flex items-center gap-2 text-[13px] font-medium text-warning"><AlertCircle size={16} />需要你的回答
+      <div className="flex items-center gap-2 text-[13px] font-medium text-warning"><Info size={16} />需要你的回答
         {visible.length > 1 && <span className="ml-auto font-normal text-chat-text-2">第 {currentPage + 1}/{visible.length} 项</span>}
       </div>
       {question == null ? (

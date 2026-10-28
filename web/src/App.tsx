@@ -1,4 +1,4 @@
-import { MessageSquare, RefreshCw, X } from "lucide-react";
+import { Close, Messages, Refresh } from "@/components/icons";
 import { useEffect, useState } from "react";
 import { get, onUnauthorized } from "@/api/http";
 import { live } from "@/api/live";
@@ -91,7 +91,7 @@ const routeKey = (route: Route) => route.name === "chat" ? `chat:${route.serverI
 function Placeholder() {
   return (
     <div className="flex h-full flex-col items-center justify-center gap-3 bg-chat text-chat-faint">
-      <MessageSquare size={40} strokeWidth={1.4} />
+      <Messages size={40} />
       <p className="text-[15px]">选择一个会话，或新建会话</p>
     </div>
   );
@@ -116,7 +116,7 @@ function Toasts() {
         <div key={toast.id} role="status" className={cx("squircle fade-in pointer-events-auto flex max-w-[min(92vw,480px)] items-start gap-2 rounded-2xl px-4 py-3 text-[14px] shadow-lg",
           toast.level === "error" ? "bg-error text-white dark:text-black" : "bg-text text-bg")}>
           <span className="flex-1 [overflow-wrap:anywhere]">{toast.message}</span>
-          <button type="button" aria-label="关闭" onClick={() => dismiss(toast.id)} className="opacity-70"><X size={16} /></button>
+          <button type="button" aria-label="关闭" onClick={() => dismiss(toast.id)} className="opacity-70"><Close size={16} /></button>
         </div>
       ))}
     </div>
@@ -129,7 +129,7 @@ function UpdatePrompt() {
   if (!ready) return null;
   return (
     <div className="squircle fade-in fixed left-1/2 top-[calc(12px+var(--safe-top))] z-[60] flex -translate-x-1/2 items-center gap-3 rounded-full bg-surface px-4 py-2 text-[14px] shadow-lg ring-1 ring-divider">
-      <RefreshCw size={16} className="text-primary" />新版本已就绪
+      <Refresh size={16} className="text-primary" />新版本已就绪
       <Button size="sm" onClick={applyUpdate}>刷新</Button>
     </div>
   );

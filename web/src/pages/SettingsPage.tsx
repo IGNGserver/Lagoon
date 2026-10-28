@@ -1,4 +1,6 @@
-import { Bell, Download, KeyRound, LogOut, Monitor, Plus, Server, ShieldCheck, Smartphone, TabletSmartphone } from "lucide-react";
+import {
+  Add, Alarm, CloudFill, Download, Lock, Ok, Phone, QoderComputer, Reset,
+} from "@/components/icons";
 import { useEffect, useState } from "react";
 import { del, enc, errorText, get, post, put } from "@/api/http";
 import { live } from "@/api/live";
@@ -39,11 +41,11 @@ export function SettingsPage() {
         <div className="mx-auto max-w-[680px]">
           <ListGroup title="服务器">
             {all.map((server) => (
-              <ListItem key={server.serverId} icon={Server} title={<span className="flex items-center gap-2"><StatusDot tone={server.connected && server.streamConnected ? "ok" : server.connected || server.loading ? "busy" : "off"} />{server.profile.name}</span>}
+              <ListItem key={server.serverId} icon={CloudFill} title={<span className="flex items-center gap-2"><StatusDot tone={server.connected && server.streamConnected ? "ok" : server.connected || server.loading ? "busy" : "off"} />{server.profile.name}</span>}
                 summary={`${server.profile.kind === "dsh" ? "DeepSeek Harness" : "OpenCode"}${server.version && server.version !== "DeepSeek Harness" ? ` ${server.version}` : ""} · ${server.profile.url}`}
                 chevron onClick={() => navigate(serverEditPath(server.serverId))} />
             ))}
-            <ListItem icon={Plus} title="添加服务器" summary="OpenCode 地址 / pair 链接，或 DeepSeek Harness 启动链接" chevron onClick={() => navigate(serverEditPath(null))} />
+            <ListItem icon={Add} title="添加服务器" summary="OpenCode 地址 / pair 链接，或 DeepSeek Harness 启动链接" chevron onClick={() => navigate(serverEditPath(null))} />
           </ListGroup>
 
           <ClientAccessSettings />
@@ -76,9 +78,9 @@ export function SettingsPage() {
           <TlsSettings auth={auth} />
 
           <ListGroup title="安全" footer={auth?.passwordFromEnv ? "访问密码由环境变量 LAGOON_PASSWORD 管理，修改需要更新部署配置。" : undefined}>
-            {!auth?.passwordFromEnv && <ListItem icon={KeyRound} title="修改访问密码" chevron onClick={() => setPassword(true)} />}
-            <ListItem icon={ShieldCheck} title="退出所有设备" summary="包括本设备，所有浏览器都需要重新登录" onClick={() => setRevoke(true)} />
-            <ListItem icon={LogOut} title="退出登录" danger onClick={async () => {
+            {!auth?.passwordFromEnv && <ListItem icon={Lock} title="修改访问密码" chevron onClick={() => setPassword(true)} />}
+            <ListItem icon={Ok} title="退出所有设备" summary="包括本设备，所有浏览器都需要重新登录" onClick={() => setRevoke(true)} />
+            <ListItem icon={Reset} title="退出登录" danger onClick={async () => {
               await post("/auth/logout").catch(() => undefined);
               live.stop();
               useStore.getState().setAuth({ ...auth!, authenticated: false });
@@ -121,9 +123,9 @@ function ClientAccessSettings() {
       <ListGroup title="客户端接入" footer="在 Lagoon Android 客户端「设置 → 从中枢导入」粘贴导入链接，即可一次导入这里的全部服务器（含凭据）。导入内容用密钥加密，HTTP 访问也不会在网络上暴露凭据；密钥与访问密码一样敏感，不用了请吊销。">
         {keys == null && <ListItem title="正在读取…" trailing={<Spinner />} />}
         {keys?.map((key) => (
-          <ListItem key={key.id} icon={TabletSmartphone} title={key.label} summary={keySummary(key)} onClick={() => setRevoking(key)} />
+          <ListItem key={key.id} icon={Phone} title={key.label} summary={keySummary(key)} onClick={() => setRevoking(key)} />
         ))}
-        <ListItem icon={Plus} title="新建接入密钥" summary="为一台设备生成导入链接" chevron onClick={() => setCreating(true)} />
+        <ListItem icon={Add} title="新建接入密钥" summary="为一台设备生成导入链接" chevron onClick={() => setCreating(true)} />
       </ListGroup>
       {creating && <ClientKeySheet onClose={() => { setCreating(false); void load(); }} />}
       <ConfirmDialog open={revoking != null} onOpenChange={(open) => !open && setRevoking(null)} title={`吊销「${revoking?.label ?? ""}」？`}
@@ -205,7 +207,7 @@ function PushSettings() {
 
   return (
     <ListGroup title="推送通知" footer={footer}>
-      <ListItem icon={Bell} title="本设备接收推送" summary={subscribed ? "已开启" : "未开启"} trailing={busy ? <Spinner /> : (
+      <ListItem icon={Alarm} title="本设备接收推送" summary={subscribed ? "已开启" : "未开启"} trailing={busy ? <Spinner /> : (
         <Switch checked={!!subscribed} disabled={support !== "ok" || subscribed == null} label="本设备接收推送" onChange={async (on) => {
           setBusy(true);
           try {
@@ -261,19 +263,19 @@ function InstallSettings() {
   if (available) {
     return (
       <ListGroup title="安装应用" footer="安装后 Lagoon 会像普通应用一样从桌面或主屏幕打开。">
-        <ListItem icon={Monitor} title="安装 Lagoon" chevron onClick={() => void install()} />
+        <ListItem icon={QoderComputer} title="安装 Lagoon" chevron onClick={() => void install()} />
       </ListGroup>
     );
   }
   if (isIos()) {
     return (
       <ListGroup title="安装应用" footer={window.isSecureContext ? "在 Safari 中点「分享」→「添加到主屏幕」。从主屏幕打开后才能接收推送。" : "需要通过 HTTPS 打开中枢才能添加为应用。"}>
-        <ListItem icon={Smartphone} title="添加到主屏幕" />
+        <ListItem icon={Phone} title="添加到主屏幕" />
       </ListGroup>
     );
   }
   if (!window.isSecureContext) {
-    return <ListGroup title="安装应用" footer="安装为应用需要通过 HTTPS 访问中枢。"><ListItem icon={Monitor} title="当前为 HTTP 访问" /></ListGroup>;
+    return <ListGroup title="安装应用" footer="安装为应用需要通过 HTTPS 访问中枢。"><ListItem icon={QoderComputer} title="当前为 HTTP 访问" /></ListGroup>;
   }
   return null;
 }
@@ -284,7 +286,7 @@ function TlsSettings({ auth }: { auth: AuthStatus | null }) {
   return (
     <ListGroup title="HTTPS 证书" footer={`中枢使用自签名证书。下载并在每台设备上安装、信任这个证书后，用 ${httpsUrl} 打开即可安装应用和接收推送。iOS：设置 → 通用 → VPN 与设备管理 安装后，再到 通用 → 关于本机 → 证书信任设置 中开启完全信任。`}>
       <ListItem icon={Download} title="下载根证书" chevron onClick={() => { window.location.href = "/api/v1/tls/cert"; }} />
-      {!auth.secure && <ListItem icon={ShieldCheck} title="切换到 HTTPS 地址" summary={httpsUrl} chevron onClick={() => { window.location.href = httpsUrl; }} />}
+      {!auth.secure && <ListItem icon={Ok} title="切换到 HTTPS 地址" summary={httpsUrl} chevron onClick={() => { window.location.href = httpsUrl; }} />}
     </ListGroup>
   );
 }

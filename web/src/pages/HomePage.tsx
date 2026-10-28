@@ -1,4 +1,6 @@
-import { Archive, ChevronDown, ChevronRight, CheckCheck, LayoutGrid, MoreHorizontal, Pencil, Pin, PinOff, Plus, Search, Settings, Trash2, X } from "lucide-react";
+import {
+  Add, ArchiveIcon, ChevronForward, Close, Delete, GridView, More, Ok, Pin, Rename, Search, Settings, Unpin,
+} from "@/components/icons";
 import { useMemo, useState, type ReactNode } from "react";
 import { enc, errorText, get, post, serverPath } from "@/api/http";
 import type { ServerView, Session } from "@/api/types";
@@ -139,26 +141,26 @@ export function HomePage() {
             <Search size={18} className="text-text-2" />
             <input autoFocus value={query} onChange={(e) => setQuery(e.target.value)} placeholder="搜索会话标题或项目"
               className="min-w-0 flex-1 bg-transparent text-[16px] outline-none placeholder:text-text-3" />
-            {query && <button type="button" aria-label="清除" onClick={() => setQuery("")}><X size={16} className="text-text-2" /></button>}
+            {query && <button type="button" aria-label="清除" onClick={() => setQuery("")}><Close size={16} className="text-text-2" /></button>}
           </div>
           <Button variant="ghost" onClick={() => { setSearching(false); setQuery(""); }}>取消</Button>
         </div>
       ) : (
         <header className="safe-top flex min-h-16 items-center gap-1 px-3 pb-1 pt-2">
           <button type="button" onClick={() => setProjects(true)} className="flex min-w-0 flex-1 items-center gap-2.5 rounded-full px-2 py-1.5 text-left hover:bg-surface-2">
-            <LayoutGrid size={24} strokeWidth={1.8} className="shrink-0" />
+            <GridView size={24} className="shrink-0" />
             <span className="truncate text-[22px] font-medium">{title}</span>
-            <ChevronDown size={20} className="shrink-0" />
+            <ChevronForward size={20} className="shrink-0 rotate-90" />
           </button>
-          {unread && <Button variant="ghost" size="sm" onClick={markAllRead} className="shrink-0"><CheckCheck size={16} />全部已读</Button>}
-          <Menu trigger={<IconButton icon={MoreHorizontal} label="更多" />} sections={[
+          {unread && <Button variant="ghost" size="sm" onClick={markAllRead} className="shrink-0"><Ok size={16} />全部已读</Button>}
+          <Menu trigger={<IconButton icon={More} label="更多" />} sections={[
             { title: "分组方式", items: (Object.keys(GROUPING_LABELS) as HomeGrouping[]).map((value) => ({
               label: GROUPING_LABELS[value], checked: grouping === value, onSelect: () => updateUi((it) => ({ ...it, grouping: value })),
             })) },
             { title: "已读同步", items: visible.some((it) => it.canSyncRead && it.connected) ? [{ label: "同步服务端已读", onSelect: syncServerRead }] : [] },
             { items: [
               { label: "搜索", icon: Search, onSelect: () => setSearching(true) },
-              { label: "已归档", icon: Archive, onSelect: () => navigate("/archived") },
+              { label: "已归档", icon: ArchiveIcon, onSelect: () => navigate("/archived") },
               { label: "设置", icon: Settings, onSelect: () => navigate("/settings") },
             ] },
           ]} />
@@ -175,7 +177,7 @@ export function HomePage() {
           <div className="flex justify-center py-16"><Spinner size={22} /></div>
         ) : all.length === 0 ? (
           <Empty title="还没有服务器" detail="添加一台运行 OpenCode 或 DeepSeek Harness 的开发机，中枢会替你保持连接。"
-            action={<Button onClick={() => navigate(serverEditPath(null))}><Plus size={18} />添加服务器</Button>} />
+            action={<Button onClick={() => navigate(serverEditPath(null))}><Add size={18} />添加服务器</Button>} />
         ) : sections.length === 0 ? (
           <Empty title={query ? "没有符合条件的会话" : visible.some((it) => it.loading) ? "正在读取会话…" : visible.some((it) => it.connected) ? "暂无会话" : "尚未连接"}
             action={!query && visible.some((it) => it.connected) ? <Button variant="secondary" onClick={newSession}>新建会话</Button> : undefined} />
@@ -185,7 +187,7 @@ export function HomePage() {
             <div key={section.key}>
               <button type="button" onClick={() => toggleSection(section.key)} className="flex items-center gap-1 px-6 pb-1.5 pt-3 text-[13px] text-text-2">
                 {section.title}
-                <ChevronRight size={14} className={cx("transition-transform", !folded && "rotate-90")} />
+                <ChevronForward size={14} className={cx("transition-transform", !folded && "rotate-90")} />
               </button>
               {!folded && section.entries.map((entry) => (
                 <SessionRow key={entryKey(entry)} entry={entry} showServer={!current && all.length > 1} pinned={pinned(entry)}
@@ -212,7 +214,7 @@ export function HomePage() {
       {!searching && all.length > 0 && (
         <button type="button" onClick={newSession} aria-label="新建会话"
           className="squircle absolute bottom-[calc(24px+var(--safe-bottom))] right-6 flex size-14 items-center justify-center rounded-full bg-primary text-on-primary shadow-[0_8px_24px_rgba(52,130,255,0.4)] transition-transform active:scale-95">
-          <Plus size={28} />
+          <Add size={28} />
         </button>
       )}
 
@@ -243,7 +245,7 @@ function ServerChips({ all, homeServer }: { all: ServerView[]; homeServer: strin
         );
       })}
       <button type="button" aria-label="添加服务器" onClick={() => navigate(serverEditPath(null))} className={cx(chip, "bg-surface-2 px-3 text-text-2")}>
-        <Plus size={18} />{all.length === 0 && "添加服务器"}
+        <Add size={18} />{all.length === 0 && "添加服务器"}
       </button>
     </div>
   );
@@ -307,10 +309,10 @@ function SessionRow({ entry, showServer, pinned, active, onRename, onDelete, onT
   const background = server.backgroundRunning.includes(session.id);
   const caps = server.capabilities;
   const items: MenuItem[] = [
-    { label: pinned ? "取消置顶" : "置顶", icon: pinned ? PinOff : Pin, onSelect: onTogglePin },
-    ...(server.connected && caps.rename ? [{ label: "重命名", icon: Pencil, onSelect: onRename }] : []),
-    ...(server.connected && caps.archive ? [{ label: "归档", icon: Archive, onSelect: () => void setArchived(server.serverId, session.id, true) }] : []),
-    ...(server.connected && caps.delete ? [{ label: "删除", icon: Trash2, danger: true, onSelect: onDelete }] : []),
+    { label: pinned ? "取消置顶" : "置顶", icon: pinned ? Unpin : Pin, onSelect: onTogglePin },
+    ...(server.connected && caps.rename ? [{ label: "重命名", icon: Rename, onSelect: onRename }] : []),
+    ...(server.connected && caps.archive ? [{ label: "归档", icon: ArchiveIcon, onSelect: () => void setArchived(server.serverId, session.id, true) }] : []),
+    ...(server.connected && caps.delete ? [{ label: "删除", icon: Delete, danger: true, onSelect: onDelete }] : []),
   ];
   return (
     <div className={cx("row-pad group relative flex items-center", active && "bg-primary-subtle")}>
@@ -325,7 +327,7 @@ function SessionRow({ entry, showServer, pinned, active, onRename, onDelete, onT
         {label && <span className={cx("shrink-0 text-[12.5px]", isWaiting(status) ? "text-warning" : "text-text-2")}>{label}</span>}
       </button>
       <Menu open={menu} onOpenChange={setMenu} sections={[{ items }]}
-        trigger={<IconButton icon={MoreHorizontal} label="会话操作" className="mr-3 opacity-0 group-hover:opacity-100 focus:opacity-100 data-[state=open]:opacity-100 [@media(pointer:coarse)]:pointer-events-none" />} />
+        trigger={<IconButton icon={More} label="会话操作" className="mr-3 opacity-0 group-hover:opacity-100 focus:opacity-100 data-[state=open]:opacity-100 [@media(pointer:coarse)]:pointer-events-none" />} />
     </div>
   );
 }

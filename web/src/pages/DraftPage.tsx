@@ -1,4 +1,4 @@
-import { ChevronDown, Folder } from "lucide-react";
+import { ChevronForward, Folder } from "@/components/icons";
 import { useState } from "react";
 import { errorText, post, serverPath } from "@/api/http";
 import type { Session } from "@/api/types";
@@ -53,11 +53,11 @@ export function DraftPage({ serverId, projectId }: { serverId?: string; projectI
       <PageHeader title="新会话" onBack={() => back()} className="bg-chat" subtitle={
         <span className="inline-flex items-center gap-1">
           {all.length > 1 ? (
-            <Menu align="start" trigger={<button type="button" className="inline-flex items-center gap-0.5 text-primary">{server.profile.name}<ChevronDown size={13} /></button>}
+            <Menu align="start" trigger={<button type="button" className="inline-flex items-center gap-0.5 text-primary">{server.profile.name}<ChevronForward size={13} className="rotate-90" /></button>}
               sections={[{ items: all.map((it) => ({ label: it.profile.name, checked: it.serverId === server.serverId, onSelect: () => { setChosenServer(it.serverId); setChosenProject(null); } })) }]} />
           ) : server.profile.name}
           <span>·</span>
-          <button type="button" className="inline-flex items-center gap-0.5 text-primary" onClick={() => setProjects(true)}>{project?.name ?? "选择项目"}<ChevronDown size={13} /></button>
+          <button type="button" className="inline-flex items-center gap-0.5 text-primary" onClick={() => setProjects(true)}>{project?.name ?? "选择项目"}<ChevronForward size={13} className="rotate-90" /></button>
         </span>
       } />
       <div className="flex min-h-0 flex-1 flex-col items-center justify-center px-8 text-center">

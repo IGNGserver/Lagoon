@@ -1,8 +1,8 @@
 import * as Dialog from "@radix-ui/react-dialog";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import * as SwitchPrimitive from "@radix-ui/react-switch";
-import { Check, ChevronLeft, ChevronRight, X, type LucideIcon } from "lucide-react";
 import { forwardRef, useEffect, useRef, type ButtonHTMLAttributes, type InputHTMLAttributes, type ReactNode, type TextareaHTMLAttributes } from "react";
+import { Back, ChevronForward, Close, Ok, type IconComponent } from "./icons";
 
 export const cx = (...names: (string | false | null | undefined)[]) => names.filter(Boolean).join(" ");
 
@@ -35,7 +35,7 @@ export const Button = forwardRef<HTMLButtonElement, ButtonHTMLAttributes<HTMLBut
   },
 );
 
-export const IconButton = forwardRef<HTMLButtonElement, ButtonHTMLAttributes<HTMLButtonElement> & { icon: LucideIcon; label: string; tone?: "plain" | "filled" | "chat"; iconSize?: number }>(
+export const IconButton = forwardRef<HTMLButtonElement, ButtonHTMLAttributes<HTMLButtonElement> & { icon: IconComponent; label: string; tone?: "plain" | "filled" | "chat"; iconSize?: number }>(
   function IconButton({ icon: Icon, label, tone = "plain", iconSize = 20, className, ...props }, ref) {
     return (
       <button
@@ -50,7 +50,7 @@ export const IconButton = forwardRef<HTMLButtonElement, ButtonHTMLAttributes<HTM
         )}
         {...props}
       >
-        <Icon size={iconSize} strokeWidth={1.9} />
+        <Icon size={iconSize} />
       </button>
     );
   },
@@ -136,7 +136,7 @@ export function ListGroup({ title, children, footer, className }: { title?: Reac
 }
 
 export function ListItem({ title, summary, trailing, onClick, chevron, danger, icon: Icon, disabled }: {
-  title: ReactNode; summary?: ReactNode; trailing?: ReactNode; onClick?: () => void; chevron?: boolean; danger?: boolean; icon?: LucideIcon; disabled?: boolean;
+  title: ReactNode; summary?: ReactNode; trailing?: ReactNode; onClick?: () => void; chevron?: boolean; danger?: boolean; icon?: IconComponent; disabled?: boolean;
 }) {
   const content = (
     <>
@@ -146,7 +146,7 @@ export function ListItem({ title, summary, trailing, onClick, chevron, danger, i
         {summary && <span className="mt-0.5 block text-[13px] leading-snug text-text-2 [overflow-wrap:anywhere]">{summary}</span>}
       </span>
       {trailing}
-      {chevron && <ChevronRight size={18} className="shrink-0 text-text-3" />}
+      {chevron && <ChevronForward size={18} className="shrink-0 text-text-3" />}
     </>
   );
   const base = "flex w-full items-center gap-3 px-4 py-3.5 text-left min-h-[56px]";
@@ -164,7 +164,7 @@ export function PageHeader({ title, subtitle, onBack, actions, large, className 
   return (
     <header className={cx("safe-top sticky top-0 z-20 shrink-0 bg-inherit", className)}>
       <div className="flex min-h-14 items-center gap-1 px-2 py-1.5">
-        {onBack && <IconButton icon={ChevronLeft} label="返回" onClick={onBack} iconSize={24} />}
+        {onBack && <IconButton icon={Back} label="返回" onClick={onBack} iconSize={24} />}
         <div className={cx("min-w-0 flex-1", !onBack && "pl-3")}>
           {!large && <h1 className="truncate text-[17px] font-semibold">{title}</h1>}
           {!large && subtitle && <div className="truncate text-[12.5px] text-text-2">{subtitle}</div>}
@@ -208,7 +208,7 @@ export function Sheet({ open, onOpenChange, title, children, footer, wide, chat 
           <div className="flex items-center gap-2 px-5 pb-2 pt-3">
             <Dialog.Title className="min-w-0 flex-1 truncate text-[18px] font-semibold">{title}</Dialog.Title>
             <Dialog.Close asChild>
-              <IconButton icon={X} label="关闭" tone={chat ? "chat" : "plain"} />
+              <IconButton icon={Close} label="关闭" tone={chat ? "chat" : "plain"} />
             </Dialog.Close>
           </div>
           <div className="scroll-area min-h-0 flex-1 px-4 pb-4">{children}</div>
@@ -244,7 +244,7 @@ export function ConfirmDialog({ open, onOpenChange, title, message, confirm, dan
 
 export interface MenuItem {
   label: string;
-  icon?: LucideIcon;
+  icon?: IconComponent;
   danger?: boolean;
   checked?: boolean;
   disabled?: boolean;
@@ -281,7 +281,7 @@ export function Menu({ trigger, sections, align = "end", open, onOpenChange }: {
                 >
                   {item.icon && <item.icon size={18} className={item.danger ? "text-error" : "text-text-2"} />}
                   <span className="flex-1">{item.label}</span>
-                  {item.checked && <Check size={16} className="text-primary" />}
+                  {item.checked && <Ok size={16} className="text-primary" />}
                 </DropdownMenu.Item>
               ))}
             </DropdownMenu.Group>
