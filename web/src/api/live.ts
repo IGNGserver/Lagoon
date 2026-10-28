@@ -13,7 +13,6 @@ class LiveConnection {
   private streamId: string | null = null;
   private watched: { serverId: string; sessionId: string }[] = [];
   private failures = 0;
-  private hiddenAt = 0;
 
   start() {
     if (this.source) return;
@@ -85,12 +84,10 @@ class LiveConnection {
   /** Visibility decides whether open conversations count as read, and whether a stale stream is rebuilt. */
   handleVisibility() {
     if (document.visibilityState === "hidden") {
-      this.hiddenAt = Date.now();
       void this.sendWatch();
       return;
     }
-    const away = Date.now() - this.hiddenAt;
-    if (!this.source || this.source.readyState === EventSource.CLOSED || (this.hiddenAt > 0 && away > 30_000)) this.restart();
+    if (!this.source || this.source.readyState !== EventSource.OPEN) this.restart();
     else void this.sendWatch();
   }
 }
