@@ -1,4 +1,5 @@
 import { del, get, post } from "@/api/http";
+import { readLocal, writeLocal } from "@/lib/local";
 
 /** iPhone / iPad (iPadOS reports a Mac with touch). */
 export const isIos = () => /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.userAgent.includes("Macintosh") && navigator.maxTouchPoints > 1);
@@ -67,6 +68,32 @@ export async function testPush(): Promise<void> {
   await post("/push/test", { endpoint: subscription?.endpoint ?? "" });
 }
 
+const PUSH_SERVERS_KEY = "pushServers";
+
+/** Per-device server notification preferences. Absent means enabled by default. */
+export function getNotifiedServers(): Record<string, boolean> {
+  return readLocal<Record<string, boolean>>(PUSH_SERVERS_KEY, {});
+}
+
+export function isServerNotified(serverId: string): boolean {
+  const map = getNotifiedServers();
+  return map[serverId] !== false;
+}
+
+export function setServerNotified(serverId: string, enabled: boolean): void {
+  const current = getNotifiedServers();
+  const next = { ...current, [serverId]: enabled };
+  writeLocal(PUSH_SERVERS_KEY, next);
+  syncPushServersToWorker(next);
+}
+
+export function syncPushServersToWorker(servers = getNotifiedServers()): void {
+  if (!("serviceWorker" in navigator)) return;
+  const send = (worker: ServiceWorker | null) => worker?.postMessage({ type: "set-push-servers", servers });
+  send(navigator.serviceWorker.controller);
+  void navigator.serviceWorker.ready.then((reg) => send(reg.active));
+}
+
 /** Chrome's install prompt, captured when the browser offers it. */
 let installEvent: (Event & { prompt: () => Promise<void> }) | null = null;
 const installListeners = new Set<() => void>();
@@ -110,6 +137,7 @@ export function registerServiceWorker(): void {
     window.location.reload();
   });
   void navigator.serviceWorker.register("/sw.js", { scope: "/" }).then((registration) => {
+    syncPushServersToWorker();
     const track = (worker: ServiceWorker | null) => {
       if (!worker) return;
       worker.addEventListener("statechange", () => {

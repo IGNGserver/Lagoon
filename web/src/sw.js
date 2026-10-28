@@ -14,8 +14,14 @@ self.addEventListener("activate", (event) => {
   })());
 });
 
+let pushServers = {};
+
 self.addEventListener("message", (event) => {
   if (event.data && event.data.type === "skip-waiting") self.skipWaiting();
+  if (event.data && event.data.type === "set-push-servers") {
+    pushServers = event.data.servers || {};
+    event.waitUntil(caches.open("lagoon-prefs").then((cache) => cache.put("/local-prefs/push-servers", new Response(JSON.stringify(pushServers)))).catch(() => undefined));
+  }
 });
 
 self.addEventListener("fetch", (event) => {
@@ -47,6 +53,18 @@ self.addEventListener("push", (event) => {
     ? [{ action: "approve", title: "允许一次" }, { action: "reject", title: "拒绝" }]
     : [];
   event.waitUntil((async () => {
+    if (data.serverId) {
+      if (!pushServers || Object.keys(pushServers).length === 0) {
+        try {
+          const cache = await caches.open("lagoon-prefs");
+          const hit = await cache.match("/local-prefs/push-servers");
+          if (hit) pushServers = await hit.json();
+        } catch { /* ignore */ }
+      }
+      if (pushServers && pushServers[data.serverId] === false) {
+        return;
+      }
+    }
     if (typeof data.badge === "number" && self.navigator.setAppBadge) {
       try { if (data.badge > 0) await self.navigator.setAppBadge(data.badge); else await self.navigator.clearAppBadge(); } catch { /* unsupported */ }
     }
