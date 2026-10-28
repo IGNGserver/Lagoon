@@ -5,7 +5,7 @@ import org.junit.Test
 
 class TaskReconciliationTest {
   private val root = Session("root", "/repo", "Root", 200, idle = 200, outcome = "succeeded")
-  private val child = Session("child", "/repo", "Child", 210, parentId = "root", idle = 210)
+  private val child = Session("child", "/repo", "Child", 210, parentId = "root", idle = 210, outcome = "succeeded")
   private fun background(baseline: Long = -1) = TaskState("root", TaskPhase.THINKING,
     TaskState.RUNNING_DETAIL, since = 100, activeAt = baseline)
   private fun read(tasks: Map<String, TaskState>, sessions: List<Session> = listOf(root),

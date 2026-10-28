@@ -466,6 +466,9 @@ internal fun HomeSessionRow(session: Session, status: SessionStatus, unseen: Boo
        if (status == SessionStatus.WAITING_SERVER || status == SessionStatus.UNKNOWN) {
          Spacer(Modifier.width(8.dp))
          Text(status.label, style = MiuixTheme.textStyles.footnote1.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
+      } else if (status == SessionStatus.FAILED) {
+        Spacer(Modifier.width(8.dp))
+        Text(status.label, style = MiuixTheme.textStyles.footnote1.copy(color = MiuixColorTokens.Error))
       } else if (status == SessionStatus.WAITING_PERMISSION || status == SessionStatus.WAITING_QUESTION) {
         Spacer(Modifier.width(8.dp))
         Text(status.label, style = MiuixTheme.textStyles.footnote1.copy(color = MiuixColorTokens.Warning))

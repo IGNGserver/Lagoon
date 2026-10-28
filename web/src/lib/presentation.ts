@@ -51,7 +51,7 @@ export function resolveSessionProject(session: Session, projects: Project[]): Pr
 
 export const STATUS_LABELS: Record<SessionStatus, string> = {
   WAITING_PERMISSION: "等待授权", WAITING_QUESTION: "等待回答", WAITING_SERVER: "等待服务器处理", RUNNING: "运行中",
-  FAILED: "失败", COMPLETED: "已完成", UNKNOWN: "状态待确认", NONE: "",
+  FAILED: "错误", COMPLETED: "已完成", UNKNOWN: "状态待确认", NONE: "",
 };
 
 export const statusOf = (server: ServerView, sessionId: string): SessionStatus => server.statuses[sessionId] ?? "NONE";

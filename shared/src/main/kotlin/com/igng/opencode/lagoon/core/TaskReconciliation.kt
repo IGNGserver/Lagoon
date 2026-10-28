@@ -53,7 +53,7 @@ internal object TaskReconciliation {
         old.pendingInput && id in inbox.verified && !confirmedWork -> old.copy(phase = TaskPhase.WAITING_SERVER,
           detail = "等待服务器处理", uncertain = false)
         !verified -> old.copy(uncertain = true)
-        finished -> TaskReducer.terminal(id, session?.outcome, old)
+        finished -> TaskReducer.terminal(id, session.outcome, old)
         // No positive running claim and no usable terminal baseline: retain the retry hint, but
         // don't invent either completion or an indefinitely running foreground execution.
         else -> old.copy(uncertain = now - old.since >= 10_000 && old.phase in TaskState.RUNNING_PHASES)

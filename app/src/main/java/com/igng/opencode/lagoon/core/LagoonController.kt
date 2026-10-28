@@ -1062,7 +1062,10 @@ class LagoonController private constructor(private val appContext: Context) {
       .filter { id -> sessions.none { it.id == id } && state.value.sessions.none { it.id == id } }.distinct()
     // 本设备认为仍在运行、但既不在前台活跃集合、也不在本页目录里的会话：重新读取其会话信息，取得
     // 服务端持久化的 outcome/time.idle，用来给漏掉终止事件的一轮做权威收尾（含转入后台的子代理）。
-    val staleActiveIds = previousActiveIds.filter { id -> active.orEmpty().none { it == id } && sessions.none { it.id == id } }.distinct()
+    // 在 controlOnly 或目录未携带 outcome 时，正在收尾的根会话也重新拉取最新 outcome。
+    val staleActiveIds = previousActiveIds.filter { id ->
+      active.orEmpty().none { it == id } && (sessions.none { it.id == id } || sessions.firstOrNull { it.id == id }?.outcome == null)
+    }.distinct()
     val extraSessions = mutableListOf<Session>()
     val deletedSessions = mutableSetOf<String>()
     (missingIds + staleActiveIds).distinct().take(100).chunked(4).forEach { batch ->
@@ -1218,7 +1221,7 @@ class LagoonController private constructor(private val appContext: Context) {
       val nextShells = (keptShells + freshShells.mapValues { (_, job) -> job.copy(observedAt = now) })
         .filterValues { it.sessionId !in deletedSessions }
       val previousTasks = (previous.tasks + storedTasks.filter { (id, task) -> previous.tasks[id]?.let { old -> task.since > old.since || (task.finishedAt ?: 0) > (old.finishedAt ?: 0) } ?: true }) - deletedSessions
-      val nextSessions = (sessions + extraSessions + previous.sessions.filter {
+      val nextSessions = (extraSessions + sessions + previous.sessions.filter {
         // A session this device saw running, or one with an unread result, never silently drops out;
         // neither do rows loaded through “加载更多” while the catalog has more pages.
         it.id in active.orEmpty() || it.id == previous.sessionId || previousTasks[it.id]?.active == true ||
@@ -1280,7 +1283,7 @@ class LagoonController private constructor(private val appContext: Context) {
       val wasActive = SessionActivityRules.rootStates(previousTasks.filterValues { it.active }, parentMap)
       val isActive = SessionActivityRules.rootStates(states.filterValues { it.active }, parentMap)
       finishedRuns = if (active == null) emptyList() else nextSessions.filter { it.parentId == null && it.id in wasActive && it.id !in isActive }
-        .map { it to wasActive.getValue(it.id).since }
+        .map { (identities[it.id] ?: it) to wasActive.getValue(it.id).since }
       // Reconciliation keeps “加载更多” progress; a full refresh restarts paging from the first page.
       val cursors = if (controlOnly && previous.sessionCursors.isNotEmpty()) previous.sessionCursors.takeIf { page.next != null }.orEmpty()
         else listOfNotNull(page.next).associateBy { "" }
