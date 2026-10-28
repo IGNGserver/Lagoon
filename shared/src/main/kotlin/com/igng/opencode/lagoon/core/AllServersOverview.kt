@@ -364,12 +364,11 @@ internal class AllServersOverview(
                        snapshot = snapshot.copy(tasks = snapshot.tasks + (child to task), parents = snapshot.parents + (child to sessionId))
                      }
                      BackgroundWork.completedSubagentId(event.type, props)?.let { child ->
-                       val outcome = when (props.obj("metadata").str("state")) {
-                         "error" -> "failed"; "cancelled" -> "interrupted"; "completed" -> "succeeded"; else -> null
-                       }
-                       val settled = TaskReducer.terminal(child, outcome, snapshot.tasks[child]) ?: return@let
                        waitingRevision++
-                       snapshot = snapshot.copy(tasks = snapshot.tasks + (child to settled))
+                       snapshot = snapshot.copy(tasks = snapshot.tasks + (child to TaskReducer.terminal(child,
+                         when (props.obj("metadata").str("state")) {
+                           "error" -> "failed"; "cancelled" -> "interrupted"; else -> "succeeded"
+                         }, snapshot.tasks[child])))
                      }
                     snapshot = reconcileWaiting(snapshot, resolvedSessions, resolvedFormSessions = resolvedFormSessions)
                     val session = snapshot.sessions.firstOrNull { it.id == sessionId }

@@ -21,16 +21,6 @@ class TaskReconciliationTest {
     }
   }
 
-  @Test fun anIdleReadWithoutAnOutcomeStaysUncertainInsteadOfCompleting() {
-    val missing = read(mapOf("root" to background()), sessions = listOf(root.copy(outcome = null)))
-    assertTrue(missing.getValue("root").active)
-    assertTrue(missing.getValue("root").uncertain)
-    assertEquals(TaskPhase.THINKING, missing.getValue("root").phase)
-    val failed = read(mapOf("root" to background()), sessions = listOf(root.copy(outcome = "failed")))
-    assertEquals(TaskPhase.FAILED, failed.getValue("root").phase)
-    assertFalse(failed.getValue("root").active)
-  }
-
   @Test fun childrenSettleBeforeParentsRegardlessOfInsertionOrder() {
     val states = read(linkedMapOf("root" to background(), "child" to TaskState("child", TaskPhase.SUBAGENT)), listOf(root, child))
     assertFalse(states.getValue("root").active)
@@ -155,7 +145,7 @@ class TaskReconciliationTest {
 
   @Test fun obsoleteCachedTerminalChildrenDoNotBlockACompleteFreshSweep() {
     val cached = child.copy(idle = 1)
-    val states = TaskReconciliation.reconcile(mapOf("root" to background(), "child" to TaskReducer.terminal("child", "succeeded", null)!!),
+    val states = TaskReconciliation.reconcile(mapOf("root" to background(), "child" to TaskReducer.terminal("child", "succeeded", null)),
       listOf(root, cached), emptySet(), emptyMap(), mapOf("child" to "root"), setOf("root"), setOf("/repo"))
     assertFalse(states.getValue("root").active)
   }
