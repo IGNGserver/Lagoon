@@ -322,8 +322,9 @@ class OpenCodeApiTest {
     // 不在前台活跃集合（active miss）不等于本轮结束：后台任务可能仍在跑。
     assertEquals(TaskPhase.TESTING, TaskReducer.status("id", false, tool).phase)
     // 服务端 time.idle 越过本轮基线时才是权威结束（对账兜底）。
-    val completed = TaskReducer.terminal("id", "succeeded", tool)
+    val completed = TaskReducer.terminal("id", "succeeded", tool)!!
     assertEquals(TaskPhase.COMPLETED, completed.phase)
+    assertNull(TaskReducer.terminal("id", null, tool))
     assertEquals(TaskPhase.COMPLETED, TaskReducer.status("id", false, completed).phase)
     assertEquals(TaskPhase.THINKING, TaskReducer.status("id", true, completed).phase)
   }

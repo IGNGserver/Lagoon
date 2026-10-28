@@ -44,7 +44,7 @@ class SessionExperienceTest {
     // 不在 /api/session/active 不等于本轮结束：后台任务仍在跑时保留运行态。
     assertEquals(running, TaskReducer.status("s", false, running))
     // 服务端 time.idle 越过本轮起点时才权威收尾，且保留运行起点。
-    val completed = TaskReducer.terminal("s", "succeeded", running)
+    val completed = TaskReducer.terminal("s", "succeeded", running)!!
     assertEquals(10L, completed.since)
     assertEquals(15L, completed.finishedAt)
     // 前台读取仍会保留“等待输入”的粘性。

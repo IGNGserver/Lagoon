@@ -46,6 +46,9 @@
       "previous": "COMPLETED", "expectedPhase": "COMPLETED" },
     { "name": "streaming text does not change the phase",
       "type": "session.text.delta", "data": { "sessionID": "s", "assistantMessageID": "msg_a", "ordinal": 0, "delta": "x" },
-      "previous": "TOOL", "expectedPhase": "TOOL" }
+      "previous": "TOOL", "expectedPhase": "TOOL" },
+    { "name": "a provider error is not the turn outcome",
+      "type": "session.error", "data": { "sessionID": "s", "error": { "name": "ProviderError", "message": "boom" } },
+      "previous": "THINKING", "expectedPhase": "THINKING" }
   ]
 }

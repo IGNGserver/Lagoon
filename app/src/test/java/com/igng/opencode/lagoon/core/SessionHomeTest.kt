@@ -80,6 +80,22 @@ class SessionHomeTest {
     assertNull(event.resultNotice(root.copy(parentId = "parent")))
     assertNull(event.copy(type = "session.execution.interrupted").resultNotice(root))
     assertNull(event.copy(type = "session.created").resultNotice(root))
+    assertNull(event.copy(type = "session.error").resultNotice(root))
+  }
+
+  @Test fun anAuthoritativeReadRecordsOnlyAKnownSucceededOrFailedOutcome() {
+    val idle = Session("root", "/repo", "Root", 1, idle = 200)
+    assertNull(idle.transitionNotice(100))
+    assertNull(idle.copy(outcome = "interrupted").transitionNotice(100))
+    assertNull(idle.copy(outcome = "unknown").transitionNotice(100))
+    assertNull(idle.copy(parentId = "parent", outcome = "failed").transitionNotice(100))
+    assertFalse(idle.copy(outcome = "succeeded").transitionNotice(100)!!.error)
+    val failed = idle.copy(outcome = "failed").transitionNotice(100)!!
+    assertTrue(failed.error)
+    // A later successful turn must not inherit the previous failure.
+    assertFalse(idle.copy(outcome = "succeeded").transitionNotice(300)!!.error)
+    assertEquals("错误", SessionStatus.FAILED.label)
+    assertEquals("状态待确认", SessionStatus.UNKNOWN.label)
   }
 
   @Test fun sessionCreatedAcceptsNestedInfoAndKeepsTheChildParentChain() {

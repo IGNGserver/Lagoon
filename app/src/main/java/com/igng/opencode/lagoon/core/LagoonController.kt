@@ -1679,10 +1679,11 @@ class LagoonController private constructor(private val appContext: Context) {
     // Apply this after transcript projection so the completion notice prevents the history-derived
     // fallback above from immediately recreating the child task.
     BackgroundWork.completedSubagentId(event.type, props)?.let { child ->
-      mutable.update { current -> withSummary(current.copy(tasks = current.tasks + (child to
-        TaskReducer.terminal(child, when (props.obj("metadata").str("state")) {
-          "error" -> "failed"; "cancelled" -> "interrupted"; else -> "succeeded"
-        }, current.tasks[child])))) }
+      val outcome = when (props.obj("metadata").str("state")) {
+        "error" -> "failed"; "cancelled" -> "interrupted"; "completed" -> "succeeded"; else -> null
+      }
+      val settled = TaskReducer.terminal(child, outcome, mutable.value.tasks[child]) ?: return@let
+      mutable.update { current -> withSummary(current.copy(tasks = current.tasks + (child to settled))) }
     }
   }
 

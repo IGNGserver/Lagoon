@@ -20,12 +20,18 @@ internal fun ServerEvent.resultNotice(session: Session, now: Long = System.curre
 
 /**
  * Mobile compensation for the volatile event stream: this device saw the root's family running (since
- * [runSince]) and an authoritative read now shows it idle. V2's `outcome` tells success from failure;
- * an interrupted run produces nothing, like the official V2 client.
+ * [runSince]) and an authoritative read now shows it idle. Only a persisted `succeeded` or `failed`
+ * outcome is a result. An empty or unknown outcome is not success, and an interrupted run produces
+ * nothing, matching the official client's `outcome === "failed"` check.
  */
 internal fun Session.transitionNotice(runSince: Long, now: Long = System.currentTimeMillis()): SessionNotice? {
-  if (parentId != null || outcome == "interrupted") return null
-  return SessionNotice("run:$id:$runSince", id, now, outcome == "failed")
+  if (parentId != null) return null
+  val failure = when (outcome) {
+    "failed" -> true
+    "succeeded" -> false
+    else -> return null
+  }
+  return SessionNotice("run:$id:$runSince", id, now, failure)
 }
 
 /** True when a notice for the same run (any source) is already in the ledger. */

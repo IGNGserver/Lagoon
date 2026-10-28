@@ -466,16 +466,19 @@ object TaskReducer {
   /**
    * 用服务端持久化的 `outcome` 收尾一轮：对账兜底，覆盖断线期间漏掉的终止事件。
    * [TaskState.activeAt] 是服务端时间，与会话自身的 `time.idle` 同源，因此不受手机与服务器时钟差影响。
+   * 空或未知的 `outcome` 不是成功：调用方必须先确认结局，否则保持待确认，不能记成已完成。
    */
-  fun terminal(sessionId: String, outcome: String?, previous: TaskState?): TaskState {
+  fun terminal(sessionId: String, outcome: String?, previous: TaskState?): TaskState? {
     val since = previous?.since ?: System.currentTimeMillis()
     val finishedAt = previous?.activeAt?.takeIf { it > 0 } ?: System.currentTimeMillis()
     val pendingInput = previous?.pendingInput == true
-    return when (outcome) {
-      "failed" -> TaskState(sessionId, TaskPhase.FAILED, "执行失败", since, finishedAt, pendingInput = pendingInput)
-      "interrupted" -> TaskState(sessionId, TaskPhase.ABORTED, "任务已停止", since, finishedAt, pendingInput = pendingInput)
-      else -> TaskState(sessionId, TaskPhase.COMPLETED, "任务已完成", since, finishedAt, pendingInput = pendingInput)
+    val phase = when (outcome) {
+      "failed" -> TaskPhase.FAILED to "执行失败"
+      "interrupted" -> TaskPhase.ABORTED to "任务已停止"
+      "succeeded" -> TaskPhase.COMPLETED to "任务已完成"
+      else -> return null
     }
+    return TaskState(sessionId, phase.first, phase.second, since, finishedAt, pendingInput = pendingInput)
   }
 
   private fun running(sessionId: String, phase: TaskPhase, previous: TaskState?, since: Long, at: Long): TaskState? =
@@ -516,8 +519,9 @@ object TaskReducer {
         else -> previous
       }
       "session.idle" -> idle(sessionId, previous)
-      "session.error" -> TaskState(sessionId, TaskPhase.FAILED,
-        properties.errorMessage().ifBlank { "执行失败" }, since, at)
+      // A provider/runtime error is not the turn's outcome. Official lists a failure only from
+      // `session.execution.failed` or a persisted `outcome === "failed"`.
+      "session.error" -> null
       // 服务端“后台工作尚未完成”的合成消息只影响时间线，不再改变根会话的执行状态。
       "session.synthetic" -> null
       "permission.asked" -> waiting(sessionId, TaskPhase.WAITING_PERMISSION, "等待权限确认", previous, since)

@@ -305,7 +305,7 @@ function SessionRow({ entry, showServer, pinned, active, onRename, onDelete, onT
   const unseen = server.notices.some((it) => it.sessionId === session.id && !it.viewed);
   const highlighted = unseen || isWaiting(status);
   const press = useLongPress(() => setMenu(true));
-  const label = status === "WAITING_SERVER" || status === "UNKNOWN" || isWaiting(status) ? STATUS_LABELS[status] : null;
+  const label = status === "WAITING_SERVER" || status === "UNKNOWN" || status === "FAILED" || isWaiting(status) ? STATUS_LABELS[status] : null;
   const background = server.backgroundRunning.includes(session.id);
   const caps = server.capabilities;
   const items: MenuItem[] = [
@@ -324,7 +324,7 @@ function SessionRow({ entry, showServer, pinned, active, onRename, onDelete, onT
           {showServer && <span className="block truncate text-[12px] text-text-2">{server.profile.name}</span>}
         </span>
         {background && status !== "RUNNING" && <span aria-label="后台还有任务" className="size-2 shrink-0 rounded-full border border-text-3/40" />}
-        {label && <span className={cx("shrink-0 text-[12.5px]", isWaiting(status) ? "text-warning" : "text-text-2")}>{label}</span>}
+        {label && <span className={cx("shrink-0 text-[12.5px]", status === "FAILED" ? "text-error" : isWaiting(status) ? "text-warning" : "text-text-2")}>{label}</span>}
       </button>
       <Menu open={menu} onOpenChange={setMenu} sections={[{ items }]}
         trigger={<IconButton icon={More} label="会话操作" className="mr-3 opacity-0 group-hover:opacity-100 focus:opacity-100 data-[state=open]:opacity-100 [@media(pointer:coarse)]:pointer-events-none" />} />

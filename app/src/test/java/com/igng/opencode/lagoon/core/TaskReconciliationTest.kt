@@ -5,7 +5,7 @@ import org.junit.Test
 
 class TaskReconciliationTest {
   private val root = Session("root", "/repo", "Root", 200, idle = 200, outcome = "succeeded")
-  private val child = Session("child", "/repo", "Child", 210, parentId = "root", idle = 210)
+  private val child = Session("child", "/repo", "Child", 210, parentId = "root", idle = 210, outcome = "succeeded")
   private fun background(baseline: Long = -1) = TaskState("root", TaskPhase.THINKING,
     TaskState.RUNNING_DETAIL, since = 100, activeAt = baseline)
   private fun read(tasks: Map<String, TaskState>, sessions: List<Session> = listOf(root),
@@ -19,6 +19,16 @@ class TaskReconciliationTest {
       assertFalse(task.active)
       assertEquals(TaskPhase.COMPLETED, task.phase)
     }
+  }
+
+  @Test fun anIdleReadWithoutAnOutcomeStaysUncertainInsteadOfCompleting() {
+    val missing = read(mapOf("root" to background()), sessions = listOf(root.copy(outcome = null)))
+    assertTrue(missing.getValue("root").active)
+    assertTrue(missing.getValue("root").uncertain)
+    assertEquals(TaskPhase.THINKING, missing.getValue("root").phase)
+    val failed = read(mapOf("root" to background()), sessions = listOf(root.copy(outcome = "failed")))
+    assertEquals(TaskPhase.FAILED, failed.getValue("root").phase)
+    assertFalse(failed.getValue("root").active)
   }
 
   @Test fun childrenSettleBeforeParentsRegardlessOfInsertionOrder() {
@@ -145,7 +155,7 @@ class TaskReconciliationTest {
 
   @Test fun obsoleteCachedTerminalChildrenDoNotBlockACompleteFreshSweep() {
     val cached = child.copy(idle = 1)
-    val states = TaskReconciliation.reconcile(mapOf("root" to background(), "child" to TaskReducer.terminal("child", "succeeded", null)),
+    val states = TaskReconciliation.reconcile(mapOf("root" to background(), "child" to TaskReducer.terminal("child", "succeeded", null)!!),
       listOf(root, cached), emptySet(), emptyMap(), mapOf("child" to "root"), setOf("root"), setOf("/repo"))
     assertFalse(states.getValue("root").active)
   }
