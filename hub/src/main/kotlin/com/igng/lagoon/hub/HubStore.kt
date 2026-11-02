@@ -2,6 +2,7 @@ package com.igng.lagoon.hub
 
 import com.igng.opencode.lagoon.core.CatalogCache
 import com.igng.opencode.lagoon.core.Diagnostics
+import com.igng.opencode.lagoon.core.DshRemoteMigration
 import com.igng.opencode.lagoon.core.HubAccessKey
 import com.igng.opencode.lagoon.core.OverviewStore
 import com.igng.opencode.lagoon.core.PermissionPolicy
@@ -49,6 +50,8 @@ class HubStore(private val dataDir: Path, private val box: SecretBox, private va
   private class StoredTask(val task: TaskState, val observedAt: Long)
 
   private val lock = Any()
+  internal val dataDirectory: Path get() = dataDir
+  internal val secretBox: SecretBox get() = box
   private val profiles = mutableListOf<ServerProfile>()
   /** Sealed `{origin, username, password, cookie}` per server. */
   private val credentials = mutableMapOf<String, String>()
@@ -61,6 +64,7 @@ class HubStore(private val dataDir: Path, private val box: SecretBox, private va
   private val parents = mutableMapOf<String, MutableMap<String, String>>()
   private val notices = mutableMapOf<String, List<SessionNotice>>()
   private val catalogs = mutableMapOf<String, Pair<List<Project>, List<Session>>>()
+  private val remoteMigrations = mutableMapOf<String, DshRemoteMigration>()
   private var policy = PermissionPolicy()
   private var refresh = RefreshMode.FAST
   private var ui = JSONObject()
@@ -101,12 +105,31 @@ class HubStore(private val dataDir: Path, private val box: SecretBox, private va
     if (next.password.isEmpty() && next.cookie.isEmpty()) credentials.remove(profile.id)
     else credentials[profile.id] = box.seal(JSONObject().put("origin", credentialOrigin(profile.url)).put("username", next.username)
       .put("password", next.password).put("cookie", next.cookie).toString())
+    rememberRemoteMigration(profile)
+    persistNow()
+  }
+
+  /** Records that a direct DSH profile cannot be converted. Credentials, drafts and caches stay put. */
+  fun remoteMigration(id: String): DshRemoteMigration? = synchronized(lock) { remoteMigrations[id] }
+
+  private fun rememberRemoteMigration(profile: ServerProfile) {
+    val plan = DshRemoteMigration.plan(profile)
+    if (plan == null) remoteMigrations.remove(profile.id) else remoteMigrations[profile.id] = plan
+  }
+
+  /** Persist only public Remote device state; client credentials/private identity are per installation and never exported. */
+  fun saveRemoteHost(profile: ServerProfile) = synchronized(lock) {
+    require(profile.kind == com.igng.opencode.lagoon.core.ServerKind.DSH_REMOTE)
+    val index = profiles.indexOfFirst { it.id == profile.id }
+    if (index < 0) throw HttpError(404, "server-not-found", "服务器不存在")
+    profiles[index] = profile
     persistNow()
   }
 
   fun deleteServer(id: String) = synchronized(lock) {
     profiles.removeAll { it.id == id }
     credentials.remove(id); clientUrls.remove(id); projects.remove(id); tasks.remove(id); parents.remove(id); notices.remove(id); catalogs.remove(id)
+    remoteMigrations.remove(id)
     persistNow(); scheduleCatalog()
   }
 
@@ -405,6 +428,9 @@ class HubStore(private val dataDir: Path, private val box: SecretBox, private va
     })
     .put("parents", JSONObject().apply { parents.forEach { (id, map) -> put(id, JSONObject(map as Map<*, *>)) } })
     .put("notices", JSONObject().apply { notices.forEach { (id, list) -> put(id, Codec.array(list.map(Codec::notice))) } })
+    .put("remoteMigrations", JSONObject().apply {
+      remoteMigrations.forEach { (id, plan) -> put(id, JSONObject().put("retained", plan.retained).put("reason", plan.reason)) }
+    })
     .put("preferences", JSONObject().put("permissionPolicy", Codec.policy(policy)).put("refreshMode", refresh.name).put("ui", ui))
     .put("auth", JSONObject().putOpt("password", passwordHash).put("sessions", Codec.array(logins.values.map {
       JSONObject().put("hash", it.hash).put("created", it.created).put("lastSeen", it.lastSeen).put("label", it.label)
@@ -432,7 +458,7 @@ class HubStore(private val dataDir: Path, private val box: SecretBox, private va
   }
 
   private fun clearAll() {
-    instanceId = ""; profiles.clear(); credentials.clear(); clientUrls.clear(); clientKeys.clear(); projects.clear(); tasks.clear(); parents.clear(); notices.clear()
+    instanceId = ""; profiles.clear(); credentials.clear(); clientUrls.clear(); clientKeys.clear(); projects.clear(); tasks.clear(); parents.clear(); notices.clear(); remoteMigrations.clear()
     passwordHash = null; logins.clear(); vapidPublic = null; vapidPrivateSealed = null; subscriptions.clear()
     policy = PermissionPolicy(); refresh = RefreshMode.FAST; ui = JSONObject()
   }
@@ -478,6 +504,15 @@ class HubStore(private val dataDir: Path, private val box: SecretBox, private va
       }
     }
     json.optJSONObject("notices")?.let { map -> map.keys().forEach { notices[it] = Decode.notices(map.optJSONArray(it)).pruned(now) } }
+    profiles.forEach(::rememberRemoteMigration)
+    json.optJSONObject("remoteMigrations")?.let { map ->
+      map.keys().forEach { id ->
+        val item = map.optJSONObject(id) ?: return@forEach
+        val profile = profiles.firstOrNull { it.id == id } ?: return@forEach
+        val planned = DshRemoteMigration.plan(profile) ?: return@forEach
+        remoteMigrations[id] = planned.copy(retained = item.optBoolean("retained", true), reason = item.optString("reason").ifBlank { planned.reason })
+      }
+    }
     json.optJSONObject("preferences")?.let { prefs ->
       prefs.optJSONObject("permissionPolicy")?.let { policy = PermissionPolicy(it.optBoolean("hide"), it.optBoolean("autoApprove")) }
       refresh = RefreshMode.entries.firstOrNull { it.name == prefs.optString("refreshMode") } ?: RefreshMode.FAST

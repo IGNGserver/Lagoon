@@ -86,6 +86,11 @@ dependencies {
   implementation("org.commonmark:commonmark-ext-gfm-strikethrough:0.30.0")
   implementation("com.squareup.okhttp3:okhttp:4.12.0")
   implementation("com.squareup.okhttp3:okhttp-sse:4.12.0")
+  // MIT Noise implementation used for DSH Remote Protocol v1's fixed IK suite.
+  implementation("com.github.auties00:noise-java:1.2") {
+    // The published legacy POM declares JAXB for its old test tooling; Noise's runtime classes do not need it.
+    exclude(group = "javax.xml.bind", module = "jaxb-api")
+  }
   implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
   implementation("io.github.kyant0:shapes-android:1.2.0")
   implementation("top.yukonga.miuix.kmp:miuix-android:0.8.8")

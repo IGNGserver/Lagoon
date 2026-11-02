@@ -3,7 +3,7 @@
  * shared/src/main/kotlin (see hub Codec.kt), so this file reads like the Android code it mirrors.
  */
 
-export type ServerKind = "opencode" | "dsh";
+export type ServerKind = "opencode" | "dsh" | "dsh-remote";
 export type DshAuthMode = "token" | "secret";
 
 export interface ServerProfile {
@@ -16,6 +16,8 @@ export interface ServerProfile {
   allowCleartext: boolean;
   kind: ServerKind;
   dshAuth: DshAuthMode;
+  remoteHostId?: string | null;
+  remoteHostFingerprint?: string | null;
   hasSecret?: boolean;
   /** The address other clients (the Android app) use when the hub's own one only works inside its container. */
   clientUrl?: string;

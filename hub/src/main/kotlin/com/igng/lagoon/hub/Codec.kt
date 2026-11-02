@@ -41,17 +41,20 @@ object Codec {
     .put("id", profile.id).put("name", profile.name).put("url", profile.url).put("username", profile.username)
     .put("autoConnect", profile.autoConnect).put("notifications", profile.notifications)
     .put("allowCleartext", profile.allowCleartext).put("kind", profile.kind.wire).put("dshAuth", profile.dshAuth.wire)
+    .putOpt("remoteHostId", profile.remoteHostId).putOpt("remoteHostFingerprint", profile.remoteHostFingerprint)
 
   fun profileFrom(json: JSONObject, id: String): ServerProfile = ServerProfile(
     id = id,
     name = json.optString("name").trim(),
     url = json.optString("url").trim().trimEnd('/'),
-    username = json.optString("username").trim(),
+    username = json.optString("username").trim().ifBlank { if (ServerKind.fromWire(json.optString("kind")) == ServerKind.DSH_REMOTE) "" else "opencode" },
     autoConnect = json.optBoolean("autoConnect", true),
     notifications = json.optBoolean("notifications", true),
     allowCleartext = json.optBoolean("allowCleartext", false),
     kind = ServerKind.fromWire(json.optString("kind")),
-    dshAuth = DshAuthMode.fromWire(json.optString("dshAuth"))
+    dshAuth = DshAuthMode.fromWire(json.optString("dshAuth")),
+    remoteHostId = json.optString("remoteHostId").takeIf(String::isNotBlank),
+    remoteHostFingerprint = json.optString("remoteHostFingerprint").takeIf(String::isNotBlank)
   )
 
   fun model(model: ModelChoice?): Any = model?.let {

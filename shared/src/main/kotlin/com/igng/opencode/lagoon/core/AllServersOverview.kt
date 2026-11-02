@@ -65,7 +65,8 @@ internal class AllServersOverview(
   /** Shared with the controller so a dead directory is remembered across every server connection. */
   private val directoryHealth: DirectoryHealth = DirectoryHealth(),
   /** A server stopped being monitored: its last snapshot must leave the global island count too. */
-  private val onSnapshotRemoved: (String) -> Unit = {}
+  private val onSnapshotRemoved: (String) -> Unit = {},
+  private val remoteBackendFactory: RemoteBackendFactory? = null
 ) {
   private val jobs = mutableMapOf<String, Job>()
   private val locks = mutableMapOf<String, Mutex>()
@@ -106,7 +107,10 @@ internal class AllServersOverview(
   fun restart(profiles: List<ServerProfile>) { start(profiles); refreshAll() }
   fun client(id: String): HarnessClient = clients.getOrPut(id) {
     val (profile, credentials) = configurations[id] ?: error("服务器已移除")
-    createHarnessClient(profile, credentials) { cookie -> rememberCookie(id, profile, cookie) }
+    val backend = if (profile.kind == ServerKind.DSH_REMOTE)
+      remoteBackendFactory?.create(profile, credentials) ?: error("DSH Remote storage is not configured") else null
+    backend?.client ?: createHarnessClient(profile, credentials,
+      onCookie = { cookie -> rememberCookie(id, profile, cookie) }, remoteBackend = backend)
   }
 
   /**
@@ -148,7 +152,7 @@ internal class AllServersOverview(
   private fun remove(id: String) {
     jobs.remove(id)?.cancel(); wakes.remove(id)?.close(); approvers.remove(id)?.dispose()
     reconnectHints.remove(id)?.close()
-    clients.remove(id); configurations.remove(id); locks.remove(id); snapshots.remove(id)
+    clients.remove(id)?.close(); configurations.remove(id); locks.remove(id); snapshots.remove(id)
     handoffs.remove(id)
     childDiscoveries.remove(id)
     onSnapshotRemoved(id)

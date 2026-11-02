@@ -2,15 +2,17 @@ import { useEffect, useState } from "react";
 import { del, enc, errorText, post, put } from "@/api/http";
 import type { DshAuthMode, ServerKind, ServerProfile } from "@/api/types";
 import { Button, ConfirmDialog, ListGroup, ListItem, PageHeader, SegmentedControl, Spinner, Switch, TextField } from "@/components/ui";
-import { back, navigate } from "@/lib/router";
+import { back, navigate, serverEditPath } from "@/lib/router";
 import { useStore } from "@/store";
 
 interface Parsed { kind?: ServerKind; url?: string; secret?: string; dshAuth?: DshAuthMode; allowCleartext?: boolean; pair?: boolean }
+interface RemoteHostChoice { deviceId: string; name: string; platform: string; online: boolean; fingerprint: string }
 
 const isPairLink = (value: string) => /[?&]auth_token=|\/auth\/connect\//.test(value);
 
 /** Add or edit one server. Saving tests the connection on the hub first; a failed test saves nothing. */
 export function ServerEditorPage({ id }: { id: string | null }) {
+  const draftId = useState(() => crypto.randomUUID())[0];
   const existing = useStore((state) => (id ? state.servers[id]?.profile : undefined));
   const hasSecret = useStore((state) => (id ? state.servers[id]?.hasSecret ?? false : false));
   const loaded = useStore((state) => state.loaded);
@@ -20,6 +22,11 @@ export function ServerEditorPage({ id }: { id: string | null }) {
   const [url, setUrl] = useState(existing?.url ?? "");
   const [username, setUsername] = useState(existing?.kind === "opencode" ? existing.username : "opencode");
   const [secret, setSecret] = useState("");
+  const [remoteHosts, setRemoteHosts] = useState<RemoteHostChoice[]>([]);
+  const [remoteHostId, setRemoteHostId] = useState(existing?.remoteHostId ?? "");
+  const [remoteFingerprint, setRemoteFingerprint] = useState("");
+  const [remotePaired, setRemotePaired] = useState(false);
+  const [remoteSlot, setRemoteSlot] = useState("");
   const [dshAuth, setDshAuth] = useState<DshAuthMode>(existing?.dshAuth ?? "token");
   const [allowCleartext, setAllowCleartext] = useState(existing?.allowCleartext ?? false);
   const [clientUrl, setClientUrl] = useState(existing?.clientUrl ?? "");
@@ -32,15 +39,46 @@ export function ServerEditorPage({ id }: { id: string | null }) {
   // The profile arrives with the hub state when the page is opened directly.
   useEffect(() => {
     if (!existing) return;
-    setKind(existing.kind); setName(existing.name); setUrl(existing.url); setUsername(existing.kind === "opencode" ? existing.username : "opencode");
+    setKind(existing.kind); setName(existing.name); setUrl(existing.url); setUsername(existing.username);
+    setRemoteHostId(existing.remoteHostId ?? "");
+    setRemoteSlot("");
     setDshAuth(existing.dshAuth); setAllowCleartext(existing.allowCleartext); setAutoConnect(existing.autoConnect);
     setClientUrl(existing.clientUrl ?? "");
   }, [existing?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const dsh = kind === "dsh";
-  const pair = !dsh && isPairLink(url.trim());
+  const remote = kind === "dsh-remote";
+  const pair = !dsh && !remote && isPairLink(url.trim());
   const http = url.trim().toLowerCase().startsWith("http://");
   const authChanged = dsh && existing != null && existing.dshAuth !== dshAuth;
+
+  async function pairRemote() {
+    setBusy(true); setResult(null);
+    try {
+      if (!id && remote) {
+        const response = await post<{ profile: ServerProfile }>("/servers/remote/profile", {
+          profile: {
+            id: draftId, name: name.trim() || "DSH Remote", url: url.trim().replace(/\/+$/, ""),
+            username: username.trim(), kind: "dsh-remote", remoteHostId: null,
+            allowCleartext: http && allowCleartext, autoConnect: false, notifications: existing?.notifications ?? true,
+          },
+        });
+        navigate(serverEditPath(response.profile.id), { replace: true });
+        return;
+      }
+      const result = await post<{ hosts: RemoteHostChoice[]; account: string; slot: string }>("/servers/remote/register", {
+        url: url.trim().replace(/\/+$/, ""), account: username.trim(), password: secret, profileId: id,
+        name: name.trim() || "Lagoon Hub", allowCleartext: http && allowCleartext,
+      });
+      setRemoteHosts(result.hosts); setRemoteHostId(""); setRemoteFingerprint("");
+      setUsername(result.account);
+      setRemoteSlot(result.slot);
+      setSecret("");
+      setRemotePaired(true);
+      setResult("设备已注册，请选择 Host 并输入从可信渠道核对的指纹。");
+    } catch (error) { setResult(errorText(error, "DSH Hub 登录失败")); }
+    finally { setBusy(false); }
+  }
 
   async function recognize(text: string) {
     try {
@@ -63,15 +101,22 @@ export function ServerEditorPage({ id }: { id: string | null }) {
     setBusy(true);
     setResult(null);
     const profile: Partial<ServerProfile> = {
-      name: name.trim() || (dsh ? "DeepSeek Harness" : "OpenCode"), url: url.trim().replace(/\/+$/, ""), username: dsh ? "dsh" : username.trim() || "opencode",
+      name: name.trim() || (dsh ? "DeepSeek Harness" : remote ? "DSH Remote" : "OpenCode"), url: url.trim().replace(/\/+$/, ""), username: dsh ? "dsh" : username.trim() || "opencode",
       kind, dshAuth: dsh ? dshAuth : "token", allowCleartext: http && allowCleartext, autoConnect, notifications: existing?.notifications ?? true,
+      remoteHostId: remote ? remoteHostId : null, remoteHostFingerprint: remote ? remoteFingerprint : null,
       clientUrl: clientUrl.trim().replace(/\/+$/, ""),
     };
-    const body = { profile, ...(secret || !existing ? { secret: dsh ? secret.trim() : secret } : {}) };
+    if (remote && (!remoteHostId || !remoteFingerprint)) { setResult("请选择 Host 并输入人工核对的指纹。"); setBusy(false); return; }
+    if (remote && !remotePaired && !existing) { setResult("请先登录 DSH Hub 并注册此客户端设备。"); setBusy(false); return; }
+    const body = { profile, ...(remote ? {} : secret || !existing ? { secret: dsh ? secret.trim() : secret } : {}) };
     try {
+      if (remote) await post("/servers/remote/confirm-host", {
+        url: profile.url, account: profile.username, hostId: remoteHostId, fingerprint: remoteFingerprint,
+        slot: remoteSlot, profileId: id, allowCleartext: profile.allowCleartext,
+      });
       const saved = id ? await put<{ profile: ServerProfile; version: string }>(`/servers/${enc(id)}`, body)
         : await post<{ profile: ServerProfile; version: string }>("/servers", body);
-      toast(`已连接 ${dsh ? "DeepSeek Harness" : "OpenCode"}${saved.version && saved.version !== "DeepSeek Harness" ? ` ${saved.version}` : ""}`);
+      toast(`已连接 ${dsh ? "DeepSeek Harness" : remote ? "DSH Remote" : "OpenCode"}${saved.version ? ` ${saved.version}` : ""}`);
       back("/");
     } catch (error) {
       setResult(errorText(error, "连接失败"));
@@ -100,8 +145,8 @@ export function ServerEditorPage({ id }: { id: string | null }) {
             {dsh ? "直接粘贴 dsh web 打印的完整启动链接即可配对；配对后 Cookie 保存在中枢，dsh 重启也不用重新配对。想完全不看电脑，可改用「签名密钥」。"
               : "推荐在电脑端运行 opencode pair，把配对链接粘贴到下方，即可免密码配置认证。"}
           </p>
-          <div className="mx-3 mb-5"><SegmentedControl value={kind} onChange={(value) => { setKind(value); if (value === "dsh") setUsername("opencode"); }}
-            options={[{ value: "opencode", label: "OpenCode" }, { value: "dsh", label: "DeepSeek Harness" }]} /></div>
+          <div className="mx-3 mb-5"><SegmentedControl value={kind} onChange={(value) => { setKind(value); if (value === "dsh") setUsername("dsh"); }}
+            options={[{ value: "opencode", label: "OpenCode" }, { value: "dsh", label: "DeepSeek Harness（旧直连）" }, { value: "dsh-remote", label: "DSH Remote" }]} /></div>
           <div className="mx-4 space-y-4">
             <TextField label="名称" value={name} onChange={(e) => setName(e.target.value)} placeholder={dsh ? "我的 DeepSeek Harness" : "我的服务器"} />
             <TextField label={pair ? "配对链接" : "地址"} value={url} inputMode="url" autoCapitalize="off" autoCorrect="off" spellCheck={false}
@@ -109,11 +154,31 @@ export function ServerEditorPage({ id }: { id: string | null }) {
               placeholder={dsh ? "http://192.168.1.100:3080" : "https://oc.example.com 或 http://192.168.1.100:4096"}
               hint={dsh ? "dsh 默认只监听本机，请用 dsh web --host <电脑的局域网 IP> --no-open 启动。中枢在容器里，localhost 指的是容器自己，同一台机器请填 host.docker.internal。"
                 : "中枢替浏览器连接开发机：填中枢能访问到的地址。同一台机器上的服务请填 host.docker.internal。"} />
+            {remote && <>
+              <TextField label="DSH Hub 账号" value={username} onChange={(e) => setUsername(e.target.value)} autoCapitalize="off" />
+              <TextField label="DSH Hub 密码（仅用于注册独立 Remote 设备）" type="password" value={secret} onChange={(e) => setSecret(e.target.value)} autoComplete="off" />
+              <Button block disabled={busy || !url.trim() || !username.trim() || !secret} onClick={() => void pairRemote()}>
+                {busy ? <><Spinner className="text-on-primary" />登录并发现 Host…</> : "登录并注册此设备"}
+              </Button>
+              {remoteHosts.length > 0 && <>
+                <label className="block text-sm">Host
+                  <select className="mt-2 w-full rounded-xl bg-surface-2 p-3" value={remoteHostId}
+                    onChange={(event) => { setRemoteHostId(event.target.value); setRemoteFingerprint(""); }}>
+                    <option value="">选择 Host</option>
+                    {remoteHosts.map((host) => <option key={host.deviceId} value={host.deviceId}>
+                      {host.name} · {host.platform} · {host.deviceId.slice(0, 8)}
+                    </option>)}
+                  </select>
+                </label>
+                {remoteHostId && <TextField label={`人工核对后输入指纹：${remoteHosts.find((host) => host.deviceId === remoteHostId)?.fingerprint ?? "重新发现 Host 以读取指纹"}`} value={remoteFingerprint}
+                  onChange={(event) => setRemoteFingerprint(event.target.value)} autoCapitalize="off" />}
+              </>}
+            </>}
             {dsh && (
               <SegmentedControl value={dshAuth} onChange={setDshAuth} options={[{ value: "token", label: "启动令牌" }, { value: "secret", label: "签名密钥" }]} />
             )}
-            {!pair && !dsh && <TextField label="用户名" value={username} onChange={(e) => setUsername(e.target.value)} autoCapitalize="off" />}
-            {!pair && (
+            {!pair && !dsh && !remote && <TextField label="用户名" value={username} onChange={(e) => setUsername(e.target.value)} autoCapitalize="off" />}
+            {!pair && !remote && (
               <TextField label={dsh ? (dshAuth === "secret" ? "签名密钥" : "启动令牌") : "密码"} type="password" value={secret} onChange={(e) => setSecret(e.target.value)}
                 autoComplete="off" placeholder={existing && hasSecret ? "留空保持不变" : undefined}
                 hint={dsh ? (dshAuth === "secret"

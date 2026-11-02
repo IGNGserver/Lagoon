@@ -1,5 +1,6 @@
 package com.igng.lagoon.hub
 
+import com.igng.opencode.lagoon.core.DshRemoteMigration
 import com.igng.opencode.lagoon.core.HubAccessKey
 import com.igng.opencode.lagoon.core.Project
 import com.igng.opencode.lagoon.core.ServerCredentials
@@ -112,6 +113,16 @@ class HubStoreTest {
       store.rememberCookie("a", dsh.url, "dsh-auth=x")
       assertEquals("dsh-auth=x", store.credentials("a").cookie)
       assertEquals("token", store.credentials("a").password)
+      val migration = store.remoteMigration("a")
+      assertEquals(true, migration?.retained)
+      assertEquals(DshRemoteMigration.plan(dsh)?.reason, migration?.reason)
+    }
+    HubStore(dir, box).use { store ->
+      assertEquals(true, store.remoteMigration("a")?.retained)
+      assertEquals("token", store.credentials("a").password)
+      assertEquals("dsh-auth=x", store.credentials("a").cookie)
+      store.deleteServer("a")
+      assertEquals(null, store.remoteMigration("a"))
     }
   }
 
