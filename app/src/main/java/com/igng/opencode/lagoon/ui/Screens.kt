@@ -277,6 +277,7 @@ private fun MiuixServerForm(
             username = remoteAccount.trim(), remoteHostId = null, remoteHostFingerprint = null)
           scope.launch {
             try { onPairRemote(draft, remoteAccount.trim(), remotePassword) { hosts = it } }
+            catch (cancel: CancellationException) { throw cancel }
             catch (error: Exception) { result = userFacingError(error, "DSH Hub 登录失败") }
             finally { remotePassword = ""; working = false }
           }
