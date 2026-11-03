@@ -97,6 +97,7 @@ object HubExportCodec {
         val profile = server.profile
         put(JSONObject().put("hubServerId", profile.id).put("name", profile.name).put("url", profile.url).put("username", profile.username)
           .put("kind", profile.kind.wire).put("dshAuth", profile.dshAuth.wire).put("allowCleartext", profile.allowCleartext)
+          .putOpt("remoteHostId", profile.remoteHostId).putOpt("remoteHostFingerprint", profile.remoteHostFingerprint)
           .put("autoConnect", profile.autoConnect).put("notifications", profile.notifications)
           .put("credentialUsername", server.credentials.username).put("secret", server.credentials.password)
           .put("cookie", server.credentials.cookie).put("localOnly", server.localOnly))
@@ -115,11 +116,13 @@ object HubExportCodec {
       val url = item.optString("url").trim().trimEnd('/')
       if (id.isEmpty() || url.toHttpUrlOrNull() == null) return@mapNotNull null
       val kind = ServerKind.fromWire(item.optString("kind"))
-      val username = item.optString("username").trim().ifBlank { if (kind == ServerKind.DSH) "dsh" else "opencode" }
+       val username = item.optString("username").trim().ifBlank { if (kind == ServerKind.DSH) "dsh" else "opencode" }
       val profile = ServerProfile(id, item.optString("name").trim().ifBlank { kind.label }, url, username,
         item.optBoolean("autoConnect", true), item.optBoolean("notifications", true),
         url.startsWith("http://", true) && item.optBoolean("allowCleartext", false), kind,
-        if (kind == ServerKind.DSH) DshAuthMode.fromWire(item.optString("dshAuth")) else DshAuthMode.TOKEN)
+         if (kind == ServerKind.DSH) DshAuthMode.fromWire(item.optString("dshAuth")) else DshAuthMode.TOKEN,
+         item.optString("remoteHostId").takeIf { kind == ServerKind.DSH_REMOTE && it.isNotBlank() },
+         item.optString("remoteHostFingerprint").takeIf { kind == ServerKind.DSH_REMOTE && it.isNotBlank() })
       ExportedServer(profile, ServerCredentials(item.optString("credentialUsername").ifBlank { username },
         item.optString("secret"), item.optString("cookie")), item.optBoolean("localOnly"))
     }

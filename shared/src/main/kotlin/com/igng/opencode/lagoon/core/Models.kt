@@ -13,8 +13,12 @@ data class ServerProfile(
   val allowCleartext: Boolean = false,
   /** 该服务器使用的 harness 协议（OpenCode / DeepSeek Harness）。 */
   val kind: ServerKind = ServerKind.OPENCODE,
-  /** DSH 的配对凭据种类：启动令牌（默认）或 Cookie 签名密钥。OpenCode 忽略。 */
-  val dshAuth: DshAuthMode = DshAuthMode.TOKEN
+  /** Legacy direct DSH credential mode; ignored by OpenCode and DSH Remote. */
+  val dshAuth: DshAuthMode = DshAuthMode.TOKEN,
+  /** DSH Remote Host selected from the authenticated DSH Hub account. */
+  val remoteHostId: String? = null,
+  /** Upstream's 12-hex-character SHA-256 Host identity fingerprint, confirmed during pairing. */
+  val remoteHostFingerprint: String? = null
 )
 
 data class Project(val id: String, val directory: String, val name: String, val sandboxes: List<String> = emptyList(),

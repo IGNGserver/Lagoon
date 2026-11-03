@@ -7,18 +7,27 @@ import org.json.JSONObject
 import java.util.UUID
 
 class ServerStore internal constructor(private val preferences: SharedPreferences, private val secrets: SharedPreferences,
-  private val encryptValue: (String) -> String, private val decryptValue: (String) -> String) : OverviewStore {
+  private val encryptValue: (String) -> String, private val decryptValue: (String) -> String,
+  private val appContext: Context? = null) : OverviewStore {
+  internal val remoteDevices: RemoteDeviceStore by lazy {
+    AndroidRemoteDeviceStore(requireNotNull(appContext) { "Remote device storage needs Android Context" })
+  }
+  internal val remotePins: RemotePeerTrustStore by lazy {
+    AndroidRemotePeerTrustStore(requireNotNull(appContext) { "Remote Host pins need Android Context" }
+      .getSharedPreferences("remote-host-pins", Context.MODE_PRIVATE))
+  }
   constructor(context: Context) : this(context.getSharedPreferences("servers", Context.MODE_PRIVATE),
     context.getSharedPreferences("secrets", Context.MODE_PRIVATE),
     KeystoreCipher("lagoon-server-passwords", legacyAlias = "opencode-lagoon-server-passwords")::encrypt,
-    KeystoreCipher("lagoon-server-passwords", legacyAlias = "opencode-lagoon-server-passwords")::decrypt)
+    KeystoreCipher("lagoon-server-passwords", legacyAlias = "opencode-lagoon-server-passwords")::decrypt, context.applicationContext)
 
   fun profiles(): List<ServerProfile> = try {
     JSONArray(preferences.getString("profiles", "[]")).objects().map {
       val id = it.str("id")
       ServerProfile(id, it.str("name"), it.str("url"), it.str("username"),
         it.optBoolean("autoConnect", true), it.optBoolean("notifications", true), it.optBoolean("allowCleartext", false),
-        ServerKind.fromWire(it.str("kind")), DshAuthMode.fromWire(it.str("dshAuth")))
+        ServerKind.fromWire(it.str("kind")), DshAuthMode.fromWire(it.str("dshAuth")), it.str("remoteHostId").takeIf(String::isNotBlank),
+        it.str("remoteHostFingerprint").takeIf(String::isNotBlank))
     }
   } catch (error: Exception) {
     Diagnostics.warn("ServerStore", "profiles 解析失败，已忽略全部服务器资料", error)
@@ -382,9 +391,22 @@ class ServerStore internal constructor(private val preferences: SharedPreference
     val json = JSONArray().apply { updated.forEach { item -> put(JSONObject()
       .put("id", item.id).put("name", item.name).put("url", item.url).put("username", item.username)
       .put("autoConnect", item.autoConnect).put("notifications", item.notifications)
-      .put("allowCleartext", item.allowCleartext).put("kind", item.kind.wire).put("dshAuth", item.dshAuth.wire)) } }
+       .put("allowCleartext", item.allowCleartext).put("kind", item.kind.wire).put("dshAuth", item.dshAuth.wire)
+       .putOpt("remoteHostId", item.remoteHostId).putOpt("remoteHostFingerprint", item.remoteHostFingerprint)) } }
     check(secrets.edit().putString(profile.id, encoded).commit()) { "无法保存凭据，请重试" }
-    check(preferences.edit().putString("profiles", json.toString()).commit()) { "无法保存服务器资料，请重试" }
+    val migration = DshRemoteMigration.plan(profile)
+    val editor = preferences.edit().putString("profiles", json.toString())
+    if (migration == null) editor.remove("remoteMigration:${profile.id}")
+    else editor.putString("remoteMigration:${profile.id}", JSONObject().put("retained", true).put("reason", migration.reason).toString())
+    check(editor.commit()) { "无法保存服务器资料，请重试" }
+  }
+
+  /** Direct DSH material stays on its original profile. Null means this profile needs no migration note. */
+  fun remoteMigration(id: String): DshRemoteMigration? {
+    val profile = profiles().firstOrNull { it.id == id } ?: return null
+    val planned = DshRemoteMigration.plan(profile) ?: return null
+    val stored = runCatching { JSONObject(preferences.getString("remoteMigration:$id", null) ?: return planned) }.getOrNull()
+    return planned.copy(retained = stored?.optBoolean("retained") != false, reason = stored?.optString("reason").orEmpty().ifBlank { planned.reason })
   }
   /**
    * 只更新已保存凭据里的会话 Cookie（DSH 换到新 Cookie 或旧 Cookie 被拒）。[url] 是签发该 Cookie
@@ -408,9 +430,10 @@ class ServerStore internal constructor(private val preferences: SharedPreference
       put(JSONObject().put("id", item.id).put("name", item.name).put("url", item.url)
         .put("username", item.username).put("autoConnect", item.autoConnect)
         .put("notifications", item.notifications)
-        .put("allowCleartext", item.allowCleartext).put("kind", item.kind.wire).put("dshAuth", item.dshAuth.wire))
+        .put("allowCleartext", item.allowCleartext).put("kind", item.kind.wire).put("dshAuth", item.dshAuth.wire)
+        .putOpt("remoteHostId", item.remoteHostId).putOpt("remoteHostFingerprint", item.remoteHostFingerprint))
     } }
-    val editor = preferences.edit().putString("profiles", json.toString()).remove("directories:$id").remove("sessionNotices:$id").remove("collapsedSections:$id").remove("collapsedProjects:$id").remove("pinned:$id")
+    val editor = preferences.edit().putString("profiles", json.toString()).remove("directories:$id").remove("sessionNotices:$id").remove("collapsedSections:$id").remove("collapsedProjects:$id").remove("pinned:$id").remove("remoteMigration:$id")
       .remove("backgroundRunning:$id")
       .remove("modelVisibility:$id").remove("modelVisibilityConfigured:$id").remove("modelVariants:$id").remove("recentModels:$id").remove("scope:$id")
     val prefixes = listOf("location", "preview", "configuration", "taskRead", "taskState", "taskParent", "taskTime", "notification", "taskLedgerVersion").map { "$it:$id:" }

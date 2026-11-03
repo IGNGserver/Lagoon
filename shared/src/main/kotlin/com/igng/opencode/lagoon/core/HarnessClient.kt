@@ -5,7 +5,8 @@ import kotlinx.coroutines.flow.Flow
 /** 一台已保存服务器使用的 harness 协议。 */
 enum class ServerKind(val wire: String, val label: String) {
   OPENCODE("opencode", "OpenCode"),
-  DSH("dsh", "DeepSeek Harness");
+  DSH("dsh", "DeepSeek Harness"),
+  DSH_REMOTE("dsh-remote", "DSH Remote");
 
   companion object {
     fun fromWire(value: String?): ServerKind =
@@ -20,6 +21,9 @@ enum class ServerKind(val wire: String, val label: String) {
  * 控制器与 UI 因此完全与协议无关：读列表、发消息、中止、审批、事件流都走这里。
  */
 interface HarnessClient {
+  /** Releases transport-owned sockets and cryptographic state; safe to call more than once. */
+  fun close() = Unit
+
   fun capabilities(): ApiCapabilities
 
   suspend fun discoverCapabilities(): ApiCapabilities
@@ -166,8 +170,10 @@ fun createHarnessClient(
   credentials: ServerCredentials,
   callTimeoutSeconds: Long = 60,
   /** 客户端换到新会话 Cookie（或确认旧 Cookie 失效，传空串）时回调，由调用方落盘。 */
-  onCookie: (String) -> Unit = {}
+  onCookie: (String) -> Unit = {},
+  remoteBackend: RemoteBackend? = null
 ): HarnessClient = when (profile.kind) {
   ServerKind.OPENCODE -> OpenCodeApi(profile, credentials, callTimeoutSeconds)
   ServerKind.DSH -> DshApi(profile, credentials, callTimeoutSeconds, onCookie)
+  ServerKind.DSH_REMOTE -> (remoteBackend ?: throw IllegalStateException("DSH Remote backend 尚未配置")).client
 }

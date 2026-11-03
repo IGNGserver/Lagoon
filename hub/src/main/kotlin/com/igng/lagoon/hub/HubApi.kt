@@ -146,6 +146,55 @@ class HubApi(
       call.respond(JSONObject().put("servers", Codec.array(store.profiles().map(store::profileJson))))
     }
     router.post("/api/v1/servers/parse") { call -> call.respond(parse(call.json().optString("text"))) }
+    router.post("/api/v1/servers/remote/register") { call ->
+      val body = call.json()
+      val remoteRegistration = kotlinx.coroutines.runBlocking { registerRemoteAccount(body) }
+      call.respond(remoteRegistration)
+    }
+    router.post("/api/v1/servers/remote/profile") { call ->
+      val body = call.json()
+      val input = body.optJSONObject("profile") ?: throw HttpError(400, "bad-request", "缺少 Remote 资料")
+      val id = input.optString("id")
+      if (runCatching { UUID.fromString(id) }.isFailure) throw HttpError(400, "bad-id", "Remote 资料标识无效")
+      if (store.profile(id) != null) throw HttpError(409, "server-exists", "服务器资料已存在")
+      val profile = Codec.profileFrom(input, id)
+      if (profile.kind != ServerKind.DSH_REMOTE) throw HttpError(400, "bad-kind", "Remote 资料类型无效")
+      validateAddress(profile)
+      if (profile.remoteHostId != null) throw HttpError(400, "host-not-selected", "预配对资料不能预先选择 Host")
+      val inactive = profile.copy(autoConnect = false)
+      store.saveServer(inactive, ServerCredentials(inactive.username))
+      runtime.run { profileChanged(inactive) }
+      call.respond(JSONObject().put("profile", store.profileJson(inactive)))
+    }
+    router.post("/api/v1/servers/remote/confirm-host") { call ->
+      val body = call.json(limit = 4096)
+      val account = body.optString("account").trim()
+      val hostId = body.optString("hostId")
+      val fingerprint = body.optString("fingerprint")
+       val slot = body.optString("slot")
+      if (slot.isBlank() || account.isBlank() || hostId.isBlank() || fingerprint.isBlank())
+        throw HttpError(400, "remote-confirmation-required", "请提供 Host 和经核对的指纹")
+       val profileId = body.optString("profileId")
+       if (profileId.isNotBlank() && !profileId.matches(Regex("[A-Za-z0-9-]{1,128}"))) throw HttpError(400, "remote-profile-invalid", "Remote 配置标识无效")
+       if (!slot.matches(Regex("profile-[A-Za-z0-9-]{1,128}")) || (profileId.isNotBlank() && slot != remoteDeviceSlot(profileId)))
+        throw HttpError(400, "remote-slot-invalid", "Remote 注册状态无效，请重新登录")
+      val url = body.optString("url").trim().trimEnd('/')
+      val allowCleartext = body.optBoolean("allowCleartext", false)
+       val profile = profileId.takeIf(String::isNotBlank)?.let(store::profile)
+       if (profileId.isNotBlank() && profile == null) throw HttpError(404, "server-not-found", "服务器不存在")
+       if (profile != null && (profile.kind != ServerKind.DSH_REMOTE || profile.url != url || profile.username != account))
+         throw HttpError(409, "remote-profile-mismatch", "Remote 配置与登录时的 Hub、账号不匹配")
+      val setup = com.igng.opencode.lagoon.core.RemoteSetup(
+        com.igng.opencode.lagoon.core.RemoteServerApi(url, allowCleartext),
+        HubRemoteDeviceStore(store.dataDirectory, store.secretBox), HubRemotePeerTrustStore(store.dataDirectory), slot,
+        com.igng.opencode.lagoon.core.canonicalRemoteOrigin(url), "Lagoon Hub", "lagoon-hub", version)
+      kotlinx.coroutines.runBlocking { setup.confirmHost(account, hostId, fingerprint) }
+       profile?.let { existing ->
+         val updated = existing.copy(remoteHostId = hostId, remoteHostFingerprint = fingerprint)
+         runtime.run { saveRemoteHostSelection(updated) }
+       }
+      call.respond(JSONObject().put("deviceId", hostId).put("fingerprint", fingerprint))
+    }
     router.post("/api/v1/servers") { call -> saveServer(call, UUID.randomUUID().toString(), creating = true) }
     router.put("/api/v1/servers/{id}") { call -> saveServer(call, call.param("id"), creating = false) }
     router.delete("/api/v1/servers/{id}") { call ->
@@ -181,6 +230,26 @@ class HubApi(
     }
   }
 
+  private suspend fun registerRemoteAccount(body: JSONObject): JSONObject {
+      val url = body.optString("url").trim().trimEnd('/')
+      val account = body.optString("account").trim()
+      val profileId = body.optString("profileId").ifBlank { UUID.randomUUID().toString() }
+      val password = body.optString("password")
+      if (url.isBlank() || account.isBlank() || password.isBlank() || !profileId.matches(Regex("[A-Za-z0-9-]{1,128}"))) throw HttpError(400, "remote-login-required", "请填写 DSH Hub 地址、账号和密码")
+      val allowCleartext = body.optBoolean("allowCleartext", false)
+      val api = com.igng.opencode.lagoon.core.RemoteServerApi(url, allowCleartext)
+      val slot = remoteDeviceSlot(profileId)
+      val setup = com.igng.opencode.lagoon.core.RemoteSetup(api, HubRemoteDeviceStore(store.dataDirectory, store.secretBox),
+        HubRemotePeerTrustStore(store.dataDirectory), slot, com.igng.opencode.lagoon.core.canonicalRemoteOrigin(url),
+        body.optString("name").ifBlank { "Lagoon Hub" }, "lagoon-hub", version)
+      val state = setup.register(account, password)
+      if (!state.account.equals(account, ignoreCase = true)) throw HttpError(400, "remote-account-mismatch", "DSH Hub 返回的账号与输入不一致")
+      val hosts = JSONArray().apply { state.hosts.forEach { host -> put(JSONObject().put("deviceId", host.deviceId)
+        .put("name", host.name).put("platform", host.platform).put("online", host.online)
+        .put("fingerprint", host.fingerprint)) } }
+      return JSONObject().put("deviceId", state.deviceId).put("account", state.account).put("slot", slot).put("hosts", hosts)
+  }
+
   /** Recognizes what the user pasted: a `dsh web` launch link, an `opencode pair` link or a plain address. */
   private fun parse(text: String): JSONObject {
     val value = text.trim()
@@ -196,15 +265,16 @@ class HubApi(
     val body = call.json()
     val input = body.optJSONObject("profile") ?: throw HttpError(400, "bad-request", "缺少服务器资料")
     val existing = store.profile(id)
+    if (creating && existing != null) throw HttpError(409, "server-exists", "服务器资料已存在")
     if (!creating && existing == null) throw HttpError(404, "server-not-found", "服务器不存在")
     val secret = body.optString("secret").takeIf { body.has("secret") && !body.isNull("secret") }
     val clientUrl = if (input.has("clientUrl")) clientAddress(input.optString("clientUrl")) else null
     val requested = Codec.profileFrom(input, id).let { profile ->
       val dsh = profile.kind == ServerKind.DSH
       profile.copy(name = profile.name.ifBlank { profile.kind.label },
-        username = if (dsh) "dsh" else profile.username.ifBlank { "opencode" },
         allowCleartext = profile.url.startsWith("http://", true) && profile.allowCleartext,
-        dshAuth = if (dsh) profile.dshAuth else DshAuthMode.TOKEN)
+        dshAuth = if (dsh) profile.dshAuth else DshAuthMode.TOKEN,
+        username = if (profile.kind == ServerKind.DSH_REMOTE) profile.username.trim() else if (dsh) "dsh" else profile.username.ifBlank { "opencode" })
     }
     val result = runtime.run {
       val pair = PairLinkResolver.isPairLink(requested.url)
@@ -212,19 +282,25 @@ class HubApi(
       val profile = if (resolved == null) requested else requested.copy(url = resolved.serverUrl, username = resolved.credentials.username)
       validateAddress(profile)
       val dsh = profile.kind == ServerKind.DSH
+      val remote = profile.kind == ServerKind.DSH_REMOTE
+      if (remote && profile.remoteHostId.isNullOrBlank()) throw HttpError(400, "remote-host-required", "请选择 DSH Host")
       if (dsh && existing != null && existing.dshAuth != profile.dshAuth && secret.isNullOrBlank()) {
         throw HttpError(400, "secret-required", "切换认证方式后请填写新的${profile.dshAuth.label}")
       }
       if (creating && resolved == null && secret.isNullOrBlank() && dsh) throw HttpError(400, "secret-required", "请填写${profile.dshAuth.label}")
-      val credentials = resolved?.credentials ?: profileCredentials(existing?.url, profile.url,
+      if (remote && profile.username.isBlank()) throw HttpError(400, "remote-account-required", "请先登录 DSH Hub 并注册 Remote 设备")
+      val credentials = if (remote) ServerCredentials(profile.username) else resolved?.credentials ?: profileCredentials(existing?.url, profile.url,
         if (existing != null) store.credentials(id) else ServerCredentials(profile.username), profile.username,
         (if (dsh) secret?.trim() else secret)?.takeIf { it.isNotEmpty() || existing == null },
         // A new DSH token/secret or a different auth mode must be proven by this test, not by an old cookie.
         cookie = "".takeIf { dsh && (secret != null || existing?.dshAuth != profile.dshAuth) })
       var minted: String? = null
-      val client = createHarnessClient(profile, credentials) { minted = it }
-      val serverVersion = client.health()
-      client.projects()
+      if (remote && profile.remoteHostFingerprint.isNullOrBlank()) throw HttpError(400, "remote-fingerprint-required", "请确认 DSH Host 指纹")
+      val backend = if (remote) runtime.remoteBackend(profile, credentials) else null
+      val client = createHarnessClient(profile, credentials, onCookie = { minted = it }, remoteBackend = backend)
+      val serverVersion = try {
+        client.health().also { client.projects() }
+      } finally { client.close() }
       store.saveServer(profile, credentials.copy(cookie = minted ?: credentials.cookie), clientUrl)
       profileChanged(profile)
       profile to serverVersion
@@ -240,6 +316,11 @@ class HubApi(
       throw HttpError(400, "client-url-invalid", "客户端访问地址必须以 http:// 或 https:// 开头")
     }
     return url
+  }
+
+  private fun remoteDeviceSlot(profileId: String): String {
+    require(profileId.matches(Regex("[A-Za-z0-9-]{1,128}")))
+    return "profile-$profileId"
   }
 
   private fun validateAddress(profile: ServerProfile) {

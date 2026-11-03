@@ -123,6 +123,9 @@ fun ServersModal(
         existing = existing,
         onCancel = onDismiss,
         onDelete = existing?.let { { deleting = true } },
+        onPairRemote = { profile, account, password, publishHosts ->
+          publishHosts(controller.registerRemote(profile, account, password))
+        },
         onSave = { profile, password, done ->
           scope.launch {
             try {
@@ -131,11 +134,19 @@ fun ServersModal(
               val actualProfile = if (resolved == null) profile else profile.copy(url = resolved.serverUrl, username = resolved.credentials.username)
               val savedUrl = state.profiles.firstOrNull { it.id == profile.id }?.url
               val previous = state.profiles.firstOrNull { it.id == profile.id }
-              val credentials = resolved?.credentials ?: profileCredentials(
-                savedUrl, actualProfile.url, controller.credentials(profile.id), actualProfile.username, password,
+               val credentials = if (actualProfile.kind == ServerKind.DSH_REMOTE) {
+                 ServerCredentials(actualProfile.username)
+               }
+                 else resolved?.credentials ?: profileCredentials(
+                 savedUrl, actualProfile.url, controller.credentials(profile.id), actualProfile.username, password,
                 // DSH 填了新令牌/密钥或换了认证方式：丢掉旧 Cookie，让这次测试真正验证新凭据。
                 cookie = "".takeIf { actualProfile.kind == ServerKind.DSH && (password != null || previous?.dshAuth != actualProfile.dshAuth) }
-              )
+               )
+               if (actualProfile.kind == ServerKind.DSH_REMOTE) {
+                 val hostId = actualProfile.remoteHostId ?: error("请先选择 DSH Host")
+                 val fingerprint = actualProfile.remoteHostFingerprint ?: error("请先确认 Host 指纹")
+                 controller.confirmRemoteHost(actualProfile, actualProfile.username, hostId, fingerprint)
+               }
               var minted: String? = null
               val version = controller.testServer(actualProfile, credentials) { minted = it }
               controller.saveServer(actualProfile, credentials.password, minted ?: credentials.cookie, credentials.username)
@@ -180,8 +191,10 @@ private fun MiuixServerForm(
   existing: ServerProfile?,
   onCancel: () -> Unit,
   onDelete: (() -> Unit)?,
+  onPairRemote: suspend (ServerProfile, String, String, (List<RemoteHost>) -> Unit) -> Unit = { _, _, _, _ -> },
   onSave: (ServerProfile, String?, (String) -> Unit) -> Unit
 ) {
+  val scope = rememberCoroutineScope()
   val clipboard = LocalClipboardManager.current
   val id = remember(existing?.id) { existing?.id ?: UUID.randomUUID().toString() }
   var name by rememberSaveable(existing?.id) { mutableStateOf(existing?.name ?: "") }
@@ -189,6 +202,14 @@ private fun MiuixServerForm(
   var harness by rememberSaveable(existing?.id) { mutableStateOf(existing?.kind ?: ServerKind.OPENCODE) }
   val isDsh = harness == ServerKind.DSH
   var dshAuth by rememberSaveable(existing?.id) { mutableStateOf(existing?.dshAuth ?: DshAuthMode.TOKEN) }
+  var remoteAccount by rememberSaveable(existing?.id) { mutableStateOf(existing?.username ?: "") }
+  var remotePassword by remember { mutableStateOf("") }
+  var hosts by remember(existing?.id) { mutableStateOf(emptyList<RemoteHost>()) }
+  var selectedHost by rememberSaveable(existing?.id) { mutableStateOf(existing?.remoteHostId.orEmpty()) }
+  var hostFingerprint by rememberSaveable(existing?.id) { mutableStateOf(existing?.remoteHostFingerprint.orEmpty()) }
+  val remoteProfileId = remember(existing?.id) {
+    if (existing != null) existing.id else UUID.randomUUID().toString()
+  }
   val isSecret = isDsh && dshAuth == DshAuthMode.SECRET
   var username by rememberSaveable(existing?.id) { mutableStateOf(existing?.username ?: "opencode") }
   var password by remember(existing?.id) { mutableStateOf("") }
@@ -244,6 +265,36 @@ private fun MiuixServerForm(
       }
     }
 
+    if (harness == ServerKind.DSH_REMOTE) {
+      item { TextField(value = remoteAccount, onValueChange = { remoteAccount = it; hosts = emptyList(); selectedHost = ""; hostFingerprint = "" }, label = "DSH Hub 账号") }
+      item { TextField(value = remotePassword, onValueChange = { remotePassword = it }, label = "DSH Hub 密码",
+        visualTransformation = PasswordVisualTransformation(), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password)) }
+      item {
+        DialogActions("未配对", {}, if (working) "正在验证…" else "登录并发现 Host", enabled = !working && remoteAccount.isNotBlank() && remotePassword.isNotBlank()) {
+          working = true
+          val draft = (existing ?: ServerProfile(remoteProfileId, "DSH Remote", normalizedInput)).copy(
+            name = name.ifBlank { "DSH Remote" }, url = normalizedInput.trimEnd('/'), kind = ServerKind.DSH_REMOTE,
+            username = remoteAccount.trim(), remoteHostId = null, remoteHostFingerprint = null)
+          scope.launch {
+            try { onPairRemote(draft, remoteAccount.trim(), remotePassword) { hosts = it } }
+            catch (cancel: CancellationException) { throw cancel }
+            catch (error: Exception) { result = userFacingError(error, "DSH Hub 登录失败") }
+            finally { remotePassword = ""; working = false }
+          }
+        }
+      }
+      if (hosts.isNotEmpty()) item {
+        SuperDropdown(title = "选择 DSH Host", items = hosts.map { "${it.name} · ${it.platform} · ${it.deviceId.take(8)} · ${it.fingerprint.orEmpty()}" },
+          selectedIndex = hosts.indexOfFirst { it.deviceId == selectedHost }.coerceAtLeast(0),
+          onSelectedIndexChange = { index ->
+            val host = hosts.getOrNull(index) ?: return@SuperDropdown
+            selectedHost = host.deviceId
+            hostFingerprint = ""
+          })
+        TextField(value = hostFingerprint, onValueChange = { hostFingerprint = it.trim() }, label = "人工核对 Host 指纹（12 位十六进制）")
+      }
+    }
+
     item {
       SuperDropdown(
         title = "服务类型",
@@ -271,7 +322,8 @@ private fun MiuixServerForm(
         TextField(
           value = url,
           onValueChange = { text: String ->
-            if (!acceptLaunchLink(text)) {
+             if (!acceptLaunchLink(text)) {
+               if (harness == ServerKind.DSH_REMOTE && text != url) { hosts = emptyList(); selectedHost = ""; hostFingerprint = "" }
               url = text
               if (name.isBlank() && text.isNotBlank()) name = "我的 ${harness.label}"
             }
@@ -388,11 +440,18 @@ private fun MiuixServerForm(
         working = true
         val normalizedUrl = normalizedInput.trimEnd('/')
         val profile = (existing ?: ServerProfile(id, "", "")).copy(
+         id = if (harness == ServerKind.DSH_REMOTE && existing == null) remoteProfileId else id,
           name = name.trim().ifBlank { harness.label }, url = normalizedUrl,
-          username = if (isDsh) "dsh" else username.trim().ifBlank { "opencode" },
+          username = when (harness) {
+             ServerKind.DSH -> "dsh"
+             ServerKind.DSH_REMOTE -> remoteAccount.trim()
+             else -> username.trim().ifBlank { "opencode" }
+           },
           autoConnect = autoConnect, notifications = notifications,
           allowCleartext = normalizedUrl.startsWith("http://", true) && allowHttp,
-          kind = harness, dshAuth = if (isDsh) dshAuth else DshAuthMode.TOKEN
+           kind = harness, dshAuth = if (isDsh) dshAuth else DshAuthMode.TOKEN,
+           remoteHostId = selectedHost.takeIf { harness == ServerKind.DSH_REMOTE && it.isNotBlank() },
+           remoteHostFingerprint = hostFingerprint.takeIf { harness == ServerKind.DSH_REMOTE && it.isNotBlank() }
         )
         // 换了 DSH 认证方式时旧凭据不能沿用：必须重新填写。
         val authChanged = isDsh && existing != null && existing.dshAuth != dshAuth
@@ -402,7 +461,7 @@ private fun MiuixServerForm(
           return@DialogActions
         }
         val secret = if (isDsh) password.trim() else password
-        onSave(profile, secret.takeIf { it.isNotBlank() || existing == null }) { message ->
+          onSave(profile, if (harness == ServerKind.DSH_REMOTE) null else secret.takeIf { it.isNotBlank() || existing == null }) { message ->
           result = message
           working = false
         }

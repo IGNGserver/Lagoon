@@ -283,6 +283,44 @@ class LagoonController private constructor(private val appContext: Context) {
   }
 
   private val store = ServerStore(appContext)
+  private val remoteBackendFactory = object : RemoteBackendFactory {
+    override fun create(profile: ServerProfile, credentials: ServerCredentials): RemoteBackend {
+      val hostId = profile.remoteHostId ?: throw IllegalStateException("请先选择并验证 DSH Host")
+      val origin = canonicalRemoteOrigin(profile.url)
+      val account = credentials.username.trim()
+      if (account.isBlank()) throw IllegalStateException("请先登录 DSH Hub 并注册 Remote 设备")
+      val manager = RemoteDeviceManager(store.remoteDevices, remoteSlot(profile.id), origin, account,
+        registerer = { descriptor, token -> RemoteServerApi(profile.url, profile.allowCleartext).register(descriptor, token) },
+        refresher = { id, token -> RemoteServerApi(profile.url, profile.allowCleartext).refresh(id, token) })
+      val session = RemoteSession(profile.url, profile.allowCleartext, hostId, manager,
+        RemotePeerTrust(store.remotePins), account)
+      return RemoteBackend(session)
+    }
+  }
+
+  private fun remoteSlot(profileId: String) = "profile-${profileId.replace(Regex("[^A-Za-z0-9_-]"), "_")}"
+
+  internal suspend fun registerRemote(profile: ServerProfile, account: String, password: String): List<RemoteHost> {
+    require(profile.kind == ServerKind.DSH_REMOTE)
+    val origin = canonicalRemoteOrigin(profile.url)
+    val api = RemoteServerApi(profile.url, profile.allowCleartext)
+    val setup = RemoteSetup(api, store.remoteDevices, store.remotePins, remoteSlot(profile.id), origin,
+      profile.name.ifBlank { "Lagoon Android" }, "android", appVersion())
+    val result = setup.register(account, password)
+    return result.hosts
+  }
+
+  internal suspend fun confirmRemoteHost(profile: ServerProfile, account: String, hostId: String, fingerprint: String): RemoteHost {
+    require(profile.kind == ServerKind.DSH_REMOTE)
+    val origin = canonicalRemoteOrigin(profile.url)
+    val setup = RemoteSetup(RemoteServerApi(profile.url, profile.allowCleartext), store.remoteDevices, store.remotePins,
+      remoteSlot(profile.id), origin, profile.name.ifBlank { "Lagoon Android" }, "android", appVersion())
+    val host = setup.confirmHost(account, hostId, fingerprint)
+    return host
+  }
+  private fun appVersion(): String = runCatching {
+    appContext.packageManager.getPackageInfo(appContext.packageName, 0).versionName
+  }.getOrNull()?.takeIf(String::isNotBlank) ?: "0.1.0"
   private val cache = OfflineCache(appContext)
   /** Transcript cache access runs one at a time in submission order: binding a server precedes reading it. */
   @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
@@ -308,7 +346,7 @@ class LagoonController private constructor(private val appContext: Context) {
       if (id == state.value.serverId) trace(generation, ConnectMilestone.STREAM)
       if (id == state.value.serverId && api != null && connecting?.isActive != true) reconcileAfterStream()
     },
-    directoryHealth, ::acceptSnapshotRemoved)
+    directoryHealth, ::acceptSnapshotRemoved, remoteBackendFactory)
   private var api: HarnessClient? = null
   private var stream: Job? = null
   private var generation = 0
@@ -503,10 +541,13 @@ class LagoonController private constructor(private val appContext: Context) {
   }
   /** [onCookie] 收到测试连接换到的会话 Cookie，保存资料时一并落盘，避免保存后再用令牌换一次。 */
   suspend fun testServer(profile: ServerProfile, credentials: ServerCredentials, onCookie: (String) -> Unit = {}): String {
-    val client = createHarnessClient(profile, credentials, onCookie = onCookie)
-    val version = client.health()
-    client.projects()
-    return version
+    val client = createHarnessClient(profile, credentials, onCookie = onCookie,
+      remoteBackend = if (profile.kind == ServerKind.DSH_REMOTE) remoteBackendFactory.create(profile, credentials) else null)
+    return try {
+      val version = client.health()
+      client.projects()
+      version
+    } finally { client.close() }
   }
   fun notifyOverviewAction(serverId: String) = allOverview.refresh(serverId)
   fun clearError() = mutable.update { it.copy(error = null) }

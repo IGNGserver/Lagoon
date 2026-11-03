@@ -12,6 +12,11 @@ sourceSets { main { kotlin.srcDir("../shared/src/main/kotlin") } }
 dependencies {
   implementation("com.squareup.okhttp3:okhttp:4.12.0")
   implementation("com.squareup.okhttp3:okhttp-sse:4.12.0")
+  // MIT Noise implementation used for DSH Remote Protocol v1's fixed IK suite.
+  implementation("com.github.auties00:noise-java:1.2") {
+    // The published legacy POM declares JAXB for its old test tooling; Noise's runtime classes do not need it.
+    exclude(group = "javax.xml.bind", module = "jaxb-api")
+  }
   implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0")
   // Android ships org.json in the platform; the JVM hub needs the artifact.
   implementation("org.json:json:20240303")

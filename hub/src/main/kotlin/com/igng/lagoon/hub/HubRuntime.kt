@@ -41,8 +41,23 @@ class HubRuntime(private val store: HubStore, private val streams: StreamRegistr
   private val dispatcher = executor.asCoroutineDispatcher()
   val scope = CoroutineScope(SupervisorJob() + dispatcher)
 
+  private val remoteBackendFactory = object : com.igng.opencode.lagoon.core.RemoteBackendFactory {
+    override fun create(profile: ServerProfile, credentials: com.igng.opencode.lagoon.core.ServerCredentials): com.igng.opencode.lagoon.core.RemoteBackend {
+      val hostId = profile.remoteHostId ?: throw IllegalStateException("请先选择并验证 DSH Host")
+      val account = credentials.username.trim()
+      if (account.isBlank()) throw IllegalStateException("请先登录 DSH Hub 并注册 Remote 设备")
+      val origin = com.igng.opencode.lagoon.core.canonicalRemoteOrigin(profile.url)
+      val devices = HubRemoteDeviceStore(store.dataDirectory, store.secretBox)
+      val manager = com.igng.opencode.lagoon.core.RemoteDeviceManager(devices, "profile-${profile.id}", origin, account,
+        registerer = { descriptor, token -> com.igng.opencode.lagoon.core.RemoteServerApi(profile.url, profile.allowCleartext).register(descriptor, token) },
+        refresher = { id, token -> com.igng.opencode.lagoon.core.RemoteServerApi(profile.url, profile.allowCleartext).refresh(id, token) })
+      val trust = com.igng.opencode.lagoon.core.RemotePeerTrust(HubRemotePeerTrustStore(store.dataDirectory))
+      return com.igng.opencode.lagoon.core.RemoteBackend(com.igng.opencode.lagoon.core.RemoteSession(
+        profile.url, profile.allowCleartext, hostId, manager, trust, account))
+    }
+  }
   private val overview = AllServersOverview(store, store, scope, ::acceptSnapshot, { null }, ::acceptEvent, ::acceptConnected,
-    DirectoryHealth(), ::acceptRemoved)
+    DirectoryHealth(), ::acceptRemoved, remoteBackendFactory)
   private val snapshots = mutableMapOf<String, ServerOverviewSnapshot>()
   private val published = mutableMapOf<String, String>()
   private val publishJobs = mutableMapOf<String, Job>()
@@ -92,6 +107,9 @@ class HubRuntime(private val store: HubStore, private val streams: StreamRegistr
     if (serverId !in monitored) restartMonitors()
     return overview.client(serverId)
   }
+
+  fun remoteBackend(profile: ServerProfile, credentials: com.igng.opencode.lagoon.core.ServerCredentials): com.igng.opencode.lagoon.core.RemoteBackend =
+    remoteBackendFactory.create(profile, credentials)
 
   fun capabilities(serverId: String): ApiCapabilities =
     runCatching { if (serverId in monitored) overview.client(serverId).capabilities() else null }.getOrNull() ?: ApiCapabilities.BASELINE
@@ -296,6 +314,11 @@ class HubRuntime(private val store: HubStore, private val streams: StreamRegistr
     restartMonitors()
     snapshots[profile.id]?.let { snapshots[profile.id] = it.copy(profile = profile) }
     schedulePublish(profile.id)
+  }
+
+  fun saveRemoteHostSelection(profile: ServerProfile) {
+    store.saveRemoteHost(profile)
+    profileChanged(profile)
   }
 
   fun profileRemoved(serverId: String) {

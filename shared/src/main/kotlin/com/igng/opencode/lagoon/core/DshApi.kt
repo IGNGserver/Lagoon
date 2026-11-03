@@ -59,7 +59,8 @@ class DshApi(
    * 落盘的 Cookie 跨 App 与 dsh 重启复用，启动令牌只在没有可用 Cookie 时才用得上。
    */
   private val onCookie: (String) -> Unit = {},
-  private val clock: () -> Long = System::currentTimeMillis
+  private val clock: () -> Long = System::currentTimeMillis,
+  private val remoteBackend: RemoteBackend? = null
 ) : HarnessClient {
   constructor(profile: ServerProfile, password: String) : this(profile, ServerCredentials(profile.username, password))
 
@@ -136,9 +137,17 @@ class DshApi(
   /** 每个会话已经投影过的最大事件 seq：消息页与实时流之间按 seq 去重。 */
   private val lastSeqs = ConcurrentHashMap<String, Long>()
 
-  override fun capabilities(): ApiCapabilities = CAPABILITIES
+  override fun capabilities(): ApiCapabilities = if (remoteBackend == null) CAPABILITIES else CAPABILITIES.copy(diff = false)
 
-  override suspend fun discoverCapabilities(): ApiCapabilities = CAPABILITIES
+  override fun close() {
+    eventChannel?.close()
+    follows.values.forEach(WebSocket::cancel)
+    follows.clear()
+    pendingApprovals.clear(); pendingQuestions.clear()
+    remoteBackend?.close()
+  }
+
+  override suspend fun discoverCapabilities(): ApiCapabilities = capabilities()
 
   // ---------------------------------------------------------------- 鉴权
 
@@ -274,6 +283,10 @@ class DshApi(
   /** 一元调用的请求信封是 `{type, rpcId, method, payload}`；响应是 `{type, rpcId, result}`。 */
   private suspend fun call(endpoint: String, payload: JSONObject = noArgs(), retried: Boolean = false): Any? =
     withContext(Dispatchers.IO) {
+      remoteBackend?.let { remote ->
+        try { return@withContext remote.call(endpoint, payload) }
+        catch (error: RemoteGatewayException) { throw ApiException(502, friendlyMessage(error.code, error.message.orEmpty()), error.code) }
+      }
       val current = cookie()
       val url = base.newBuilder().addEncodedPathSegment("api").addEncodedPathSegments(endpoint).build()
       val envelope = JSONObject()
@@ -326,6 +339,7 @@ class DshApi(
     "workspace-file/too-large" -> "文件过大，无法读取"
     "gateway/service-unavailable" -> "该实例没有提供这项能力"
     "gateway/arguments-invalid" -> "请求与实例契约不一致，请更新 Lagoon 或 dsh"
+    "RESPONSE_TOO_LARGE" -> "响应过大，且该操作不能安全地重试"
     else -> upstream
   }
 
@@ -341,6 +355,7 @@ class DshApi(
 
   /** 认证栅栏内的精确 GET 路由（改动摘要/对比）；失败返回 null。 */
   private suspend fun fetchJson(url: HttpUrl): JSONObject? = withContext(Dispatchers.IO) {
+    if (remoteBackend != null) return@withContext null
     val request = Request.Builder().url(url).header("Cookie", cookie()).get().build()
     try {
       http.newCall(request).execute().use { response ->
@@ -548,6 +563,7 @@ class DshApi(
     onItem: (JSONObject) -> Unit,
     onClosed: (Throwable?) -> Unit
   ): WebSocket = withContext(Dispatchers.IO) {
+    remoteBackend?.let { return@withContext it.open(endpoint, payload, onItem, onClosed) }
     val current = cookie()
     val streamId = UUID.randomUUID().toString()
     // OkHttp 的 WebSocket 直接接受 http(s) URL 并发起 Upgrade；HttpUrl 不接受 ws/wss 方案。
