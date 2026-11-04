@@ -18,7 +18,7 @@ class RemoteDeviceStoreTest {
 
   private fun tokens(accessExpiry: Long = 200_000) = RemoteTokenPair("device-access-token-123", accessExpiry, "device-refresh-token-123", 900_000)
 
-  @Test fun storesSealedIdentityAndSerializesRefreshAcrossManagers() = runBlocking {
+  @Test fun serializesRefreshAcrossManagersAndPersistsIdentity() = runBlocking {
     val store = TestStore()
     val first = RemoteDeviceManager(store, "phone", "https://hub.example", "user@example.com",
       { _, _ -> tokens(100_000) }, { _, _ -> tokens(300_000) })
