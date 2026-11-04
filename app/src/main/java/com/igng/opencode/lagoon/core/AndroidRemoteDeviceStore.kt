@@ -24,5 +24,9 @@ internal class AndroidRemoteDeviceStore internal constructor(
     if (!preferences.edit().putString(slot, encrypted).commit()) throw IOException("Remote 设备资料保存失败")
   }
 
+  override fun delete(slot: String) = synchronized(lock) {
+    if (!preferences.edit().remove(slot).commit()) throw IOException("Remote 设备资料删除失败")
+  }
+
   private companion object { val lock = Any() }
 }

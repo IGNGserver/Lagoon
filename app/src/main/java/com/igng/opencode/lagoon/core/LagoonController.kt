@@ -37,7 +37,12 @@ internal fun operationKey(server: String?, session: String?, project: String?, a
 internal fun attachmentKey(session: String?): String = session ?: "draft"
 
 data class LagoonState(
-  val profiles: List<ServerProfile> = emptyList(), val serverId: String? = null, val version: String = "",
+  val profiles: List<ServerProfile> = emptyList(),
+  /** Local, user-created device groups. Presentation only; never sent to a server. */
+  val deviceGroups: List<DeviceGroup> = emptyList(),
+  /** null = the home is not grouped (single profile or all-servers mode). */
+  val homeGroupId: String? = null,
+  val serverId: String? = null, val version: String = "",
   val connected: Boolean = false, val cached: Boolean = false, val loading: Boolean = false, val error: String? = null,
   /** True when the last catalog refresh could not read every project; some values are last-known. */
   val degraded: Boolean = false,
@@ -47,6 +52,8 @@ data class LagoonState(
   val projects: List<Project> = emptyList(), val projectId: String? = null,
   /** Home list filter: null = 全部会话 (default), otherwise one project id. Not the execution target. */
   val scopeProjectId: String? = null,
+  /** Device-group workspace filter; only meaningful while [homeGroupId] is set. */
+  val scopeWorkspaceKey: String? = null,
   val sessions: List<Session> = emptyList(), val sessionId: String? = null,
   val knownParents: Map<String, String> = emptyMap(),
   val messages: List<Message> = emptyList(), val tasks: Map<String, TaskState> = emptyMap(),
@@ -132,6 +139,13 @@ data class LagoonState(
   val transcriptLoadingSince: Long = 0
 ) {
   val server: ServerProfile? get() = profiles.firstOrNull { it.id == serverId }
+  val homeGroup: DeviceGroup? get() = homeGroupId?.let { id -> deviceGroups.firstOrNull { it.id == id } }
+  val homeGroupProfiles: List<ServerProfile> get() = homeGroup?.memberIds?.mapNotNull { id -> profiles.firstOrNull { it.id == id } }.orEmpty()
+  /** The home is aggregating more than one server: all-servers mode or a device group. */
+  val multiServerView: Boolean get() = allServers || homeGroup != null
+  val deviceTabs: List<DeviceTab> by lazy(LazyThreadSafetyMode.PUBLICATION) {
+    DeviceGroupState(deviceGroups, homeGroupId).tabs(profiles)
+  }
   /**
    * The open conversation can take a prompt now and deliver it once the server answers: the server is
    * still connecting or is between retries, rather than not configured at all.
@@ -191,7 +205,7 @@ data class LagoonState(
   fun sessionActivity(sessionId: String? = this.sessionId): SessionActivity =
     SessionActivityRules.activity(sessionId, sessions, presentedTasks, shells, parents)
   fun sessionStatus(session: Session, active: Map<String, TaskState> = activeRootTasks): SessionStatus {
-    if (allServers && serverId == null) return allSessionStatuses[session.key] ?: SessionStatus.NONE
+    if (multiServerView) allSessionStatuses[session.key]?.let { return it }
     val unseen = notices.unseenFor(session.id)
     val present = presentedTasks[session.id]
     val staleOwn = (staleConnection || present?.uncertain == true) && present?.active == true
@@ -282,7 +296,7 @@ class LagoonController private constructor(private val appContext: Context) {
       val origin = canonicalRemoteOrigin(profile.url)
       val account = credentials.username.trim()
       if (account.isBlank()) throw IllegalStateException("请先登录 DSH Hub 并注册 Remote 设备")
-      val manager = RemoteDeviceManager(store.remoteDevices, remoteSlot(profile.id), origin, account,
+      val manager = RemoteDeviceManager(store.remoteDevices, remoteSlot(profile), origin, account,
         registerer = { descriptor, token -> RemoteServerApi(profile.url, profile.allowCleartext).register(descriptor, token) },
         refresher = { id, token -> RemoteServerApi(profile.url, profile.allowCleartext).refresh(id, token) })
       val session = RemoteSession(profile.url, profile.allowCleartext, hostId, manager,
@@ -292,6 +306,13 @@ class LagoonController private constructor(private val appContext: Context) {
   }
 
   private fun remoteSlot(profileId: String) = "profile-${profileId.replace(Regex("[^A-Za-z0-9_-]"), "_")}"
+
+  /** New enrollments use a Host-stable slot; existing profiles keep their old profile slot. */
+  private fun remoteSlot(profile: ServerProfile): String {
+    val host = profile.remoteHostId?.takeIf(String::isNotBlank) ?: return remoteSlot(profile.id)
+    val slot = "host-${host.replace(Regex("[^A-Za-z0-9_-]"), "_")}"
+    return if (runCatching { store.remoteDevices.load(slot) }.getOrNull() != null) slot else remoteSlot(profile.id)
+  }
 
   internal suspend fun registerRemote(profile: ServerProfile, account: String, password: String): List<RemoteHost> {
     require(profile.kind == ServerKind.DSH_REMOTE)
@@ -311,6 +332,69 @@ class LagoonController private constructor(private val appContext: Context) {
     val host = setup.confirmHost(account, hostId, fingerprint)
     return host
   }
+
+  /** One manager per login flow; the in-memory account token lives only as long as the UI keeps it. */
+  internal fun remoteAccountManager(address: String, allowCleartext: Boolean): RemoteAccountManager =
+    RemoteAccountManager(address, allowCleartext, "Lagoon · ${android.os.Build.MODEL.ifBlank { "Android" }}",
+      "android", appVersion(), store.remoteDevices, store.remotePins, store.remoteCatalogStore)
+
+  internal fun remoteCatalogs(): List<RemoteCatalog> = store.remoteCatalogs()
+
+  internal fun remoteCatalog(origin: String, account: String): RemoteCatalog? =
+    store.remoteCatalogs().firstOrNull { it.origin == canonicalRemoteOrigin(origin) && it.account == account }
+
+  /**
+   * Creates one ServerProfile per selected Host. Existing profiles for the same origin/host are
+   * reused, so adding a Host twice does not duplicate it in the home chips.
+   */
+  internal fun addRemoteProfiles(catalog: RemoteCatalog, selected: List<RemoteHostMeta>): List<ServerProfile> {
+    if (catalog.hosts.isEmpty()) return emptyList()
+    val origin = catalog.origin.trimEnd('/')
+    val existing = store.profiles()
+    val created = mutableListOf<ServerProfile>()
+    for (host in selected) {
+      val current = existing.firstOrNull { it.kind == ServerKind.DSH_REMOTE && it.remoteHostId == host.hostId && canonicalRemoteOrigin(it.url) == catalog.origin }
+      if (current != null) {
+        // Refresh the cached fingerprint/name without touching credentials or user settings.
+        if (current.name == catalog.account || current.name == host.name) continue
+        created += current
+        continue
+      }
+      var name = host.name.ifBlank { "远程主机" }
+      var suffix = 2
+      while (store.profiles().any { it.name == name }) { name = "${host.name} (${suffix++})" }
+      val profile = ServerProfile(
+        id = java.util.UUID.randomUUID().toString(),
+        name = name,
+        url = origin,
+        username = catalog.account,
+        autoConnect = true,
+        notifications = true,
+        allowCleartext = catalog.origin.startsWith("http://", ignoreCase = true),
+        kind = ServerKind.DSH_REMOTE,
+        remoteHostId = host.hostId,
+        remoteHostFingerprint = host.fingerprint
+      )
+      saveServer(profile, password = null, cookie = null, credentialUsername = catalog.account, connect = false)
+      created += profile
+    }
+    store.saveRemoteCatalog(catalog)
+    val firstOnline = created.firstOrNull { host -> catalog.hosts.firstOrNull { it.hostId == host.remoteHostId }?.online == true }
+      ?: created.firstOrNull()
+    if (firstOnline != null) connect(firstOnline.id, preserveHome = state.value.allServers)
+    return created
+  }
+
+  internal fun saveRemoteCatalog(catalog: RemoteCatalog) = store.saveRemoteCatalog(catalog)
+
+  /** Stop background retries after a sign-out; profiles and cached conversations stay local. */
+  internal fun markRemoteSignedOut(origin: String, account: String) {
+    store.profiles().filter {
+      it.kind == ServerKind.DSH_REMOTE && canonicalRemoteOrigin(it.url) == canonicalRemoteOrigin(origin) && it.username == account
+    }.forEach { profile ->
+      saveServer(profile.copy(autoConnect = false), password = null, cookie = null, credentialUsername = account, connect = false)
+    }
+  }
   private fun appVersion(): String = runCatching {
     appContext.packageManager.getPackageInfo(appContext.packageName, 0).versionName
   }.getOrNull()?.takeIf(String::isNotBlank) ?: "0.1.0"
@@ -327,8 +411,19 @@ class LagoonController private constructor(private val appContext: Context) {
   // Writing operations that must survive the UI leaving the foreground (permission replies, aborts)
   // run here rather than in a composer-scoped coroutine.
   private val operationScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+  private val deviceGroupStore = DeviceGroupStore(appContext)
   private val initialAllServers = store.allServers()
-  private val mutable = MutableStateFlow(LagoonState(profiles = store.profiles(), serverId = if (initialAllServers) store.selectedId() else store.homeServerId(), homeServerId = store.homeServerId(), allServers = initialAllServers, permissionPolicy = store.permissionPolicy()))
+  private val mutable = MutableStateFlow(
+    run {
+      val profiles = store.profiles()
+      val groups = deviceGroupStore.load().sanitized(profiles.map { it.id }.toSet())
+      val selectedProfile = if (initialAllServers) store.selectedId() else store.homeServerId()
+      val selectedGroup = selectedProfile?.let { id -> groups.groupOf(id)?.id } ?: groups.selectedGroupId
+      LagoonState(profiles = profiles, deviceGroups = groups.groups, homeGroupId = selectedGroup,
+        serverId = selectedProfile, homeServerId = store.homeServerId(), allServers = initialAllServers,
+        permissionPolicy = store.permissionPolicy())
+    }
+  )
   val state: StateFlow<LagoonState> = mutable
   private val allSnapshots = mutableMapOf<String, ServerOverviewSnapshot>()
   /** Shared per-directory read health; a dead directory must not degrade every server's state. */
@@ -534,6 +629,12 @@ class LagoonController private constructor(private val appContext: Context) {
   }
   /** [onCookie] 收到测试连接换到的会话 Cookie，保存资料时一并落盘，避免保存后再用令牌换一次。 */
   suspend fun testServer(profile: ServerProfile, credentials: ServerCredentials, onCookie: (String) -> Unit = {}): String {
+    // A second Remote connection with the same client identity would replace the live one. Reuse the
+    // persistent monitor's client for any already-saved Remote profile.
+    if (profile.kind == ServerKind.DSH_REMOTE && store.profiles().any { it.id == profile.id }) {
+      val existing = runCatching { allOverview.client(profile.id) }.getOrNull()
+      if (existing != null) return existing.health()
+    }
     val client = createHarnessClient(profile, credentials, onCookie = onCookie,
       remoteBackend = if (profile.kind == ServerKind.DSH_REMOTE) remoteBackendFactory.create(profile, credentials) else null)
     return try {
@@ -543,6 +644,27 @@ class LagoonController private constructor(private val appContext: Context) {
     } finally { client.close() }
   }
   fun notifyOverviewAction(serverId: String) = allOverview.refresh(serverId)
+
+  private fun clientFor(serverId: String): HarnessClient? =
+    if (serverId == state.value.serverId) api else runCatching { allOverview.client(serverId) }.getOrNull()
+
+  internal suspend fun pluginBundles(serverId: String): List<RemotePluginBundle> =
+    clientFor(serverId)?.pluginBundles().orEmpty()
+
+  internal suspend fun pluginEntries(serverId: String): List<RemotePluginEntry> =
+    clientFor(serverId)?.pluginEntries().orEmpty()
+
+  internal suspend fun setPluginBundle(serverId: String, name: String, enabled: Boolean): Boolean =
+    clientFor(serverId)?.setPluginBundle(name, enabled) == true
+
+  internal suspend fun setPluginEntry(serverId: String, entryId: String, enabled: Boolean): Boolean =
+    clientFor(serverId)?.setPluginEntry(entryId, enabled) == true
+
+  /** Measures one encrypted RPC round trip on the active Remote connection. */
+  internal suspend fun probeRemote(serverId: String? = state.value.serverId): RemoteProbe? {
+    if (serverId == null || serverId != state.value.serverId || state.value.server?.kind != ServerKind.DSH_REMOTE) return null
+    return api?.probeRemote()
+  }
   fun clearError() = mutable.update { it.copy(error = null) }
   /**
    * The live stream (re)connected. Events between the last read and the handshake may be lost, so the
@@ -790,8 +912,127 @@ class LagoonController private constructor(private val appContext: Context) {
   fun setAllServers(enabled: Boolean) {
     if (enabled == state.value.allServers) return
     store.rememberAllServers(enabled)
-    mutable.update { it.copy(allServers = enabled) }
-    if (!enabled) state.value.homeServerId?.takeIf { it != state.value.serverId }?.let { connect(it) }
+    if (enabled) {
+      mutable.update { it.copy(allServers = true, scopeWorkspaceKey = null, scopeProjectId = null) }
+      return
+    }
+    val group = state.value.homeGroup
+    if (group != null) selectGroup(group.id)
+    else {
+      mutable.update { it.copy(allServers = false) }
+      state.value.homeServerId?.takeIf { it != state.value.serverId }?.let { connect(it) }
+    }
+  }
+
+  /** Persists a device-group edit and publishes it without touching any server connection. */
+  private fun saveDeviceGroups(groups: List<DeviceGroup>, selected: String?) {
+    val clean = DeviceGroupState(groups, selected).sanitized(store.profiles().map { it.id }.toSet())
+    try {
+      deviceGroupStore.save(clean)
+    } catch (cancel: CancellationException) {
+      throw cancel
+    } catch (error: Exception) {
+      Diagnostics.warn("LagoonController", "设备分组保存失败", error)
+      mutable.update { it.copy(message = "设备分组保存失败") }
+      return
+    }
+    mutable.update { it.copy(deviceGroups = clean.groups, homeGroupId = clean.selectedGroupId) }
+    allOverview.start(store.profiles(), include = setOfNotNull(state.value.serverId))
+  }
+
+  /** A group edit can move the writable profile out of the selected group. Pick a surviving member. */
+  private fun ensureSelectedGroupActive() {
+    val group = state.value.homeGroup ?: return
+    if (state.value.serverId !in group.memberIds) selectGroup(group.id)
+  }
+
+  fun createDevice(name: String, memberIds: List<String>) {
+    val valid = memberIds.filter { id -> state.value.profiles.any { it.id == id } }.distinct()
+    val label = name.trim().take(128)
+    if (label.isBlank() || valid.isEmpty()) return
+    val groups = state.value.deviceGroups.map { group ->
+      group.copy(memberIds = group.memberIds.filterNot { it in valid })
+    }.filter { it.memberIds.isNotEmpty() } + DeviceGroup(
+      id = java.util.UUID.randomUUID().toString(), name = label, memberIds = valid, updatedAt = System.currentTimeMillis()
+    )
+    saveDeviceGroups(groups, state.value.homeGroupId)
+    ensureSelectedGroupActive()
+  }
+
+  fun updateDevice(id: String, name: String, memberIds: List<String>) {
+    val label = name.trim().take(128)
+    val valid = memberIds.filter { profileId -> state.value.profiles.any { it.id == profileId } }.distinct()
+    if (label.isBlank() || valid.isEmpty() || state.value.deviceGroups.none { it.id == id }) return
+    val groups = state.value.deviceGroups.map { group ->
+      when (group.id) {
+        id -> group.copy(name = label, memberIds = valid, updatedAt = System.currentTimeMillis())
+        else -> group.copy(memberIds = group.memberIds.filterNot { it in valid })
+      }
+    }.filter { it.memberIds.isNotEmpty() }
+    saveDeviceGroups(groups, state.value.homeGroupId)
+    if (state.value.homeGroupId == id) {
+      val active = state.value.serverId?.takeIf { it in valid }
+      if (active == null) selectGroup(id)
+    }
+    ensureSelectedGroupActive()
+  }
+
+  fun deleteDevice(id: String) {
+    if (state.value.deviceGroups.none { it.id == id }) return
+    val groups = state.value.deviceGroups.filterNot { it.id == id }
+    saveDeviceGroups(groups, state.value.homeGroupId?.takeIf { it != id })
+  }
+
+  /** Group-level convenience: each member still has its own connection and autoConnect flag. */
+  fun setDeviceAutoConnect(id: String, enabled: Boolean) {
+    val group = state.value.deviceGroups.firstOrNull { it.id == id } ?: return
+    val members = group.memberIds.mapNotNull { member -> store.profiles().firstOrNull { it.id == member } }
+    members.forEach { profile ->
+      if (profile.autoConnect != enabled) {
+        saveServer(profile.copy(autoConnect = enabled), password = null, cookie = null,
+          credentialUsername = profile.username, connect = false)
+      }
+    }
+    if (enabled) allOverview.start(store.profiles(), include = members.mapTo(HashSet()) { it.id })
+  }
+
+  fun moveProfile(profileId: String, groupId: String?) {
+    if (state.value.profiles.none { it.id == profileId }) return
+    if (groupId != null && state.value.deviceGroups.none { it.id == groupId }) return
+    val groups = state.value.deviceGroups.map { group ->
+      val without = group.copy(memberIds = group.memberIds.filterNot { it == profileId })
+      if (group.id == groupId) without.copy(memberIds = without.memberIds + profileId, updatedAt = System.currentTimeMillis()) else without
+    }.filter { it.memberIds.isNotEmpty() }
+    saveDeviceGroups(groups, state.value.homeGroupId)
+    ensureSelectedGroupActive()
+  }
+
+  /** Selects a device tab: a group keeps its last active profile, a singleton connects directly. */
+  fun selectGroup(id: String, profileId: String? = null) {
+    val group = state.value.deviceGroups.firstOrNull { it.id == id } ?: return
+    val members = group.memberIds.mapNotNull { member -> state.value.profiles.firstOrNull { it.id == member } }
+    if (members.isEmpty()) return
+    val current = state.value.serverId
+    val active: ServerProfile = profileId?.let { requested -> members.firstOrNull { it.id == requested } }
+      ?: current?.let { selected -> members.firstOrNull { it.id == selected } }
+      ?: members.firstOrNull { profile -> state.value.allServerSnapshots[profile.id]?.connected == true }
+      ?: members.first()
+    store.rememberAllServers(false)
+    saveDeviceGroups(state.value.deviceGroups, id)
+    mutable.update { it.copy(allServers = false, homeGroupId = id, scopeWorkspaceKey = null, scopeProjectId = null) }
+    if (active.id != state.value.serverId || !state.value.connected) {
+      connect(active.id, preserveHome = true, groupOverride = id)
+    }
+  }
+
+  fun selectProfile(profileId: String) {
+    val group = state.value.deviceGroups.firstOrNull { profileId in it.memberIds }
+    if (group != null) selectGroup(group.id, profileId)
+    else {
+      saveDeviceGroups(state.value.deviceGroups, null)
+      if (state.value.allServers) mutable.update { it.copy(allServers = false) }
+      connect(profileId)
+    }
   }
 
   fun saveServer(profile: ServerProfile, password: String?, cookie: String? = null, credentialUsername: String? = null, connect: Boolean = true) {
@@ -802,7 +1043,9 @@ class LagoonController private constructor(private val appContext: Context) {
         notifications.cancel(profile.id, session)
       }
     }
-    mutable.update { it.copy(profiles = store.profiles()) }
+    val profiles = store.profiles()
+    val groups = DeviceGroupState(state.value.deviceGroups, state.value.homeGroupId).sanitized(profiles.map { it.id }.toSet())
+    mutable.update { it.copy(profiles = profiles, deviceGroups = groups.groups, homeGroupId = groups.selectedGroupId) }
     scheduleBackgroundSync()
     allOverview.start(store.profiles(), include = setOfNotNull(if (connect) profile.id else state.value.serverId))
     if (connect) connect(profile.id, preserveHome = state.value.allServers)
@@ -824,13 +1067,21 @@ class LagoonController private constructor(private val appContext: Context) {
     if (transcripts != null) scope.launch(storeDispatcher) { attempt { transcripts.deleteServer(id) } }
     scheduleBackgroundSync()
 
+    // A deleted profile cannot stay in a device tab. Empty groups disappear; the selected group
+    // falls back to null only when it no longer has members.
+    saveDeviceGroups(DeviceGroupState(state.value.deviceGroups, state.value.homeGroupId).withoutProfile(id).groups,
+      state.value.homeGroupId?.takeIf { id -> state.value.deviceGroups.any { it.id == id } })
     allOverview.start(store.profiles(), include = setOfNotNull(state.value.serverId))
     mutable.update { it.copy(profiles = store.profiles(), allServerSnapshots = allSnapshots.toMap(),
       homeServerId = it.homeServerId.takeUnless { selected -> selected == id }) }
     if (mutable.value.serverId == id) {
-      val next = store.profiles().firstOrNull()?.id
-      if (next != null) connect(next, preserveHome = true)
-      else mutable.update { LagoonState(allServers = it.allServers, permissionPolicy = it.permissionPolicy) }
+      val group = state.value.homeGroup
+      if (group != null) selectGroup(group.id)
+      else {
+        val next = store.profiles().firstOrNull()?.id
+        if (next != null) connect(next, preserveHome = true)
+        else mutable.update { LagoonState(allServers = it.allServers, deviceGroups = it.deviceGroups, homeGroupId = it.homeGroupId, permissionPolicy = it.permissionPolicy) }
+      }
     }
   }
   private fun stopSingleConnection() {
@@ -843,7 +1094,8 @@ class LagoonController private constructor(private val appContext: Context) {
     generation += 1
     api = null
   }
-  fun connect(id: String, projectOverride: String? = null, sessionOverride: String? = null, preserveHome: Boolean = false) {
+  fun connect(id: String, projectOverride: String? = null, sessionOverride: String? = null, preserveHome: Boolean = false,
+    groupOverride: String? = null) {
     val profile = store.profiles().firstOrNull { it.id == id } ?: return
     val previous = state.value
     val previousServer = previous.serverId
@@ -871,8 +1123,11 @@ class LagoonController private constructor(private val appContext: Context) {
     store.select(id, rememberedProject, rememberedSession)
     // Drop the pre-ledger “永久已完成” states and read markers; keep runs this device saw as still running.
     store.migrateTaskLedger(id)
-    mutable.update { LagoonState(profiles = store.profiles(), serverId = id, loading = true, projectId = rememberedProject, sessionId = rememberedSession,
-      allServers = preserveHome && previous.allServers, homeServerId = if (preserveHome) previous.homeServerId else id,
+    mutable.update { LagoonState(profiles = store.profiles(), deviceGroups = previous.deviceGroups,
+      homeGroupId = groupOverride ?: if (preserveHome) previous.homeGroupId else null,
+      serverId = id, loading = true, projectId = rememberedProject, sessionId = rememberedSession,
+      allServers = if (groupOverride != null) false else preserveHome && previous.allServers,
+      homeServerId = if (preserveHome) previous.homeServerId else id,
       allServerSnapshots = allSnapshots.toMap(), permissionPolicy = store.permissionPolicy(),
       sessions = snapshot?.sessions.orEmpty(), projects = snapshot?.projects ?: store.localProjects(id).map { it.copy(serverId = id) },
       permissions = snapshot?.permissions.orEmpty(), questions = snapshot?.questions.orEmpty(),
@@ -1926,6 +2181,42 @@ class LagoonController private constructor(private val appContext: Context) {
       if (current.serverId != server) current
       else current.copy(shellOutput = ShellOutputView(job.id, job.command, job.directory, loading = true))
     }
+    if (state.value.server?.kind == ServerKind.DSH_REMOTE) {
+      shellOutputJob = scope.launch {
+        val text = StringBuilder()
+        try {
+          val ok = client.followJobOutput(job.sessionId, job.id) { chunk, running, finished ->
+            if (chunk.isNotEmpty()) {
+              text.append(chunk)
+              if (text.length > 64 * 1024) text.delete(0, text.length - 64 * 1024)
+            }
+            mutable.update { current ->
+              if (current.serverId != server || current.shellOutput?.shellId != job.id) current
+              else current.copy(shellOutput = current.shellOutput?.copy(
+                text = text.toString(), loading = !finished,
+                snapshot = ShellSnapshot(job.id, job.command, job.directory,
+                  status = if (running) "running" else "exited", started = job.started)))
+            }
+          }
+          if (!ok) mutable.update { current ->
+            if (current.shellOutput?.shellId != job.id) current
+            else current.copy(shellOutput = current.shellOutput?.copy(loading = false, error = "此主机没有后台任务输出"))
+          }
+        } catch (cancel: CancellationException) { throw cancel }
+        catch (error: Exception) {
+          mutable.update { current ->
+            if (current.shellOutput?.shellId != job.id) current
+            else current.copy(shellOutput = current.shellOutput?.copy(loading = false, error = userFacingError(error, "读取后台输出失败")))
+          }
+        } finally {
+          mutable.update { current ->
+            if (current.shellOutput?.shellId != job.id) current
+            else current.copy(shellOutput = current.shellOutput?.copy(loading = false))
+          }
+        }
+      }
+      return
+    }
     shellOutputJob = scope.launch {
       var cursor: Long? = null
       var initialized = false
@@ -2371,8 +2662,13 @@ class LagoonController private constructor(private val appContext: Context) {
     val server = state.value.serverId ?: return
     val scope = projectId?.takeIf { id -> state.value.projects.any { it.id == id } }
     store.rememberScope(server, scope)
-    mutable.update { it.copy(scopeProjectId = scope) }
+    mutable.update { it.copy(scopeProjectId = scope, scopeWorkspaceKey = null) }
     if (scope != null && scope != state.value.projectId) selectProject(scope)
+  }
+
+  /** Group home filter by merged workspace name; selecting a harness stays a separate action. */
+  fun setWorkspaceScope(key: String?) {
+    mutable.update { it.copy(scopeWorkspaceKey = key, scopeProjectId = null) }
   }
 
   // ---- Device-local projects ----
@@ -2725,6 +3021,16 @@ class LagoonController private constructor(private val appContext: Context) {
     if (op.isCurrent(this) && !state.value.streamConnected) loadSession(session, token = op.token, client = op.client, ancillary = false)
   }
   }
+  fun promptChild(text: String, onSent: (() -> Unit)? = null) = withSession("child-prompt") { op, client, session ->
+    val parent = session.parentId?.takeIf(String::isNotBlank) ?: throw ApiException(409, "这不是子会话")
+    if (!client.promptSubagent(parent, session.id, text.trim())) throw ApiException(501, "此服务器不支持继续子代理")
+    if (op.isCurrent(this)) onSent?.invoke()
+  }
+
+  fun updateQueued(itemId: String, action: QueueAction) = withSession("queue") { _, client, session ->
+    if (!client.updateQueue(session.id, itemId, action)) throw ApiException(501, "此服务器不支持修改排队消息")
+  }
+
   fun abort() = withSession("abort") { op, client, session ->
     client.abort(session)
     workRevision++

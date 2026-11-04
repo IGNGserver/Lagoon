@@ -16,6 +16,12 @@ class ServerStore internal constructor(private val preferences: SharedPreference
     AndroidRemotePeerTrustStore(requireNotNull(appContext) { "Remote Host pins need Android Context" }
       .getSharedPreferences("remote-host-pins", Context.MODE_PRIVATE))
   }
+  internal val remoteCatalogStore: RemoteCatalogStore by lazy {
+    AndroidRemoteCatalogStore(requireNotNull(appContext) { "Remote Host catalog needs Android Context" })
+  }
+  internal fun remoteCatalogs(): List<RemoteCatalog> = remoteCatalogStore.load()
+  internal fun saveRemoteCatalog(catalog: RemoteCatalog) = remoteCatalogStore.save(catalog)
+  internal fun clearRemoteCatalog(origin: String, account: String) = remoteCatalogStore.clear(origin, account)
   constructor(context: Context) : this(context.getSharedPreferences("servers", Context.MODE_PRIVATE),
     context.getSharedPreferences("secrets", Context.MODE_PRIVATE),
     KeystoreCipher("lagoon-server-passwords", legacyAlias = "opencode-lagoon-server-passwords")::encrypt,

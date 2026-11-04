@@ -16,6 +16,14 @@ class RemoteCapabilitiesTest {
     assertTrue(capabilities.supportsWorkspace("cursor", "agent.acp.cursor.v1"))
     assertFalse(capabilities.supportsWorkspace("pi", "agent.acp.pi.v1"))
     assertFalse(capabilities.supportsWorkspace("cursor", "agent.acp.other.v1"))
+    assertFalse(capabilities.supportsWorkspaceUpload)
+  }
+
+  @Test fun workspaceUploadIsCapabilityGated() {
+    val supported = RemoteCapabilities.parse(JSONObject("""{"capabilities":["harness.remote.v3","workspace.upload.v1"]}"""))
+    assertTrue(supported.supportsWorkspaceUpload)
+    val unsupported = RemoteCapabilities.parse(JSONObject("""{"capabilities":["harness.remote.v3"]}"""))
+    assertFalse(unsupported.supportsWorkspaceUpload)
   }
 
   @Test fun rejectsLegacyMissingAndConflictingCarrier() {

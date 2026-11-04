@@ -22,6 +22,7 @@ internal class RemoteDeviceRecord(
 internal interface RemoteDeviceStore {
   fun load(slot: String): RemoteDeviceRecord?
   fun save(slot: String, record: RemoteDeviceRecord)
+  fun delete(slot: String)
 }
 
 internal object RemoteDeviceCodec {

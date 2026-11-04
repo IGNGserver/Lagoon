@@ -81,7 +81,7 @@ private fun warmMarkdown(rows: List<TranscriptRow>) {
 
 @Composable
 internal fun Conversation(state: LagoonState, controller: LagoonController, modifier: Modifier = Modifier, onFile: (String) -> Unit, onModal: (Boolean) -> Unit,
-  onOpenChild: (String) -> Unit = {}, onActivityGroup: (TranscriptRow) -> Unit = {}) {
+  onOpenChild: (String) -> Unit = {}, onActivityGroup: (TranscriptRow) -> Unit = {}, onQueuedAction: (TranscriptRow) -> Unit = {}) {
   val list = rememberLazyListState()
   val scope = rememberCoroutineScope()
   val unverified = state.livePresentedTasks[state.sessionId]?.active != true || state.cached || !state.connected
@@ -175,7 +175,7 @@ internal fun Conversation(state: LagoonState, controller: LagoonController, modi
       items(questions.asReversed(), key = { "question:${it.id}" }) { MiuixQuestionCard(it, controller, state.pending("question:${it.id}")) }
       items(permissions.asReversed(), key = { "permission:${it.id}" }) { MiuixPermissionCard(it, controller, state.pending("permission:${it.id}"), onModal) }
       items(mainRows.asReversed(), key = { it.key }, contentType = { it.kind }) { row ->
-        TranscriptRowView(row, onFile, onOpenChild, onActivityGroup)
+        TranscriptRowView(row, onFile, onOpenChild, onActivityGroup, onQueuedAction)
       }
       if (rows.isEmpty()) item(key = "empty-hint") { ResourceHint(state.resource("messages"), "会话尚无消息", "在下方输入第一项任务。", controller::reload) }
       // A fixed height, so the spinner appearing never changes the list's extent.
@@ -229,12 +229,12 @@ private fun elapsedText(seconds: Long): String = when {
 }
 
 @Composable
-private fun TranscriptRowView(row: TranscriptRow, onFile: (String) -> Unit, onOpenChild: (String) -> Unit, onActivityGroup: (TranscriptRow) -> Unit) {
+private fun TranscriptRowView(row: TranscriptRow, onFile: (String) -> Unit, onOpenChild: (String) -> Unit, onActivityGroup: (TranscriptRow) -> Unit, onQueuedAction: (TranscriptRow) -> Unit) {
   when (row.kind) {
     "time" -> Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
       Text(row.text, style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
     }
-    "user" -> UserMessageRow(row, onFile)
+    "user" -> UserMessageRow(row, onFile, onQueuedAction)
     // One selection container per reply so a long press can select across paragraphs; the turn's final
     // answer is also copyable as a whole from the meta row below it.
     "text" -> SelectionContainer { Column { parsed(row.key, row.text).forEach { block -> MarkdownBlockView(block, selectable = false) } } }
@@ -286,7 +286,7 @@ private fun TranscriptRowView(row: TranscriptRow, onFile: (String) -> Unit, onOp
 }
 
 @Composable
-private fun UserMessageRow(row: TranscriptRow, onFile: (String) -> Unit) {
+private fun UserMessageRow(row: TranscriptRow, onFile: (String) -> Unit, onQueuedAction: (TranscriptRow) -> Unit) {
   val bubbleMax = LocalConfiguration.current.screenWidthDp.dp * 0.86f
   Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.End) {
     if (row.attachments.isNotEmpty()) Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -304,6 +304,10 @@ private fun UserMessageRow(row: TranscriptRow, onFile: (String) -> Unit) {
     Row(Modifier.fillMaxWidth().padding(top = 4.dp), verticalAlignment = Alignment.CenterVertically) {
       Spacer(Modifier.weight(1f))
       if (row.meta.isNotBlank()) Text(row.meta, style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
+      if (row.status == "queued") {
+        Spacer(Modifier.width(8.dp))
+        TextButton(text = "操作", onClick = { onQueuedAction(row) })
+      }
     }
   }
 }

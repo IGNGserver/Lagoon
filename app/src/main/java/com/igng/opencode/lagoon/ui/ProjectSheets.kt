@@ -29,6 +29,7 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
 @Composable
 internal fun ProjectScopeSheet(state: LagoonState, controller: LagoonController, onDismiss: () -> Unit) {
   if (state.browsePath != null) { DirectoryBrowserSheet(state, controller); return }
+  if (state.homeGroup != null) { DeviceWorkspaceScopeSheet(state, controller, onDismiss); return }
   var query by rememberSaveable { mutableStateOf("") }
   var removing by remember { mutableStateOf<Project?>(null) }
   val counts = HomeScope.counts(state.sessions, state.projects)
@@ -67,6 +68,45 @@ internal fun ProjectScopeSheet(state: LagoonState, controller: LagoonController,
     }
   }
   removing?.let { project -> RemoveProjectDialog(project, controller) { removing = null } }
+}
+
+/** Workspace picker for a device group: same-named projects from its harnesses are one entry. */
+@Composable
+internal fun DeviceWorkspaceScopeSheet(state: LagoonState, controller: LagoonController, onDismiss: () -> Unit) {
+  val group = state.homeGroup ?: return
+  val workspaces = remember(state.sessions, state.projects, group.id) { deviceWorkspaces(state.sessions, state.projects, group.id) }
+  SuperBottomSheet(title = "选择工作区", show = true, onDismissRequest = onDismiss) {
+    LazyColumn(Modifier.fillMaxWidth().heightIn(max = 560.dp), contentPadding = PaddingValues(bottom = 16.dp)) {
+      item {
+        Card(Modifier.fillMaxWidth()) {
+          ChoiceRow("全部会话", "${state.sessions.count { it.visibleOnHome }} 个会话", state.scopeWorkspaceKey == null) {
+            controller.setWorkspaceScope(null); onDismiss()
+          }
+        }
+      }
+      item { SmallTitle("工作区", insideMargin = PaddingValues(horizontal = 16.dp, vertical = 8.dp)) }
+      if (workspaces.isEmpty()) item {
+        Text("这个设备还没有工作区。先在对应 harness 中添加项目目录。", Modifier.padding(16.dp),
+          style = MiuixTheme.textStyles.footnote1.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
+      } else item {
+        Card(Modifier.fillMaxWidth()) {
+          workspaces.forEach { workspace ->
+            ChoiceRow(
+              title = workspace.name,
+              summary = listOfNotNull(
+                "${workspace.sessions.count { it.visibleOnHome }} 个会话",
+                "${workspace.members.size} 个 harness".takeIf { workspace.members.size > 1 },
+                workspace.members.firstOrNull()?.directory
+              ).joinToString(" · "),
+              selected = state.scopeWorkspaceKey == workspace.key
+            ) {
+              controller.setWorkspaceScope(workspace.key); onDismiss()
+            }
+          }
+        }
+      }
+    }
+  }
 }
 
 /** Scope picker used by the aggregate home. Project filtering stays server-local, so selecting one
@@ -130,6 +170,7 @@ internal fun DraftTargetSheet(state: LagoonState, controller: LagoonController, 
 @Composable
 internal fun AllServersDraftTargetSheet(
   state: LagoonState,
+  profiles: List<ServerProfile> = state.profiles,
   onSelect: (ServerProfile, Project) -> Unit,
   onDismiss: () -> Unit
 ) {
@@ -140,7 +181,7 @@ internal fun AllServersDraftTargetSheet(
         Text("没有可用项目。请先在对应服务器中添加一个项目目录。", Modifier.padding(16.dp),
           style = MiuixTheme.textStyles.footnote1.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
       }
-      state.profiles.forEach { profile ->
+      profiles.forEach { profile ->
         val projects = grouped[profile.id].orEmpty()
         if (projects.isNotEmpty()) {
           item { SmallTitle(profile.name, insideMargin = PaddingValues(horizontal = 16.dp, vertical = 8.dp)) }
@@ -149,6 +190,47 @@ internal fun AllServersDraftTargetSheet(
               projects.forEach { project ->
                 ProjectChoiceRow(project, HomeScope.displayPath(project.directory, null), false,
                   onSelect = { onSelect(profile, project) })
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+/** Draft target for a device group: one workspace name can contain several harnesses. */
+@Composable
+internal fun GroupDraftTargetSheet(
+  state: LagoonState,
+  profiles: List<ServerProfile>,
+  onSelect: (ServerProfile, Project) -> Unit,
+  onDismiss: () -> Unit
+) {
+  val group = state.homeGroup
+  val workspaces = remember(state.sessions, state.projects, group?.id) {
+    group?.let { deviceWorkspaces(state.sessions, state.projects, it.id) }.orEmpty()
+  }
+  SuperBottomSheet(title = "在哪个工作区新建", show = true, onDismissRequest = onDismiss) {
+    LazyColumn(Modifier.fillMaxWidth().heightIn(max = 660.dp), contentPadding = PaddingValues(bottom = 16.dp)) {
+      if (workspaces.isEmpty()) item {
+        Text("没有可用工作区。请先在对应 harness 中添加一个项目目录。", Modifier.padding(16.dp),
+          style = MiuixTheme.textStyles.footnote1.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
+      }
+      workspaces.forEach { workspace ->
+        if (workspace.members.isNotEmpty()) {
+          item { SmallTitle(workspace.name, insideMargin = PaddingValues(horizontal = 16.dp, vertical = 8.dp)) }
+          item {
+            Card(Modifier.fillMaxWidth()) {
+              workspace.members.forEach { project ->
+                val profile = project.serverId?.let { id -> profiles.firstOrNull { it.id == id } }
+                if (profile != null) {
+                  ChoiceRow(
+                    title = profile.name,
+                    summary = listOfNotNull(profile.kind.label, project.name, project.directory).joinToString(" · "),
+                    selected = false
+                  ) { onSelect(profile, project) }
+                }
               }
             }
           }

@@ -108,9 +108,12 @@ fun ServersModal(
   state: LagoonState,
   controller: LagoonController,
   existing: ServerProfile?,
-  onDismiss: () -> Unit
+  onDismiss: () -> Unit,
+  onRemoteHosts: () -> Unit = {}
 ) {
   var deleting by remember { mutableStateOf(false) }
+  var remoteDetails by remember { mutableStateOf(false) }
+  var remoteExtensions by remember { mutableStateOf(false) }
   val scope = rememberCoroutineScope()
 
   SuperBottomSheet(
@@ -123,6 +126,9 @@ fun ServersModal(
         existing = existing,
         onCancel = onDismiss,
         onDelete = existing?.let { { deleting = true } },
+        onRemoteDetails = { remoteDetails = true },
+        onRemoteExtensions = { remoteExtensions = true },
+        onRemoteHosts = onRemoteHosts,
         onPairRemote = { profile, account, password, publishHosts ->
           publishHosts(controller.registerRemote(profile, account, password))
         },
@@ -184,6 +190,8 @@ fun ServersModal(
       }
     }
   }
+  if (remoteDetails && existing != null) RemoteConnectionDialog(existing, state, controller) { remoteDetails = false }
+  if (remoteExtensions && existing != null) RemoteExtensionsDialog(existing, controller) { remoteExtensions = false }
 }
 
 @Composable
@@ -191,6 +199,9 @@ private fun MiuixServerForm(
   existing: ServerProfile?,
   onCancel: () -> Unit,
   onDelete: (() -> Unit)?,
+  onRemoteDetails: (() -> Unit)? = null,
+  onRemoteExtensions: (() -> Unit)? = null,
+  onRemoteHosts: () -> Unit = {},
   onPairRemote: suspend (ServerProfile, String, String, (List<RemoteHost>) -> Unit) -> Unit = { _, _, _, _ -> },
   onSave: (ServerProfile, String?, (String) -> Unit) -> Unit
 ) {
@@ -219,6 +230,29 @@ private fun MiuixServerForm(
   var showAdvanced by remember { mutableStateOf(existing?.allowCleartext == true) }
   var result by remember { mutableStateOf("") }
   var working by remember { mutableStateOf(false) }
+
+  if (harness == ServerKind.DSH_REMOTE) {
+    Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+      SuperDropdown(
+        title = "服务类型",
+        items = ServerKind.entries.map { it.label },
+        selectedIndex = ServerKind.entries.indexOf(harness),
+        onSelectedIndexChange = { index ->
+          harness = ServerKind.entries[index]
+          if (name.isBlank()) name = "我的 ${harness.label}"
+        }
+      )
+      RemoteServerSummary(
+        existing = existing,
+        onDetails = onRemoteDetails,
+        onExtensions = onRemoteExtensions,
+        onManage = onRemoteHosts,
+        onDelete = onDelete,
+        onCancel = onCancel
+      )
+    }
+    return
+  }
 
   /** 粘贴 `dsh web` 的完整启动链接：拆成地址与令牌，并切到 DSH。 */
   fun acceptLaunchLink(text: String): Boolean {
@@ -488,6 +522,8 @@ fun SettingsScreen(
   onNotifications: () -> Unit,
   onEditServer: (ServerProfile?) -> Unit,
   onManageModels: () -> Unit,
+  onRemoteHosts: () -> Unit,
+  onManageDevices: () -> Unit = {},
   onBack: () -> Unit
 ) {
   val context = androidx.compose.ui.platform.LocalContext.current
@@ -590,6 +626,19 @@ fun SettingsScreen(
           )
         }
         SuperArrow(title = "添加服务器", summary = "OpenCode 地址 / pair 链接，或 DeepSeek Harness 令牌", onClick = { onEditServer(null) })
+        SuperArrow(
+          title = "设备分组",
+          summary = if (state.deviceGroups.isEmpty()) "把同一台电脑上的多个 harness 归到一个设备"
+            else "${state.deviceGroups.size} 个设备 · 手动分组",
+          onClick = onManageDevices
+        )
+        val catalogs = remember(state.profiles) { controller.remoteCatalogs() }
+        SuperArrow(
+          title = "DSH Remote 主机",
+          summary = if (catalogs.isEmpty()) "用浏览器登录，接入电脑上的 DSH"
+            else "${catalogs.first().account} · ${catalogs.sumOf { it.hosts.size }} 台主机",
+          onClick = onRemoteHosts
+        )
         SuperArrow(
           title = "模型显示",
           summary = when {

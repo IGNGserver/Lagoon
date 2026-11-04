@@ -17,6 +17,18 @@ class RemoteBackend internal constructor(private val session: RemoteSession) : A
   )
 
   internal val client: HarnessClient get() = harness
+  internal suspend fun supportsWorkspaceUpload(): Boolean = session.capabilities().supportsWorkspaceUpload
+
+  internal suspend fun probe(): RemoteProbe {
+    val started = System.nanoTime()
+    session.gateway().call("harness.transport.describe", JSONObject())
+    val elapsed = (System.nanoTime() - started) / 1_000_000
+    return RemoteProbe(elapsed)
+  }
+
+  internal suspend fun uploadWorkspaceFile(sessionId: String, bytes: ByteArray, name: String): RemoteUploadedFile =
+    session.uploadWorkspaceFile(sessionId, bytes, name)
+
   internal suspend fun call(endpoint: String, payload: JSONObject): Any? {
     requireHarness()
     return session.gateway().call(endpoint, payload)

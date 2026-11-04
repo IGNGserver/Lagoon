@@ -56,22 +56,29 @@ internal fun HomeScreen(
   onProjects: () -> Unit,
   onSelectServer: (ServerProfile?) -> Unit,
   onEditServer: (ServerProfile?) -> Unit,
+  onSelectGroup: (DeviceGroup) -> Unit = {},
+  onEditGroup: (DeviceGroup) -> Unit = {},
+  onManageDevices: () -> Unit = {},
   onPage: (RootPage) -> Unit
 ) {
   val preferences = LocalContext.current.getSharedPreferences("ui", Context.MODE_PRIVATE)
   var grouping by remember { mutableStateOf(runCatching { HomeGrouping.valueOf(preferences.getString("homeGrouping", null)!!) }.getOrDefault(HomeGrouping.DATE)) }
   var menu by remember { mutableStateOf(false) }
   var searching by rememberSaveable { mutableStateOf(false) }
-  var query by rememberSaveable(state.allServers, state.serverId) { mutableStateOf("") }
+  var query by rememberSaveable(state.allServers, state.serverId, state.homeGroupId) { mutableStateOf("") }
   var renaming by remember { mutableStateOf<Session?>(null) }
   var deleting by remember { mutableStateOf<Session?>(null) }
   val hasUnread = state.homeUnseenSessions().isNotEmpty()
-  val serverReadCount = if (state.allServers) {
-    state.allServerSnapshots.values.sumOf { it.serverReadCandidates().size }
-  } else {
-    state.serverId?.let { state.allServerSnapshots[it] }?.serverReadCandidates()?.size ?: 0
+  val serverReadCount = state.homeReadSnapshots().values.sumOf { it.serverReadCandidates().size }
+  val groupWorkspaces = remember(state.sessions, state.projects, state.homeGroupId) {
+    state.homeGroup?.let { group -> deviceWorkspaces(state.sessions, state.projects, group.id) }.orEmpty()
   }
+  val scopeWorkspace = state.scopeWorkspaceKey?.let { key -> groupWorkspaces.firstOrNull { it.key == key } }
   fun closeSearch() { searching = false; query = "" }
+  LaunchedEffect(groupWorkspaces, state.scopeWorkspaceKey) {
+    val key = state.scopeWorkspaceKey
+    if (key != null && groupWorkspaces.none { it.key == key }) controller.setWorkspaceScope(null)
+  }
   BackHandler(enabled = searching) { closeSearch() }
   Box(Modifier.fillMaxSize()) {
     Column(Modifier.fillMaxSize()) {
@@ -79,6 +86,8 @@ internal fun HomeScreen(
       else HomeTopBar(
          title = when {
            state.allServers -> "全部服务器"
+           scopeWorkspace != null -> scopeWorkspace.name
+           state.homeGroup != null -> state.homeGroup!!.name
            else -> state.scopeProjectId?.let { id -> state.projects.firstOrNull { it.id == id }?.name } ?: "全部会话"
          },
         onTitleClick = onProjects,
@@ -103,6 +112,8 @@ internal fun HomeScreen(
               ), title = "已读同步"))
               add(MenuSection(listOf(
                 MenuAction("搜索", MiuixIcons.Search) { searching = true },
+                MenuAction("全部设备", MiuixIcons.GridView) { controller.setAllServers(true) },
+                MenuAction("设备分组", MiuixIcons.Settings) { onManageDevices() },
                 MenuAction("已归档", ARCHIVE_ICON) { onPage(RootPage.ARCHIVED) },
                 MenuAction("设置", MiuixIcons.Settings) { onPage(RootPage.SETTINGS) }
               )))
@@ -110,12 +121,12 @@ internal fun HomeScreen(
           }
         }
       )
-      if (!searching) ServerChips(state, onSelectServer, onEditServer)
+      if (!searching) DeviceChips(state, controller, onSelectServer, onEditServer, onSelectGroup, onEditGroup)
       if (!searching) GlobalTaskStrip(state, controller, onArchived = {
         controller.setAllServers(true)
         onPage(RootPage.ARCHIVED)
       })
-      if (!state.allServers) ConnectionStrip(state, controller)
+      if (!state.multiServerView) ConnectionStrip(state, controller)
       Box(Modifier.weight(1f).fillMaxWidth()) {
         SessionList(state, controller, grouping, query.trim(), onOpen, onNewSession, onEditServer,
           onRename = { renaming = it }, onDelete = { deleting = it })
@@ -161,7 +172,8 @@ private fun SearchTopBar(query: String, onQuery: (String) -> Unit, onClose: () -
 @Composable
 private fun GlobalTaskStrip(state: LagoonState, controller: LagoonController, onArchived: () -> Unit) {
   val now by produceState(System.currentTimeMillis()) { while (true) { delay(60_000); value = System.currentTimeMillis() } }
-  val summary = state.globalSummary
+  val grouped = state.homeGroup != null
+  val summary = if (grouped) state.summary else state.globalSummary
   val archived = state.archivedTaskCount(now)
   val silent = state.silentServersWithTasks(now)
   if (summary.isEmpty && archived == 0 && silent.isEmpty()) return
@@ -171,9 +183,10 @@ private fun GlobalTaskStrip(state: LagoonState, controller: LagoonController, on
     verticalArrangement = Arrangement.spacedBy(2.dp)
   ) {
     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-      Text("全部服务器 · 全部项目", Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis,
+      Text(if (grouped) "${state.homeGroup?.name.orEmpty()} · 全部项目" else "全部服务器 · 全部项目",
+        Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis,
         style = MiuixTheme.textStyles.footnote2.copy(color = muted))
-      if (!state.allServers || state.scopeProjectId != null) {
+      if (grouped || !state.allServers || state.scopeProjectId != null || state.scopeWorkspaceKey != null) {
         Text("查看全部", Modifier.clip(CircleShape).clickable(role = Role.Button) {
           controller.setScope(null)
           controller.setAllServers(true)
@@ -224,16 +237,36 @@ private fun HomeTopBar(title: String, onTitleClick: () -> Unit, action: (@Compos
  * connection dot (connected / recovering / offline); tap switches, long press edits, ＋ adds.
  */
 @Composable
-private fun ServerChips(state: LagoonState, onSelect: (ServerProfile?) -> Unit, onEdit: (ServerProfile?) -> Unit) {
+private fun DeviceChips(
+  state: LagoonState,
+  controller: LagoonController,
+  onSelect: (ServerProfile?) -> Unit,
+  onEdit: (ServerProfile?) -> Unit,
+  onSelectGroup: (DeviceGroup) -> Unit,
+  onEditGroup: (DeviceGroup) -> Unit
+) {
+  fun connected(profile: ServerProfile): Boolean =
+    if (profile.id == state.serverId) state.connected else state.allServerSnapshots[profile.id]?.connected == true
+  fun streaming(profile: ServerProfile): Boolean =
+    if (profile.id == state.serverId) state.streamConnected else state.allServerSnapshots[profile.id]?.streamConnected == true
+  fun loading(profile: ServerProfile): Boolean =
+    if (profile.id == state.serverId) state.loading else state.allServerSnapshots[profile.id]?.loading == true
+  @Composable
+  fun dot(profiles: List<ServerProfile>, current: Boolean): androidx.compose.ui.graphics.Color? {
+    val anyConnected = profiles.any(::connected)
+    val anyStreaming = profiles.any(::streaming)
+    val anyLoading = profiles.any(::loading)
+    return when {
+      anyConnected && anyStreaming -> MiuixColorTokens.Success
+      anyConnected || anyLoading -> MiuixColorTokens.Warning
+      current || state.allServers -> MiuixTheme.colorScheme.onSurfaceVariantSummary
+      else -> null
+    }
+  }
   LazyRow(Modifier.fillMaxWidth(), contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-    item(key = "all-servers") {
+    if (state.deviceGroups.isEmpty() || state.allServers) item(key = "all-servers") {
       val current = state.allServers
-      val dot = when {
-        !current -> null
-        state.connected && state.streamConnected -> MiuixColorTokens.Success
-        state.connected || state.loading -> MiuixColorTokens.Warning
-        else -> MiuixTheme.colorScheme.onSurfaceVariantSummary
-      }
+      val color = dot(state.profiles, current)
       Card(
         cornerRadius = 20.dp,
         insideMargin = PaddingValues(horizontal = 16.dp),
@@ -242,42 +275,38 @@ private fun ServerChips(state: LagoonState, onSelect: (ServerProfile?) -> Unit, 
         onClick = { onSelect(null) }
       ) {
         Row(Modifier.heightIn(min = 40.dp), verticalAlignment = Alignment.CenterVertically) {
-          dot?.let { StatusDot(it); Spacer(Modifier.width(8.dp)) }
+          color?.let { StatusDot(it); Spacer(Modifier.width(8.dp)) }
           Text("全部", style = MiuixTheme.textStyles.body2.copy(fontWeight = if (current) FontWeight.Medium else FontWeight.Normal,
             color = if (current) MiuixTheme.colorScheme.primary else MiuixTheme.colorScheme.onSurfaceVariantSummary))
         }
       }
     }
-    items(state.profiles, key = { it.id }) { profile ->
-      val current = !state.allServers && profile.id == state.serverId
-      val selected = profile.id == state.serverId
-      val overview = state.allServerSnapshots[profile.id]
-      // 当前（可写）连接的服务器以控制器自己的状态为准：概览读会跳过它，快照可能是旧的 loading。
-      val dot = when {
-        selected -> when {
-          state.connected && state.streamConnected -> MiuixColorTokens.Success
-          state.connected || state.loading -> MiuixColorTokens.Warning
-          else -> MiuixTheme.colorScheme.onSurfaceVariantSummary
-        }
-        overview?.connected == true && overview.streamConnected -> MiuixColorTokens.Success
-        overview?.connected == true || overview?.loading == true -> MiuixColorTokens.Warning
-        state.allServers -> MiuixTheme.colorScheme.onSurfaceVariantSummary
-        else -> null
-      }
+    items(state.deviceTabs, key = { it.id }) { tab ->
+      val group = tab.group
+      val current = !state.allServers && if (group != null) state.homeGroupId == group.id
+        else state.homeGroupId == null && tab.profiles.any { it.id == state.serverId }
+      val color = dot(tab.profiles, current)
       Card(
         cornerRadius = 20.dp,
         insideMargin = PaddingValues(horizontal = 16.dp),
         colors = CardDefaults.defaultColors(color = if (current) MiuixColorTokens.PrimarySubtle else MiuixTheme.colorScheme.secondaryContainer),
         pressFeedbackType = PressFeedbackType.Sink,
-         onClick = { onSelect(profile) },
-        onLongPress = { onEdit(profile) }
+        onClick = {
+          val profile = tab.primaryProfile
+          if (group != null) onSelectGroup(group) else profile?.let(onSelect)
+        },
+        onLongPress = { if (group != null) onEditGroup(group) else tab.primaryProfile?.let(onEdit) }
       ) {
-        // A fixed height keeps Latin and CJK names on one baseline row.
         Row(Modifier.heightIn(min = 40.dp), verticalAlignment = Alignment.CenterVertically) {
-          dot?.let { StatusDot(it); Spacer(Modifier.width(8.dp)) }
-          Text(profile.name, Modifier.widthIn(max = 160.dp), maxLines = 1, overflow = TextOverflow.Ellipsis,
+          color?.let { StatusDot(it); Spacer(Modifier.width(8.dp)) }
+          Text(tab.label, Modifier.widthIn(max = 160.dp), maxLines = 1, overflow = TextOverflow.Ellipsis,
             style = MiuixTheme.textStyles.body2.copy(fontWeight = if (current) FontWeight.Medium else FontWeight.Normal,
               color = if (current) MiuixTheme.colorScheme.primary else MiuixTheme.colorScheme.onSurfaceVariantSummary))
+          if (group != null && tab.profiles.size > 1) {
+            Spacer(Modifier.width(4.dp))
+            Text("${tab.profiles.count(::connected)}/${tab.profiles.size}",
+              style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
+          }
         }
       }
     }
@@ -313,22 +342,36 @@ private fun SessionList(
   val list = rememberLazyListState()
   val now by produceState(System.currentTimeMillis()) { while (true) { kotlinx.coroutines.delay(60_000); value = System.currentTimeMillis() } }
   val active = remember(state.tasks, state.parents, state.permissionPolicy, state.autoApprovalFailures, state.connected, state.lastContactAt, now) { state.activeRootTasks }
-  val statuses = remember(state.sessions, state.notices, active, state.backgroundRunning, state.allSessionStatuses, state.allServers, state.allServerSnapshots, state.permissionPolicy, state.autoApprovalFailures, now) {
-    if (state.allServers) state.allServerStatuses(now)
+  val statuses = remember(state.sessions, state.notices, active, state.backgroundRunning, state.allSessionStatuses, state.multiServerView, state.allServerSnapshots, state.permissionPolicy, state.autoApprovalFailures, now) {
+    if (state.multiServerView) state.allSessionStatuses
     else state.sessions.associate { it.key to state.sessionStatus(it, active) }
   }
-  val unseen = remember(state.notices, state.allUnseenSessions, state.allServers) {
-    if (state.allServers) state.allUnseenSessions else state.notices.filterNot { it.viewed }.map { it.sessionId }.toSet()
+  val unseen = remember(state.notices, state.allUnseenSessions, state.multiServerView) {
+    if (state.multiServerView) state.allUnseenSessions else state.notices.filterNot { it.viewed }.map { it.sessionId }.toSet()
   }
   // Remembered on their inputs: the home list used to regroup on every state change (each streamed
   // event of any open conversation), not only when sessions, statuses or the filter changed.
-  val roots = remember(state.sessions, state.projects, state.scopeProjectId, query) {
-    HomeScope.roots(state.sessions, state.projects, state.scopeProjectId).filter { session ->
-      query.isBlank() || session.displayTitle().contains(query, true) ||
-        resolveSessionProject(session, state.projects)?.name?.contains(query, true) == true || session.directory.contains(query, true)
-    }
+  val roots = remember(state.sessions, state.projects, state.scopeProjectId, state.scopeWorkspaceKey, state.homeGroupId, query) {
+    val workspaceScope = state.scopeWorkspaceKey
+    val groupId = state.homeGroupId
+    HomeScope.roots(state.sessions, state.projects, state.scopeProjectId)
+      .filter { session -> state.allServers || workspaceScope == null || groupId == null || deviceWorkspaceKey(session, state.projects, groupId) == workspaceScope }
+      .filter { session ->
+        query.isBlank() || session.displayTitle().contains(query, true) ||
+          resolveSessionProject(session, state.projects)?.name?.contains(query, true) == true || session.directory.contains(query, true)
+      }
   }
-  val sections = remember(grouping, roots, state.projects, statuses, state.pinned, now) { HomeSections.build(grouping, roots, state.projects, statuses, state.pinned, now) }
+  val sections = remember(grouping, roots, state.projects, state.pinned, state.homeGroup?.id, now) {
+    val group = state.homeGroup
+    if (group != null && grouping == HomeGrouping.PROJECT) {
+      val visible = roots.mapTo(HashSet()) { it.key }
+      deviceWorkspaces(roots, state.projects, group.id).mapNotNull { workspace ->
+        val sessions = workspace.sessions.filter { it.key in visible }
+        if (sessions.isEmpty()) null
+        else HomeSection("workspace:${workspace.key.replace('\u0000', ':')}", workspace.name, sessions)
+      }
+    } else HomeSections.build(grouping, roots, state.projects, statuses, state.pinned, now)
+  }
   // Running sessions move to the top as they report activity. While the reader touches or scrolls the
   // list the order is held, so the row under the finger is still the one they meant when they lift it;
   // statuses stay live. Moves then animate instead of jumping.
@@ -380,13 +423,14 @@ private fun SessionList(
         }
          if (!collapsed) items(section.sessions, key = { "session:${section.key}:${it.key}" }, contentType = { "session" }) { session ->
           val pinned = session.id in state.pinned
-          val background = if (state.allServers) session.serverId?.let { id -> state.allServerSnapshots[id]?.backgroundRunning?.contains(session.id) } == true
+          val background = if (state.multiServerView) session.serverId?.let { id -> state.allServerSnapshots[id]?.backgroundRunning?.contains(session.id) } == true
             else state.backgroundRunning.contains(session.id)
           Box(Modifier.animateItem()) { HomeSessionRow(session, statuses[session.key] ?: SessionStatus.NONE, session.key in unseen,
             background = background,
-            serverName = if (state.allServers) session.serverId?.let { id -> state.profiles.firstOrNull { it.id == id }?.name } else null,
+            serverName = if (state.multiServerView) session.serverId?.let { id -> state.profiles.firstOrNull { it.id == id }?.name } else null,
+            harness = if (state.multiServerView) session.serverId?.let { id -> state.profiles.firstOrNull { it.id == id }?.kind } else null,
             onClick = { (session.target ?: state.serverId?.let { SessionTarget(it, session.id) })?.let(onOpen) }, actions = { buildList {
-            if (!state.allServers) {
+            if (!state.multiServerView) {
               add(MenuAction(if (pinned) "取消置顶" else "置顶", if (pinned) MiuixIcons.Unpin else MiuixIcons.Pin) { controller.togglePin(session.id) })
               if (state.connected && state.capabilities.supports(SessionAction.RENAME)) add(MenuAction("重命名", MiuixIcons.Rename) { onRename(session) })
               if (state.connected && state.capabilities.archive != null) add(MenuAction("归档", ARCHIVE_ICON) { controller.setArchived(session.id, true) })
@@ -438,7 +482,7 @@ internal val UNARCHIVE_ICON get() = MiuixIcons.Import
  */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-internal fun HomeSessionRow(session: Session, status: SessionStatus, unseen: Boolean, background: Boolean = false, serverName: String? = null, onClick: () -> Unit, actions: () -> List<MenuAction>) {
+internal fun HomeSessionRow(session: Session, status: SessionStatus, unseen: Boolean, background: Boolean = false, serverName: String? = null, harness: ServerKind? = null, onClick: () -> Unit, actions: () -> List<MenuAction>) {
   // Built only on long press: a list of actions (and their lambdas) per row per recomposition was waste.
   var menuItems by remember { mutableStateOf(emptyList<MenuAction>()) }
   var menu by remember { mutableStateOf(false) }
@@ -456,8 +500,11 @@ internal fun HomeSessionRow(session: Session, status: SessionStatus, unseen: Boo
        Column(Modifier.weight(1f)) {
          Text(session.displayTitle(), maxLines = 1, overflow = TextOverflow.Ellipsis,
            style = MiuixTheme.textStyles.body1.copy(fontWeight = if (highlighted) FontWeight.Medium else FontWeight.Normal, color = MiuixTheme.colorScheme.onSurface))
-         serverName?.let { Text(it, maxLines = 1, overflow = TextOverflow.Ellipsis,
-           style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary)) }
+         if (serverName != null || harness != null) Row(verticalAlignment = Alignment.CenterVertically) {
+           harness?.let { HarnessBadge(it); Spacer(Modifier.width(6.dp)) }
+           serverName?.let { Text(it, maxLines = 1, overflow = TextOverflow.Ellipsis,
+             style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary)) }
+         }
        }
        if (background && status != SessionStatus.RUNNING) {
          Spacer(Modifier.width(8.dp))

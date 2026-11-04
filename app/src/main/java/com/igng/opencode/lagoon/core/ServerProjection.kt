@@ -28,17 +28,21 @@ internal fun LagoonState.serverSnapshots(): Map<String, ServerOverviewSnapshot> 
     summary = summary, autoApprovalFailures = autoApprovalFailures, shells = shells))
 }
 
-/** The servers the home page is currently projecting: one server, or every monitored server in 全部 mode. */
+/** The servers the home page is currently projecting: one server, one device group, or every server. */
 internal fun LagoonState.homeReadSnapshots(): Map<String, ServerOverviewSnapshot> {
   val snapshots = serverSnapshots()
   if (allServers) return snapshots
+  homeGroup?.let { group ->
+    val scoped = allServerSnapshots.filterKeys { it in group.memberIds }
+    return if (scoped.isNotEmpty()) scoped else snapshots.filterKeys { it in group.memberIds }
+  }
   val id = homeServerId ?: serverId ?: return emptyMap()
   return snapshots[id]?.let { mapOf(id to it) } ?: emptyMap()
 }
 
-/** Unread results the home button would clear. 全部 mode already uses server-scoped keys. */
+/** Unread results the home button would clear. Aggregate modes already use server-scoped keys. */
 internal fun LagoonState.homeUnseenSessions(): Set<String> =
-  if (allServers) allUnseenSessions
+  if (multiServerView) allUnseenSessions
   else notices.filterNot { it.viewed }.map { it.sessionId }.toSet()
 
 /** Server-scoped candidates for the independent “服务端已读” action. */
@@ -57,6 +61,7 @@ internal fun LagoonState.allServerStatuses(now: Long = System.currentTimeMillis(
 fun LagoonState.homeProjection(): LagoonState {
   val snapshots = serverSnapshots()
   if (!allServers) {
+    homeGroup?.let { group -> return groupHomeProjection(snapshots, group) }
     val id = homeServerId ?: serverId
     if (id == serverId) return copy(allServers = false, allServerSnapshots = snapshots)
     val snapshot = snapshots[id] ?: return copy(serverId = id, sessions = emptyList(), projects = emptyList(), tasks = emptyMap(),
@@ -89,11 +94,48 @@ fun LagoonState.homeProjection(): LagoonState {
 }
 
 /**
+ * A device group is an aggregate like 全部, restricted to its members. The writable connection stays
+ * one profile so chat, drafts and actions keep their existing server-scoped contracts.
+ */
+private fun LagoonState.groupHomeProjection(
+  snapshots: Map<String, ServerOverviewSnapshot>,
+  group: DeviceGroup
+): LagoonState {
+  val members = group.memberIds.toSet()
+  val scoped = snapshots.filterKeys { it in members }
+  val statuses = scoped.values.flatMap { snapshot ->
+    snapshot.sessionStatuses(permissionPolicy).map { (id, status) -> scopedKey(snapshot.serverId, id) to status }
+  }.toMap()
+  val active = serverId?.takeIf { id -> id in members && scoped[id]?.connected == true }
+    ?: members.firstOrNull { id -> scoped[id]?.connected == true }
+    ?: serverId?.takeIf { it in members }
+    ?: members.firstOrNull()
+  val summary = TaskSummary.merge(scoped.values.filter { it.profile.notifications }.map { it.displaySummary(permissionPolicy) })
+  val unseen = scoped.values.flatMap { snapshot ->
+    snapshot.notices.filterNot { it.viewed }.map { scopedKey(snapshot.serverId, it.sessionId) }
+  }.toSet()
+  return copy(serverId = active, homeServerId = active ?: homeServerId, homeGroupId = group.id, allServers = false,
+    sessionId = null, projectId = null, scopeProjectId = null,
+    sessions = scoped.values.flatMap { it.sessions }.distinctBy { it.key }.sortedWith(sessionActivityOrder),
+    projects = scoped.values.flatMap { it.projects }.distinctBy { it.key },
+    tasks = emptyMap(), permissions = emptyList(), questions = emptyList(), notices = emptyList(),
+    knownParents = emptyMap(), backgroundRunning = emptySet(), pinned = emptySet(),
+    sessionCursors = emptyMap(), catalogComplete = true,
+    connected = scoped.values.any { it.connected }, loading = scoped.values.any { it.loading },
+    cached = scoped.values.any { it.cached }, degraded = scoped.values.any { it.degraded },
+    streamConnected = scoped.values.any { it.streamConnected },
+    lastContactAt = scoped.values.maxOfOrNull { it.lastReadAt } ?: lastContactAt,
+    autoApprovalFailures = scoped.values.flatMap { it.autoApprovalFailures }.toSet(),
+    summary = summary, allServerSnapshots = scoped, allSessionStatuses = statuses,
+    allUnseenSessions = unseen)
+}
+
+/**
  * Archived root sessions still counted by the island (active work or unread result) but hidden from
  * the home list by `visibleOnHome`. The home global strip links this count to the archived page.
  */
 internal fun LagoonState.archivedTaskCount(now: Long = System.currentTimeMillis()): Int =
-  serverSnapshots().values.sumOf { snapshot ->
+  homeReadSnapshots().values.sumOf { snapshot ->
     val archived = snapshot.sessions.filter { it.parentId == null && it.archived }.map { it.id }.toSet()
     if (archived.isEmpty()) return@sumOf 0
     val active = SessionActivityRules.rootStates(
@@ -106,6 +148,6 @@ internal fun LagoonState.archivedTaskCount(now: Long = System.currentTimeMillis(
 
 /** Notification-disabled servers that still have work, so the home count can say what the island omits. */
 internal fun LagoonState.silentServersWithTasks(now: Long = System.currentTimeMillis()): List<String> =
-  serverSnapshots().values.filter { snapshot ->
+  homeReadSnapshots().values.filter { snapshot ->
     !snapshot.profile.notifications && !snapshot.displaySummary(permissionPolicy, now).isEmpty
   }.map { it.profile.name }

@@ -74,6 +74,11 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
   var requestModal by remember { mutableStateOf(false) }
   var activityGroup by remember(state.serverId, state.sessionId) { mutableStateOf<TranscriptRow?>(null) }
   var activityItem by remember(state.serverId, state.sessionId) { mutableStateOf<TranscriptRow?>(null) }
+  var queuedAction by remember(state.serverId, state.sessionId) { mutableStateOf<TranscriptRow?>(null) }
+  var queuedEdit by remember(state.serverId, state.sessionId) { mutableStateOf<TranscriptRow?>(null) }
+  var queuedText by remember(state.serverId, state.sessionId) { mutableStateOf("") }
+  var childContinue by remember(state.serverId, state.sessionId) { mutableStateOf(false) }
+  var childText by remember(state.serverId, state.sessionId) { mutableStateOf("") }
   val activity = remember(state.sessions, state.presentedTasks, state.shells, state.parents, state.sessionId) { state.sessionActivity() }
   val focusManager = LocalFocusManager.current
   val keyboard = LocalSoftwareKeyboardController.current
@@ -118,8 +123,11 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
             focusManager.clearFocus(); keyboard?.hide()
             activityGroup = it
             activityItem = it.takeIf { row -> row.kind == "tool" }
-          })
-        if (session.parentId != null) ChildSessionBar(state, session, onBack)
+          }, onQueuedAction = { queuedAction = it })
+        if (session.parentId != null) ChildSessionBar(state, session, onBack,
+          onContinue = if (state.server?.kind == ServerKind.DSH || state.server?.kind == ServerKind.DSH_REMOTE) {
+            { childContinue = true }
+          } else null)
         else {
           if (activity.hasActive) SessionActivityChip(activity) { sheet = ChatSheet.ACTIVITY }
           ChatComposer(state, controller, interactive, onModal = { composerModal = it }, onServerFile = { sheet = ChatSheet.FILES; controller.listFiles() })
@@ -168,6 +176,42 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
     }
   }
   ShellOutputSheet(state, controller)
+  queuedAction?.let { row ->
+    val itemId = row.key.removePrefix("user:")
+    SuperBottomSheet(title = "排队消息", show = true, onDismissRequest = { queuedAction = null }) {
+      Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text(row.text, maxLines = 3, overflow = TextOverflow.Ellipsis, style = MiuixTheme.textStyles.body2)
+        TextButton(text = "立即插话", onClick = { controller.updateQueued(itemId, QueueAction.Steer); queuedAction = null }, modifier = Modifier.fillMaxWidth())
+        TextButton(text = "编辑", onClick = { queuedAction = null; queuedEdit = row; queuedText = row.text }, modifier = Modifier.fillMaxWidth())
+        TextButton(text = "撤回", onClick = { controller.updateQueued(itemId, QueueAction.Remove); queuedAction = null }, modifier = Modifier.fillMaxWidth(),
+          colors = ButtonDefaults.textButtonColors(textColor = MiuixColorTokens.Error))
+      }
+    }
+  }
+  queuedEdit?.let { row ->
+    SuperDialog(title = "编辑排队消息", show = true, onDismissRequest = { queuedEdit = null }) {
+      Column(Modifier.padding(top = 8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        TextField(value = queuedText, onValueChange = { queuedText = it }, label = "消息内容")
+        DialogActions("取消", { queuedEdit = null }, "保存", queuedText.isNotBlank()) {
+          controller.updateQueued(row.key.removePrefix("user:"), QueueAction.Edit(queuedText.trim()))
+          queuedEdit = null
+        }
+      }
+    }
+  }
+  if (childContinue) {
+    SuperDialog(title = "继续子代理", show = true, onDismissRequest = { childContinue = false }) {
+      Column(Modifier.padding(top = 8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text("消息会通过父会话发送给这个可继续的子代理。", style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
+        TextField(value = childText, onValueChange = { childText = it }, label = "消息内容")
+        DialogActions("取消", { childContinue = false }, "发送", childText.isNotBlank()) {
+          val text = childText.trim()
+          childContinue = false; childText = ""
+          controller.promptChild(text)
+        }
+      }
+    }
+  }
   if (rename) RenameSessionDialog(state, controller, session) { rename = false }
   if (delete) SuperDialog(title = "删除此会话？", show = true, onDismissRequest = { if (!state.pending("delete")) delete = false }) {
     Column { Text("会话消息将从服务器永久删除。\n${state.title(session)}"); ActionError(state, "delete")
@@ -196,7 +240,7 @@ private fun SessionActivityChip(activity: SessionActivity, onClick: () -> Unit) 
 
 /** The child-session footer: live status and a way back, with no composer (official subagents are read-only). */
 @Composable
-private fun ChildSessionBar(state: LagoonState, session: Session, onBack: () -> Unit) {
+private fun ChildSessionBar(state: LagoonState, session: Session, onBack: () -> Unit, onContinue: (() -> Unit)? = null) {
   val task = state.livePresentedTasks[session.id]
   val waiting = task?.phase in TaskState.WAITING_PHASES
   val phase = when {
@@ -231,6 +275,7 @@ private fun ChildSessionBar(state: LagoonState, session: Session, onBack: () -> 
       Text(listOfNotNull(session.agent, session.model?.label).joinToString(" · ").ifBlank { "子会话" },
         style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary), maxLines = 1, overflow = TextOverflow.Ellipsis)
     }
+    onContinue?.let { TextButton(text = "继续", onClick = it) }
     TextButton(text = "返回父会话", onClick = onBack)
   }
 }
@@ -321,7 +366,7 @@ private fun ShellOutputSheet(state: LagoonState, controller: LagoonController) {
           snapshot.exit != null -> "已结束 · 退出码 ${snapshot.exit}"
           else -> "已结束"
         }, Modifier.weight(1f), style = MiuixTheme.textStyles.footnote1.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
-        if (snapshot?.running == true) state.shells[output.shellId]?.let { job ->
+        if (snapshot?.running == true && state.server?.kind != ServerKind.DSH_REMOTE) state.shells[output.shellId]?.let { job ->
           TextButton(text = "停止", onClick = { controller.stopShell(job) })
         }
       }
@@ -517,7 +562,9 @@ private fun SessionSubtitle(state: LagoonState, session: Session) {
       Text("${status.label} · ", style = MiuixTheme.textStyles.footnote1.copy(color = muted))
     else -> {}
   }
-  Text(listOfNotNull(state.server?.name, resolveSessionProject(session, state.projects)?.name).joinToString(" · "), maxLines = 1, overflow = TextOverflow.Ellipsis,
+  val profile = session.serverId?.let { id -> state.profiles.firstOrNull { it.id == id } } ?: state.server
+  if (state.multiServerView) profile?.let { HarnessBadge(it.kind); Spacer(Modifier.width(4.dp)) }
+  Text(listOfNotNull(profile?.name, resolveSessionProject(session, state.projects)?.name).joinToString(" · "), maxLines = 1, overflow = TextOverflow.Ellipsis,
     style = MiuixTheme.textStyles.footnote1.copy(color = muted))
 }
 

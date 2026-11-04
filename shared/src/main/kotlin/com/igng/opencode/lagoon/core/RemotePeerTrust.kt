@@ -14,20 +14,22 @@ internal interface RemotePeerTrustStore {
   fun pinIfAbsent(scope: RemotePeerScope, publicKey: String): String
 }
 
+internal class RemoteTrustException(message: String, val changed: Boolean) : IOException(message)
+
 internal class RemotePeerTrust(private val store: RemotePeerTrustStore) {
   fun pinAfterConfirmation(scope: RemotePeerScope, host: RemoteHost): String {
     validateScope(scope, host)
     val key = host.publicKey?.takeIf(RemoteServerApi::validPublicKey) ?: throw IOException("Host 身份公钥无效")
     val stored = store.pinIfAbsent(scope, key)
-    if (!sameKey(stored, key)) throw IOException("Host 身份公钥已变更，请先移除旧信任记录")
+    if (!sameKey(stored, key)) throw RemoteTrustException("Host 身份公钥已变更，请先移除旧信任记录", changed = true)
     return key
   }
 
   fun verify(scope: RemotePeerScope, host: RemoteHost): String {
     validateScope(scope, host)
     val key = host.publicKey?.takeIf(RemoteServerApi::validPublicKey) ?: throw IOException("Host 身份公钥无效")
-    val pinned = store.pinned(scope) ?: throw IOException("该 Host 尚未获信任，请先核对身份指纹")
-    if (!sameKey(pinned, key)) throw IOException("Host 身份公钥已变更，请核实设备身份")
+    val pinned = store.pinned(scope) ?: throw RemoteTrustException("该 Host 尚未获信任，请先核对身份指纹", changed = false)
+    if (!sameKey(pinned, key)) throw RemoteTrustException("Host 身份公钥已变更，请核实设备身份", changed = true)
     return key
   }
 

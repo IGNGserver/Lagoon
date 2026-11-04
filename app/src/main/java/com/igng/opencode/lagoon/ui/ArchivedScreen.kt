@@ -25,24 +25,25 @@ internal fun ArchivedScreen(state: LagoonState, controller: LagoonController, on
   var deleting by remember { mutableStateOf<Session?>(null) }
   val archived = state.sessions.filter { it.parentId == null && it.archived }.sortedWith(sessionActivityOrder)
   val active = remember(state.tasks, state.parents, state.permissionPolicy, state.autoApprovalFailures, state.connected, state.lastContactAt) { state.activeRootTasks }
-  val statuses = remember(state.sessions, state.notices, active, state.backgroundRunning, state.allSessionStatuses, state.allServers) {
-    state.sessions.associate { it.key to state.sessionStatus(it, active) }
+  val statuses = remember(state.sessions, state.notices, active, state.backgroundRunning, state.allSessionStatuses, state.multiServerView) {
+    if (state.multiServerView) state.allSessionStatuses else state.sessions.associate { it.key to state.sessionStatus(it, active) }
   }
-  val unseen = remember(state.notices, state.allUnseenSessions, state.allServers) {
-    if (state.allServers) state.allUnseenSessions else state.notices.filterNot { it.viewed }.map { it.sessionId }.toSet()
+  val unseen = remember(state.notices, state.allUnseenSessions, state.multiServerView) {
+    if (state.multiServerView) state.allUnseenSessions else state.notices.filterNot { it.viewed }.map { it.sessionId }.toSet()
   }
   val muted = MiuixTheme.colorScheme.onSurfaceVariantSummary
   Column(Modifier.fillMaxSize()) {
     PageTopBar("已归档", onBack)
     LazyColumn(Modifier.fillMaxSize().overScrollVertical(), contentPadding = PaddingValues(top = 4.dp, bottom = 48.dp)) {
       items(archived, key = { it.key }) { session ->
-        val background = if (state.allServers) session.serverId?.let { id -> state.allServerSnapshots[id]?.backgroundRunning?.contains(session.id) } == true
+        val background = if (state.multiServerView) session.serverId?.let { id -> state.allServerSnapshots[id]?.backgroundRunning?.contains(session.id) } == true
           else state.backgroundRunning.contains(session.id)
         HomeSessionRow(session, statuses[session.key] ?: SessionStatus.NONE, unseen = session.key in unseen, background = background,
-          serverName = if (state.allServers) session.serverId?.let { id -> state.profiles.firstOrNull { it.id == id }?.name } else null,
+          serverName = if (state.multiServerView) session.serverId?.let { id -> state.profiles.firstOrNull { it.id == id }?.name } else null,
+          harness = if (state.multiServerView) session.serverId?.let { id -> state.profiles.firstOrNull { it.id == id }?.kind } else null,
           onClick = { (session.target ?: state.serverId?.let { SessionTarget(it, session.id) })?.let(onOpen) }, actions = { buildList {
-          if (!state.allServers && state.connected && state.capabilities.archive?.restorable == true) add(MenuAction("取消归档", UNARCHIVE_ICON) { controller.setArchived(session.id, false) })
-          if (!state.allServers && state.connected && state.capabilities.deleteSession) add(MenuAction("删除", MiuixIcons.Delete, danger = true) { deleting = session })
+          if (!state.multiServerView && state.connected && state.capabilities.archive?.restorable == true) add(MenuAction("取消归档", UNARCHIVE_ICON) { controller.setArchived(session.id, false) })
+          if (!state.multiServerView && state.connected && state.capabilities.deleteSession) add(MenuAction("删除", MiuixIcons.Delete, danger = true) { deleting = session })
         } })
       }
       if (archived.isEmpty()) item {

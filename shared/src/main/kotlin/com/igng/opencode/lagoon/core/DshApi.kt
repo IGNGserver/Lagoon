@@ -1281,6 +1281,101 @@ class DshApi(
     return Message(id, "user", created, parts, queued = queued, type = "user")
   }
 
+  override suspend fun updateQueue(sessionId: String, itemId: String, action: QueueAction): Boolean {
+    val payload = when (action) {
+      is QueueAction.Edit -> JSONObject().put("kind", "edit").put("content", JSONArray().put(JSONObject().put("type", "text").put("text", action.text)))
+      QueueAction.Remove -> JSONObject().put("kind", "remove")
+      QueueAction.Steer -> JSONObject().put("kind", "steer")
+    }
+    call("session/updateQueue", requestArgs(JSONObject().put("sessionId", sessionId).put("itemId", itemId).put("action", payload)))
+    return true
+  }
+
+  override suspend fun probeRemote(): RemoteProbe? = remoteBackend?.probe()
+
+  override suspend fun pluginBundles(): List<RemotePluginBundle> {
+    val list = call("pluginManager/listBundles") as? JSONArray ?: return emptyList()
+    return (0 until list.length()).mapNotNull { i ->
+      val item = list.optJSONObject(i) ?: return@mapNotNull null
+      val name = item.optString("name").takeIf { it.isNotBlank() } ?: return@mapNotNull null
+      RemotePluginBundle(name, item.optBoolean("enabled"), item.optBoolean("installed"),
+        item.optBoolean("official"), item.optString("version").takeIf { it.isNotBlank() },
+        item.optString("description").takeIf { it.isNotBlank() },
+        item.optString("readOnlyReason").takeIf { it.isNotBlank() })
+    }
+  }
+
+  override suspend fun pluginEntries(): List<RemotePluginEntry> {
+    val list = call("pluginManager/listPlugins") as? JSONArray ?: return emptyList()
+    return (0 until list.length()).mapNotNull { i ->
+      val item = list.optJSONObject(i) ?: return@mapNotNull null
+      val id = item.optString("entryId").takeIf { it.isNotBlank() } ?: return@mapNotNull null
+      RemotePluginEntry(id, item.optString("moduleName").takeIf { it.isNotBlank() } ?: id,
+        item.optBoolean("enabled"), item.optString("fiberPhase").takeIf { it.isNotBlank() },
+        item.optString("readOnlyReason").takeIf { it.isNotBlank() })
+    }
+  }
+
+  override suspend fun setPluginBundle(name: String, enabled: Boolean): Boolean {
+    call("pluginManager/setBundleEnabled", JSONObject().put("name", name).put("enabled", enabled))
+    return true
+  }
+
+  override suspend fun setPluginEntry(entryId: String, enabled: Boolean): Boolean {
+    call("pluginManager/setPluginEnabled", JSONObject().put("id", entryId).put("enabled", enabled))
+    return true
+  }
+
+  override suspend fun promptSubagent(parentId: String, childId: String, text: String): Boolean {
+    if (text.isBlank()) return false
+    val request = JSONObject().put("requestId", java.util.UUID.randomUUID().toString())
+      .put("parentSessionId", parentId).put("childSessionId", childId)
+      .put("mode", "continuable").put("delivery", "steer")
+      .put("content", JSONArray().put(JSONObject().put("type", "text").put("text", text)))
+      .put("clientTimeZone", java.util.TimeZone.getDefault().id)
+    call("subagents/prompt", requestArgs(request))
+    return true
+  }
+
+  override suspend fun followJobOutput(
+    sessionId: String,
+    jobId: String,
+    onUpdate: (text: String, running: Boolean, finished: Boolean) -> Unit
+  ): Boolean {
+    val closed = CompletableDeferred<Unit>()
+    var sawFrame = false
+    val socket = try {
+      openMux("job/follow", requestArgs(JSONObject().put("sessionId", sessionId).put("jobId", jobId)),
+        onItem = { frame ->
+          sawFrame = true
+          when (frame.optString("type")) {
+            "opened", "status" -> {
+              val job = frame.optJSONObject("job")
+              val status = job?.optString("status").orEmpty()
+              val running = status == "running" || status == "stopping"
+              onUpdate("", running, status.isNotBlank() && !running)
+            }
+            "output" -> {
+              val chunks = frame.optJSONArray("chunks")
+              val text = buildString {
+                if (chunks != null) for (i in 0 until chunks.length()) {
+                  val chunk = chunks.optJSONObject(i) ?: continue
+                  append(chunk.optString("text"))
+                }
+              }
+              if (text.isNotEmpty()) onUpdate(text, true, false)
+            }
+          }
+        },
+        onClosed = { closed.complete(Unit) })
+    } catch (cancel: CancellationException) { throw cancel }
+    catch (error: Exception) { throw error }
+    return try {
+      closed.await()
+      sawFrame
+    } finally { runCatching { socket.cancel() } }
+  }
+
   override suspend fun activeSessions(): Set<String> = withContext(Dispatchers.IO) {
     val listing = listing()
     val sessions = listing.items.mapNotNull { itemToSession(it) }
@@ -1395,6 +1490,19 @@ class DshApi(
     if (model != null) runCatching { selectModel(session, model) }
     selectPreset(session, agent)
     val content = JSONArray()
+    val remote = remoteBackend
+    val uploadLines = mutableListOf<String>()
+    // Remote has no fileUploads receipt; publish arbitrary files into the current workspace and
+    // reference the returned path. Images keep the existing multimodal image block.
+    if (remote != null) {
+      for (file in inline) {
+        val mime = file.mime.substringBefore(';').trim().lowercase()
+        if (AttachmentPolicy.kind(mime, file.name) == AttachmentPolicy.Kind.IMAGE) continue
+        val bytes = readInlineBytes(file) ?: throw ApiException(400, "附件无法读取：${file.name}")
+        val uploaded = remote.uploadWorkspaceFile(session.id, bytes, file.name)
+        uploadLines += "已上传文件：${uploaded.path}"
+      }
+    }
     // DSH 的 prompt 没有「文件引用」块；引用的服务器文件折算成 `@路径` 文本，与官方 Web 的提及写法一致。
     val body = buildString {
       append(text)
@@ -1402,9 +1510,14 @@ class DshApi(
         if (isNotEmpty()) append('\n')
         append(references.joinToString("\n") { "@${it.path}" })
       }
+      if (uploadLines.isNotEmpty()) {
+        if (isNotEmpty()) append('\n')
+        append(uploadLines.joinToString("\n"))
+      }
     }.trim()
     if (body.isNotBlank()) content.put(JSONObject().put("type", "text").put("text", body))
     for (file in inline) {
+      if (remote != null && AttachmentPolicy.kind(file.mime.substringBefore(';').trim().lowercase(), file.name) != AttachmentPolicy.Kind.IMAGE) continue
       val payload = inlineContent(file) ?: continue
       content.put(payload)
     }

@@ -14,6 +14,7 @@ class RemoteDeviceStoreTest {
     val values = mutableMapOf<String, String>()
     override fun load(slot: String): RemoteDeviceRecord? = values[slot]?.let(RemoteDeviceCodec::decode)
     override fun save(slot: String, record: RemoteDeviceRecord) { values[slot] = RemoteDeviceCodec.encode(record) }
+    override fun delete(slot: String) { values.remove(slot) }
   }
 
   private fun tokens(accessExpiry: Long = 200_000) = RemoteTokenPair("device-access-token-123", accessExpiry, "device-refresh-token-123", 900_000)

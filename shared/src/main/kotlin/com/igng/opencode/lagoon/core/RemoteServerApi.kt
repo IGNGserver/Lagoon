@@ -37,6 +37,69 @@ internal class RemoteServerApi(address: String, allowCleartext: Boolean = false)
     return RemoteAccount(requiredText(body, "account", 254), token(body, "token"), positiveLong(body, "expiresAt"))
   }
 
+  /** Browser/QR sign-in providers. A 404 means this Server only supports email/password. */
+  suspend fun oauthProviders(): List<RemoteOAuthProvider> {
+    val body = try { request("GET", "api/v1/auth/oauth/providers") }
+    catch (error: RemoteServerException) { if (error.status == 404) return emptyList() else throw error }
+    val items = body.optJSONArray("items") ?: return emptyList()
+    if (items.length() > 64) throw IOException("DSH Remote 登录方式过多")
+    val ids = HashSet<String>()
+    return (0 until items.length()).mapNotNull { index ->
+      val item = items.optJSONObject(index) ?: return@mapNotNull null
+      val id = (item.opt("id") as? String)?.takeIf { it.matches(Regex("[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}")) } ?: return@mapNotNull null
+      val label = (item.opt("displayName") as? String)?.trim()?.takeIf { it.isNotEmpty() && it.length <= 128 } ?: return@mapNotNull null
+      val startRaw = (item.opt("startUrl") as? String) ?: return@mapNotNull null
+      val start = try { requireAuthEntryPath(startRaw) } catch (_: IOException) { return@mapNotNull null }
+      val qr = (item.opt("qrStartUrl") as? String)?.takeIf { it.isNotBlank() }?.let {
+        try { requireAuthEntryPath(it) } catch (_: IOException) { null }
+      }
+      if (!ids.add(id)) return@mapNotNull null
+      RemoteOAuthProvider(id, label, start, qr)
+    }
+  }
+
+  suspend fun startQrLogin(provider: RemoteOAuthProvider): RemoteBrowserLogin {
+    val path = requireAuthEntryPath(provider.qrStartUrl ?: throw IOException("这个登录方式不支持浏览器登录"))
+    val body = requestAt("POST", entryUrl(path), JSONObject())
+    val qrId = requiredText(body, "qrId", 256).also {
+      if (!it.matches(Regex("[A-Za-z0-9_-]{16,256}"))) throw IOException("DSH Remote 登录会话无效")
+    }
+    val scan = requiredText(body, "scanUrl", 4096).let { requireQrLoginUrl(it, base) }
+    val expires = body.opt("expiresIn") as? Number ?: throw IOException("DSH Remote 登录会话无效")
+    val seconds = expires.toLong()
+    if (expires.toDouble() != seconds.toDouble() || seconds !in 1..3600) throw IOException("DSH Remote 登录会话无效")
+    return RemoteBrowserLogin(qrId, scan, System.currentTimeMillis() + seconds * 1000, provider.id)
+  }
+
+  suspend fun pollQrLogin(qrId: String): RemoteQrPoll {
+    if (!qrId.matches(Regex("[A-Za-z0-9_-]{16,256}"))) throw IOException("DSH Remote 登录会话无效")
+    val body = request("GET", "api/v1/auth/oauth/qr/$qrId")
+    return when (body.optString("status")) {
+      "pending" -> RemoteQrPoll.Pending
+      "expired" -> RemoteQrPoll.Expired
+      "complete" -> RemoteQrPoll.Complete(requiredText(body, "token", 8192).also {
+        if (it.length < 16) throw IOException("DSH Remote 登录凭据无效")
+      })
+      else -> throw IOException("DSH Remote 登录状态无效")
+    }
+  }
+
+  suspend fun accountMe(accountToken: String): String {
+    if (!validToken(accountToken)) throw IOException("DSH Remote 账号凭据无效")
+    val body = requestAt("GET", entryUrl("/api/v1/auth/me"), null, accountToken)
+    return requiredText(body, "account", 254)
+  }
+
+  /** Revoke this device on the Server. A missing/expired token is not a local failure. */
+  suspend fun revokeSelf(accessToken: String) = withContext(Dispatchers.IO) {
+    if (!validToken(accessToken)) throw IllegalArgumentException("Remote 设备凭据无效")
+    val request = Request.Builder().url(sameOriginUrl("/api/v1/devices/self")).delete()
+      .header("Accept", "application/json").header("Authorization", "Bearer $accessToken").build()
+    http.newCall(request).execute().use { response ->
+      if (!response.isSuccessful) throw RemoteServerException(response.code, null, response.code == 429 || response.code >= 500)
+    }
+  }
+
   suspend fun register(identity: RemoteClientDescriptor, accountToken: String): RemoteTokenPair {
     identity.validate()
     val device = JSONObject().put("deviceId", identity.deviceId).put("name", identity.name)
@@ -78,9 +141,21 @@ internal class RemoteServerApi(address: String, allowCleartext: Boolean = false)
       body.optString("fingerprint").takeIf(String::isNotBlank))
   }
 
-  private suspend fun request(method: String, path: String, body: JSONObject? = null, bearer: String? = null): JSONObject = withContext(Dispatchers.IO) {
+  private fun entryUrl(path: String): okhttp3.HttpUrl = sameOriginUrl(requireAuthEntryPath(path))
+
+  private fun sameOriginUrl(path: String): okhttp3.HttpUrl {
+    val url = requireNotNull(base.resolve(path)) { "DSH Hub 地址无效" }
+    require(url.scheme == base.scheme && url.host == base.host && url.port == base.port) { "DSH Hub 请求目标无效" }
+    return url
+  }
+
+  private suspend fun request(method: String, path: String, body: JSONObject? = null, bearer: String? = null): JSONObject =
+    requestAt(method, base.newBuilder().addEncodedPathSegments(path).build(), body, bearer)
+
+  private suspend fun requestAt(method: String, url: okhttp3.HttpUrl, body: JSONObject? = null, bearer: String? = null): JSONObject = withContext(Dispatchers.IO) {
+    if (url.scheme != base.scheme || url.host != base.host || url.port != base.port) throw IOException("DSH Hub 请求目标无效")
     if (bearer != null) require(validToken(bearer)) { "DSH Hub 授权凭据无效" }
-    val request = Request.Builder().url(base.newBuilder().addEncodedPathSegments(path).build())
+    val request = Request.Builder().url(url)
       .header("Accept", "application/json").apply { if (bearer != null) header("Authorization", "Bearer $bearer") }
       .method(method, body?.toString()?.toRequestBody("application/json; charset=utf-8".toMediaType())).build()
     http.newCall(request).execute().use { response ->

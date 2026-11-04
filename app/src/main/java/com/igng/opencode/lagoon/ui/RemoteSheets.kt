@@ -1,0 +1,471 @@
+package com.igng.opencode.lagoon.ui
+
+import android.content.ActivityNotFoundException
+import android.content.Intent
+import android.net.Uri
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import com.igng.opencode.lagoon.core.*
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import top.yukonga.miuix.kmp.basic.*
+import top.yukonga.miuix.kmp.extra.SuperBottomSheet
+import top.yukonga.miuix.kmp.extra.SuperSwitch
+import top.yukonga.miuix.kmp.extra.SuperDialog
+import top.yukonga.miuix.kmp.theme.MiuixTheme
+
+private const val DEFAULT_REMOTE_ORIGIN = "https://dsh.r2049.cn/"
+
+internal fun formatFingerprint(value: String?): String {
+  val raw = value.orEmpty().uppercase().filter { it in '0'..'9' || it in 'A'..'F' }
+  return if (raw.length == 12) raw.chunked(4).joinToString(" ") else raw.ifBlank { "未提供" }
+}
+
+private fun openLoginUrl(context: android.content.Context, url: String): Boolean = try {
+  context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+  true
+} catch (_: ActivityNotFoundException) { false } catch (_: Exception) { false }
+
+/**
+ * DSH Remote account onboarding: browser/QR or email login, Host selection, explicit fingerprint
+ * confirmation, then one ServerProfile per selected Host. The account token stays in this screen.
+ */
+@Composable
+internal fun RemoteEnrollSheet(
+  controller: LagoonController,
+  onDismiss: () -> Unit,
+  onDone: (added: Int) -> Unit
+) {
+  val scope = rememberCoroutineScope()
+  val context = LocalContext.current
+  val clipboard = LocalClipboardManager.current
+  var origin by rememberSaveable { mutableStateOf(DEFAULT_REMOTE_ORIGIN) }
+  var allowHttp by rememberSaveable { mutableStateOf(false) }
+  val managerResult = remember(origin, allowHttp) { runCatching { controller.remoteAccountManager(origin.trim(), allowHttp) } }
+  val manager = managerResult.getOrNull()
+  var providers by remember { mutableStateOf(emptyList<RemoteOAuthProvider>()) }
+  var providersLoading by remember { mutableStateOf(false) }
+  var error by remember { mutableStateOf<String?>(null) }
+  var busy by remember { mutableStateOf(false) }
+  var pending by remember { mutableStateOf<RemoteBrowserLogin?>(null) }
+  var candidates by remember { mutableStateOf(emptyList<RemoteHostCandidate>()) }
+  var selected by remember { mutableStateOf(setOf<String>()) }
+  var review by remember { mutableStateOf(false) }
+  var confirmed by remember { mutableStateOf(setOf<String>()) }
+  var account by remember { mutableStateOf("") }
+  var password by remember { mutableStateOf("") }
+  var showSelfHosted by rememberSaveable { mutableStateOf(false) }
+  var resultText by remember { mutableStateOf<String?>(null) }
+
+  LaunchedEffect(manager) {
+    providers = emptyList()
+    pending = null
+    busy = false
+    candidates = emptyList()
+    selected = emptySet()
+    confirmed = emptySet()
+    review = false
+    error = null
+    if (manager == null) {
+      error = managerResult.exceptionOrNull()?.message ?: "服务器地址无效"
+      return@LaunchedEffect
+    }
+    providersLoading = true
+    try { providers = manager.providers() }
+    catch (cancel: CancellationException) { throw cancel }
+    catch (e: Exception) { error = userFacingError(e, "没能读取登录方式") }
+    finally { providersLoading = false }
+  }
+
+  LaunchedEffect(pending?.qrId) {
+    val login = pending ?: return@LaunchedEffect
+    while (pending?.qrId == login.qrId) {
+      delay(2_000)
+      if (pending?.qrId != login.qrId) return@LaunchedEffect
+      try {
+        when (val polled = manager!!.pollBrowserLogin(login)) {
+          RemoteQrPoll.Pending -> Unit
+          RemoteQrPoll.Expired -> { error = "登录超时，请重新发起"; pending = null }
+          is RemoteQrPoll.Complete -> {
+            busy = true
+            try {
+              candidates = manager.completeBrowserLogin(login, polled.accountToken)
+              pending = null
+            } catch (cancel: CancellationException) { throw cancel }
+            catch (e: Exception) { error = userFacingError(e, "登录后读取主机失败"); pending = null }
+            finally { busy = false }
+          }
+        }
+      } catch (cancel: CancellationException) { throw cancel }
+      catch (e: Exception) { error = userFacingError(e, "登录状态读取失败"); pending = null }
+    }
+  }
+
+  fun loadCandidates(action: suspend () -> List<RemoteHostCandidate>) {
+    if (busy) return
+    scope.launch {
+      busy = true; error = null
+      try {
+        candidates = action()
+        selected = candidates.filter { it.canEnroll && it.meta.online }.map { it.hostId }.toSet()
+        confirmed = emptySet()
+        review = false
+      } catch (cancel: CancellationException) { throw cancel }
+      catch (e: Exception) { error = userFacingError(e, "登录 DSH Remote 失败") }
+      finally { busy = false }
+    }
+  }
+
+  SuperBottomSheet(title = "DSH Remote", show = true, onDismissRequest = onDismiss) {
+    Column(Modifier.fillMaxWidth().fillMaxHeight(0.88f)) {
+      LazyColumn(Modifier.weight(1f).fillMaxWidth(), contentPadding = PaddingValues(horizontal = 20.dp, vertical = 8.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        if (candidates.isEmpty()) {
+          item {
+            Text("登录后选择要接入的电脑。每台主机会在本机注册一个独立设备身份，用于同时保持连接。",
+              style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
+          }
+          item { TextField(value = origin, onValueChange = { origin = it; allowHttp = it.startsWith("http://", true); error = null }, label = "DSH Remote 服务器") }
+          if (origin.startsWith("http://", true)) item {
+            SuperSwitch(title = "允许此地址使用 HTTP", summary = "只在你信任的网络中开启", checked = allowHttp, onCheckedChange = { allowHttp = it })
+          }
+          if (providersLoading) item { Text("正在读取登录方式…", style = MiuixTheme.textStyles.footnote2) }
+          val browserProviders = providers.filter { it.qrStartUrl != null }
+          if (browserProviders.isNotEmpty()) {
+            item { Text("在浏览器中登录", style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary)) }
+            items(browserProviders, key = { it.id }) { provider ->
+              TextButton(text = "使用 ${provider.displayName} 登录", onClick = {
+                if (pending != null || busy) return@TextButton
+                scope.launch {
+                  busy = true; error = null
+                  try {
+                    val login = manager!!.beginBrowserLogin(provider)
+                    pending = login
+                    if (!openLoginUrl(context, login.loginUrl)) {
+                      error = "没能打开浏览器，可复制登录链接后手动打开"; pending = null
+                    }
+                  } catch (cancel: CancellationException) { throw cancel }
+                  catch (e: Exception) { error = userFacingError(e, "没能发起登录") }
+                  finally { busy = false }
+                }
+              }, modifier = Modifier.fillMaxWidth(), enabled = !busy && pending == null)
+            }
+          } else if (!providersLoading && manager != null) {
+            item {
+              Text("这个服务器没有提供浏览器登录；可在下面用邮箱密码登录，或换一个服务器地址。",
+                style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
+            }
+          }
+          item {
+            TextButton(text = if (showSelfHosted) "收起自建服务器登录" else "自建服务器 · 邮箱登录",
+              onClick = { showSelfHosted = !showSelfHosted }, modifier = Modifier.fillMaxWidth())
+          }
+          if (showSelfHosted) {
+            item { TextField(value = account, onValueChange = { account = it }, label = "邮箱 / 账号") }
+            item {
+              TextField(value = password, onValueChange = { password = it }, label = "密码",
+                visualTransformation = PasswordVisualTransformation(),
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password))
+            }
+            item {
+              TextButton(text = if (busy) "正在登录…" else "邮箱登录", enabled = !busy && manager != null && account.isNotBlank() && password.isNotBlank(),
+                onClick = { if (manager != null) loadCandidates { manager.loginWithPassword(account.trim(), password) } },
+                modifier = Modifier.fillMaxWidth())
+            }
+          }
+          pending?.let { login ->
+            item {
+              Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                InfiniteProgressIndicator(size = 16.dp, strokeWidth = 2.dp)
+                Spacer(Modifier.width(8.dp))
+                Text("在浏览器里完成登录…", Modifier.weight(1f), style = MiuixTheme.textStyles.footnote2)
+                TextButton(text = "取消", onClick = { pending = null })
+              }
+            }
+            item {
+              TextButton(text = "复制登录链接", onClick = {
+                clipboard.setText(AnnotatedString(login.loginUrl))
+              }, modifier = Modifier.fillMaxWidth())
+            }
+          }
+        } else if (!review) {
+          item {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+              Column(Modifier.weight(1f)) {
+                Text("选择主机", style = MiuixTheme.textStyles.headline2.copy(fontWeight = FontWeight.Medium))
+                Text("已发现 ${candidates.size} 台 · 已选 ${selected.size}", style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
+              }
+              TextButton(text = "重新登录", onClick = { candidates = emptyList(); selected = emptySet() })
+            }
+          }
+          items(candidates, key = { it.hostId }) { candidate ->
+            val enabled = candidate.canEnroll
+            val checked = candidate.hostId in selected
+            Row(Modifier.fillMaxWidth().clip(miuixSquircleShape(14.dp))
+              .clickable(enabled = enabled) {
+                selected = if (checked) selected - candidate.hostId else selected + candidate.hostId
+              }.padding(horizontal = 8.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+              Checkbox(checked = checked, onCheckedChange = { if (enabled) selected = if (it) selected + candidate.hostId else selected - candidate.hostId }, enabled = enabled)
+              Spacer(Modifier.width(8.dp))
+              Column(Modifier.weight(1f)) {
+                Text(candidate.meta.name, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MiuixTheme.textStyles.body1)
+                Text(listOfNotNull(
+                  candidate.meta.platform.ifBlank { null },
+                  candidate.meta.harnessVersion?.let { "Harness $it" },
+                  if (candidate.meta.online) "在线" else "离线",
+                  if (candidate.canEnroll) null else "身份不可用"
+                ).joinToString(" · "), style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary), maxLines = 1)
+                Text("指纹 ${formatFingerprint(candidate.meta.fingerprint)}", style = MiuixTheme.textStyles.footnote2.copy(fontFamily = FontFamily.Monospace),
+                  color = when (candidate.meta.trust) {
+                    RemoteTrustState.CHANGED -> MiuixColorTokens.Error
+                    RemoteTrustState.PINNED -> MiuixColorTokens.Success
+                    RemoteTrustState.UNKNOWN -> MiuixTheme.colorScheme.onSurfaceVariantSummary
+                  })
+              }
+            }
+          }
+          item {
+            TextButton(text = "下一步：核对指纹", enabled = selected.isNotEmpty() && !busy, onClick = {
+              confirmed = emptySet(); review = true
+            }, modifier = Modifier.fillMaxWidth())
+          }
+        } else {
+          item {
+            Text("核对主机指纹", style = MiuixTheme.textStyles.headline2.copy(fontWeight = FontWeight.Medium))
+            Text("在电脑的远程插件状态页核对；全部勾选后才能接入。", style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
+          }
+          val chosen = candidates.filter { it.hostId in selected }
+          items(chosen, key = { it.hostId }) { candidate ->
+            val checked = candidate.hostId in confirmed
+            Row(Modifier.fillMaxWidth().clip(miuixSquircleShape(14.dp)).clickable {
+              confirmed = if (checked) confirmed - candidate.hostId else confirmed + candidate.hostId
+            }.padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
+              Checkbox(checked = checked, onCheckedChange = { if (it) confirmed = confirmed + candidate.hostId else confirmed = confirmed - candidate.hostId })
+              Spacer(Modifier.width(8.dp))
+              Column(Modifier.weight(1f)) {
+                Text(candidate.meta.name, style = MiuixTheme.textStyles.body1)
+                Text(formatFingerprint(candidate.meta.fingerprint), style = MiuixTheme.textStyles.body2.copy(fontFamily = FontFamily.Monospace))
+              }
+            }
+          }
+          item {
+            TextButton(text = if (busy) "正在接入…" else "接入选中主机", enabled = !busy && confirmed.size == chosen.size && chosen.isNotEmpty(), onClick = {
+              scope.launch {
+                busy = true; error = null
+                try {
+                  val enrollment = manager!!.enroll(chosen, chosen.associate { it.hostId to it.meta.fingerprint!! })
+                  val added = controller.addRemoteProfiles(enrollment.catalog, chosen.map { it.meta })
+                  resultText = if (enrollment.failures.isEmpty()) "已接入 ${added.size} 台主机"
+                    else "已接入 ${added.size} 台；${enrollment.failures.size} 台失败：${enrollment.failures.values.first()}"
+                  onDone(added.size)
+                } catch (cancel: CancellationException) { throw cancel }
+                catch (e: Exception) { error = userFacingError(e, "接入主机失败") }
+                finally { busy = false }
+              }
+            }, modifier = Modifier.fillMaxWidth())
+          }
+          item { TextButton(text = "返回选择", onClick = { review = false }, modifier = Modifier.fillMaxWidth()) }
+        }
+        resultText?.let { text -> item { Text(text, color = MiuixColorTokens.Success, style = MiuixTheme.textStyles.footnote1) } }
+        error?.let { text ->
+          item {
+            Column {
+              Text(text, color = MiuixColorTokens.Error, style = MiuixTheme.textStyles.footnote1)
+              TextButton(text = "关闭", onClick = onDismiss, modifier = Modifier.fillMaxWidth())
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+/** Compact entry shown from Settings; the full account page is the enrollment sheet for now. */
+@Composable
+internal fun RemoteAccountSummary(
+  controller: LagoonController,
+  onOpen: () -> Unit,
+  modifier: Modifier = Modifier
+) {
+  val catalogs = remember { controller.remoteCatalogs() }
+  val hosts = catalogs.flatMap { it.hosts }.size
+  Card(modifier.fillMaxWidth(), insideMargin = PaddingValues(horizontal = 16.dp, vertical = 12.dp)) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+      Column(Modifier.weight(1f)) {
+        Text(if (catalogs.isEmpty()) "连接 DSH Remote" else "DSH Remote 账号", style = MiuixTheme.textStyles.body1)
+        Text(
+          if (catalogs.isEmpty()) "用浏览器登录，接入电脑上的 DSH"
+          else "${catalogs.first().account} · $hosts 台主机",
+          style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary),
+          maxLines = 1, overflow = TextOverflow.Ellipsis
+        )
+      }
+      TextButton(text = if (catalogs.isEmpty()) "登录" else "管理", onClick = onOpen)
+    }
+  }
+}
+
+/** Read-only remote server edit panel; keeps the management flow out of the generic form. */
+@Composable
+internal fun RemoteServerSummary(
+  existing: ServerProfile?,
+  onDetails: (() -> Unit)? = null,
+  onExtensions: (() -> Unit)? = null,
+  onManage: () -> Unit,
+  onDelete: (() -> Unit)?,
+  onCancel: () -> Unit
+) {
+  Column(Modifier.fillMaxWidth().padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+    Text(if (existing == null) "DSH Remote" else existing.name, style = MiuixTheme.textStyles.title3)
+    Text(
+      if (existing == null) "DSH Remote 主机通过账号登录接入；登录后选择要连接的电脑。"
+      else "${existing.remoteHostFingerprint?.let { formatFingerprint(it) } ?: "指纹待确认"} · ${existing.url}",
+      style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+    )
+    TextButton(text = if (existing == null) "登录并选择主机" else "管理 DSH Remote 主机", onClick = onManage, modifier = Modifier.fillMaxWidth())
+    if (existing != null && onDetails != null) {
+      TextButton(text = "网络与连接", onClick = onDetails, modifier = Modifier.fillMaxWidth())
+    }
+    if (existing != null && onExtensions != null) {
+      TextButton(text = "主机扩展（插件开关）", onClick = onExtensions, modifier = Modifier.fillMaxWidth())
+    }
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+      TextButton(text = "取消", onClick = onCancel)
+      if (onDelete != null) TextButton(text = "从此设备移除", onClick = onDelete, colors = ButtonDefaults.textButtonColors(textColor = MiuixColorTokens.Error))
+    }
+  }
+}
+
+
+/** One diagnostic dialog; the measurement is an encrypted RPC round trip, not a network RTT. */
+@Composable
+internal fun RemoteConnectionDialog(
+  profile: ServerProfile,
+  state: LagoonState,
+  controller: LagoonController,
+  onDismiss: () -> Unit
+) {
+  val scope = rememberCoroutineScope()
+  var probe by remember { mutableStateOf<RemoteProbe?>(null) }
+  var busy by remember { mutableStateOf(false) }
+  var error by remember { mutableStateOf<String?>(null) }
+  SuperDialog(title = "网络与连接", show = true, onDismissRequest = onDismiss) {
+    Column(Modifier.fillMaxWidth().padding(top = 8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+      val current = state.serverId == profile.id
+      val rows = buildList {
+        add("主机" to profile.name)
+        add("连接方式" to "DSH Remote")
+        add("地址" to profile.url)
+        add("状态" to when {
+          !current -> "未打开"
+          state.connected && state.streamConnected -> "已连接"
+          state.connected -> "已连接 · 实时同步恢复中"
+          state.connection.stage == ConnectStage.RETRYING -> "正在重试"
+          else -> "未连接"
+        })
+        add("当前路径" to "Relay 中继")
+        add("加密" to "Noise IK · 端到端加密")
+        add("服务版本" to state.version.ifBlank { "未知" })
+        add("主机指纹" to (profile.remoteHostFingerprint?.let { formatFingerprint(it) } ?: "待确认"))
+        add("加密 RPC 往返" to (probe?.let { "${it.durationMillis} 毫秒" } ?: "未测量"))
+      }
+      rows.forEach { (label, value) ->
+        Row(Modifier.fillMaxWidth()) {
+          Text(label, Modifier.width(96.dp), style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
+          Text(value, style = MiuixTheme.textStyles.footnote2)
+        }
+      }
+      Text("当前版本固定使用 Relay；LAN / P2P / TURN 尚未启用。测量只反映一次加密 RPC，不代表网络层 RTT。",
+        style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
+      error?.let { Text(it, color = MiuixColorTokens.Error, style = MiuixTheme.textStyles.footnote2) }
+      Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+        TextButton(text = "关闭", onClick = onDismiss)
+        TextButton(text = if (busy) "测量中…" else "重新测量", enabled = !busy && current, onClick = {
+          scope.launch {
+            busy = true; error = null
+            try { probe = controller.probeRemote(profile.id) }
+            catch (e: Exception) { error = userFacingError(e, "测量失败") }
+            finally { busy = false }
+          }
+        })
+      }
+    }
+  }
+}
+
+
+/** Official plugin bundle switches over the authenticated Remote settings channel. */
+@Composable
+internal fun RemoteExtensionsDialog(
+  profile: ServerProfile,
+  controller: LagoonController,
+  onDismiss: () -> Unit
+) {
+  val scope = rememberCoroutineScope()
+  var bundles by remember { mutableStateOf(emptyList<RemotePluginBundle>()) }
+  var busy by remember { mutableStateOf(true) }
+  var saving by remember { mutableStateOf<String?>(null) }
+  var error by remember { mutableStateOf<String?>(null) }
+  fun reload() {
+    scope.launch {
+      busy = true; error = null
+      try { bundles = controller.pluginBundles(profile.id) }
+      catch (e: Exception) { error = userFacingError(e, "读取插件失败") }
+      finally { busy = false }
+    }
+  }
+  LaunchedEffect(profile.id) { reload() }
+  SuperDialog(title = "主机扩展", show = true, onDismissRequest = onDismiss) {
+    Column(Modifier.fillMaxWidth().heightIn(max = 480.dp).verticalScroll(rememberScrollState()).padding(top = 8.dp),
+      verticalArrangement = Arrangement.spacedBy(6.dp)) {
+      Text("只列出 Host 官方允许远程开关的插件 bundle；安装、卸载和插件配置仍需在电脑上完成。",
+        style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
+      if (busy) Text("正在读取插件…", style = MiuixTheme.textStyles.footnote2)
+      bundles.forEach { bundle ->
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+          Column(Modifier.weight(1f)) {
+            Text(bundle.name, style = MiuixTheme.textStyles.body2, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text(listOfNotNull(bundle.version?.let { "v$it" }, bundle.description, bundle.readOnlyReason).joinToString(" · "),
+              style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary), maxLines = 2)
+          }
+          SuperSwitch(checked = bundle.enabled, enabled = bundle.readOnlyReason == null && saving == null,
+            onCheckedChange = { checked ->
+              saving = bundle.name
+              scope.launch {
+                try { controller.setPluginBundle(profile.id, bundle.name, checked); reload() }
+                catch (e: Exception) { error = userFacingError(e, "切换插件失败") }
+                finally { saving = null }
+              }
+            })
+        }
+      }
+      if (!busy && bundles.isEmpty() && error == null) Text("没有可远程开关的插件。", style = MiuixTheme.textStyles.footnote2)
+      error?.let { Text(it, color = MiuixColorTokens.Error, style = MiuixTheme.textStyles.footnote2) }
+      Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+        TextButton(text = "关闭", onClick = onDismiss)
+        TextButton(text = "刷新", onClick = { reload() }, enabled = !busy)
+      }
+    }
+  }
+}

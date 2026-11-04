@@ -7,6 +7,8 @@ import java.io.IOException
 internal data class RemoteWorkspaceType(val id: String, val name: String, val capability: String, val available: Boolean)
 
 internal data class RemoteCapabilities(val capabilities: Set<String>, val workspaceTypes: List<RemoteWorkspaceType>?) {
+  val supportsWorkspaceUpload: Boolean get() = "workspace.upload.v1" in capabilities
+
   val sessionFormat: Int? get() = when {
     "harness.remote.v3" in capabilities -> 3
     "harness.remote.v1" in capabilities -> 1

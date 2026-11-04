@@ -95,6 +95,11 @@ class MainActivity : ComponentActivity() {
        var showingAllDraftTarget by rememberSaveable { mutableStateOf(false) }
        var pendingDraftTarget by remember { mutableStateOf<Pair<String, String>?>(null) }
        var showingModelManagement by rememberSaveable { mutableStateOf(false) }
+       var showingRemoteEnroll by rememberSaveable { mutableStateOf(false) }
+       var showingRemoteHosts by rememberSaveable { mutableStateOf(false) }
+       var showingDeviceGroups by rememberSaveable { mutableStateOf(false) }
+       var editingGroupId by rememberSaveable { mutableStateOf<String?>(null) }
+       var showingGroupDraftTarget by rememberSaveable { mutableStateOf(false) }
       // Each blank draft gets a fresh saveable scope so a sent draft never reappears.
       var draftNonce by rememberSaveable { mutableIntStateOf(0) }
       var globalMessage by remember { mutableStateOf<String?>(null) }
@@ -119,6 +124,7 @@ class MainActivity : ComponentActivity() {
        fun openDraft() {
          focusManager.clearFocus()
          if (home.allServers) { showingAllDraftTarget = true; return }
+         if (home.homeGroup != null) { showingGroupDraftTarget = true; return }
          if (!state.connected) { globalMessage = if (state.profiles.isEmpty()) "先添加一个服务器" else "服务器尚未连接，连接后才能新建会话"; globalMessageType = MiuixToastType.INFO; return }
         if (state.projects.isEmpty()) { globalMessage = "先添加一个项目"; globalMessageType = MiuixToastType.INFO; showingProjects = true; return }
         controller.beginDraft()
@@ -134,7 +140,11 @@ class MainActivity : ComponentActivity() {
           to.sessions.lastOrNull()?.let(controller::selectSession)
           val current = controller.state.value
           val home = current.homeServerId
-          if (leavesSession(from, to) && !current.allServers && home != null && home != current.serverId) controller.connect(home)
+          if (leavesSession(from, to) && !current.allServers) {
+            val group = current.homeGroup
+            if (group != null) controller.selectGroup(group.id)
+            else if (home != null && home != current.serverId) controller.connect(home)
+          }
         }
       }
       LaunchedEffect(state.serverId) {
@@ -241,13 +251,17 @@ class MainActivity : ComponentActivity() {
                  target.page == RootPage.SETTINGS -> SettingsScreen(state, controller, themeMode, { themeMode = it; preferences.edit().putString("themeMode", it.name).apply() }, previewBack, { previewBack = it; preferences.edit().putBoolean("previewBack", it).apply() }, refreshMode, { refreshMode = it; controller.setRefreshMode(it) }, {
                    if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
                    else startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, packageName))
-                 }, ::editServer, onManageModels = { showingModelManagement = true }, onBack = { goBack() })
+                 }, ::editServer, onManageModels = { showingModelManagement = true }, onRemoteHosts = { showingRemoteHosts = true }, onManageDevices = { editingGroupId = null; showingDeviceGroups = true }, onBack = { goBack() })
                  else -> HomeScreen(home, controller, onOpen = { openSession(it) }, onNewSession = { openDraft() }, onProjects = { showingProjects = true },
                     onSelectServer = { profile ->
                       if (profile == null) controller.setAllServers(true)
-                      else if (profile.id != home.serverId || !home.connected || home.allServers) controller.connect(profile.id)
+                      else controller.selectProfile(profile.id)
                     },
-                   onEditServer = ::editServer, onPage = ::openPage)
+                    onEditServer = ::editServer,
+                    onSelectGroup = { group -> controller.selectGroup(group.id) },
+                    onEditGroup = { group -> editingGroupId = group.id; showingDeviceGroups = true },
+                    onManageDevices = { editingGroupId = null; showingDeviceGroups = true },
+                    onPage = ::openPage)
               }
             }
             peekRoute?.let { peek ->
@@ -287,7 +301,13 @@ class MainActivity : ComponentActivity() {
             if (state.loading || state.pendingOperations.any { ":open:" in it }) InfiniteProgressIndicator(Modifier.fillMaxWidth().align(Alignment.TopCenter).height(3.dp))
             MiuixToastHost(globalMessage, globalMessageType, { globalMessage = null }, Modifier.align(Alignment.TopCenter).statusBarsPadding().padding(top = 16.dp))
             // MIUIX popups must stay inside this Scaffold content's popup registry.
-            if (showingServerForm) ServersModal(state, controller, state.profiles.firstOrNull { it.id == editingServerId }) { showingServerForm = false; editingServerId = null }
+            if (showingServerForm) ServersModal(state, controller, state.profiles.firstOrNull { it.id == editingServerId },
+              onDismiss = { showingServerForm = false; editingServerId = null },
+              onRemoteHosts = {
+                val add = editingServerId == null
+                showingServerForm = false; editingServerId = null
+                if (add) showingRemoteEnroll = true else showingRemoteHosts = true
+              })
              if (showingProjects) {
                if (home.allServers) AllServersScopeSheet(home, controller) { showingProjects = false }
                else ProjectScopeSheet(home, controller) { showingProjects = false }
@@ -298,7 +318,24 @@ class MainActivity : ComponentActivity() {
                 navigator.server = profile.id
                 controller.connect(profile.id, project.id, preserveHome = true)
              }, onDismiss = { showingAllDraftTarget = false })
+             if (showingDeviceGroups) DeviceGroupsSheet(state, controller, editingGroupId, onDismiss = {
+               showingDeviceGroups = false; editingGroupId = null
+             })
+             if (showingGroupDraftTarget) GroupDraftTargetSheet(home, profiles = home.homeGroupProfiles,
+               onSelect = { profile, project ->
+                 showingGroupDraftTarget = false
+                 pendingDraftTarget = profile.id to project.id
+                 navigator.server = profile.id
+                 controller.connect(profile.id, project.id, preserveHome = true)
+               }, onDismiss = { showingGroupDraftTarget = false })
             if (showingModelManagement) ModelManagementSheet(state, controller) { showingModelManagement = false }
+            if (showingRemoteHosts) RemoteHostsSheet(controller, onDismiss = { showingRemoteHosts = false }, onEnroll = {
+              showingRemoteHosts = false; showingRemoteEnroll = true
+            })
+            if (showingRemoteEnroll) RemoteEnrollSheet(controller, onDismiss = { showingRemoteEnroll = false }, onDone = { added ->
+              showingRemoteEnroll = false
+              if (added > 0) { globalMessage = "已接入 $added 台远程主机"; globalMessageType = MiuixToastType.SUCCESS }
+            })
           }
         }
       }

@@ -20,6 +20,12 @@ enum class ServerKind(val wire: String, val label: String) {
  * OpenCode（[OpenCodeApi]）与 DeepSeek Harness（[DshApi]）各自实现同一套方法面，
  * 控制器与 UI 因此完全与协议无关：读列表、发消息、中止、审批、事件流都走这里。
  */
+sealed interface QueueAction {
+  data class Edit(val text: String) : QueueAction
+  data object Remove : QueueAction
+  data object Steer : QueueAction
+}
+
 interface HarnessClient {
   /** Releases transport-owned sockets and cryptographic state; safe to call more than once. */
   fun close() = Unit
@@ -54,6 +60,31 @@ interface HarnessClient {
     messagesPage(id, cursor, size).let { page -> ApiPage(page.items.map { MessageRecord(it, null) }, page.next) }
 
   suspend fun inbox(id: String): List<Message>
+
+  /** Edits/removes/steers a still-queued prompt. False when the harness has no queue RPC. */
+  suspend fun updateQueue(sessionId: String, itemId: String, action: QueueAction): Boolean = false
+
+  /**
+   * Streams one background job's output (`job/follow`), appending text and reporting running/finished.
+   * Returns false when the harness has no such stream.
+   */
+  suspend fun followJobOutput(
+    sessionId: String,
+    jobId: String,
+    onUpdate: (text: String, running: Boolean, finished: Boolean) -> Unit
+  ): Boolean = false
+
+  /** One encrypted RPC round trip, when the harness has a remote diagnostic channel. */
+  suspend fun probeRemote(): RemoteProbe? = null
+
+  /** Sends one follow-up to a continuable subagent child. False when unsupported. */
+  suspend fun promptSubagent(parentId: String, childId: String, text: String): Boolean = false
+
+  /** Official plugin inventory; empty when the harness has no plugin channel. */
+  suspend fun pluginBundles(): List<RemotePluginBundle> = emptyList()
+  suspend fun pluginEntries(): List<RemotePluginEntry> = emptyList()
+  suspend fun setPluginBundle(name: String, enabled: Boolean): Boolean = false
+  suspend fun setPluginEntry(entryId: String, enabled: Boolean): Boolean = false
 
   /** Includes admitted internal inputs (e.g. compaction/move) which have no transcript row. */
   suspend fun hasPendingInput(id: String): Boolean = inbox(id).isNotEmpty()

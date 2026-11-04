@@ -46,3 +46,6 @@ ANDROID_HOME="$HOME/Android/Sdk" GRADLE_USER_HOME="$HOME/.build/gradle" BUILD_SC
 ```
 
 这些只验证当前代码片段，不代替仓库 `AGENTS.md` 的完整 Validation 或 Remote 的真实互操作验收。
+
+多 Host 并行接入与“同一物理设备多 harness 分组”的设计见
+[`DSH_REMOTE_MULTI_HOST.md`](DSH_REMOTE_MULTI_HOST.md)。
