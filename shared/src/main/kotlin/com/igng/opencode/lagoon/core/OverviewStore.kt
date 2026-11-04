@@ -3,7 +3,7 @@ package com.igng.opencode.lagoon.core
 /**
  * The persistent state [AllServersOverview] reads and writes: credentials, the device-registered
  * project list, the task ledger and the unread-result ledger. Android implements it with
- * SharedPreferences ([ServerStore]); the hub keeps it in its data volume.
+ * SharedPreferences ([ServerStore]).
  */
 interface OverviewStore {
   fun credentials(id: String): ServerCredentials
