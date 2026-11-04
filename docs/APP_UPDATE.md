@@ -10,7 +10,7 @@ Lagoon 的设置页提供“检查更新 → 下载并校验 → 系统安装器
 
 ## 更新源与版本选择
 
-- 数据源为仓库 `updates` 分支的静态清单 `https://raw.githubusercontent.com/IGNGserver/Lagoon/updates/updates.json`，设备直连且不携带令牌，不回退 GitHub API 或中枢。
+- 数据源为仓库 `updates` 分支的静态清单 `https://raw.githubusercontent.com/IGNGserver/Lagoon/updates/updates.json`，设备直连且不携带令牌，不回退 GitHub API。
 - 发布流程先生成包含完整资产与 SHA-256 的清单；清单规范见 [UPDATES.md](UPDATES.md)。
 - 客户端按 SemVer 2.0 比较版本，包含 `-alpha.N` / `-beta.N` / `-rc.N` 的优先级规则，例如 `0.3.0-rc.10 > 0.3.0-rc.9`、`0.3.0 > 0.3.0-rc.10`。
 - 用户可选正式/预发布通道，预发布包含正式版。旧 `updatePrerelease` 偏好迁移到本机 `ui` SharedPreferences 的 `updateChannel`。正式通道同时排除预发布标记与 SemVer 预发布后缀；切换通道不降级。

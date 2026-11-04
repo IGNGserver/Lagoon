@@ -4,13 +4,7 @@
 
 面向多种 coding agent harness 的原生 Android 移动控制端。Kotlin + Jetpack Compose 界面采用小米 HyperOS / MIUIX 设计规范，引入连续曲率 Squircle、科技蓝语义调色板。App 首发支持用户自己的 OpenCode 2.x Server，现已适配 DeepSeek Harness（`dsh web` 实例），直连端点，无需第三方中转服务；未来将持续扩展适配更多 harness。
 
-## Lagoon 中枢与网页端（v3）
-
-在任意一台机器上用 docker compose 部署 Lagoon 中枢，就能在电脑或手机浏览器里连接、监控和控制各台开发机上的 harness，网页可以安装为 PWA 并接收任务推送。中枢替浏览器保持连接、保存凭据，只有一个访问密码（允许弱密码）。安卓客户端仍然直连开发机，不依赖中枢。
-
-- 部署：[`deploy/README.md`](deploy/README.md)，镜像 `ghcr.io/igngserver/lagoon-hub`（amd64 / arm64）；
-- 设计与接口契约：[`docs/HUB_DESIGN.md`](docs/HUB_DESIGN.md)；
-- 代码：`hub/`（Kotlin/JVM 中枢）、`web/`（React + TypeScript 网页）、`shared/`（安卓与中枢共用的协议适配、模型与任务归约）。
+Lagoon 目前只维护 Android 客户端。v3 曾提供自托管中枢与网页端，现已停止维护并从本仓库移除；相关说明见 [`docs/HUB_EOL.md`](docs/HUB_EOL.md)。
 
 ## 功能
 
@@ -24,22 +18,13 @@
 
 ## 本地构建
 
-中枢与网页（不需要 Android SDK）：
-
-```sh
-LAGOON_HUB_ONLY=1 ./gradlew :hub:test :hub:installDist
-cd web && pnpm install --frozen-lockfile && pnpm lint && pnpm typecheck && pnpm test && pnpm build
-```
-
-Android：
-
 需要 JDK 17+、Android SDK Platform 36。执行：
 
 ```sh
 ANDROID_HOME=/path/to/Android/Sdk ./gradlew :app:assembleDebug :app:testDebugUnitTest
 ```
 
-本仓库把 Gradle build 输出放在 `/tmp/lagoon-gradle/`，每个 checkout 使用独立路径 `/tmp/lagoon-gradle/<checkout-hash>/app/outputs/apk/debug/app-debug.apk`。
+本仓库把 Gradle build 输出放在 `BUILD_SCRATCH_ROOT`（默认 `~/.build`），每个 checkout 使用独立路径 `<scratch>/Lagoon/<checkout-hash>/app/outputs/apk/debug/app-debug.apk`。
 
 在 App 中添加可访问的 OpenCode Server URL。服务端需启用 Basic Auth；也可以直接粘贴 `opencode pair` 输出的官方链接，App 会访问一次链接、保存返回的会话 Cookie，再用该 Cookie 连接 API。建议通过 HTTPS 或可信 VPN 访问。使用局域网 HTTP 时，必须在该服务器资料中明确开启明文连接，授权会随资料保存。
 
@@ -65,7 +50,7 @@ DSH 的 Client↔Host 协议与 OpenCode 完全不同，Lagoon 用 `HarnessClien
 ## 更名与迁移
 
 项目统一更名为 **“Lagoon”**（应用显示名为 Lagoon，定位从 OpenCode 专用客户端升级为面向多 Harness 的通用移动控制端）。
-- 显示名与工程名：应用显示名为 `Lagoon`，`rootProject.name = "Lagoon"`，发布工作流名为 `发布 Lagoon Release`，安装包产物名为 `Lagoon-<version>.apk`，Gradle 临时输出目录调整为 `/tmp/lagoon-gradle/`。
+- 显示名与工程名：应用显示名为 `Lagoon`，`rootProject.name = "Lagoon"`，发布工作流名为 `发布 Lagoon Release`，安装包产物名为 `Lagoon-<version>.apk`，Gradle 构建输出放在 `BUILD_SCRATCH_ROOT`（默认 `~/.build`）。
 - 应用标识与升级：`applicationId` 保持为 `com.igng.opencode.lagoon` 并使用固定生产签名，与既有安装版本签名完全一致，支持直接平滑覆盖安装升级。
 - 深链接：支持 `lagoon://` 路由（同时兼容接听 `opencode-lagoon://` 历史深链接）。
 - 安全存储：`KeystoreCipher` 别名升级为 `lagoon-*`，并自动兼容读取旧有的 `opencode-lagoon-*` 凭据。
