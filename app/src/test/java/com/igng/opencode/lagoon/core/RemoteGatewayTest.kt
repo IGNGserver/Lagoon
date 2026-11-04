@@ -1,8 +1,5 @@
-package com.igng.lagoon.hub
+package com.igng.opencode.lagoon.core
 
-import com.igng.opencode.lagoon.core.RemoteGateway
-import com.igng.opencode.lagoon.core.RemoteGatewayException
-import com.igng.opencode.lagoon.core.RemoteRpcException
 import kotlinx.coroutines.runBlocking
 import org.json.JSONObject
 import org.junit.Assert.*

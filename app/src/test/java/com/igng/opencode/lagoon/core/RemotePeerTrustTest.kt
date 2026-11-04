@@ -1,9 +1,5 @@
-package com.igng.lagoon.hub
+package com.igng.opencode.lagoon.core
 
-import com.igng.opencode.lagoon.core.RemoteHost
-import com.igng.opencode.lagoon.core.RemotePeerScope
-import com.igng.opencode.lagoon.core.RemotePeerTrust
-import com.igng.opencode.lagoon.core.RemotePeerTrustStore
 import org.junit.Assert.*
 import org.junit.Test
 import java.io.IOException

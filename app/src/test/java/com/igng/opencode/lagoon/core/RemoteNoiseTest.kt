@@ -1,7 +1,5 @@
-package com.igng.lagoon.hub
+package com.igng.opencode.lagoon.core
 
-import com.igng.opencode.lagoon.core.RemoteIdentity
-import com.igng.opencode.lagoon.core.RemoteNoise
 import org.junit.Assert.*
 import org.junit.Test
 import java.io.IOException

@@ -1,6 +1,5 @@
-package com.igng.lagoon.hub
+package com.igng.opencode.lagoon.core
 
-import com.igng.opencode.lagoon.core.RemoteSecureFragments
 import org.junit.Assert.*
 import org.junit.Test
 import java.io.IOException

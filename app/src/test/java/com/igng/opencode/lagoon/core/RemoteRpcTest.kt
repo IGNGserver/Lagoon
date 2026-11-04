@@ -1,8 +1,5 @@
-package com.igng.lagoon.hub
+package com.igng.opencode.lagoon.core
 
-import com.igng.opencode.lagoon.core.RemoteRpc
-import com.igng.opencode.lagoon.core.RemoteRpcException
-import com.igng.opencode.lagoon.core.RemoteSecureChannel
 import kotlinx.coroutines.async
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.runBlocking

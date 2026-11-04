@@ -1,8 +1,5 @@
-package com.igng.lagoon.hub
+package com.igng.opencode.lagoon.core
 
-import com.igng.opencode.lagoon.core.RemoteClientDescriptor
-import com.igng.opencode.lagoon.core.RemoteServerApi
-import com.igng.opencode.lagoon.core.RemoteServerException
 import kotlinx.coroutines.runBlocking
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer

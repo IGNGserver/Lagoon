@@ -1,8 +1,5 @@
-package com.igng.lagoon.hub
+package com.igng.opencode.lagoon.core
 
-import com.igng.opencode.lagoon.core.RemoteIdentity
-import com.igng.opencode.lagoon.core.RemoteNoise
-import com.igng.opencode.lagoon.core.RemoteRelay
 import com.southernstorm.noise.protocol.HandshakeState
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.runBlocking

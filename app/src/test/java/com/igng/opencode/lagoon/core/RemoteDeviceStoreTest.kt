@@ -1,8 +1,5 @@
-package com.igng.lagoon.hub
+package com.igng.opencode.lagoon.core
 
-import com.igng.opencode.lagoon.core.RemoteDeviceManager
-import com.igng.opencode.lagoon.core.RemoteDeviceRecord
-import com.igng.opencode.lagoon.core.RemoteTokenPair
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.delay

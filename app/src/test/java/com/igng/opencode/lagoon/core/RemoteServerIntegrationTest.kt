@@ -1,14 +1,12 @@
-package com.igng.lagoon.hub
+package com.igng.opencode.lagoon.core
 
-import com.igng.opencode.lagoon.core.RemoteClientDescriptor
-import com.igng.opencode.lagoon.core.RemoteServerApi
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.*
 import org.junit.Test
 import java.util.UUID
 
 /** Runs against a real instance of the pinned upstream self-hosted Server, started in local scratch. */
-class RemoteHubIntegrationTest {
+class RemoteServerIntegrationTest {
   @Test fun accountRegistrationRefreshAndHostDiscoveryInteroperateWithUpstreamServer() = runBlocking {
     val serverPort = System.getenv("DSH_REMOTE_TEST_PORT")?.toIntOrNull()
       ?: throw org.junit.AssumptionViolatedException("point DSH_REMOTE_TEST_PORT at the pinned upstream smoke server")
