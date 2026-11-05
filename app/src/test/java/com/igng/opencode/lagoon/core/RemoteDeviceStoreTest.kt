@@ -61,4 +61,75 @@ class RemoteDeviceStoreTest {
     store.values["hub"] = "invalid"
     try { store.load("hub"); fail() } catch (_: IOException) { }
   }
+
+  private fun seeded(store: TestStore, transition: RemoteDeviceRecord.Transition = RemoteDeviceRecord.Transition.NONE,
+    transitionAt: Long = 0): RemoteDeviceRecord {
+    val identity = RemoteIdentity.generate()
+    val record = RemoteDeviceRecord(canonicalRemoteOrigin("https://hub.example"), "user@example.com",
+      identity, tokens(accessExpiry = 100_000), transition, transitionAt)
+    store.save("phone", record)
+    return record
+  }
+
+  /** 进程被杀留下的 REFRESHING 不能在重启后永久卡死：超过阈值就重试刷新。 */
+  @Test fun staleRefreshingRecoversOnNextAccess() = runBlocking {
+    val store = TestStore()
+    seeded(store, RemoteDeviceRecord.Transition.REFRESHING, transitionAt = 1_000)
+    var refreshes = 0
+    val manager = RemoteDeviceManager(store, "phone", "https://hub.example", "user@example.com")
+    val record = manager.access(now = 200_000) { _, _ -> refreshes++; tokens(300_000) }
+    assertEquals(1, refreshes)
+    assertEquals(300_000, record.tokens!!.accessTokenExpiresAt)
+    assertEquals(RemoteDeviceRecord.Transition.NONE, store.load("phone")!!.transition)
+  }
+
+  /** 正在进行中的刷新不并发重试，但必须是“稍后重试”而不是永久失败。 */
+  @Test fun freshRefreshingIsNotRetriedConcurrently() = runBlocking {
+    val store = TestStore()
+    seeded(store, RemoteDeviceRecord.Transition.REFRESHING, transitionAt = 195_000)
+    var refreshes = 0
+    val manager = RemoteDeviceManager(store, "phone", "https://hub.example", "user@example.com")
+    val error = runCatching { manager.access(now = 200_000) { _, _ -> refreshes++; tokens(300_000) } }.exceptionOrNull()
+    assertTrue(error is IOException)
+    assertTrue(error!!.message!!.contains("稍后重试"))
+    assertEquals(0, refreshes)
+  }
+
+  /** 刷新失败保留“结果未知”标记与旧令牌，但标记带时间戳，冷却后自动重试而不是永久卡死。 */
+  @Test fun failedRefreshKeepsUnknownStateThenRecovers() = runBlocking {
+    val store = TestStore()
+    seeded(store)
+    val manager = RemoteDeviceManager(store, "phone", "https://hub.example", "user@example.com")
+    val failure = runCatching { manager.access(now = 200_000) { _, _ -> throw IOException("network down") } }.exceptionOrNull()
+    assertTrue(failure is IOException)
+    val stored = store.load("phone")!!
+    assertEquals(RemoteDeviceRecord.Transition.REFRESHING, stored.transition)
+    assertEquals("device-refresh-token-123", stored.tokens!!.refreshToken)
+    assertTrue(stored.transitionAt > 0)
+    var refreshes = 0
+    val recovered = manager.access(now = 200_000 + 120_000) { _, _ -> refreshes++; tokens(300_000) }
+    assertEquals(1, refreshes)
+    assertEquals(RemoteDeviceRecord.Transition.NONE, recovered.transition)
+    assertEquals(300_000, recovered.tokens!!.accessTokenExpiresAt)
+  }
+
+  /** 服务端明确拒绝才提示重新登录。 */
+  @Test fun rejectedRefreshAsksForLogin() = runBlocking {
+    val store = TestStore()
+    seeded(store)
+    val manager = RemoteDeviceManager(store, "phone", "https://hub.example", "user@example.com")
+    val failure = runCatching { manager.access(now = 200_000) { _, _ -> throw RemoteServerException(401, "AUTH_INVALID", false) } }.exceptionOrNull()
+    assertTrue(failure is IOException)
+    assertTrue(failure!!.message!!.contains("重新登录"))
+    assertEquals(RemoteDeviceRecord.Transition.NONE, store.load("phone")!!.transition)
+  }
+
+  /** 注册失败同样恢复记录：同一 identity 重新注册是幂等的。 */
+  @Test fun failedRegistrationRestoresRecord() = runBlocking {
+    val store = TestStore()
+    val manager = RemoteDeviceManager(store, "phone", "https://hub.example", "user@example.com")
+    runCatching { manager.register("Lagoon", "jvm", "1.0", "account-token-123") { _, _ -> throw IOException("offline") } }
+    val stored = store.load("phone")
+    assertTrue(stored == null || stored.transition == RemoteDeviceRecord.Transition.NONE)
+  }
 }
