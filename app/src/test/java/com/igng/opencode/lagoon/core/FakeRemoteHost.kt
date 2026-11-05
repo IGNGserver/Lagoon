@@ -39,6 +39,15 @@ internal class FakeRemoteHost(
   private val counters = AtomicInteger(0)
   private val fragmentIds = AtomicInteger(0)
   private var cipher: CipherStatePair? = null
+  /** 为 true 时在 `connect.accepted` 里下发独立 Relay 数据通道，密文随后只走该通道。 */
+  var assignRelay: Boolean = false
+  var relayTicket: String = "relay-ticket-1234"
+  var relayEpoch: Int = 7
+  private var controlSocket: WebSocket? = null
+  private var dataSocket: WebSocket? = null
+  private var dataReady = false
+  private var pendingHandshake: JSONObject? = null
+  private var handshakeData: String? = null
 
   /** endpoint → 该流要推送的帧（值为 JSON 字符串或 JSONObject）。 */
   var streamFrames: (endpoint: String, payload: JSONObject) -> List<Any> = { _, _ -> emptyList() }
@@ -65,6 +74,7 @@ internal class FakeRemoteHost(
             .put("identityKey", hostIdentity.publicKey).put("clientVersion", "0.6.0").put("harnessVersion", "0.2.1-rc.5")
             .put("fingerprint", "0000 1111 2222").toString())
           path == "/ws/v1/connect" -> MockResponse().withWebSocketUpgrade(listener)
+          path == "/relay/v1" -> MockResponse().withWebSocketUpgrade(dataListener)
           else -> MockResponse().setResponseCode(404).setBody("{}")
         }
       }
@@ -74,8 +84,10 @@ internal class FakeRemoteHost(
 
   val url: String get() = server.url("/").toString().trimEnd('/')
 
-  private fun send(socket: WebSocket, type: String, payload: JSONObject) {
-    socket.send(JSONObject().put("v", 1).put("id", UUID.randomUUID().toString()).put("type", type)
+  private fun send(socket: WebSocket?, type: String, payload: JSONObject) = sendOn(socket, type, payload)
+
+  private fun sendOn(socket: WebSocket?, type: String, payload: JSONObject) {
+    socket?.send(JSONObject().put("v", 1).put("id", UUID.randomUUID().toString()).put("type", type)
       .put("timestamp", System.currentTimeMillis()).put("payload", payload).toString())
   }
 
@@ -85,7 +97,7 @@ internal class FakeRemoteHost(
     for (fragment in fragments(message.toString().toByteArray(Charsets.UTF_8))) {
       val encrypted = ByteArray(fragment.size + 16)
       val written = pair.sender.encryptWithAd(null, fragment, 0, encrypted, 0, fragment.size)
-      send(socket, "relay", JSONObject().put("connectionId", connectionId)
+      sendOn(if (dataReady) dataSocket else controlSocket, "relay", JSONObject().put("connectionId", connectionId)
         .put("targetDeviceId", clientDeviceId).put("counter", counters.getAndIncrement())
         .put("ciphertext", encoder.encodeToString(encrypted.copyOf(written))))
     }
@@ -100,6 +112,7 @@ internal class FakeRemoteHost(
   private lateinit var clientDeviceId: String
 
   private val listener = object : WebSocketListener() {
+    override fun onOpen(webSocket: WebSocket, response: Response) { controlSocket = webSocket }
     override fun onMessage(webSocket: WebSocket, text: String) {
       try {
         val frame = JSONObject(text)
@@ -112,21 +125,20 @@ internal class FakeRemoteHost(
               .put("maxControlFrameBytes", 65536).put("maxRelayFrameBytes", 1048576)
               .put("heartbeatIntervalMs", 30000))
           }
-          "connect.request" -> send(webSocket, "connect.accepted", JSONObject().put("connectionId", connectionId))
+          "connect.request" -> send(webSocket, "connect.accepted", JSONObject().put("connectionId", connectionId)
+            .apply {
+              if (assignRelay) put("relayEndpoint", "$url/relay/v1").put("relayTicket", relayTicket).put("relayEpoch", relayEpoch)
+            })
           "secure.handshake" -> {
-            val responder = HandshakeState("Noise_IK_25519_ChaChaPoly_SHA256", HandshakeState.RESPONDER)
-            responder.localKeyPair.setPrivateKey(Base64.getUrlDecoder().decode(hostIdentity.privateKey), 0)
-            val prologue = RemoteNoise.prologue(connectionId, hostId, clientDeviceId)
-            responder.setPrologue(prologue, 0, prologue.size)
-            responder.start()
-            val input = Base64.getUrlDecoder().decode(payload.getString("data"))
-            responder.readMessage(input, 0, input.size, ByteArray(input.size), 0)
-            val output = ByteArray(256)
-            val length = responder.writeMessage(output, 0, byteArrayOf(), 0, 0)
-            cipher = responder.split()
-            send(webSocket, "secure.handshake", JSONObject().put("connectionId", connectionId)
-              .put("targetDeviceId", clientDeviceId).put("step", 2)
-              .put("data", Base64.getUrlEncoder().withoutPadding().encodeToString(output.copyOf(length))))
+            handshakeData = payload.getString("data")
+            if (assignRelay && !dataReady) pendingHandshake = payload else processHandshake(webSocket)
+          }
+          "transport.selected" -> {
+            if (payload.optString("transport") != "relay") throw IllegalStateException("unexpected transport")
+            pendingHandshake?.let { pending ->
+              pendingHandshake = null
+              processHandshake(webSocket)
+            }
           }
           "relay" -> {
             val pair = cipher ?: return
@@ -144,6 +156,56 @@ internal class FakeRemoteHost(
         webSocket.cancel()
       }
     }
+  }
+
+  private val dataListener = object : WebSocketListener() {
+    override fun onOpen(webSocket: WebSocket, response: Response) { dataSocket = webSocket }
+    override fun onMessage(webSocket: WebSocket, text: String) {
+      val frame = JSONObject(text)
+      val payload = frame.getJSONObject("payload")
+      when (frame.getString("type")) {
+        "relay.attach" -> {
+          if (payload.optString("ticket") != relayTicket || payload.optString("peerDeviceId") != hostId) {
+            webSocket.close(4003, "bad ticket")
+            return
+          }
+          sendOn(webSocket, "relay.ready", JSONObject().put("connectionId", connectionId).put("epoch", relayEpoch))
+          dataReady = true
+          pendingHandshake?.let { pending ->
+            pendingHandshake = null
+            processHandshake(webSocket)
+          }
+        }
+        "relay" -> {
+          val pair = cipher ?: return
+          val input = Base64.getUrlDecoder().decode(payload.getString("ciphertext"))
+          val plaintext = ByteArray(input.size)
+          val count = pair.receiver.decryptWithAd(null, input, 0, plaintext, 0, input.size)
+          handleMessage(webSocket, JSONObject(String(plaintext, 0, count, Charsets.UTF_8)))
+        }
+        "ping" -> sendOn(webSocket, "pong", payload)
+        else -> Unit
+      }
+    }
+    override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) { }
+  }
+
+  /** 数据通道就绪后才允许握手（对应真 Host 的 `resumePendingHandshake`）。 */
+  private fun processHandshake(socket: WebSocket) {
+    if (cipher != null) return
+    val responder = HandshakeState("Noise_IK_25519_ChaChaPoly_SHA256", HandshakeState.RESPONDER)
+    responder.localKeyPair.setPrivateKey(Base64.getUrlDecoder().decode(hostIdentity.privateKey), 0)
+    val prologue = RemoteNoise.prologue(connectionId, hostId, clientDeviceId)
+    responder.setPrologue(prologue, 0, prologue.size)
+    responder.start()
+    val input = Base64.getUrlDecoder().decode(handshakeData ?: return)
+    responder.readMessage(input, 0, input.size, ByteArray(input.size), 0)
+    val output = ByteArray(256)
+    val length = responder.writeMessage(output, 0, byteArrayOf(), 0, 0)
+    cipher = responder.split()
+    send(socket, "secure.handshake", JSONObject().put("connectionId", connectionId)
+      .put("targetDeviceId", clientDeviceId).put("step", 2)
+      .put("data", Base64.getUrlEncoder().withoutPadding().encodeToString(output.copyOf(length))))
   }
 
   private fun handleMessage(socket: WebSocket, message: JSONObject) {

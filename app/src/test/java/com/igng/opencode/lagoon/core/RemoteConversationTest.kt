@@ -160,4 +160,27 @@ class RemoteConversationTest {
       } finally { backend.close(); session.close() }
     }
   }
+
+  /** 中枢下发独立 Relay 数据通道时，握手与密文都必须搬到该通道上（relay.attach → relay.ready → transport.selected）。 */
+  @Test fun loadsConversationThroughAssignedRelayDataSocket() = runBlocking {
+    val id = "session-${UUID.randomUUID()}"
+    FakeRemoteHost().use { host ->
+      host.assignRelay = true
+      host.call = { endpoint, _ ->
+        when (endpoint) {
+          "session/list" -> host.ok(JSONObject().put("items", JSONArray().put(sessionRow(id))))
+          "session/page" -> host.ok(JSONObject().put("records", JSONArray()).put("hasMore", false))
+          else -> host.ok(JSONObject())
+        }
+      }
+      host.streamFrames = { endpoint, _ -> if (endpoint == "session/follow") listOf(snapshot(id, 4)) else emptyList() }
+      host.start()
+      val (session, backend) = backend(host)
+      try {
+        val page = backend.client.messagesPage(id)
+        assertEquals(2, page.items.size)
+        assertTrue("应打开过独立 Relay 数据通道", host.requests.any { it.startsWith("GET /relay/v1") })
+      } finally { backend.close(); session.close() }
+    }
+  }
 }

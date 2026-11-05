@@ -1,6 +1,8 @@
 package com.igng.opencode.lagoon.core
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeout
@@ -25,7 +27,7 @@ internal class RemoteRelay(
   private val token: String,
   private val hostId: String,
   private val pinnedHostKey: String,
-  allowCleartext: Boolean = false,
+  private val allowCleartext: Boolean = false,
   private val onMessage: (ByteArray) -> Unit,
   private val onClose: (IOException) -> Unit
 ) : RemoteSecureChannel {
@@ -48,7 +50,13 @@ internal class RemoteRelay(
   private var state = State.NEW
   /** 无法识别的控制帧计数（诊断用）。 */
   internal val unsupportedFrames = java.util.concurrent.atomic.AtomicInteger()
-  private enum class State { NEW, HELLO, CONNECT, HANDSHAKE, READY, CLOSED }
+  /** 中枢通过 `connect.accepted` 下发的独立 Relay 数据通道（`relayEndpoint` + `relayTicket`）。 */
+  private var dataSocket: WebSocket? = null
+  private var dataReady = false
+  private var relayTicket: String? = null
+  private var relayEpoch: Long? = null
+  private var attachSignal: CompletableDeferred<Unit>? = null
+  private enum class State { NEW, HELLO, CONNECT, ASSIGNED, HANDSHAKE, READY, CLOSED }
 
   init {
     require(base.isHttps || allowCleartext) { "DSH Hub HTTP 明文连接未获授权" }
@@ -78,8 +86,9 @@ internal class RemoteRelay(
         for (part in outgoing.encode(message)) {
           if (outgoingCounter > MAX_COUNTER) throw IOException("Remote 计数器耗尽")
           val encrypted = session.encrypt(part)
-          sendFrame("relay", JSONObject().put("connectionId", id).put("targetDeviceId", hostId)
-            .put("counter", outgoingCounter++).put("ciphertext", encode(encrypted)), relayLimit)
+          // 独立数据通道就绪后，业务密文只走它；控制通道继续承载 ping/握手等控制帧。
+          sendFrameOn(if (dataReady) dataSocket else socket, "relay", JSONObject().put("connectionId", id)
+            .put("targetDeviceId", hostId).put("counter", outgoingCounter++).put("ciphertext", encode(encrypted)), relayLimit)
         }
       }
     } catch (error: Exception) { fail(IOException("Remote 发送失败", error)); throw error }
@@ -138,14 +147,23 @@ internal class RemoteRelay(
         }
         "connect.accepted" -> {
           if (state != State.CONNECT) throw IOException("Remote 握手顺序无效")
-          if (payload.has("relayEndpoint") || payload.has("relayTicket")) throw IOException("暂不支持独立 Relay 端点")
           val id = textField(payload, "connectionId")
           connectionId = id
           val session = RemoteNoise(identity, hostId, pinnedHostKey, id)
           noise = session
-          state = State.HANDSHAKE
-          sendFrame("secure.handshake", JSONObject().put("connectionId", id).put("targetDeviceId", hostId)
-            .put("step", 1).put("data", encode(session.writeHandshake())), controlLimit)
+          val endpoint = (payload.opt("relayEndpoint") as? String)?.trim()?.takeIf { it.isNotEmpty() }
+          val ticket = (payload.opt("relayTicket") as? String)?.takeIf { it.isNotEmpty() }
+          if (endpoint != null && ticket != null) {
+            // 中枢要求把密文搬到独立数据通道：先附加，拿到 relay.ready 后再发 transport.selected 与握手。
+            relayTicket = ticket
+            relayEpoch = (payload.opt("relayEpoch") as? Number)?.toLong()
+            state = State.ASSIGNED
+            SharedHttp.ioScope.launch { attachRelay(endpoint) }
+          } else {
+            state = State.HANDSHAKE
+            sendFrame("secure.handshake", JSONObject().put("connectionId", id).put("targetDeviceId", hostId)
+              .put("step", 1).put("data", encode(session.writeHandshake())), controlLimit)
+          }
         }
         "secure.handshake" -> {
           if (state != State.HANDSHAKE || payload.opt("step") != 2 || incomingHandshakeStep != 0) throw IOException("Remote 握手顺序无效")
@@ -173,24 +191,115 @@ internal class RemoteRelay(
     message?.let(onMessage)
   }
 
+  /**
+   * 独立 Relay 数据通道：按参考实现 `relay.attach → relay.ready → transport.selected → secure.handshake`
+   * 的顺序建立。失败必须明确报出来，不能再以“暂不支持”直接放弃整条连接。
+   */
+  private suspend fun attachRelay(endpoint: String) {
+    try {
+      val url = requireNotNull(endpoint.toHttpUrlOrNull()) { "中枢下发的 Relay 地址无效" }
+      require(url.scheme == "https" || (url.scheme == "http" && allowCleartext)) { "Relay 数据通道要求 HTTPS（或显式允许明文）" }
+      require(url.username.isEmpty() && url.password.isEmpty()) { "Relay 地址不能包含凭据" }
+      val signal = CompletableDeferred<Unit>()
+      synchronized(this) {
+        if (state != State.ASSIGNED) throw IOException("Relay 数据通道状态无效")
+        attachSignal = signal
+      }
+      val socket = http.newWebSocket(Request.Builder().url(url).build(), dataListener)
+      synchronized(this) {
+        if (state != State.ASSIGNED) { socket.cancel(); throw IOException("Relay 数据通道状态无效") }
+        dataSocket = socket
+      }
+      withTimeout(RELAY_ATTACH_TIMEOUT_MILLIS) { signal.await() }
+      synchronized(this) {
+        if (state != State.ASSIGNED) throw IOException("Relay 数据通道状态无效")
+        val id = connectionId ?: throw IOException("Relay 数据通道没有连接标识")
+        val session = noise ?: throw IOException("Relay 数据通道没有安全会话")
+        state = State.HANDSHAKE
+        sendFrame("transport.selected", JSONObject().put("connectionId", id)
+          .put("targetDeviceId", hostId).put("transport", "relay"), controlLimit)
+        sendFrame("secure.handshake", JSONObject().put("connectionId", id).put("targetDeviceId", hostId)
+          .put("step", 1).put("data", encode(session.writeHandshake())), controlLimit)
+      }
+    } catch (cancel: CancellationException) {
+      throw cancel
+    } catch (error: Exception) {
+      fail(IOException("Relay 数据通道建立失败", error))
+    }
+  }
+
+  /** 数据通道只承载 `relay`/`relay.ready`/`relay.detach`/`ping`/`pong`，其余交给统一控制帧处理。 */
+  private val dataListener = object : WebSocketListener() {
+    override fun onOpen(webSocket: WebSocket, response: Response) {
+      try {
+        synchronized(this@RemoteRelay) {
+          val id = connectionId ?: throw IOException("Relay 数据通道没有连接标识")
+          val ticket = relayTicket ?: throw IOException("Relay 数据通道没有票据")
+          sendFrameOn(webSocket, "relay.attach", JSONObject().put("connectionId", id)
+            .put("deviceId", identity.deviceId).put("peerDeviceId", hostId).put("ticket", ticket), controlLimit)
+        }
+      } catch (error: Exception) { fail(IOException("Relay 数据通道附加失败", error)) }
+    }
+
+    override fun onMessage(webSocket: WebSocket, text: String) {
+      try {
+        val probe = try { JSONObject(text) } catch (_: Exception) { throw IOException("Relay 数据帧不是有效 JSON") }
+        if (probe.optString("type") == "relay.ready") {
+          val payload = probe.optJSONObject("payload") ?: throw IOException("Relay 数据通道应答无效")
+          synchronized(this@RemoteRelay) {
+            if (state != State.ASSIGNED) throw IOException("Relay 数据通道状态无效")
+            if (payload.opt("connectionId") != connectionId) throw IOException("Relay 数据通道连接标识不一致")
+            val epoch = (payload.opt("epoch") as? Number)?.toLong()
+            if (relayEpoch != null && epoch != relayEpoch) throw IOException("Relay 数据通道代次不一致")
+            dataReady = true
+            attachSignal?.complete(Unit)
+          }
+          return
+        }
+        if (probe.optString("type") == "relay.detach") throw IOException("Relay 数据通道被对端断开")
+        handle(text)
+      } catch (error: Exception) { fail(IOException("Relay 数据通道失败", error)) }
+    }
+
+    override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+      attachSignal?.completeExceptionally(IOException("Relay 数据通道连接失败", t))
+      fail(IOException("Relay 数据通道连接失败", t))
+    }
+
+    override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+      if (state != State.CLOSED) fail(IOException("Relay 数据通道已关闭（$code）"))
+    }
+
+    override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+      webSocket.close(code, null)
+      if (state != State.CLOSED) fail(IOException("Relay 数据通道正在关闭"))
+    }
+  }
+
   private fun checkTarget(payload: JSONObject) {
     if (payload.opt("connectionId") != connectionId || payload.opt("targetDeviceId") != identity.deviceId) throw IOException("Remote 目标身份不匹配")
   }
-  private fun sendFrame(type: String, payload: JSONObject, limit: Int) {
+  private fun sendFrame(type: String, payload: JSONObject, limit: Int) = sendFrameOn(socket, type, payload, limit)
+
+  private fun sendFrameOn(target: WebSocket?, type: String, payload: JSONObject, limit: Int) {
     val text = JSONObject().put("v", 1).put("id", UUID.randomUUID().toString()).put("type", type)
       .put("timestamp", System.currentTimeMillis()).put("payload", payload).toString()
     val max = if (type == "relay") relayLimit else limit
-    if (text.toByteArray(Charsets.UTF_8).size > max || socket?.send(text) != true) throw IOException("Remote 帧发送失败")
+    if (text.toByteArray(Charsets.UTF_8).size > max || target?.send(text) != true) throw IOException("Remote 帧发送失败")
   }
+
   private fun fail(error: IOException) {
-    val toClose = synchronized(this) {
+    val closing = synchronized(this) {
       if (state == State.CLOSED) return
       state = State.CLOSED
       ready.completeExceptionally(error)
+      attachSignal?.completeExceptionally(error)
+      dataReady = false
       noise?.close(); noise = null
-      socket.also { socket = null }
+      (socket.also { socket = null }) to (dataSocket.also { dataSocket = null })
     }
-    toClose?.cancel()
+    closing.first?.cancel()
+    closing.second?.cancel()
     onClose(error)
   }
   private fun textField(obj: JSONObject, name: String): String = (obj.opt(name) as? String)
@@ -207,5 +316,9 @@ internal class RemoteRelay(
     if (encode(decoded) != data) throw IOException("Remote 编码无效")
     return decoded
   }
-  private companion object { const val MAX_COUNTER = 9007199254740991L }
+  private companion object {
+    const val MAX_COUNTER = 9007199254740991L
+    /** 与参考实现一致：数据通道附加超时 15 秒。 */
+    const val RELAY_ATTACH_TIMEOUT_MILLIS = 15_000L
+  }
 }
