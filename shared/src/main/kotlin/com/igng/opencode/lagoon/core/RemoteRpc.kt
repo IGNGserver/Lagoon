@@ -27,6 +27,8 @@ internal class RemoteRpc(
   private val lock = Any()
   private val writeLock = Mutex()
   private val pending = mutableMapOf<String, CompletableDeferred<Any?>>()
+  /** 无法识别的消息类型计数（诊断用）。 */
+  internal val unknownTypes = java.util.concurrent.atomic.AtomicInteger()
   private var closed = false
 
   suspend fun call(method: String, params: JSONObject, timeoutMillis: Long = 30_000): Any? {
@@ -87,7 +89,8 @@ internal class RemoteRpc(
         synchronized(lock) { pending.remove(request) }?.completeExceptionally(RemoteRpcException(code, payload.optBoolean("retryable")))
       }
       "event" -> onEvent(payload)
-      else -> throw IOException("Remote RPC 收到未知消息类型")
+      // 未知类型只可能是对端新增的消息；丢掉它并记录，不能因为一次协议扩展就让整条连接失效。
+      else -> unknownTypes.incrementAndGet()
     }
   }
 

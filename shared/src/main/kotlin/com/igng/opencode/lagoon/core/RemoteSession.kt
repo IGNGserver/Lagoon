@@ -33,7 +33,10 @@ internal class RemoteSession(
     catch (error: RemoteFailureException) { throw error }
     catch (error: RemoteServerException) { throw remoteServerFailure(error) }
     catch (error: Exception) {
-      throw RemoteFailureException(RemoteFailureKind.AUTH_REQUIRED, "DSH Remote 登录已失效，请重新登录", retryable = false, cause = error)
+      // 保留自愈层给出的原因（刷新冷却、凭据过期等），否则一律显示“登录失效”会把可重试的故障说成永久故障。
+      throw RemoteFailureException(RemoteFailureKind.AUTH_REQUIRED,
+        error.message?.takeIf { it.isNotBlank() } ?: "DSH Remote 登录已失效，请重新登录",
+        retryable = false, cause = error)
     }
     val token = device.tokens?.accessToken ?: throw RemoteFailureException(RemoteFailureKind.AUTH_REQUIRED, "Remote 设备尚未注册", retryable = false)
     val host = try { api.host(token, hostId) }
@@ -51,12 +54,13 @@ internal class RemoteSession(
         (gateway ?: throw IOException("Remote 事件早于能力协商")).event(it)
       }
     } catch (error: Exception) {
-      throw RemoteFailureException(RemoteFailureKind.NETWORK, "没能建立加密中继", retryable = true, cause = error)
+      throw RemoteFailureException(RemoteFailureKind.NETWORK, "没能建立加密中继：${detail(error)}", retryable = true, cause = error)
     }
     try {
       val capabilities = try { connection.capabilities() }
       catch (error: Exception) {
-        throw RemoteFailureException(RemoteFailureKind.INCOMPATIBLE, "主机或远程插件版本不兼容", retryable = false, cause = error)
+        throw RemoteFailureException(RemoteFailureKind.INCOMPATIBLE,
+          "主机或远程插件版本不兼容：${detail(error)}", retryable = false, cause = error)
       }
       val nextGateway = RemoteGateway("harness.remote.stream.transfer.v1" in capabilities.capabilities) { method, params -> connection.call(method, params) }
       gateway = nextGateway
@@ -66,6 +70,12 @@ internal class RemoteSession(
         SharedHttp.ioScope.launch { connection.awaitClosed(); nextGateway.close() }
       }
     } catch (error: Exception) { connection.close(); throw error }
+  }
+
+  /** 把底层原因压成一句可读文案：链路故障最怕只剩一句“连接失败”。 */
+  private fun detail(error: Throwable): String {
+    val parts = generateSequence(error) { it.cause }.mapNotNull { it.message?.takeIf(String::isNotBlank) }.distinct().take(3).toList()
+    return parts.joinToString(" / ").ifBlank { error.javaClass.simpleName }
   }
 
   /** Top-level workspace.upload.* RPCs; not Gateway endpoints and never wrapped in harness.remote.call. */

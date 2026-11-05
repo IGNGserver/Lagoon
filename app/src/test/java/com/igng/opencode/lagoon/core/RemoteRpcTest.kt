@@ -55,4 +55,18 @@ class RemoteRpcTest {
       assertEquals("TRANSPORT_CLOSED", error.code)
     }
   }
+
+  /** 对端新增消息类型只应被忽略，不能把整条连接打死。 */
+  @Test fun unknownMessageTypeIsIgnored() = runBlocking {
+    val transport = FakeChannel()
+    val rpc = RemoteRpc(transport) { 1000L }
+    val call = async { rpc.call("harness.remote.call", JSONObject()) }
+    val request = transport.sent.receive()
+    rpc.receive(JSONObject().put("v", 1).put("id", "future").put("type", "future/new-frame")
+      .put("timestamp", 1000L).put("payload", JSONObject().put("anything", true)))
+    rpc.receive(response(request.getString("id"), "ok"))
+    assertEquals("ok", call.await())
+    assertEquals(1, rpc.unknownTypes.get())
+    assertFalse(transport.closed)
+  }
 }

@@ -46,6 +46,8 @@ internal class RemoteRelay(
   private var controlLimit = 65536
   private var relayLimit = 1048576
   private var state = State.NEW
+  /** 无法识别的控制帧计数（诊断用）。 */
+  internal val unsupportedFrames = java.util.concurrent.atomic.AtomicInteger()
   private enum class State { NEW, HELLO, CONNECT, HANDSHAKE, READY, CLOSED }
 
   init {
@@ -112,7 +114,8 @@ internal class RemoteRelay(
       if (state == State.CLOSED) return
       if (text.toByteArray(Charsets.UTF_8).size > relayLimit) throw IOException("Remote 帧超过上限")
       val frame = try { JSONObject(text) } catch (_: Exception) { throw IOException("Remote 帧不是有效 JSON") }
-      if (frame.keys().asSequence().toSet() != setOf("v", "id", "type", "timestamp", "payload") || frame.opt("v") != 1 ||
+      // 必需字段齐全即可；中枢后续新增字段不应让整条连接失效（通道本身已认证并加密）。
+      if (!listOf("v", "id", "type", "timestamp", "payload").all { frame.has(it) } || frame.opt("v") != 1 ||
         (frame.opt("id") as? String).isNullOrEmpty() || (frame.opt("timestamp") as? Number)?.toLong()?.let { it > 0 } != true)
         throw IOException("Remote 帧信封无效")
       val type = frame.opt("type") as? String ?: throw IOException("Remote 帧类型无效")
@@ -163,7 +166,8 @@ internal class RemoteRelay(
             message = incoming.decode(noise!!.decrypt(decode(textField(payload, "ciphertext"))))
           } else if (n > incomingCounter + 1) throw IOException("Remote 计数器跳号")
         }
-        else -> throw IOException("Remote 收到不支持的控制帧")
+        // 未知控制帧（新版本中枢的扩展）忽略并计数，不影响已建立的其他流程。
+        else -> unsupportedFrames.incrementAndGet()
       }
     }
     message?.let(onMessage)

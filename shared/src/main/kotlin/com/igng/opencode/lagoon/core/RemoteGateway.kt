@@ -18,10 +18,13 @@ import java.util.concurrent.ConcurrentHashMap
 
 /** Typert carrier bound to one Noise connection and its owner peer. Never retries business calls. */
 internal class RemoteGateway(private val transferFrames: Boolean = false, private val rpc: suspend (String, JSONObject) -> Any?) : AutoCloseable {
-  private data class StreamState(val output: Channel<Any>, val frames: Channel<JSONObject>, var worker: Job? = null)
+  private data class StreamState(val output: Channel<Any>, val frames: Channel<JSONObject>,
+    var worker: Job? = null, var failure: IOException? = null)
   private val streams = ConcurrentHashMap<String, StreamState>()
   private val transfers = Mutex()
   @Volatile private var closed = false
+  /** 最近一次流级失败的原因，供连接详情/日志定位；不参与控制流。 */
+  @Volatile internal var lastError: String? = null
 
   suspend fun call(endpoint: String, payload: JSONObject): Any? {
     require(validEndpoint(endpoint))
@@ -102,7 +105,8 @@ internal class RemoteGateway(private val transferFrames: Boolean = false, privat
   private suspend fun readTransfer(id: String, descriptor: JSONObject): Any? {
     val bytes = descriptor.optInt("totalBytes", -1)
     val total = descriptor.optInt("totalChunks", -1)
-    if (descriptor.optString("transferId") != id || bytes !in 1..MAX_RESPONSE || total != (bytes + CHUNK - 1) / CHUNK)
+    if (bytes !in 1..MAX_RESPONSE) throw IOException("Remote 响应 $bytes 字节，超过本机 $MAX_RESPONSE 字节上限")
+    if (descriptor.optString("transferId") != id || total != (bytes + CHUNK - 1) / CHUNK)
       throw IOException("Remote 传输描述无效")
     val output = ByteArray(bytes)
     for (index in 0 until total) {
@@ -141,7 +145,8 @@ internal class RemoteGateway(private val transferFrames: Boolean = false, privat
             else frame.opt("value") ?: JSONObject.NULL) ?: JSONObject.NULL
           stream.output.send(value)
         }
-        stream.output.close()
+        // 坏帧不会切断事件通道：先把已排队的帧交给消费者，再以记录下来的原因收尾。
+        stream.output.close(stream.failure)
       } catch (cancel: CancellationException) { stream.output.close(cancel); throw cancel }
       catch (error: Exception) { stream.output.close(error) }
       finally { streams.remove(id, stream) }
@@ -161,27 +166,47 @@ internal class RemoteGateway(private val transferFrames: Boolean = false, privat
     }
   }
 
+  /**
+   * 一条流事件。事件通道同时承载所有 RPC 的响应，所以这里**不能**抛异常：一个坏帧只会让
+   * 它所属的那条流失败并记录原因，其他 RPC 与流照常工作。协议漂移时用户看到的是“这条会话读不到”，
+   * 而不是“整台主机全部功能消失”。
+   */
   fun event(payload: JSONObject) {
-    val name = payload.opt("event") as? String ?: throw IOException("Remote 事件无效")
+    val name = payload.opt("event") as? String
     if (name != "harness.remote.frame" && name != "harness.remote.stream.closed") return
-    val data = payload.optJSONObject("data") ?: throw IOException("Remote 流事件无效")
-    val id = data.opt("streamId") as? String ?: throw IOException("Remote 流标识无效")
+    val data = payload.optJSONObject("data") ?: run { lastError = "流事件缺少 data"; return }
+    val id = (data.opt("streamId") as? String) ?: run { lastError = "流事件缺少 streamId"; return }
     val stream = streams[id] ?: return
-    if (name == "harness.remote.frame") {
-      val hasValue = data.has("value")
-      val hasTransfer = data.has("transfer")
-      if (data.opt("hasValue") != true || (hasValue && hasTransfer)) throw IOException("Remote 流帧内容无效")
-      if (hasTransfer && (!transferFrames || data.optJSONObject("transfer")?.optString("kind") != "chunked")) throw IOException("Remote 流传输描述无效")
-      if (stream.frames.trySend(data).isFailure) {
-        streams.remove(id)
-        stream.frames.close(IOException("Remote 流消费者过慢")); stream.output.close(IOException("Remote 流消费者过慢")); stream.worker?.cancel()
-        throw IOException("Remote 流消费者过慢")
-      }
-    } else {
-      if (data.optString("reason") == "failed") {
-        stream.frames.close(IOException("Remote 流失败")); stream.output.close(IOException("Remote 流失败")); stream.worker?.cancel()
-      } else stream.frames.close()
+    if (name == "harness.remote.stream.closed") {
+      val failure = if (data.optString("reason") == "failed") IOException(
+        "Remote 流失败：${data.optJSONObject("failure")?.optString("message").orEmpty().ifBlank { "主机未给出原因" }}")
+      else null
+      stream.frames.close(failure); stream.output.close(failure); stream.worker?.cancel()
+      if (failure != null) lastError = failure.message
+      return
     }
+    val hasValue = data.has("value")
+    val hasTransfer = data.has("transfer")
+    val problem = when {
+      data.opt("hasValue") != true -> "流帧缺少 hasValue"
+      hasValue && hasTransfer -> "流帧同时带了 value 与 transfer"
+      hasTransfer && !transferFrames -> "未协商 transferFrames 却收到分片帧"
+      hasTransfer && data.optJSONObject("transfer")?.optString("kind") != "chunked" -> "流分片描述无效"
+      else -> null
+    }
+    if (problem != null) {
+      failStream(id, stream, IOException(problem))
+      return
+    }
+    if (stream.frames.trySend(data).isFailure) failStream(id, stream, IOException("Remote 流消费者过慢"))
+  }
+
+  private fun failStream(id: String, stream: StreamState, error: IOException) {
+    lastError = error.message
+    streams.remove(id, stream)
+    stream.failure = error
+    // 不带 cause 关闭帧队列：worker 会先送完已缓冲的帧，再用 failure 结束输出。
+    stream.frames.close()
   }
 
   internal suspend fun closeStream(id: String) {
@@ -221,7 +246,8 @@ internal class RemoteGateway(private val transferFrames: Boolean = false, privat
   private companion object {
     const val DIRECT_LIMIT = 2 * 1024 * 1024
     const val MAX_TRANSFER = 288 * 1024 * 1024
-    const val MAX_RESPONSE = 16 * 1024 * 1024
+    /** Host 允许 288 MiB 的分块响应；设备侧仍留出内存余量，超过就明确报错而不是装作“描述无效”。 */
+    const val MAX_RESPONSE = 64 * 1024 * 1024
     const val CHUNK = 512 * 1024
     val READS = setOf(
       "session/list", "session/page", "session/projections", "session/modelCatalog",

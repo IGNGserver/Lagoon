@@ -112,4 +112,32 @@ class RemoteGatewayTest {
     }
     assertEquals(0, transfers)
   }
+
+  /** 一个坏帧只让所属流失败：事件通道还要继续承载其他 RPC。 */
+  @Test fun malformedStreamFrameFailsOnlyThatStream() = runBlocking {
+    var calls = 0
+    lateinit var gateway: RemoteGateway
+    gateway = RemoteGateway { method, params ->
+      calls++
+      when (method) {
+        "harness.remote.stream.open" -> {
+          // 首帧合法，随后是一帧缺少 hasValue 的坏帧。
+          gateway.event(JSONObject().put("event", "harness.remote.frame").put("data",
+            JSONObject().put("streamId", params.getString("streamId")).put("hasValue", true).put("value", JSONObject().put("type", "first"))))
+          gateway.event(JSONObject().put("event", "harness.remote.frame").put("data",
+            JSONObject().put("streamId", params.getString("streamId")).put("value", JSONObject().put("type", "broken"))))
+        }
+        "harness.remote.stream.close" -> JSONObject()
+        "harness.remote.call" -> JSONObject().put("ok", true).put("value", "still-alive")
+        else -> throw AssertionError("unexpected $method")
+      }
+    }
+    val stream = gateway.open("session/follow", JSONObject())
+    assertEquals("first", (stream.receive() as JSONObject).getString("type"))
+    // 坏帧之后该流以异常结束，但同一 gateway 的普通调用仍然可用。
+    try { stream.receive(); fail() } catch (_: Exception) { }
+    assertEquals("still-alive", gateway.call("session/list", JSONObject()))
+    assertNotNull(gateway.lastError)
+    assertTrue(calls >= 2)
+  }
 }
