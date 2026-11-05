@@ -123,7 +123,11 @@ internal fun AllServersScopeSheet(state: LagoonState, controller: LagoonControll
         }
       }
       item { SmallTitle("设备", insideMargin = PaddingValues(horizontal = 16.dp, vertical = 8.dp)) }
-      items(state.profiles, key = { it.id }) { profile ->
+      if (state.enabledProfiles.isEmpty()) item {
+        Text("没有启用的连接。请先在设备管理中启用一个连接。", Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+          style = MiuixTheme.textStyles.footnote1.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
+      }
+      items(state.enabledProfiles, key = { it.id }) { profile ->
         val snapshot = state.allServerSnapshots[profile.id]
         Card(Modifier.fillMaxWidth()) {
           ChoiceRow(profile.name, "${counts[profile.id] ?: 0} 个会话${if (snapshot?.connected == true) " · 已连接" else " · 未连接"}", false) {
@@ -170,7 +174,7 @@ internal fun DraftTargetSheet(state: LagoonState, controller: LagoonController, 
 @Composable
 internal fun AllServersDraftTargetSheet(
   state: LagoonState,
-  profiles: List<ServerProfile> = state.profiles,
+  profiles: List<ServerProfile> = state.enabledProfiles,
   onSelect: (ServerProfile, Project) -> Unit,
   onDismiss: () -> Unit
 ) {
@@ -223,7 +227,7 @@ internal fun GroupDraftTargetSheet(
           item {
             Card(Modifier.fillMaxWidth()) {
               workspace.members.forEach { project ->
-                val profile = project.serverId?.let { id -> profiles.firstOrNull { it.id == id } }
+                val profile = project.serverId?.let { id -> profiles.firstOrNull { it.id == id && it.enabled } }
                 if (profile != null) {
                   ChoiceRow(
                     title = profile.name,

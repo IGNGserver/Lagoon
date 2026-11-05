@@ -69,6 +69,10 @@ internal fun SshHostForm(
   val scope = rememberCoroutineScope()
   val hostId = remember(initial?.id) { initial?.id ?: SshHostConfig.newId() }
   val initialSecrets = remember(initial?.id) { initial?.let { controller.sshHostSecrets(it.id) } ?: SshSecrets() }
+  val existingProfile = remember(initial?.id, state.profiles) {
+    state.profiles.firstOrNull { initial?.id != null && it.sshHostId == initial.id }
+  }
+  val enabled = existingProfile?.enabled ?: true
   var name by rememberSaveable(initial?.id) { mutableStateOf(initial?.name.orEmpty()) }
   var host by rememberSaveable(initial?.id) { mutableStateOf(initial?.host.orEmpty()) }
   var port by rememberSaveable(initial?.id) { mutableStateOf((initial?.port ?: 22).toString()) }
@@ -234,7 +238,7 @@ internal fun SshHostForm(
           autoConnect = autoConnect,
           notifications = notifications,
           groupId = groupId,
-          connect = true
+          connect = enabled
         )
         onSaved()
       } catch (cancel: CancellationException) {
@@ -256,6 +260,14 @@ internal fun SshHostForm(
         Text(
           "通过 SSH 连接远端电脑（Linux / macOS / WSL），连接时会自动在远端启动或复用 dsh web，再经本地加密隧道连接。",
           style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.primary)
+        )
+      }
+    }
+    if (!enabled) item {
+      Card(colors = CardDefaults.defaultColors(color = MiuixColorTokens.WarningSubtle), insideMargin = PaddingValues(12.dp)) {
+        Text(
+          "此连接已禁用：保存不会建立连接。要使用它，请先在设备管理中启用。",
+          style = MiuixTheme.textStyles.footnote2.copy(color = MiuixColorTokens.Warning)
         )
       }
     }
@@ -379,7 +391,7 @@ internal fun SshHostForm(
     item {
       Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         TextButton(text = "取消", onClick = onCancel, modifier = Modifier.weight(1f))
-        TextButton(text = if (working) "正在保存…" else "保存并连接", enabled = !working, onClick = { save() }, modifier = Modifier.weight(1f))
+        TextButton(text = if (working) "正在保存…" else if (enabled) "保存并连接" else "保存", enabled = !working, onClick = { save() }, modifier = Modifier.weight(1f))
       }
     }
     if (initial != null) item {

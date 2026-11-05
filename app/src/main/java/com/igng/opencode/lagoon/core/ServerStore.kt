@@ -33,7 +33,8 @@ class ServerStore internal constructor(private val preferences: SharedPreference
       ServerProfile(id, it.str("name"), it.str("url"), it.str("username"),
         it.optBoolean("autoConnect", true), it.optBoolean("notifications", true), it.optBoolean("allowCleartext", false),
         ServerKind.fromWire(it.str("kind")), DshAuthMode.fromWire(it.str("dshAuth")), it.str("remoteHostId").takeIf(String::isNotBlank),
-        it.str("remoteHostFingerprint").takeIf(String::isNotBlank), it.str("sshHostId").takeIf(String::isNotBlank))
+        it.str("remoteHostFingerprint").takeIf(String::isNotBlank), it.str("sshHostId").takeIf(String::isNotBlank),
+        it.optBoolean("enabled", true))
     }
   } catch (error: Exception) {
     Diagnostics.warn("ServerStore", "profiles 解析失败，已忽略全部服务器资料", error)
@@ -393,12 +394,25 @@ class ServerStore internal constructor(private val preferences: SharedPreference
     check(preferences.edit().putString("profiles", profilesJson(updated)).commit()) { "无法保存服务器资料，请重试" }
   }
 
+  /**
+   * Enables or disables one saved connection without touching credentials, caches, drafts or the
+   * unread ledger. A no-op when the profile is already in the requested state.
+   */
+  fun setProfileEnabled(id: String, enabled: Boolean): Boolean {
+    val current = profiles()
+    val profile = current.firstOrNull { it.id == id } ?: return false
+    if (profile.enabled == enabled) return true
+    val updated = current.map { if (it.id == id) it.copy(enabled = enabled) else it }
+    return preferences.edit().putString("profiles", profilesJson(updated)).commit()
+  }
+
   private fun profilesJson(profiles: List<ServerProfile>): String = JSONArray().apply {
     profiles.forEach { item ->
       put(JSONObject()
         .put("id", item.id).put("name", item.name).put("url", item.url).put("username", item.username)
         .put("autoConnect", item.autoConnect).put("notifications", item.notifications)
         .put("allowCleartext", item.allowCleartext).put("kind", item.kind.wire).put("dshAuth", item.dshAuth.wire)
+        .put("enabled", item.enabled)
         .putOpt("remoteHostId", item.remoteHostId).putOpt("remoteHostFingerprint", item.remoteHostFingerprint)
         .putOpt("sshHostId", item.sshHostId))
     }

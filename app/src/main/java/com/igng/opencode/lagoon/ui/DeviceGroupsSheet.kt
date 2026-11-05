@@ -55,7 +55,7 @@ internal fun DeviceGroupsSheet(
   var selected by remember(initialGroupId) { mutableStateOf(editing?.memberIds?.toSet().orEmpty()) }
   var connectAll by remember(initialGroupId) {
     mutableStateOf(
-      editing?.memberIds?.mapNotNull { id -> state.profiles.firstOrNull { it.id == id } }?.let { members ->
+      editing?.memberIds?.mapNotNull { id -> state.profiles.firstOrNull { it.id == id && it.enabled } }?.let { members ->
         members.isNotEmpty() && members.all { it.autoConnect }
       } ?: true
     )
@@ -74,7 +74,7 @@ internal fun DeviceGroupsSheet(
       verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
       item {
-        Text("把同一台电脑上的不同连接放进一个组。首页只显示「全部」和这些分组；分组只影响本机展示。",
+        Text("把同一台电脑上的不同连接放进一个组。首页只显示「全部」和这些分组；分组只影响本机展示。已禁用的成员仍保留在组里，重新启用后自动恢复。",
           style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
       }
       item { TextField(value = name, onValueChange = { name = it }, label = "分组名称", modifier = Modifier.fillMaxWidth()) }
@@ -89,7 +89,7 @@ internal fun DeviceGroupsSheet(
       if (opencodeMembers.isNotEmpty()) {
         item { SmallTitle("OpenCode", insideMargin = PaddingValues(horizontal = 4.dp, vertical = 4.dp)) }
         items(opencodeMembers, key = { "oc:${it.id}" }) { profile ->
-          MemberRow(profile.name, profile.endpointSummary, profile.id in selected, profile.kind) {
+          MemberRow(profile.name, profile.endpointSummary + if (profile.enabled) "" else " · 已禁用", profile.id in selected, profile.kind) {
             selected = if (profile.id in selected) selected - profile.id else selected + profile.id
           }
         }
@@ -97,7 +97,7 @@ internal fun DeviceGroupsSheet(
       if (dshMembers.isNotEmpty()) {
         item { SmallTitle("DeepSeek Harness", insideMargin = PaddingValues(horizontal = 4.dp, vertical = 4.dp)) }
         items(dshMembers, key = { "dsh:${it.id}" }) { profile ->
-          MemberRow(profile.name, profile.endpointSummary, profile.id in selected, profile.kind) {
+          MemberRow(profile.name, profile.endpointSummary + if (profile.enabled) "" else " · 已禁用", profile.id in selected, profile.kind) {
             selected = if (profile.id in selected) selected - profile.id else selected + profile.id
           }
         }

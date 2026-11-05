@@ -129,11 +129,15 @@ class MainActivity : ComponentActivity() {
       }
        fun openDraft() {
          focusManager.clearFocus()
+         if (state.enabledProfiles.isEmpty()) {
+           if (state.profiles.isEmpty()) showingAddDevice = true
+           else { globalMessage = "所有连接均已禁用，请先在设备管理中启用"; globalMessageType = MiuixToastType.INFO }
+           return
+         }
          if (home.allServers) { showingAllDraftTarget = true; return }
          if (home.homeGroup != null) { showingGroupDraftTarget = true; return }
          if (!state.connected) {
-           if (state.profiles.isEmpty()) { showingAddDevice = true }
-           else { globalMessage = "设备尚未连接，连接后才能新建会话"; globalMessageType = MiuixToastType.INFO }
+           globalMessage = "设备尚未连接，连接后才能新建会话"; globalMessageType = MiuixToastType.INFO
            return
          }
         if (state.projects.isEmpty()) { globalMessage = "先添加一个项目"; globalMessageType = MiuixToastType.INFO; showingProjects = true; return }
@@ -173,7 +177,13 @@ class MainActivity : ComponentActivity() {
         }
       }
       LaunchedEffect(state.serverId) {
-        if (navigator.server != state.serverId) { if (navigator.navigation.sessions.isEmpty()) snapshots.clear(); navigator.server = state.serverId }
+        if (navigator.server != state.serverId) {
+          // A disabled current connection can move the writable server (or clear it) while a chat is
+          // still on the stack. Never leave that chat pointing at a different server's session id.
+          if (navigator.navigation.sessions.isNotEmpty()) navigator.navigate(SessionNavigation())
+          if (navigator.navigation.sessions.isEmpty()) snapshots.clear()
+          navigator.server = state.serverId
+        }
       }
        LaunchedEffect(state.sessionId) {
         val id = state.sessionId
@@ -223,7 +233,9 @@ class MainActivity : ComponentActivity() {
        LaunchedEffect(deepLink) {
          val (server, session) = deepLink ?: return@LaunchedEffect
          handledDeepLink = "$server:$session"
-          if (state.profiles.none { it.id == server }) { globalMessage = "这个设备已移除"; globalMessageType = MiuixToastType.ERROR; deepLink = null }
+          val profile = state.profiles.firstOrNull { it.id == server }
+          if (profile == null) { globalMessage = "这个设备已移除"; globalMessageType = MiuixToastType.ERROR; deepLink = null }
+          else if (!profile.enabled) { globalMessage = "这个连接已禁用，请先在设备管理中启用"; globalMessageType = MiuixToastType.ERROR; deepLink = null }
           else {
             navigator.navigate(SessionNavigation()); openSession(SessionTarget(server, session)); deepLink = null
           }

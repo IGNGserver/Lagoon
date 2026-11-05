@@ -152,19 +152,27 @@ fun ServersModal(
                 // DSH 填了新令牌/密钥或换了认证方式：丢掉旧 Cookie，让这次测试真正验证新凭据。
                 cookie = "".takeIf { actualProfile.kind == ServerKind.DSH && (password != null || previous?.dshAuth != actualProfile.dshAuth) }
                )
-               if (actualProfile.kind == ServerKind.DSH_REMOTE) {
+               if (actualProfile.kind == ServerKind.DSH_REMOTE && previous?.enabled != false) {
                  val hostId = actualProfile.remoteHostId ?: error("请先选择 DSH Host")
                  val fingerprint = actualProfile.remoteHostFingerprint ?: error("请先确认 Host 指纹")
                  controller.confirmRemoteHost(actualProfile, actualProfile.username, hostId, fingerprint)
                }
-              var minted: String? = null
-              val version = controller.testServer(actualProfile, credentials) { minted = it }
-              controller.saveServer(actualProfile, credentials.password, minted ?: credentials.cookie, credentials.username)
               val label = when (actualProfile.kind) {
                 ServerKind.OPENCODE -> "OpenCode 直连"
                 ServerKind.DSH_REMOTE -> "DSH 远程中枢"
                 ServerKind.DSH -> if (actualProfile.sshHostId != null) "DSH SSH 直连" else "DeepSeek Harness"
               }
+              if (previous?.enabled == false) {
+                // A disabled connection must not be dialled just because the user edited it. Save the
+                // new settings without testing; enabling it later performs the first connection.
+                controller.saveServer(actualProfile, credentials.password, null, credentials.username, connect = false)
+                done("已保存 $label（连接已禁用，未连接）")
+                onDismiss()
+                return@launch
+              }
+              var minted: String? = null
+              val version = controller.testServer(actualProfile, credentials) { minted = it }
+              controller.saveServer(actualProfile, credentials.password, minted ?: credentials.cookie, credentials.username)
               val detail = if (version.isBlank() || version.equals(actualProfile.kind.label, ignoreCase = true) || version == "DeepSeek Harness") "" else " $version"
               done("已连接 $label$detail")
               onDismiss()
@@ -220,6 +228,7 @@ internal fun MiuixServerForm(
 ) {
   val scope = rememberCoroutineScope()
   val clipboard = LocalClipboardManager.current
+  val canConnect = existing?.enabled != false
   val id = remember(existing?.id) { existing?.id ?: UUID.randomUUID().toString() }
   var name by rememberSaveable(existing?.id) { mutableStateOf(existing?.name ?: "") }
   var url by remember(existing?.id) { mutableStateOf(existing?.url ?: "") }
@@ -311,6 +320,18 @@ internal fun MiuixServerForm(
           if (isDsh) "💡 直接粘贴 dsh web 打印的完整启动链接即可配对；配对后 Cookie 会保存在本机，dsh 重启也不用重新配对。想完全不看电脑，可改用「签名密钥」。"
           else "💡 推荐在电脑端运行 opencode pair 并将配对链接直接粘贴到下方，即可免密码一键配置认证。",
           style = MiuixTheme.textStyles.footnote1.copy(color = MiuixTheme.colorScheme.primary)
+        )
+      }
+    }
+
+    if (!canConnect) item {
+      Card(
+        colors = CardDefaults.defaultColors(color = MiuixColorTokens.WarningSubtle),
+        insideMargin = PaddingValues(12.dp)
+      ) {
+        Text(
+          "此连接已禁用：保存不会建立连接。要使用它，请先在设备管理中启用。",
+          style = MiuixTheme.textStyles.footnote2.copy(color = MiuixColorTokens.Warning)
         )
       }
     }
@@ -445,7 +466,7 @@ internal fun MiuixServerForm(
       item {
         Text(
           text = result,
-          color = if (result.startsWith("已连接")) MiuixColorTokens.Success else MiuixColorTokens.Error,
+          color = if (result.startsWith("已连接") || result.startsWith("已保存")) MiuixColorTokens.Success else MiuixColorTokens.Error,
           style = MiuixTheme.textStyles.body2
         )
       }
@@ -453,7 +474,7 @@ internal fun MiuixServerForm(
 
     item {
       DialogActions(
-        "取消", onCancel, if (working) "正在测试…" else "保存并连接",
+        "取消", onCancel, if (working) "正在测试…" else if (canConnect) "保存并连接" else "保存",
         enabled = !working && name.isNotBlank() &&
           (normalizedInput.startsWith("https://", true) || (normalizedInput.startsWith("http://", true) && allowHttp))
       ) {
@@ -604,7 +625,11 @@ fun SettingsScreen(
       Card(Modifier.fillMaxWidth()) {
         SuperArrow(
           title = "设备管理",
-          summary = "${state.profiles.size} 个连接 · ${state.deviceGroups.size} 个分组",
+          summary = buildString {
+            append("${state.enabledProfiles.size} 个启用连接")
+            if (state.disabledProfileCount > 0) append(" · ${state.disabledProfileCount} 个已禁用")
+            append(" · ${state.deviceGroups.size} 个分组")
+          },
           onClick = onManageDevices
         )
         SuperArrow(

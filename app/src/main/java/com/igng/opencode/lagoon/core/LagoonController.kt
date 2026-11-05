@@ -151,12 +151,15 @@ data class LagoonState(
   val transcriptLoadingSince: Long = 0
 ) {
   val server: ServerProfile? get() = profiles.firstOrNull { it.id == serverId }
+  /** Connections the user has not disabled. Presentation layers must use this, not [profiles]. */
+  val enabledProfiles: List<ServerProfile> by lazy(LazyThreadSafetyMode.PUBLICATION) { profiles.filter { it.enabled } }
+  val disabledProfileCount: Int get() = profiles.count { !it.enabled }
   val homeGroup: DeviceGroup? get() = homeGroupId?.let { id -> deviceGroups.firstOrNull { it.id == id } }
-  val homeGroupProfiles: List<ServerProfile> get() = homeGroup?.memberIds?.mapNotNull { id -> profiles.firstOrNull { it.id == id } }.orEmpty()
+  val homeGroupProfiles: List<ServerProfile> get() = homeGroup?.memberIds?.mapNotNull { id -> profiles.firstOrNull { it.id == id && it.enabled } }.orEmpty()
   /** The home is aggregating more than one server: all-servers mode or a device group. */
   val multiServerView: Boolean get() = allServers || homeGroup != null
   val deviceTabs: List<DeviceTab> by lazy(LazyThreadSafetyMode.PUBLICATION) {
-    DeviceGroupState(deviceGroups, homeGroupId).tabs(profiles)
+    DeviceGroupState(deviceGroups, homeGroupId).tabs(enabledProfiles)
   }
   /**
    * The open conversation can take a prompt now and deliver it once the server answers: the server is
@@ -201,7 +204,7 @@ data class LagoonState(
   val visiblePermissions: List<PermissionRequest> by lazy(LazyThreadSafetyMode.PUBLICATION) { permissions.filter { permissionPolicy.visible(it.id, autoApprovalFailures) } }
   val globalSummary: TaskSummary get() {
     val snapshots = serverSnapshots().values
-    if (snapshots.isEmpty()) return summary
+    if (snapshots.isEmpty()) return if (enabledProfiles.isEmpty()) TaskSummary.EMPTY else summary
     // 关闭通知的服务器不进入系统汇总（灵动岛 / 前台服务），但它的数据仍留在应用内首页。
     return TaskSummary.merge(snapshots.filter { it.profile.notifications }.map { it.displaySummary(permissionPolicy) })
   }
@@ -446,8 +449,15 @@ class LagoonController private constructor(private val appContext: Context) {
       val groupLoad = deviceGroupStore.load()
       val groups = groupLoad.state.sanitized(profiles.map { it.id }.toSet())
       val sshHosts = sshHostStore.load()
-      val selectedProfile = store.selectedId() ?: store.homeServerId() ?: profiles.firstOrNull()?.id
-      val selectedGroup = groups.selectedGroupId?.takeIf { id -> groups.groups.any { g -> g.id == id } }
+      val enabledIds = profiles.filter { it.enabled }.mapTo(HashSet()) { it.id }
+      val storedHome = store.homeServerId()?.takeIf { it in enabledIds }
+      val selectedProfile = store.selectedId()?.takeIf { it in enabledIds }
+        ?: storedHome
+        ?: profiles.firstOrNull { it.enabled }?.id
+      // A group whose members are all disabled must not keep the home pinned to an empty tab.
+      val selectedGroup = groups.selectedGroupId?.takeIf { id ->
+        groups.groups.any { group -> group.id == id && group.memberIds.any { it in enabledIds } }
+      }
       LagoonState(
         profiles = profiles,
         sshHosts = sshHosts,
@@ -457,7 +467,7 @@ class LagoonController private constructor(private val appContext: Context) {
         // 全部 is the default home; a selected group is the only other explicit home mode.
         allServers = selectedGroup == null,
         serverId = selectedProfile,
-        homeServerId = store.homeServerId() ?: selectedProfile,
+        homeServerId = storedHome ?: selectedProfile,
         message = if (groupLoad.resetLegacy) "设备分组已按新版规则重置，请重新创建" else null,
         permissionPolicy = store.permissionPolicy()
       )
@@ -504,6 +514,8 @@ class LagoonController private constructor(private val appContext: Context) {
   @Volatile private var monitoring = false
   private var backgroundStop: Job? = null
   private var connecting: Job? = null
+  /** The connection the user was actively viewing when it was disabled; restored on re-enable. */
+  private var lastDisabledActiveId: String? = null
   @Volatile private var lastFullRefreshAt = 0L
   /** 自动刷新频率；界面切换后立即生效（对账循环每次迭代都会读取）。 */
   @Volatile private var refreshMode: RefreshMode = RefreshMode.FAST
@@ -569,12 +581,12 @@ class LagoonController private constructor(private val appContext: Context) {
       if (signature != lastSummary) { lastSummary = signature; publishSummary(state); ensureMonitoring(state) }
     } }
     allOverview.start(mutable.value.profiles, include = setOfNotNull(mutable.value.serverId))
-    mutable.value.serverId?.takeIf { id -> mutable.value.profiles.any { it.id == id } }?.let { connect(it, preserveHome = true) }
+    mutable.value.serverId?.takeIf { id -> mutable.value.profiles.any { it.id == id && it.enabled } }?.let { connect(it, preserveHome = true) }
     observeNetwork()
     scheduleBackgroundSync()
   }
   private fun scheduleBackgroundSync() {
-    attempt { BackgroundSyncWorker.schedule(appContext, store.profiles().isNotEmpty()) }
+    attempt { BackgroundSyncWorker.schedule(appContext, store.profiles().any { it.enabled }) }
       .onFailure { Diagnostics.warn("BackgroundSync", "无法安排后台定时刷新", it) }
   }
 
@@ -587,8 +599,13 @@ class LagoonController private constructor(private val appContext: Context) {
   /** Rebuilds the home/notification projection after one overview connection changes. */
   private fun acceptAllSnapshot(snapshot: ServerOverviewSnapshot) {
     val profiles = store.profiles()
-    if (profiles.none { it.id == snapshot.serverId }) return
-    val currentProfile = profiles.first { it.id == snapshot.serverId }
+    val currentProfile = profiles.firstOrNull { it.id == snapshot.serverId }
+    if (currentProfile == null || !currentProfile.enabled) {
+      // A monitor can publish once more while it is being removed. A disabled profile must never
+      // reappear in the home/notification projection, even for that frame.
+      if (allSnapshots.remove(snapshot.serverId) != null) mutable.update { it.copy(allServerSnapshots = allSnapshots.toMap()) }
+      return
+    }
     val normalized = snapshot.copy(profile = currentProfile)
     val previous = allSnapshots.put(normalized.serverId, normalized)
     mutable.update { current ->
@@ -621,8 +638,10 @@ class LagoonController private constructor(private val appContext: Context) {
 
     // The overview reader does not infer notifications from historical rows. Only rows that appeared
     // after this server was already being watched are forwarded to the ordinary per-session channel.
+    // The very first snapshot is a baseline: old unread results (including ones retained across a
+    // disable/enable cycle) must not replay as a notification burst.
     val oldNoticeIds = previous?.notices?.map { it.id }?.toSet().orEmpty()
-    normalized.notices.filter { it.id !in oldNoticeIds && !it.viewed }.forEach { notice ->
+    if (previous != null) normalized.notices.filter { it.id !in oldNoticeIds && !it.viewed }.forEach { notice ->
       val session = normalized.sessions.firstOrNull { it.id == notice.sessionId } ?: return@forEach
       val task = TaskState(session.id, if (notice.error) TaskPhase.FAILED else TaskPhase.COMPLETED,
         if (notice.error) "执行失败" else "任务已完成", notice.time, finishedAt = notice.time)
@@ -1055,7 +1074,8 @@ class LagoonController private constructor(private val appContext: Context) {
   /** A group edit can move the writable profile out of the selected group. Pick a surviving member. */
   private fun ensureSelectedGroupActive() {
     val group = state.value.homeGroup ?: return
-    if (state.value.serverId !in group.memberIds) selectGroup(group.id)
+    val active = state.value.server?.takeIf { it.enabled }
+    if (active == null || active.id !in group.memberIds) selectGroup(group.id)
   }
 
   fun createDevice(name: String, memberIds: List<String>): String {
@@ -1125,8 +1145,11 @@ class LagoonController private constructor(private val appContext: Context) {
   /** Selects a device tab: a group keeps its last active profile, a singleton connects directly. */
   fun selectGroup(id: String, profileId: String? = null) {
     val group = state.value.deviceGroups.firstOrNull { it.id == id } ?: return
-    val members = group.memberIds.mapNotNull { member -> state.value.profiles.firstOrNull { it.id == member } }
-    if (members.isEmpty()) return
+    val members = group.memberIds.mapNotNull { member -> state.value.profiles.firstOrNull { it.id == member && it.enabled } }
+    if (members.isEmpty()) {
+      mutable.update { it.copy(message = "这个设备组没有启用的连接") }
+      return
+    }
     val current = state.value.serverId
     val active: ServerProfile = profileId?.let { requested -> members.firstOrNull { it.id == requested } }
       ?: current?.let { selected -> members.firstOrNull { it.id == selected } }
@@ -1154,12 +1177,130 @@ class LagoonController private constructor(private val appContext: Context) {
         notifications.cancel(profile.id, session)
       }
     }
+    if (!profile.enabled) cancelProfileNotifications(profile.id)
     val profiles = store.profiles()
     val groups = DeviceGroupState(state.value.deviceGroups, state.value.homeGroupId).sanitized(profiles.map { it.id }.toSet())
     mutable.update { it.copy(profiles = profiles, deviceGroups = groups.groups, homeGroupId = groups.selectedGroupId) }
     scheduleBackgroundSync()
-    allOverview.start(store.profiles(), include = setOfNotNull(if (connect) profile.id else state.value.serverId))
-    if (connect) connect(profile.id, preserveHome = true)
+    val connectNow = connect && profile.enabled
+    allOverview.start(profiles, include = setOfNotNull(if (connectNow) profile.id else state.value.serverId))
+    if (connectNow) connect(profile.id, preserveHome = true)
+  }
+
+  /**
+   * Enables or disables one saved connection. Disabling stops its monitor/client immediately (an SSH
+   * link is closed too), removes it from every home/notification projection, and switches away when
+   * it was the writable server. Re-enabling starts monitoring at once, even when `autoConnect` is
+   * off, so cached conversations return and a live read is scheduled. Credentials, drafts, caches
+   * and the unread ledger are never touched.
+   */
+  fun setProfileEnabled(profileId: String, enabled: Boolean) {
+    val profile = store.profiles().firstOrNull { it.id == profileId } ?: return
+    if (profile.enabled == enabled) return
+    if (!store.setProfileEnabled(profileId, enabled)) {
+      mutable.update { it.copy(message = "无法保存连接状态，请重试") }
+      return
+    }
+    val profiles = store.profiles()
+    val wasActive = state.value.serverId == profileId
+    val currentGroupId = state.value.homeGroupId
+    if (!enabled) {
+      cancelProfileNotifications(profileId)
+      profile.sshHostId?.let(sshHostManager::close)
+      allSnapshots.remove(profileId)
+      val enabledIds = profiles.filter { it.enabled }.mapTo(HashSet()) { it.id }
+      val groups = DeviceGroupState(state.value.deviceGroups, currentGroupId).sanitized(profiles.map { it.id }.toSet())
+      mutable.update {
+        it.copy(
+          profiles = profiles,
+          deviceGroups = groups.groups,
+          homeGroupId = groups.selectedGroupId,
+          homeServerId = it.homeServerId?.takeIf { id -> id != profileId },
+          allServerSnapshots = allSnapshots.toMap(),
+          message = "已禁用 ${profile.name}"
+        )
+      }
+      allOverview.start(profiles, include = setOfNotNull(state.value.serverId?.takeIf { it in enabledIds }))
+      if (wasActive) {
+        val fallback = if (currentGroupId != null) {
+          // Another enabled member keeps the group and its writable connection alive.
+          state.value.homeGroup?.memberIds
+            ?.mapNotNull { member -> profiles.firstOrNull { it.id == member && it.enabled } }
+            ?.firstOrNull()
+        } else if (!state.value.allServers) {
+          profiles.firstOrNull { it.enabled }
+        } else null
+        if (fallback != null) {
+          val group = currentGroupId?.takeIf { groupId ->
+            state.value.deviceGroups.firstOrNull { it.id == groupId }?.memberIds?.contains(fallback.id) == true
+          }
+          connect(fallback.id, preserveHome = true, groupOverride = group)
+        } else {
+          showAggregateAfterDisable(profiles, "已禁用 ${profile.name}")
+        }
+        // Remember this only after the fallback connect: connect() clears it when a different
+        // profile becomes active. Re-enabling the disabled connection can then restore the view.
+        lastDisabledActiveId = profileId
+      }
+      scheduleBackgroundSync()
+      return
+    }
+
+    val restore = lastDisabledActiveId == profileId
+    lastDisabledActiveId = null
+    val groups = DeviceGroupState(state.value.deviceGroups, state.value.homeGroupId)
+      .sanitized(profiles.map { it.id }.toSet())
+    mutable.update {
+      it.copy(
+        profiles = profiles,
+        deviceGroups = groups.groups,
+        homeGroupId = groups.selectedGroupId,
+        homeServerId = it.homeServerId ?: profileId,
+        message = "已启用 ${profile.name}，正在连接"
+      )
+    }
+    // `include` deliberately overrides autoConnect for this one read so the restored conversations
+    // appear immediately even when the profile was saved with 自动连接 off.
+    allOverview.start(profiles, include = setOfNotNull(state.value.serverId, profileId))
+    allOverview.refresh(profileId)
+    val current = state.value
+    if (restore || current.serverId == null ||
+      (!current.allServers && current.homeGroupId == null && current.homeServerId == profileId)) {
+      connect(profileId, preserveHome = true)
+    }
+    scheduleBackgroundSync()
+  }
+
+  private fun cancelProfileNotifications(id: String) {
+    notifications.cancelSummary(id)
+    (store.taskStates(id).keys + store.sessionNotices(id).map { it.sessionId }).distinct().forEach { session ->
+      notifications.cancel(id, session)
+    }
+  }
+
+  /**
+   * Leaves single-server mode after its last enabled connection was disabled. Other enabled
+   * profiles keep their overview monitors; the home becomes the aggregate projection with no
+   * writable server until the user picks one.
+   */
+  private fun showAggregateAfterDisable(profiles: List<ServerProfile>, message: String) {
+    stopSingleConnection()
+    store.rememberAllServers(true)
+    val snapshots = allSnapshots.filterKeys { id -> profiles.any { it.id == id && it.enabled } }
+    mutable.update { latest ->
+      LagoonState(
+        profiles = profiles,
+        sshHosts = latest.sshHosts,
+        deviceGroups = latest.deviceGroups,
+        deviceGroupReset = latest.deviceGroupReset,
+        homeGroupId = null,
+        allServers = true,
+        permissionPolicy = latest.permissionPolicy,
+        pendingAttachments = latest.pendingAttachments,
+        allServerSnapshots = snapshots,
+        message = message
+      ).homeProjection()
+    }
   }
 
 
@@ -1247,6 +1388,7 @@ class LagoonController private constructor(private val appContext: Context) {
     }
     val profiles = store.profiles()
     val groups = DeviceGroupState(state.value.deviceGroups, state.value.homeGroupId).sanitized(profiles.map { it.id }.toSet())
+    if (!profile.enabled) cancelProfileNotifications(profile.id)
     mutable.update {
       it.copy(
         profiles = profiles,
@@ -1258,9 +1400,9 @@ class LagoonController private constructor(private val appContext: Context) {
     sshHostManager.close(clean.id)
     allOverview.invalidate(profile.id)
     scheduleBackgroundSync()
-    allOverview.start(store.profiles(), include = setOf(profile.id))
+    allOverview.start(profiles, include = setOfNotNull(if (profile.enabled) profile.id else state.value.serverId))
     if (groupId != null) moveProfile(profile.id, groupId)
-    if (connect) connect(profile.id, preserveHome = true)
+    if (connect && profile.enabled) connect(profile.id, preserveHome = true)
     return profile
   }
 
@@ -1306,11 +1448,7 @@ class LagoonController private constructor(private val appContext: Context) {
 
   fun deleteServer(id: String) {
     val removed = store.profiles().firstOrNull { it.id == id }
-    notifications.cancelSummary(id)
-    // The global summary id is shared now; cancel the per-session results/attention of this server.
-    (store.taskStates(id).keys + store.sessionNotices(id).map { it.sessionId }).distinct().forEach { session ->
-      notifications.cancel(id, session)
-    }
+    cancelProfileNotifications(id)
     if (mutable.value.serverId == id) {
       stopSingleConnection()
     }
@@ -1343,14 +1481,10 @@ class LagoonController private constructor(private val appContext: Context) {
     if (mutable.value.serverId == id) {
       val group = state.value.homeGroup
       if (group != null) selectGroup(group.id)
-      else {
-        val next = store.profiles().firstOrNull()?.id
+      if (mutable.value.serverId == id) {
+        val next = store.profiles().firstOrNull { it.enabled }?.id
         if (next != null) connect(next, preserveHome = true)
-        else mutable.update { LagoonState(
-          profiles = emptyList(), sshHosts = sshHostStore.load(), allServers = true,
-          deviceGroups = it.deviceGroups, deviceGroupReset = it.deviceGroupReset,
-          homeGroupId = null, permissionPolicy = it.permissionPolicy
-        ) }
+        else showAggregateAfterDisable(store.profiles(), "已删除连接")
       }
     }
   }
@@ -1366,19 +1500,33 @@ class LagoonController private constructor(private val appContext: Context) {
   }
   fun connect(id: String, projectOverride: String? = null, sessionOverride: String? = null, preserveHome: Boolean = false,
     groupOverride: String? = null) {
-    val profile = store.profiles().firstOrNull { it.id == id } ?: return
+    val profiles = store.profiles()
+    val profile = profiles.firstOrNull { it.id == id && it.enabled }
+    if (profile == null) {
+      mutable.update { it.copy(message = if (profiles.any { p -> p.id == id }) "这个连接已禁用，请先在设备管理中启用" else "这个连接已移除") }
+      return
+    }
+    if (id != lastDisabledActiveId) lastDisabledActiveId = null
     val previous = state.value
     val previousServer = previous.serverId
     // Hand the old server's control state back to its persistent observer, not to a disconnected cache.
     allSnapshots.putAll(previous.serverSnapshots())
     previousServer?.let { previous.serverSnapshots()[it]?.let(allOverview::handoff) }
     if (!preserveHome) { store.rememberAllServers(false); store.rememberHomeServer(id) }
+    // Only keep a device group when the newly active profile is still one of its enabled members.
+    val group = (groupOverride ?: if (preserveHome) previous.homeGroupId else null)?.let { groupId ->
+      previous.deviceGroups.firstOrNull { it.id == groupId && id in it.memberIds }
+    }
+    // A disabled previous home must not survive as the single-server projection.
+    val homeServerId = previous.homeServerId?.takeIf { homeId ->
+      preserveHome && (homeId == id || profiles.any { it.id == homeId && it.enabled })
+    } ?: id
     // A reconnect to the same server keeps the open conversation's pending prompt; anything else goes back to its draft.
     returnQueuedToDrafts { it.serverId == id && it.sessionId == (sessionOverride ?: previous.sessionId) && id == previousServer }
     stopSingleConnection()
     val token = generation
     connectTrace.begin(token.toLong(), "连接 ${profile.kind.label}")
-    allOverview.start(store.profiles(), include = setOfNotNull(id))
+    allOverview.start(profiles, include = setOfNotNull(id))
     api = allOverview.client(id)
     if (transcripts != null && profile.kind == ServerKind.OPENCODE) scope.launch(storeDispatcher) {
       attempt { transcripts.bindServer(id, transcriptIdentity(profile)) }.onFailure { Diagnostics.warn("TranscriptStore", "绑定服务器失败", it) }
@@ -1393,12 +1541,12 @@ class LagoonController private constructor(private val appContext: Context) {
     store.select(id, rememberedProject, rememberedSession)
     // Drop the pre-ledger “永久已完成” states and read markers; keep runs this device saw as still running.
     store.migrateTaskLedger(id)
-    mutable.update { LagoonState(profiles = store.profiles(), sshHosts = previous.sshHosts,
+    mutable.update { LagoonState(profiles = profiles, sshHosts = previous.sshHosts,
       deviceGroups = previous.deviceGroups, deviceGroupReset = previous.deviceGroupReset,
-      homeGroupId = groupOverride ?: if (preserveHome) previous.homeGroupId else null,
+      homeGroupId = group?.id,
       serverId = id, loading = true, projectId = rememberedProject, sessionId = rememberedSession,
-      allServers = if (groupOverride != null) false else preserveHome && previous.allServers,
-      homeServerId = if (preserveHome) previous.homeServerId else id,
+      allServers = if (group != null) false else preserveHome && previous.allServers,
+      homeServerId = homeServerId,
       allServerSnapshots = allSnapshots.toMap(), permissionPolicy = store.permissionPolicy(),
       sessions = snapshot?.sessions.orEmpty(), projects = snapshot?.projects ?: store.localProjects(id).map { it.copy(serverId = id) },
       permissions = snapshot?.permissions.orEmpty(), questions = snapshot?.questions.orEmpty(),
@@ -1436,6 +1584,13 @@ class LagoonController private constructor(private val appContext: Context) {
   }
   /** Opens immediately; loading the transcript does not change the originating home filter. */
   fun openConversation(target: SessionTarget) {
+    if (store.profiles().none { it.id == target.serverId && it.enabled }) {
+      mutable.update {
+        it.copy(message = if (store.profiles().any { profile -> profile.id == target.serverId }) "这个连接已禁用，请先在设备管理中启用"
+          else "这个连接已移除")
+      }
+      return
+    }
     if (target.serverId != state.value.serverId) {
       connect(target.serverId, sessionOverride = target.sessionId, preserveHome = true)
     } else if (state.value.sessions.any { it.id == target.sessionId }) selectSession(target.sessionId)
@@ -1447,6 +1602,7 @@ class LagoonController private constructor(private val appContext: Context) {
   }
   private fun scheduleReconnect(id: String, token: Int, attempt: Int = 0) {
     if (token != generation || state.value.serverId != id) return
+    if (store.profiles().none { it.id == id && it.enabled }) return
     val delayMillis = (2_000L shl attempt.coerceAtMost(4)).coerceAtMost(60_000L)
     val now = System.currentTimeMillis()
     mutable.update { it.copy(connection = ConnectionStatus(ConnectStage.RETRYING, now, now + delayMillis, retryReason(it.error))) }
@@ -1456,7 +1612,7 @@ class LagoonController private constructor(private val appContext: Context) {
     }
   }
   private suspend fun reconnect(id: String, token: Int, attempt: Int) {
-    val profile = store.profiles().firstOrNull { it.id == id } ?: return
+    val profile = store.profiles().firstOrNull { it.id == id && it.enabled } ?: return
     connectTrace.begin(token.toLong(), "重连 ${profile.kind.label} 第 ${attempt + 1} 次")
     setStage(token, ConnectStage.CONNECTING)
     api = allOverview.client(id)
@@ -1956,7 +2112,7 @@ class LagoonController private constructor(private val appContext: Context) {
    */
   private fun ensureMonitoring(state: LagoonState) {
       val active = LiveUpdateContent.stageOf(state.globalSummary) == LiveUpdateStage.ACTIVE || state.globalBackgroundCount > 0
-      if (foreground && active && state.profiles.any { it.notifications } && TaskNotifications.ALL_SERVERS_ID !in monitorRequested) {
+      if (foreground && active && state.enabledProfiles.any { it.notifications } && TaskNotifications.ALL_SERVERS_ID !in monitorRequested) {
         monitorRequested += TaskNotifications.ALL_SERVERS_ID
         attempt { TaskMonitorService.startAll(appContext) }
           .onFailure {

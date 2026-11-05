@@ -23,7 +23,13 @@ data class ServerProfile(
    * Set when this DSH profile is reached through a saved SSH host. The connection is built by the
    * app's SSH layer; [url] only carries a stable `ssh://user@host:port` display identity.
    */
-  val sshHostId: String? = null
+  val sshHostId: String? = null,
+  /**
+   * Local opt-out for this saved connection. A disabled profile is never dialled, monitored or
+   * projected into the home/notification surfaces, even when it is selected or explicitly included.
+   * Credentials, drafts, caches and the unread ledger stay on disk so re-enabling can resume.
+   */
+  val enabled: Boolean = true
 )
 
 data class Project(val id: String, val directory: String, val name: String, val sandboxes: List<String> = emptyList(),

@@ -157,9 +157,16 @@ internal fun AddDeviceSheet(
                     val actual = if (resolved == null) profile
                     else profile.copy(url = resolved.serverUrl, username = resolved.credentials.username)
                     val savedUrl = state.profiles.firstOrNull { it.id == profile.id }?.url
+                    val previous = state.profiles.firstOrNull { it.id == profile.id }
                     val credentials = resolved?.credentials ?: profileCredentials(
                       savedUrl, actual.url, controller.credentials(profile.id), actual.username, password
                     )
+                    if (previous?.enabled == false) {
+                      controller.saveServer(actual, credentials.password, null, credentials.username, connect = false)
+                      done("已保存 OpenCode 直连（连接已禁用，未连接）")
+                      onDismiss()
+                      return@launch
+                    }
                     var minted: String? = null
                     val version = controller.testServer(actual, credentials) { minted = it }
                     controller.saveServer(actual, credentials.password, minted ?: credentials.cookie, credentials.username)

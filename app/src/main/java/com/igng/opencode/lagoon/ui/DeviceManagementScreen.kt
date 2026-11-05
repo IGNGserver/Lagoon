@@ -32,6 +32,7 @@ import top.yukonga.miuix.kmp.basic.Card
 import top.yukonga.miuix.kmp.basic.CardDefaults
 import top.yukonga.miuix.kmp.basic.Icon
 import top.yukonga.miuix.kmp.basic.SmallTitle
+import top.yukonga.miuix.kmp.basic.Switch
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.basic.TextButton
 import top.yukonga.miuix.kmp.extra.SuperArrow
@@ -58,8 +59,9 @@ internal fun DeviceManagementScreen(
 ) {
   val catalog = controller.activeRemoteCatalog()
   val groupOf = state.deviceGroups.flatMap { group -> group.memberIds.map { it to group.name } }.toMap()
+  val disabled = state.disabledProfileCount
   val online = state.profiles.count { profile ->
-    if (profile.id == state.serverId) state.connected else state.allServerSnapshots[profile.id]?.connected == true
+    profile.enabled && (if (profile.id == state.serverId) state.connected else state.allServerSnapshots[profile.id]?.connected == true)
   }
 
   Column(Modifier.fillMaxSize().background(MiuixTheme.colorScheme.surface)) {
@@ -101,7 +103,7 @@ internal fun DeviceManagementScreen(
             Column(Modifier.weight(1f)) {
               Text("全部设备", style = MiuixTheme.textStyles.body1.copy(fontWeight = FontWeight.Medium))
               Text(
-                "${state.profiles.size} 个连接 · $online 在线",
+                "${state.profiles.size} 个连接${if (disabled > 0) " · $disabled 已禁用" else ""} · $online 在线",
                 style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
               )
             }
@@ -181,7 +183,7 @@ internal fun DeviceManagementScreen(
         item {
           SmallTitle("全部连接")
           Text(
-            "分组只改变首页聚合；这里始终可以查看和编辑每一个已保存的连接。",
+            "分组只改变首页聚合；这里始终可以查看和编辑每一个已保存的连接。禁用后不再连接，也不会出现在会话、归档和通知中；凭据、草稿和缓存保留。",
             Modifier.padding(horizontal = 16.dp),
             style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
           )
@@ -198,7 +200,8 @@ internal fun DeviceManagementScreen(
             )
           }
           items(opencodeProfiles, key = { "profile:${it.id}" }) { profile ->
-            ProfileRow(profile, state, groupOf[profile.id]) { onEditProfile(profile) }
+            ProfileRow(profile, state, groupOf[profile.id], onClick = { onEditProfile(profile) },
+              onToggleEnabled = { enabled -> controller.setProfileEnabled(profile.id, enabled) })
           }
         }
 
@@ -211,9 +214,9 @@ internal fun DeviceManagementScreen(
             )
           }
           items(dshProfiles, key = { "profile:${it.id}" }) { profile ->
-            ProfileRow(profile, state, groupOf[profile.id]) {
+            ProfileRow(profile, state, groupOf[profile.id], onClick = {
               if (profile.sshHostId != null) onEditSshHost(profile.sshHostId) else onEditProfile(profile)
-            }
+            }, onToggleEnabled = { enabled -> controller.setProfileEnabled(profile.id, enabled) })
           }
         }
       }
@@ -234,7 +237,9 @@ internal fun DeviceManagementScreen(
 @Composable
 private fun GroupRow(group: DeviceGroup, state: LagoonState, onClick: () -> Unit) {
   val members = group.memberIds.mapNotNull { id -> state.profiles.firstOrNull { it.id == id } }
-  val online = members.count { profile ->
+  val enabledMembers = members.filter { it.enabled }
+  val disabled = members.size - enabledMembers.size
+  val online = enabledMembers.count { profile ->
     if (profile.id == state.serverId) state.connected else state.allServerSnapshots[profile.id]?.connected == true
   }
   Column(Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 14.dp, vertical = 12.dp)) {
@@ -247,7 +252,7 @@ private fun GroupRow(group: DeviceGroup, state: LagoonState, onClick: () -> Unit
           overflow = TextOverflow.Ellipsis
         )
         Text(
-          "${members.size} 个连接 · $online 在线",
+          "${members.size} 个连接${if (disabled > 0) " · $disabled 已禁用" else ""} · $online 在线",
           style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
         )
       }
@@ -257,7 +262,7 @@ private fun GroupRow(group: DeviceGroup, state: LagoonState, onClick: () -> Unit
     }
     if (members.isNotEmpty()) {
       Text(
-        members.joinToString("、") { it.name },
+        members.joinToString("、") { if (it.enabled) it.name else "${it.name}（已禁用）" },
         Modifier.padding(top = 4.dp),
         style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary),
         maxLines = 1,
@@ -268,44 +273,64 @@ private fun GroupRow(group: DeviceGroup, state: LagoonState, onClick: () -> Unit
 }
 
 @Composable
-private fun ProfileRow(profile: ServerProfile, state: LagoonState, groupName: String?, onClick: () -> Unit) {
-  val connected = if (profile.id == state.serverId) state.connected else state.allServerSnapshots[profile.id]?.connected == true
+private fun ProfileRow(
+  profile: ServerProfile,
+  state: LagoonState,
+  groupName: String?,
+  onClick: () -> Unit,
+  onToggleEnabled: (Boolean) -> Unit
+) {
+  val connected = profile.enabled &&
+    (if (profile.id == state.serverId) state.connected else state.allServerSnapshots[profile.id]?.connected == true)
   val endpoint = profile.endpointSummary
-  val subtitle = if (groupName == null) endpoint else "$endpoint · 分组：$groupName"
-  Card(Modifier.fillMaxWidth().padding(bottom = 2.dp), insideMargin = PaddingValues(horizontal = 14.dp, vertical = 10.dp)) {
-    Row(
-      Modifier.fillMaxWidth().clickable(onClick = onClick).clip(RoundedCornerShape(12.dp)),
-      verticalAlignment = Alignment.CenterVertically
-    ) {
-      Icon(
-        if (profile.sshHostId != null) MiuixIcons.Link else MiuixIcons.GridView,
-        null,
-        Modifier.size(22.dp),
-        tint = MiuixTheme.colorScheme.onSurfaceVariantSummary
-      )
-      Spacer(Modifier.width(12.dp))
-      Column(Modifier.weight(1f)) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-          Text(profile.name, style = MiuixTheme.textStyles.body1, maxLines = 1, overflow = TextOverflow.Ellipsis)
-          if (profile.kind == ServerKind.DSH && profile.sshHostId == null) {
-            Spacer(Modifier.width(6.dp))
-            Text("旧版", style = MiuixTheme.textStyles.footnote2.copy(color = MiuixColorTokens.Warning))
-          }
-        }
-        Text(
-          subtitle,
-          style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary),
-          maxLines = 1,
-          overflow = TextOverflow.Ellipsis
+  val subtitle = buildString {
+    append(endpoint)
+    if (groupName != null) append(" · 分组：").append(groupName)
+    if (!profile.enabled) append(" · 已禁用")
+  }
+  val muted = MiuixTheme.colorScheme.onSurfaceVariantSummary
+  Card(Modifier.fillMaxWidth().padding(bottom = 2.dp), insideMargin = PaddingValues(start = 14.dp, end = 6.dp, top = 10.dp, bottom = 10.dp)) {
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+      Row(
+        Modifier.weight(1f).clickable(onClick = onClick).clip(RoundedCornerShape(12.dp)).padding(vertical = 2.dp),
+        verticalAlignment = Alignment.CenterVertically
+      ) {
+        Icon(
+          if (profile.sshHostId != null) MiuixIcons.Link else MiuixIcons.GridView,
+          null,
+          Modifier.size(22.dp),
+          tint = if (profile.enabled) muted else muted.copy(alpha = 0.55f)
         )
+        Spacer(Modifier.width(12.dp))
+        Column(Modifier.weight(1f)) {
+          Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+              profile.name,
+              style = MiuixTheme.textStyles.body1.copy(color = if (profile.enabled) MiuixTheme.colorScheme.onSurface else muted),
+              maxLines = 1,
+              overflow = TextOverflow.Ellipsis
+            )
+            if (profile.kind == ServerKind.DSH && profile.sshHostId == null) {
+              Spacer(Modifier.width(6.dp))
+              Text("旧版", style = MiuixTheme.textStyles.footnote2.copy(color = MiuixColorTokens.Warning))
+            }
+          }
+          Text(
+            subtitle,
+            style = MiuixTheme.textStyles.footnote2.copy(color = muted),
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+          )
+        }
+        if (connected) {
+          StatusDot(MiuixColorTokens.Success)
+          Spacer(Modifier.width(6.dp))
+          Text("在线", style = MiuixTheme.textStyles.footnote2.copy(color = MiuixColorTokens.Success))
+        }
+        Spacer(Modifier.width(8.dp))
+        DropdownChevron(18.dp, muted)
       }
-      if (connected) {
-        StatusDot(MiuixColorTokens.Success)
-        Spacer(Modifier.width(6.dp))
-        Text("在线", style = MiuixTheme.textStyles.footnote2.copy(color = MiuixColorTokens.Success))
-      }
-      Spacer(Modifier.width(8.dp))
-      DropdownChevron(18.dp, MiuixTheme.colorScheme.onSurfaceVariantSummary)
+      Switch(checked = profile.enabled, onCheckedChange = onToggleEnabled)
     }
   }
 }

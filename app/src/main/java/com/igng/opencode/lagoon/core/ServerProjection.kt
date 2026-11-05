@@ -13,10 +13,13 @@ internal val LagoonState.livePresentedTasks: Map<String, TaskState>
 
 /** The local conversation overrides its own snapshot, never another server's state. */
 internal fun LagoonState.serverSnapshots(): Map<String, ServerOverviewSnapshot> {
-  val id = serverId ?: return allServerSnapshots
-  val profile = server ?: return allServerSnapshots
-  if (!connected && sessions.isEmpty() && tasks.isEmpty()) return allServerSnapshots
-  return allServerSnapshots + (id to ServerOverviewSnapshot(id, profile, version = version, connected = connected,
+  val enabledIds = enabledProfiles.mapTo(HashSet()) { it.id }
+  val visible = if (enabledIds.size == profiles.size) allServerSnapshots
+    else allServerSnapshots.filterKeys { it in enabledIds }
+  val id = serverId?.takeIf { it in enabledIds } ?: return visible
+  val profile = profiles.firstOrNull { it.id == id } ?: return visible
+  if (!connected && sessions.isEmpty() && tasks.isEmpty()) return visible
+  return visible + (id to ServerOverviewSnapshot(id, profile, version = version, connected = connected,
     canSyncRead = capabilities.sessionView != null,
     cached = cached, loading = loading, lastReadAt = lastContactAt, error = error, degraded = degraded,
     streamConnected = streamConnected, projects = projects, sessions = sessions, parents = parents, tasks = tasks,
@@ -29,10 +32,13 @@ internal fun LagoonState.homeReadSnapshots(): Map<String, ServerOverviewSnapshot
   val snapshots = serverSnapshots()
   if (allServers) return snapshots
   homeGroup?.let { group ->
-    val scoped = allServerSnapshots.filterKeys { it in group.memberIds }
-    return if (scoped.isNotEmpty()) scoped else snapshots.filterKeys { it in group.memberIds }
+    return snapshots.filterKeys { it in group.memberIds }
   }
-  val id = homeServerId ?: serverId ?: return emptyMap()
+  val preferred = homeServerId ?: serverId
+  val id = preferred?.takeIf { snapshots.containsKey(it) }
+    ?: serverId?.takeIf { snapshots.containsKey(it) }
+    ?: snapshots.keys.firstOrNull()
+    ?: return emptyMap()
   return snapshots[id]?.let { mapOf(id to it) } ?: emptyMap()
 }
 
@@ -56,24 +62,39 @@ internal fun LagoonState.allServerStatuses(now: Long = System.currentTimeMillis(
 /** A home filter is a projection, not a connection switch. */
 fun LagoonState.homeProjection(): LagoonState {
   val snapshots = serverSnapshots()
+  val enabledIds = enabledProfiles.mapTo(HashSet()) { it.id }
   if (!allServers) {
-    homeGroup?.let { group -> return groupHomeProjection(snapshots, group) }
-    val id = homeServerId ?: serverId
-    if (id == serverId) return copy(allServers = false, allServerSnapshots = snapshots)
-    val snapshot = snapshots[id] ?: return copy(serverId = id, sessions = emptyList(), projects = emptyList(), tasks = emptyMap(),
-      permissions = emptyList(), questions = emptyList(), notices = emptyList(), connected = false, loading = true, allServers = false,
-      allServerSnapshots = snapshots)
-    return copy(serverId = id, version = snapshot.version, connected = snapshot.connected, streamConnected = snapshot.streamConnected,
-      cached = snapshot.cached, loading = snapshot.loading, degraded = snapshot.degraded, sessions = snapshot.sessions,
-      projects = snapshot.projects, tasks = snapshot.tasks, permissions = snapshot.permissions, questions = snapshot.questions,
-      notices = snapshot.notices, knownParents = snapshot.parents, backgroundRunning = snapshot.backgroundRunning,
-      summary = snapshot.displaySummary(permissionPolicy), lastContactAt = snapshot.lastReadAt,
-      autoApprovalFailures = snapshot.autoApprovalFailures, sessionId = null, projectId = null, scopeProjectId = null,
-      serverReadPending = serverReadPending,
-      allServerSnapshots = snapshots)
+    val group = homeGroup
+    if (group != null && group.memberIds.any { it in enabledIds }) return groupHomeProjection(snapshots, group)
+    if (group == null) {
+      val id = (homeServerId ?: serverId)?.takeIf { it in enabledIds }
+        ?: serverId?.takeIf { it in enabledIds }
+        ?: enabledProfiles.firstOrNull()?.id
+        ?: return copy(allServers = true, homeGroupId = null, homeServerId = null, serverId = null,
+          sessionId = null, projectId = null, scopeProjectId = null, scopeWorkspaceKey = null,
+          sessions = emptyList(), projects = emptyList(), messages = emptyList(), tasks = emptyMap(), permissions = emptyList(),
+          questions = emptyList(), notices = emptyList(), knownParents = emptyMap(), backgroundRunning = emptySet(),
+          connected = false, loading = false, cached = false, summary = TaskSummary.EMPTY,
+          allServerSnapshots = snapshots, allSessionStatuses = emptyMap(), allUnseenSessions = emptySet())
+      if (id == serverId) return copy(allServers = false, homeServerId = id, allServerSnapshots = snapshots)
+      val snapshot = snapshots[id] ?: return copy(serverId = id, homeServerId = id, sessions = emptyList(), projects = emptyList(), tasks = emptyMap(),
+        permissions = emptyList(), questions = emptyList(), notices = emptyList(), connected = false, loading = true, allServers = false,
+        allServerSnapshots = snapshots)
+      return copy(serverId = id, homeServerId = id, version = snapshot.version, connected = snapshot.connected, streamConnected = snapshot.streamConnected,
+        cached = snapshot.cached, loading = snapshot.loading, degraded = snapshot.degraded, sessions = snapshot.sessions,
+        projects = snapshot.projects, tasks = snapshot.tasks, permissions = snapshot.permissions, questions = snapshot.questions,
+        notices = snapshot.notices, knownParents = snapshot.parents, backgroundRunning = snapshot.backgroundRunning,
+        summary = snapshot.displaySummary(permissionPolicy), lastContactAt = snapshot.lastReadAt,
+        autoApprovalFailures = snapshot.autoApprovalFailures, sessionId = null, projectId = null, scopeProjectId = null,
+        serverReadPending = serverReadPending,
+        allServerSnapshots = snapshots)
+    }
+    // The selected group has no enabled member left: fall through to the aggregate projection.
   }
   val statuses = allServerStatuses()
-  return copy(serverId = null, sessionId = null, projectId = null, scopeProjectId = null,
+  return copy(serverId = null, homeGroupId = null, allServers = true,
+    homeServerId = homeServerId?.takeIf { it in enabledIds },
+    sessionId = null, projectId = null, scopeProjectId = null,
     sessions = snapshots.values.flatMap { it.sessions }.distinctBy { it.key }.sortedWith(sessionActivityOrder),
     projects = snapshots.values.flatMap { it.projects }.distinctBy { it.key }, tasks = emptyMap(), permissions = emptyList(),
     questions = emptyList(), notices = emptyList(), knownParents = emptyMap(), backgroundRunning = emptySet(),
@@ -85,7 +106,8 @@ fun LagoonState.homeProjection(): LagoonState {
     // “离线”与“数据待同步”是两回事：某台服务器没连上时由 chip 的状态点表达，不再把整页钉在
     // “部分数据待同步”上；只有已连接服务器上影响可见状态的读取失败才计 degraded。
     degraded = snapshots.values.any { it.degraded },
-    summary = globalSummary, allServerSnapshots = snapshots, allSessionStatuses = statuses,
+    summary = if (snapshots.isEmpty()) TaskSummary.EMPTY else globalSummary,
+    allServerSnapshots = snapshots, allSessionStatuses = statuses,
     allUnseenSessions = snapshots.values.flatMap { snapshot -> snapshot.notices.filterNot { it.viewed }.map { scopedKey(snapshot.serverId, it.sessionId) } }.toSet())
 }
 
@@ -103,14 +125,15 @@ private fun LagoonState.groupHomeProjection(
     snapshot.sessionStatuses(permissionPolicy).map { (id, status) -> scopedKey(snapshot.serverId, id) to status }
   }.toMap()
   val active = serverId?.takeIf { id -> id in members && scoped[id]?.connected == true }
-    ?: members.firstOrNull { id -> scoped[id]?.connected == true }
-    ?: serverId?.takeIf { it in members }
-    ?: members.firstOrNull()
+    ?: scoped.keys.firstOrNull { id -> scoped[id]?.connected == true }
+    ?: serverId?.takeIf { it in members && profiles.any { profile -> profile.id == it && profile.enabled } }
+    ?: scoped.keys.firstOrNull()
   val summary = TaskSummary.merge(scoped.values.filter { it.profile.notifications }.map { it.displaySummary(permissionPolicy) })
   val unseen = scoped.values.flatMap { snapshot ->
     snapshot.notices.filterNot { it.viewed }.map { scopedKey(snapshot.serverId, it.sessionId) }
   }.toSet()
-  return copy(serverId = active, homeServerId = active ?: homeServerId, homeGroupId = group.id, allServers = false,
+  return copy(serverId = active, homeServerId = active ?: homeServerId?.takeIf { id -> profiles.any { it.id == id && it.enabled } },
+    homeGroupId = group.id, allServers = false,
     sessionId = null, projectId = null, scopeProjectId = null,
     sessions = scoped.values.flatMap { it.sessions }.distinctBy { it.key }.sortedWith(sessionActivityOrder),
     projects = scoped.values.flatMap { it.projects }.distinctBy { it.key },

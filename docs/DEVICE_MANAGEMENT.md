@@ -65,7 +65,25 @@ DSH 分页不再提供“直连 DSH”的地址/令牌输入。已有旧版直�
 - 新建/编辑分组时可勾选「同时连接全部成员」，默认开启；关闭后仅有当前活动连接保持监控。
 - 分组只影响本机展示，不上传服务端，不改变认证、路由或会话身份。
 
-## 4. 升级迁移
+## 4. 禁用连接
+
+设备管理的每个连接行都有一个启用开关；「设备」和「Harness」两种角色都支持禁用。
+禁用是本机偏好，不删除资料、不上传服务端，也不改变远端任务。
+
+- 持久化：`ServerProfile.enabled` 默认 `true`；旧版资料没有该字段时按启用处理。
+- 禁用后该 profile 不再被 `AllServersOverview` 拨号，即使它被当前选中、被设备组
+  「同时连接全部成员」覆盖或被旧通知/深链引用。当前连接会被关闭，SSH 主机链接也会关闭。
+- 首页、设备组、归档、搜索、全局任务行、灵动态/系统通知和「服务端已读」候选都通过
+  `ServerProjection` 过滤禁用 profile，因此不会再显示它的对话和计数。
+- 禁用时撤下该服务器的结果/待处理通知；本机未读账本、草稿、会话缓存和凭据保留。
+  重新启用后未读会回到应用内列表，但第一次快照只作为基线，不会重放旧系统通知。
+- 如果禁用的是当前设备：优先切到当前设备组的其它启用成员；单设备模式切到其它启用连接；
+  没有可用连接时回到「全部」空首页。关闭的设备组保留成员关系，重新启用后自动回到组内。
+- 重新启用会立即建立一次监控并刷新（即使该 profile 的「自动连接」是关闭的），首页先显示
+  缓存、再更新实时数据；当前没有可写连接时会自动接回该 profile。
+- 全部连接禁用后不再安排 WorkManager 后台同步；设备管理仍保留所有行，便于重新启用。
+
+## 5. 升级迁移
 
 `DeviceGroupStore` 从 v1 升到 v2：
 
@@ -77,23 +95,30 @@ DSH 分页不再提供“直连 DSH”的地址/令牌输入。已有旧版直�
 首页默认进入「全部」。`homeGroupId == null` 即全部；选中显式分组时 `allServers = false`。
 旧版的 `allServers` 偏好不再决定首页形态，只作为兼容字段保留。
 
-## 5. 代码落点
+## 6. 代码落点
 
 | 层 | 文件 |
 |---|---|
+| 连接资料/启用字段 | `shared/.../Models.kt`、`app/.../core/ServerStore.kt` |
+| 自动连接/监控 | `shared/.../AllServersOverview.kt` |
 | 分组模型/编解码 | `shared/.../DeviceGroup.kt` |
 | 分组存储/迁移 | `app/.../core/DeviceGroupStore.kt` |
+| 首页投影/过滤 | `app/.../core/ServerProjection.kt` |
 | 首页胶囊 | `app/.../ui/SessionsHomeScreen.kt` |
 | 设备管理页 | `app/.../ui/DeviceManagementScreen.kt` |
 | 分组编辑 | `app/.../ui/DeviceGroupsSheet.kt` |
 | 添加设备页 | `app/.../ui/AddDeviceSheet.kt` |
 | 控制器 | `app/.../core/LagoonController.kt` |
+| 通知/深链入口 | `app/.../system/NotificationActionReceiver.kt`、`app/.../ui/MainActivity.kt` |
 | 页面路由 | `app/.../ui/AppBackStack.kt`、`MainActivity.kt` |
 
-## 6. 验证
+## 7. 验证
 
 - `DeviceGroupTest` / `DeviceGroupProjectionTest`：v2 codec、只显示显式分组、未分组 profile、
   全部聚合、角色推导。
 - `DeviceGroupStoreTest`：v1 只重置一次、v2 往返、损坏回退。
+- `DisabledProfileTest`：`enabled` 旧资料默认值/往返/凭据保留；禁用快照不进入首页和汇总；
+  单设备回退、全禁用空首页、设备组只统计启用成员；禁用 profile 即使被 `include` 也不拨号，
+  重新启用后恢复连接。
 - `ANDROID_HOME=/home/lvziw/Android/Sdk ./gradlew :app:testDebugUnitTest :app:assembleDebug`
   全量通过。

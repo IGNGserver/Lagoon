@@ -265,7 +265,7 @@ private fun DeviceChips(
     horizontalArrangement = Arrangement.spacedBy(8.dp)) {
     item(key = "all-devices") {
       val current = state.allServers
-      val color = dot(state.profiles, current)
+      val color = dot(state.enabledProfiles, current)
       Card(
         cornerRadius = 20.dp,
         insideMargin = PaddingValues(horizontal = 16.dp),
@@ -410,7 +410,7 @@ private fun SessionList(
         try { do { val event = awaitPointerEvent() } while (event.changes.any { it.pressed }) } finally { touching = false }
       }
     }, state = list, contentPadding = PaddingValues(top = 4.dp, bottom = 120.dp)) {
-      if (state.cached || state.degraded || !state.connected && !state.loading && state.profiles.isNotEmpty()) item(key = "sync") {
+      if (state.cached || state.degraded || !state.connected && !state.loading && state.enabledProfiles.isNotEmpty()) item(key = "sync") {
         Text(when { state.cached -> "离线缓存 · 下拉重试"; state.degraded -> "部分数据待同步 · 下拉重试"; else -> "尚未连接 · 点按重试" },
           style = MiuixTheme.textStyles.footnote1, color = MiuixColorTokens.Warning,
           modifier = Modifier.fillMaxWidth().clickable(role = Role.Button) { controller.reload() }.padding(horizontal = 24.dp, vertical = 8.dp))
@@ -442,9 +442,29 @@ private fun SessionList(
       if (visibleSections.isEmpty()) item(key = "empty") {
         if (state.loading && query.isBlank()) SessionRowsSkeleton()
         else Column(Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 48.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-          Text(when { state.loading -> "正在读取会话…"; query.isNotBlank() -> "没有符合条件的会话"; state.connected -> "暂无会话"; state.profiles.isEmpty() -> "还没有添加设备"; else -> "尚未连接" }, color = muted)
-          if (!state.loading && query.isBlank()) TextButton(text = if (state.connected) "新建会话" else if (state.profiles.isEmpty()) "添加设备" else "重新连接",
-            onClick = { if (state.connected) onNewSession() else if (state.profiles.isEmpty()) onManageDevices() else controller.reload() })
+          val allDisabled = state.enabledProfiles.isEmpty() && state.profiles.isNotEmpty()
+          Text(when {
+            state.loading -> "正在读取会话…"
+            query.isNotBlank() -> "没有符合条件的会话"
+            allDisabled -> "所有连接已禁用"
+            state.profiles.isEmpty() -> "还没有添加设备"
+            state.connected -> "暂无会话"
+            else -> "尚未连接"
+          }, color = muted)
+          if (!state.loading && query.isBlank()) {
+            val action = when {
+              state.connected -> "新建会话"
+              allDisabled || state.profiles.isEmpty() -> "管理设备"
+              else -> "重新连接"
+            }
+            TextButton(text = action, onClick = {
+              when {
+                state.connected -> onNewSession()
+                allDisabled || state.profiles.isEmpty() -> onManageDevices()
+                else -> controller.reload()
+              }
+            })
+          }
         }
       }
       if (state.sessionCursors.isNotEmpty()) item(key = "more") {

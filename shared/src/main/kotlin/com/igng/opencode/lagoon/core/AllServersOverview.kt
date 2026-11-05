@@ -83,12 +83,13 @@ internal class AllServersOverview(
   private val liveStreams = mutableMapOf<String, Job>()
 
   /**
-   * Ensures one monitor per server that should stay connected: profiles with `autoConnect` enabled,
-   * plus [include] (the server the user just opened). The “自动连接此服务器” switch used to be
-   * ignored and every saved server was dialled forever, including permanently unreachable ones.
+   * Ensures one monitor per server that should stay connected: enabled profiles with `autoConnect`
+   * on, plus [include] (the server the user just opened). A disabled profile is never dialled even
+   * when it is selected or explicitly included. The “自动连接此服务器” switch used to be ignored and
+   * every saved server was dialled forever, including permanently unreachable ones.
    */
   fun start(profiles: List<ServerProfile>, include: Set<String> = emptySet()) {
-    val wanted = profiles.filter { it.autoConnect || it.id in include }
+    val wanted = profiles.filter { it.enabled && (it.autoConnect || it.id in include) }
     (jobs.keys - wanted.map { it.id }.toSet()).forEach(::remove)
     wanted.forEach { profile ->
       val id = profile.id
@@ -112,6 +113,7 @@ internal class AllServersOverview(
   fun invalidate(id: String) { remove(id) }
   fun client(id: String): HarnessClient = clients.getOrPut(id) {
     val (profile, credentials) = configurations[id] ?: error("服务器已移除")
+    check(profile.enabled) { "连接已禁用" }
     val backend = if (profile.kind == ServerKind.DSH_REMOTE)
       remoteBackendFactory?.create(profile, credentials) ?: error("DSH Remote storage is not configured") else null
     backend?.client ?: createHarnessClient(profile, credentials,
