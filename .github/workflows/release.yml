@@ -212,7 +212,14 @@ jobs:
           # 而不是让 gh release create 因 Release 已存在而报错退出。
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             echo "Release $RELEASE_TAG 已存在，按幂等更新处理"
-            gh release edit "$RELEASE_TAG" --title "Lagoon ${RELEASE_TAG}" --notes-file release-notes.md "${flags[@]}"
+            if [[ "$RELEASE_TYPE" == "pre-release" ]]; then
+              gh release edit "$RELEASE_TAG" --title "Lagoon ${RELEASE_TAG}" --notes-file release-notes.md --prerelease
+            else
+              # GitHub refuses --latest while the existing Release is still a prerelease.
+              # Clear that flag first, then promote it to Latest.
+              gh release edit "$RELEASE_TAG" --title "Lagoon ${RELEASE_TAG}" --notes-file release-notes.md --prerelease=false
+              gh release edit "$RELEASE_TAG" --latest
+            fi
             gh release upload "$RELEASE_TAG" "$apk_asset" --clobber
           else
             gh release create "$RELEASE_TAG" "$apk_asset" --title "Lagoon ${RELEASE_TAG}" --notes-file release-notes.md --verify-tag "${flags[@]}"
