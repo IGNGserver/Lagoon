@@ -1,0 +1,101 @@
+package com.igng.opencode.lagoon.core
+
+import android.content.Context
+import android.content.SharedPreferences
+import java.io.IOException
+
+/**
+ * Persistence for saved SSH hosts: the non-secret config in one preferences file and the password /
+ * private key / passphrase in a separate Keystore-encrypted file. The config is versioned so a later
+ * schema change can migrate it without touching server profiles or credentials.
+ */
+internal class SshHostStore internal constructor(
+  private val preferences: SharedPreferences,
+  private val secretPreferences: SharedPreferences,
+  private val encrypt: (String) -> String,
+  private val decrypt: (String) -> String
+) {
+  constructor(context: Context) : this(
+    context.getSharedPreferences("ssh-hosts", Context.MODE_PRIVATE),
+    context.getSharedPreferences("ssh-secrets", Context.MODE_PRIVATE),
+    KeystoreCipher("lagoon-ssh-secrets")::encrypt,
+    KeystoreCipher("lagoon-ssh-secrets")::decrypt
+  )
+
+  fun load(): List<SshHostConfig> {
+    val text = preferences.getString(KEY, null) ?: return emptyList()
+    return try {
+      SshHostCodec.decode(text).distinctBy { it.id }
+    } catch (error: Exception) {
+      Diagnostics.warn("SshHostStore", "SSH 主机配置读取失败，已忽略", error)
+      emptyList()
+    }
+  }
+
+  fun save(config: SshHostConfig, secrets: SshSecrets? = null) {
+    if (secrets != null) saveSecrets(config, secrets)
+    val next = load().filterNot { it.id == config.id } + config
+    if (!preferences.edit().putString(KEY, SshHostCodec.encode(next)).commit()) {
+      throw IOException("SSH 主机保存失败")
+    }
+  }
+
+  fun delete(id: String) {
+    val next = load().filterNot { it.id == id }
+    if (!preferences.edit().putString(KEY, SshHostCodec.encode(next)).commit()) {
+      throw IOException("SSH 主机删除失败")
+    }
+    val editor = secretPreferences.edit()
+    secretKeys(id).forEach(editor::remove)
+    editor.commit()
+  }
+
+  fun secrets(id: String): SshSecrets = SshSecrets(
+    password = readSecret(passwordKey(id)),
+    privateKey = readSecret(privateKeyKey(id)),
+    passphrase = readSecret(passphraseKey(id))
+  )
+
+  /** Trust-on-first-use: remembers the key the person accepted. */
+  fun pinHostKey(id: String, key: PresentedSshHostKey) {
+    val current = load().firstOrNull { it.id == id } ?: return
+    save(current.copyWith(hostKeyType = key.type, hostKeyFingerprint = key.fingerprint))
+  }
+
+  /** Forgets the pinned key after the person explicitly confirmed the machine changed. */
+  fun resetHostKey(id: String) {
+    val current = load().firstOrNull { it.id == id } ?: return
+    save(current.copyWith(clearHostKey = true))
+  }
+
+  private fun saveSecrets(config: SshHostConfig, secrets: SshSecrets) {
+    val editor = secretPreferences.edit()
+    if (config.auth == SshAuthMethod.PASSWORD) {
+      writeSecret(editor, passwordKey(config.id), secrets.password)
+      editor.remove(privateKeyKey(config.id)).remove(passphraseKey(config.id))
+    } else {
+      writeSecret(editor, privateKeyKey(config.id), secrets.privateKey?.trim())
+      writeSecret(editor, passphraseKey(config.id), secrets.passphrase)
+      editor.remove(passwordKey(config.id))
+    }
+    if (!editor.commit()) throw IOException("SSH 凭据保存失败")
+  }
+
+  private fun writeSecret(editor: SharedPreferences.Editor, key: String, value: String?) {
+    if (value.isNullOrEmpty()) editor.remove(key) else editor.putString(key, encrypt(value))
+  }
+
+  private fun readSecret(key: String): String? = try {
+    secretPreferences.getString(key, null)?.let(decrypt)?.takeIf(String::isNotEmpty)
+  } catch (error: Exception) {
+    Diagnostics.warn("SshHostStore", "SSH 凭据解密失败", error)
+    null
+  }
+
+  private fun secretKeys(id: String) = listOf(passwordKey(id), privateKeyKey(id), passphraseKey(id))
+  private fun passwordKey(id: String) = "ssh:$id:password"
+  private fun privateKeyKey(id: String) = "ssh:$id:privateKey"
+  private fun passphraseKey(id: String) = "ssh:$id:passphrase"
+
+  private companion object { const val KEY = "hosts" }
+}

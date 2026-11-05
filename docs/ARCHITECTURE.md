@@ -1,7 +1,8 @@
 # 实现结构与验收
 
 - `core/OpenCodeApi.kt`: OpenCode 2.x（`anomalyco/opencode` `packages/protocol`）REST、Basic Auth、`location[directory]` 位置上下文、`/api/event` 全局 SSE。各 2.0.x 版本间变化的路由由 `core/ApiCapabilities.kt` 从实例 `/openapi.json` 解析。所有请求绑定固定 origin，禁止跨源重定向转发凭据；SSE 溢出会转成流错误以触发重连对账。
-- `core/HarnessClient.kt`: harness 抽象层。`ServerKind`（`opencode` / `dsh`）随服务器资料持久化，`createHarnessClient` 按类型选实现；控制器、总览与通知层只依赖 `HarnessClient` 接口，不感知具体协议。
+- `core/HarnessClient.kt`: harness 抽象层。`ServerKind`（`opencode` / `dsh` / `dsh-remote`）随服务器资料持久化；`dsh` 带 `sshHostId` 时由 App 注入的 SSH factory 创建 `SshDshClient`，否则走直连 `DshApi`；控制器、总览与通知层只依赖 `HarnessClient` 接口，不感知具体协议。
+- `core/SshHostStore.kt` + `core/ssh/*`: SSH 主机配置/密钥、JSch 传输、远端 `dsh web` bootstrap、稳定本地转发、Host Key TOFU 和断线/进程重启恢复，详见 `docs/SSH_HOSTS.md`。设备管理与分组 v2 见 `docs/DEVICE_MANAGEMENT.md`。
 - `core/DshApi.kt`: DeepSeek Harness 适配（`dsh web` 的 Typert RPC Gateway，完整契约见 `docs/dsh-protocol.md`）。启动令牌先走浏览器式根路径交换（长寿命 Cookie，跨进程重启有效，换到后加密落盘复用并滑动续期），根路径不交付 Cookie 时才退回 `GET /connect?token=…&interactions=answer` 的 API Peer；签名密钥模式在本机签发 Cookie（`core/DshAuth.kt`）；一元调用 `POST /api/<namespace>/<method>`（payload 只含一个 `args` 对象，字段是方法形参名），流式数据走 `/api/remote.mux`（`open`/`item`/`end` 帧）：`session/follow` 给出快照、增量事件与实时 assistant 流，`workspace/follow` 维护项目清单与归档集合，`$events` 给出会话增删、运行状态与审批/问答 waterfall（回应走 `$events/result`，其他客户端结算的 `cancel` 帧撤回本地待办）。文件浏览走 `workspaceFiles`，改动列表走 `workspace/changes` 摘要与认证栅栏内的 `/api/changes.summary|diff` 路由，后台作业走 `job/list`，手动压缩走 `/compact` 命令。会话事件按 `turn/step/tool` 翻译成控制器认识的事件契约；DSH 没有删除会话与消息级回退，分别折算为归档与「分叉」提示。
 - `core/HttpOrigin.kt`: scheme+host+port 的凭据目标标识与回环明文白名单。
 - `core/LagoonController.kt`: 所有页面共享的服务端状态、任务归一化和操作入口；异步写操作通过不可变 `OperationContext`（serverId + generation + client + selection revision + snapshot）绑定起点，切换后不再回写。

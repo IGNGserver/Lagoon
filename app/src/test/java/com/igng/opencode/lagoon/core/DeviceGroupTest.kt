@@ -6,7 +6,8 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class DeviceGroupTest {
-  private fun profile(id: String, name: String = id) = ServerProfile(id, name, "https://example.test", kind = ServerKind.OPENCODE)
+  private fun profile(id: String, name: String = id, kind: ServerKind = ServerKind.OPENCODE) =
+    ServerProfile(id, name, "https://example.test", kind = kind)
 
   @Test fun codecRoundTripsGroupsAndSelection() {
     val state = DeviceGroupState(
@@ -41,12 +42,33 @@ class DeviceGroupTest {
     assertNull(clean.selectedGroupId)
   }
 
-  @Test fun tabsPutExplicitGroupsFirstAndRenderUngroupedAsSingletons() {
+  @Test fun tabsOnlyContainExplicitGroups() {
     val state = DeviceGroupState(listOf(DeviceGroup("g1", "MacBook", listOf("p1", "p2"))))
     val tabs = state.tabs(listOf(profile("p1"), profile("p2"), profile("p3")))
-    assertEquals(listOf("group:g1", "profile:p3"), tabs.map { it.id })
+    assertEquals(listOf("group:g1"), tabs.map { it.id })
     assertEquals(listOf("p1", "p2"), tabs[0].profiles.map { it.id })
     assertTrue(tabs[0].isGroup)
+    assertEquals(listOf("p3"), state.ungrouped(listOf(profile("p1"), profile("p2"), profile("p3"))).map { it.id })
+  }
+
+  @Test fun deviceRoleDistinguishesHostsFromHarnesses() {
+    val ssh = profile("ssh").copy(sshHostId = "ssh-1", kind = ServerKind.DSH)
+    val remote = profile("remote", kind = ServerKind.DSH_REMOTE)
+    val opencode = profile("oc")
+    val legacy = profile("legacy", kind = ServerKind.DSH)
+    assertEquals(DeviceMemberRole.DEVICE, ssh.deviceMemberRole)
+    assertEquals(DeviceMemberRole.DEVICE, remote.deviceMemberRole)
+    assertEquals(DeviceMemberRole.HARNESS, opencode.deviceMemberRole)
+    assertEquals(DeviceMemberRole.HARNESS, legacy.deviceMemberRole)
+  }
+
+  @Test fun codecRejectsVersionOne() {
+    val legacy = """{"version":1,"groups":[],"selected":null}"""
+    assertEquals(1, DeviceGroupCodec.version(legacy))
+    try {
+      DeviceGroupCodec.decode(legacy)
+      assertTrue("expected IOException", false)
+    } catch (_: java.io.IOException) { }
   }
 
   @Test fun workspacesMergeSameNamesAcrossHarnessesButKeepMembers() {

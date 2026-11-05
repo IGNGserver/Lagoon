@@ -2,16 +2,17 @@
 
 > 官网与下载入口：<https://lagoon.igng.net/>
 
-面向多种 coding agent harness 的原生 Android 移动控制端。Kotlin + Jetpack Compose 界面采用小米 HyperOS / MIUIX 设计规范，引入连续曲率 Squircle、科技蓝语义调色板。App 首发支持用户自己的 OpenCode 2.x Server，现已适配 DeepSeek Harness（`dsh web` 实例），直连端点，无需第三方中转服务；未来将持续扩展适配更多 harness。
+面向多种 coding agent harness 的原生 Android 移动控制端。Kotlin + Jetpack Compose 界面采用小米 HyperOS / MIUIX 设计规范，引入连续曲率 Squircle、科技蓝语义调色板。App 首发支持用户自己的 OpenCode 2.x Server，现已适配 DeepSeek Harness：可通过一个 DSH Remote Hub 账号，或任意数量的 SSH 主机接入；旧版直连 DSH 资料保留可编辑/删除，但不再作为新建连接方式。
 
 Lagoon 目前只维护 Android 客户端。v3 曾提供自托管中枢与网页端，现已停止维护并从本仓库移除；相关说明见 [`docs/HUB_EOL.md`](docs/HUB_EOL.md)。
 
 ## 功能
 
 - 首发支持 OpenCode 2.x 服务端（`/api/*` 接口，以 `/api/info` 识别版本；1.x 已不再支持）；多服务器连接、Basic Auth/官方 pair 链接、Android Keystore 保护的密码与会话 Cookie、离线缓存、SSE 自动重连
-- 支持 DeepSeek Harness：粘贴启动链接或填写签名密钥即可配对，Cookie 落盘复用、跨 dsh 重启不掉线，走 Typert RPC（一元调用 + mux 事件流），时间线、任务状态、审批与问答和其它 harness 共用同一套界面与通知；详见下文「DeepSeek Harness 支持」
+- 支持 DeepSeek Harness：一个 DSH Remote Hub（浏览器/邮箱登录、主机目录、逐台指纹核对）或任意数量的 SSH 主机（密码/私钥、Host Key 固定、远端 `dsh web` 启停/复用、稳定本地转发与断线重连）；走 Typert RPC（一元调用 + mux 事件流），时间线、任务状态、审批与问答和其它 harness 共用同一套界面与通知；详见 [`docs/SSH_HOSTS.md`](docs/SSH_HOSTS.md) 与下文「DeepSeek Harness 支持」
 - 项目与会话、异步任务（运行中可继续发送以引导当前轮次）、Agent/Model、斜杠命令（走服务端 `/command`）、文本/Reasoning/Tool 消息、停止与权限/表单处理；时间线按官方客户端规则投影，系统指令、合成输入、技能等给模型看的记录只显示一行通知
 - 子会话、改动、文件浏览与搜索、重命名、删除；随版本变化的接口（重命名、恢复撤销、改动、已读同步）按实例 `/openapi.json` 选择
+- 设备管理：首页只保留「全部」和显式设备组，添加设备页用 OpenCode / DeepSeek Harness 分页；DSH 页支持一个 Remote Hub + 无限 SSH 主机，设备组可混合设备与 Harness；分组 v1 升级时只清空一次，旧服务器资料/凭据/缓存不受影响；详见 [`docs/DEVICE_MANAGEMENT.md`](docs/DEVICE_MANAGEMENT.md)
 - 全服务器任务总览：实时显示运行中、未读完成、待回复与失败计数，并可从首页直接打开最需关注的任务；Android 16+ 使用系统实时更新（Live Updates），Android 15 及以下使用普通任务通知与应用内首页概览，详见 `docs/LIVE_UPDATES.md`
 - 本地前台监控与运行中、待处理、完成通知；任务总览仅统计未读结果，用户打开会话后即视为已读；支持一键清空本机未读结果，并可独立把服务端 `time.viewed` 同步到已结束的执行轮次
 - 应用内检查更新：设置页按 SemVer 选择 GitHub 上的正式版或预发布版，下载后校验大小、SHA-256、包名、版本码与签名，再交给系统安装器覆盖安装；首次安装会引导开启“安装未知应用”
@@ -28,10 +29,12 @@ ANDROID_HOME=/path/to/Android/Sdk ./gradlew :app:assembleDebug :app:testDebugUni
 
 在 App 中添加可访问的 OpenCode Server URL。服务端需启用 Basic Auth；也可以直接粘贴 `opencode pair` 输出的官方链接，App 会访问一次链接、保存返回的会话 Cookie，再用该 Cookie 连接 API。建议通过 HTTPS 或可信 VPN 访问。使用局域网 HTTP 时，必须在该服务器资料中明确开启明文连接，授权会随资料保存。
 
-添加 DeepSeek Harness 时，「服务类型」选择 DeepSeek Harness。默认只监听 loopback，手机访问需要 `dsh web --host <本机 IP> --no-open`（或经反向代理/TLS，并加 `--trusted-host`）。有两种配对方式：
+添加 DeepSeek Harness 走「添加设备 › DeepSeek Harness」，该页只有两种新连接方式：
 
-- **启动令牌（默认）**：直接粘贴 `dsh web` 打印的整条启动链接，地址与令牌会自动拆开。令牌只用于换取该实例的浏览器 Cookie；Cookie 由 Android Keystore 加密保存在本机，App 重启、dsh 重启后都直接复用，dsh 未重启时还会自动续期。Cookie 默认 30 天绝对有效期，到期且 dsh 已重启过时才需要用新链接重新配对；想更久可在 `~/.dsh/profiles/web/cordis.patch.yml` 调大 `cookieMaxAgeDays`（见 `docs/dsh-protocol.md`）。
-- **签名密钥（不看电脑配对）**：填写 `~/.dsh/.credentials.yaml` 中 `client-connection/browser-session` 记录的 `secret`。它是该 dsh 的长期凭据，手机用它在本机签发 Cookie，dsh 重启、Cookie 过期都不需要重新配对；删除该记录并重启 dsh 即可吊销全部 Cookie。只在 HTTPS 或可信局域网中使用。
+- **DSH Remote Hub**：登录一个 Hub 账号，发现账号下的电脑，逐台核对 Host 指纹后接入。每台 Host 注册独立的 client 身份，因此可以并行监控；不会退化成一次只连一台。Hub 目录、浏览器登录和自建服务器邮箱登录沿用 `docs/DSH_REMOTE_*` 的链路。
+- **SSH 主机**：填写地址、端口、用户名、密码或私钥，首次连接核对 `SHA256:` 主机指纹。App 通过 SSH 自动探测/启动 `dsh web`（`--host 127.0.0.1 --port 0 --no-open`），把它转发到手机本地，再用 `Host: 127.0.0.1:<远端端口>` 登录 DSH。主机需要 POSIX shell（Linux/macOS/WSL），并已安装 `dsh`；详细字段、状态目录、Host Key、重连与安全边界见 [`docs/SSH_HOSTS.md`](docs/SSH_HOSTS.md)。
+
+旧版直连 DSH（地址 + 启动令牌/签名密钥）资料仍会出现在设备管理的 Harness 区域，可编辑或删除；新版本不再创建直连资料。
 
 ### DeepSeek Harness 支持
 

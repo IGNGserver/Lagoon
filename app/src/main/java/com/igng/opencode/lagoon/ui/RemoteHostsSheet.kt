@@ -27,8 +27,8 @@ internal fun RemoteHostsSheet(
   onEnroll: () -> Unit
 ) {
   val scope = rememberCoroutineScope()
-  var catalogs by remember { mutableStateOf(controller.remoteCatalogs()) }
-  val catalog = catalogs.firstOrNull()
+  var catalogState by remember { mutableStateOf(controller.activeRemoteCatalog()) }
+  val catalog = catalogState
   val manager = remember(catalog?.origin, catalog?.account) {
     catalog?.let { runCatching { controller.remoteAccountManager(it.origin, it.origin.startsWith("http://", true)) }.getOrNull() }
   }
@@ -39,7 +39,7 @@ internal fun RemoteHostsSheet(
 
   fun added(hostId: String): Boolean = profiles.any { it.kind == ServerKind.DSH_REMOTE && it.remoteHostId == hostId }
 
-  fun reload() { catalogs = controller.remoteCatalogs() }
+  fun reload() { catalogState = controller.activeRemoteCatalog() }
 
   if (confirmSignOut && catalog != null) {
     SuperDialog(title = "退出 DSH Remote？", show = true, onDismissRequest = { confirmSignOut = false }) {

@@ -224,9 +224,13 @@ fun createHarnessClient(
   callTimeoutSeconds: Long = 60,
   /** 客户端换到新会话 Cookie（或确认旧 Cookie 失效，传空串）时回调，由调用方落盘。 */
   onCookie: (String) -> Unit = {},
-  remoteBackend: RemoteBackend? = null
+  remoteBackend: RemoteBackend? = null,
+  /** App-provided factory for `sshHostId != null`; shared/ has no Android SSH implementation. */
+  sshClientFactory: ((ServerProfile, ServerCredentials) -> HarnessClient)? = null
 ): HarnessClient = when (profile.kind) {
   ServerKind.OPENCODE -> OpenCodeApi(profile, credentials, callTimeoutSeconds)
-  ServerKind.DSH -> DshApi(profile, credentials, callTimeoutSeconds, onCookie)
+  ServerKind.DSH -> if (profile.sshHostId != null) {
+    sshClientFactory?.invoke(profile, credentials) ?: throw IllegalStateException("SSH backend 尚未配置")
+  } else DshApi(profile, credentials, callTimeoutSeconds, onCookie)
   ServerKind.DSH_REMOTE -> (remoteBackend ?: throw IllegalStateException("DSH Remote backend 尚未配置")).client
 }

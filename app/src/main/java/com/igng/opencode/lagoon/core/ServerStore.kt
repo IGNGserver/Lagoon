@@ -33,7 +33,7 @@ class ServerStore internal constructor(private val preferences: SharedPreference
       ServerProfile(id, it.str("name"), it.str("url"), it.str("username"),
         it.optBoolean("autoConnect", true), it.optBoolean("notifications", true), it.optBoolean("allowCleartext", false),
         ServerKind.fromWire(it.str("kind")), DshAuthMode.fromWire(it.str("dshAuth")), it.str("remoteHostId").takeIf(String::isNotBlank),
-        it.str("remoteHostFingerprint").takeIf(String::isNotBlank))
+        it.str("remoteHostFingerprint").takeIf(String::isNotBlank), it.str("sshHostId").takeIf(String::isNotBlank))
     }
   } catch (error: Exception) {
     Diagnostics.warn("ServerStore", "profiles 解析失败，已忽略全部服务器资料", error)
@@ -321,6 +321,8 @@ class ServerStore internal constructor(private val preferences: SharedPreference
   override fun credentials(id: String): ServerCredentials {
     val profile = profiles().firstOrNull { it.id == id }
     val fallback = profile?.username ?: "opencode"
+    // SSH credentials live in the dedicated SSH store. Never try to interpret `ssh://…` as an HTTP origin.
+    if (profile?.sshHostId != null) return ServerCredentials(fallback)
     return try {
       val raw = decrypt(id)
       when {
@@ -368,14 +370,17 @@ class ServerStore internal constructor(private val preferences: SharedPreference
       credentialUsername ?: profile.username, password, cookie)
     // Encrypt everything before mutating either store. Credentials carry their own origin, so a
     // crash between these two preference commits can only cause a missing login, never a leak.
-    val encoded = if (next.password.isEmpty() && next.cookie.isEmpty()) null else encryptValue(JSONObject()
+    // SSH-backed DSH profiles keep their private key/password in the SSH secret store; their URL is
+    // a synthetic `ssh://…` identity that must never be parsed as an HTTP credential origin.
+    val encoded = if (profile.sshHostId != null || (next.password.isEmpty() && next.cookie.isEmpty())) null else encryptValue(JSONObject()
       .put("origin", credentialOrigin(profile.url)).put("username", next.username).put("password", next.password).put("cookie", next.cookie).toString())
     val updated = profiles().filterNot { it.id == profile.id } + profile
     val json = JSONArray().apply { updated.forEach { item -> put(JSONObject()
       .put("id", item.id).put("name", item.name).put("url", item.url).put("username", item.username)
       .put("autoConnect", item.autoConnect).put("notifications", item.notifications)
        .put("allowCleartext", item.allowCleartext).put("kind", item.kind.wire).put("dshAuth", item.dshAuth.wire)
-       .putOpt("remoteHostId", item.remoteHostId).putOpt("remoteHostFingerprint", item.remoteHostFingerprint)) } }
+       .putOpt("remoteHostId", item.remoteHostId).putOpt("remoteHostFingerprint", item.remoteHostFingerprint)
+       .putOpt("sshHostId", item.sshHostId)) } }
     check(secrets.edit().putString(profile.id, encoded).commit()) { "无法保存凭据，请重试" }
     val migration = DshRemoteMigration.plan(profile)
     val editor = preferences.edit().putString("profiles", json.toString())
@@ -397,6 +402,7 @@ class ServerStore internal constructor(private val preferences: SharedPreference
    */
   override fun rememberCookie(id: String, url: String, cookie: String) {
     val profile = profiles().firstOrNull { it.id == id } ?: return
+    if (profile.sshHostId != null) return
     if (profile.url != url) return
     val current = credentials(id)
     if (current.cookie == cookie) return
@@ -414,7 +420,8 @@ class ServerStore internal constructor(private val preferences: SharedPreference
         .put("username", item.username).put("autoConnect", item.autoConnect)
         .put("notifications", item.notifications)
         .put("allowCleartext", item.allowCleartext).put("kind", item.kind.wire).put("dshAuth", item.dshAuth.wire)
-        .putOpt("remoteHostId", item.remoteHostId).putOpt("remoteHostFingerprint", item.remoteHostFingerprint))
+        .putOpt("remoteHostId", item.remoteHostId).putOpt("remoteHostFingerprint", item.remoteHostFingerprint)
+        .putOpt("sshHostId", item.sshHostId))
     } }
     val editor = preferences.edit().putString("profiles", json.toString()).remove("directories:$id").remove("sessionNotices:$id").remove("collapsedSections:$id").remove("collapsedProjects:$id").remove("pinned:$id").remove("remoteMigration:$id")
       .remove("backgroundRunning:$id")

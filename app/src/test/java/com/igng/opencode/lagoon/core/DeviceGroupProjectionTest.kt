@@ -63,11 +63,24 @@ class DeviceGroupProjectionTest {
     assertEquals("a", home.serverId)
   }
 
-  @Test fun tabsCollapseGroupedProfilesIntoOneEntry() {
+  @Test fun tabsOnlyContainExplicitGroups() {
     val a = profile("a", "A")
     val b = profile("b", "B")
     val c = profile("c", "C")
     val state = LagoonState(profiles = listOf(a, b, c), deviceGroups = listOf(DeviceGroup("g", "MacBook", listOf("a", "b"))))
-    assertEquals(listOf("group:g", "profile:c"), state.deviceTabs.map { it.id })
+    assertEquals(listOf("group:g"), state.deviceTabs.map { it.id })
+  }
+
+  @Test fun allDevicesModeAggregatesEveryProfile() {
+    val a = profile("a", "A")
+    val b = profile("b", "B")
+    val state = LagoonState(profiles = listOf(a, b), serverId = "a", allServers = true,
+      allServerSnapshots = mapOf(
+        "a" to snapshot("a", ServerKind.OPENCODE, true, listOf(Session("s1", "/repo", "one", 1)), emptyList()),
+        "b" to snapshot("b", ServerKind.OPENCODE, true, listOf(Session("s2", "/repo", "two", 2)), emptyList())
+      ))
+    val home = state.homeProjection()
+    assertTrue(home.multiServerView)
+    assertEquals(listOf("s1", "s2"), home.sessions.map { it.id }.sorted())
   }
 }

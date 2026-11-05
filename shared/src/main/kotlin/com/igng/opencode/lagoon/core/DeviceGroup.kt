@@ -11,7 +11,8 @@ import java.util.Locale
  * servers; it is never uploaded and does not affect authentication, routing or session identity.
  *
  * A profile belongs to at most one group. Group order is the persistence order; member order is
- * the order chosen in the editor. Profiles that are not in any group render as singleton tabs.
+ * the order chosen in the editor. Ungrouped profiles do not get a home tab: 全部 is the only
+ * implicit bucket, so every saved profile remains reachable without becoming top-bar noise.
  */
 data class DeviceGroup(
   val id: String,
@@ -19,6 +20,26 @@ data class DeviceGroup(
   val memberIds: List<String> = emptyList(),
   val updatedAt: Long = 0
 )
+
+/** How a group member is presented. Devices are computers; harnesses are protocol endpoints. */
+enum class DeviceMemberRole(val label: String) { DEVICE("设备"), HARNESS("Harness") }
+
+/**
+ * A DSH Remote host and an SSH host are devices; OpenCode and the legacy direct-DSH profile are
+ * harnesses. The distinction is presentational only: both kinds remain ordinary ServerProfiles.
+ */
+val ServerProfile.deviceMemberRole: DeviceMemberRole
+  get() = when {
+    sshHostId != null -> DeviceMemberRole.DEVICE
+    kind == ServerKind.DSH_REMOTE -> DeviceMemberRole.DEVICE
+    else -> DeviceMemberRole.HARNESS
+  }
+
+/** One profile with its presentation role, used by the device management page and group editor. */
+data class DeviceMember(val profile: ServerProfile, val role: DeviceMemberRole)
+
+fun List<ServerProfile>.deviceMembers(): List<DeviceMember> =
+  map { DeviceMember(it, it.deviceMemberRole) }
 
 data class DeviceGroupState(
   val groups: List<DeviceGroup> = emptyList(),
@@ -51,22 +72,29 @@ data class DeviceGroupState(
     next.copy(selectedGroupId = next.selectedGroupId?.takeIf { id -> next.groups.any { it.id == id } })
   }
 
+  /**
+   * Top-bar entries for the explicit groups only. Ungrouped profiles intentionally produce no tab;
+   * they remain visible in 全部 and in the device management page.
+   */
   fun tabs(profiles: List<ServerProfile>): List<DeviceTab> {
     val byId = profiles.associateBy { it.id }
     val used = HashSet<String>()
-    val result = ArrayList<DeviceTab>(groups.size + profiles.size)
+    val result = ArrayList<DeviceTab>(groups.size)
     groups.forEach { group ->
       val members = group.memberIds.mapNotNull { byId[it] }.filter { used.add(it.id) }
       if (members.isNotEmpty()) result += DeviceTab("group:${group.id}", group.name, group, members)
     }
-    profiles.filter { it.id !in used }.forEach { profile ->
-      result += DeviceTab("profile:${profile.id}", profile.name, null, listOf(profile))
-    }
     return result
+  }
+
+  /** Profiles that are not in any group, in save order. */
+  fun ungrouped(profiles: List<ServerProfile>): List<ServerProfile> {
+    val grouped = groups.flatMap { it.memberIds }.toSet()
+    return profiles.filter { it.id !in grouped }
   }
 }
 
-/** One top-bar entry: an explicit group, or an ungrouped profile rendered as a singleton. */
+/** One top-bar entry for an explicit group. */
 data class DeviceTab(
   val id: String,
   val label: String,
@@ -148,8 +176,10 @@ fun deviceWorkspaceKey(session: Session, projects: List<Project>, scope: String)
 }
 
 internal object DeviceGroupCodec {
+  const val VERSION = 2
+
   fun encode(state: DeviceGroupState): String = JSONObject()
-    .put("version", 1)
+    .put("version", VERSION)
     .put("selected", state.selectedGroupId ?: JSONObject.NULL)
     .put("groups", JSONArray().apply {
       state.groups.forEach { group ->
@@ -161,10 +191,13 @@ internal object DeviceGroupCodec {
       }
     }).toString()
 
+  /** The stored schema version, or null when the text is not a device-group document. */
+  fun version(text: String): Int? = runCatching { JSONObject(text).optInt("version", 0) }.getOrNull()
+
   fun decode(text: String): DeviceGroupState {
     try {
       val json = JSONObject(text)
-      if (json.optInt("version") != 1) throw IOException("设备分组版本无效")
+      if (json.optInt("version") != VERSION) throw IOException("设备分组版本无效")
       val rawGroups = json.optJSONArray("groups") ?: JSONArray()
       if (rawGroups.length() > 64) throw IOException("设备分组过多")
       val groups = (0 until rawGroups.length()).mapNotNull { index ->

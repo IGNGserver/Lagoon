@@ -60,7 +60,12 @@ class DshApi(
    */
   private val onCookie: (String) -> Unit = {},
   private val clock: () -> Long = System::currentTimeMillis,
-  private val remoteBackend: RemoteBackend? = null
+  private val remoteBackend: RemoteBackend? = null,
+  /**
+   * SSH tunnel mode: requests go to a local forwarder, but DSH's loopback Host fence and cookie
+   * audience must see the remote authority (`127.0.0.1:<remotePort>`).
+   */
+  private val hostHeader: String? = null
 ) : HarnessClient {
   constructor(profile: ServerProfile, password: String) : this(profile, ServerCredentials(profile.username, password))
 
@@ -84,6 +89,11 @@ class DshApi(
       val request = chain.request()
       if (HttpOrigin.of(request.url) != origin) throw IOException("拒绝向非授权地址发送凭据")
       chain.proceed(request)
+    }
+    .addInterceptor { chain ->
+      val request = chain.request()
+      if (hostHeader.isNullOrBlank()) chain.proceed(request)
+      else chain.proceed(request.newBuilder().header("Host", hostHeader).build())
     }
     .addInterceptor(HttpMetrics.interceptor)
     .build()
@@ -2010,7 +2020,7 @@ class DshApi(
     "DeepSeek Harness"
   }
 
-  private companion object {
+  internal companion object {
     const val WATCH_LIMIT = 12
 
     /** 认证失效的错误码：控制器据此提示重新配对，而不是当成网络抖动。 */
@@ -2048,7 +2058,7 @@ class DshApi(
      * DSH 的实例能力。删除没有对应 RPC（归档代替）；回退没有对应语义；没有 `/openapi.json`
      * 之类的契约文档，漂移按方法级失败处理。
      */
-    val CAPABILITIES = ApiCapabilities(
+    private val CAPABILITIES = ApiCapabilities(
       actions = mapOf(SessionAction.RENAME to ActionEndpoint("POST", "session/rename")),
       diff = true,
       sessionView = null,
@@ -2057,5 +2067,8 @@ class DshApi(
       deleteSession = false,
       fork = true
     )
+
+    /** Capabilities for a tunneled SSH client created before its DshApi instance exists. */
+    internal val TUNNEL_CAPABILITIES: ApiCapabilities get() = CAPABILITIES
   }
 }

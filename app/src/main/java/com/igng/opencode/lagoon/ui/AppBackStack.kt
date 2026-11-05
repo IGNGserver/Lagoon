@@ -9,6 +9,7 @@ package com.igng.opencode.lagoon.ui
 internal enum class RootPage(val label: String) {
   HOME("会话"),
   ARCHIVED("已归档"),
+  DEVICES("设备"),
   SETTINGS("设置")
 }
 

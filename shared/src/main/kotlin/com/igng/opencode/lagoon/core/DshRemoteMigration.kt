@@ -11,7 +11,7 @@ data class DshRemoteMigration(
 ) {
   companion object {
     fun plan(profile: ServerProfile): DshRemoteMigration? {
-      if (profile.kind != ServerKind.DSH) return null
+      if (profile.kind != ServerKind.DSH || profile.sshHostId != null) return null
       return DshRemoteMigration(
         profile.id,
         retained = true,

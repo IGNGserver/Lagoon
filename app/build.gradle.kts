@@ -86,6 +86,11 @@ dependencies {
   implementation("org.commonmark:commonmark-ext-gfm-strikethrough:0.30.0")
   implementation("com.squareup.okhttp3:okhttp:4.12.0")
   implementation("com.squareup.okhttp3:okhttp-sse:4.12.0")
+  // SSH transport for DSH over SSH (BSD-licensed mwiede fork; direct-tcpip + modern KEX/key support).
+  implementation("com.github.mwiede:jsch:0.2.25")
+  // Android 26–32 has no JCE Ed25519; JSch's BouncyCastle adapter supplies Ed25519 host keys and
+  // private-key authentication on those API levels.
+  implementation("org.bouncycastle:bcprov-jdk18on:1.79")
   // MIT Noise implementation used for DSH Remote Protocol v1's fixed IK suite.
   implementation("com.github.auties00:noise-java:1.2") {
     // The published legacy POM declares JAXB for its old test tooling; Noise's runtime classes do not need it.

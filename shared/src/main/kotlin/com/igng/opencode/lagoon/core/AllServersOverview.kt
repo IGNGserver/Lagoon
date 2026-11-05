@@ -66,7 +66,8 @@ internal class AllServersOverview(
   private val directoryHealth: DirectoryHealth = DirectoryHealth(),
   /** A server stopped being monitored: its last snapshot must leave the global island count too. */
   private val onSnapshotRemoved: (String) -> Unit = {},
-  private val remoteBackendFactory: RemoteBackendFactory? = null
+  private val remoteBackendFactory: RemoteBackendFactory? = null,
+  private val sshClientFactory: ((ServerProfile, ServerCredentials) -> HarnessClient)? = null
 ) {
   private val jobs = mutableMapOf<String, Job>()
   private val locks = mutableMapOf<String, Mutex>()
@@ -105,12 +106,17 @@ internal class AllServersOverview(
   }
 
   fun restart(profiles: List<ServerProfile>) { start(profiles); refreshAll() }
+
+  /** Drops a server's monitor and client so the next [start] rebuilds it from changed credentials
+   * or an edited SSH host config. */
+  fun invalidate(id: String) { remove(id) }
   fun client(id: String): HarnessClient = clients.getOrPut(id) {
     val (profile, credentials) = configurations[id] ?: error("服务器已移除")
     val backend = if (profile.kind == ServerKind.DSH_REMOTE)
       remoteBackendFactory?.create(profile, credentials) ?: error("DSH Remote storage is not configured") else null
     backend?.client ?: createHarnessClient(profile, credentials,
-      onCookie = { cookie -> rememberCookie(id, profile, cookie) }, remoteBackend = backend)
+      onCookie = { cookie -> rememberCookie(id, profile, cookie) }, remoteBackend = backend,
+      sshClientFactory = sshClientFactory)
   }
 
   /**

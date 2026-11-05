@@ -54,8 +54,6 @@ internal fun HomeScreen(
   onOpen: (SessionTarget) -> Unit,
   onNewSession: () -> Unit,
   onProjects: () -> Unit,
-  onSelectServer: (ServerProfile?) -> Unit,
-  onEditServer: (ServerProfile?) -> Unit,
   onSelectGroup: (DeviceGroup) -> Unit = {},
   onEditGroup: (DeviceGroup) -> Unit = {},
   onManageDevices: () -> Unit = {},
@@ -85,10 +83,11 @@ internal fun HomeScreen(
       if (searching) SearchTopBar(query, { query = it }, ::closeSearch)
       else HomeTopBar(
          title = when {
-           state.allServers -> "全部服务器"
+           state.allServers -> "全部设备"
            scopeWorkspace != null -> scopeWorkspace.name
            state.homeGroup != null -> state.homeGroup!!.name
-           else -> state.scopeProjectId?.let { id -> state.projects.firstOrNull { it.id == id }?.name } ?: "全部会话"
+           else -> state.scopeProjectId?.let { id -> state.projects.firstOrNull { it.id == id }?.name }
+             ?: state.server?.name ?: "全部会话"
          },
         onTitleClick = onProjects,
         action = if (hasUnread) {
@@ -112,8 +111,7 @@ internal fun HomeScreen(
               ), title = "已读同步"))
               add(MenuSection(listOf(
                 MenuAction("搜索", MiuixIcons.Search) { searching = true },
-                MenuAction("全部设备", MiuixIcons.GridView) { controller.setAllServers(true) },
-                MenuAction("设备分组", MiuixIcons.Settings) { onManageDevices() },
+                MenuAction("设备管理", MiuixIcons.GridView) { onManageDevices() },
                 MenuAction("已归档", ARCHIVE_ICON) { onPage(RootPage.ARCHIVED) },
                 MenuAction("设置", MiuixIcons.Settings) { onPage(RootPage.SETTINGS) }
               )))
@@ -121,14 +119,15 @@ internal fun HomeScreen(
           }
         }
       )
-      if (!searching) DeviceChips(state, controller, onSelectServer, onEditServer, onSelectGroup, onEditGroup)
+      if (!searching) DeviceChips(state, onSelectAll = { controller.setAllServers(true) },
+        onSelectGroup = onSelectGroup, onEditGroup = onEditGroup, onManageDevices = onManageDevices)
       if (!searching) GlobalTaskStrip(state, controller, onArchived = {
         controller.setAllServers(true)
         onPage(RootPage.ARCHIVED)
       })
       if (!state.multiServerView) ConnectionStrip(state, controller)
       Box(Modifier.weight(1f).fillMaxWidth()) {
-        SessionList(state, controller, grouping, query.trim(), onOpen, onNewSession, onEditServer,
+        SessionList(state, controller, grouping, query.trim(), onOpen, onNewSession, onManageDevices,
           onRename = { renaming = it }, onDelete = { deleting = it })
       }
     }
@@ -183,7 +182,7 @@ private fun GlobalTaskStrip(state: LagoonState, controller: LagoonController, on
     verticalArrangement = Arrangement.spacedBy(2.dp)
   ) {
     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-      Text(if (grouped) "${state.homeGroup?.name.orEmpty()} · 全部项目" else "全部服务器 · 全部项目",
+      Text(if (grouped) "${state.homeGroup?.name.orEmpty()} · 全部项目" else "全部设备 · 全部项目",
         Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis,
         style = MiuixTheme.textStyles.footnote2.copy(color = muted))
       if (grouped || !state.allServers || state.scopeProjectId != null || state.scopeWorkspaceKey != null) {
@@ -233,17 +232,16 @@ private fun HomeTopBar(title: String, onTitleClick: () -> Unit, action: (@Compos
 }
 
 /**
- * One capsule per saved server. The current one is tinted with the MIUIX primary and carries the
- * connection dot (connected / recovering / offline); tap switches, long press edits, ＋ adds.
+ * 全部 + explicit device groups. Ungrouped profiles deliberately do not get a tab (they remain in
+ * 全部 and in 设备管理), and there is no trailing ＋: adding a device lives in 设备管理.
  */
 @Composable
 private fun DeviceChips(
   state: LagoonState,
-  controller: LagoonController,
-  onSelect: (ServerProfile?) -> Unit,
-  onEdit: (ServerProfile?) -> Unit,
+  onSelectAll: () -> Unit,
   onSelectGroup: (DeviceGroup) -> Unit,
-  onEditGroup: (DeviceGroup) -> Unit
+  onEditGroup: (DeviceGroup) -> Unit,
+  onManageDevices: () -> Unit
 ) {
   fun connected(profile: ServerProfile): Boolean =
     if (profile.id == state.serverId) state.connected else state.allServerSnapshots[profile.id]?.connected == true
@@ -259,12 +257,13 @@ private fun DeviceChips(
     return when {
       anyConnected && anyStreaming -> MiuixColorTokens.Success
       anyConnected || anyLoading -> MiuixColorTokens.Warning
-      current || state.allServers -> MiuixTheme.colorScheme.onSurfaceVariantSummary
+      current || state.allServers || profiles.isEmpty() -> MiuixTheme.colorScheme.onSurfaceVariantSummary
       else -> null
     }
   }
-  LazyRow(Modifier.fillMaxWidth(), contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-    if (state.deviceGroups.isEmpty() || state.allServers) item(key = "all-servers") {
+  LazyRow(Modifier.fillMaxWidth(), contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
+    horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+    item(key = "all-devices") {
       val current = state.allServers
       val color = dot(state.profiles, current)
       Card(
@@ -272,7 +271,8 @@ private fun DeviceChips(
         insideMargin = PaddingValues(horizontal = 16.dp),
         colors = CardDefaults.defaultColors(color = if (current) MiuixColorTokens.PrimarySubtle else MiuixTheme.colorScheme.secondaryContainer),
         pressFeedbackType = PressFeedbackType.Sink,
-        onClick = { onSelect(null) }
+        onClick = onSelectAll,
+        onLongPress = onManageDevices
       ) {
         Row(Modifier.heightIn(min = 40.dp), verticalAlignment = Alignment.CenterVertically) {
           color?.let { StatusDot(it); Spacer(Modifier.width(8.dp)) }
@@ -281,48 +281,48 @@ private fun DeviceChips(
         }
       }
     }
+    if (!state.allServers && state.homeGroupId == null) {
+      val profile = state.server
+      if (profile != null) item(key = "single:${profile.id}") {
+        Card(
+          cornerRadius = 20.dp,
+          insideMargin = PaddingValues(horizontal = 16.dp),
+          colors = CardDefaults.defaultColors(color = MiuixColorTokens.PrimarySubtle),
+          pressFeedbackType = PressFeedbackType.Sink,
+          onClick = {},
+          onLongPress = onManageDevices
+        ) {
+          Row(Modifier.heightIn(min = 40.dp), verticalAlignment = Alignment.CenterVertically) {
+            StatusDot(if (connected(profile)) MiuixColorTokens.Success else MiuixTheme.colorScheme.onSurfaceVariantSummary)
+            Spacer(Modifier.width(8.dp))
+            Text(profile.name, Modifier.widthIn(max = 160.dp), maxLines = 1, overflow = TextOverflow.Ellipsis,
+              style = MiuixTheme.textStyles.body2.copy(fontWeight = FontWeight.Medium,
+                color = MiuixTheme.colorScheme.primary))
+          }
+        }
+      }
+    }
     items(state.deviceTabs, key = { it.id }) { tab ->
       val group = tab.group
-      val current = !state.allServers && if (group != null) state.homeGroupId == group.id
-        else state.homeGroupId == null && tab.profiles.any { it.id == state.serverId }
+      val current = !state.allServers && group != null && state.homeGroupId == group.id
       val color = dot(tab.profiles, current)
       Card(
         cornerRadius = 20.dp,
         insideMargin = PaddingValues(horizontal = 16.dp),
         colors = CardDefaults.defaultColors(color = if (current) MiuixColorTokens.PrimarySubtle else MiuixTheme.colorScheme.secondaryContainer),
         pressFeedbackType = PressFeedbackType.Sink,
-        onClick = {
-          val profile = tab.primaryProfile
-          if (group != null) onSelectGroup(group) else profile?.let(onSelect)
-        },
-        onLongPress = { if (group != null) onEditGroup(group) else tab.primaryProfile?.let(onEdit) }
+        onClick = { group?.let(onSelectGroup) },
+        onLongPress = { group?.let(onEditGroup) }
       ) {
         Row(Modifier.heightIn(min = 40.dp), verticalAlignment = Alignment.CenterVertically) {
           color?.let { StatusDot(it); Spacer(Modifier.width(8.dp)) }
           Text(tab.label, Modifier.widthIn(max = 160.dp), maxLines = 1, overflow = TextOverflow.Ellipsis,
             style = MiuixTheme.textStyles.body2.copy(fontWeight = if (current) FontWeight.Medium else FontWeight.Normal,
               color = if (current) MiuixTheme.colorScheme.primary else MiuixTheme.colorScheme.onSurfaceVariantSummary))
-          if (group != null && tab.profiles.size > 1) {
+          if (tab.profiles.size > 1) {
             Spacer(Modifier.width(4.dp))
             Text("${tab.profiles.count(::connected)}/${tab.profiles.size}",
               style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
-          }
-        }
-      }
-    }
-    item(key = "add-server") {
-      Card(
-        cornerRadius = 20.dp,
-        insideMargin = PaddingValues(horizontal = 12.dp),
-        colors = CardDefaults.defaultColors(color = MiuixTheme.colorScheme.secondaryContainer),
-        pressFeedbackType = PressFeedbackType.Sink,
-        onClick = { onEdit(null) }
-      ) {
-        Row(Modifier.heightIn(min = 40.dp), verticalAlignment = Alignment.CenterVertically) {
-          Icon(MiuixIcons.Add, "添加服务器", Modifier.size(20.dp), tint = MiuixTheme.colorScheme.onSurfaceVariantSummary)
-          if (state.profiles.isEmpty()) {
-            Spacer(Modifier.width(4.dp))
-            Text("添加服务器", style = MiuixTheme.textStyles.body2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
           }
         }
       }
@@ -334,7 +334,7 @@ private fun DeviceChips(
 @Composable
 private fun SessionList(
   state: LagoonState, controller: LagoonController, grouping: HomeGrouping, query: String,
-   onOpen: (SessionTarget) -> Unit, onNewSession: () -> Unit, onEditServer: (ServerProfile?) -> Unit,
+   onOpen: (SessionTarget) -> Unit, onNewSession: () -> Unit, onManageDevices: () -> Unit,
   onRename: (Session) -> Unit, onDelete: (Session) -> Unit
 ) {
   var refreshing by remember { mutableStateOf(false) }
@@ -444,7 +444,7 @@ private fun SessionList(
         else Column(Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 48.dp), horizontalAlignment = Alignment.CenterHorizontally) {
           Text(when { state.loading -> "正在读取会话…"; query.isNotBlank() -> "没有符合条件的会话"; state.connected -> "暂无会话"; state.profiles.isEmpty() -> "还没有服务器"; else -> "尚未连接" }, color = muted)
           if (!state.loading && query.isBlank()) TextButton(text = if (state.connected) "新建会话" else if (state.profiles.isEmpty()) "添加服务器" else "重新连接",
-            onClick = { if (state.connected) onNewSession() else if (state.profiles.isEmpty()) onEditServer(null) else controller.reload() })
+            onClick = { if (state.connected) onNewSession() else if (state.profiles.isEmpty()) onManageDevices() else controller.reload() })
         }
       }
       if (state.sessionCursors.isNotEmpty()) item(key = "more") {

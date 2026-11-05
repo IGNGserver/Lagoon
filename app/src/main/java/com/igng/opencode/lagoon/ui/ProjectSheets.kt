@@ -115,14 +115,14 @@ internal fun DeviceWorkspaceScopeSheet(state: LagoonState, controller: LagoonCon
 @Composable
 internal fun AllServersScopeSheet(state: LagoonState, controller: LagoonController, onDismiss: () -> Unit) {
   val counts = state.sessions.filter { it.visibleOnHome }.groupingBy { it.serverId.orEmpty() }.eachCount()
-  SuperBottomSheet(title = "全部服务器", show = true, onDismissRequest = onDismiss) {
+  SuperBottomSheet(title = "全部设备", show = true, onDismissRequest = onDismiss) {
     LazyColumn(Modifier.fillMaxWidth().heightIn(max = 560.dp), contentPadding = PaddingValues(bottom = 16.dp)) {
       item {
         Card(Modifier.fillMaxWidth()) {
-          ChoiceRow("全部服务器", "${state.sessions.count { it.parentId == null }} 个会话", true, onClick = onDismiss)
+          ChoiceRow("全部设备", "${state.sessions.count { it.parentId == null }} 个会话", true, onClick = onDismiss)
         }
       }
-      item { SmallTitle("服务器", insideMargin = PaddingValues(horizontal = 16.dp, vertical = 8.dp)) }
+      item { SmallTitle("设备", insideMargin = PaddingValues(horizontal = 16.dp, vertical = 8.dp)) }
       items(state.profiles, key = { it.id }) { profile ->
         val snapshot = state.allServerSnapshots[profile.id]
         Card(Modifier.fillMaxWidth()) {

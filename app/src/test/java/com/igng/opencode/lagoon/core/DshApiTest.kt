@@ -1099,4 +1099,16 @@ class DshApiTest {
     }
   }
 
+  @Test fun tunnelHostHeaderIsAppliedToEveryRequest() = runBlocking {
+    MockWebServer().use { server ->
+      server.enqueue(rootOk())
+      server.enqueue(MockResponse().setResponseCode(401))
+      val client = DshApi(profile(server), ServerCredentials("dsh", "tok"), hostHeader = "127.0.0.1:45678")
+      runCatching { client.health() }
+      val request = server.takeRequest(2, TimeUnit.SECONDS)
+      assertNotNull(request)
+      assertEquals("127.0.0.1:45678", request!!.getHeader("Host"))
+      client.close()
+    }
+  }
 }

@@ -7,17 +7,30 @@ import java.io.IOException
 /**
  * Local-only device grouping. The groups never leave this installation; a corrupt or missing
  * record must not affect saved servers or credentials.
+ *
+ * Version 2 changed the home model from “every ungrouped profile is a tab” to “全部 + explicit
+ * groups”. Existing v1 groups are therefore discarded exactly once and replaced by a v2 empty
+ * document; profiles, credentials and caches are untouched.
  */
 internal class DeviceGroupStore internal constructor(private val preferences: SharedPreferences) {
   constructor(context: Context) : this(context.getSharedPreferences("device-groups", Context.MODE_PRIVATE))
 
-  fun load(): DeviceGroupState {
-    val text = preferences.getString(KEY, null) ?: return DeviceGroupState()
+  data class Loaded(val state: DeviceGroupState, val resetLegacy: Boolean)
+
+  fun load(): Loaded {
+    val text = preferences.getString(KEY, null) ?: return Loaded(DeviceGroupState(), resetLegacy = false)
+    val version = DeviceGroupCodec.version(text)
+    if (version != null && version in 1 until DeviceGroupCodec.VERSION) {
+      // Persist the reset immediately so a process kill during upgrade cannot wipe a second time.
+      runCatching { save(DeviceGroupState()) }
+        .onFailure { Diagnostics.warn("DeviceGroupStore", "旧版设备分组重置写入失败", it) }
+      return Loaded(DeviceGroupState(), resetLegacy = true)
+    }
     return try {
-      DeviceGroupCodec.decode(text)
+      Loaded(DeviceGroupCodec.decode(text), resetLegacy = false)
     } catch (error: Exception) {
       Diagnostics.warn("DeviceGroupStore", "设备分组读取失败，已忽略本机分组", error)
-      DeviceGroupState()
+      Loaded(DeviceGroupState(), resetLegacy = false)
     }
   }
 

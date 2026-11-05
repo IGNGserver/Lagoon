@@ -201,8 +201,9 @@ fun ServersModal(
 }
 
 @Composable
-private fun MiuixServerForm(
+internal fun MiuixServerForm(
   existing: ServerProfile?,
+  fixedKind: ServerKind? = null,
   onCancel: () -> Unit,
   onDelete: (() -> Unit)?,
   onRemoteDetails: (() -> Unit)? = null,
@@ -218,7 +219,7 @@ private fun MiuixServerForm(
   val id = remember(existing?.id) { existing?.id ?: UUID.randomUUID().toString() }
   var name by rememberSaveable(existing?.id) { mutableStateOf(existing?.name ?: "") }
   var url by remember(existing?.id) { mutableStateOf(existing?.url ?: "") }
-  var harness by rememberSaveable(existing?.id) { mutableStateOf(existing?.kind ?: ServerKind.OPENCODE) }
+  var harness by rememberSaveable(existing?.id) { mutableStateOf(fixedKind ?: existing?.kind ?: ServerKind.OPENCODE) }
   val isDsh = harness == ServerKind.DSH
   var dshAuth by rememberSaveable(existing?.id) { mutableStateOf(existing?.dshAuth ?: DshAuthMode.TOKEN) }
   var remoteAccount by rememberSaveable(existing?.id) { mutableStateOf(existing?.username ?: "") }
@@ -241,7 +242,7 @@ private fun MiuixServerForm(
 
   if (harness == ServerKind.DSH_REMOTE) {
     Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-      SuperDropdown(
+      if (fixedKind == null) SuperDropdown(
         title = "服务类型",
         items = ServerKind.entries.map { it.label },
         selectedIndex = ServerKind.entries.indexOf(harness),
@@ -266,6 +267,7 @@ private fun MiuixServerForm(
 
   /** 粘贴 `dsh web` 的完整启动链接：拆成地址与令牌，并切到 DSH。 */
   fun acceptLaunchLink(text: String): Boolean {
+    if (fixedKind == ServerKind.OPENCODE) return false
     val link = DshLaunchLink.parse(text) ?: return false
     harness = ServerKind.DSH
     dshAuth = DshAuthMode.TOKEN
@@ -339,7 +341,7 @@ private fun MiuixServerForm(
       }
     }
 
-    item {
+    if (fixedKind == null) item {
       SuperDropdown(
         title = "服务类型",
         items = ServerKind.entries.map { it.label },
@@ -530,10 +532,9 @@ fun SettingsScreen(
   refreshMode: RefreshMode,
   onRefreshMode: (RefreshMode) -> Unit,
   onNotifications: () -> Unit,
-  onEditServer: (ServerProfile?) -> Unit,
   onManageModels: () -> Unit,
-  onRemoteHosts: () -> Unit,
   onManageDevices: () -> Unit = {},
+  onAddDevice: () -> Unit = {},
   onBack: () -> Unit
 ) {
   val context = androidx.compose.ui.platform.LocalContext.current
@@ -625,29 +626,17 @@ fun SettingsScreen(
     contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 4.dp, bottom = 48.dp)
   ) {
     item {
-      SmallTitle("服务器")
+      SmallTitle("设备")
       Card(Modifier.fillMaxWidth()) {
-        state.profiles.forEach { profile ->
-          val current = profile.id == state.serverId
-          SuperArrow(
-            title = profile.name,
-            summary = if (!current) profile.url else if (state.connected) "当前 · ${profile.kind.label}${state.version.takeIf { it.isNotBlank() && !it.equals(profile.kind.label, true) }?.let { " $it" }.orEmpty()} · ${profile.url}" else "当前 · 未连接 · ${profile.url}",
-            onClick = { onEditServer(profile) }
-          )
-        }
-        SuperArrow(title = "添加服务器", summary = "OpenCode 地址 / pair 链接，或 DeepSeek Harness 令牌", onClick = { onEditServer(null) })
         SuperArrow(
-          title = "设备分组",
-          summary = if (state.deviceGroups.isEmpty()) "把同一台电脑上的多个 harness 归到一个设备"
-            else "${state.deviceGroups.size} 个设备 · 手动分组",
+          title = "设备管理",
+          summary = "${state.profiles.size} 个连接 · ${state.deviceGroups.size} 个分组",
           onClick = onManageDevices
         )
-        val catalogs = remember(state.profiles) { controller.remoteCatalogs() }
         SuperArrow(
-          title = "DSH Remote 主机",
-          summary = if (catalogs.isEmpty()) "用浏览器登录，接入电脑上的 DSH"
-            else "${catalogs.first().account} · ${catalogs.sumOf { it.hosts.size }} 台主机",
-          onClick = onRemoteHosts
+          title = "添加设备",
+          summary = "OpenCode、DSH Remote Hub 或 SSH 主机",
+          onClick = onAddDevice
         )
         SuperArrow(
           title = "模型显示",
@@ -688,10 +677,10 @@ fun SettingsScreen(
     item {
       SmallTitle("授权")
       Card(Modifier.fillMaxWidth()) {
-        SuperSwitch(title = "不显示授权窗口", summary = "本手机全部服务器：隐藏授权窗口、列表标记和通知；不会因此允许操作，任务可能仍等待电脑端处理",
+        SuperSwitch(title = "不显示授权窗口", summary = "本手机全部设备：隐藏授权窗口、列表标记和通知；不会因此允许操作，任务可能仍等待电脑端处理",
           checked = state.permissionPolicy.hide,
           onCheckedChange = { controller.setPermissionPolicy(state.permissionPolicy.copy(hide = it)) })
-        SuperSwitch(title = "自动授权", summary = "本手机全部服务器：自动对每个权限请求“允许一次”，不保存永久规则；请仅连接可信服务器",
+        SuperSwitch(title = "自动授权", summary = "本手机全部设备：自动对每个权限请求“允许一次”，不保存永久规则；请仅连接可信设备",
           checked = state.permissionPolicy.autoApprove,
           onCheckedChange = { controller.setPermissionPolicy(state.permissionPolicy.copy(autoApprove = it)) })
       }

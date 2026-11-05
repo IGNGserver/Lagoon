@@ -1,5 +1,12 @@
 # DSH Go 远程能力借鉴与 Lagoon 落位设计
 
+> **2026-11-05 更新**：SSH 主机已作为 DSH 的一等连接方式落地，行为/配置对齐 dsh-Go 的
+> `SshHostConfig` + `RemoteDshBootstrap` + `SshHostLink`，实现为 Kotlin/JSch 独立重写；
+> 直连 DSH（地址 + 令牌）已从新建设备入口移除。设计与限制见
+> [`SSH_HOSTS.md`](SSH_HOSTS.md)，设备管理见 [`DEVICE_MANAGEMENT.md`](DEVICE_MANAGEMENT.md)。
+> 本文正文中“明确不做 SSH 主机”“SSH 作为远程主路径不借鉴”等结论已被此次更新取代，保留原文
+> 仅用于记录当时的取舍。
+>
 > 分析对象：`ccch1mneyyy/dsh-Go`（GitHub 约 9.1k Star，2026-11-04 抓取的 `9ac085f`）与
 > `liguobao/ds-harness-remote`（Remote Protocol v1，0.6.x Host 插件）。
 > Lagoon 基线：`cd45f72`。

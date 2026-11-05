@@ -91,6 +91,9 @@ class MainActivity : ComponentActivity() {
        // Saveable: rotating or switching the system theme recreates the activity, which closed these sheets.
        var showingServerForm by rememberSaveable { mutableStateOf(false) }
        var editingServerId by rememberSaveable { mutableStateOf<String?>(null) }
+       var showingAddDevice by rememberSaveable { mutableStateOf(false) }
+       var addingOpenCodeId by rememberSaveable { mutableStateOf<String?>(null) }
+       var addingSshHostId by rememberSaveable { mutableStateOf<String?>(null) }
        var showingProjects by rememberSaveable { mutableStateOf(false) }
        var showingAllDraftTarget by rememberSaveable { mutableStateOf(false) }
        var pendingDraftTarget by remember { mutableStateOf<Pair<String, String>?>(null) }
@@ -128,14 +131,33 @@ class MainActivity : ComponentActivity() {
          focusManager.clearFocus()
          if (home.allServers) { showingAllDraftTarget = true; return }
          if (home.homeGroup != null) { showingGroupDraftTarget = true; return }
-         if (!state.connected) { globalMessage = if (state.profiles.isEmpty()) "先添加一个服务器" else "服务器尚未连接，连接后才能新建会话"; globalMessageType = MiuixToastType.INFO; return }
+         if (!state.connected) {
+           if (state.profiles.isEmpty()) { showingAddDevice = true }
+           else { globalMessage = "设备尚未连接，连接后才能新建会话"; globalMessageType = MiuixToastType.INFO }
+           return
+         }
         if (state.projects.isEmpty()) { globalMessage = "先添加一个项目"; globalMessageType = MiuixToastType.INFO; showingProjects = true; return }
         controller.beginDraft()
         draftNonce += 1
          navigator.navigate(navigator.navigation.copy(sessions = listOf(DRAFT_SESSION)))
        }
       fun openPage(page: RootPage) { focusManager.clearFocus(); navigator.navigate(navigator.navigation.push(page)) }
-      fun editServer(profile: ServerProfile?) { editingServerId = profile?.id; showingServerForm = true }
+      fun editServer(profile: ServerProfile?) {
+        showingAddDevice = false; addingOpenCodeId = null; addingSshHostId = null
+        editingServerId = profile?.id; showingServerForm = true
+      }
+      fun editDevice(profile: ServerProfile) {
+        showingServerForm = false; editingServerId = null
+        when {
+          profile.sshHostId != null -> { addingSshHostId = profile.sshHostId; addingOpenCodeId = null; showingAddDevice = true }
+          profile.kind == ServerKind.OPENCODE -> { addingOpenCodeId = profile.id; addingSshHostId = null; showingAddDevice = true }
+          else -> editServer(profile)
+        }
+      }
+      fun addDevice() {
+        showingServerForm = false; editingServerId = null
+        addingOpenCodeId = null; addingSshHostId = null; showingAddDevice = true
+      }
       fun goBack() = navigator.goBack()
       SideEffect {
         navigator.onBack = { from, to ->
@@ -166,7 +188,8 @@ class MainActivity : ComponentActivity() {
          val target = pendingDraftTarget ?: return@LaunchedEffect
          // 只等这一次连接成功：没有超时的等待会让“之后手动连接该服务器”被误当成草稿目标，
          // 把用户突然拽进空白草稿页；失败则给出明确反馈。
-         val connected = withTimeoutOrNull(15_000) {
+         // SSH hosts may need a handshake, dsh web bootstrap and a tunnel before the first session.
+         val connected = withTimeoutOrNull(45_000) {
            while (!(controller.state.value.serverId == target.first && controller.state.value.connected)) delay(200)
            true
          } ?: false
@@ -194,13 +217,13 @@ class MainActivity : ComponentActivity() {
         lifecycle.addObserver(observer); visible(lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED))
         onDispose { lifecycle.removeObserver(observer); visible(false) }
       }
-      LaunchedEffect(state.profiles.isEmpty()) { if (state.profiles.isEmpty()) editServer(null) }
+      LaunchedEffect(state.profiles.isEmpty()) { if (state.profiles.isEmpty()) addDevice() }
       LaunchedEffect(state.error) { state.error?.let { globalMessage = it; globalMessageType = MiuixToastType.ERROR; controller.clearError() } }
       LaunchedEffect(state.message) { state.message?.let { globalMessage = it; globalMessageType = MiuixToastType.SUCCESS; controller.clearMessage() } }
        LaunchedEffect(deepLink) {
          val (server, session) = deepLink ?: return@LaunchedEffect
          handledDeepLink = "$server:$session"
-          if (state.profiles.none { it.id == server }) { globalMessage = "这个服务器已移除"; globalMessageType = MiuixToastType.ERROR; deepLink = null }
+          if (state.profiles.none { it.id == server }) { globalMessage = "这个设备已移除"; globalMessageType = MiuixToastType.ERROR; deepLink = null }
           else {
             navigator.navigate(SessionNavigation()); openSession(SessionTarget(server, session)); deepLink = null
           }
@@ -218,6 +241,7 @@ class MainActivity : ComponentActivity() {
           route.session == DRAFT_SESSION -> "新会话"
           route.session != null -> "会话"
           route.page == RootPage.ARCHIVED -> "已归档"
+          route.page == RootPage.DEVICES -> "设备管理"
           route.page == RootPage.SETTINGS -> "设置"
           else -> "首页"
         }
@@ -251,19 +275,24 @@ class MainActivity : ComponentActivity() {
                    controller.state.value.serverId?.let { server -> openSession(SessionTarget(server, child), child = true) }
                  }, onModal = {}, interactive = active)
                  target.page == RootPage.ARCHIVED -> ArchivedScreen(home, controller, onOpen = { openSession(it) }, onBack = { goBack() })
+                 target.page == RootPage.DEVICES -> DeviceManagementScreen(
+                   state = state, controller = controller, onBack = { goBack() },
+                   onAddDevice = { addDevice() },
+                   onEditGroup = { groupId -> editingGroupId = groupId; showingDeviceGroups = true },
+                   onEditProfile = { profile -> editDevice(profile) },
+                   onEditSshHost = { hostId -> addingSshHostId = hostId; addingOpenCodeId = null; showingAddDevice = true },
+                   onLoginHub = { showingRemoteEnroll = true },
+                   onManageHub = { showingRemoteHosts = true }
+                 )
                  target.page == RootPage.SETTINGS -> SettingsScreen(state, controller, themeMode, { themeMode = it; preferences.edit().putString("themeMode", it.name).apply() }, previewBack, { previewBack = it; preferences.edit().putBoolean("previewBack", it).apply() }, refreshMode, { refreshMode = it; controller.setRefreshMode(it) }, {
                    if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
                    else startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, packageName))
-                 }, ::editServer, onManageModels = { showingModelManagement = true }, onRemoteHosts = { showingRemoteHosts = true }, onManageDevices = { editingGroupId = null; showingDeviceGroups = true }, onBack = { goBack() })
+                 }, onManageModels = { showingModelManagement = true },
+                   onManageDevices = { openPage(RootPage.DEVICES) }, onAddDevice = { addDevice() }, onBack = { goBack() })
                  else -> HomeScreen(home, controller, onOpen = { openSession(it) }, onNewSession = { openDraft() }, onProjects = { showingProjects = true },
-                    onSelectServer = { profile ->
-                      if (profile == null) controller.setAllServers(true)
-                      else controller.selectProfile(profile.id)
-                    },
-                    onEditServer = ::editServer,
                     onSelectGroup = { group -> controller.selectGroup(group.id) },
                     onEditGroup = { group -> editingGroupId = group.id; showingDeviceGroups = true },
-                    onManageDevices = { editingGroupId = null; showingDeviceGroups = true },
+                    onManageDevices = { openPage(RootPage.DEVICES) },
                     onPage = ::openPage)
               }
             }
@@ -324,6 +353,15 @@ class MainActivity : ComponentActivity() {
              if (showingDeviceGroups) DeviceGroupsSheet(state, controller, editingGroupId, onDismiss = {
                showingDeviceGroups = false; editingGroupId = null
              })
+            if (showingAddDevice) AddDeviceSheet(
+              state = state,
+              controller = controller,
+              existingOpenCode = state.profiles.firstOrNull { it.id == addingOpenCodeId },
+              initialSshHostId = addingSshHostId,
+              onDismiss = { showingAddDevice = false; addingOpenCodeId = null; addingSshHostId = null },
+              onLoginHub = { showingAddDevice = false; addingOpenCodeId = null; addingSshHostId = null; showingRemoteEnroll = true },
+              onManageHub = { showingAddDevice = false; addingOpenCodeId = null; addingSshHostId = null; showingRemoteHosts = true }
+            )
              if (showingGroupDraftTarget) GroupDraftTargetSheet(home, profiles = home.homeGroupProfiles,
                onSelect = { profile, project ->
                  showingGroupDraftTarget = false

@@ -72,7 +72,8 @@ class NotificationActionReceiver : BroadcastReceiver() {
     val store = ServerStore(context)
     val profile = store.profiles().firstOrNull { it.id == serverId } ?: return false
     if (profileUrl != profile.url) return false
-    val client = createHarnessClient(profile, store.credentials(serverId), callTimeoutSeconds = 8)
+    val client = if (profile.sshHostId != null) LagoonController.get(context).sshClientForNotification(profile)
+      else createHarnessClient(profile, store.credentials(serverId), callTimeoutSeconds = 8)
     return try {
       when (action) {
         "abort" -> client.abort(Session(sessionId, directory, "", 0))

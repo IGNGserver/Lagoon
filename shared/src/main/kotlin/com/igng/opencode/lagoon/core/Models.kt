@@ -18,7 +18,12 @@ data class ServerProfile(
   /** DSH Remote Host selected from the authenticated DSH Hub account. */
   val remoteHostId: String? = null,
   /** Upstream's 12-hex-character SHA-256 Host identity fingerprint, confirmed during pairing. */
-  val remoteHostFingerprint: String? = null
+  val remoteHostFingerprint: String? = null,
+  /**
+   * Set when this DSH profile is reached through a saved SSH host. The connection is built by the
+   * app's SSH layer; [url] only carries a stable `ssh://user@host:port` display identity.
+   */
+  val sshHostId: String? = null
 )
 
 data class Project(val id: String, val directory: String, val name: String, val sandboxes: List<String> = emptyList(),
