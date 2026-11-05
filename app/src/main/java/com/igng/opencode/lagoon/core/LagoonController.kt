@@ -368,14 +368,15 @@ class LagoonController private constructor(private val appContext: Context) {
     for (host in selected) {
       val current = existing.firstOrNull { it.kind == ServerKind.DSH_REMOTE && it.remoteHostId == host.hostId && canonicalRemoteOrigin(it.url) == catalog.origin }
       if (current != null) {
-        // Refresh the cached fingerprint/name without touching credentials or user settings.
-        if (current.name == catalog.account || current.name == host.name) continue
-        created += current
+        // Reuse the saved profile; only an auto-generated " (N)" suffix may be dropped.
+        val repaired = ProfileNames.adoptHostName(current, host.name, store.profiles())
+        if (repaired != null) {
+          runCatching { store.rename(repaired.id, repaired.name) }
+            .onFailure { Diagnostics.warn("ServerStore", "无法修复设备名称 ${repaired.id}", it) }
+        }
         continue
       }
-      var name = host.name.ifBlank { "远程主机" }
-      var suffix = 2
-      while (store.profiles().any { it.name == name }) { name = "${host.name} (${suffix++})" }
+      val name = ProfileNames.uniqueDeviceName(host.name, store.profiles())
       val profile = ServerProfile(
         id = java.util.UUID.randomUUID().toString(),
         name = name,
@@ -429,7 +430,15 @@ class LagoonController private constructor(private val appContext: Context) {
   private val sshHostManager = SshHostManager(sshHostStore)
   private val mutable = MutableStateFlow(
     run {
-      val profiles = store.profiles()
+      val storedProfiles = store.profiles()
+      // Old builds deduped device names against every profile, including OpenCode Harnesses. Strip
+      // only suffixes proven to be generated: the base must still be the Hub's name for this Host.
+      val profiles = ProfileNames.repairGeneratedSuffixes(storedProfiles, store.remoteCatalogs()).also { repaired ->
+        repaired.filterIndexed { index, profile -> profile.name != storedProfiles[index].name }.forEach { profile ->
+          runCatching { store.rename(profile.id, profile.name) }
+            .onFailure { Diagnostics.warn("ServerStore", "无法修复设备名称 ${profile.id}", it) }
+        }
+      }
       val groupLoad = deviceGroupStore.load()
       val groups = groupLoad.state.sanitized(profiles.map { it.id }.toSet())
       val sshHosts = sshHostStore.load()

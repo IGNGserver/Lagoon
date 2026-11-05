@@ -375,19 +375,34 @@ class ServerStore internal constructor(private val preferences: SharedPreference
     val encoded = if (profile.sshHostId != null || (next.password.isEmpty() && next.cookie.isEmpty())) null else encryptValue(JSONObject()
       .put("origin", credentialOrigin(profile.url)).put("username", next.username).put("password", next.password).put("cookie", next.cookie).toString())
     val updated = profiles().filterNot { it.id == profile.id } + profile
-    val json = JSONArray().apply { updated.forEach { item -> put(JSONObject()
-      .put("id", item.id).put("name", item.name).put("url", item.url).put("username", item.username)
-      .put("autoConnect", item.autoConnect).put("notifications", item.notifications)
-       .put("allowCleartext", item.allowCleartext).put("kind", item.kind.wire).put("dshAuth", item.dshAuth.wire)
-       .putOpt("remoteHostId", item.remoteHostId).putOpt("remoteHostFingerprint", item.remoteHostFingerprint)
-       .putOpt("sshHostId", item.sshHostId)) } }
+    val json = profilesJson(updated)
     check(secrets.edit().putString(profile.id, encoded).commit()) { "无法保存凭据，请重试" }
     val migration = DshRemoteMigration.plan(profile)
-    val editor = preferences.edit().putString("profiles", json.toString())
+    val editor = preferences.edit().putString("profiles", json)
     if (migration == null) editor.remove("remoteMigration:${profile.id}")
     else editor.putString("remoteMigration:${profile.id}", JSONObject().put("retained", true).put("reason", migration.reason).toString())
     check(editor.commit()) { "无法保存服务器资料，请重试" }
   }
+
+  /**
+   * Changes only the display name. Credentials, routing, migration notes and every other field stay
+   * untouched, so a naming repair can never invalidate a login.
+   */
+  fun rename(id: String, name: String) {
+    val updated = profiles().map { if (it.id == id) it.copy(name = name) else it }
+    check(preferences.edit().putString("profiles", profilesJson(updated)).commit()) { "无法保存服务器资料，请重试" }
+  }
+
+  private fun profilesJson(profiles: List<ServerProfile>): String = JSONArray().apply {
+    profiles.forEach { item ->
+      put(JSONObject()
+        .put("id", item.id).put("name", item.name).put("url", item.url).put("username", item.username)
+        .put("autoConnect", item.autoConnect).put("notifications", item.notifications)
+        .put("allowCleartext", item.allowCleartext).put("kind", item.kind.wire).put("dshAuth", item.dshAuth.wire)
+        .putOpt("remoteHostId", item.remoteHostId).putOpt("remoteHostFingerprint", item.remoteHostFingerprint)
+        .putOpt("sshHostId", item.sshHostId))
+    }
+  }.toString()
 
   /** Direct DSH material stays on its original profile. Null means this profile needs no migration note. */
   fun remoteMigration(id: String): DshRemoteMigration? {
@@ -415,15 +430,8 @@ class ServerStore internal constructor(private val preferences: SharedPreference
     decryptValue(value)
   } catch (_: Exception) { null }
   fun delete(id: String) {
-    val json = JSONArray().apply { profiles().filterNot { it.id == id }.forEach { item ->
-      put(JSONObject().put("id", item.id).put("name", item.name).put("url", item.url)
-        .put("username", item.username).put("autoConnect", item.autoConnect)
-        .put("notifications", item.notifications)
-        .put("allowCleartext", item.allowCleartext).put("kind", item.kind.wire).put("dshAuth", item.dshAuth.wire)
-        .putOpt("remoteHostId", item.remoteHostId).putOpt("remoteHostFingerprint", item.remoteHostFingerprint)
-        .putOpt("sshHostId", item.sshHostId))
-    } }
-    val editor = preferences.edit().putString("profiles", json.toString()).remove("directories:$id").remove("sessionNotices:$id").remove("collapsedSections:$id").remove("collapsedProjects:$id").remove("pinned:$id").remove("remoteMigration:$id")
+    val editor = preferences.edit().putString("profiles", profilesJson(profiles().filterNot { it.id == id }))
+      .remove("directories:$id").remove("sessionNotices:$id").remove("collapsedSections:$id").remove("collapsedProjects:$id").remove("pinned:$id").remove("remoteMigration:$id")
       .remove("backgroundRunning:$id")
       .remove("modelVisibility:$id").remove("modelVisibilityConfigured:$id").remove("modelVariants:$id").remove("recentModels:$id").remove("scope:$id")
     val prefixes = listOf("location", "preview", "configuration", "taskRead", "taskState", "taskParent", "taskTime", "notification", "taskLedgerVersion").map { "$it:$id:" }

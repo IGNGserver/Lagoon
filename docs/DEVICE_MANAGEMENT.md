@@ -44,6 +44,9 @@ DSH 分页不再提供“直连 DSH”的地址/令牌输入。已有旧版直�
 - 登录后批量发现主机，逐台核对 Host 指纹，再为每台主机注册独立 client 身份（沿用
   `RemoteAccountManager` 的多 Host 并行模型）。
 - Hub 下的每台 Host 是独立设备/profile；不会退化成 dsh-Go 的“一次只连一台”。
+- Host 名称只在“设备”范围内去重：OpenCode / 旧版直连 DSH 属于 Harness，和设备同名不会再让
+  设备被保存成 `ubuntu-dev (2)`。旧版本已经写入的这种后缀会在启动时按 Hub 目录自动纠正；
+  只有同一分区里确实重名的第二台设备才保留 `(2)`。
 
 ### SSH 主机
 
