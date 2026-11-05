@@ -24,11 +24,10 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import com.igng.opencode.lagoon.core.DeviceMemberRole
 import com.igng.opencode.lagoon.core.LagoonController
 import com.igng.opencode.lagoon.core.LagoonState
 import com.igng.opencode.lagoon.core.ServerKind
-import com.igng.opencode.lagoon.core.deviceMemberRole
+import com.igng.opencode.lagoon.core.endpointSummary
 import top.yukonga.miuix.kmp.basic.ButtonDefaults
 import top.yukonga.miuix.kmp.basic.Checkbox
 import top.yukonga.miuix.kmp.basic.SmallTitle
@@ -61,8 +60,8 @@ internal fun DeviceGroupsSheet(
       } ?: true
     )
   }
-  val devices = state.profiles.filter { it.deviceMemberRole == DeviceMemberRole.DEVICE }
-  val harnesses = state.profiles.filter { it.deviceMemberRole == DeviceMemberRole.HARNESS }
+  val opencodeMembers = state.profiles.filter { it.kind == ServerKind.OPENCODE }
+  val dshMembers = state.profiles.filter { it.kind != ServerKind.OPENCODE }
 
   SuperBottomSheet(
     title = if (editing != null) "编辑设备组" else "新建设备组",
@@ -75,7 +74,7 @@ internal fun DeviceGroupsSheet(
       verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
       item {
-        Text("把同一台电脑的设备和 Harness 放进一个组。首页只显示「全部」和这些分组；分组只影响本机展示。",
+        Text("把同一台电脑上的不同连接放进一个组。首页只显示「全部」和这些分组；分组只影响本机展示。",
           style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
       }
       item { TextField(value = name, onValueChange = { name = it }, label = "分组名称", modifier = Modifier.fillMaxWidth()) }
@@ -87,22 +86,18 @@ internal fun DeviceGroupsSheet(
           onCheckedChange = { connectAll = it }
         )
       }
-      if (devices.isNotEmpty()) {
-        item { SmallTitle("设备", insideMargin = PaddingValues(horizontal = 4.dp, vertical = 4.dp)) }
-        items(devices, key = { "device:${it.id}" }) { profile ->
-          MemberRow(profile.name, when {
-            profile.sshHostId != null -> "SSH · ${profile.url.removePrefix("ssh://")}"
-            else -> "DSH Remote · ${profile.remoteHostId?.take(8).orEmpty()}"
-          }, profile.id in selected, profile.kind) {
+      if (opencodeMembers.isNotEmpty()) {
+        item { SmallTitle("OpenCode", insideMargin = PaddingValues(horizontal = 4.dp, vertical = 4.dp)) }
+        items(opencodeMembers, key = { "oc:${it.id}" }) { profile ->
+          MemberRow(profile.name, profile.endpointSummary, profile.id in selected, profile.kind) {
             selected = if (profile.id in selected) selected - profile.id else selected + profile.id
           }
         }
       }
-      if (harnesses.isNotEmpty()) {
-        item { SmallTitle("Harness", insideMargin = PaddingValues(horizontal = 4.dp, vertical = 4.dp)) }
-        items(harnesses, key = { "harness:${it.id}" }) { profile ->
-          MemberRow(profile.name, if (profile.kind == ServerKind.OPENCODE) "OpenCode" else "旧版直连 DSH",
-            profile.id in selected, profile.kind) {
+      if (dshMembers.isNotEmpty()) {
+        item { SmallTitle("DeepSeek Harness", insideMargin = PaddingValues(horizontal = 4.dp, vertical = 4.dp)) }
+        items(dshMembers, key = { "dsh:${it.id}" }) { profile ->
+          MemberRow(profile.name, profile.endpointSummary, profile.id in selected, profile.kind) {
             selected = if (profile.id in selected) selected - profile.id else selected + profile.id
           }
         }

@@ -9,7 +9,6 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -17,7 +16,6 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -25,14 +23,11 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.igng.opencode.lagoon.core.DeviceGroup
-import com.igng.opencode.lagoon.core.DeviceGroupState
-import com.igng.opencode.lagoon.core.DeviceMemberRole
 import com.igng.opencode.lagoon.core.LagoonController
 import com.igng.opencode.lagoon.core.LagoonState
 import com.igng.opencode.lagoon.core.ServerKind
 import com.igng.opencode.lagoon.core.ServerProfile
-import com.igng.opencode.lagoon.core.deviceMemberRole
-import top.yukonga.miuix.kmp.basic.ButtonDefaults
+import com.igng.opencode.lagoon.core.endpointSummary
 import top.yukonga.miuix.kmp.basic.Card
 import top.yukonga.miuix.kmp.basic.CardDefaults
 import top.yukonga.miuix.kmp.basic.Icon
@@ -44,14 +39,10 @@ import top.yukonga.miuix.kmp.icon.MiuixIcons
 import top.yukonga.miuix.kmp.icon.extended.Add
 import top.yukonga.miuix.kmp.icon.extended.GridView
 import top.yukonga.miuix.kmp.icon.extended.Link
-import top.yukonga.miuix.kmp.icon.extended.Refresh
-import top.yukonga.miuix.kmp.icon.extended.Settings
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 
 /**
- * One place for every saved device / harness: 全部, explicit groups, the DSH Remote Hub account
- * and ungrouped endpoints. Starting a new connection is one tap away; no per-profile top-bar tabs
- * and no add button on the home strip.
+ * 设备管理：聚合全部连接、显式设备分组、DSH 远程中枢账号与独立端点。
  */
 @Composable
 internal fun DeviceManagementScreen(
@@ -67,8 +58,6 @@ internal fun DeviceManagementScreen(
 ) {
   val catalog = controller.activeRemoteCatalog()
   val groupOf = state.deviceGroups.flatMap { group -> group.memberIds.map { it to group.name } }.toMap()
-  val devices = state.profiles.filter { it.deviceMemberRole == DeviceMemberRole.DEVICE }
-  val harnesses = state.profiles.filter { it.deviceMemberRole == DeviceMemberRole.HARNESS }
   val online = state.profiles.count { profile ->
     if (profile.id == state.serverId) state.connected else state.allServerSnapshots[profile.id]?.connected == true
   }
@@ -90,8 +79,10 @@ internal fun DeviceManagementScreen(
           Row(verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
               Text("设备分组已重置", style = MiuixTheme.textStyles.body1.copy(fontWeight = FontWeight.Medium))
-              Text("旧版分组已按新的“全部 + 分组”规则清空一次，设备、凭据和会话都还在。",
-                style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
+              Text(
+                "旧版分组已按新的“全部 + 分组”规则清空一次，连接记录、凭据和会话都完好保留。",
+                style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+              )
             }
             TextButton(text = "知道了", onClick = { controller.dismissDeviceGroupReset() })
           }
@@ -109,8 +100,10 @@ internal fun DeviceManagementScreen(
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
               Text("全部设备", style = MiuixTheme.textStyles.body1.copy(fontWeight = FontWeight.Medium))
-              Text("${devices.size} 个设备 · ${harnesses.size} 个 Harness · $online 在线",
-                style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
+              Text(
+                "${state.profiles.size} 个连接 · $online 在线",
+                style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+              )
             }
             DropdownChevron(18.dp, MiuixTheme.colorScheme.onSurfaceVariantSummary)
           }
@@ -118,25 +111,35 @@ internal fun DeviceManagementScreen(
       }
 
       item {
-        SmallTitle("DSH Remote Hub")
+        SmallTitle("DSH 远程中枢账号")
         if (catalog == null) {
           Card(Modifier.fillMaxWidth(), insideMargin = PaddingValues(horizontal = 14.dp, vertical = 12.dp)) {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-              Text("一个 Hub 账号，接入它下面所有电脑上的 DSH。", style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
-              TextButton(text = "登录 DSH Remote Hub", onClick = onLoginHub, modifier = Modifier.fillMaxWidth())
+              Text(
+                "登录中枢账号，安全接入名下各台托管电脑上的 DSH。",
+                style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+              )
+              TextButton(text = "登录 DSH 远程中枢", onClick = onLoginHub, modifier = Modifier.fillMaxWidth())
             }
           }
         } else {
           Card(Modifier.fillMaxWidth().clickable(onClick = onManageHub), insideMargin = PaddingValues(horizontal = 14.dp, vertical = 12.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
               Column(Modifier.weight(1f)) {
-                Text(catalog.account, style = MiuixTheme.textStyles.body1.copy(fontWeight = FontWeight.Medium),
-                  maxLines = 1, overflow = TextOverflow.Ellipsis)
-                Text("${catalog.origin} · ${catalog.hosts.size} 台主机",
+                Text(
+                  catalog.account,
+                  style = MiuixTheme.textStyles.body1.copy(fontWeight = FontWeight.Medium),
+                  maxLines = 1,
+                  overflow = TextOverflow.Ellipsis
+                )
+                Text(
+                  "${catalog.origin} · ${catalog.hosts.size} 台托管主机",
                   style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary),
-                  maxLines = 1, overflow = TextOverflow.Ellipsis)
+                  maxLines = 1,
+                  overflow = TextOverflow.Ellipsis
+                )
               }
-              Text("管理", style = MiuixTheme.textStyles.body2.copy(color = MiuixTheme.colorScheme.primary))
+              Text("管理中枢与主机", style = MiuixTheme.textStyles.body2.copy(color = MiuixTheme.colorScheme.primary))
               Spacer(Modifier.width(4.dp))
               DropdownChevron(18.dp, MiuixTheme.colorScheme.primary)
             }
@@ -149,17 +152,27 @@ internal fun DeviceManagementScreen(
         Card(Modifier.fillMaxWidth()) {
           if (state.deviceGroups.isEmpty()) {
             Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-              Text("把同一台电脑上的设备和 Harness 放进一个分组，首页只显示「全部」和这些分组。",
-                style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
-              TextButton(text = "新建设备组", onClick = { onEditGroup(null) }, modifier = Modifier.fillMaxWidth(),
-                enabled = state.profiles.isNotEmpty())
+              Text(
+                "把同一台电脑上的多个连接放进一个分组，首页只显示「全部」和这些分组。",
+                style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+              )
+              TextButton(
+                text = "新建设备组",
+                onClick = { onEditGroup(null) },
+                modifier = Modifier.fillMaxWidth(),
+                enabled = state.profiles.isNotEmpty()
+              )
             }
           } else {
             state.deviceGroups.forEach { group ->
               GroupRow(group, state, onClick = { onEditGroup(group.id) })
             }
-            TextButton(text = "新建设备组", onClick = { onEditGroup(null) }, modifier = Modifier.fillMaxWidth(),
-              enabled = state.profiles.isNotEmpty())
+            TextButton(
+              text = "新建设备组",
+              onClick = { onEditGroup(null) },
+              modifier = Modifier.fillMaxWidth(),
+              enabled = state.profiles.isNotEmpty()
+            )
           }
         }
       }
@@ -167,37 +180,51 @@ internal fun DeviceManagementScreen(
       if (state.profiles.isNotEmpty()) {
         item {
           SmallTitle("全部连接")
-          Text("分组只改变首页聚合；这里始终可以编辑每一台设备和 Harness。", Modifier.padding(horizontal = 16.dp),
-            style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
+          Text(
+            "分组只改变首页聚合；这里始终可以查看和编辑每一个已保存的连接。",
+            Modifier.padding(horizontal = 16.dp),
+            style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+          )
         }
-        val allDevices = state.profiles.filter { it.deviceMemberRole == DeviceMemberRole.DEVICE }
-        val allHarnesses = state.profiles.filter { it.deviceMemberRole == DeviceMemberRole.HARNESS }
-        if (allDevices.isNotEmpty()) {
+        val opencodeProfiles = state.profiles.filter { it.kind == ServerKind.OPENCODE }
+        val dshProfiles = state.profiles.filter { it.kind != ServerKind.OPENCODE }
+
+        if (opencodeProfiles.isNotEmpty()) {
           item {
-            Text("设备", Modifier.padding(start = 16.dp, top = 2.dp, bottom = 4.dp),
-              style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
+            Text(
+              "OpenCode",
+              Modifier.padding(start = 16.dp, top = 6.dp, bottom = 4.dp),
+              style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+            )
           }
-          items(allDevices, key = { "device:${it.id}" }) { profile ->
+          items(opencodeProfiles, key = { "profile:${it.id}" }) { profile ->
+            ProfileRow(profile, state, groupOf[profile.id]) { onEditProfile(profile) }
+          }
+        }
+
+        if (dshProfiles.isNotEmpty()) {
+          item {
+            Text(
+              "DeepSeek Harness",
+              Modifier.padding(start = 16.dp, top = 8.dp, bottom = 4.dp),
+              style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+            )
+          }
+          items(dshProfiles, key = { "profile:${it.id}" }) { profile ->
             ProfileRow(profile, state, groupOf[profile.id]) {
               if (profile.sshHostId != null) onEditSshHost(profile.sshHostId) else onEditProfile(profile)
             }
-          }
-        }
-        if (allHarnesses.isNotEmpty()) {
-          item {
-            Text("Harness", Modifier.padding(start = 16.dp, top = 8.dp, bottom = 4.dp),
-              style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
-          }
-          items(allHarnesses, key = { "harness:${it.id}" }) { profile ->
-            ProfileRow(profile, state, groupOf[profile.id]) { onEditProfile(profile) }
           }
         }
       }
 
       item {
         Card(Modifier.fillMaxWidth().padding(top = 12.dp)) {
-          SuperArrow(title = "添加设备", summary = "OpenCode、DSH Remote Hub 或 SSH 主机",
-            onClick = onAddDevice)
+          SuperArrow(
+            title = "添加设备",
+            summary = "OpenCode 直连、DSH 远程中枢或 DSH SSH 直连",
+            onClick = onAddDevice
+          )
         }
       }
     }
@@ -207,27 +234,35 @@ internal fun DeviceManagementScreen(
 @Composable
 private fun GroupRow(group: DeviceGroup, state: LagoonState, onClick: () -> Unit) {
   val members = group.memberIds.mapNotNull { id -> state.profiles.firstOrNull { it.id == id } }
-  val devices = members.count { it.deviceMemberRole == DeviceMemberRole.DEVICE }
-  val harnesses = members.count { it.deviceMemberRole == DeviceMemberRole.HARNESS }
   val online = members.count { profile ->
     if (profile.id == state.serverId) state.connected else state.allServerSnapshots[profile.id]?.connected == true
   }
   Column(Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 14.dp, vertical = 12.dp)) {
     Row(verticalAlignment = Alignment.CenterVertically) {
       Column(Modifier.weight(1f)) {
-        Text(group.name, style = MiuixTheme.textStyles.body1.copy(fontWeight = FontWeight.Medium),
-          maxLines = 1, overflow = TextOverflow.Ellipsis)
-        Text("$devices 个设备 · $harnesses 个 Harness · $online 在线",
-          style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
+        Text(
+          group.name,
+          style = MiuixTheme.textStyles.body1.copy(fontWeight = FontWeight.Medium),
+          maxLines = 1,
+          overflow = TextOverflow.Ellipsis
+        )
+        Text(
+          "${members.size} 个连接 · $online 在线",
+          style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+        )
       }
       members.take(4).forEach { HarnessBadge(it.kind) }
       Spacer(Modifier.width(4.dp))
       DropdownChevron(18.dp, MiuixTheme.colorScheme.onSurfaceVariantSummary)
     }
     if (members.isNotEmpty()) {
-      Text(members.joinToString("、") { it.name }, Modifier.padding(top = 4.dp),
+      Text(
+        members.joinToString("、") { it.name },
+        Modifier.padding(top = 4.dp),
         style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary),
-        maxLines = 1, overflow = TextOverflow.Ellipsis)
+        maxLines = 1,
+        overflow = TextOverflow.Ellipsis
+      )
     }
   }
 }
@@ -235,19 +270,18 @@ private fun GroupRow(group: DeviceGroup, state: LagoonState, onClick: () -> Unit
 @Composable
 private fun ProfileRow(profile: ServerProfile, state: LagoonState, groupName: String?, onClick: () -> Unit) {
   val connected = if (profile.id == state.serverId) state.connected else state.allServerSnapshots[profile.id]?.connected == true
-  val endpoint = when {
-    profile.sshHostId != null -> "SSH · ${profile.url.removePrefix("ssh://")}"
-    profile.kind == ServerKind.DSH_REMOTE -> "DSH Remote · ${profile.remoteHostId?.take(8).orEmpty()}"
-    profile.kind == ServerKind.OPENCODE -> "OpenCode · ${profile.url}"
-    else -> "旧版直连 DSH · ${profile.url}"
-  }
+  val endpoint = profile.endpointSummary
   val subtitle = if (groupName == null) endpoint else "$endpoint · 分组：$groupName"
   Card(Modifier.fillMaxWidth().padding(bottom = 2.dp), insideMargin = PaddingValues(horizontal = 14.dp, vertical = 10.dp)) {
-    Row(Modifier.fillMaxWidth().clickable(onClick = onClick).clip(RoundedCornerShape(12.dp)),
-      verticalAlignment = Alignment.CenterVertically) {
+    Row(
+      Modifier.fillMaxWidth().clickable(onClick = onClick).clip(RoundedCornerShape(12.dp)),
+      verticalAlignment = Alignment.CenterVertically
+    ) {
       Icon(
         if (profile.sshHostId != null) MiuixIcons.Link else MiuixIcons.GridView,
-        null, Modifier.size(22.dp), tint = MiuixTheme.colorScheme.onSurfaceVariantSummary
+        null,
+        Modifier.size(22.dp),
+        tint = MiuixTheme.colorScheme.onSurfaceVariantSummary
       )
       Spacer(Modifier.width(12.dp))
       Column(Modifier.weight(1f)) {
@@ -258,8 +292,12 @@ private fun ProfileRow(profile: ServerProfile, state: LagoonState, groupName: St
             Text("旧版", style = MiuixTheme.textStyles.footnote2.copy(color = MiuixColorTokens.Warning))
           }
         }
-        Text(subtitle, style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary),
-          maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Text(
+          subtitle,
+          style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary),
+          maxLines = 1,
+          overflow = TextOverflow.Ellipsis
+        )
       }
       if (connected) {
         StatusDot(MiuixColorTokens.Success)

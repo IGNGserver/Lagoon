@@ -35,6 +35,24 @@ val ServerProfile.deviceMemberRole: DeviceMemberRole
     else -> DeviceMemberRole.HARNESS
   }
 
+/** 统一连接类型展示标签（OpenCode 直连、DSH 远程中枢、DSH SSH 直连、旧版直连 DSH） */
+val ServerProfile.connectionTypeLabel: String
+  get() = when {
+    sshHostId != null -> "DSH SSH 直连"
+    kind == ServerKind.DSH_REMOTE -> "DSH 远程中枢"
+    kind == ServerKind.OPENCODE -> "OpenCode 直连"
+    else -> "旧版直连 DSH"
+  }
+
+/** 统一连接端点简要描述，例如 "OpenCode 直连 · http://..." */
+val ServerProfile.endpointSummary: String
+  get() = when {
+    sshHostId != null -> "DSH SSH 直连 · ${url.removePrefix("ssh://")}"
+    kind == ServerKind.DSH_REMOTE -> "DSH 远程中枢 · ${remoteHostId?.take(8).orEmpty()}"
+    kind == ServerKind.OPENCODE -> "OpenCode 直连 · $url"
+    else -> "旧版直连 DSH · $url"
+  }
+
 /** One profile with its presentation role, used by the device management page and group editor. */
 data class DeviceMember(val profile: ServerProfile, val role: DeviceMemberRole)
 

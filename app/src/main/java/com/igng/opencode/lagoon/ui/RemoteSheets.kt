@@ -132,12 +132,12 @@ internal fun RemoteEnrollSheet(
         confirmed = emptySet()
         review = false
       } catch (cancel: CancellationException) { throw cancel }
-      catch (e: Exception) { error = userFacingError(e, "登录 DSH Remote 失败") }
+      catch (e: Exception) { error = userFacingError(e, "登录 DSH 远程中枢失败") }
       finally { busy = false }
     }
   }
 
-  SuperBottomSheet(title = "DSH Remote", show = true, onDismissRequest = onDismiss) {
+  SuperBottomSheet(title = "DSH 远程中枢", show = true, onDismissRequest = onDismiss) {
     Column(Modifier.fillMaxWidth().fillMaxHeight(0.88f)) {
       LazyColumn(Modifier.weight(1f).fillMaxWidth(), contentPadding = PaddingValues(horizontal = 20.dp, vertical = 8.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -146,7 +146,7 @@ internal fun RemoteEnrollSheet(
             Text("登录后选择要接入的电脑。每台主机会在本机注册一个独立设备身份，用于同时保持连接。",
               style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
           }
-          item { TextField(value = origin, onValueChange = { origin = it; allowHttp = it.startsWith("http://", true); error = null }, label = "DSH Remote 服务器") }
+          item { TextField(value = origin, onValueChange = { origin = it; allowHttp = it.startsWith("http://", true); error = null }, label = "中枢服务器地址") }
           if (origin.startsWith("http://", true)) item {
             SuperSwitch(title = "允许此地址使用 HTTP", summary = "只在你信任的网络中开启", checked = allowHttp, onCheckedChange = { allowHttp = it })
           }
@@ -173,12 +173,12 @@ internal fun RemoteEnrollSheet(
             }
           } else if (!providersLoading && manager != null) {
             item {
-              Text("这个服务器没有提供浏览器登录；可在下面用邮箱密码登录，或换一个服务器地址。",
+              Text("这个中枢没有提供浏览器登录；可在下面用邮箱密码登录，或换一个中枢地址。",
                 style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
             }
           }
           item {
-            TextButton(text = if (showSelfHosted) "收起自建服务器登录" else "自建服务器 · 邮箱登录",
+            TextButton(text = if (showSelfHosted) "收起自建中枢登录" else "自建中枢 · 邮箱登录",
               onClick = { showSelfHosted = !showSelfHosted }, modifier = Modifier.fillMaxWidth())
           }
           if (showSelfHosted) {
@@ -252,7 +252,7 @@ internal fun RemoteEnrollSheet(
           }
         } else {
           item {
-            Text("核对主机指纹", style = MiuixTheme.textStyles.headline2.copy(fontWeight = FontWeight.Medium))
+            Text("核对远程主机指纹", style = MiuixTheme.textStyles.headline2.copy(fontWeight = FontWeight.Medium))
             Text("在电脑的远程插件状态页核对；全部勾选后才能接入。", style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
           }
           val chosen = candidates.filter { it.hostId in selected }
@@ -276,11 +276,11 @@ internal fun RemoteEnrollSheet(
                 try {
                   val enrollment = manager!!.enroll(chosen, chosen.associate { it.hostId to it.meta.fingerprint!! })
                   val added = controller.addRemoteProfiles(enrollment.catalog, chosen.map { it.meta })
-                  resultText = if (enrollment.failures.isEmpty()) "已接入 ${added.size} 台主机"
+                  resultText = if (enrollment.failures.isEmpty()) "已接入 ${added.size} 台远程主机"
                     else "已接入 ${added.size} 台；${enrollment.failures.size} 台失败：${enrollment.failures.values.first()}"
                   onDone(added.size)
                 } catch (cancel: CancellationException) { throw cancel }
-                catch (e: Exception) { error = userFacingError(e, "接入主机失败") }
+                catch (e: Exception) { error = userFacingError(e, "接入远程主机失败") }
                 finally { busy = false }
               }
             }, modifier = Modifier.fillMaxWidth())
@@ -313,10 +313,10 @@ internal fun RemoteAccountSummary(
   Card(modifier.fillMaxWidth(), insideMargin = PaddingValues(horizontal = 16.dp, vertical = 12.dp)) {
     Row(verticalAlignment = Alignment.CenterVertically) {
       Column(Modifier.weight(1f)) {
-        Text(if (catalogs.isEmpty()) "连接 DSH Remote" else "DSH Remote 账号", style = MiuixTheme.textStyles.body1)
+        Text(if (catalogs.isEmpty()) "连接 DSH 远程中枢" else "DSH 远程中枢账号", style = MiuixTheme.textStyles.body1)
         Text(
-          if (catalogs.isEmpty()) "用浏览器登录，接入电脑上的 DSH"
-          else "${catalogs.first().account} · $hosts 台主机",
+          if (catalogs.isEmpty()) "用浏览器登录，安全接入名下托管的 DSH 电脑"
+          else "${catalogs.first().account} · $hosts 台托管主机",
           style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary),
           maxLines = 1, overflow = TextOverflow.Ellipsis
         )
@@ -339,13 +339,13 @@ internal fun RemoteServerSummary(
   onCancel: () -> Unit
 ) {
   Column(Modifier.fillMaxWidth().padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-    Text(if (existing == null) "DSH Remote" else existing.name, style = MiuixTheme.textStyles.title3)
+    Text(if (existing == null) "DSH 远程主机" else existing.name, style = MiuixTheme.textStyles.title3)
     Text(
-      if (existing == null) "DSH Remote 主机通过账号登录接入；登录后选择要连接的电脑。"
+      if (existing == null) "DSH 托管主机通过中枢账号登录接入；登录后选择要连接的电脑。"
       else "${existing.remoteHostFingerprint?.let { formatFingerprint(it) } ?: "指纹待确认"} · ${existing.url}",
       style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
     )
-    TextButton(text = if (existing == null) "登录并选择主机" else "管理 DSH Remote 主机", onClick = onManage, modifier = Modifier.fillMaxWidth())
+    TextButton(text = if (existing == null) "登录中枢并选择主机" else "管理中枢与主机", onClick = onManage, modifier = Modifier.fillMaxWidth())
     if (existing != null && onDetails != null) {
       TextButton(text = "网络与连接", onClick = onDetails, modifier = Modifier.fillMaxWidth())
     }
@@ -383,7 +383,7 @@ internal fun RemoteConnectionDialog(
       val current = state.serverId == profile.id
       val rows = buildList {
         add("主机" to profile.name)
-        add("连接方式" to "DSH Remote")
+        add("连接方式" to "DSH 远程中枢")
         add("地址" to profile.url)
         add("状态" to when {
           !current -> "未打开"

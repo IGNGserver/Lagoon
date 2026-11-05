@@ -254,7 +254,7 @@ internal fun SshHostForm(
     item {
       Card(colors = CardDefaults.defaultColors(color = MiuixColorTokens.PrimarySubtle), insideMargin = PaddingValues(12.dp)) {
         Text(
-          "SSH 主机需要开着 SSH 并装好 DSH（POSIX shell，Linux / macOS / WSL）。连接时会自动启动或复用远端的 dsh web，再经本地隧道登录。",
+          "通过 SSH 连接远端电脑（Linux / macOS / WSL），连接时会自动在远端启动或复用 dsh web，再经本地加密隧道连接。",
           style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.primary)
         )
       }
@@ -384,7 +384,7 @@ internal fun SshHostForm(
     }
     if (initial != null) item {
       TextButton(
-        text = "删除 SSH 主机",
+        text = "删除 DSH SSH 主机",
         onClick = { confirmingDelete = true },
         modifier = Modifier.fillMaxWidth(),
         colors = ButtonDefaults.textButtonColors(textColor = MiuixColorTokens.Error)
@@ -395,7 +395,7 @@ internal fun SshHostForm(
   if (confirmingDelete && initial != null) {
     SuperDialog(title = "删除 ${initial.name}？", show = true, onDismissRequest = { confirmingDelete = false }) {
       Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text("会删除本机的 SSH 配置、加密凭据和对应的 DSH 设备资料；远端的 dsh web 与会话不会被删除。",
+        Text("会删除本机的 SSH 配置、加密凭据和对应的 DSH 连接资料；远端的 dsh web 与会话不会受到影响。",
           style = MiuixTheme.textStyles.body1)
         DialogActions("取消", { confirmingDelete = false }, "确认删除", danger = true) {
           controller.deleteSshHost(initial.id)

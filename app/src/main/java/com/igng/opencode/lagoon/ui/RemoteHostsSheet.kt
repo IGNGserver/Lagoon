@@ -42,9 +42,9 @@ internal fun RemoteHostsSheet(
   fun reload() { catalogState = controller.activeRemoteCatalog() }
 
   if (confirmSignOut && catalog != null) {
-    SuperDialog(title = "退出 DSH Remote？", show = true, onDismissRequest = { confirmSignOut = false }) {
+    SuperDialog(title = "退出 DSH 远程中枢？", show = true, onDismissRequest = { confirmSignOut = false }) {
       Column(Modifier.padding(top = 8.dp)) {
-        Text("会断开并停止本机后台重连；服务器资料、聊天缓存和主机指纹仍保留在本机。可在主机上重新登录。",
+        Text("会断开并停止本机后台重连；本地保存的配置、聊天缓存和主机指纹仍保留在本机。可在主机上重新登录。",
           style = MiuixTheme.textStyles.body1)
         DialogActions("取消", { confirmSignOut = false }, if (busy) "正在退出…" else "退出登录", !busy, danger = true) {
           scope.launch {
@@ -63,14 +63,14 @@ internal fun RemoteHostsSheet(
     }
   }
 
-  SuperBottomSheet(title = "远程主机", show = true, onDismissRequest = onDismiss) {
+  SuperBottomSheet(title = "DSH 远程主机", show = true, onDismissRequest = onDismiss) {
     Column(Modifier.fillMaxWidth().fillMaxHeight(0.78f)) {
       LazyColumn(Modifier.weight(1f).fillMaxWidth(), contentPadding = PaddingValues(horizontal = 20.dp, vertical = 8.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp)) {
         if (catalog == null) {
           item {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-              Text("还没有登录 DSH Remote。登录后选择要接入的电脑。", style = MiuixTheme.textStyles.footnote1)
+              Text("还没有登录 DSH 远程中枢。登录后选择要接入的电脑。", style = MiuixTheme.textStyles.footnote1)
               TextButton(text = "登录并接入主机", onClick = onEnroll, modifier = Modifier.fillMaxWidth())
             }
           }
@@ -89,13 +89,13 @@ internal fun RemoteHostsSheet(
           }
           item {
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-              Text("主机 · ${catalog.hosts.size}", Modifier.weight(1f), style = MiuixTheme.textStyles.footnote1.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
+              Text("托管主机 · ${catalog.hosts.size}", Modifier.weight(1f), style = MiuixTheme.textStyles.footnote1.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
               TextButton(text = if (busy) "刷新中…" else "刷新", enabled = !busy, onClick = {
                 scope.launch {
                   busy = true; error = null
                   try { manager?.refresh(); reload() }
                   catch (cancel: CancellationException) { throw cancel }
-                  catch (e: Exception) { error = userFacingError(e, "刷新主机失败") }
+                  catch (e: Exception) { error = userFacingError(e, "刷新中枢主机失败") }
                   finally { busy = false }
                 }
               })
@@ -110,7 +110,7 @@ internal fun RemoteHostsSheet(
                   Text(if (host.online) "在线" else "离线", style = MiuixTheme.textStyles.footnote2.copy(
                     color = if (host.online) MiuixColorTokens.Success else MiuixTheme.colorScheme.onSurfaceVariantSummary))
                 }
-                Text(listOfNotNull(host.platform.ifBlank { null }, host.harnessVersion?.let { "Harness $it" }, if (added(host.hostId)) "已添加" else "未添加").joinToString(" · "),
+                Text(listOfNotNull(host.platform.ifBlank { null }, host.harnessVersion?.let { "Harness $it" }, if (added(host.hostId)) "已接入" else "未接入").joinToString(" · "),
                   style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary), maxLines = 1)
                 Text(host.fingerprint?.let { formatFingerprint(it) } ?: "指纹待确认",
                   style = MiuixTheme.textStyles.footnote2.copy(fontFamily = FontFamily.Monospace),

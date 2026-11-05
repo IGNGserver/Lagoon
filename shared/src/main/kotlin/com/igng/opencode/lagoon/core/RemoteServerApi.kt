@@ -29,7 +29,7 @@ internal class RemoteServerApi(address: String, allowCleartext: Boolean = false)
   }
 
   suspend fun health() {
-    if (request("GET", "health").optString("status") != "ok") throw IOException("DSH Hub 健康检查失败")
+    if (request("GET", "health").optString("status") != "ok") throw IOException("DSH 远程中枢健康检查失败")
   }
 
   suspend fun login(account: String, password: String): RemoteAccount {
@@ -38,7 +38,7 @@ internal class RemoteServerApi(address: String, allowCleartext: Boolean = false)
     } catch (error: RemoteServerException) {
       // A login 401 is a credential mismatch, not an expired session. Do not let the raw
       // AUTH_INVALID code read like a network or token problem.
-      if (error.status == 401) throw IOException("账号或密码不正确；请使用中枢服务端配置的账号与密码", error)
+      if (error.status == 401) throw IOException("账号或密码不正确；请使用 DSH 远程中枢配置的账号与密码", error)
       throw error
     }
     return RemoteAccount(requiredText(body, "account", 254), token(body, "token"), positiveLong(body, "expiresAt"))
@@ -138,8 +138,8 @@ internal class RemoteServerApi(address: String, allowCleartext: Boolean = false)
     val body = try {
       requestAt("GET", sameOriginUrl("/api/v1/account/devices"), null, accountToken)
     } catch (error: RemoteServerException) {
-      if (error.status == 401) throw IOException("DSH Remote 登录已失效，请重新登录", error)
-      if (error.status == 404) throw IOException("这个中枢不支持账号设备目录，请升级 DSH Remote 中枢", error)
+      if (error.status == 401) throw IOException("DSH 远程中枢登录已失效，请重新登录", error)
+      if (error.status == 404) throw IOException("服务端不支持账号设备目录，请升级 DSH 远程中枢", error)
       throw error
     }
     val items = body.optJSONArray("items") ?: throw IOException("DSH Hub 设备列表无效")

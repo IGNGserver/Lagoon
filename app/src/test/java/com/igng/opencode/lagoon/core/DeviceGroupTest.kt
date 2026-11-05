@@ -62,6 +62,23 @@ class DeviceGroupTest {
     assertEquals(DeviceMemberRole.HARNESS, legacy.deviceMemberRole)
   }
 
+  @Test fun connectionTypeLabelsAndSummariesAreUnified() {
+    val ssh = profile("ssh").copy(sshHostId = "ssh-1", kind = ServerKind.DSH, url = "ssh://me@server:22")
+    val remote = profile("remote").copy(kind = ServerKind.DSH_REMOTE, remoteHostId = "host-12345678-abcd", url = "https://hub.example.com")
+    val opencode = profile("oc").copy(url = "https://opencode.example.com")
+    val legacy = profile("legacy").copy(kind = ServerKind.DSH, url = "http://localhost:3000")
+
+    assertEquals("DSH SSH 直连", ssh.connectionTypeLabel)
+    assertEquals("DSH 远程中枢", remote.connectionTypeLabel)
+    assertEquals("OpenCode 直连", opencode.connectionTypeLabel)
+    assertEquals("旧版直连 DSH", legacy.connectionTypeLabel)
+
+    assertEquals("DSH SSH 直连 · me@server:22", ssh.endpointSummary)
+    assertEquals("DSH 远程中枢 · host-123", remote.endpointSummary)
+    assertEquals("OpenCode 直连 · https://opencode.example.com", opencode.endpointSummary)
+    assertEquals("旧版直连 DSH · http://localhost:3000", legacy.endpointSummary)
+  }
+
   @Test fun codecRejectsVersionOne() {
     val legacy = """{"version":1,"groups":[],"selected":null}"""
     assertEquals(1, DeviceGroupCodec.version(legacy))

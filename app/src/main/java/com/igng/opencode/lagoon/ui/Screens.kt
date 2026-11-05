@@ -119,7 +119,7 @@ fun ServersModal(
   val scope = rememberCoroutineScope()
 
   SuperBottomSheet(
-    title = if (existing == null) "添加服务器" else "编辑服务器",
+    title = if (existing == null) "添加设备" else if (existing.kind == ServerKind.DSH_REMOTE) "DSH 远程主机详情" else if (existing.kind == ServerKind.OPENCODE) "编辑 OpenCode 直连" else "编辑设备",
     show = true,
     onDismissRequest = onDismiss
   ) {
@@ -160,8 +160,12 @@ fun ServersModal(
               var minted: String? = null
               val version = controller.testServer(actualProfile, credentials) { minted = it }
               controller.saveServer(actualProfile, credentials.password, minted ?: credentials.cookie, credentials.username)
-              val label = actualProfile.kind.label
-              val detail = if (version.isBlank() || version.equals(label, ignoreCase = true) || version == "DeepSeek Harness") "" else " $version"
+              val label = when (actualProfile.kind) {
+                ServerKind.OPENCODE -> "OpenCode 直连"
+                ServerKind.DSH_REMOTE -> "DSH 远程中枢"
+                ServerKind.DSH -> if (actualProfile.sshHostId != null) "DSH SSH 直连" else "DeepSeek Harness"
+              }
+              val detail = if (version.isBlank() || version.equals(actualProfile.kind.label, ignoreCase = true) || version == "DeepSeek Harness") "" else " $version"
               done("已连接 $label$detail")
               onDismiss()
             } catch (cancel: CancellationException) {
@@ -308,36 +312,6 @@ internal fun MiuixServerForm(
           else "💡 推荐在电脑端运行 opencode pair 并将配对链接直接粘贴到下方，即可免密码一键配置认证。",
           style = MiuixTheme.textStyles.footnote1.copy(color = MiuixTheme.colorScheme.primary)
         )
-      }
-    }
-
-    if (harness == ServerKind.DSH_REMOTE) {
-      item { TextField(value = remoteAccount, onValueChange = { remoteAccount = it; hosts = emptyList(); selectedHost = ""; hostFingerprint = "" }, label = "DSH Hub 账号") }
-      item { TextField(value = remotePassword, onValueChange = { remotePassword = it }, label = "DSH Hub 密码",
-        visualTransformation = PasswordVisualTransformation(), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password)) }
-      item {
-        DialogActions("未配对", {}, if (working) "正在验证…" else "登录并发现 Host", enabled = !working && remoteAccount.isNotBlank() && remotePassword.isNotBlank()) {
-          working = true
-          val draft = (existing ?: ServerProfile(remoteProfileId, "DSH Remote", normalizedInput)).copy(
-            name = name.ifBlank { "DSH Remote" }, url = normalizedInput.trimEnd('/'), kind = ServerKind.DSH_REMOTE,
-            username = remoteAccount.trim(), remoteHostId = null, remoteHostFingerprint = null)
-          scope.launch {
-            try { onPairRemote(draft, remoteAccount.trim(), remotePassword) { hosts = it } }
-            catch (cancel: CancellationException) { throw cancel }
-            catch (error: Exception) { result = userFacingError(error, "DSH Hub 登录失败") }
-            finally { remotePassword = ""; working = false }
-          }
-        }
-      }
-      if (hosts.isNotEmpty()) item {
-        SuperDropdown(title = "选择 DSH Host", items = hosts.map { "${it.name} · ${it.platform} · ${it.deviceId.take(8)} · ${it.fingerprint.orEmpty()}" },
-          selectedIndex = hosts.indexOfFirst { it.deviceId == selectedHost }.coerceAtLeast(0),
-          onSelectedIndexChange = { index ->
-            val host = hosts.getOrNull(index) ?: return@SuperDropdown
-            selectedHost = host.deviceId
-            hostFingerprint = ""
-          })
-        TextField(value = hostFingerprint, onValueChange = { hostFingerprint = it.trim() }, label = "人工核对 Host 指纹（12 位十六进制）")
       }
     }
 
