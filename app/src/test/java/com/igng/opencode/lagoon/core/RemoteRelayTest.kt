@@ -17,6 +17,41 @@ import java.util.Base64
 import java.util.UUID
 
 class RemoteRelayTest {
+
+  /** `hello` must advertise the app version and only capabilities we can actually serve. */
+  @Test fun helloCarriesClientVersionAndAcceptsNegotiatedSubset() = runBlocking {
+    val client = RemoteIdentity.generate()
+    val host = RemoteIdentity.generate()
+    val hello = CompletableDeferred<JSONObject>()
+    MockWebServer().use { server ->
+      server.enqueue(MockResponse().withWebSocketUpgrade(object : WebSocketListener() {
+        override fun onMessage(webSocket: WebSocket, text: String) {
+          val frame = JSONObject(text)
+          if (frame.optString("type") != "hello") return
+          val payload = frame.getJSONObject("payload")
+          hello.complete(payload)
+          webSocket.send(JSONObject().put("v", 1).put("id", UUID.randomUUID().toString()).put("type", "hello.ack")
+            .put("timestamp", System.currentTimeMillis())
+            .put("payload", JSONObject().put("protocol", 1)
+              .put("serverVersion", "self-hosted/test")
+              .put("capabilities", JSONArray().put("transport.relay").put("transport.relay.attach"))
+              .put("maxControlFrameBytes", 65536).put("maxRelayFrameBytes", 1048576)).toString())
+        }
+      }))
+      server.start()
+      val relay = RemoteRelay(server.url("/").toString(), client, "device-access-token-123", host.deviceId, host.publicKey, true,
+        {}, {}, clientVersion = "4.2.0-rc.3-test")
+      // No handshake in this fixture: connect times out after hello.ack, which is all we assert.
+      runCatching { relay.connect(1_500) }
+      val payload = withTimeout(2_000) { hello.await() }
+      assertEquals("4.2.0-rc.3-test", payload.optString("clientVersion"))
+      val capabilities = payload.getJSONArray("capabilities").toString()
+      assertTrue(capabilities.contains("transport.relay"))
+      assertEquals("self-hosted/test", relay.serverVersion)
+      assertTrue(relay.negotiatedCapabilities.contains("transport.relay.attach"))
+    }
+  }
+
   @Test fun establishesAuthenticatedRelayAndExchangesEncryptedMessages() = runBlocking {
     val client = RemoteIdentity.generate()
     val host = RemoteIdentity.generate()

@@ -29,7 +29,9 @@ internal class RemoteRelay(
   private val pinnedHostKey: String,
   private val allowCleartext: Boolean = false,
   private val onMessage: (ByteArray) -> Unit,
-  private val onClose: (IOException) -> Unit
+  private val onClose: (IOException) -> Unit,
+  /** Sent in `hello`; the Hub stores it as the peer version and shows it in the device list. */
+  private val clientVersion: String = ""
 ) : RemoteSecureChannel {
   private val base = requireNotNull(address.trim().toHttpUrlOrNull()) { "DSH Hub 地址无效" }
   private val http = OkHttpClient.Builder().connectTimeout(10, TimeUnit.SECONDS).readTimeout(0, TimeUnit.SECONDS)
@@ -50,6 +52,17 @@ internal class RemoteRelay(
   private var state = State.NEW
   /** 无法识别的控制帧计数（诊断用）。 */
   internal val unsupportedFrames = java.util.concurrent.atomic.AtomicInteger()
+  /** `hello.ack` 上报的中枢版本，仅用于诊断。 */
+  @Volatile internal var serverVersion: String? = null
+    private set
+  /** 与本链路实际协商出的能力（永远是客户端所报能力的子集）。 */
+  @Volatile internal var negotiatedCapabilities: Set<String> = emptySet()
+    private set
+  /** `relay` 表示在控制通道上中继；独立数据通道就绪后仍是 `relay`，由 [relayAttached] 区分。 */
+  @Volatile internal var transport: String = "relay"
+    private set
+  @Volatile internal var relayAttached: Boolean = false
+    private set
   /** 中枢通过 `connect.accepted` 下发的独立 Relay 数据通道（`relayEndpoint` + `relayTicket`）。 */
   private var dataSocket: WebSocket? = null
   private var dataReady = false
@@ -104,7 +117,8 @@ internal class RemoteRelay(
           socket = webSocket
           sendFrame("hello", JSONObject().put("role", "client").put("deviceId", identity.deviceId)
             .put("accessToken", token).put("protocols", JSONArray().put(1))
-            .put("capabilities", JSONArray().put("transport.relay")), controlLimit)
+            .put("capabilities", JSONArray().also { array -> CLIENT_CAPABILITIES.forEach(array::put) })
+            .apply { if (clientVersion.isNotBlank()) put("clientVersion", clientVersion.take(64)) }, controlLimit)
         }
       } catch (error: Exception) { fail(IOException("Remote 认证失败", error)) }
     }
@@ -140,8 +154,9 @@ internal class RemoteRelay(
           if (state != State.HELLO || payload.opt("protocol") != 1) throw IOException("Remote 握手顺序无效")
           controlLimit = limit(payload, "maxControlFrameBytes", 65536)
           relayLimit = limit(payload, "maxRelayFrameBytes", 1048576)
-          val caps = payload.optJSONArray("capabilities")
-          if (caps != null && (caps.length() != 1 || caps.opt(0) != "transport.relay")) throw IOException("DSH Hub 的 Relay 协商无效")
+          serverVersion = (payload.opt("serverVersion") as? String)?.take(128)?.takeIf { it.isNotBlank() }
+          negotiatedCapabilities = negotiateCapabilities(payload.optJSONArray("capabilities"))
+          if ("transport.relay" !in negotiatedCapabilities) throw IOException("DSH Hub 没有协商 Relay 传输")
           state = State.CONNECT
           sendFrame("connect.request", JSONObject().put("hostDeviceId", hostId).put("preferredTransports", JSONArray().put("relay")), controlLimit)
         }
@@ -252,6 +267,7 @@ internal class RemoteRelay(
             val epoch = (payload.opt("epoch") as? Number)?.toLong()
             if (relayEpoch != null && epoch != relayEpoch) throw IOException("Relay 数据通道代次不一致")
             dataReady = true
+            relayAttached = true
             attachSignal?.complete(Unit)
           }
           return
@@ -274,6 +290,23 @@ internal class RemoteRelay(
       webSocket.close(code, null)
       if (state != State.CLOSED) fail(IOException("Relay 数据通道正在关闭"))
     }
+  }
+
+  /**
+   * The Hub may select a subset of what we offered, and older Hubs omit the field entirely
+   * (which means plain Relay). Never accept a capability we did not offer: that would let a
+   * broken peer select a transport this client cannot actually use.
+   */
+  private fun negotiateCapabilities(raw: JSONArray?): Set<String> {
+    if (raw == null) return setOf("transport.relay")
+    if (raw.length() > MAX_CAPABILITIES) throw IOException("DSH Hub 的能力列表超过上限")
+    val selected = LinkedHashSet<String>()
+    for (index in 0 until raw.length()) {
+      val value = raw.opt(index) as? String ?: throw IOException("DSH Hub 的能力列表无效")
+      if (value.length !in 1..128 || value !in CLIENT_CAPABILITIES) throw IOException("DSH Hub 选择了未提供的能力")
+      if (!selected.add(value)) throw IOException("DSH Hub 的能力列表重复")
+    }
+    return selected
   }
 
   private fun checkTarget(payload: JSONObject) {
@@ -317,6 +350,8 @@ internal class RemoteRelay(
     return decoded
   }
   private companion object {
+    val CLIENT_CAPABILITIES = setOf("transport.relay", "transport.relay.attach")
+    const val MAX_CAPABILITIES = 128
     const val MAX_COUNTER = 9007199254740991L
     /** 与参考实现一致：数据通道附加超时 15 秒。 */
     const val RELAY_ATTACH_TIMEOUT_MILLIS = 15_000L

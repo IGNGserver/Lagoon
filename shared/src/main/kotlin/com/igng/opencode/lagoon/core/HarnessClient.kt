@@ -30,6 +30,9 @@ interface HarnessClient {
   /** Releases transport-owned sockets and cryptographic state; safe to call more than once. */
   fun close() = Unit
 
+  /** True after [close] or after the shared Remote session was released. */
+  val isClosed: Boolean get() = false
+
   fun capabilities(): ApiCapabilities
 
   suspend fun discoverCapabilities(): ApiCapabilities

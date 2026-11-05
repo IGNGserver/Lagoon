@@ -1,6 +1,9 @@
 package com.igng.opencode.lagoon.core
 
 import org.json.JSONObject
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.launch
@@ -13,32 +16,61 @@ internal class RemoteSession(
   private val hostId: String,
   private val devices: RemoteDeviceManager,
   private val trust: RemotePeerTrust,
-  private val account: String
+  private val account: String,
+  private val clientVersion: String = ""
 ) : AutoCloseable {
   private val mutex = Mutex()
   @Volatile private var active: Active? = null
   @Volatile private var closed = false
+  @Volatile private var generation = 0
+  private val statusFlow = MutableStateFlow(RemoteConnectionStatus(hostId = hostId))
   private data class Active(val connection: RemoteConnection, val gateway: RemoteGateway, val capabilities: RemoteCapabilities)
+
+  /** Observable connection state; UI and the doctor report read this instead of inferring from data. */
+  internal val status: StateFlow<RemoteConnectionStatus> = statusFlow.asStateFlow()
+  internal val hub: String get() = address
+  internal val host: String get() = hostId
+  internal val isClosed: Boolean get() = closed
+  internal val accountId: String get() = account
+  internal fun credentials(): RemoteCredentialSummary = devices.status()
 
   suspend fun gateway(): RemoteGateway = ensure().gateway
   suspend fun capabilities(): RemoteCapabilities = ensure().capabilities
 
   private suspend fun ensure(): Active = mutex.withLock {
-    if (closed) throw IOException("Remote 会话已关闭")
+    if (closed) { publishClosed(); throw IOException("Remote 会话已关闭") }
     active?.takeUnless { it.connection.isClosed }?.let { return@withLock it }
     active?.gateway?.close()
     active = null
+    val attempt = ++generation
+    statusFlow.value = statusFlow.value.copy(phase = RemotePhase.CREDENTIALS, generation = attempt,
+      startedAt = System.currentTimeMillis(), readyAt = 0, lastError = null, capabilities = emptySet())
+    return try {
+      connectLocked(attempt)
+    } catch (error: kotlinx.coroutines.CancellationException) {
+      throw error
+    } catch (error: Throwable) {
+      recordFailure(error, attempt)
+      throw error
+    }
+  }
+
+  private suspend fun connectLocked(attempt: Int): Active {
     val api = RemoteServerApi(address, allowCleartext)
     val device = try { devices.access { id, token -> api.refresh(id, token) } }
     catch (error: RemoteFailureException) { throw error }
     catch (error: RemoteServerException) { throw remoteServerFailure(error) }
     catch (error: Exception) {
-      // 保留自愈层给出的原因（刷新冷却、凭据过期等），否则一律显示“登录失效”会把可重试的故障说成永久故障。
-      throw RemoteFailureException(RemoteFailureKind.AUTH_REQUIRED,
-        error.message?.takeIf { it.isNotBlank() } ?: "DSH Remote 登录已失效，请重新登录",
-        retryable = false, cause = error)
+      // 保留自愈层给出的原因，并区分“需要重新登录”和“刷新暂时失败”：后者不能把用户永久推去重登。
+      val message = error.message?.takeIf { it.isNotBlank() } ?: "DSH Remote 登录已失效，请重新登录"
+      val requiresLogin = message.contains("重新登录") || message.contains("尚未注册") ||
+        message.contains("已过期") || message.contains("设备资料损坏")
+      throw RemoteFailureException(
+        if (requiresLogin) RemoteFailureKind.AUTH_REQUIRED else RemoteFailureKind.NETWORK,
+        message, retryable = !requiresLogin, cause = error)
     }
     val token = device.tokens?.accessToken ?: throw RemoteFailureException(RemoteFailureKind.AUTH_REQUIRED, "Remote 设备尚未注册", retryable = false)
+    statusFlow.value = statusFlow.value.copy(phase = RemotePhase.CONNECTING)
     val host = try { api.host(token, hostId) }
     catch (error: RemoteServerException) { throw remoteServerFailure(error) }
     if (!host.online) throw RemoteFailureException(RemoteFailureKind.OFFLINE, "主机现在不在线", retryable = true)
@@ -49,14 +81,15 @@ internal class RemoteSession(
       else RemoteFailureException(RemoteFailureKind.TRUST_REQUIRED, error.message ?: "尚未确认主机指纹", retryable = false, cause = error)
     }
     var gateway: RemoteGateway? = null
+    statusFlow.value = statusFlow.value.copy(phase = RemotePhase.HANDSHAKING)
     val connection = try {
-      RemoteConnection.connect(address, device.identity, token, host, key, allowCleartext) {
+      RemoteConnection.connect(address, device.identity, token, host, key, allowCleartext, clientVersion) {
         (gateway ?: throw IOException("Remote 事件早于能力协商")).event(it)
       }
     } catch (error: Exception) {
       throw RemoteFailureException(RemoteFailureKind.NETWORK, "没能建立加密中继：${detail(error)}", retryable = true, cause = error)
     }
-    try {
+    return try {
       val capabilities = try { connection.capabilities() }
       catch (error: Exception) {
         throw RemoteFailureException(RemoteFailureKind.INCOMPATIBLE,
@@ -67,9 +100,41 @@ internal class RemoteSession(
       Active(connection, nextGateway, capabilities).also { current ->
         if (closed) { nextGateway.close(); connection.close(); throw IOException("Remote 会话已关闭") }
         active = current
-        SharedHttp.ioScope.launch { connection.awaitClosed(); nextGateway.close() }
+        statusFlow.value = statusFlow.value.copy(phase = RemotePhase.READY, generation = attempt,
+          readyAt = System.currentTimeMillis(), hostId = host.deviceId, hostName = host.name,
+          serverVersion = connection.serverVersion, pluginVersion = host.clientVersion,
+          harnessVersion = host.harnessVersion, transport = connection.transport,
+          relayAssignment = connection.relayAttached, capabilities = capabilities.capabilities,
+          lastError = null)
+        SharedHttp.ioScope.launch {
+          connection.awaitClosed()
+          nextGateway.close()
+          if (!closed && active?.connection === connection) {
+            statusFlow.value = statusFlow.value.copy(phase = RemotePhase.FAILED, readyAt = 0,
+              lastError = RemoteFailureSnapshot(RemoteFailureKind.NETWORK, "加密中继已断开", retryable = true))
+          }
+        }
       }
     } catch (error: Exception) { connection.close(); throw error }
+  }
+
+  private fun recordFailure(error: Throwable, attempt: Int) {
+    if (statusFlow.value.generation != attempt) return
+    val failure = error as? RemoteFailureException
+      ?: (error as? RemoteServerException)?.let(::remoteServerFailure)
+    val kind = failure?.kind ?: RemoteFailureKind.NETWORK
+    val retryable = failure?.retryable ?: true
+    val message = failure?.message?.takeIf { it.isNotBlank() }
+      ?: error.message?.takeIf { it.isNotBlank() }
+      ?: error.javaClass.simpleName
+    val code = (error as? RemoteRpcException)?.code ?: (error as? RemoteGatewayException)?.code
+    statusFlow.value = statusFlow.value.copy(phase = if (closed) RemotePhase.CLOSED else RemotePhase.FAILED,
+      readyAt = 0, lastError = RemoteFailureSnapshot(kind, message, retryable, code))
+  }
+
+  private fun publishClosed() {
+    if (statusFlow.value.phase != RemotePhase.CLOSED)
+      statusFlow.value = statusFlow.value.copy(phase = RemotePhase.CLOSED, readyAt = 0)
   }
 
   /** 把底层原因压成一句可读文案：链路故障最怕只剩一句“连接失败”。 */
@@ -128,6 +193,7 @@ internal class RemoteSession(
 
   override fun close() {
     closed = true
+    publishClosed()
     active?.gateway?.close()
     active?.connection?.close()
     active = null

@@ -5,6 +5,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
@@ -66,7 +67,7 @@ class DshApi(
    * audience must see the remote authority (`127.0.0.1:<remotePort>`).
    */
   private val hostHeader: String? = null
-) : HarnessClient {
+) : HarnessClient, RemoteDoctorSource {
   constructor(profile: ServerProfile, password: String) : this(profile, ServerCredentials(profile.username, password))
 
   private val base: HttpUrl = requireNotNull(profile.url.trimEnd('/').toHttpUrlOrNull()) { "服务器地址无效" }
@@ -121,7 +122,15 @@ class DshApi(
   private val cursors = ConcurrentHashMap<String, Long>()
   /** 需要实时事件（`session/follow`）的会话，最近打开的放最后。 */
   private val watched = LinkedHashSet<String>()
-  private val follows = ConcurrentHashMap<String, WebSocket>()
+  /**
+   * 每个会话只有一条长期 `session/follow`。快照从这条流取，实时事件也从这条流进；
+   * 不再“先开一条取快照、再开一条做实时”。[followOpenLock] 串行化首次打开，
+   * 避免消息页和事件流同时各开一条。
+   */
+  private val followStates = ConcurrentHashMap<String, FollowState>()
+  private val followOpenLock = Any()
+  /** 最近一次会话快照的规模；只记数量/游标，不记正文。 */
+  private val snapshotStats = ConcurrentHashMap<String, RemoteSnapshotStats>()
   @Volatile private var eventChannel: Channel<ServerEvent>? = null
   @Volatile private var eventsClientId: String? = null
   /** 仍在等待回答的审批/问答瀑布；键是网关事件 id。 */
@@ -130,8 +139,13 @@ class DshApi(
   /** 当前 `$events` 客户端代次与它重新投递过的瀑布 id（断线重连后对账用）。 */
   private val readyGeneration = java.util.concurrent.atomic.AtomicInteger()
   private val redelivered = ConcurrentHashMap.newKeySet<String>()
-  /** 会话 follow 意外断开后的重试退避（毫秒），收到帧即清零。 */
-  private val followRetries = ConcurrentHashMap<String, Long>()
+  /** `$events` 的当前状态，供连接医生展示。 */
+  @Volatile private var eventsReady = false
+  @Volatile private var eventsLastFrameAt = 0L
+  @Volatile private var eventsReconnects = 0
+  @Volatile private var eventsError: String? = null
+  /** DshApi 本身已关闭；follow 重连协程据此退出。 */
+  @Volatile private var closed = false
   @Volatile private var catalog: JSONObject? = null
   /** 已归档会话集合（`workspace/follow` 的 baseline 与 `archived` 增量维护）。 */
   private val archivedSessions = ConcurrentHashMap.newKeySet<String>()
@@ -147,12 +161,15 @@ class DshApi(
   /** 每个会话已经投影过的最大事件 seq：消息页与实时流之间按 seq 去重。 */
   private val lastSeqs = ConcurrentHashMap<String, Long>()
 
+  override val isClosed: Boolean get() = closed || remoteBackend?.isClosed == true
+
   override fun capabilities(): ApiCapabilities = if (remoteBackend == null) CAPABILITIES else CAPABILITIES.copy(diff = false)
 
   override fun close() {
+    closed = true
     eventChannel?.close()
-    follows.values.forEach(WebSocket::cancel)
-    follows.clear()
+    followStates.values.toList().forEach(::stopFollowState)
+    followStates.clear()
     pendingApprovals.clear(); pendingQuestions.clear()
     remoteBackend?.close()
   }
@@ -388,7 +405,7 @@ class DshApi(
 
   /** The `session/list` read in flight; concurrent callers share it (see [listing]). */
   /** `workspace/follow` 的参数形状；首次成功或被拒绝后确定，见 [fetchWorkspaceBaseline]。 */
-  private var workspaceArgsStyle = WorkspaceArgsStyle.EMPTY
+  @Volatile private var workspaceArgsStyle = WorkspaceArgsStyle.EMPTY
   private enum class WorkspaceArgsStyle { EMPTY, REQUEST }
 
   private var listingFlight: Deferred<Listing>? = null
@@ -564,22 +581,27 @@ class DshApi(
     val wanted = size.coerceAtLeast(1)
     if (cursor == null) {
       // 首屏：`session/follow` 的首帧快照直接给出完整日志（`records` + 切点 `cursor`）。
-      val snapshot = fetchSnapshot(id)
+      // 取快照的流会继续留着做实时流，不再取完就取消。
+      val snapshot = snapshotFor(session)
       val through = snapshot.optDouble("cursor", 0.0).toLong()
       // 空会话的切点是 -1（Host 的 `cursorBeforeNext(0)`）；0 也合法，不能当作“没有日志”。
       if (through >= 0) cursors[id] = through
       val records = snapshot.arr("records").objects()
       val messages = recordsToMessages(session, records)
       // 空白会话排障：记录“拿到了什么”，不记录任何消息内容。
+      val snapshotCursor = snapshot.optDouble("cursor", -1.0).toLong()
+      val snapshotHasMore = snapshot.optBoolean("hasMore")
+      snapshotStats[session.id] = RemoteSnapshotStats(session.id, records.size, messages.size,
+        snapshotCursor, snapshotHasMore)
       Diagnostics.info("DshApi", "session/follow 快照 · ${address(id).str("kind")} · records=${records.size} " +
-        "messages=${messages.size} cursor=${snapshot.optDouble("cursor", -1.0).toLong()} hasMore=${snapshot.optBoolean("hasMore")}")
+        "messages=${messages.size} cursor=$snapshotCursor hasMore=$snapshotHasMore")
       // 时间线被整页替换：清掉实时部件记录，让后续增量重建部件而不是写进已消失的行。
       liveParts.keys.filter { it.startsWith("${session.id}|") }.forEach { liveParts.remove(it) }
       advanceSeq(id, records.mapNotNull { it.obj("event").optDouble("seq", 0.0).toLong().takeIf { value -> value > 0 } }.maxOrNull())
       ApiPage(messages.takeLast(wanted), null)
     } else {
       val through = cursors[id] ?: run {
-        val snapshot = fetchSnapshot(id)
+        val snapshot = snapshotFor(session)
         snapshot.optDouble("cursor", 0.0).toLong().also { if (it >= 0) cursors[id] = it }
       }
       if (through < 0) return@withContext ApiPage(emptyList(), null)
@@ -709,20 +731,19 @@ class DshApi(
   }
 
   /**
-   * 首屏快照。参数对齐官方客户端的窗口：`assistantStream` 让“正在跑的轮次”也能看到已产出的内容，
-   * `maxMessages`/`turnWindow` 限制单帧体积，更早的历史仍由 `session/page` 翻页补。
+   * 首屏快照从长期 follow 流取。参数对齐官方客户端的窗口：`assistantStream` 让“正在跑的轮次”
+   * 也能看到已产出的内容，`maxMessages`/`turnWindow` 限制单帧体积，更早的历史仍由
+   * `session/page` 翻页补。
+   *
    * 首帧必须是 `snapshot`：中枢/协议漂移时返回别的帧，若直接当空日志处理就会得到永远空白的会话。
+   * 失败会落在 [snapshotStats] 里，连接医生能看到“读了几条、游标在哪、失败原因是什么”。
    */
-  private suspend fun fetchSnapshot(id: String): JSONObject {
-    val request = requestArgs(JSONObject()
-      .put("address", address(id))
-      .put("assistantStream", true)
-      .put("maxMessages", SNAPSHOT_MAX_MESSAGES)
-      .put("turnWindow", JSONObject().put("minMessages", SNAPSHOT_MIN_MESSAGES).put("minTurns", 2)))
+  private suspend fun snapshotFor(session: Session, fresh: Boolean = true): JSONObject {
     var failure: Exception? = null
     for (attempt in 1..SNAPSHOT_ATTEMPTS) {
+      val state = followFor(session, fresh = fresh)
       try {
-        val frame = fetchFirstFrame("session/follow", request)
+        val frame = withTimeout(STREAM_FIRST_FRAME_TIMEOUT_MILLIS) { state.snapshot.await() }
         if (frame.str("type") != "snapshot") throw ApiException(502,
           "会话流首帧不是快照（${frame.str("type").ifBlank { "未知帧" }}）", "stream/not-snapshot")
         return frame
@@ -730,10 +751,14 @@ class DshApi(
         throw cancel
       } catch (error: Exception) {
         failure = error
+        snapshotStats[session.id] = RemoteSnapshotStats(session.id, 0, 0, -1, false,
+          error = streamFailure("session/follow", error).message)
+        stopFollow(session.id)
         if (attempt < SNAPSHOT_ATTEMPTS) kotlinx.coroutines.delay(SNAPSHOT_RETRY_DELAY_MILLIS)
       }
     }
-    throw failure as? ApiException ?: ApiException(502, "无法读取会话日志：${failure?.message ?: "未知错误"}")
+    val last = failure ?: IOException("无法读取会话日志：没有返回快照")
+    throw last as? ApiException ?: streamFailure("session/follow", last)
   }
 
   /**
@@ -951,58 +976,195 @@ class DshApi(
     var closed = false
     val push: (ServerEvent) -> Unit = { event -> channel.trySend(event) }
 
-    val globalSocket = try {
-      openMux("\$events", noArgs(), onItem = { frame ->
-        when (frame.str("type")) {
-          "ready" -> {
-            eventsClientId = frame.str("clientId")
-            reconcileAfterReady(push)
-            onOpen()
-          }
-          "emit" -> handleEmit(frame, push)
-          "waterfall" -> handleWaterfall(frame, push)
-          "cancel" -> handleCancelled(frame, push)
-          else -> Unit
-        }
-      }, onClosed = { cause ->
-        if (!closed) {
-          closed = true
-          close(cause)
-        }
-      })
-    } catch (error: Exception) {
-      close(error)
-      awaitClose { }
-      return@callbackFlow
-    }
+    // follow 可能先于事件流建立：把快照之后、事件流挂上之前到达的增量补送，避免“打开会话的头几秒丢了”。
+    flushFollowBuffers(push)
 
-    // 工作区清单与归档集合：项目页与归档标记随增量保持新鲜。
-    val workspaceSocket = try {
-      openMux("workspace/follow", noArgs(), onItem = { frame -> applyWorkspaceFrame(frame) }, onClosed = { })
-    } catch (error: Exception) {
-      null
-    }
+    val eventsJob = launch { runEventsLoop(push, onOpen) { closed } }
+    val workspaceJob = launch { runWorkspaceLoop { closed } }
+    val statusJob = launch { runStatusFallback(push) { closed } }
 
     val pump = launch {
       for (event in channel) send(event)
     }
 
     // 已在观察中的会话补上 follow，运行中的会话也会从 $events 的 api-session/status 补进来。
-    synchronized(watched) { watched.toList() }.forEach { startFollow(it, channel) }
+    synchronized(watched) { watched.toList() }.forEach { startFollow(it) }
 
     awaitClose {
       closed = true
-      runCatching { globalSocket.cancel() }
-      workspaceSocket?.let { runCatching { it.cancel() } }
-      followers().forEach { runCatching { it.cancel() } }
-      follows.clear()
+      eventsJob.cancel()
+      workspaceJob.cancel()
+      statusJob.cancel()
+      followStates.values.toList().forEach(::stopFollowState)
       pump.cancel()
       channel.close()
       if (eventChannel === channel) eventChannel = null
     }
   }
 
-  private fun followers(): List<WebSocket> = follows.values.toList()
+  /**
+   * `$events` 是状态的主实时源，但不是内容和状态的唯一来源：它断开时只标记 degraded、
+   * 按退避重连，**不关闭整条 Flow**。内容仍然由各会话自己的 follow 流提供；运行状态由
+   * [runStatusFallback] 用 `session/list` 兜底。
+   */
+  private suspend fun runEventsLoop(push: (ServerEvent) -> Unit, onOpen: () -> Unit, isClosed: () -> Boolean) {
+    var backoff = EVENTS_RETRY_MIN_MILLIS
+    while (!isClosed()) {
+      val ended = CompletableDeferred<Throwable?>()
+      var socket: WebSocket? = null
+      var wasReady = false
+      try {
+        socket = openMux("\$events", noArgs(), onItem = { frame ->
+          eventsLastFrameAt = System.currentTimeMillis()
+          when (frame.str("type")) {
+            "ready" -> {
+              eventsClientId = frame.str("clientId")
+              eventsReady = true
+              wasReady = true
+              eventsError = null
+              backoff = EVENTS_RETRY_MIN_MILLIS
+              flushFollowBuffers(push)
+              reconcileAfterReady(push)
+              runCatching { onOpen() }
+              Diagnostics.info("DshApi", "\$events ready · client=${eventsClientId?.take(8)}")
+            }
+            "emit" -> handleEmit(frame, push)
+            "waterfall" -> handleWaterfall(frame, push)
+            "cancel" -> handleCancelled(frame, push)
+            else -> Unit
+          }
+        }, onClosed = { cause ->
+          eventsReady = false
+          ended.complete(cause)
+        })
+        val cause = try { ended.await() } finally { socket?.cancel() }
+        if (isClosed()) break
+        eventsError = cause?.message?.takeIf { it.isNotBlank() } ?: "事件流已关闭"
+        eventsReconnects++
+        if (wasReady) connectionEvent(false, eventsError)?.let(push)
+        Diagnostics.warn("DshApi", "\$events 断开，准备重连：${eventsError}")
+      } catch (cancel: CancellationException) {
+        throw cancel
+      } catch (error: Exception) {
+        eventsReady = false
+        eventsError = error.message?.takeIf { it.isNotBlank() } ?: error.javaClass.simpleName
+        eventsReconnects++
+        if (wasReady) connectionEvent(false, eventsError)?.let(push)
+        socket?.cancel()
+        Diagnostics.warn("DshApi", "\$events 建立失败", error)
+      }
+      delay(backoff)
+      backoff = (backoff * 2).coerceAtMost(EVENTS_RETRY_MAX_MILLIS)
+    }
+    eventsReady = false
+  }
+
+  /**
+   * 工作区清单与归档集合。参数形状按代际不同（0.2.1 只接受 `{args:{}}`，更新代际要
+   * `{args:{request:{}}}`），一元基线与这条实时流共用同一个探测结果，避免一边成功一边失败。
+   */
+  private suspend fun runWorkspaceLoop(isClosed: () -> Boolean) {
+    var backoff = WORKSPACE_RETRY_MIN_MILLIS
+    while (!isClosed()) {
+      val ended = CompletableDeferred<Throwable?>()
+      var socket: WebSocket? = null
+      var argumentsInvalid = false
+      try {
+        socket = openMux("workspace/follow", workspacePayload(), onItem = { frame -> applyWorkspaceFrame(frame) },
+          onClosed = { cause ->
+            if (cause != null) argumentsInvalid = isGatewayArgumentsInvalid(cause)
+            ended.complete(cause)
+          })
+        val cause = try { ended.await() } finally { socket?.cancel() }
+        if (isClosed()) break
+        if (argumentsInvalid || isGatewayArgumentsInvalid(cause)) {
+          flipWorkspaceStyle()
+          backoff = WORKSPACE_RETRY_MIN_MILLIS
+          Diagnostics.info("DshApi", "workspace/follow 参数代际切换为 $workspaceArgsStyle")
+          continue
+        }
+        if (cause != null) Diagnostics.warn("DshApi", "workspace/follow 断开", cause)
+      } catch (cancel: CancellationException) {
+        throw cancel
+      } catch (error: Exception) {
+        socket?.cancel()
+        if (isGatewayArgumentsInvalid(error)) {
+          flipWorkspaceStyle()
+          backoff = WORKSPACE_RETRY_MIN_MILLIS
+          continue
+        }
+        Diagnostics.warn("DshApi", "workspace/follow 建立失败", error)
+      }
+      delay(backoff)
+      backoff = (backoff * 2).coerceAtMost(WORKSPACE_RETRY_MAX_MILLIS)
+    }
+  }
+
+  /**
+   * `$events` 不可用时的状态兜底：低频读 `session/list.running`，只对变化发事件。
+   * 这样审批/问答会显示“实时通道断开”，但“某会话正在跑”不会跟着一起消失。
+   */
+  private suspend fun runStatusFallback(push: (ServerEvent) -> Unit, isClosed: () -> Boolean) {
+    var previous: Set<String>? = null
+    while (!isClosed()) {
+      delay(STATUS_FALLBACK_MILLIS)
+      if (eventsReady) { previous = null; continue }
+      val running = try { listing().running } catch (cancel: CancellationException) {
+        throw cancel
+      } catch (error: Exception) {
+        Diagnostics.warn("DshApi", "状态兜底读取失败", error)
+        continue
+      }
+      val before = previous
+      if (before != null) {
+        for (id in running - before) emitStatus(id, true, push)
+        for (id in before - running) emitStatus(id, false, push)
+      }
+      previous = running
+    }
+  }
+
+  /**
+   * A transport-level signal the overview can use without closing the whole event flow.
+   * Only Remote connections emit it: direct/SSH event streams are shared with existing callers
+   * that treat every event as a session projection.
+   */
+  private fun connectionEvent(connected: Boolean, error: String?): ServerEvent? {
+    val now = System.currentTimeMillis()
+    return ServerEvent(id = "dsh:events:$connected:$now", directory = "", type = "server.connection",
+      properties = JSONObject().put("connected", connected).apply { if (error != null) put("error", error) }, created = now)
+  }
+
+  private fun emitStatus(id: String, running: Boolean, push: (ServerEvent) -> Unit) {
+    val now = System.currentTimeMillis()
+    push(ServerEvent(id = "dsh:status:$id:$running:$now", directory = known[id]?.directory.orEmpty(),
+      type = "session.status", properties = JSONObject()
+        .put("sessionID", id)
+        .put("status", JSONObject().put("type", if (running) "busy" else "idle")), created = now))
+  }
+
+  private fun flushFollowBuffers(push: (ServerEvent) -> Unit) {
+    for (state in followStates.values) {
+      val drained = synchronized(state.pending) {
+        if (state.pending.isEmpty()) emptyList() else state.pending.toList().also { state.pending.clear() }
+      }
+      drained.forEach(push)
+    }
+  }
+
+  private fun workspacePayload(): JSONObject =
+    if (workspaceArgsStyle == WorkspaceArgsStyle.REQUEST) requestArgs(JSONObject()) else noArgs()
+
+  private fun flipWorkspaceStyle() {
+    workspaceArgsStyle = if (workspaceArgsStyle == WorkspaceArgsStyle.REQUEST) WorkspaceArgsStyle.EMPTY else WorkspaceArgsStyle.REQUEST
+  }
+
+  private fun isGatewayArgumentsInvalid(error: Throwable?): Boolean =
+    generateSequence(error) { it.cause }.any { candidate ->
+      (candidate as? RemoteGatewayException)?.code == "gateway/arguments-invalid" ||
+        (candidate as? ApiException)?.code == "gateway/arguments-invalid" ||
+        candidate.message?.contains("gateway/arguments-invalid") == true
+    }
 
   private fun handleEmit(frame: JSONObject, push: (ServerEvent) -> Unit) {
     val name = frame.str("event")
@@ -1030,7 +1192,7 @@ class DshApi(
         if (id.isNotBlank()) {
           known.remove(id)
           synchronized(watched) { watched.remove(id) }
-          follows.remove(id)?.cancel()
+          stopFollow(id)
           push(ServerEvent(id = "dsh:removed:$id", directory = "", type = "session.deleted",
             properties = JSONObject().put("sessionID", id), created = System.currentTimeMillis()))
         }
@@ -1174,58 +1336,133 @@ class DshApi(
     call("\$events/result", envelope(args))
   }
 
-  private fun startFollow(id: String, channel: Channel<ServerEvent>) {
-    if (follows.containsKey(id)) return
-    val session = known[id] ?: return
-    ioScope.launch {
-      try {
-        val socket = openMux(
-          "session/follow",
-          requestArgs(JSONObject().put("address", address(id)).put("assistantStream", true)),
-          onItem = { frame ->
-            when (frame.str("type")) {
-              "snapshot" -> {
-                followRetries.remove(id)
-                frame.optDouble("cursor", 0.0).toLong().takeIf { it > 0 }?.let { cursors[id] = it }
-                // 首次 follow 的快照记录已由消息页拉取，只登记切点；重连后的快照补投断线期间的事件。
-                if (lastSeq(id) > 0) {
-                  for (record in frame.arr("records").objects()) {
-                    val event = record.obj("event")
-                    val seq = event.optDouble("seq", 0.0).toLong()
-                    if (seq <= lastSeq(id)) continue
-                    translate(session, event).forEach { channel.trySend(it) }
-                    advanceSeq(id, seq)
-                  }
-                }
-              }
-              "event" -> {
-                val event = frame.obj("event")
-                val seq = event.optDouble("seq", 0.0).toLong()
-                // 只投影时间线还没有的耐久事件（与消息页快照按 seq 去重）。
-                if (seq <= 0 || seq > lastSeq(id)) {
-                  // 断线/背压造成的 seq 缺口：先用 session/page 补齐，再投影当前事件，
-                  // 否则这一步之后的工具调用会与前面的用户消息脱节。
-                  val previous = lastSeq(id)
-                  if (seq > 0) gapRepairWindow(previous, seq)?.let { repairGap(session, id, it, channel) }
-                  translate(session, event).forEach { channel.trySend(it) }
-                  if (seq > 0) advanceSeq(id, seq)
-                }
-              }
-              "assistant-stream" -> translateLive(session, frame.obj("frame"), { channel.trySend(it) })
-              else -> Unit
-            }
-          },
-          onClosed = { cause ->
-            follows.remove(id)
-            if (cause != null) retryFollow(id, channel)
+  /**
+   * 一个会话一条 follow。首个调用者创建 [FollowState] 并异步打开；后来的消息页/事件流共用它。
+   * 打开中的状态也会被复用，避免消息页和 `$events` 同时各开一条。
+   */
+  private fun followFor(session: Session, fresh: Boolean = false): FollowState = synchronized(followOpenLock) {
+    val existing = followStates[session.id]
+    val reusable = existing != null && !existing.closed &&
+      (existing.opening || existing.socket != null || existing.snapshot.isCompleted) &&
+      (!fresh || !existing.snapshot.isCompleted || System.currentTimeMillis() - existing.snapshotAt <= SNAPSHOT_REUSE_MILLIS)
+    if (reusable) return existing
+    existing?.let(::stopFollowState)
+    val state = FollowState(session.id)
+    state.opening = true
+    followStates[session.id] = state
+    ioScope.launch { openFollow(session, state) }
+    state
+  }
+
+  private suspend fun openFollow(session: Session, state: FollowState) {
+    try {
+      val payload = requestArgs(JSONObject()
+        .put("address", address(session.id))
+        .put("assistantStream", true)
+        .put("maxMessages", SNAPSHOT_MAX_MESSAGES)
+        .put("turnWindow", JSONObject().put("minMessages", SNAPSHOT_MIN_MESSAGES).put("minTurns", 2)))
+      val socket = openMux("session/follow", payload,
+        onItem = { frame -> onFollowFrame(session, state, frame) },
+        onClosed = { cause -> onFollowClosed(session, state, cause) })
+      state.opening = false
+      state.socket = socket
+      if (state.closed) socket.cancel()
+    } catch (cancel: CancellationException) {
+      state.opening = false
+      if (!state.snapshot.isCompleted) state.snapshot.completeExceptionally(cancel)
+      throw cancel
+    } catch (error: Exception) {
+      state.opening = false
+      state.error = error.message?.takeIf { it.isNotBlank() } ?: error.javaClass.simpleName
+      if (!state.snapshot.isCompleted) state.snapshot.completeExceptionally(error)
+      followStates.remove(session.id, state)
+      Diagnostics.warn("DshApi", "会话 follow 未建立：${state.error}")
+    }
+  }
+
+  private fun onFollowFrame(session: Session, state: FollowState, frame: JSONObject) {
+    if (state.closed) return
+    state.lastFrameAt = System.currentTimeMillis()
+    val type = frame.str("type")
+    if (type != "snapshot" && !state.snapshot.isCompleted) {
+      // 协议要求首帧必须是 snapshot；把它当空日志会得到永远空白的会话。
+      val error = ApiException(502, "会话流首帧不是快照（${type.ifBlank { "未知帧" }}）", "stream/not-snapshot")
+      state.error = error.message
+      state.snapshot.completeExceptionally(error)
+      stopFollowState(state)
+      return
+    }
+    when (type) {
+      "snapshot" -> {
+        state.error = null
+        state.snapshotAt = System.currentTimeMillis()
+        frame.optDouble("cursor", 0.0).toLong().takeIf { it >= 0 }?.let { cursors[session.id] = it }
+        val baseline = lastSeq(session.id)
+        if (!state.snapshot.isCompleted) state.snapshot.complete(frame)
+        // 重连/重同步：只补投时间线还没有的耐久记录，避免整页重复。
+        if (baseline > 0) {
+          for (record in frame.arr("records").objects()) {
+            val event = record.obj("event")
+            val seq = event.optDouble("seq", 0.0).toLong()
+            if (seq <= baseline) continue
+            translate(session, event).forEach { emitFollow(state, it) }
+            advanceSeq(session.id, seq)
           }
-        )
-        follows[id] = socket
-      } catch (error: CancellationException) {
-        throw error
-      } catch (error: Exception) {
-        Diagnostics.warn("DshApi", "会话事件流未建立", error)
+        }
+        val records = frame.arr("records").objects().size
+        snapshotStats[session.id] = RemoteSnapshotStats(session.id, records,
+          snapshotStats[session.id]?.messages ?: 0, frame.optDouble("cursor", -1.0).toLong(),
+          frame.optBoolean("hasMore"), state.snapshotAt)
       }
+      "event" -> {
+        val event = frame.obj("event")
+        val seq = event.optDouble("seq", 0.0).toLong()
+        if (seq <= 0 || seq > lastSeq(session.id)) {
+          val previous = lastSeq(session.id)
+          if (seq > 0) gapRepairWindow(previous, seq)?.let { repairGap(session, state, it) }
+          translate(session, event).forEach { emitFollow(state, it) }
+          if (seq > 0) advanceSeq(session.id, seq)
+        }
+      }
+      "assistant-stream" -> translateLive(session, frame.obj("frame")) { emitFollow(state, it) }
+      else -> Unit
+    }
+  }
+
+  private fun onFollowClosed(session: Session, state: FollowState, cause: Throwable?) {
+    state.opening = false
+    state.socket = null
+    if (!state.snapshot.isCompleted) {
+      state.snapshot.completeExceptionally(cause ?: IOException("会话流已关闭"))
+    }
+    if (state.closed) return
+    state.closed = true
+    state.error = cause?.message?.takeIf { it.isNotBlank() } ?: "会话流已关闭"
+    followStates.remove(session.id, state)
+    val watchedNow = synchronized(watched) { session.id in watched }
+    if (!watchedNow && eventChannel == null) return
+    Diagnostics.warn("DshApi", "会话 follow 断开，准备重连：${state.error}")
+    val reconnects = state.reconnects + 1
+    val wait = (FOLLOW_RETRY_MIN_MILLIS shl (reconnects - 1).coerceAtMost(5)).coerceAtMost(FOLLOW_RETRY_MAX_MILLIS)
+    ioScope.launch {
+      delay(wait)
+      if (closed) return@launch
+      if (!synchronized(watched) { session.id in watched } && eventChannel == null) return@launch
+      val next = followFor(session)
+      next.reconnects = reconnects
+    }
+  }
+
+  private fun emitFollow(state: FollowState, event: ServerEvent) {
+    val channel = eventChannel
+    if (channel != null) {
+      channel.trySend(event)
+      return
+    }
+    // 事件流还没建立：先放进有界缓冲，等 events() 挂上后补齐；不丢开场几秒。
+    synchronized(state.pending) {
+      if (state.pending.size >= FOLLOW_PENDING_LIMIT) state.pending.removeFirst()
+      state.pending.addLast(event)
     }
   }
 
@@ -1236,10 +1473,10 @@ class DshApi(
   internal fun gapRepairWindow(previous: Long, seq: Long): LongRange? =
     if (previous > 0 && seq > previous + 1 && seq - previous <= MAX_GAP_REPAIR) (previous + 1) until seq else null
 
-  private fun repairGap(session: Session, id: String, missing: LongRange, channel: Channel<ServerEvent>) {
+  private fun repairGap(session: Session, state: FollowState, missing: LongRange) {
     ioScope.launch {
       try {
-        val request = JSONObject().put("address", address(id))
+        val request = JSONObject().put("address", address(session.id))
           .put("throughSeq", missing.last).put("beforeSeq", missing.first).put("maxMessages", GAP_REPAIR_PAGE)
         val page = callObject("session/page", requestArgs(request))
         var repaired = 0
@@ -1247,7 +1484,7 @@ class DshApi(
           val event = record.obj("event")
           val seq = event.optDouble("seq", 0.0).toLong()
           if (seq !in missing) continue
-          translate(session, event).forEach { channel.trySend(it) }
+          translate(session, event).forEach { emitFollow(state, it) }
           repaired++
         }
         Diagnostics.info("DshApi", "会话事件缺口补齐 · ${missing.first}..${missing.last} · events=$repaired")
@@ -1259,18 +1496,20 @@ class DshApi(
     }
   }
 
-  /** 单条会话流意外断开（全局事件流仍在）：退避后重新 follow，仍在观察的会话才重连。 */
-  private fun retryFollow(id: String, channel: Channel<ServerEvent>) {
-    val wait = followRetries.merge(id, FOLLOW_RETRY_MIN_MILLIS) { previous, _ -> (previous * 2).coerceAtMost(FOLLOW_RETRY_MAX_MILLIS) } ?: return
-    ioScope.launch {
-      kotlinx.coroutines.delay(wait)
-      val stillWatched = synchronized(watched) { id in watched }
-      if (eventChannel === channel && stillWatched) startFollow(id, channel)
-    }
+  private fun startFollow(id: String) {
+    known[id]?.let { followFor(it) }
   }
 
   private fun stopFollow(id: String) {
-    follows.remove(id)?.cancel()
+    followStates[id]?.let(::stopFollowState)
+  }
+
+  private fun stopFollowState(state: FollowState) {
+    state.closed = true
+    followStates.remove(state.sessionId, state)
+    runCatching { state.socket?.cancel() }
+    synchronized(state.pending) { state.pending.clear() }
+    if (!state.snapshot.isCompleted) state.snapshot.completeExceptionally(IOException("会话流已关闭"))
   }
 
   /** 记录最近打开的会话并限制 follow 数量，避免长连堆积。 */
@@ -1286,8 +1525,45 @@ class DshApi(
         stopFollow(oldest)
       }
     }
-    val channel = eventChannel ?: return
-    sessions.forEach { startFollow(it.id, channel) }
+    if (eventChannel == null) return
+    sessions.forEach { startFollow(it.id) }
+  }
+
+  /** 连接医生用：每条 follow 的最近状态，只有会话 id 与计数，没有消息正文。 */
+  internal fun followDiagnostics(): List<RemoteFollowStats> = followStates.values.map { state ->
+    RemoteFollowStats(state.sessionId, open = !state.closed && (state.socket != null || state.opening),
+      lastSeq = lastSeq(state.sessionId), lastFrameAt = state.lastFrameAt,
+      reconnects = state.reconnects, error = state.error)
+  }
+
+  override fun remoteDoctor(appVersion: String): RemoteDoctor? {
+    val backend = remoteBackend ?: return null
+    val status = backend.connectionStatus()
+    return RemoteDoctor(
+      hub = backend.hub,
+      account = backend.account,
+      hostName = status.hostName,
+      hostId = backend.hostId,
+      appVersion = appVersion,
+      status = status,
+      credentials = backend.credentials(),
+      snapshots = snapshotStats.values.sortedByDescending { it.at }.take(8),
+      follows = followDiagnostics(),
+      events = RemoteEventStats(eventsReady, eventsClientId, readyGeneration.get(), eventsLastFrameAt,
+        eventsReconnects, eventsError)
+    )
+  }
+
+  private class FollowState(val sessionId: String) {
+    val snapshot = CompletableDeferred<JSONObject>()
+    val pending = ArrayDeque<ServerEvent>()
+    @Volatile var socket: WebSocket? = null
+    @Volatile var opening = false
+    @Volatile var closed = false
+    @Volatile var snapshotAt = 0L
+    @Volatile var lastFrameAt = 0L
+    @Volatile var reconnects = 0
+    @Volatile var error: String? = null
   }
 
   // ---------------------------------------------------------------- 记录折算
@@ -2024,7 +2300,7 @@ class DshApi(
    * 逐文件对比来自认证栅栏内的 `/api/changes.diff`。摘要只在该 Host 进程内、会话存活期间提供。
    */
   override suspend fun diff(session: Session): List<FileChange> = withContext(Dispatchers.IO) {
-    val snapshot = try { fetchSnapshot(session.id) } catch (error: CancellationException) { throw error } catch (error: Exception) { return@withContext emptyList() }
+    val snapshot = try { snapshotFor(session, fresh = false) } catch (error: CancellationException) { throw error } catch (error: Exception) { return@withContext emptyList() }
     val announced = mutableListOf<Long>()
     for (record in snapshot.arr("records").objects()) {
       val event = record.obj("event")
@@ -2188,6 +2464,8 @@ class DshApi(
     /** 与官方客户端一致的窗口：限制单帧体积，更早的历史由 `session/page` 补。 */
     const val SNAPSHOT_MAX_MESSAGES = 500
     const val SNAPSHOT_MIN_MESSAGES = 50
+    /** 重新打开会话时，超过这个时长的旧快照不再复用，改为从新 Follow Generation 重同步。 */
+    const val SNAPSHOT_REUSE_MILLIS = 15_000L
     /** 单次补洞最多补这么多 seq；更大的缺口交给快照整体校正。 */
     const val MAX_GAP_REPAIR = 2_000L
     const val GAP_REPAIR_PAGE = 500
@@ -2216,6 +2494,13 @@ class DshApi(
     const val REDELIVERY_GRACE_MILLIS = 3_000L
     const val FOLLOW_RETRY_MIN_MILLIS = 2_000L
     const val FOLLOW_RETRY_MAX_MILLIS = 60_000L
+    const val FOLLOW_PENDING_LIMIT = 512
+    const val EVENTS_RETRY_MIN_MILLIS = 1_000L
+    const val EVENTS_RETRY_MAX_MILLIS = 30_000L
+    const val WORKSPACE_RETRY_MIN_MILLIS = 2_000L
+    const val WORKSPACE_RETRY_MAX_MILLIS = 60_000L
+    /** `$events` 不可用时的状态兜底周期。 */
+    const val STATUS_FALLBACK_MILLIS = 15_000L
 
     /** 单次改动列表最多合并的轮次数与文件数。 */
     const val MAX_CHANGE_TURNS = 8

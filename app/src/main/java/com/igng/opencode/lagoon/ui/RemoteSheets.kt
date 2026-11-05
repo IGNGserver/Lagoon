@@ -378,6 +378,12 @@ internal fun RemoteConnectionDialog(
   var probe by remember { mutableStateOf<RemoteProbe?>(null) }
   var busy by remember { mutableStateOf(false) }
   var error by remember { mutableStateOf<String?>(null) }
+  var doctor by remember { mutableStateOf<RemoteDoctor?>(null) }
+  val clipboard = LocalClipboardManager.current
+  suspend fun reloadDoctor() {
+    doctor = runCatching { controller.remoteDoctor(profile.id) }.getOrNull()
+  }
+  LaunchedEffect(profile.id) { reloadDoctor() }
   SuperDialog(title = "网络与连接", show = true, onDismissRequest = onDismiss) {
     Column(Modifier.fillMaxWidth().padding(top = 8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
       val current = state.serverId == profile.id
@@ -400,22 +406,33 @@ internal fun RemoteConnectionDialog(
         add("最近联络" to (if (state.lastContactAt > 0) agoText(state.lastContactAt) else "未知"))
         add("当前阶段" to (if (state.connection.since > 0) "${agoText(state.connection.since)} · ${state.connection.stage.name}" else "未知"))
       }
-      rows.forEach { (label, value) ->
+      val doctorRows = doctor?.diagnosticLines().orEmpty()
+        .filterNot { (label, _) -> rows.any { it.first == label } }
+      (rows + doctorRows).forEach { (label, value) ->
         Row(Modifier.fillMaxWidth()) {
           Text(label, Modifier.width(96.dp), style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
           Text(value, style = MiuixTheme.textStyles.footnote2)
         }
       }
-      Text("当前版本固定使用 Relay；LAN / P2P / TURN 尚未启用。测量只反映一次加密 RPC，不代表网络层 RTT。",
+      if (doctor != null) {
+        Text("诊断只包含连接阶段、计数与错误码，不包含消息正文或令牌。",
+          style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
+      }
+      Text("当前版本使用 Relay；中枢下发独立数据通道时自动附加，LAN / P2P / TURN 尚未启用。测量只反映一次加密 RPC，不代表网络层 RTT。",
         style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
       error?.let { Text(it, color = MiuixColorTokens.Error, style = MiuixTheme.textStyles.footnote2) }
       Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+        doctor?.let { report ->
+          TextButton(text = "复制诊断", onClick = { clipboard.setText(AnnotatedString(report.asText())) })
+        }
         TextButton(text = "关闭", onClick = onDismiss)
         TextButton(text = if (busy) "测量中…" else "重新测量", enabled = !busy && current, onClick = {
           scope.launch {
             busy = true; error = null
-            try { probe = controller.probeRemote(profile.id) }
-            catch (e: Exception) { error = userFacingError(e, "测量失败") }
+            try {
+              probe = controller.probeRemote(profile.id)
+              reloadDoctor()
+            } catch (e: Exception) { error = userFacingError(e, "测量失败") }
             finally { busy = false }
           }
         })

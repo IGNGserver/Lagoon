@@ -316,7 +316,7 @@ class LagoonController private constructor(private val appContext: Context) {
       val key = "remote|$origin|$account|$hostId"
       val session = RemoteConnectionRegistry.acquire(key) {
         RemoteSession(profile.url, profile.allowCleartext, hostId, manager,
-          RemotePeerTrust(store.remotePins), account)
+          RemotePeerTrust(store.remotePins), account, appVersion())
       }
       return RemoteBackend(session) { RemoteConnectionRegistry.release(key) }
     }
@@ -485,7 +485,7 @@ class LagoonController private constructor(private val appContext: Context) {
     },
     directoryHealth, ::acceptSnapshotRemoved, remoteBackendFactory,
     sshClientFactory = { profile, _ -> sshHostManager.client(profile) })
-  private var api: HarnessClient? = null
+  @Volatile private var api: HarnessClient? = null
   private var stream: Job? = null
   private var generation = 0
   private var refresh: Job? = null
@@ -718,7 +718,11 @@ class LagoonController private constructor(private val appContext: Context) {
   fun notifyOverviewAction(serverId: String) = allOverview.refresh(serverId)
 
   private fun clientFor(serverId: String): HarnessClient? =
-    if (serverId == state.value.serverId) api else runCatching { allOverview.client(serverId) }.getOrNull()
+    if (serverId == state.value.serverId) {
+      // A monitor rebuild can close the cached client while this screen still holds it. Resolve the
+      // current lease instead of calling into a closed transport.
+      api?.takeUnless { it.isClosed } ?: runCatching { allOverview.client(serverId) }.getOrNull()?.also { api = it }
+    } else runCatching { allOverview.client(serverId) }.getOrNull()
 
   internal suspend fun pluginBundles(serverId: String): List<RemotePluginBundle> =
     clientFor(serverId)?.pluginBundles().orEmpty()
@@ -779,6 +783,13 @@ class LagoonController private constructor(private val appContext: Context) {
   @Volatile var remoteRecoveryHandler: (() -> Unit)? = null
 
   fun openRemoteRecovery() { remoteRecoveryHandler?.invoke() }
+
+  /** Full connection report for the diagnostic dialog; only DSH Remote connections implement it. */
+  internal suspend fun remoteDoctor(serverId: String? = state.value.serverId): RemoteDoctor? {
+    val id = serverId ?: return null
+    val client = clientFor(id) ?: return null
+    return (client as? RemoteDoctorSource)?.remoteDoctor(appVersion())
+  }
 
   /** Measures one encrypted RPC round trip on the active Remote connection. */
   internal suspend fun probeRemote(serverId: String? = state.value.serverId): RemoteProbe? {

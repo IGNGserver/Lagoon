@@ -19,7 +19,7 @@ internal fun RemoteFailureKind.recovery(): RemoteRecoveryKind? = when (this) {
 }
 
 /** User-actionable Remote failure. UI may key recovery on [kind], never on a message string. */
-internal enum class RemoteFailureKind {
+enum class RemoteFailureKind {
   OFFLINE, AUTH_REQUIRED, DEVICE_REVOKED, HOST_NOT_FOUND,
   TRUST_REQUIRED, TRUST_CHANGED, CONNECTION_REPLACED,
   INCOMPATIBLE, REJECTED, RATE_LIMITED, NETWORK

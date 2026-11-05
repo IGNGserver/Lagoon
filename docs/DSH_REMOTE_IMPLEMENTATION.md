@@ -159,3 +159,66 @@ Noise + relay + `harness.remote.stream.open` + 1.5 MB 分片快照 + `session/fo
   首次被 `gateway/arguments-invalid` 拒绝后自动换形状并记住，不再把代际写死。
 - 主动关闭连接会让流正常结束，不再向消费者抛“连接已关闭”。
 - 新增测试：独立数据通道端到端、连接注册表引用计数、缺口补齐、`workspace/follow` 参数回退。
+
+## 连接生命周期、单 Follow 与连接医生（本轮）
+
+目标是让“连接失败”和“会话没有内容”在数据模型上就不可能混为一谈。
+
+### 可观测状态
+
+`RemoteSession` 现在暴露 `StateFlow<RemoteConnectionStatus>`：
+
+- 阶段：`IDLE / CREDENTIALS / CONNECTING / HANDSHAKING / READY / FAILED / CLOSED`；
+- 每次新建隧道 `generation + 1`，并记录 `startedAt / readyAt`；
+- 记录中枢 `serverVersion`、Host 插件版本、DSH 版本、`transport`、是否走独立 Relay 数据通道、
+  协商出的 capability 集合；
+- 失败折叠成 `RemoteFailureSnapshot(kind, message, retryable, code)`，不再只有一句 IOException。
+
+`hello` 现在上报 `clientVersion`（App 版本），中枢的设备列表不再永远停留在注册时的版本；
+`hello.ack` 的 capability 按“已提供能力的子集”校验，既接受旧中枢省略字段，也拒绝中枢选择
+客户端没广告的能力。
+
+### 一个会话一条长期 follow
+
+`session/follow` 从“打开取快照 → 取消”改成每个会话一条 **Follow Generation**：
+
+- 首帧必须是 `snapshot`，否则报 `stream/not-snapshot` 并重开；
+- 快照直接服务 `messagesPage(cursor=null)`，流继续留着做实时；
+- 快照之后、`events()` 挂上之前的增量进入有界缓冲（512 条），事件流建立时补送；
+- 重连后的新快照只补投 `seq > lastSeq` 的记录，避免整页重复；
+- 保留 `session/page` 的 seq 缺口补齐（上限 2000 条），缺口过大交给下一次快照整体校正；
+- 子代理地址、`assistantStream`、`maxMessages/turnWindow` 与官方客户端窗口一致。
+
+打开动作由 `followOpenLock` 串行化，消息页和 `$events` 不会再各开一条。
+
+### 内容与状态解耦
+
+- `events()` 不再因为 `$events` 失败而结束：只把 `eventsReady` 置 false、按 1s→30s 退避重连，
+  并发出 `server.connection` 事件；总览据此显示“实时同步恢复中”，而不是整页变空。
+- `$events` 不可用时，每 15s 读一次 `session/list.running`，只对变化补发 `session.status`；
+  审批/问答会显示实时通道断开，但“某会话正在跑”不会跟着消失。
+- `workspace/follow` 的实时流和一元基线共用同一个参数代际探测结果；被
+  `gateway/arguments-invalid` 拒绝后切换形状并重试，不再只有基线会回退。
+- 控制器解析“当前 client”：监控重建关闭旧 client 后，按需从总览重新取租约，避免对着已关闭的
+  传输发请求。
+
+### 连接医生
+
+`HarnessClient` 上不暴露诊断类型；`DshApi` 实现内部 `RemoteDoctorSource`，由控制器读取。
+“网络与连接”对话框新增：
+
+- 中枢/账号/主机/客户端版本；
+- 连接阶段、generation、路径（控制通道 Relay / 独立数据通道）；
+- 中枢、插件、DSH 版本与协商能力；
+- 凭据状态（正常/刷新中/待重试/已过期，access/refresh 剩余时间）；
+- 最近快照 `records/messages/cursor/hasMore`；
+- 每条 follow 的 `lastSeq/最后帧/重连次数/错误`；
+- `$events` 的 ready/generation/clientId/最后事件/重连次数；
+- 最近错误与上游 code，可一键复制。报告只含计数和错误码，不含消息正文或令牌。
+
+### 验证
+
+- 新增 `RemoteConnectionDesignTest`：状态机 READY/generation、单会话一条 follow、`$events` 失败
+  不结束事件流、90s 后刷新状态自愈、诊断文本不含令牌。
+- `RemoteRelayTest` 新增 hello `clientVersion` 与 capability 子集协商用例。
+- 可重复的真实链路：`scripts/remote-e2e.sh`（自建 Hub + 隔离 `dsh web` Host + `RemoteLiveProbeTest`）。

@@ -306,6 +306,12 @@ internal class AllServersOverview(
                     while (seenEvents.size > 512) seenEvents.remove(seenEvents.first())
                   }
                   val props = event.properties
+                  if (event.type == "server.connection") {
+                    val connected = props.optBoolean("connected")
+                    snapshot = snapshot.copy(streamConnected = connected)
+                    emit(snapshot)
+                    return@collect
+                  }
                   if (event.type.startsWith("session.execution.") || event.type.startsWith("shell.") ||
                     event.type in setOf("session.deleted", "session.synthetic", "session.error", "session.idle", "session.status") ||
                     BackgroundWork.backgroundSubagentId(event.type, props) != null) childDiscoveries.remove(id)

@@ -22,6 +22,12 @@ class RemoteBackend internal constructor(
   )
 
   internal val client: HarnessClient get() = harness
+  internal val isClosed: Boolean get() = closed.get() || session.isClosed
+  internal val hub: String get() = session.hub
+  internal val account: String get() = session.accountId
+  internal val hostId: String get() = session.host
+  internal fun connectionStatus(): RemoteConnectionStatus = session.status.value
+  internal fun credentials(): RemoteCredentialSummary = session.credentials()
   internal suspend fun supportsWorkspaceUpload(): Boolean = session.capabilities().supportsWorkspaceUpload
 
   internal suspend fun probe(): RemoteProbe {
