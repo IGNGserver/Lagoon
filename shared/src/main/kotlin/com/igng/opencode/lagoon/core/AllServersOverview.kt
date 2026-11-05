@@ -344,8 +344,12 @@ internal class AllServersOverview(
                   if (selectedServer() != id) {
                     if (event.type == "session.created") {
                       waitingRevision++
-                      val session = props.sessionInfo().toSession().copy(serverId = id)
-                      if (session.id.isNotBlank()) snapshot = snapshot.copy(sessions = (listOf(session) + snapshot.sessions).distinctBy { it.id },
+                      val fresh = props.sessionInfo().toSession().copy(serverId = id)
+                      val prior = snapshot.sessions.firstOrNull { it.id == fresh.id }
+                      // 与控制器一致：blank 只能 true→false，旧事件不能把已开始的会话重新藏起来。
+                      val session = if (prior != null && !prior.blank) fresh.copy(blank = false) else fresh
+                      if (session.id.isNotBlank()) snapshot = snapshot.copy(
+                        sessions = (listOf(session) + snapshot.sessions.filterNot { it.id == session.id }),
                         parents = snapshot.parents + listOfNotNull(session.parentId?.let { session.id to it }).toMap())
                     }
                     if (event.type == "session.deleted") {

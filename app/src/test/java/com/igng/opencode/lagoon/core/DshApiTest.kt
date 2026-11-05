@@ -54,11 +54,12 @@ class DshApiTest {
     """{"type":"server-response","rpcId":"x","result":{"ok":false,"error":{"code":"$code","message":"$message","details":{}}}}"""
   )
 
-  private fun sessionRow(id: String = "s1", directory: String = "/repo", title: String = "修复登录", running: Boolean = false) = JSONObject()
+  private fun sessionRow(id: String = "s1", directory: String = "/repo", title: String = "修复登录", running: Boolean = false,
+                         blank: Boolean = false) = JSONObject()
     .put("sessionId", id)
     .put("updatedAt", 100)
     .put("running", running)
-    .put("blank", false)
+    .put("blank", blank)
     .put("agentAvailable", true)
     .put("formatStatus", "current")
     .put("cwd", directory)
@@ -212,6 +213,85 @@ class DshApiTest {
       assertEquals("修复登录", session.title)
       assertEquals("/repo", session.directory)
       assertEquals(null, page.next)
+    }
+  }
+
+  @Test fun blankSessionsAreParsedAndStartedSessionsStayVisible() = runBlocking {
+    MockWebServer().use { server ->
+      server.enqueue(rootOk())
+      val metadataOnly = sessionRow(id = "metadata").apply {
+        remove("blank")
+        getJSONObject("projections").getJSONObject("values")
+          .put("sessionListMetadata", JSONObject().put("blank", true))
+      }
+      // top-level blank 可能是旧缓存；lastPromptAt 证明它已经收到过 prompt。
+      val prompted = sessionRow(id = "prompted", blank = true).apply {
+        getJSONObject("projections").getJSONObject("values")
+          .put("sessionListMetadata", JSONObject().put("blank", true).put("lastPromptAt", 123))
+      }
+      server.enqueue(envelope("""{"items":[
+        ${sessionRow(id = "draft", blank = true)},
+        ${sessionRow(id = "started", blank = false)},
+        $metadataOnly,
+        $prompted
+      ]}"""))
+      server.enqueue(envelope("""{"items":[
+        ${sessionRow(id = "draft", blank = true)},
+        ${sessionRow(id = "started", blank = true)},
+        $metadataOnly,
+        $prompted
+      ]}"""))
+      val client = api(server)
+      val first = client.rootSessionsPage().items.associateBy { it.id }
+      // 空白行不进入首页目录 ...
+      assertFalse(first.containsKey("draft"))
+      assertFalse(first.containsKey("metadata"))
+      assertFalse(first.getValue("started").blank)
+      assertFalse(first.getValue("prompted").blank)
+      // ... 但仍留在 known 里，供复用与单调判断使用。
+      assertTrue(client.session("draft").blank)
+      assertTrue(client.session("metadata").blank)
+      assertFalse(client.session("prompted").blank)
+      // 旧列表/旧事件把已开始的会话重新标成 blank 时，不能把首页行藏掉。
+      val second = client.rootSessionsPage().items.associateBy { it.id }
+      assertFalse(second.containsKey("draft"))
+      assertFalse(second.getValue("started").blank)
+      assertTrue(client.session("draft").blank)
+    }
+  }
+
+  @Test fun createSessionReusesBlankThenFallsBackWhenReuseIsDeclined() = runBlocking {
+    MockWebServer().use { server ->
+      server.enqueue(rootOk())
+      server.enqueue(envelope("""{"items":[${sessionRow(id = "draft", blank = true)}]}"""))
+      server.enqueue(failure("session/conflict"))
+      server.enqueue(envelope("""{"sessionId":"fresh"}"""))
+      val client = api(server)
+      client.rootSessionsPage()
+      val created = client.createSession("/repo", "")
+      assertEquals("fresh", created.id)
+      assertTrue(created.blank)
+      server.takeRequest() // token exchange
+      server.takeRequest() // session/list
+      val reuse = JSONObject(server.takeRequest().body.readUtf8())
+        .getJSONObject("payload").getJSONObject("args").getJSONObject("request")
+      assertEquals("draft", reuse.getString("sessionId"))
+      val retry = JSONObject(server.takeRequest().body.readUtf8())
+        .getJSONObject("payload").getJSONObject("args").getJSONObject("request")
+      assertFalse(retry.has("sessionId"))
+    }
+  }
+
+  @Test fun acceptedPromptClearsBlankOnTheCachedSession() = runBlocking {
+    MockWebServer().use { server ->
+      server.enqueue(rootOk())
+      server.enqueue(envelope("""{"sessionId":"s5"}"""))
+      server.enqueue(envelope("""{"accepted":true}"""))
+      val client = api(server)
+      val created = client.createSession("/repo", "")
+      assertTrue(created.blank)
+      client.send(created, "开始", null, null, id = "req-1", delivery = Delivery.QUEUE)
+      assertFalse(client.session("s5").blank)
     }
   }
 
@@ -942,6 +1022,7 @@ class DshApiTest {
       server.enqueue(envelope("""{"title":"新任务","seq":2}"""))
       val created = api(server).createSession("/repo", "新任务")
       assertEquals("s5", created.id)
+      assertTrue(created.blank)
       server.takeRequest()
       val create = JSONObject(server.takeRequest().body.readUtf8()).getJSONObject("payload").getJSONObject("args").getJSONObject("request")
       assertEquals("/repo", create.getString("cwd"))
@@ -1046,7 +1127,7 @@ class DshApiTest {
               if (frame.optString("endpoint") != "\$events") return
               val id = frame.getString("streamId")
               webSocket.send("""{"type":"item","streamId":"$id","value":{"type":"ready","clientId":"c1"}}""")
-              webSocket.send("""{"type":"item","streamId":"$id","value":{"type":"emit","event":"api-session/added","args":[${sessionRow(id = "s7", directory = "/w")}]}}""")
+              webSocket.send("""{"type":"item","streamId":"$id","value":{"type":"emit","event":"api-session/added","args":[${sessionRow(id = "s7", directory = "/w", blank = true)}]}}""")
             }
           })
           else -> MockResponse().setResponseCode(404)
@@ -1057,6 +1138,7 @@ class DshApiTest {
       assertEquals("s7", session.id)
       assertEquals("/w", session.directory)
       assertEquals("修复登录", session.title)
+      assertTrue(session.blank)
     } finally {
       server.shutdown()
     }

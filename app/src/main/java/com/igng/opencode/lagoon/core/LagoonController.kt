@@ -1531,9 +1531,12 @@ class LagoonController private constructor(private val appContext: Context) {
     if (transcripts != null && profile.kind == ServerKind.OPENCODE) scope.launch(storeDispatcher) {
       attempt { transcripts.bindServer(id, transcriptIdentity(profile)) }.onFailure { Diagnostics.warn("TranscriptStore", "绑定服务器失败", it) }
     }
-    val rememberedProject = projectOverride ?: store.selectedProject(id)
-    val rememberedSession = sessionOverride ?: store.selectedSession(id)
     val snapshot = allSnapshots[id]
+    val rememberedProject = projectOverride ?: store.selectedProject(id)
+    // 恢复上次打开的会话时，不把服务端空白草稿恢复成聊天页；回到本地「新会话」草稿。
+    val rememberedSession = (sessionOverride ?: store.selectedSession(id))?.takeIf { selected ->
+      snapshot?.sessions?.firstOrNull { it.id == selected }?.blank != true
+    }
     seenEvents.clear(); visibleConversation = null
     closeShellOutput(); familyDiscovery = null
     resolvedPermissions.clear()
@@ -1641,7 +1644,7 @@ class LagoonController private constructor(private val appContext: Context) {
         .distinctBy { normalizedDirectory(it.directory) }
         .map { it.copy(serverId = id) }
       val sessions = cachedSessions.map { scoped(id, it) }
-      val sessionId = store.selectedSession(id)?.takeIf { selected -> sessions.any { it.id == selected } }
+      val sessionId = store.selectedSession(id)?.takeIf { selected -> sessions.any { it.id == selected && !it.blank } }
       trace(token, ConnectMilestone.CACHE_PAINT)
       mutable.update { it.copy(loading = false, connected = false, cached = true, error = "离线缓存：$reason",
         projects = projects, sessions = sessions, projectId = store.selectedProject(id) ?: projects.firstOrNull()?.id,
@@ -2225,11 +2228,14 @@ class LagoonController private constructor(private val appContext: Context) {
         if (created.id.isNotBlank()) {
           state.value.serverId?.let { store.rememberParents(it, listOf(created)) }
           mutable.update { current ->
-            val parent = created.parentId
-            val parents = if (parent == null) current.knownParents - created.id
-            else current.knownParents + (created.id to parent)
+            val prior = current.sessions.firstOrNull { it.id == created.id }
+            // blank 是单向的：已经见过它开始轮次，就不能被更旧的 created 事件重新标记为草稿。
+            val merged = if (prior != null && !prior.blank) created.copy(blank = false) else created
+            val parent = merged.parentId
+            val parents = if (parent == null) current.knownParents - merged.id
+            else current.knownParents + (merged.id to parent)
             current.copy(knownParents = parents,
-              sessions = (listOf(created) + current.sessions).distinctBy { item -> item.id }.sortedWith(sessionActivityOrder))
+              sessions = (listOf(merged) + current.sessions.filterNot { it.id == merged.id }).sortedWith(sessionActivityOrder))
           }
         }
       }
@@ -3420,6 +3426,11 @@ class LagoonController private constructor(private val appContext: Context) {
         op.commit { it.copy(messages = it.messages.filterNot { message -> message.id == id }) }
         onFailed?.invoke()
         throw error
+      }
+      // 首条 prompt 已被接受：这个会话不再是服务端草稿。即使随后到达的列表/事件还带旧的
+      // blank=true，首页也不应把它继续藏起来（DshApi 的 known 同样会保持非空白）。
+      op.commitConnection { current ->
+        current.copy(sessions = current.sessions.map { item -> if (item.id == session.id) item.copy(blank = false) else item })
       }
       // Admission starts a separate pending-input claim, not a continuation of an obsolete run.
       workRevision++

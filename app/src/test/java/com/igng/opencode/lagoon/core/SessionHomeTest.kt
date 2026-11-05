@@ -24,6 +24,15 @@ class SessionHomeTest {
     assertFalse(JSONObject("""{"id":"s","time":{"archived":null}}""").toSession().archived)
   }
 
+  @Test fun dshBlankDraftsAreHiddenWhileOpencodeEmptyRootsRemainVisible() {
+    val draft = Session("draft", "/repo", "", 5, blank = true)
+    val opencodeEmpty = JSONObject("""{"id":"flat","directory":"/repo","title":"","time":{"updated":5}}""").toSession()
+    assertFalse(draft.visibleOnHome)
+    assertTrue(opencodeEmpty.visibleOnHome)
+    assertEquals(listOf("flat"), groupSessions(listOf(draft, opencodeEmpty), emptyList()).single().sessions.map { it.id })
+    assertTrue(JSONObject("""{"id":"parsed","blank":true}""").toSession().blank)
+  }
+
   @Test fun titlesUseOnlyServerMetadataAndNormalizeOnlyOfficialPlaceholders() {
     fun title(value: String, parent: String? = null) = Session("s", "/repo", value, 1, parent).displayTitle()
     assertEquals("新会话", title("New session - 2026-10-03T00:00:00.123Z"))
@@ -152,7 +161,7 @@ class SessionHomeTest {
   @Test fun offlineCatalogPreservesProjectWorktreesAndExecutionMetadata() = runBlocking {
     val cache = OfflineCache(memoryPreferences(), { it }, { it })
     val project = Project("p", "/repo", "Project", listOf("/trees/task"))
-    val session = Session("s", "/trees/task", "Server title", 50, projectId = "p", viewed = 10, idle = 40, outcome = "failed")
+    val session = Session("s", "/trees/task", "Server title", 50, projectId = "p", viewed = 10, idle = 40, outcome = "failed", blank = true)
     cache.saveCatalog("server", listOf(project), listOf(session)); cache.awaitWrites()
     val restored = cache.catalog("server")!!
     assertEquals(project, restored.first.single())

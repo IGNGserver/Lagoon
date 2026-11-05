@@ -95,7 +95,7 @@ object SessionActivityRules {
     parents: Map<String, String>
   ): List<SubSessionEntry> {
     val children = mutableMapOf<String, MutableList<Session>>()
-    sessions.forEach { session ->
+    sessions.filterNot { it.blank }.forEach { session ->
       val parent = session.parentId ?: return@forEach
       if (parent.isNotBlank() && parent != session.id) children.getOrPut(parent) { mutableListOf() }.add(session)
     }

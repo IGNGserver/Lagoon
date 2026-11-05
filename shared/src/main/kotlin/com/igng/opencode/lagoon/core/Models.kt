@@ -53,7 +53,13 @@ data class Session(val id: String, val directory: String, val title: String, val
   /** Source server when this session is shown in the all-servers overview. */
   val serverId: String? = null,
   /** `subagent` identity mode: one-shot / continuable / external / unknown. */
-  val subagentMode: String? = null) {
+  val subagentMode: String? = null,
+  /**
+   * DSH 服务端尚未开始任何轮次的空白会话（`session/list` 的 `blank`）。
+   * 官方客户端只显示当前选中的那一行；Lagoon 有本地草稿页，所以服务端空白行全部隐藏。
+   * OpenCode 没有这个状态，恒为 `false`。
+   */
+  val blank: Boolean = false) {
   /** 排序口径与官方一致：优先 `time.updated`，缺失时退回 `time.created`。 */
   val activityAt: Long get() = updated.takeIf { it > 0 } ?: created
   /** Session ids are only unique within one OpenCode server. */
@@ -263,7 +269,8 @@ internal fun JSONObject.toSession(): Session {
     info.str("agent").ifBlank { null }, info.obj("model").toModelChoice(),
     info.longPath("time", "viewed"), info.longPath("time", "idle"),
     info.str("outcome").ifBlank { null },
-    info.obj("revert").str("messageID").ifBlank { null }
+    info.obj("revert").str("messageID").ifBlank { null },
+    blank = info.optBoolean("blank", false)
   )
 }
 /** `Model.Ref` (`{providerID, id, variant?}`); `modelID` is accepted for metadata written by older clients. */

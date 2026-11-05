@@ -172,7 +172,7 @@ fun deviceWorkspaces(
       entry.members += project
     }
   }
-  sessions.forEach { session ->
+  sessions.filterNot { it.blank }.forEach { session ->
     val project = resolveSessionProject(session, projects)
     val entry = acc(project)
     entry.sessions += session

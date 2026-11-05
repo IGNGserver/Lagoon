@@ -423,6 +423,15 @@ class DshApi(
     val updated = item.optDouble("updatedAt", 0.0).toLong()
     val previous = known[id]
     val title = values.str("title").ifBlank { previous?.title.orEmpty() }
+    // DSH 的空白会话是“尚未开始任何轮次”的服务端草稿。顶层 `blank` 是权威字段；
+    // 只带投影的旧代际回退到 `sessionListMetadata.blank`。一旦本机见过它开始过轮次，
+    // 就不允许更旧的列表/事件把它重新标成空白。running 是同一事实的更新信号，优先相信它。
+    val metadata = values.obj("sessionListMetadata")
+    val listedBlank = if (item.has("blank")) item.optBoolean("blank")
+      else metadata.optBoolean("blank", false)
+    // lastPromptAt 是“已经收到过用户 prompt”的持久事实；即使 blank 是旧缓存，也不能把有 prompt 的会话藏掉。
+    val prompted = (metadata.opt("lastPromptAt") as? Number)?.toLong()?.let { it > 0 } == true
+    val blank = listedBlank && !prompted && !item.optBoolean("running") && previous?.blank != false
     return Session(
       id = id,
       directory = directory,
@@ -439,7 +448,8 @@ class DshApi(
       idle = if (item.optBoolean("running")) 0 else previous?.idle ?: 0,
       outcome = previous?.outcome,
       revertMessageId = null,
-      serverId = previous?.serverId
+      serverId = previous?.serverId,
+      blank = blank
     )
   }
 
@@ -536,6 +546,9 @@ class DshApi(
       val sessions = items.mapNotNull { itemToSession(it) }
         .filter { directory == null || it.directory.trimEnd('/') == directory.trimEnd('/') }
         .filter { it.parentId == null }
+        // 空白会话不进入首页目录，也不为它们各开一条 session/follow 流；它们仍留在 known 里，
+        // 下次新建同目录会话时可以复用。
+        .filterNot { it.blank }
         .sortedByDescending { it.activityAt }
       rememberWatched(sessions)
       ApiPage(sessions, null)
@@ -1005,6 +1018,7 @@ class DshApi(
           .put("directory", session.directory)
           .put("title", session.title)
           .putOpt("parentID", session.parentId)
+          .put("blank", session.blank)
           .put("time", JSONObject().put("created", session.created).put("updated", session.updated))
         push(ServerEvent(id = "dsh:added:${session.id}:${session.updated}", directory = session.directory,
           type = "session.created", properties = JSONObject().put("sessionID", session.id).put("title", session.title).put("info", info),
@@ -1686,17 +1700,40 @@ class DshApi(
   override suspend fun createSession(directory: String, title: String): Session = withContext(Dispatchers.IO) {
     // `session/create` 的请求只有 cwd/workspaceId/sessionId/agentPreset，网关按严格 schema 校验，
     // 多带 title 会以 gateway/arguments-invalid 失败；标题在创建后用 rename 设置。
+    // 复用同目录已有的空白会话：DSH Web 也是这么做的，否则每次新建都会留下一个服务端草稿。
+    val reusable = reusableBlank(directory)
+    try {
+      createSessionOnce(directory, title, reusable)
+    } catch (error: ApiException) {
+      // 这些错误明确表示“没有创建/没有复用”，换一次不带 sessionId 的请求是安全的；
+      // 网络错误不能重试，否则可能重复创建。
+      if (reusable == null || error.code !in BLANK_REUSE_DECLINED) throw error
+      createSessionOnce(directory, title, null)
+    }
+  }
+
+  /** 同目录、未归档、未开始的空白会话；取最新的一条，避免把历史草稿全部翻出来。 */
+  private fun reusableBlank(directory: String): String? {
+    val wanted = normalizedDirectory(directory)
+    if (wanted.isEmpty()) return null
+    return known.values.asSequence()
+      .filter { it.blank && it.parentId == null && !it.archived && normalizedDirectory(it.directory) == wanted }
+      .maxByOrNull { it.updated }?.id
+  }
+
+  private suspend fun createSessionOnce(directory: String, title: String, reuse: String?): Session {
     val request = JSONObject().put("cwd", directory)
+    if (reuse != null) request.put("sessionId", reuse)
     val result = callObject("session/create", requestArgs(request))
     val id = result.str("sessionId").ifBlank { throw ApiException(502, "服务器没有返回新会话 id") }
     val created = Session(
       id = id, directory = directory, title = title.ifBlank { "新会话" },
       updated = System.currentTimeMillis(), projectId = directory, created = System.currentTimeMillis(),
-      agent = result.str("agentPreset").ifBlank { null }
+      agent = result.str("agentPreset").ifBlank { null }, blank = true
     )
     known[id] = created
     if (title.isNotBlank()) runCatching { renameSession(created, title) }
-    created
+    return created
   }
 
   override suspend fun renameSession(session: Session, title: String) {
@@ -1792,6 +1829,9 @@ class DshApi(
       .put("content", content)
       .put("clientTimeZone", java.util.TimeZone.getDefault().id)
     call("session/prompt", requestArgs(request))
+    // prompt 已被接受：本机不再把它当服务端草稿。即使随后的列表/事件仍带旧的 blank，
+    // 也由 `itemToSession` 的单调判断保持可见；真正的 turn/start 会由 Host 再确认。
+    known[session.id] = (known[session.id] ?: session).copy(blank = false)
   }
 
   /**
@@ -1974,7 +2014,7 @@ class DshApi(
   }
 
   override suspend fun children(session: Session): List<Session> = withContext(Dispatchers.IO) {
-    listing().items.mapNotNull { itemToSession(it) }.filter { it.parentId == session.id }
+    listing().items.mapNotNull { itemToSession(it) }.filter { it.parentId == session.id && !it.blank }
   }
 
   // ---------------------------------------------------------------- 改动 / 文件
@@ -2151,6 +2191,13 @@ class DshApi(
     /** 单次补洞最多补这么多 seq；更大的缺口交给快照整体校正。 */
     const val MAX_GAP_REPAIR = 2_000L
     const val GAP_REPAIR_PAGE = 500
+    /**
+     * 复用空白会话被拒且明确没有创建时的错误码。网络错误/未知错误不在此列，避免重复创建。
+     */
+    private val BLANK_REUSE_DECLINED = setOf(
+      "session/conflict", "session/agent-busy", "session/writer-held", "session/not-found",
+      "session/workspace-attach-failed", "gateway/arguments-invalid"
+    )
 
     /** 认证失效的错误码：控制器据此提示重新配对，而不是当成网络抖动。 */
     const val AUTH_EXPIRED = DSH_AUTH_EXPIRED

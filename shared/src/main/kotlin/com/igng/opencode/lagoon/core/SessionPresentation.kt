@@ -63,7 +63,11 @@ fun sessionStatus(activeFamily: TaskState?, unseen: List<SessionNotice>): Sessio
   else -> SessionStatus.NONE
 }
 
-val Session.visibleOnHome: Boolean get() = parentId == null && !archived
+/**
+ * 首页/搜索/项目计数统一使用这个可见性。DSH 的 `blank` 是服务端尚未发送的草稿；
+ * Lagoon 自己已有本地草稿页，所以服务端空白行全部隐藏（OpenCode 的 blank 恒为 false）。
+ */
+val Session.visibleOnHome: Boolean get() = parentId == null && !archived && !blank
 val sessionActivityOrder: Comparator<Session> = compareByDescending<Session> { it.activityAt }.thenBy { it.id }
 
 data class SessionGroup(val key: String, val name: String, val sessions: List<Session>) {

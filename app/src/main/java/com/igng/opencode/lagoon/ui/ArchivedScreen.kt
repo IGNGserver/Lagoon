@@ -23,7 +23,7 @@ import top.yukonga.miuix.kmp.utils.overScrollVertical
 @Composable
 internal fun ArchivedScreen(state: LagoonState, controller: LagoonController, onOpen: (SessionTarget) -> Unit, onBack: () -> Unit) {
   var deleting by remember { mutableStateOf<Session?>(null) }
-  val archived = state.sessions.filter { it.parentId == null && it.archived }.sortedWith(sessionActivityOrder)
+  val archived = state.sessions.filter { it.parentId == null && it.archived && !it.blank }.sortedWith(sessionActivityOrder)
   val active = remember(state.tasks, state.parents, state.permissionPolicy, state.autoApprovalFailures, state.connected, state.lastContactAt) { state.activeRootTasks }
   val statuses = remember(state.sessions, state.notices, active, state.backgroundRunning, state.allSessionStatuses, state.multiServerView) {
     if (state.multiServerView) state.allSessionStatuses else state.sessions.associate { it.key to state.sessionStatus(it, active) }

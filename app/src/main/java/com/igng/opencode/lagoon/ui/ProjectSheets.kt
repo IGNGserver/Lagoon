@@ -119,7 +119,7 @@ internal fun AllServersScopeSheet(state: LagoonState, controller: LagoonControll
     LazyColumn(Modifier.fillMaxWidth().heightIn(max = 560.dp), contentPadding = PaddingValues(bottom = 16.dp)) {
       item {
         Card(Modifier.fillMaxWidth()) {
-          ChoiceRow("全部设备", "${state.sessions.count { it.parentId == null }} 个会话", true, onClick = onDismiss)
+          ChoiceRow("全部设备", "${state.sessions.count { it.parentId == null && !it.blank }} 个会话", true, onClick = onDismiss)
         }
       }
       item { SmallTitle("设备", insideMargin = PaddingValues(horizontal = 16.dp, vertical = 8.dp)) }
