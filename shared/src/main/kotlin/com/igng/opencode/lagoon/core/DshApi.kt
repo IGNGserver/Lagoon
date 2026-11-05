@@ -459,11 +459,11 @@ class DshApi(
     }
   }
 
-  /** 取一次 workspace/follow 首帧并落缓存（事件流不在线时的兜底）。 */
+  /** 取一次 workspace/follow 首帧并落缓存（事件流不在线时的兜底）。读不到就报错，不能装成“没有工作区”。 */
   private suspend fun fetchWorkspaceBaseline(): List<JSONObject> {
-    val frame = fetchFirstFrame("workspace/follow", noArgs()) ?: return emptyList()
+    val frame = fetchFirstFrame("workspace/follow", noArgs())
     if (frame.str("type") == "baseline") applyWorkspaceFrame(frame)
-    return workspaceItems ?: emptyList()
+    return workspaceItems ?: throw ApiException(502, "工作区列表为空：workspace/follow 没有返回 baseline")
   }
 
   /** baseline / upsert / remove / order / archived 帧；pinned 暂不消费。 */
@@ -527,7 +527,8 @@ class DshApi(
       // 首屏：`session/follow` 的首帧快照直接给出完整日志（`records` + 切点 `cursor`）。
       val snapshot = fetchSnapshot(id)
       val through = snapshot.optDouble("cursor", 0.0).toLong()
-      if (through > 0) cursors[id] = through
+      // 空会话的切点是 -1（Host 的 `cursorBeforeNext(0)`）；0 也合法，不能当作“没有日志”。
+      if (through >= 0) cursors[id] = through
       val records = snapshot.arr("records").objects()
       val messages = recordsToMessages(session, records)
       // 时间线被整页替换：清掉实时部件记录，让后续增量重建部件而不是写进已消失的行。
@@ -537,9 +538,9 @@ class DshApi(
     } else {
       val through = cursors[id] ?: run {
         val snapshot = fetchSnapshot(id)
-        snapshot.optDouble("cursor", 0.0).toLong().also { if (it > 0) cursors[id] = it }
+        snapshot.optDouble("cursor", 0.0).toLong().also { if (it >= 0) cursors[id] = it }
       }
-      if (through <= 0) return@withContext ApiPage(emptyList(), null)
+      if (through < 0) return@withContext ApiPage(emptyList(), null)
       val before = cursor.toLongOrNull() ?: return@withContext ApiPage(emptyList(), null)
       val request = JSONObject()
         .put("address", address(id))
@@ -631,9 +632,12 @@ class DshApi(
     streamHttp.newWebSocket(request, listener)
   }
 
-  /** 取一条流的首个 `item` 帧（`workspace/follow` 的清单、`session/follow` 的快照、`job/list` 的行）。 */
-  private suspend fun fetchFirstFrame(endpoint: String, payload: JSONObject): JSONObject? {
-    val deferred = CompletableDeferred<JSONObject?>()
+  /**
+   * 取一条流的首个 `item` 帧（`workspace/follow` 的清单、`session/follow` 的快照、`job/list` 的行）。
+   * 失败必须带端点与上游原因抛出：把“读不到”当成空数据会让会话页永远空白且无法排障。
+   */
+  private suspend fun fetchFirstFrame(endpoint: String, payload: JSONObject): JSONObject {
+    val deferred = CompletableDeferred<JSONObject>()
     val socket = try {
       openMux(endpoint, payload, onItem = { frame ->
         if (!deferred.isCompleted) deferred.complete(frame)
@@ -641,24 +645,68 @@ class DshApi(
         if (!deferred.isCompleted) deferred.completeExceptionally(cause ?: IOException("流已关闭"))
       })
     } catch (error: Exception) {
-      return null
+      throw streamFailure(endpoint, error)
     }
     return try {
-      withTimeout(20_000) { deferred.await() }
+      withTimeout(STREAM_FIRST_FRAME_TIMEOUT_MILLIS) { deferred.await() }
     } catch (error: CancellationException) {
       throw error
     } catch (error: Exception) {
-      null
+      throw streamFailure(endpoint, error)
     } finally {
       runCatching { socket.cancel() }
     }
   }
 
-  private suspend fun fetchSnapshot(id: String): JSONObject =
-    fetchFirstFrame("session/follow", requestArgs(JSONObject().put("address", address(id))))
-      ?: throw ApiException(502, "无法读取会话日志：DSH 没有返回快照")
+  /** 把流层的失败折成用户能看懂、也能定位的一层错误（保留上游 code）。 */
+  private fun streamFailure(endpoint: String, error: Throwable): ApiException {
+    if (error is ApiException) return error
+    val code = (error as? RemoteGatewayException)?.code
+    val reason = error.message?.takeIf { it.isNotBlank() } ?: error.javaClass.simpleName
+    return ApiException(502, "读取 $endpoint 失败：$reason", code)
+  }
 
-  private fun address(id: String): JSONObject = JSONObject().put("kind", "session").put("sessionId", id)
+  /**
+   * 首屏快照。参数对齐官方客户端的窗口：`assistantStream` 让“正在跑的轮次”也能看到已产出的内容，
+   * `maxMessages`/`turnWindow` 限制单帧体积，更早的历史仍由 `session/page` 翻页补。
+   * 首帧必须是 `snapshot`：中枢/协议漂移时返回别的帧，若直接当空日志处理就会得到永远空白的会话。
+   */
+  private suspend fun fetchSnapshot(id: String): JSONObject {
+    val request = requestArgs(JSONObject()
+      .put("address", address(id))
+      .put("assistantStream", true)
+      .put("maxMessages", SNAPSHOT_MAX_MESSAGES)
+      .put("turnWindow", JSONObject().put("minMessages", SNAPSHOT_MIN_MESSAGES).put("minTurns", 2)))
+    var failure: Exception? = null
+    for (attempt in 1..SNAPSHOT_ATTEMPTS) {
+      try {
+        val frame = fetchFirstFrame("session/follow", request)
+        if (frame.str("type") != "snapshot") throw ApiException(502,
+          "会话流首帧不是快照（${frame.str("type").ifBlank { "未知帧" }}）", "stream/not-snapshot")
+        return frame
+      } catch (cancel: CancellationException) {
+        throw cancel
+      } catch (error: Exception) {
+        failure = error
+        if (attempt < SNAPSHOT_ATTEMPTS) kotlinx.coroutines.delay(SNAPSHOT_RETRY_DELAY_MILLIS)
+      }
+    }
+    throw failure as? ApiException ?: ApiException(502, "无法读取会话日志：${failure?.message ?: "未知错误"}")
+  }
+
+  /**
+   * 会话地址。子代理会话必须用父会话地址投递（Host 会拒绝 `kind:"session"` 并报
+   * `session/agent-busy: subagent Sessions require their durable parent address`）。
+   */
+  private fun address(id: String): JSONObject {
+    val session = known[id]
+    val parent = session?.parentId?.takeIf { it.isNotBlank() }
+    if (parent != null && parent != id) {
+      return JSONObject().put("kind", "subagent").put("parentSessionId", parent)
+        .put("childSessionId", id).put("mode", session.subagentMode?.takeIf { it.isNotBlank() } ?: "unknown")
+    }
+    return JSONObject().put("kind", "session").put("sessionId", id)
+  }
 
   // ---------------------------------------------------------------- 事件翻译
 
@@ -1561,7 +1609,13 @@ class DshApi(
   private suspend fun runningJobs(session: Session): List<JSONObject> {
     val now = System.currentTimeMillis()
     jobCache[session.id]?.takeIf { now - it.first < JOB_CACHE_MILLIS }?.let { return it.second }
-    val jobs = fetchFirstFrame("job/list", requestArgs(JSONObject().put("sessionId", session.id)))?.arr("jobs")?.objects() ?: emptyList()
+    val jobs = try {
+      fetchFirstFrame("job/list", requestArgs(JSONObject().put("sessionId", session.id))).arr("jobs").objects()
+    } catch (cancel: CancellationException) {
+      throw cancel
+    } catch (_: Exception) {
+      emptyList()
+    }
     jobCache[session.id] = now to jobs
     return jobs
   }
@@ -2022,6 +2076,15 @@ class DshApi(
 
   internal companion object {
     const val WATCH_LIMIT = 12
+
+    /** 首帧等待上限；只覆盖“流被打开到第一帧到达”，不含后续分片/transfer 读取。 */
+    const val STREAM_FIRST_FRAME_TIMEOUT_MILLIS = 20_000L
+    /** 首屏快照的尝试次数：拿到非 snapshot 帧或流错误时重开一次，仍失败才报错。 */
+    const val SNAPSHOT_ATTEMPTS = 2
+    const val SNAPSHOT_RETRY_DELAY_MILLIS = 400L
+    /** 与官方客户端一致的窗口：限制单帧体积，更早的历史由 `session/page` 补。 */
+    const val SNAPSHOT_MAX_MESSAGES = 500
+    const val SNAPSHOT_MIN_MESSAGES = 50
 
     /** 认证失效的错误码：控制器据此提示重新配对，而不是当成网络抖动。 */
     const val AUTH_EXPIRED = DSH_AUTH_EXPIRED
