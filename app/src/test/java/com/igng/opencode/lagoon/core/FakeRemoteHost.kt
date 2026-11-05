@@ -55,6 +55,8 @@ internal class FakeRemoteHost(
   var call: (endpoint: String, payload: JSONObject) -> JSONObject = { endpoint, _ -> ok(JSONObject()) }
   /** 设成非空时，该 endpoint 的流在 open 响应后立刻以 failed 关闭（模拟主机侧读失败）。 */
   var streamFailure: String? = null
+  /** 返回非空错误码时，`stream.open` 直接以 rpc.error 拒绝（模拟参数形状/网关校验失败）。 */
+  var streamOpenError: (endpoint: String, payload: JSONObject) -> String? = { _, _ -> null }
 
   private val connectionId = UUID.randomUUID().toString()
 
@@ -230,6 +232,12 @@ internal class FakeRemoteHost(
         streamOpens += params
         val streamId = params.getString("streamId")
         val endpoint = params.getString("endpoint")
+        streamOpenError(endpoint, params.optJSONObject("payload") ?: JSONObject())?.let { code ->
+          sendMessage(socket, JSONObject().put("v", 1).put("id", id).put("type", "rpc.error")
+            .put("timestamp", System.currentTimeMillis())
+            .put("payload", JSONObject().put("requestId", id).put("code", code).put("message", code)))
+          return
+        }
         val frames = streamFrames(endpoint, params.optJSONObject("payload") ?: JSONObject())
         val failure = streamFailure
         if (failure != null) {
@@ -269,6 +277,14 @@ internal class FakeRemoteHost(
         .putInt(id).putShort(index.toShort()).putShort(total.toShort()).putInt(message.size)
         .put(message, offset, length).array()
     }
+  }
+
+  /** 向某 endpoint 最近打开的那条流补推一帧（模拟实时事件）。 */
+  fun push(endpoint: String, value: Any) {
+    val params = streamOpens.lastOrNull { it.optString("endpoint") == endpoint } ?: return
+    val socket = controlSocket ?: return
+    publish(socket, "harness.remote.frame", JSONObject().put("streamId", params.getString("streamId"))
+      .put("hasValue", true).put("value", value))
   }
 
   fun accountEmail(): String = account

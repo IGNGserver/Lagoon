@@ -309,9 +309,13 @@ class LagoonController private constructor(private val appContext: Context) {
       val manager = RemoteDeviceManager(store.remoteDevices, remoteSlot(profile), origin, account,
         registerer = { descriptor, token -> RemoteServerApi(profile.url, profile.allowCleartext).register(descriptor, token) },
         refresher = { id, token -> RemoteServerApi(profile.url, profile.allowCleartext).refresh(id, token) })
-      val session = RemoteSession(profile.url, profile.allowCleartext, hostId, manager,
-        RemotePeerTrust(store.remotePins), account)
-      return RemoteBackend(session)
+      // 同一 (Hub, 账号, Host) 全进程只保留一条加密连接，避免 monitor/控制器/测试互相顶掉。
+      val key = "remote|$origin|$account|$hostId"
+      val session = RemoteConnectionRegistry.acquire(key) {
+        RemoteSession(profile.url, profile.allowCleartext, hostId, manager,
+          RemotePeerTrust(store.remotePins), account)
+      }
+      return RemoteBackend(session) { RemoteConnectionRegistry.release(key) }
     }
   }
 

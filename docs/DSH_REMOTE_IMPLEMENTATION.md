@@ -145,3 +145,17 @@ Noise + relay + `harness.remote.stream.open` + 1.5 MB 分片快照 + `session/fo
 
 仍未做：独立 Relay 数据通道（中枢若在 `connect.accepted` 里下发 `relayEndpoint/relayTicket`，
 当前会明确报“暂不支持独立 Relay 端点”）、进程级单连接注册表、流 seq 缺口自动补洞。
+
+## P1 收尾（第四阶段）
+
+- **独立 Relay 数据通道**：中枢若在 `connect.accepted` 里下发 `relayEndpoint/relayTicket/relayEpoch`，
+  客户端按参考实现 `relay.attach → relay.ready → transport.selected → secure.handshake` 附加数据通道
+  （15s 超时，`relay.detach`/断开都会明确失败）；就绪后业务密文只走该通道，控制通道保留 ping 与握手。
+- **进程级单连接注册表**：`RemoteConnectionRegistry` 按 `(Hub, 账号, hostId)` 共享 `RemoteSession` 并引用计数，
+  首页监控、控制器打开的会话与「测试连接」不再各开一条隧道互相顶掉；最后一个持有者释放时才真正关闭。
+- **实时缺口补齐**：`session/follow` 的实时事件出现 seq 缺口时，用 `session/page`（`beforeSeq=last+1`,
+  `throughSeq=gap-1`）补齐后再投影当前事件；缺口超过 2000 条时交给下一次快照整体校正。
+- **代际参数表**：`workspace/follow` 的参数形状按代际不同（0.2.1 线 `{args:{}}`，新代际 `{args:{request:{}}}`），
+  首次被 `gateway/arguments-invalid` 拒绝后自动换形状并记住，不再把代际写死。
+- 主动关闭连接会让流正常结束，不再向消费者抛“连接已关闭”。
+- 新增测试：独立数据通道端到端、连接注册表引用计数、缺口补齐、`workspace/follow` 参数回退。

@@ -1,6 +1,10 @@
 package com.igng.opencode.lagoon.core
 
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
@@ -180,6 +184,88 @@ class RemoteConversationTest {
         val page = backend.client.messagesPage(id)
         assertEquals(2, page.items.size)
         assertTrue("应打开过独立 Relay 数据通道", host.requests.any { it.startsWith("GET /relay/v1") })
+      } finally { backend.close(); session.close() }
+    }
+  }
+
+  /**
+   * `workspace/follow` 的参数形状按代际不同：0.2.1 线只收 `{args:{}}`，新代际收 `{args:{request:{}}}`。
+   * 被 `gateway/arguments-invalid` 拒绝时要自动换形状，而不是把“没有工作区”当成结果。
+   */
+  @Test fun workspaceFollowFallsBackToGenerationSpecificArgs() = runBlocking {
+    val baseline = JSONObject().put("type", "baseline").put("value", JSONObject()
+      .put("items", JSONArray().put(JSONObject().put("workspaceId", "w1").put("path", "/repo").put("title", "repo")))
+      .put("archivedSessionIds", JSONArray()))
+    FakeRemoteHost().use { host ->
+      var rejected = 0
+      host.streamOpenError = { endpoint, payload ->
+        val args = payload.optJSONObject("args")
+        if (endpoint == "workspace/follow" && args != null && !args.has("request")) {
+          rejected++
+          "gateway/arguments-invalid"
+        } else null
+      }
+      host.streamFrames = { endpoint, _ -> if (endpoint == "workspace/follow") listOf(baseline) else emptyList() }
+      host.start()
+      val (session, backend) = backend(host)
+      try {
+        val projects = backend.client.projects()
+        assertEquals(1, rejected)
+        assertEquals(1, projects.size)
+        assertEquals("/repo", projects.single().directory)
+        // 第二次沿用已经确认的形状，不再被拒。
+        assertEquals(1, backend.client.projects().size)
+        assertEquals(1, rejected)
+      } finally { backend.close(); session.close() }
+    }
+  }
+
+  /** 实时流出现 seq 缺口时用 `session/page` 补齐，缺的事件不会悄悄丢掉。 */
+  @Test fun repairsLiveSeqGapFromSessionPage() = runBlocking {
+    val id = "session-${UUID.randomUUID()}"
+    fun record(seq: Int): JSONObject = JSONObject().put("type", "event").put("event", JSONObject()
+      .put("type", "assistant/message").put("seq", seq).put("time", 100L + seq)
+      .put("data", JSONObject().put("turn", 1).put("step", seq)
+        .put("message", JSONObject().put("role", "assistant")
+          .put("content", JSONArray().put(JSONObject().put("type", "text").put("text", "补洞 $seq"))))))
+    FakeRemoteHost().use { host ->
+      host.call = { endpoint, payload ->
+        when (endpoint) {
+          "session/list" -> host.ok(JSONObject().put("items", JSONArray().put(sessionRow(id))))
+          "session/page" -> {
+            val request = payload.getJSONObject("args").getJSONObject("request")
+            val before = request.getInt("beforeSeq")
+            val through = request.getInt("throughSeq")
+            val records = JSONArray()
+            for (seq in before..through) records.put(record(seq))
+            host.ok(JSONObject().put("records", records).put("hasMore", false))
+          }
+          else -> host.ok(JSONObject())
+        }
+      }
+      host.streamFrames = { endpoint, _ -> if (endpoint == "session/follow") listOf(snapshot(id, 4)) else emptyList() }
+      host.start()
+      val (session, backend) = backend(host)
+      try {
+        val received = mutableListOf<ServerEvent>()
+        val collector = launch { backend.client.events {}.collect { event -> synchronized(received) { received += event } } }
+        delay(300)
+        backend.client.messagesPage(id)
+        delay(300)
+        host.push("session/follow", JSONObject().put("type", "event").put("event", JSONObject()
+          .put("type", "assistant/message").put("seq", 9).put("time", 900L)
+          .put("data", JSONObject().put("turn", 1).put("step", 9)
+            .put("message", JSONObject().put("role", "assistant")
+              .put("content", JSONArray().put(JSONObject().put("type", "text").put("text", "最新一步")))))))
+        fun pageCalls() = host.rpcCalls.filter {
+          it.optString("method") == "harness.remote.call" && it.optJSONObject("params")?.optString("endpoint") == "session/page"
+        }
+        withTimeout(5_000) { while (pageCalls().isEmpty()) delay(20) }
+        val request = pageCalls().first()
+          .getJSONObject("params").getJSONObject("payload").getJSONObject("args").getJSONObject("request")
+        assertEquals(5, request.getInt("beforeSeq"))
+        assertEquals(8, request.getInt("throughSeq"))
+        collector.cancelAndJoin()
       } finally { backend.close(); session.close() }
     }
   }

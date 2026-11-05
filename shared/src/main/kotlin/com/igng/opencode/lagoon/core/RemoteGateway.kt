@@ -221,7 +221,8 @@ internal class RemoteGateway(private val transferFrames: Boolean = false, privat
   override fun close() {
     synchronized(streams) {
       closed = true
-      streams.values.forEach { it.frames.close(IOException("Remote 连接已关闭")); it.output.close(IOException("Remote 连接已关闭")); it.worker?.cancel() }
+      // 主动关闭不算故障：让消费者正常结束，而不是收到一个“连接已关闭”的异常。
+      streams.values.forEach { it.frames.close(); it.output.close(); it.worker?.cancel() }
       streams.clear()
     }
   }

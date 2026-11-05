@@ -10,7 +10,12 @@ import java.io.IOException
 import java.util.concurrent.atomic.AtomicBoolean
 
 /** Adapts the existing Typert projection to a single authenticated Remote owner peer. */
-class RemoteBackend internal constructor(private val session: RemoteSession) : AutoCloseable {
+class RemoteBackend internal constructor(
+  private val session: RemoteSession,
+  /** 释放共享连接（默认直接关闭会话）；见 [RemoteConnectionRegistry]。 */
+  private val release: () -> Unit = { session.close() }
+) : AutoCloseable {
+  private val closed = java.util.concurrent.atomic.AtomicBoolean(false)
   private val harness = DshApi(
     ServerProfile("remote-backend", "DSH Remote", "https://remote.invalid", kind = ServerKind.DSH_REMOTE),
     ServerCredentials("dsh"), remoteBackend = this
@@ -45,7 +50,9 @@ class RemoteBackend internal constructor(private val session: RemoteSession) : A
     if (session.capabilities().sessionFormat == null) throw IOException("Host 没有 DSH Typert 后端，不能切换到其他后端")
   }
 
-  override fun close() = session.close()
+  override fun close() {
+    if (closed.compareAndSet(false, true)) release()
+  }
 
   private class StreamSocket(
     private val stream: RemoteGatewayStream,

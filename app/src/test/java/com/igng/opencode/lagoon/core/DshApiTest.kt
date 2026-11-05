@@ -19,6 +19,7 @@ import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.util.concurrent.CountDownLatch
@@ -1110,5 +1111,15 @@ class DshApiTest {
       assertEquals("127.0.0.1:45678", request!!.getHeader("Host"))
       client.close()
     }
+  }
+
+  /** 断线缺口只在有限范围内自动补；过大或还没有基线时不补，交给快照校正。 */
+  @Test fun gapRepairWindowCoversOnlyBoundedForwardGaps() {
+    val api = DshApi(ServerProfile("srv", "DSH", "http://127.0.0.1:1", username = "dsh", allowCleartext = true, kind = ServerKind.DSH),
+      ServerCredentials("dsh", "tok"))
+    assertEquals(5L..8L, api.gapRepairWindow(4, 9))
+    assertNull("还没有基线时不补", api.gapRepairWindow(0, 9))
+    assertNull("连续事件不是缺口", api.gapRepairWindow(4, 5))
+    assertNull("过大缺口交给快照", api.gapRepairWindow(4, 4 + DshApi.MAX_GAP_REPAIR + 2))
   }
 }

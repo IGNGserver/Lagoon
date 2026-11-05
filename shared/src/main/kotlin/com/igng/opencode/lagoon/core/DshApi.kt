@@ -387,6 +387,10 @@ class DshApi(
   }
 
   /** The `session/list` read in flight; concurrent callers share it (see [listing]). */
+  /** `workspace/follow` 的参数形状；首次成功或被拒绝后确定，见 [fetchWorkspaceBaseline]。 */
+  private var workspaceArgsStyle = WorkspaceArgsStyle.EMPTY
+  private enum class WorkspaceArgsStyle { EMPTY, REQUEST }
+
   private var listingFlight: Deferred<Listing>? = null
   private val listingLock = Mutex()
 
@@ -459,9 +463,31 @@ class DshApi(
     }
   }
 
-  /** 取一次 workspace/follow 首帧并落缓存（事件流不在线时的兜底）。读不到就报错，不能装成“没有工作区”。 */
+  /**
+   * 取一次 workspace/follow 首帧并落缓存（事件流不在线时的兜底）。读不到就报错，不能装成“没有工作区”。
+   *
+   * 参数形状按代际不同：0.2.1 线只接受 `{args:{}}`，更新的代际用 `{args:{request:{}}}`。
+   * 先用本机已知形状，被 `gateway/arguments-invalid` 拒绝时换另一种并记住，避免把协议代际写死。
+   */
   private suspend fun fetchWorkspaceBaseline(): List<JSONObject> {
-    val frame = fetchFirstFrame("workspace/follow", noArgs())
+    var frame: JSONObject
+    if (workspaceArgsStyle == WorkspaceArgsStyle.REQUEST) {
+      frame = try {
+        fetchFirstFrame("workspace/follow", requestArgs(JSONObject()))
+      } catch (error: ApiException) {
+        if (error.code != "gateway/arguments-invalid") throw error
+        workspaceArgsStyle = WorkspaceArgsStyle.EMPTY
+        fetchFirstFrame("workspace/follow", noArgs())
+      }
+    } else {
+      frame = try {
+        fetchFirstFrame("workspace/follow", noArgs())
+      } catch (error: ApiException) {
+        if (error.code != "gateway/arguments-invalid") throw error
+        workspaceArgsStyle = WorkspaceArgsStyle.REQUEST
+        fetchFirstFrame("workspace/follow", requestArgs(JSONObject()))
+      }
+    }
     if (frame.str("type") == "baseline") applyWorkspaceFrame(frame)
     return workspaceItems ?: throw ApiException(502, "工作区列表为空：workspace/follow 没有返回 baseline")
   }
@@ -664,7 +690,7 @@ class DshApi(
   /** 把流层的失败折成用户能看懂、也能定位的一层错误（保留上游 code）。 */
   private fun streamFailure(endpoint: String, error: Throwable): ApiException {
     if (error is ApiException) return error
-    val code = (error as? RemoteGatewayException)?.code
+    val code = (error as? RemoteGatewayException)?.code ?: (error as? RemoteRpcException)?.code
     val reason = error.message?.takeIf { it.isNotBlank() } ?: error.javaClass.simpleName
     return ApiException(502, "读取 $endpoint 失败：$reason", code)
   }
@@ -1163,6 +1189,10 @@ class DshApi(
                 val seq = event.optDouble("seq", 0.0).toLong()
                 // 只投影时间线还没有的耐久事件（与消息页快照按 seq 去重）。
                 if (seq <= 0 || seq > lastSeq(id)) {
+                  // 断线/背压造成的 seq 缺口：先用 session/page 补齐，再投影当前事件，
+                  // 否则这一步之后的工具调用会与前面的用户消息脱节。
+                  val previous = lastSeq(id)
+                  if (seq > 0) gapRepairWindow(previous, seq)?.let { repairGap(session, id, it, channel) }
                   translate(session, event).forEach { channel.trySend(it) }
                   if (seq > 0) advanceSeq(id, seq)
                 }
@@ -1181,6 +1211,36 @@ class DshApi(
         throw error
       } catch (error: Exception) {
         Diagnostics.warn("DshApi", "会话事件流未建立", error)
+      }
+    }
+  }
+
+  /**
+   * 补洞窗口：`previous` 之后、`seq` 之前缺失的耐久事件。缺口过大（> [MAX_GAP_REPAIR]）时不逐条补，
+   * 交给下一次打开会话的快照整体校正，避免重连风暴里发出超长翻页请求。
+   */
+  internal fun gapRepairWindow(previous: Long, seq: Long): LongRange? =
+    if (previous > 0 && seq > previous + 1 && seq - previous <= MAX_GAP_REPAIR) (previous + 1) until seq else null
+
+  private fun repairGap(session: Session, id: String, missing: LongRange, channel: Channel<ServerEvent>) {
+    ioScope.launch {
+      try {
+        val request = JSONObject().put("address", address(id))
+          .put("throughSeq", missing.last).put("beforeSeq", missing.first).put("maxMessages", GAP_REPAIR_PAGE)
+        val page = callObject("session/page", requestArgs(request))
+        var repaired = 0
+        for (record in page.arr("records").objects()) {
+          val event = record.obj("event")
+          val seq = event.optDouble("seq", 0.0).toLong()
+          if (seq !in missing) continue
+          translate(session, event).forEach { channel.trySend(it) }
+          repaired++
+        }
+        Diagnostics.info("DshApi", "会话事件缺口补齐 · ${missing.first}..${missing.last} · events=$repaired")
+      } catch (cancel: CancellationException) {
+        throw cancel
+      } catch (error: Exception) {
+        Diagnostics.warn("DshApi", "会话事件缺口补齐失败", error)
       }
     }
   }
@@ -2088,6 +2148,9 @@ class DshApi(
     /** 与官方客户端一致的窗口：限制单帧体积，更早的历史由 `session/page` 补。 */
     const val SNAPSHOT_MAX_MESSAGES = 500
     const val SNAPSHOT_MIN_MESSAGES = 50
+    /** 单次补洞最多补这么多 seq；更大的缺口交给快照整体校正。 */
+    const val MAX_GAP_REPAIR = 2_000L
+    const val GAP_REPAIR_PAGE = 500
 
     /** 认证失效的错误码：控制器据此提示重新配对，而不是当成网络抖动。 */
     const val AUTH_EXPIRED = DSH_AUTH_EXPIRED
