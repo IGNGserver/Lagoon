@@ -19,8 +19,14 @@
   - `GET /api/v1/auth/oauth/providers`
   - `POST <qrStartUrl>` / `GET /api/v1/auth/oauth/qr/{id}`
   - `GET /api/v1/auth/me`（Bearer account token）
+  - `GET /api/v1/account/devices`（Bearer account token，登录后的 Host 发现）
   - `DELETE /api/v1/devices/self`
   - 入口路径限定同源 `/api/v1/auth/`，拒绝控制字符、`.`/`..`、`%` 段；`scanUrl` 同源。
+  - **账号 token 与设备 token 不能混用**：`/api/v1/devices`、`/api/v1/devices/{id}` 要
+    已注册 Client 的 device token；登录后只有 account token，必须走
+    `/api/v1/account/devices`，否则会得到 `401 AUTH_INVALID`，表现成“密码错误”。
+    `/api/v1/account/devices` 同时返回 Host 的 `identityKey`，发现阶段不需要再逐台取详情；
+    响应里也会包含 Client，按 `role=host` 过滤。
 - `RemoteCatalog` / `RemoteCatalogCodec` / `AndroidRemoteCatalogStore`：
   - 账号级 Host 目录，不存 token/公钥；每 Host 记录展示名称、平台、在线、版本、指纹、trust。
   - `remote-host-catalog` 是唯一 Host 目录来源；设备组只是后续视图层。
@@ -99,7 +105,7 @@ ANDROID_HOME=/home/lvziw/Android/Sdk BUILD_SCRATCH_ROOT=/home/lvziw/.build-lagoo
 
 - `RemoteOAuthTest`：provider 解析、QR 轮询、account me、跨源拒绝、revoke。
 - `RemoteCatalogTest`：目录编解码、重复 Host 拒绝。
-- `RemoteAccountManagerTest`：邮箱登录、发现、Host-stable 设备 slot、pin、目录保存。
+- `RemoteAccountManagerTest`：邮箱登录后走账号设备目录、过滤 Client、Host-stable 设备 slot、刷新仍走设备 token、pin、目录保存。
 - `RemoteFailureTest`：状态码到失败类型、指纹失败、离线可重试。
 - `RemoteCapabilitiesTest`：`workspace.upload.v1` 门控。
 - `DshApiTest`：插件 bundle 解析、`credentials/describe/set/unset` 通道、`goals/get/create/pause` 会话级 RPC、`workspaceFiles/readBytes`/`officeToPdf/render` 预览、子代理 `subagent.mode` 解析、`schedule/list`、`settings/mutate` 自定义模型路由。

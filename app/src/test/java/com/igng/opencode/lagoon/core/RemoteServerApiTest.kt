@@ -53,6 +53,37 @@ class RemoteServerApiTest {
     assertEquals(refresh, JSONObject(refreshRequest.body.readUtf8()).getString("refreshToken"))
   }
 
+  @Test fun accountDirectoryUsesAccountTokenAndSkipsClients() = server { mock, api ->
+    mock.enqueue(MockResponse().setBody("""{"items":[
+      {"deviceId":"$hostId","name":"Host","platform":"linux","role":"host","membershipId":"member","online":true,"identityKey":"$key"},
+      {"deviceId":"$id","name":"Phone","platform":"android","role":"client","membershipId":"member","online":false,"identityKey":"$key"},
+      {"deviceId":"a8f582fb-f662-49c6-b7f0-456a797a5303","name":"NoKey","platform":"linux","role":"host","membershipId":"member","online":false}
+    ]}"""))
+    val hosts = api.accountHosts(accountToken)
+    assertEquals(2, hosts.size)
+    assertEquals(hostId, hosts[0].deviceId)
+    assertEquals(key, hosts[0].publicKey)
+    assertEquals("NoKey", hosts[1].name)
+    assertNull(hosts[1].publicKey)
+    val request = mock.takeRequest()
+    assertEquals("/api/v1/account/devices", request.path)
+    assertEquals("Bearer $accountToken", request.getHeader("Authorization"))
+  }
+
+  @Test fun accountDirectoryRejectsExpiredAccountSessionWithUserMessage() = server { mock, api ->
+    mock.enqueue(MockResponse().setResponseCode(401)
+      .setBody("""{"error":{"code":"ACCOUNT_AUTH_REQUIRED","message":"ACCOUNT_AUTH_REQUIRED","retryable":false}}"""))
+    try { api.accountHosts(accountToken); fail("expected failure") }
+    catch (error: IOException) { assertTrue(error.message!!.contains("重新登录")) }
+  }
+
+  @Test fun loginRejectsWrongPasswordWithCredentialMessage() = server { mock, api ->
+    mock.enqueue(MockResponse().setResponseCode(401)
+      .setBody("""{"error":{"code":"AUTH_INVALID","message":"AUTH_INVALID","retryable":false}}"""))
+    try { api.login("user@example.org", "wrong"); fail("expected failure") }
+    catch (error: IOException) { assertTrue(error.message!!.contains("账号或密码")) }
+  }
+
   @Test fun redirectNeverForwardsAccountCredentials() = server { mock, api ->
     MockWebServer().use { other ->
       other.start()

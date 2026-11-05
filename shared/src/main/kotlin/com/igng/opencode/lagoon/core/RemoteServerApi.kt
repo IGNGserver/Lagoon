@@ -33,7 +33,14 @@ internal class RemoteServerApi(address: String, allowCleartext: Boolean = false)
   }
 
   suspend fun login(account: String, password: String): RemoteAccount {
-    val body = request("POST", "api/v1/auth/login", JSONObject().put("email", account.trim()).put("password", password))
+    val body = try {
+      request("POST", "api/v1/auth/login", JSONObject().put("email", account.trim()).put("password", password))
+    } catch (error: RemoteServerException) {
+      // A login 401 is a credential mismatch, not an expired session. Do not let the raw
+      // AUTH_INVALID code read like a network or token problem.
+      if (error.status == 401) throw IOException("账号或密码不正确；请使用中枢服务端配置的账号与密码", error)
+      throw error
+    }
     return RemoteAccount(requiredText(body, "account", 254), token(body, "token"), positiveLong(body, "expiresAt"))
   }
 
@@ -121,6 +128,28 @@ internal class RemoteServerApi(address: String, allowCleartext: Boolean = false)
     return (0 until items.length()).map { index -> host(items.optJSONObject(index) ?: throw IOException("DSH Hub 设备信息无效"), false) }
   }
 
+  /**
+   * Account-scoped Host directory. `/api/v1/devices` is Client-device-token scoped and rejects the
+   * 8-hour account token issued by login; `/api/v1/account/devices` is the account-token route and
+   * already carries each Host's identityKey, so discovery needs no per-Host detail call.
+   */
+  suspend fun accountHosts(accountToken: String): List<RemoteHost> {
+    if (!validToken(accountToken)) throw IOException("DSH Remote 账号凭据无效")
+    val body = try {
+      requestAt("GET", sameOriginUrl("/api/v1/account/devices"), null, accountToken)
+    } catch (error: RemoteServerException) {
+      if (error.status == 401) throw IOException("DSH Remote 登录已失效，请重新登录", error)
+      if (error.status == 404) throw IOException("这个中枢不支持账号设备目录，请升级 DSH Remote 中枢", error)
+      throw error
+    }
+    val items = body.optJSONArray("items") ?: throw IOException("DSH Hub 设备列表无效")
+    if (items.length() > 5000) throw IOException("DSH Hub 设备列表超过上限")
+    return (0 until items.length()).mapNotNull { index ->
+      val item = items.optJSONObject(index) ?: throw IOException("DSH Hub 设备信息无效")
+      if (item.optString("role") != "host") null else accountHost(item)
+    }
+  }
+
   /** Fetch separately: list results intentionally do not contain the Host identity key. */
   suspend fun host(accessToken: String, deviceId: String): RemoteHost {
     require(validDeviceId(deviceId)) { "DSH Hub 设备 ID 无效" }
@@ -130,16 +159,28 @@ internal class RemoteServerApi(address: String, allowCleartext: Boolean = false)
   }
 
   private fun host(body: JSONObject, includeKey: Boolean): RemoteHost {
-    val id = requiredText(body, "deviceId", 64)
-    if (!validDeviceId(id) || body.optString("role") != "host") throw IOException("DSH Hub Host 身份无效")
+    val id = hostId(body)
     val key = if (includeKey) requiredText(body, "identityKey", 43).also {
       if (!validPublicKey(it)) throw IOException("DSH Hub Host 公钥无效")
     } else null
-    return RemoteHost(id, requiredText(body, "name", 128), requiredText(body, "platform", 64),
+    return remoteHost(body, id, key)
+  }
+
+  /** Account directory entries may omit identityKey on older/minimal Servers; show them as unenrollable instead of hiding them. */
+  private fun accountHost(body: JSONObject): RemoteHost =
+    remoteHost(body, hostId(body), (body.opt("identityKey") as? String)?.takeIf(RemoteServerApi::validPublicKey))
+
+  private fun hostId(body: JSONObject): String {
+    val id = requiredText(body, "deviceId", 64)
+    if (!validDeviceId(id) || body.optString("role") != "host") throw IOException("DSH Hub Host 身份无效")
+    return id
+  }
+
+  private fun remoteHost(body: JSONObject, id: String, key: String?): RemoteHost =
+    RemoteHost(id, requiredText(body, "name", 128), requiredText(body, "platform", 64),
       requiredText(body, "membershipId", 256), body.optBoolean("online", false), key,
       body.optString("clientVersion").takeIf(String::isNotBlank), body.optString("harnessVersion").takeIf(String::isNotBlank),
       body.optString("fingerprint").takeIf(String::isNotBlank))
-  }
 
   private fun entryUrl(path: String): okhttp3.HttpUrl = sameOriginUrl(requireAuthEntryPath(path))
 

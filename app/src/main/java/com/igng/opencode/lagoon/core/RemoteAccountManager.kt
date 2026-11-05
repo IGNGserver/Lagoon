@@ -56,12 +56,12 @@ internal class RemoteAccountManager(
   /** Completes a browser login and loads the account's Hosts. */
   suspend fun completeBrowserLogin(login: RemoteBrowserLogin, accountToken: String): List<RemoteHostCandidate> {
     val name = api.accountMe(accountToken)
-    return adoptAccount(name, accountToken, login.provider)
+    return adoptAccount(name, accountToken, login.provider, accountScoped = true)
   }
 
   suspend fun loginWithPassword(name: String, password: String): List<RemoteHostCandidate> {
     val login = api.login(name, password)
-    return adoptAccount(login.account, login.token, "password")
+    return adoptAccount(login.account, login.token, "password", accountScoped = true)
   }
 
   suspend fun refresh(): RemoteCatalog {
@@ -135,35 +135,44 @@ internal class RemoteAccountManager(
 
   fun cachedCandidates(): List<RemoteHostCandidate> = candidates
 
-  private suspend fun adoptAccount(name: String, token: String, source: String): List<RemoteHostCandidate> {
+  private suspend fun adoptAccount(name: String, token: String, source: String, accountScoped: Boolean): List<RemoteHostCandidate> {
     account = name
     accountToken = token
     provider = source
-    return loadCandidates(token, name)
+    return loadCandidates(token, name, accountScoped)
   }
 
-  private suspend fun loadCandidates(token: String, name: String): List<RemoteHostCandidate> {
-    val list = api.hosts(token)
-    val out = mutableListOf<RemoteHostCandidate>()
-    for (host in list) {
-      val detail = runCatching { api.host(token, host.deviceId) }.getOrNull() ?: continue
-      val fingerprint = detail.publicKey?.let { runCatching { RemoteSetup.fingerprint(it) }.getOrNull() }
-      val scope = RemotePeerScope(origin, name, detail.deviceId)
-      val pinned = pins.pinned(scope)
-      val trust = when {
-        pinned == null -> RemoteTrustState.UNKNOWN
-        detail.publicKey != null && sameKey(pinned, detail.publicKey) -> RemoteTrustState.PINNED
-        else -> RemoteTrustState.CHANGED
-      }
-      out += RemoteHostCandidate(detail, RemoteHostMeta(detail.deviceId, detail.name, detail.platform, detail.online,
-        lastSeenAt = null, harnessVersion = detail.harnessVersion, pluginVersion = null, fingerprint = fingerprint, trust = trust))
+  /**
+   * Account tokens only work on `/api/v1/account/devices`; `/api/v1/devices` requires a registered
+   * Client device token. Using the wrong pair yields HTTP 401 AUTH_INVALID right after a successful
+   * login, which the UI used to surface as a credential failure.
+   */
+  private suspend fun loadCandidates(token: String, name: String, accountScoped: Boolean = false): List<RemoteHostCandidate> {
+    val details = if (accountScoped) {
+      api.accountHosts(token)
+    } else {
+      api.hosts(token).mapNotNull { runCatching { api.host(token, it.deviceId) }.getOrNull() }
     }
+    val out = details.map { candidate(it, name) }
     candidates = out
     return out
   }
 
+  private fun candidate(detail: RemoteHost, name: String): RemoteHostCandidate {
+    val fingerprint = detail.publicKey?.let { runCatching { RemoteSetup.fingerprint(it) }.getOrNull() }
+    val scope = RemotePeerScope(origin, name, detail.deviceId)
+    val pinned = pins.pinned(scope)
+    val trust = when {
+      detail.publicKey == null || pinned == null -> RemoteTrustState.UNKNOWN
+      sameKey(pinned, detail.publicKey) -> RemoteTrustState.PINNED
+      else -> RemoteTrustState.CHANGED
+    }
+    return RemoteHostCandidate(detail, RemoteHostMeta(detail.deviceId, detail.name, detail.platform, detail.online,
+      lastSeenAt = null, harnessVersion = detail.harnessVersion, pluginVersion = null, fingerprint = fingerprint, trust = trust))
+  }
+
   private suspend fun loadHosts(token: String, name: String): List<RemoteHostMeta> =
-    loadCandidates(token, name).map { it.meta }
+    loadCandidates(token, name, accountScoped = false).map { it.meta }
 
   private suspend fun deviceToken(catalog: RemoteCatalog): String? {
     for (host in catalog.hosts) {
