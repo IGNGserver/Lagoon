@@ -531,6 +531,9 @@ class DshApi(
       if (through >= 0) cursors[id] = through
       val records = snapshot.arr("records").objects()
       val messages = recordsToMessages(session, records)
+      // 空白会话排障：记录“拿到了什么”，不记录任何消息内容。
+      Diagnostics.info("DshApi", "session/follow 快照 · ${address(id).str("kind")} · records=${records.size} " +
+        "messages=${messages.size} cursor=${snapshot.optDouble("cursor", -1.0).toLong()} hasMore=${snapshot.optBoolean("hasMore")}")
       // 时间线被整页替换：清掉实时部件记录，让后续增量重建部件而不是写进已消失的行。
       liveParts.keys.filter { it.startsWith("${session.id}|") }.forEach { liveParts.remove(it) }
       advanceSeq(id, records.mapNotNull { it.obj("event").optDouble("seq", 0.0).toLong().takeIf { value -> value > 0 } }.maxOrNull())

@@ -116,3 +116,32 @@ ANDROID_HOME=/home/lvziw/Android/Sdk BUILD_SCRATCH_ROOT=/home/lvziw/.build-lagoo
 2. P2：上传进度/取消、完整模型服务商/自定义路由表单。
 3. P3：子代理续聊补 continuable 判定/刷新；Office/PDF/图片首屏预览和目标条已接入；定时任务未做。
 4. P4：评估已完成，见 [`DSH_REMOTE_WEBRTC_EVAL.md`](DSH_REMOTE_WEBRTC_EVAL.md)；Host 提供能力前继续 Relay。
+
+## P0 修复：Remote 会话读取不再静默空白（2026-11-05）
+
+真机症状：首页有会话，但每条会话内容都是空白。排查发现链路本身可用（用假 Host 跑通了
+Noise + relay + `harness.remote.stream.open` + 1.5 MB 分片快照 + `session/follow` 解码），
+真正的问题是**失败被折成空数据**、**凭据刷新可能永久卡死**、以及**缺字段导致的可诊断性为零**。
+
+已修复：
+
+- `DshApi.fetchFirstFrame` 失败不再返回 null：抛带端点与上游 code 的 `ApiException`，
+  `projects()` 也不会把“读不到工作区”当成“没有工作区”。聊天页因此能看到真实原因。
+- `session/follow` 首帧必须是 `snapshot`（否则重试一次并报 `stream/not-snapshot`）；
+  首屏快照补 `assistantStream:true / maxMessages:500 / turnWindow{50,2}`，与官方客户端窗口一致，
+  正在跑的轮次也能看到已产出的内容。
+- 空会话的 `cursor` 为 `-1` 或 `0` 时同样写入分页切点，翻页不再永久为空。
+- 子代理会话使用 `kind:"subagent" + parentSessionId + childSessionId + mode` 地址
+  （Host 对 `kind:"session"` 会报 `session/agent-busy`）。
+- 凭据刷新引入 `transitionAt`：超过 90s 的 `REFRESHING` 视为进程被杀/断网并自动重试，
+  失败保留旧令牌，只有 401/403 才要求重新登录；注册失败恢复原记录。
+- 流事件不再抛异常：坏帧只失败所属流（先送完已缓冲的帧），未知消息类型/控制帧忽略并计数。
+- 连接与能力协商失败带上层原因（不再只有“没能建立加密中继”）。
+- transfer 响应上限 16 MiB → 64 MiB，并给出明确超限文案。
+- 新增 `FakeRemoteHost` 端到端测试（Noise + 控制帧 + 加密 relay + DSHF 分片），覆盖
+  小快照、1.5 MB 分片快照、非 snapshot 首帧、流失败四种情形。
+
+排查入口：`adb logcat -s DshApi` 会打印每次快照的 `records/messages/cursor/hasMore`。
+
+仍未做：独立 Relay 数据通道（中枢若在 `connect.accepted` 里下发 `relayEndpoint/relayTicket`，
+当前会明确报“暂不支持独立 Relay 端点”）、进程级单连接注册表、流 seq 缺口自动补洞。

@@ -2623,7 +2623,14 @@ class LagoonController private constructor(private val appContext: Context) {
     }
   }
   private suspend fun loadSession(session: Session, ancillary: Boolean = true, token: Int = generation, client: HarnessClient? = api) {
-    val client = client ?: return
+    val client = client ?: run {
+      // 连接还没建立时也必须说明原因：静默返回会让聊天页永远空白，看起来像“会话没有内容”。
+      val reason = state.value.error ?: state.value.connection.reason
+        ?: "尚未连接到这台设备，无法读取会话内容"
+      mutable.update { it.copy(resources = it.resources + ("messages" to ResourceStatus(ResourceState.ERROR, reason)),
+        transcriptLoadingSince = 0) }
+      return
+    }
     val serverId = state.value.serverId ?: return
     val revision = selectionRevision
     val requestSequence = ++messageSequence
