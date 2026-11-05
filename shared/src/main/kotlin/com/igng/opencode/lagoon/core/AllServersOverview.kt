@@ -534,13 +534,8 @@ internal class AllServersOverview(
     fetchParents()
     sessions = visibleSessions()
     val parentMap = (store.taskParents(id) + sessions.mapNotNull { session -> session.parentId?.let { session.id to it } }) - deletedSessions
-    val unresolvedOwners = shells.values.any {
-      it.sessionId !in identityMap || BackgroundWork.rootOf(it.sessionId, parentMap) !in identityMap
-    }
     val inboxRead = PendingInputs.read(client, sessions, oldTasks, active)
-    val states = TaskReconciliation.reconcile(oldTasks, sessions, active, shells, parentMap,
-      identityMap.keys + fetchedIds, successfulShellDirs, deletedSessions,
-      childRead.incompleteRoots + if (unresolvedOwners) candidateRoots else emptySet(), inboxRead).toMutableMap()
+    val states = TaskReconciliation.reconcile(oldTasks, sessions, active, parentMap, deletedSessions, inboxRead).toMutableMap()
 
     permissions.forEach { request ->
       val old = oldTasks[request.sessionId]
@@ -567,12 +562,10 @@ internal class AllServersOverview(
     val background = SessionActivityRules.backgroundRoots(folded, shells, parentMap)
     val titles = sessions.associate { it.id to it.displayTitle() }
     val summary = TaskSummary.of(folded, notices, parentMap, titles, serverId = id, serverName = profile.name)
-    // Only failures that can hide currently relevant state count as degraded. Failures for idle
-    // sessions' directories (deleted worktrees) are handled by the directory backoff above.
-    val activeDirectories = activeIds.mapNotNull { identityMap[it]?.directory }.map(::normalizedDirectory).toSet()
-    val degraded = activeResult.isFailure || folded.values.any { it.active && it.uncertain } ||
-      sessionPermissionResults.any { it.second.isFailure && (it.first in activeIds || normalizedDirectory(identityMap[it.first]?.directory.orEmpty()) in activeDirectories) } ||
-      formResults.any { it.second.isFailure && normalizedDirectory(it.first) in activeDirectories }
+    // A session is running exactly when `session.active` says so, so only that read (and the root
+    // catalog, which throws out of this function) can make the page "部分数据待同步". Directory-scoped
+    // reads fail permanently for deleted worktrees and cannot all fit in one sweep.
+    val degraded = activeResult.isFailure
     if (degraded) Diagnostics.warn("AllServers", "服务器 ${profile.name} 部分状态读取失败")
     return reconcileWaiting(previous.copy(
       profile = profile,

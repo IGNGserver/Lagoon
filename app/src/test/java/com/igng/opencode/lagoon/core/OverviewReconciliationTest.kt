@@ -73,16 +73,20 @@ class OverviewReconciliationTest {
     }
   }
 
-  @Test fun shellReadFailuresDoNotCountAsEitherRunningOrCompleted() = runBlocking {
+  /**
+   * A shell listing is background activity, not proof about the root execution. It used to pin both
+   * the row ("状态待确认") and the page banner ("部分数据待同步") for any directory the sweep missed.
+   */
+  @Test fun shellReadFailuresNeitherHoldTheRootOpenNorDegradeThePage() = runBlocking {
     MockWebServer().use { server ->
       server.dispatcher = dispatcher(shellCode = 500)
       val snapshot = read(server, mapOf("root" to background()))
-      assertTrue(snapshot.tasks.getValue("root").uncertain)
-      assertTrue(snapshot.degraded)
+      assertFalse(snapshot.tasks.getValue("root").active)
+      assertFalse(snapshot.degraded)
       assertEquals(0, snapshot.summary.running)
-      assertTrue(snapshot.notices.isEmpty())
+      assertEquals(listOf("root"), snapshot.notices.map { it.sessionId })
       val state = LagoonState(allServerSnapshots = mapOf("a" to snapshot))
-      assertEquals(SessionStatus.UNKNOWN, state.allServerStatuses()[root.key])
+      assertFalse(state.allServerStatuses().getValue(root.key) in setOf(SessionStatus.RUNNING))
     }
   }
 
@@ -105,7 +109,6 @@ class OverviewReconciliationTest {
       val child = Session("child", "/repo", "Child", 1, parentId = "root")
       val snapshot = read(server, mapOf("root" to background(), "child" to TaskState("child", TaskPhase.SUBAGENT, since = 100, activeAt = -1)),
         parents = mapOf("child" to "root"), children = listOf(child))
-      assertTrue(snapshot.tasks.getValue("child").uncertain)
       assertFalse("the root settles on its own idle baseline", snapshot.tasks.getValue("root").active)
       assertEquals(listOf("root"), snapshot.notices.map { it.sessionId })
     }
@@ -120,7 +123,7 @@ class OverviewReconciliationTest {
     }
   }
 
-  @Test fun aFailedChildSweepCannotCompleteTheRoot() = runBlocking {
+  @Test fun aFailedChildSweepDoesNotBlockTheRootFromSettling() = runBlocking {
     MockWebServer().use { server ->
       val base = dispatcher()
       server.dispatcher = object : Dispatcher() {
@@ -128,8 +131,9 @@ class OverviewReconciliationTest {
           MockResponse().setResponseCode(500) else base.dispatch(request)
       }
       val snapshot = read(server, mapOf("root" to background()))
-      assertTrue(snapshot.tasks.getValue("root").uncertain)
-      assertTrue(snapshot.notices.isEmpty())
+      // Descendants are background identities; the root's own execution is `session.active`'s answer.
+      assertFalse(snapshot.tasks.getValue("root").active)
+      assertEquals(listOf("root"), snapshot.notices.map { it.sessionId })
     }
   }
 

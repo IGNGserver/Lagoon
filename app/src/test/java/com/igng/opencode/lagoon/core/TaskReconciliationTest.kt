@@ -9,9 +9,9 @@ class TaskReconciliationTest {
   private fun background(baseline: Long = -1) = TaskState("root", TaskPhase.THINKING,
     TaskState.RUNNING_DETAIL, since = 100, activeAt = baseline)
   private fun read(tasks: Map<String, TaskState>, sessions: List<Session> = listOf(root),
-    active: Set<String>? = emptySet(), directories: Set<String> = setOf("/repo"),
-    verified: Set<String> = sessions.map { it.id }.toSet(), deleted: Set<String> = emptySet()) =
-    TaskReconciliation.reconcile(tasks, sessions, active, emptyMap(), mapOf("child" to "root"), verified, directories, deleted, now = 20_000)
+    active: Set<String>? = emptySet(), deleted: Set<String> = emptySet(),
+    inbox: PendingInputs.Read = PendingInputs.Read(verified = tasks.keys), now: Long = 20_000) =
+    TaskReconciliation.reconcile(tasks, sessions, active, mapOf("child" to "root"), deleted, inbox, now)
 
   @Test fun foldedRootsSettleWithAnUnknownOrEqualBaseline() {
     listOf(-1L, 199L).forEach { baseline ->
@@ -36,23 +36,41 @@ class TaskReconciliationTest {
     }
   }
 
-  @Test fun failedOrSkippedReadsAreUnknownNotFinishedOrStillSpinning() {
-    val previous = mapOf("root" to background())
-    listOf(read(previous, active = null), read(previous, directories = emptySet()), read(previous, verified = emptySet())).forEach { states ->
-      assertTrue(states.getValue("root").active) // retain evidence for the next retry
-      assertTrue(states.getValue("root").uncertain)
-      assertEquals(0, TaskSummary.of(states).running)
-      val lagoon = LagoonState(sessions = listOf(root), tasks = states, connected = true)
-      assertEquals(SessionStatus.UNKNOWN, lagoon.sessionStatus(root))
-      assertTrue(lagoon.livePresentedTasks.isEmpty())
-      assertFalse(read(states).getValue("root").active)
-    }
+  /**
+   * The regression behind "状态待确认": rows used to keep a permanent unknown state whenever any
+   * directory-scoped read could not be completed. A failed activity read now keeps the claim for the
+   * next retry only, and never reaches the home row as a third state.
+   */
+  @Test fun aFailedActivityReadKeepsTheClaimButNeverShowsAnUnknownRow() {
+    val states = read(mapOf("root" to background()), active = null)
+    assertTrue(states.getValue("root").active)
+    assertTrue(states.getValue("root").uncertain)
+    assertEquals(0, TaskSummary.of(states).running)
+    val lagoon = LagoonState(sessions = listOf(root), tasks = states, connected = true)
+    assertEquals(SessionStatus.NONE, lagoon.sessionStatus(root))
+    assertTrue(lagoon.livePresentedTasks.isEmpty())
+    // The next successful read settles it without inventing a result.
+    assertEquals(TaskPhase.COMPLETED, read(states).getValue("root").phase)
   }
 
-  @Test fun aMissingChildIdentityPreventsFalseCompletion() {
+  @Test fun oneUnprovableSiblingCannotFreezeTheOtherRoots() {
+    val states = read(mapOf("root" to background(), "other" to TaskState("other", TaskPhase.THINKING, since = 100)),
+      sessions = listOf(root), active = emptySet())
+    assertFalse(states.getValue("root").active)
+    // "other" has no identity in this read: it stays a retry hint, but its own row is not unknown.
+    val lagoon = LagoonState(sessions = listOf(root), tasks = states, connected = true)
+    assertEquals(SessionStatus.NONE, lagoon.sessionStatus(root))
+    assertEquals(0, TaskSummary.of(states).running)
+  }
+
+  @Test fun aMissingChildIdentityIsNotGuessedIntoAResult() {
     val states = read(mapOf("root" to background(), "child" to TaskState("child", TaskPhase.SUBAGENT)))
-    assertTrue(states.getValue("root").uncertain)
+    // The root's own execution is decided by `session.active`, not by descendants.
+    assertFalse(states.getValue("root").active)
+    // The child has no identity in this read, so it stays a retry hint: never a result, and never a
+    // live claim the summary or the home row would render.
     assertTrue(states.getValue("child").uncertain)
+    assertEquals(0, TaskSummary.of(states).running)
   }
 
   @Test fun confirmedDeletedChildNoLongerPinsItsParent() {
@@ -65,8 +83,11 @@ class TaskReconciliationTest {
     val old = TaskState("root", TaskPhase.THINKING, since = 100)
     assertFalse(read(mapOf("root" to old)).getValue("root").active)
     assertTrue(read(mapOf("root" to old.copy(since = 19_999))).getValue("root").active)
-    val noBaseline = read(mapOf("root" to old), sessions = listOf(root.copy(idle = 0, outcome = null)))
-    assertTrue(noBaseline.getValue("root").uncertain)
+    // A session that never ran has no outcome: it settles quietly instead of claiming success.
+    val neverRan = root.copy(idle = 0, outcome = null)
+    val noBaseline = read(mapOf("root" to old), sessions = listOf(neverRan))
+    assertFalse(noBaseline.getValue("root").active)
+    assertNull(neverRan.transitionNotice(old.since))
     assertEquals(0, TaskSummary.of(noBaseline).running)
   }
 
@@ -78,9 +99,9 @@ class TaskReconciliationTest {
     val restored = read(store.taskStates("a"), listOf(root, child))
     assertFalse(restored.getValue("child").active)
     assertNull(restored["root"])
-    val uncertain = background().copy(uncertain = true)
-    store.rememberTask("b", uncertain)
-    assertEquals(uncertain, store.taskStates("b")["root"])
+    // A failed read is not durable state: the store keeps what this device observed, nothing else.
+    store.rememberTask("b", background().copy(uncertain = true))
+    assertFalse(store.taskStates("b").getValue("root").uncertain)
   }
 
   @Test fun trackedShellDirectoriesWinOverMoreThanEightIdleProjects() {
@@ -90,17 +111,21 @@ class TaskReconciliationTest {
     assertEquals(8, directories.size)
   }
 
-  @Test fun failedDescendantDiscoveryIsNotAnEmptyBackgroundFamily() {
-    val states = TaskReconciliation.reconcile(mapOf("root" to background()), listOf(root), emptySet(), emptyMap(),
-      emptyMap(), setOf("root"), setOf("/repo"), incompleteRoots = setOf("root"))
-    assertTrue(states.getValue("root").uncertain)
+  /**
+   * A family sweep that cannot finish only delays descendant identities. It must not hold the root
+   * open, and it must not mark anything as unverifiable for display.
+   */
+  @Test fun aFailedDescendantSweepDoesNotHoldTheRootOpen() {
+    val states = read(mapOf("root" to background()))
+    assertFalse(states.getValue("root").active)
     assertEquals(0, TaskSummary.of(states).running)
+    assertEquals(emptySet<String>(), SessionActivityRules.backgroundRoots(states, emptyMap(), emptyMap()))
   }
 
-  @Test fun persistedActivityWithoutAFreshnessTimestampIsUnverifiedAfterRestart() {
+  @Test fun persistedActivityWithoutAFreshnessTimestampIsNotRenderedAsUnknownAfterRestart() {
     val states = TaskReconciliation.restored(mapOf("root" to background()))
     val state = LagoonState(sessions = listOf(root), tasks = states, connected = false, lastContactAt = 0)
-    assertEquals(SessionStatus.UNKNOWN, state.sessionStatus(root))
+    assertEquals(SessionStatus.NONE, state.sessionStatus(root))
     assertTrue(state.livePresentedTasks.isEmpty())
     assertEquals(0, TaskSummary.of(states).running)
   }
@@ -120,7 +145,7 @@ class TaskReconciliationTest {
       val state = LagoonState(sessions = listOf(root), tasks = tasks)
       assertTrue(state.livePresentedTasks.isEmpty())
       assertTrue(TaskSummary.of(state.presentedTasks).isEmpty)
-      assertEquals(SessionStatus.UNKNOWN, state.sessionStatus(root))
+      assertEquals(SessionStatus.NONE, state.sessionStatus(root))
     }
   }
 
@@ -130,11 +155,11 @@ class TaskReconciliationTest {
     assertEquals(TaskPhase.WAITING_SERVER, accepted.phase)
     assertEquals(20_000L, accepted.since)
     val queued = TaskReconciliation.reconcile(mapOf("root" to accepted), listOf(root), emptySet(), emptyMap(),
-      emptyMap(), setOf("root"), setOf("/repo"), inbox = PendingInputs.Read(setOf("root"), setOf("root")))
+      inbox = PendingInputs.Read(setOf("root"), setOf("root")))
     assertTrue(queued.getValue("root").active)
     assertTrue(queued.getValue("root").pendingInput)
-    val failedRead = TaskReconciliation.reconcile(queued, listOf(root), emptySet(), emptyMap(), emptyMap(),
-      setOf("root"), setOf("/repo"), inbox = PendingInputs.Read())
+    val failedRead = TaskReconciliation.reconcile(queued, listOf(root), emptySet(), emptyMap(),
+      inbox = PendingInputs.Read())
     assertTrue(failedRead.getValue("root").uncertain)
     val terminal = TaskReducer.event("root", "session.execution.succeeded", org.json.JSONObject(), accepted, 210)!!
     assertEquals(TaskPhase.WAITING_SERVER, terminal.phase)
@@ -146,14 +171,13 @@ class TaskReconciliationTest {
   @Test fun obsoleteCachedTerminalChildrenDoNotBlockACompleteFreshSweep() {
     val cached = child.copy(idle = 1)
     val states = TaskReconciliation.reconcile(mapOf("root" to background(), "child" to TaskReducer.terminal("child", "succeeded", null)),
-      listOf(root, cached), emptySet(), emptyMap(), mapOf("child" to "root"), setOf("root"), setOf("/repo"))
+      listOf(root, cached), emptySet(), mapOf("child" to "root"))
     assertFalse(states.getValue("root").active)
   }
 
   @Test fun aShellWithoutAPreviousRootIsOnlyBackgroundActivity() {
     val shell = ShellJob("sh", "root", "sleep", 1, "/repo")
-    val states = TaskReconciliation.reconcile(emptyMap(), listOf(root), emptySet(), mapOf("sh" to shell),
-      emptyMap(), setOf("root"), emptySet())
+    val states = TaskReconciliation.reconcile(emptyMap(), listOf(root), emptySet(), emptyMap())
     assertNull(states["root"])
     assertEquals(0, TaskSummary.of(states).running)
     assertEquals(setOf("root"), SessionActivityRules.backgroundRoots(states, mapOf("sh" to shell), emptyMap()))

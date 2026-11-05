@@ -5,7 +5,7 @@ package com.igng.opencode.lagoon.core
  * 只通过 [SessionActivityRules.backgroundRoots] 在列表上留下一个低调标记，并在会话内提供入口。
  */
 enum class SubSessionPhase {
-  RUNNING, WAITING_PERMISSION, WAITING_QUESTION, WAITING_SERVER, COMPLETED, FAILED, INTERRUPTED, UNKNOWN;
+  RUNNING, WAITING_PERMISSION, WAITING_QUESTION, WAITING_SERVER, COMPLETED, FAILED, INTERRUPTED;
 
   val active: Boolean get() = this in ACTIVE
 
@@ -136,8 +136,9 @@ object SessionActivityRules {
 
   private fun entry(session: Session, depth: Int, task: TaskState?): SubSessionEntry {
     val phase = when {
-      task?.active == true && task.uncertain -> SubSessionPhase.UNKNOWN
-      task?.active == true -> when (task.phase) {
+      // No live claim means the child has settled. A missing outcome still renders as completed:
+      // the list has no "unknown" execution state, matching the official client's idle default.
+      task?.active == true && !task.uncertain -> when (task.phase) {
         TaskPhase.WAITING_PERMISSION -> SubSessionPhase.WAITING_PERMISSION
         TaskPhase.WAITING_QUESTION -> SubSessionPhase.WAITING_QUESTION
         TaskPhase.WAITING_SERVER -> SubSessionPhase.WAITING_SERVER
@@ -145,8 +146,7 @@ object SessionActivityRules {
       }
       task?.phase == TaskPhase.FAILED || session.outcome == "failed" -> SubSessionPhase.FAILED
       task?.phase == TaskPhase.ABORTED || session.outcome == "interrupted" -> SubSessionPhase.INTERRUPTED
-      task?.phase == TaskPhase.COMPLETED || session.outcome == "succeeded" || session.idle > 0 -> SubSessionPhase.COMPLETED
-      else -> SubSessionPhase.UNKNOWN
+      else -> SubSessionPhase.COMPLETED
     }
     val started = task?.since?.takeIf { it > 0 } ?: session.created.takeIf { it > 0 } ?: session.activityAt
     val ended = task?.finishedAt?.takeIf { it > 0 } ?: session.idle.takeIf { it > 0 }

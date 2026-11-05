@@ -295,6 +295,7 @@ private fun ChildSessionBar(state: LagoonState, session: Session, onBack: () -> 
   val task = state.livePresentedTasks[session.id]
   val waiting = task?.phase in TaskState.WAITING_PHASES
   val phase = when {
+    task?.active == true && task.uncertain -> "等待同步"
     task?.active == true -> when (task.phase) {
       TaskPhase.WAITING_PERMISSION -> "等待授权"
       TaskPhase.WAITING_QUESTION -> "等待回答"
@@ -303,8 +304,7 @@ private fun ChildSessionBar(state: LagoonState, session: Session, onBack: () -> 
     }
     session.outcome == "failed" -> "失败"
     session.outcome == "interrupted" -> "已中断"
-    session.outcome == "succeeded" || session.idle > 0 -> "已完成"
-    else -> "状态待确认"
+    else -> "已完成"
   }
   val started = task?.since?.takeIf { it > 0 } ?: session.created
   val ended = task?.finishedAt?.takeIf { it > 0 } ?: session.idle.takeIf { it > 0 }
@@ -394,7 +394,6 @@ private fun subSessionLabel(phase: SubSessionPhase): String = when (phase) {
   SubSessionPhase.COMPLETED -> "已完成"
   SubSessionPhase.FAILED -> "失败"
   SubSessionPhase.INTERRUPTED -> "已中断"
-  SubSessionPhase.UNKNOWN -> "状态待确认"
 }
 
 /** Live output for one background shell, polled from the server's byte-cursor output route. */
@@ -410,7 +409,7 @@ private fun ShellOutputSheet(state: LagoonState, controller: LagoonController) {
         val snapshot = output.snapshot
         Text(when {
           output.loading -> "正在读取输出…"
-          snapshot == null -> "状态待确认"
+          snapshot == null -> "暂时无法读取输出"
           snapshot.running -> "运行中"
           snapshot.status == "timeout" -> "已超时"
           snapshot.status == "killed" -> "已停止"
@@ -609,7 +608,7 @@ private fun SessionSubtitle(state: LagoonState, session: Session) {
     SessionStatus.RUNNING -> { InfiniteProgressIndicator(color = MiuixTheme.colorScheme.primary, size = 12.dp, strokeWidth = 1.5.dp, orbitingDotSize = 1.5.dp); Spacer(Modifier.width(6.dp)) }
     SessionStatus.WAITING_PERMISSION, SessionStatus.WAITING_QUESTION, SessionStatus.FAILED ->
       Text("${status.label} · ", style = MiuixTheme.textStyles.footnote1.copy(color = if (status == SessionStatus.FAILED) MiuixColorTokens.Error else MiuixColorTokens.Warning))
-    SessionStatus.WAITING_SERVER, SessionStatus.UNKNOWN ->
+    SessionStatus.WAITING_SERVER ->
       Text("${status.label} · ", style = MiuixTheme.textStyles.footnote1.copy(color = muted))
     else -> {}
   }

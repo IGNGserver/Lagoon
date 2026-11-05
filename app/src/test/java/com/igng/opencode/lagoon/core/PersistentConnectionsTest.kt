@@ -264,7 +264,7 @@ class PersistentConnectionsTest {
         assertTrue(snapshot.tasks.getValue("s").uncertain)
         assertEquals(0L, snapshot.lastReadAt)
         assertEquals(0, snapshot.displaySummary(PermissionPolicy()).running)
-        assertEquals(SessionStatus.UNKNOWN, LagoonState(allServerSnapshots = mapOf("a" to snapshot)).allServerStatuses()[scopedKey("a", "s")])
+        assertEquals(SessionStatus.NONE, LagoonState(allServerSnapshots = mapOf("a" to snapshot)).allServerStatuses()[scopedKey("a", "s")])
       } finally { manager.stop(); scope.cancel() }
     }
   }

@@ -510,7 +510,7 @@ internal fun HomeSessionRow(session: Session, status: SessionStatus, unseen: Boo
          Spacer(Modifier.width(8.dp))
          BackgroundMarker()
        }
-       if (status == SessionStatus.WAITING_SERVER || status == SessionStatus.UNKNOWN) {
+       if (status == SessionStatus.WAITING_SERVER) {
          Spacer(Modifier.width(8.dp))
          Text(status.label, style = MiuixTheme.textStyles.footnote1.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
       } else if (status == SessionStatus.FAILED) {
@@ -531,7 +531,7 @@ private fun StatusGlyph(status: SessionStatus, unseen: Boolean) {
   when {
     status == SessionStatus.RUNNING ->
       InfiniteProgressIndicator(color = MiuixTheme.colorScheme.primary, size = 16.dp, strokeWidth = 2.dp, orbitingDotSize = 2.dp)
-    status == SessionStatus.WAITING_SERVER || status == SessionStatus.UNKNOWN ->
+    status == SessionStatus.WAITING_SERVER ->
       Icon(MiuixIcons.Info, status.label, Modifier.size(20.dp), tint = muted)
     status == SessionStatus.WAITING_PERMISSION || status == SessionStatus.WAITING_QUESTION ->
       Icon(MiuixIcons.Info, status.label, Modifier.size(20.dp), tint = MiuixColorTokens.Warning)

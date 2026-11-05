@@ -213,13 +213,11 @@ data class LagoonState(
     SessionActivityRules.activity(sessionId, sessions, presentedTasks, shells, parents)
   fun sessionStatus(session: Session, active: Map<String, TaskState> = activeRootTasks): SessionStatus {
     if (multiServerView) allSessionStatuses[session.key]?.let { return it }
-    val unseen = notices.unseenFor(session.id)
+    // `active` is already the live set: uncertain claims and server-owned work past the offline TTL
+    // are excluded, so a row the phone cannot prove is simply idle (or its unread result).
     val present = presentedTasks[session.id]
-    val staleOwn = (staleConnection || present?.uncertain == true) && present?.active == true
-    val staleRoot = (staleConnection || tasks.values.any { it.uncertain }) && rawActiveRootTasks.containsKey(session.id)
-    val state = if (session.parentId == null) active[session.id] else present ?: active[session.id]
-    if ((staleOwn || staleRoot) && state == null && unseen.isEmpty()) return SessionStatus.UNKNOWN
-    return sessionStatus(state, unseen)
+    val state = if (session.parentId == null) active[session.id] else present?.takeIf { it.active && !it.uncertain } ?: active[session.id]
+    return sessionStatus(state, notices.unseenFor(session.id))
   }
 }
 
@@ -1476,16 +1474,10 @@ class LagoonController private constructor(private val appContext: Context) {
       sweptPermissions.mapNotNull { it.second.getOrNull() }.flatten()).distinctBy { it.id }
     val questions = formResults.mapNotNull { it.second.getOrNull() }.flatten().distinctBy { it.id }
     store.rememberParents(serverId, sessions + extraSessions)
-    // 只有“影响当前可见状态”的读取失败才算降级：活跃会话自身的权限/表单读不到，列表与通知可能
-    // 展示旧状态；空闲会话目录的失败（常见于已删除的 worktree）只做目录退避，不再钉住 banner。
-    val activeIds = active.orEmpty()
-    val activeDirectories = activeIds.mapNotNull { identities[it]?.directory }.map(::normalizedDirectory).toSet()
-    val degraded = activeResult.isFailure ||
-      state.value.tasks.values.any { task -> task.active && identities[task.sessionId]?.let {
-        normalizedDirectory(it.directory) !in refreshedShellDirectories
-      } != false } ||
-      permissionResults.any { it.second.isFailure && (it.first in activeIds || normalizedDirectory(identities[it.first]?.directory.orEmpty()) in activeDirectories) } ||
-      formResults.any { it.second.isFailure && normalizedDirectory(it.first) in activeDirectories }
+    // Only the read that decides whether a row is running can say the page is out of sync. Shell,
+    // permission and form failures keep their own last-known entries; they must not pin
+    // "部分数据待同步" on every server with more directories than one sweep can cover.
+    val degraded = activeResult.isFailure
     if (degraded) Diagnostics.warn("LagoonController", "部分状态读取失败，保留上次可信状态", activeResult.exceptionOrNull())
 
     deletedSessions.forEach { store.forgetTask(serverId, it) }
@@ -1511,14 +1503,8 @@ class LagoonController private constructor(private val appContext: Context) {
           previous.notices.unseenFor(it.id).isNotEmpty() || page.next != null
         }).filterNot { it.id in deletedSessions }.map { scoped(serverId, it) }.distinctBy { it.id }.sortedWith(sessionActivityOrder)
       val parentMap = store.taskParents(serverId) + nextSessions.mapNotNull { s -> s.parentId?.let { s.id to it } }
-      val unresolvedOwners = nextShells.values.any {
-        it.sessionId !in identities || BackgroundWork.rootOf(it.sessionId, parentMap) !in identities
-      }
-      val states = TaskReconciliation.reconcile(previousTasks, nextSessions, active, nextShells, parentMap,
-        // Previous sessions are verified identities too: they may be children paged out of the root
-        // listing, and excluding them made a finished root look uncertain forever.
-        (nextSessions.map { it.id } + identities.keys).toSet(), refreshedShellDirectories, deletedSessions,
-        childRead.incompleteRoots + if (unresolvedOwners) candidateRoots else emptySet(), inboxRead).toMutableMap()
+      val states = TaskReconciliation.reconcile(previousTasks, nextSessions, active, parentMap,
+        deletedSessions, inboxRead).toMutableMap()
       // A successful read is authoritative; a failed one keeps the previous requests so a pending
       // approval is never silently dropped.
       val readIds = waitingCandidates.map { it.id }.toSet()

@@ -76,15 +76,14 @@ object HomeSections {
 
   /**
    * 需要处理 › 运行中 › 未读结果 › 其他, the order the official client ranks session indicators.
-   * “等待服务器处理”也是需要处理的一类（只是等待的是服务端/电脑端），不再落到“其他”；
-   * 无法核实的旧运行态归入“其他”，行内显示“状态待确认”。
+   * “等待服务器处理”也是需要处理的一类（只是等待的是服务端/电脑端），不再落到“其他”。
    */
   fun byStatus(sessions: List<Session>, statuses: Map<String, SessionStatus>): List<HomeSection> {
     fun bucket(session: Session) = when (statuses[session.key] ?: SessionStatus.NONE) {
       SessionStatus.WAITING_PERMISSION, SessionStatus.WAITING_QUESTION, SessionStatus.WAITING_SERVER -> 0
       SessionStatus.RUNNING -> 1
       SessionStatus.FAILED, SessionStatus.COMPLETED -> 2
-      SessionStatus.NONE, SessionStatus.UNKNOWN -> 3
+      SessionStatus.NONE -> 3
     }
     val titles = listOf("需要处理", "运行中", "未读结果", "其他")
     return sessions.groupBy(::bucket).toSortedMap().map { (index, list) -> HomeSection("status:$index", titles[index], list) }

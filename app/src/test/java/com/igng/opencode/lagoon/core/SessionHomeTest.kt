@@ -95,7 +95,8 @@ class SessionHomeTest {
     // A later successful turn must not inherit the previous failure.
     assertFalse(idle.copy(outcome = "succeeded").transitionNotice(300)!!.error)
     assertEquals("错误", SessionStatus.FAILED.label)
-    assertEquals("状态待确认", SessionStatus.UNKNOWN.label)
+    // 与官方一致：只有一套执行状态，没有第三种“待确认”。
+    assertTrue(SessionStatus.entries.none { it.name.contains("UNKNOWN") })
   }
 
   @Test fun sessionCreatedAcceptsNestedInfoAndKeepsTheChildParentChain() {

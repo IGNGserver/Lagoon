@@ -493,7 +493,19 @@ object TaskReducer {
     TaskState(sessionId, phase, detail, since, activeAt = previous?.activeAt ?: -1L,
       pendingInput = previous?.pendingInput == true)
 
-  /** 显式 idle 信号（`session.idle` / `session.status` idle）：权威收尾本轮根执行。 */
+  /**
+   * The v2 client settles every execution-ending event to idle immediately, including a `shutdown`
+   * interruption: the restarted server re-emits `session.execution.started` (and reappears in
+   * `session.active`) if it actually resumes the turn. Keeping the old claim here is what left rows
+   * spinning, then "状态待确认", after a server restart.
+   */
+  private fun settled(sessionId: String, phase: TaskPhase, detail: String, previous: TaskState?, at: Long): TaskState =
+    TaskState(sessionId, phase, detail, previous?.since ?: at, at)
+
+  /**
+   * Explicit idle signal. OpenCode v2 expresses this as `session.execution.*` (handled above); the
+   * DSH adapter synthesizes `session.status` and legacy frames still use `session.idle`.
+   */
   private fun idle(sessionId: String, previous: TaskState?): TaskState? = when {
     previous == null -> null
     previous.active -> TaskState(sessionId, TaskPhase.COMPLETED, "任务已完成", previous.since,
@@ -511,11 +523,11 @@ object TaskReducer {
         else it
       }
       // 根执行 settle 就是本轮结束。后台 shell / 子会话是独立活动，不把它重新变成“运行中”。
-      "session.execution.succeeded" -> TaskState(sessionId, TaskPhase.COMPLETED, "任务已完成", since, at)
-      "session.execution.failed" -> TaskState(sessionId, TaskPhase.FAILED, properties.errorText("error").ifBlank { "执行失败" }, since, at)
-      // A shutdown keeps the execution claim; the restarted server resumes the same turn.
-      "session.execution.interrupted" -> if (properties.str("reason") == "shutdown") previous
-        else TaskState(sessionId, TaskPhase.ABORTED, "任务已停止", since, at)
+      "session.execution.succeeded" -> settled(sessionId, TaskPhase.COMPLETED, "任务已完成", previous, at)
+      "session.execution.failed" -> settled(sessionId, TaskPhase.FAILED, properties.errorText("error").ifBlank { "执行失败" }, previous, at)
+      "session.execution.interrupted" -> settled(sessionId, TaskPhase.ABORTED, "任务已停止", previous, at)
+      // DSH normalizes its own running flag into the OpenCode shape so the shared reducer can settle
+      // sessions this phone is not following. OpenCode v2 itself only sends `session.execution.*`.
       "session.status" -> when (properties.obj("status").str("type")) {
         "busy", "retry" -> running(sessionId, TaskPhase.THINKING, previous, since, at)
         "idle" -> idle(sessionId, previous)

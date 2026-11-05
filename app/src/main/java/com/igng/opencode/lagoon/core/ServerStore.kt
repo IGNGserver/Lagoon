@@ -65,11 +65,14 @@ class ServerStore internal constructor(private val preferences: SharedPreference
   }
   override fun rememberTask(id: String, state: TaskState, parent: String?, observedAt: Long, durable: Boolean): TaskState = synchronized(taskLock) {
     val key = "taskState:$id:${state.sessionId}"
-    val previous = runCatching { JSONObject(preferences.getString(key, "")!!).let { json -> TaskState(state.sessionId, TaskPhase.valueOf(json.str("phase")), json.str("detail"), json.optLong("since"), json.optLong("finished").takeIf { it > 0 }, json.optLong("activeAt", -1), json.optBoolean("uncertain"), json.optBoolean("pendingInput")) } }.getOrNull()
-    val lastObserved = preferences.getLong("taskTime:$id:${state.sessionId}", 0)
-    if (observedAt < lastObserved) return@synchronized previous ?: state
-    val next = if (previous != null && state.active && !previous.active && state.since <= previous.since)
-      state.copy(since = observedAt, finishedAt = null) else state
+    // `uncertain` describes one failed read, not the task: it is re-derived on every start, so the
+    // durable record keeps only what this device actually observed (running / waiting / finished).
+    val observed = if (state.uncertain) state.copy(uncertain = false) else state
+    val previous = runCatching { JSONObject(preferences.getString(key, "")!!).let { json -> TaskState(observed.sessionId, TaskPhase.valueOf(json.str("phase")), json.str("detail"), json.optLong("since"), json.optLong("finished").takeIf { it > 0 }, json.optLong("activeAt", -1), json.optBoolean("uncertain"), json.optBoolean("pendingInput")) } }.getOrNull()
+    val lastObserved = preferences.getLong("taskTime:$id:${observed.sessionId}", 0)
+    if (observedAt < lastObserved) return@synchronized previous ?: observed
+    val next = if (previous != null && observed.active && !previous.active && observed.since <= previous.since)
+      observed.copy(since = observedAt, finishedAt = null) else observed
     if (previous != next || parent != preferences.getString("taskParent:$id:${state.sessionId}", null)) {
       val editor = preferences.edit().putString(key, JSONObject().put("phase", next.phase.name).put("detail", next.detail)
         .put("since", next.since).put("finished", next.finishedAt).put("activeAt", next.activeAt).put("uncertain", next.uncertain).put("pendingInput", next.pendingInput).toString()).putLong("taskTime:$id:${state.sessionId}", observedAt)

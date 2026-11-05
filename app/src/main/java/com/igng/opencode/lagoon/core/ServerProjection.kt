@@ -11,10 +11,6 @@ internal val LagoonState.livePresentedTasks: Map<String, TaskState>
     it.phase !in TaskState.RUNNING_PHASES && it.phase != TaskPhase.WAITING_SERVER
   } else presentedTasks.filterValues { !it.uncertain }
 
-/** Root families this phone last knew as active, before the offline TTL is applied. */
-internal val LagoonState.rawActiveRootTasks: Map<String, TaskState>
-  get() = SessionActivityRules.rootStates(presentedTasks.filterValues { it.active }, parents)
-
 /** The local conversation overrides its own snapshot, never another server's state. */
 internal fun LagoonState.serverSnapshots(): Map<String, ServerOverviewSnapshot> {
   val id = serverId ?: return allServerSnapshots

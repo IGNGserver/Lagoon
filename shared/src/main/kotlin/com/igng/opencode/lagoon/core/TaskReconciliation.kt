@@ -7,16 +7,18 @@ internal object TaskReconciliation {
     if (task.active) task.copy(uncertain = true) else task
   }
 
+  /**
+   * [active] is `GET /api/session/active`, the single source of "is this session running"; `null`
+   * means the read failed. [inbox] reports admitted-but-undrained input. Nothing else — shells,
+   * descendant sweeps, directory health — may hold a session open, because a read that cannot cover
+   * every directory would then pin rows in a state the server never reported.
+   */
   fun reconcile(
     previous: Map<String, TaskState>,
     sessions: List<Session>,
     active: Set<String>?,
-    shells: Map<String, ShellJob>,
     parents: Map<String, String>,
-    verifiedSessions: Set<String>,
-    verifiedShellDirectories: Set<String>,
     deleted: Set<String> = emptySet(),
-    incompleteRoots: Set<String> = emptySet(),
     inbox: PendingInputs.Read = PendingInputs.Read(verified = previous.keys),
     now: Long = System.currentTimeMillis()
   ): Map<String, TaskState> {
@@ -24,7 +26,7 @@ internal object TaskReconciliation {
     val states = previous.filterKeys { it !in deleted }.mapValues { (id, task) ->
       if (id in inbox.verified) task.copy(pendingInput = id in inbox.pending) else task
     }.toMutableMap()
-    // A foreground claim is positive evidence, even when a shell/location read failed.
+    // A foreground claim is positive evidence, whatever else failed this round.
     active.orEmpty().forEach { id ->
       states[id] = TaskReducer.status(id, true, states[id], identities[id]?.idle ?: -1).copy(uncertain = false)
     }
@@ -33,30 +35,29 @@ internal object TaskReconciliation {
       val old = states[id] ?: original
       if (id in deleted || id in active.orEmpty() || !old.active) return@forEach
       val session = identities[id]
-      val family = (BackgroundWork.familyOf(id, parents) - deleted).filter {
-        it == id || states[it]?.active == true || it in verifiedSessions
-      }.toSet()
-      // A running shell/child makes the root's background *activity* visible, but it is not proof
-      // that the root's own execution is still running. The root settles on its own idle baseline.
-      val confirmedWork = active != null && (family.any { it != id && it in active } || shells.values.any {
-        it.sessionId in family && normalizedDirectory(it.directory) in verifiedShellDirectories
-      })
-      val verified = active != null && id in inbox.verified && BackgroundWork.rootOf(id, parents) !in incompleteRoots && id in verifiedSessions && session != null && family.all { member ->
-        val identity = identities[member]
-        identity != null && member in verifiedSessions && normalizedDirectory(identity.directory) in verifiedShellDirectories
-      }
+      // Official clients settle a session from `session.active` alone: absent from a successful read
+      // means idle. Shell listings, descendant sweeps and inbox reads describe background work and
+      // queued input; a failure there must not freeze the root as "状态待确认".
       val child = old.phase == TaskPhase.SUBAGENT || parents[id] != null
       val finished = session != null && session.idle > 0 &&
         ((old.activeAt >= 0 && session.idle > old.activeAt) ||
           (old.activeAt < 0 && (child || now - old.since >= 10_000)))
+      // A just-submitted turn gets a short grace window in which it is neither running nor settled;
+      // anything older settles idle instead of spinning forever.
+      val settleIdle = finished || now - old.since >= 10_000
+      val inboxKnown = id in inbox.verified
       states[id] = when {
-        old.pendingInput && id in inbox.verified && !confirmedWork -> old.copy(phase = TaskPhase.WAITING_SERVER,
-          detail = "等待服务器处理", uncertain = false)
-        !verified -> old.copy(uncertain = true)
-        finished -> TaskReducer.terminal(id, session.outcome, old)
-        // No positive running claim and no usable terminal baseline: retain the retry hint, but
-        // don't invent either completion or an indefinitely running foreground execution.
-        else -> old.copy(uncertain = now - old.since >= 10_000 && old.phase in TaskState.RUNNING_PHASES)
+        // Admitted input the server has not drained yet outlives the previous run's outcome.
+        inboxKnown && id in inbox.pending -> old.copy(phase = TaskPhase.WAITING_SERVER,
+          detail = "等待服务器处理", uncertain = false, pendingInput = true)
+        // The inbox read itself failed: keep a previously admitted prompt, don't invent one.
+        !inboxKnown && old.pendingInput -> old.copy(uncertain = true)
+        // The authoritative activity read failed, or this session's identity is not loaded: keep the
+        // last claim for the next retry. It is never guessed into a result, and it already stops
+        // counting as live for the summary and the row (see `liveTasks`).
+        active == null || session == null -> old.copy(uncertain = true)
+        settleIdle -> TaskReducer.terminal(id, session.outcome, old)
+        else -> old.copy(uncertain = false)
       }
     }
     // Keep live states and terminal child records (historical tool metadata must not resurrect
@@ -64,7 +65,10 @@ internal object TaskReconciliation {
     return states.filterValues { it.active || it.sessionId in parents || previous[it.sessionId]?.active == true }
   }
 
-  /** A failed/unfinished sweep is unknown; the scanner resumes it on the following poll. */
+  /**
+   * Descendant sweep for the family list and background marker. An unfinished sweep only delays those
+   * identities; it never decides whether the root's own execution is over (that is [reconcile]'s job).
+   */
   suspend fun children(client: HarnessClient, roots: List<Session>, parents: Map<String, String>,
     discovery: ChildDiscovery = ChildDiscovery()): ChildDiscovery.Result = discovery.read(client, roots, parents)
 

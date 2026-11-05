@@ -142,7 +142,7 @@ class ServerProjectionTest {
     assertTrue(HomeScope.roots(state.homeProjection().sessions, state.homeProjection().projects, null).isEmpty())
   }
 
-  @Test fun staleServerWorkLeavesTheIslandAndTurnsHomeStatusUnknown() {
+  @Test fun staleServerWorkLeavesTheIslandAndTheRowSimplySettles() {
     val session = Session("same", "/repo", "A", 0, serverId = "a")
     val snapshot = ServerOverviewSnapshot("a", a, connected = false, loading = false,
       lastReadAt = System.currentTimeMillis() - STALE_CONNECTION_TASK_MILLIS - 1_000,
@@ -150,7 +150,8 @@ class ServerProjectionTest {
     val state = LagoonState(profiles = listOf(a), allServers = true, allServerSnapshots = mapOf("a" to snapshot))
 
     assertEquals(0, state.globalSummary.running)
-    assertEquals(SessionStatus.UNKNOWN, state.homeProjection().allSessionStatuses[session.key])
+    // 离线超时的旧运行态不再转圈，也不再显示第三种状态：没有未读结果就是安静圆点。
+    assertEquals(SessionStatus.NONE, state.homeProjection().allSessionStatuses[session.key])
   }
 
   @Test fun pendingPermissionsSurviveTheOfflineTtlBecauseThePhoneStillHoldsThem() {

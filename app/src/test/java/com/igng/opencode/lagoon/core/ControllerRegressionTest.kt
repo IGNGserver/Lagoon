@@ -611,7 +611,7 @@ class ControllerRegressionTest {
       refresh(c, controlOnly=false)
       assertTrue(state.value.degraded);assertTrue(state.value.sessions.any{it.id=="sa"});assertEquals(TaskPhase.THINKING,state.value.tasks["sa"]?.phase);assertEquals("sa",state.value.sessionId)
       assertTrue(state.value.tasks.getValue("sa").uncertain)
-      assertEquals(SessionStatus.UNKNOWN, state.value.sessionStatus(state.value.sessions.first { it.id == "sa" }))
+      assertEquals(SessionStatus.NONE, state.value.sessionStatus(state.value.sessions.first { it.id == "sa" }))
       assertEquals(0, state.value.summary.running)
     }
   }

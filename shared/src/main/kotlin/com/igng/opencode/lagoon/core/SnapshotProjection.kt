@@ -51,20 +51,13 @@ internal fun ServerOverviewSnapshot.displaySummary(policy: PermissionPolicy, now
     sessions.associate { it.id to it.displayTitle() }, serverId, profile.name)
 
 /**
- * One indicator per session of [this] server, using the same offline TTL as the summary: roots whose
- * only activity was server-owned work dropped by that TTL are [SessionStatus.UNKNOWN], not idle.
+ * One indicator per session of [this] server. A connected server shows exactly what the last
+ * authoritative read proved — the official client has no "unknown" execution state. While the server
+ * is offline, work this phone can no longer prove simply stops counting as live (see [liveTasks]);
+ * the row falls back to its unread result or a quiet dot instead of "状态待确认".
  */
 fun ServerOverviewSnapshot.sessionStatuses(policy: PermissionPolicy, now: Long = System.currentTimeMillis()): Map<String, SessionStatus> {
-  val live = liveTasks(now)
-  val active = SessionActivityRules.rootStates(policy.tasks(live, permissions, autoApprovalFailures).filterValues { it.active }, parents)
-  // Roots whose only activity was server-owned work dropped by the offline TTL must stop spinning,
-  // but they are not "idle" either: mark them unknown until an authoritative read returns.
-  val staleRoots = if (isStale(now) || tasks.values.any { it.uncertain }) {
-    SessionActivityRules.rootStates(policy.tasks(tasks, permissions, autoApprovalFailures).filterValues { it.active }, parents).keys - active.keys
-  } else emptySet()
-  return sessions.associate { session ->
-    val unseen = notices.unseenFor(session.id)
-    session.id to (if (session.id in staleRoots && unseen.isEmpty()) SessionStatus.UNKNOWN
-      else sessionStatus(active[session.id], unseen))
-  }
+  val active = SessionActivityRules.rootStates(
+    policy.tasks(liveTasks(now), permissions, autoApprovalFailures).filterValues { it.active }, parents)
+  return sessions.associate { session -> session.id to sessionStatus(active[session.id], notices.unseenFor(session.id)) }
 }

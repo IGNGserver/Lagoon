@@ -44,12 +44,13 @@ fun Session.displayTitle(): String {
  * unread result › nothing. Attention may roll up from descendants; a running child is background
  * activity, not the root's running state. Results belong to the root and exist only while unread — a
  * session that finished long ago, or that was already opened, shows nothing.
- * [UNKNOWN] marks server-owned work whose last read is older than the island's offline TTL: it must
- * not keep spinning as if the phone could still prove it is running.
+ *
+ * There is deliberately no "unknown" member: the v2 client derives a session's state from
+ * `session.active` alone, so a session the phone cannot currently prove is running is simply idle.
  */
 enum class SessionStatus(val label: String) {
   WAITING_PERMISSION("等待授权"), WAITING_QUESTION("等待回答"), WAITING_SERVER("等待服务器处理"), RUNNING("运行中"),
-  FAILED("错误"), COMPLETED("已完成"), UNKNOWN("状态待确认"), NONE("")
+  FAILED("错误"), COMPLETED("已完成"), NONE("")
 }
 
 fun sessionStatus(activeFamily: TaskState?, unseen: List<SessionNotice>): SessionStatus = when {

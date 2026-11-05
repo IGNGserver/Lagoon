@@ -45,7 +45,7 @@ class HomeSectionsTest {
     val sessions = listOf(session("unknown", at(4, 23)), session("done", at(1, 12)),
       session("failed", now - 10 * 86_400_000L), session("idle", now - 40 * 86_400_000L),
       session("missing", now - 41 * 86_400_000L))
-    val statuses = mapOf("unknown" to SessionStatus.UNKNOWN, "done" to SessionStatus.COMPLETED,
+    val statuses = mapOf("unknown" to SessionStatus.NONE, "done" to SessionStatus.COMPLETED,
       "failed" to SessionStatus.FAILED, "idle" to SessionStatus.NONE)
 
     val sections = HomeSections.build(HomeGrouping.DATE, sessions, emptyList(), statuses, now = now, zone = zone)
@@ -78,7 +78,7 @@ class HomeSectionsTest {
     assertEquals(listOf("今天", "更早"), sections.map { it.title })
     assertEquals(listOf(running), sections.first().sessions)
     assertEquals(listOf(idle), sections.last().sessions)
-    for (status in listOf(SessionStatus.UNKNOWN, SessionStatus.COMPLETED, SessionStatus.NONE)) {
+    for (status in listOf(SessionStatus.COMPLETED, SessionStatus.NONE)) {
       val settled = HomeSections.build(HomeGrouping.DATE, sessions, emptyList(),
         mapOf(running.key to status), now = now, zone = zone)
       assertEquals(listOf("更早"), settled.map { it.title })
@@ -129,8 +129,8 @@ class HomeSectionsTest {
     assertEquals(listOf("需要处理"), sections.map { it.title })
   }
 
-  @Test fun unknownOfflineWorkFallsUnderTheRest() {
-    val sections = HomeSections.byStatus(listOf(session("offline", at(5, 8))), mapOf("offline" to SessionStatus.UNKNOWN))
+  @Test fun settledOfflineWorkFallsUnderTheRest() {
+    val sections = HomeSections.byStatus(listOf(session("offline", at(5, 8))), mapOf("offline" to SessionStatus.NONE))
     assertEquals(listOf("其他"), sections.map { it.title })
   }
 
