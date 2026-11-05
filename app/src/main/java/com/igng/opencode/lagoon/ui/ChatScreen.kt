@@ -51,6 +51,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.conflate
 import kotlinx.coroutines.withContext
+import java.io.File
 import top.yukonga.miuix.kmp.basic.*
 import top.yukonga.miuix.kmp.extra.SuperBottomSheet
 import top.yukonga.miuix.kmp.extra.SuperDialog
@@ -61,7 +62,7 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
 import top.yukonga.miuix.kmp.theme.miuixCapsuleShape
 import top.yukonga.miuix.kmp.theme.miuixShape
 
-private enum class ChatSheet { CHANGES, FILES, ACTIVITY }
+private enum class ChatSheet { CHANGES, FILES, ACTIVITY, SCHEDULES }
 
 @Composable
 fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> Unit, onOpenChild: (String) -> Unit, onModal: (Boolean) -> Unit, interactive: Boolean = true) {
@@ -79,6 +80,8 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
   var queuedText by remember(state.serverId, state.sessionId) { mutableStateOf("") }
   var childContinue by remember(state.serverId, state.sessionId) { mutableStateOf(false) }
   var childText by remember(state.serverId, state.sessionId) { mutableStateOf("") }
+  var goalDialog by remember(state.serverId, state.sessionId) { mutableStateOf(false) }
+  var goalText by remember(state.serverId, state.sessionId) { mutableStateOf("") }
   val activity = remember(state.sessions, state.presentedTasks, state.shells, state.parents, state.sessionId) { state.sessionActivity() }
   val focusManager = LocalFocusManager.current
   val keyboard = LocalSoftwareKeyboardController.current
@@ -96,6 +99,9 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
       add(MenuAction("子会话与后台（${activity.subSessions.size + activity.shells.size}）", MiuixIcons.MindMap) { sheet = ChatSheet.ACTIVITY })
       if (state.capabilities.diff) add(MenuAction("改动（${state.changes.size}）", MiuixIcons.Merge) { sheet = ChatSheet.CHANGES })
       add(MenuAction("文件", MiuixIcons.Folder) { sheet = ChatSheet.FILES; controller.listFiles() })
+      if (state.server?.kind == ServerKind.DSH || state.server?.kind == ServerKind.DSH_REMOTE) {
+        add(MenuAction("定时任务", MiuixIcons.Info) { sheet = ChatSheet.SCHEDULES; controller.loadSchedules() })
+      }
     }),
     MenuSection(buildList {
       add(MenuAction(if (session.id in state.pinned) "取消置顶" else "置顶", if (session.id in state.pinned) MiuixIcons.Unpin else MiuixIcons.Pin) { controller.togglePin(session.id) })
@@ -125,11 +131,17 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
             activityItem = it.takeIf { row -> row.kind == "tool" }
           }, onQueuedAction = { queuedAction = it })
         if (session.parentId != null) ChildSessionBar(state, session, onBack,
-          onContinue = if (state.server?.kind == ServerKind.DSH || state.server?.kind == ServerKind.DSH_REMOTE) {
+          onContinue = if ((state.server?.kind == ServerKind.DSH || state.server?.kind == ServerKind.DSH_REMOTE) &&
+            session.subagentMode == "continuable") {
             { childContinue = true }
           } else null)
         else {
           if (activity.hasActive) SessionActivityChip(activity) { sheet = ChatSheet.ACTIVITY }
+          val goalSupported = state.server?.kind == ServerKind.DSH || state.server?.kind == ServerKind.DSH_REMOTE
+          LaunchedEffect(state.sessionId, state.connected, goalSupported) {
+            if (state.connected && goalSupported) controller.loadGoal()
+          }
+          if (goalSupported && (state.goal != null || state.connected)) GoalBar(state, controller) { goalDialog = true }
           ChatComposer(state, controller, interactive, onModal = { composerModal = it }, onServerFile = { sheet = ChatSheet.FILES; controller.listFiles() })
         }
       }
@@ -156,10 +168,10 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
     }
   }
   sheet?.let { which ->
-    val resource = when (which) { ChatSheet.CHANGES -> "changes"; ChatSheet.FILES -> "files"; ChatSheet.ACTIVITY -> "children" }
-    SuperBottomSheet(title = when (which) { ChatSheet.CHANGES -> "代码改动"; ChatSheet.FILES -> "文件"; ChatSheet.ACTIVITY -> "子会话与后台" }, show = true, onDismissRequest = { sheet = null }) {
+    val resource = when (which) { ChatSheet.CHANGES -> "changes"; ChatSheet.FILES -> "files"; ChatSheet.ACTIVITY -> "children"; ChatSheet.SCHEDULES -> "schedules" }
+    SuperBottomSheet(title = when (which) { ChatSheet.CHANGES -> "代码改动"; ChatSheet.FILES -> "文件"; ChatSheet.ACTIVITY -> "子会话与后台"; ChatSheet.SCHEDULES -> "定时任务" }, show = true, onDismissRequest = { sheet = null }) {
       Column(Modifier.fillMaxWidth().fillMaxHeight(0.72f).padding(vertical = 8.dp)) {
-        if (which != ChatSheet.FILES) ResourceHint(state.resource(resource), "暂无记录", retry = controller::reload)
+        if (which != ChatSheet.FILES && which != ChatSheet.SCHEDULES) ResourceHint(state.resource(resource), "暂无记录", retry = controller::reload)
         when (which) {
           // Server lists may repeat an entry; LazyColumn crashes on a duplicate key, so keys never come from data alone.
           ChatSheet.CHANGES -> LazyColumn { itemsIndexed(state.changes, key = { index, change -> "$index:${change.path}" }) { _, change ->
@@ -168,6 +180,7 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
             if (expanded) VirtualText(change.patch.ifBlank { change.after })
           } }
           ChatSheet.FILES -> FilesPanel(state, controller) { path -> controller.addReference(path); sheet = null }
+          ChatSheet.SCHEDULES -> SchedulesPanel(state, controller)
           ChatSheet.ACTIVITY -> ActivityPanel(state, activity, controller,
             onOpenChild = { sheet = null; onOpenChild(it) },
             onOpenShell = { sheet = null; controller.openShellOutput(it) })
@@ -212,6 +225,19 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
       }
     }
   }
+  if (goalDialog) {
+    SuperDialog(title = "设定长期目标", show = true, onDismissRequest = { goalDialog = false }) {
+      Column(Modifier.padding(top = 8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text("目标是会话级的；达到上限或手动完成前，Host 可能自动续跑。", style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
+        TextField(value = goalText, onValueChange = { goalText = it }, label = "目标")
+        DialogActions("取消", { goalDialog = false }, "创建", goalText.isNotBlank()) {
+          val text = goalText.trim()
+          goalDialog = false; goalText = ""
+          controller.createGoal(text)
+        }
+      }
+    }
+  }
   if (rename) RenameSessionDialog(state, controller, session) { rename = false }
   if (delete) SuperDialog(title = "删除此会话？", show = true, onDismissRequest = { if (!state.pending("delete")) delete = false }) {
     Column { Text("会话消息将从服务器永久删除。\n${state.title(session)}"); ActionError(state, "delete")
@@ -239,6 +265,31 @@ private fun SessionActivityChip(activity: SessionActivity, onClick: () -> Unit) 
 }
 
 /** The child-session footer: live status and a way back, with no composer (official subagents are read-only). */
+@Composable
+private fun GoalBar(state: LagoonState, controller: LagoonController, onCreate: () -> Unit) {
+  val goal = state.goal
+  if (goal == null) {
+    TextButton(text = "设定目标", onClick = onCreate, modifier = Modifier.padding(horizontal = 20.dp))
+    return
+  }
+  Card(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)) {
+    Column(Modifier.padding(horizontal = 12.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+      Row(verticalAlignment = Alignment.CenterVertically) {
+        Text(goal.label, style = MiuixTheme.textStyles.footnote2.copy(color = if (goal.blocked) MiuixColorTokens.Error else MiuixTheme.colorScheme.primary))
+        Spacer(Modifier.width(8.dp))
+        Text("${goal.roundsStarted}/${goal.maxRounds} 轮", style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
+        Spacer(Modifier.weight(1f))
+        if (goal.active) TextButton(text = "暂停", onClick = { controller.goalAction("pause") })
+        if (goal.paused || goal.blocked) TextButton(text = "继续", onClick = { controller.goalAction("resume") })
+        if (!goal.complete) TextButton(text = "完成", onClick = { controller.goalAction("complete") })
+        TextButton(text = "清除", onClick = { controller.goalAction("clear") })
+      }
+      Text(goal.objective, style = MiuixTheme.textStyles.footnote1, maxLines = 2, overflow = TextOverflow.Ellipsis)
+      goal.blockedReason?.let { Text(it, style = MiuixTheme.textStyles.footnote2.copy(color = MiuixColorTokens.Error), maxLines = 2) }
+    }
+  }
+}
+
 @Composable
 private fun ChildSessionBar(state: LagoonState, session: Session, onBack: () -> Unit, onContinue: (() -> Unit)? = null) {
   val task = state.livePresentedTasks[session.id]
@@ -949,11 +1000,32 @@ private fun RemoveBadge(modifier: Modifier, onRemove: () -> Unit) {
 }
 
 @Composable
+private fun SchedulesPanel(state: LagoonState, controller: LagoonController) {
+  if (state.schedulesLoading) { Text("正在读取定时任务…", style = MiuixTheme.textStyles.footnote2); return }
+  if (state.schedules.isEmpty()) {
+    Text("此会话没有定时任务。创建仍通过 Agent 的 schedule_create 工具完成。",
+      style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
+    TextButton(text = "刷新", onClick = { controller.loadSchedules() })
+    return
+  }
+  LazyColumn(Modifier.fillMaxWidth()) {
+    items(state.schedules, key = { it.id }) { schedule ->
+      BasicComponent(title = schedule.title, summary = "${schedule.detail} · ${schedule.scheduledAt}",
+        onClick = { controller.loadSchedules() })
+      Text(schedule.prompt, style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary), maxLines = 2, overflow = TextOverflow.Ellipsis,
+        modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp))
+    }
+  }
+}
+
+@Composable
 private fun FilesPanel(state: LagoonState, controller: LagoonController, onReference: (String) -> Unit) {
   var query by rememberSaveable { mutableStateOf("") }
   val searching = query.trim().length >= 2
   val path = state.filePath
-  val viewingFile = state.fileText != null || state.fileBinary
+  val previewBytes = state.filePreview.takeUnless { searching }
+  val previewMime = state.filePreviewMime
+  val viewingFile = state.fileText != null || state.fileBinary || previewBytes != null
   val crumbs = remember(path) { if (path == "." || path.isBlank()) emptyList() else HomeScope.crumbs(path) }
   val nodes = remember(state.files, state.searchResults, searching) {
     (if (searching) state.searchResults.map { FileNode(it, "file") } else state.files).distinctBy { it.path }
@@ -977,11 +1049,15 @@ private fun FilesPanel(state: LagoonState, controller: LagoonController, onRefer
       }
     }
     ResourceHint(state.resource(if (searching) "search" else "files"), "此目录没有文件", retry = { if (searching) controller.searchFiles(query) else controller.listFiles() })
-    if (state.fileBinary && !searching) { Text("当前无法预览此二进制文件"); TextButton(text = "引用到消息", enabled = !state.pending("send"), onClick = { onReference(state.filePath) }) }
-    val preview = state.fileText?.takeUnless { searching }
-    if (preview != null) {
+    if (previewBytes != null) {
       TextButton(text = "引用到消息", onClick = { onReference(state.filePath) })
-      VirtualText(preview, Modifier.weight(1f), highlight = false)
+      FilePreviewView(previewMime, previewBytes, Modifier.weight(1f))
+    } else if (state.fileBinary && !searching) {
+      Text("当前无法预览此二进制文件")
+      TextButton(text = "引用到消息", enabled = !state.pending("send"), onClick = { onReference(state.filePath) })
+    } else if (state.fileText?.takeUnless { searching } != null) {
+      TextButton(text = "引用到消息", onClick = { onReference(state.filePath) })
+      VirtualText(state.fileText!!, Modifier.weight(1f), highlight = false)
     } else if (!state.fileBinary || searching) {
       LazyColumn { items(nodes, key = { it.path }) { node ->
         val directory = node.type == "directory"
@@ -990,6 +1066,48 @@ private fun FilesPanel(state: LagoonState, controller: LagoonController, onRefer
       } }
     }
   }
+}
+
+@Composable
+private fun FilePreviewView(mime: String?, bytes: ByteArray, modifier: Modifier = Modifier) {
+  val context = androidx.compose.ui.platform.LocalContext.current
+  val bitmap by produceState<android.graphics.Bitmap?>(null, mime, bytes) {
+    value = withContext(Dispatchers.IO) {
+      runCatching {
+        when {
+          mime?.startsWith("image/") == true -> BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+          mime == "application/pdf" -> renderPdfFirstPage(context, bytes)
+          else -> null
+        }
+      }.getOrNull()
+    }
+  }
+  Column(modifier.fillMaxWidth()) {
+    if (mime == "application/pdf") Text("仅预览第 1 页", style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
+    val image = bitmap
+    if (image != null) Image(image.asImageBitmap(), contentDescription = "文件预览", modifier = Modifier.fillMaxWidth(), contentScale = ContentScale.FillWidth)
+    else Text("预览渲染失败", style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
+  }
+}
+
+private fun renderPdfFirstPage(context: android.content.Context, bytes: ByteArray): android.graphics.Bitmap? {
+  val file = File.createTempFile("lagoon-preview", ".pdf", context.cacheDir)
+  return try {
+    file.writeBytes(bytes)
+    android.os.ParcelFileDescriptor.open(file, android.os.ParcelFileDescriptor.MODE_READ_ONLY).use { descriptor ->
+      android.graphics.pdf.PdfRenderer(descriptor).use { renderer ->
+        if (renderer.pageCount <= 0) return null
+        renderer.openPage(0).use { page ->
+          val scale = (1200f / page.width.coerceAtLeast(1)).coerceIn(1f, 3f)
+          val bitmap = android.graphics.Bitmap.createBitmap((page.width * scale).toInt().coerceAtLeast(1),
+            (page.height * scale).toInt().coerceAtLeast(1), android.graphics.Bitmap.Config.ARGB_8888)
+          bitmap.eraseColor(android.graphics.Color.WHITE)
+          page.render(bitmap, null, null, android.graphics.pdf.PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+          bitmap
+        }
+      }
+    }
+  } finally { runCatching { file.delete() } }
 }
 
 internal fun editDraft(drafts: MutableMap<String, String>, key: String, value: String) {

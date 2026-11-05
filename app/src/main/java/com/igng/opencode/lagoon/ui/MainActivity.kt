@@ -97,6 +97,9 @@ class MainActivity : ComponentActivity() {
        var showingModelManagement by rememberSaveable { mutableStateOf(false) }
        var showingRemoteEnroll by rememberSaveable { mutableStateOf(false) }
        var showingRemoteHosts by rememberSaveable { mutableStateOf(false) }
+       LaunchedEffect(controller) {
+         controller.remoteRecoveryHandler = { showingRemoteHosts = false; showingRemoteEnroll = true }
+       }
        var showingDeviceGroups by rememberSaveable { mutableStateOf(false) }
        var editingGroupId by rememberSaveable { mutableStateOf<String?>(null) }
        var showingGroupDraftTarget by rememberSaveable { mutableStateOf(false) }

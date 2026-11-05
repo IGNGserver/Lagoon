@@ -2,6 +2,22 @@ package com.igng.opencode.lagoon.core
 
 import java.io.IOException
 
+/** UI-level recovery affordance; safe to expose in state. */
+enum class RemoteRecoveryKind(val label: String) {
+  LOGIN("重新登录"),
+  TRUST("核对指纹"),
+  HOST("刷新主机"),
+  RECONNECT("重新连接")
+}
+
+internal fun RemoteFailureKind.recovery(): RemoteRecoveryKind? = when (this) {
+  RemoteFailureKind.AUTH_REQUIRED, RemoteFailureKind.DEVICE_REVOKED -> RemoteRecoveryKind.LOGIN
+  RemoteFailureKind.TRUST_REQUIRED, RemoteFailureKind.TRUST_CHANGED -> RemoteRecoveryKind.TRUST
+  RemoteFailureKind.HOST_NOT_FOUND -> RemoteRecoveryKind.HOST
+  RemoteFailureKind.CONNECTION_REPLACED -> RemoteRecoveryKind.RECONNECT
+  else -> null
+}
+
 /** User-actionable Remote failure. UI may key recovery on [kind], never on a message string. */
 internal enum class RemoteFailureKind {
   OFFLINE, AUTH_REQUIRED, DEVICE_REVOKED, HOST_NOT_FOUND,

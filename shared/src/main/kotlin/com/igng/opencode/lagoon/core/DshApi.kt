@@ -415,6 +415,7 @@ class DshApi(
       title = title.ifBlank { "新会话" },
       updated = updated,
       parentId = item.str("parentSessionId").ifBlank { null },
+      subagentMode = values.obj("subagent").str("mode").takeIf { it.isNotBlank() },
       projectId = directory.ifBlank { null },
       created = previous?.created ?: updated,
       archived = id in archivedSessions || previous?.archived == true,
@@ -1318,6 +1319,141 @@ class DshApi(
 
   override suspend fun setPluginBundle(name: String, enabled: Boolean): Boolean {
     call("pluginManager/setBundleEnabled", JSONObject().put("name", name).put("enabled", enabled))
+    return true
+  }
+
+  override suspend fun createProviderRoute(
+    route: String, displayName: String, api: String, baseUrl: String,
+    apiKeyEnv: String, modelId: String, apiKey: String
+  ): Boolean {
+    val validRoute = Regex("[a-z][a-z0-9-]{0,63}").matches(route)
+    if (!validRoute || api !in setOf("openai-completions", "openai-responses", "anthropic-messages") ||
+      modelId.isBlank() || !baseUrl.startsWith("http://") && !baseUrl.startsWith("https://"))
+      throw ApiException(400, "模型服务商参数无效")
+    val describe = callObject("settings/describe")
+    val namespaces = describe.optJSONArray("namespaces") ?: throw ApiException(404, "Host 没有设置命名空间")
+    val ns = (0 until namespaces.length()).mapNotNull { namespaces.optJSONObject(it) }
+      .firstOrNull { it.optString("ns") == "llm-pi-ai" }
+      ?: throw ApiException(404, "Host 没有启用 pi-ai 模型适配器")
+    if (!ns.optBoolean("writable", true)) throw ApiException(403, "Host 设置只读")
+    val profile = JSONObject().put("displayName", displayName.ifBlank { route })
+      .put("api", api).put("baseURL", baseUrl).put("apiKeyEnv", apiKeyEnv)
+      .put("models", JSONArray().put(JSONObject().put("id", modelId)))
+    val ops = JSONArray().put(JSONObject().put("op", "set")
+      .put("path", JSONArray().put("providers").put(route)).put("value", profile))
+    call("settings/mutate", JSONObject().put("ns", "llm-pi-ai").put("ops", ops)
+      .put("expectedRevision", ns.optInt("revision", 0)))
+    if (apiKey.isNotBlank()) setCredential(apiKeyEnv, apiKey)
+    return true
+  }
+
+  override suspend fun schedules(sessionId: String): List<RemoteSchedule> {
+    val value = call("schedule/list", JSONObject().put("request", JSONObject().put("sessionId", sessionId))) as? JSONArray
+      ?: return emptyList()
+    return (0 until value.length()).mapNotNull { index ->
+      val item = value.optJSONObject(index) ?: return@mapNotNull null
+      val id = item.optString("id").takeIf { it.isNotBlank() } ?: return@mapNotNull null
+      val kind = item.optString("kind")
+      val detail = when (kind) {
+        "every" -> "${item.optInt("everySeconds")} 秒"
+        "daily" -> "${item.optString("time")} ${item.optString("timeZone")}"
+        "weekly" -> {
+          val days = item.optJSONArray("weekdays")
+          val text = if (days == null) "" else (0 until days.length()).joinToString(",") { days.optInt(it).toString() }
+          "${item.optString("time")} ${item.optString("timeZone")} · $text"
+        }
+        "cron" -> "${item.optString("expression")} ${item.optString("timeZone")}"
+        "after" -> "${item.optInt("afterSeconds")} 秒后"
+        "at" -> item.optString("scheduledAt")
+        else -> kind
+      }
+      RemoteSchedule(id, kind, item.optString("title").ifBlank { "定时任务" },
+        item.optString("prompt"), item.optString("scheduledAt"), detail)
+    }
+  }
+
+  override suspend fun previewFile(directory: String, path: String, session: Session?): FilePreview? = withContext(Dispatchers.IO) {
+    val ext = path.substringAfterLast('.', "").lowercase()
+    val imageMime = when (ext) {
+      "png" -> "image/png"; "jpg", "jpeg" -> "image/jpeg"; "gif" -> "image/gif"; "webp" -> "image/webp"
+      else -> null
+    }
+    val max = if (imageMime != null) 8 * 1024 * 1024 else 16 * 1024 * 1024
+    val office = ext in setOf("doc", "docx", "xls", "xlsx", "ppt", "pptx")
+    if (imageMime == null && ext != "pdf" && !office) return@withContext null
+    val scope = fileScope(directory, session)
+    val value = try {
+      if (office) callObject("officeToPdf/render", envelope(argsOf("workspaceFileScopeId" to scope.id, "path" to path)))
+      else callObject("workspaceFiles/readBytes", envelope(argsOf(
+        "workspaceFileScopeId" to scope.id, "path" to path,
+        "range" to JSONObject().put("offset", 0).put("length", max)
+      )))
+    } catch (error: ApiException) {
+      // Unsupported preview endpoints are a capability gap, not a failed file read.
+      if (error.code.orEmpty().startsWith("gateway/") || error.status == 404) return@withContext null
+      throw error
+    }
+    val encoded = value.optString("data").takeIf { it.isNotBlank() } ?: return@withContext null
+    val bytes = try { java.util.Base64.getDecoder().decode(encoded) } catch (_: Exception) {
+      throw ApiException(502, "预览数据编码无效")
+    }
+    if (bytes.size > max) throw ApiException(413, "文件超过预览上限")
+    if (!office && value.has("eof") && !value.optBoolean("eof"))
+      throw ApiException(413, if (ext == "pdf") "PDF 超过 16 MiB 预览上限" else "图片超过 8 MiB 预览上限")
+    FilePreview(if (office) "application/pdf" else imageMime ?: "application/pdf", bytes)
+  }
+
+  override suspend fun goal(sessionId: String): RemoteGoal? {
+    val value = call("goals/get", JSONObject().put("agentId", sessionId)) as? JSONObject ?: return null
+    val id = value.optString("id").takeIf { it.isNotBlank() } ?: return null
+    val ref = value.optJSONObject("ref")
+    val obligation = value.optString("objective")
+    val phase = value.optString("phase")
+    return RemoteGoal(
+      id = id,
+      revision = ref?.optInt("revision", 0) ?: value.optInt("revision", 0),
+      objective = obligation,
+      phase = phase,
+      maxRounds = value.optInt("maxGoalRounds", 0),
+      roundsStarted = value.optInt("roundsStarted", 0),
+      activation = value.optString("activation").takeIf { it.isNotBlank() },
+      blockedReason = value.optJSONObject("blockedReason")?.optString("message")?.takeIf { it.isNotBlank() }
+    )
+  }
+
+  override suspend fun createGoal(sessionId: String, objective: String, maxRounds: Int?): Boolean {
+    val request = JSONObject().put("objective", objective)
+    if (maxRounds != null) request.put("maxGoalRounds", maxRounds)
+    call("goals/create", JSONObject().put("agentId", sessionId).put("request", request))
+    return true
+  }
+
+  override suspend fun goalAction(sessionId: String, id: String, revision: Int, action: String): Boolean {
+    if (action !in setOf("pause", "resume", "complete", "clear")) return false
+    call("goals/$action", JSONObject().put("agentId", sessionId)
+      .put("ref", JSONObject().put("id", id).put("revision", revision)))
+    return true
+  }
+
+  override suspend fun credentialStatus(refs: List<String>): Map<String, RemoteCredentialStatus> {
+    if (refs.isEmpty()) return emptyMap()
+    val body = call("credentials/describe", JSONObject().put("refs", JSONArray(refs))) as? JSONObject ?: return emptyMap()
+    return body.keys().asSequence().mapNotNull { ref ->
+      val item = body.optJSONObject(ref) ?: return@mapNotNull null
+      ref to RemoteCredentialStatus(ref, item.optBoolean("configured"), item.optBoolean("writable", true),
+        item.optString("source").takeIf { it.isNotBlank() })
+    }.toMap()
+  }
+
+  override suspend fun setCredential(ref: String, value: String): Boolean {
+    if (ref.isBlank() || value.isBlank()) return false
+    call("credentials/set", JSONObject().put("ref", ref).put("value", value))
+    return true
+  }
+
+  override suspend fun clearCredential(ref: String): Boolean {
+    if (ref.isBlank()) return false
+    call("credentials/unset", JSONObject().put("ref", ref))
     return true
   }
 

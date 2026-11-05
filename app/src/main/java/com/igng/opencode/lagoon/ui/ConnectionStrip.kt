@@ -75,7 +75,9 @@ internal fun ConnectionStrip(state: LagoonState, controller: LagoonController, m
       verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
       if (shown.tone == ConnectionBanner.Tone.PROGRESS) InfiniteProgressIndicator(size = 14.dp, strokeWidth = 2.dp)
       Text(shown.text, style = MiuixTheme.textStyles.footnote1, color = color, maxLines = 2, modifier = Modifier.weight(1f))
-      if (shown.retry) TextButton(text = "立即重试", onClick = { controller.retryNow() })
+      val recovery = state.remoteRecovery
+      if (recovery != null) TextButton(text = recovery.label, onClick = { controller.openRemoteRecovery() })
+      else if (shown.retry) TextButton(text = "立即重试", onClick = { controller.retryNow() })
     }
   }
 }

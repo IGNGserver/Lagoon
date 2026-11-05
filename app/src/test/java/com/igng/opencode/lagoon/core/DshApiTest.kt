@@ -64,6 +64,128 @@ class DshApiTest {
     .put("projections", JSONObject().put("kind", "sequenced").put("asOfSeq", 3)
       .put("values", JSONObject().put("title", title).put("agentPreset", "standard")))
 
+  @Test fun customProviderRouteUsesSettingsMutateAndCredential() = runBlocking {
+    MockWebServer().use { server ->
+      server.enqueue(rootOk())
+      server.enqueue(envelope("""{"writable":true,"hasDocument":false,"namespaces":[{"ns":"llm-pi-ai","autoGenerate":true,"schema":{},"value":{},"revision":3,"applies":"live","secrets":[]}]}"""))
+      server.enqueue(envelope("""{"ns":"llm-pi-ai"}"""))
+      server.enqueue(envelope("""{}"""))
+      assertTrue(api(server).createProviderRoute("acme", "Acme", "openai-completions",
+        "https://gw.example/v1", "ACME_API_KEY", "acme-1", "sk-test"))
+      server.takeRequest()
+      assertEquals("/api/settings/describe", server.takeRequest().path)
+      val mutate = server.takeRequest()
+      assertEquals("/api/settings/mutate", mutate.path)
+      val body = JSONObject(mutate.body.readUtf8()).getJSONObject("payload")
+      assertEquals("llm-pi-ai", body.getString("ns"))
+      assertEquals(3, body.getInt("expectedRevision"))
+      val op = body.getJSONArray("ops").getJSONObject(0)
+      assertEquals("providers", op.getJSONArray("path").getString(0))
+      assertEquals("acme", op.getJSONArray("path").getString(1))
+      assertEquals("/api/credentials/set", server.takeRequest().path)
+    }
+  }
+
+  @Test fun scheduleListIsReadOnlyAndSessionScoped() = runBlocking {
+    MockWebServer().use { server ->
+      server.enqueue(rootOk())
+      server.enqueue(envelope("""[{"id":"r1","kind":"daily","title":"晨会","prompt":"提醒我","scheduledAt":"2026-11-06T01:00:00Z","time":"09:00","timeZone":"Asia/Shanghai"}]"""))
+      val list = api(server).schedules("s1")
+      assertEquals(1, list.size)
+      assertEquals("晨会", list.single().title)
+      assertEquals("09:00 Asia/Shanghai", list.single().detail)
+      server.takeRequest()
+      val request = server.takeRequest()
+      assertEquals("/api/schedule/list", request.path)
+      assertEquals("s1", JSONObject(request.body.readUtf8()).getJSONObject("payload").getJSONObject("request").getString("sessionId"))
+    }
+  }
+
+  @Test fun subagentModeComesFromSessionProjection() = runBlocking {
+    MockWebServer().use { server ->
+      server.enqueue(rootOk())
+      server.enqueue(envelope("""{"items":[{"sessionId":"c1","updatedAt":1,"running":false,"cwd":"/repo","parentSessionId":"p1","origin":"subagent",
+        "projections":{"values":{"title":"子任务","subagent":{"mode":"continuable"}}}}]}"""))
+      val session = api(server).children(Session("p1", "/repo", "P", 1)).single()
+      assertEquals("continuable", session.subagentMode)
+    }
+  }
+
+  @Test fun filePreviewUsesBase64ReadBytesAndOfficeRender() = runBlocking {
+    MockWebServer().use { server ->
+      server.enqueue(rootOk())
+      server.enqueue(envelope("""{"absolutePath":"/repo/a.png","bytes":5,"offset":0,"data":"aGVsbG8=","eof":true}"""))
+      server.enqueue(envelope("""{"data":"JVBERi0="}"""))
+      val client = api(server)
+      val session = Session("s1", "/repo", "T", 1)
+      val image = client.previewFile("/repo", "a.png", session)!!
+      assertEquals("image/png", image.mime)
+      assertArrayEquals("hello".toByteArray(), image.bytes)
+      val pdf = client.previewFile("/repo", "a.docx", session)!!
+      assertEquals("application/pdf", pdf.mime)
+      assertArrayEquals("%PDF-".toByteArray(), pdf.bytes)
+      server.takeRequest() // root
+      assertEquals("/api/workspaceFiles/readBytes", server.takeRequest().path)
+      assertEquals("/api/officeToPdf/render", server.takeRequest().path)
+    }
+  }
+
+  @Test fun goalReadAndMutationUseSessionScopedRpc() = runBlocking {
+    MockWebServer().use { server ->
+      server.enqueue(rootOk())
+      server.enqueue(envelope("""{"id":"g1","revision":2,"objective":"完成 P4","phase":"active","maxGoalRounds":30,"roundsStarted":1,"activation":"armed","createdAt":1,"updatedAt":2}"""))
+      server.enqueue(envelope("""{"ref":{"id":"g1","revision":2}}"""))
+      server.enqueue(envelope("""{}"""))
+      val client = api(server)
+      val goal = client.goal("s1")!!
+      assertEquals("g1", goal.id)
+      assertEquals(2, goal.revision)
+      assertEquals("完成 P4", goal.objective)
+      assertEquals(1, goal.roundsStarted)
+      assertTrue(client.createGoal("s1", "新目标", 5))
+      assertTrue(client.goalAction("s1", "g1", 2, "pause"))
+      server.takeRequest() // root
+      assertEquals("/api/goals/get", server.takeRequest().path)
+      assertEquals("/api/goals/create", server.takeRequest().path)
+      val pause = server.takeRequest()
+      assertEquals("/api/goals/pause", pause.path)
+      val body = JSONObject(pause.body.readUtf8())
+      assertEquals("s1", body.getJSONObject("payload").getString("agentId"))
+    }
+  }
+
+  @Test fun credentialStatusAndWritesUseSettingsChannel() = runBlocking {
+    MockWebServer().use { server ->
+      server.enqueue(rootOk())
+      server.enqueue(envelope("""{"DEEPSEEK_API_KEY":{"configured":true,"writable":true,"source":"file"}}"""))
+      server.enqueue(envelope("{}"))
+      server.enqueue(envelope("{}"))
+      val client = api(server)
+      val status = client.credentialStatus(listOf("DEEPSEEK_API_KEY")).getValue("DEEPSEEK_API_KEY")
+      assertTrue(status.configured)
+      assertTrue(status.writable)
+      assertEquals("file", status.source)
+      assertTrue(client.setCredential("DEEPSEEK_API_KEY", "sk-test"))
+      assertTrue(client.clearCredential("DEEPSEEK_API_KEY"))
+      server.takeRequest() // root token exchange
+      assertEquals("/api/credentials/describe", server.takeRequest().path)
+      val set = server.takeRequest(); assertEquals("/api/credentials/set", set.path)
+      assertEquals("/api/credentials/unset", server.takeRequest().path)
+    }
+  }
+
+  @Test fun pluginInventoryIsParsedFromRemoteSettingsChannel() = runBlocking {
+    MockWebServer().use { server ->
+      server.enqueue(rootOk())
+      server.enqueue(envelope("""[{"name":"dsh-opencode-go","enabled":true,"installed":true,"official":false,"version":"1.0.0","description":"Go"} ]"""))
+      val bundles = api(server).pluginBundles()
+      assertEquals(1, bundles.size)
+      assertEquals("dsh-opencode-go", bundles.single().name)
+      assertTrue(bundles.single().enabled)
+      assertEquals("1.0.0", bundles.single().version)
+    }
+  }
+
   @Test fun listingExchangesTokenForCookieThenSendsArgsEnvelope() = runBlocking {
     MockWebServer().use { server ->
       server.enqueue(rootOk())

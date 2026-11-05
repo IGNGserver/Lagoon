@@ -114,6 +114,8 @@ fun ServersModal(
   var deleting by remember { mutableStateOf(false) }
   var remoteDetails by remember { mutableStateOf(false) }
   var remoteExtensions by remember { mutableStateOf(false) }
+  var remoteModelKey by remember { mutableStateOf(false) }
+  var remoteProvider by remember { mutableStateOf(false) }
   val scope = rememberCoroutineScope()
 
   SuperBottomSheet(
@@ -128,6 +130,8 @@ fun ServersModal(
         onDelete = existing?.let { { deleting = true } },
         onRemoteDetails = { remoteDetails = true },
         onRemoteExtensions = { remoteExtensions = true },
+        onRemoteModelKey = { remoteModelKey = true },
+        onRemoteProvider = { remoteProvider = true },
         onRemoteHosts = onRemoteHosts,
         onPairRemote = { profile, account, password, publishHosts ->
           publishHosts(controller.registerRemote(profile, account, password))
@@ -192,6 +196,8 @@ fun ServersModal(
   }
   if (remoteDetails && existing != null) RemoteConnectionDialog(existing, state, controller) { remoteDetails = false }
   if (remoteExtensions && existing != null) RemoteExtensionsDialog(existing, controller) { remoteExtensions = false }
+  if (remoteModelKey && existing != null) RemoteModelKeyDialog(existing, controller) { remoteModelKey = false }
+  if (remoteProvider && existing != null) RemoteProviderDialog(existing, controller) { remoteProvider = false }
 }
 
 @Composable
@@ -201,6 +207,8 @@ private fun MiuixServerForm(
   onDelete: (() -> Unit)?,
   onRemoteDetails: (() -> Unit)? = null,
   onRemoteExtensions: (() -> Unit)? = null,
+  onRemoteModelKey: (() -> Unit)? = null,
+  onRemoteProvider: (() -> Unit)? = null,
   onRemoteHosts: () -> Unit = {},
   onPairRemote: suspend (ServerProfile, String, String, (List<RemoteHost>) -> Unit) -> Unit = { _, _, _, _ -> },
   onSave: (ServerProfile, String?, (String) -> Unit) -> Unit
@@ -246,6 +254,8 @@ private fun MiuixServerForm(
         existing = existing,
         onDetails = onRemoteDetails,
         onExtensions = onRemoteExtensions,
+        onModelKey = onRemoteModelKey,
+        onProvider = onRemoteProvider,
         onManage = onRemoteHosts,
         onDelete = onDelete,
         onCancel = onCancel

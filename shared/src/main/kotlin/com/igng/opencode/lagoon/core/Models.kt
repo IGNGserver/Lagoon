@@ -40,7 +40,9 @@ data class Session(val id: String, val directory: String, val title: String, val
   /** 已暂存撤销的边界（`revert.messageID`）：官方时间线隐藏 id ≥ 它的消息。 */
   val revertMessageId: String? = null,
   /** Source server when this session is shown in the all-servers overview. */
-  val serverId: String? = null) {
+  val serverId: String? = null,
+  /** `subagent` identity mode: one-shot / continuable / external / unknown. */
+  val subagentMode: String? = null) {
   /** 排序口径与官方一致：优先 `time.updated`，缺失时退回 `time.created`。 */
   val activityAt: Long get() = updated.takeIf { it > 0 } ?: created
   /** Session ids are only unique within one OpenCode server. */

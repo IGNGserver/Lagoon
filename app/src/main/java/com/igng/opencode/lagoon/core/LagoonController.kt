@@ -70,6 +70,7 @@ data class LagoonState(
   val pendingAttachments: Map<String, List<LocalAttachment>> = emptyMap(),
   val agent: String? = null, val model: ModelChoice? = null,
   val files: List<FileNode> = emptyList(), val filePath: String = ".", val fileText: String? = null, val fileBinary: Boolean = false,
+  val filePreview: ByteArray? = null, val filePreviewMime: String? = null,
   /** 添加项目用的远程目录选择器：当前绝对路径、目录项与搜索结果；[browsePath] 为 null 表示未打开。 */
   val browsePath: String? = null, val browseEntries: List<FileNode> = emptyList(), val browseSearch: List<String> = emptyList(),
   /** 目录浏览器是否显示以点开头的隐藏项；默认隐藏，每次重新打开浏览器时复位。 */
@@ -128,6 +129,12 @@ data class LagoonState(
   val lastContactAt: Long = 0,
   /** What the selected server's connection is waiting for; drives the status strip under the header. */
   val connection: ConnectionStatus = ConnectionStatus(),
+  /** Set only for a typed Remote failure whose fix needs a UI sheet (login/trust/host). */
+  val remoteRecovery: RemoteRecoveryKind? = null,
+  val goal: RemoteGoal? = null,
+  val goalLoading: Boolean = false,
+  val schedules: List<RemoteSchedule> = emptyList(),
+  val schedulesLoading: Boolean = false,
   /** Wall clock when the selected server's live stream went down; 0 while it is up. */
   val streamDownSince: Long = 0,
   /**
@@ -660,6 +667,54 @@ class LagoonController private constructor(private val appContext: Context) {
   internal suspend fun setPluginEntry(serverId: String, entryId: String, enabled: Boolean): Boolean =
     clientFor(serverId)?.setPluginEntry(entryId, enabled) == true
 
+  internal suspend fun credentialStatus(serverId: String, ref: String): RemoteCredentialStatus? =
+    clientFor(serverId)?.credentialStatus(listOf(ref))?.get(ref)
+
+  internal suspend fun setCredential(serverId: String, ref: String, value: String): Boolean =
+    clientFor(serverId)?.setCredential(ref, value) == true
+
+  internal suspend fun createProviderRoute(serverId: String, route: String, displayName: String, api: String,
+    baseUrl: String, apiKeyEnv: String, modelId: String, apiKey: String): Boolean =
+    clientFor(serverId)?.createProviderRoute(route, displayName, api, baseUrl, apiKeyEnv, modelId, apiKey) == true
+
+  internal suspend fun clearCredential(serverId: String, ref: String): Boolean =
+    clientFor(serverId)?.clearCredential(ref) == true
+
+  fun loadGoal() = withSession("goal-refresh") { op, client, session ->
+    val goal = try { client.goal(session.id) } catch (error: Exception) {
+      if (error is CancellationException) throw error
+      null
+    }
+    if (op.isCurrent(this)) op.commit { it.copy(goal = goal) }
+  }
+
+  fun loadSchedules() = withSession("schedules") { op, client, session ->
+    if (op.isCurrent(this)) op.commit { it.copy(schedulesLoading = true) }
+    val schedules = try { client.schedules(session.id) } catch (error: Exception) {
+      if (error is CancellationException) throw error
+      if (op.isCurrent(this)) op.commit { it.copy(schedulesLoading = false, error = userFacingError(error, "读取定时任务失败")) }
+      return@withSession
+    }
+    if (op.isCurrent(this)) op.commit { it.copy(schedules = schedules, schedulesLoading = false) }
+  }
+
+  fun createGoal(objective: String, maxRounds: Int? = null) = withSession("goal") { op, client, session ->
+    check(objective.isNotBlank()) { "目标不能为空" }
+    if (!client.createGoal(session.id, objective.trim(), maxRounds)) throw ApiException(501, "此服务器不支持长期目标")
+    if (op.isCurrent(this)) loadGoal()
+  }
+
+  fun goalAction(action: String) = withSession("goal") { op, client, session ->
+    val current = state.value.goal ?: throw ApiException(409, "当前会话没有目标")
+    if (!client.goalAction(session.id, current.id, current.revision, action)) throw ApiException(501, "此服务器不支持目标操作")
+    if (op.isCurrent(this)) loadGoal()
+  }
+
+  /** Set by the composition root; the connection strip asks it to open the Remote recovery sheet. */
+  @Volatile var remoteRecoveryHandler: (() -> Unit)? = null
+
+  fun openRemoteRecovery() { remoteRecoveryHandler?.invoke() }
+
   /** Measures one encrypted RPC round trip on the active Remote connection. */
   internal suspend fun probeRemote(serverId: String? = state.value.serverId): RemoteProbe? {
     if (serverId == null || serverId != state.value.serverId || state.value.server?.kind != ServerKind.DSH_REMOTE) return null
@@ -1133,7 +1188,7 @@ class LagoonController private constructor(private val appContext: Context) {
       permissions = snapshot?.permissions.orEmpty(), questions = snapshot?.questions.orEmpty(),
       autoApprovalFailures = snapshot?.autoApprovalFailures.orEmpty(), streamConnected = snapshot?.streamConnected == true,
       streamDownSince = if (snapshot?.streamConnected == true) 0 else System.currentTimeMillis(),
-      connection = ConnectionStatus(ConnectStage.CONNECTING, System.currentTimeMillis()),
+      connection = ConnectionStatus(ConnectStage.CONNECTING, System.currentTimeMillis()), remoteRecovery = null,
       agent = configuration.agent, model = configuration.model, agentChanged = configuration.agentChanged, modelChanged = configuration.modelChanged,
       draft = rememberedSession?.let { store.draft(id, it) }.orEmpty(), references = rememberedSession?.let { store.references(id, it) }.orEmpty(),
       tasks = snapshot?.tasks ?: TaskReconciliation.restored(store.taskStates(id)), knownParents = store.taskParents(id), notices = store.sessionNotices(id), collapsedSections = store.collapsedSections(id), pinned = store.pinnedSessions(id),
@@ -1155,6 +1210,7 @@ class LagoonController private constructor(private val appContext: Context) {
         if (token != generation) return@launch
         connectTrace.fail(token.toLong(), userFacingError(error, "连接失败"))
         showOffline(id, token, userFacingError(error, "连接失败"))
+        if (token == generation) mutable.update { it.copy(remoteRecovery = remoteFailure(error)?.kind?.recovery()) }
         // A refresh while offline must be able to recover: retry the connection with backoff instead
         // of leaving the user on a stale snapshot with no path back to a live stream (A10).
         // Expired credentials do not heal by retrying quickly; keep probing at the slowest pace.
@@ -1518,6 +1574,7 @@ class LagoonController private constructor(private val appContext: Context) {
         draftSessions = store.draftSessionIds(serverId), previews = nextSessions.associate { session -> session.id to (previous.previews[session.id] ?: store.sessionPreview(serverId, session.id)) }, connected = true, cached = previous.cached && previous.sessionId != null, loading = false,
         error = null, degraded = degraded, lastContactAt = System.currentTimeMillis(),
         connection = if (previous.connection.stage == ConnectStage.READY) previous.connection else ConnectionStatus(ConnectStage.READY, System.currentTimeMillis()),
+        remoteRecovery = null,
         projects = projects, sessions = nextSessions, knownParents = store.taskParents(serverId), tasks = states, shells = nextShells, notices = store.sessionNotices(serverId), collapsedSections = store.collapsedSections(serverId), sessionCursors = cursors, catalogComplete = cursors.isEmpty(),
         permissions = nextPermissions, questions = nextQuestions,
         projectId = (previous.projectId ?: store.selectedProject(serverId))?.takeIf { id -> projects.any { it.id == id } } ?: projects.firstOrNull()?.id,
@@ -2094,7 +2151,7 @@ class LagoonController private constructor(private val appContext: Context) {
     visibleConversation = null
     mutable.update { it.copy(projectId = id, sessionId = null, messages = emptyList(), agent = null, model = null,
       agentChanged = false, modelChanged = false, draft = "", references = emptyList(), resources = emptyMap(),
-      files = emptyList(), searchResults = emptyList(), fileText = null, fileBinary = false) }
+      files = emptyList(), searchResults = emptyList(), fileText = null, fileBinary = false, filePreview = null, filePreviewMime = null) }
     store.rememberLocation(id, null)
     val token = generation
     scope.launch { loadChoices(project.directory, token) }
@@ -2332,7 +2389,7 @@ class LagoonController private constructor(private val appContext: Context) {
       draft = draft, references = references, loadedOlderMessages = false, messagesCursor = null, resources = mapOf("messages" to ResourceStatus(ResourceState.LOADING)),
       provisionalMessageIds = emptySet(), transcriptLoadingSince = if (offline) 0 else System.currentTimeMillis(),
       changes = emptyList(), files = emptyList(),
-      searchResults = emptyList(), fileText = null, fileBinary = false)) }
+      searchResults = emptyList(), fileText = null, fileBinary = false, filePreview = null, filePreviewMime = null)) }
     store.rememberLocation(project?.id, id)
     transcripts?.protectedSession = serverId to id
     restoreComposerInput(serverId, id, selectionRevision)
@@ -3119,6 +3176,7 @@ class LagoonController private constructor(private val appContext: Context) {
         throw error
       }
       if (request == fileSequence) op.commit { it.copy(files = files, filePath = path, fileText = null, fileBinary = false,
+        filePreview = null, filePreviewMime = null,
         resources = it.resources + ("files" to ResourceStatus(if (files.isEmpty()) ResourceState.EMPTY else ResourceState.READY))) }
     }
   }
@@ -3127,11 +3185,22 @@ class LagoonController private constructor(private val appContext: Context) {
     mutable.update { it.copy(resources = it.resources + ("files" to ResourceStatus(ResourceState.LOADING))) }
     return act { op ->
       val directory = op.snapshot.executionDirectory ?: error("先选择项目")
+      val preview = try { op.client.previewFile(directory, path, op.snapshot.session) } catch (error: Exception) {
+        if (request == fileSequence) op.commit { it.copy(resources = it.resources + ("files" to ResourceStatus(ResourceState.ERROR, userFacingError(error)))) }
+        throw error
+      }
+      if (preview != null) {
+        if (request == fileSequence) op.commit { it.copy(filePath = path, fileText = null, fileBinary = false,
+          filePreview = preview.bytes, filePreviewMime = preview.mime,
+          resources = it.resources + ("files" to ResourceStatus(ResourceState.READY))) }
+        return@act
+      }
       val content = try { op.client.fileContent(directory, path, op.snapshot.session) } catch (error: Exception) {
         if (request == fileSequence) op.commit { it.copy(resources = it.resources + ("files" to ResourceStatus(ResourceState.ERROR, userFacingError(error)))) }
         throw error
       }
       if (request == fileSequence) op.commit { it.copy(fileText = content.content, fileBinary = content.type == "binary", filePath = path,
+        filePreview = null, filePreviewMime = null,
         resources = it.resources + ("files" to ResourceStatus(ResourceState.READY))) }
     }
   }

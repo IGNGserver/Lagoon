@@ -332,6 +332,8 @@ internal fun RemoteServerSummary(
   existing: ServerProfile?,
   onDetails: (() -> Unit)? = null,
   onExtensions: (() -> Unit)? = null,
+  onModelKey: (() -> Unit)? = null,
+  onProvider: (() -> Unit)? = null,
   onManage: () -> Unit,
   onDelete: (() -> Unit)?,
   onCancel: () -> Unit
@@ -349,6 +351,12 @@ internal fun RemoteServerSummary(
     }
     if (existing != null && onExtensions != null) {
       TextButton(text = "主机扩展（插件开关）", onClick = onExtensions, modifier = Modifier.fillMaxWidth())
+    }
+    if (existing != null && onModelKey != null) {
+      TextButton(text = "主机模型密钥", onClick = onModelKey, modifier = Modifier.fillMaxWidth())
+    }
+    if (existing != null && onProvider != null) {
+      TextButton(text = "添加自定义模型服务商", onClick = onProvider, modifier = Modifier.fillMaxWidth())
     }
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
       TextButton(text = "取消", onClick = onCancel)
@@ -389,6 +397,8 @@ internal fun RemoteConnectionDialog(
         add("服务版本" to state.version.ifBlank { "未知" })
         add("主机指纹" to (profile.remoteHostFingerprint?.let { formatFingerprint(it) } ?: "待确认"))
         add("加密 RPC 往返" to (probe?.let { "${it.durationMillis} 毫秒" } ?: "未测量"))
+        add("最近联络" to (if (state.lastContactAt > 0) agoText(state.lastContactAt) else "未知"))
+        add("当前阶段" to (if (state.connection.since > 0) "${agoText(state.connection.since)} · ${state.connection.stage.name}" else "未知"))
       }
       rows.forEach { (label, value) ->
         Row(Modifier.fillMaxWidth()) {
@@ -443,22 +453,19 @@ internal fun RemoteExtensionsDialog(
         style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
       if (busy) Text("正在读取插件…", style = MiuixTheme.textStyles.footnote2)
       bundles.forEach { bundle ->
-        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-          Column(Modifier.weight(1f)) {
-            Text(bundle.name, style = MiuixTheme.textStyles.body2, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            Text(listOfNotNull(bundle.version?.let { "v$it" }, bundle.description, bundle.readOnlyReason).joinToString(" · "),
-              style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary), maxLines = 2)
-          }
-          SuperSwitch(checked = bundle.enabled, enabled = bundle.readOnlyReason == null && saving == null,
-            onCheckedChange = { checked ->
-              saving = bundle.name
-              scope.launch {
-                try { controller.setPluginBundle(profile.id, bundle.name, checked); reload() }
-                catch (e: Exception) { error = userFacingError(e, "切换插件失败") }
-                finally { saving = null }
-              }
-            })
-        }
+        SuperSwitch(
+          title = bundle.name,
+          summary = listOfNotNull(bundle.version?.let { "v$it" }, bundle.description, bundle.readOnlyReason).joinToString(" · "),
+          checked = bundle.enabled,
+          enabled = bundle.readOnlyReason == null && saving == null,
+          onCheckedChange = { checked ->
+            saving = bundle.name
+            scope.launch {
+              try { controller.setPluginBundle(profile.id, bundle.name, checked); reload() }
+              catch (e: Exception) { error = userFacingError(e, "切换插件失败") }
+              finally { saving = null }
+            }
+          })
       }
       if (!busy && bundles.isEmpty() && error == null) Text("没有可远程开关的插件。", style = MiuixTheme.textStyles.footnote2)
       error?.let { Text(it, color = MiuixColorTokens.Error, style = MiuixTheme.textStyles.footnote2) }
@@ -467,5 +474,128 @@ internal fun RemoteExtensionsDialog(
         TextButton(text = "刷新", onClick = { reload() }, enabled = !busy)
       }
     }
+  }
+}
+
+
+/** Minimal model credential setup for the Host's default DeepSeek key. */
+@Composable
+internal fun RemoteModelKeyDialog(
+  profile: ServerProfile,
+  controller: LagoonController,
+  onDismiss: () -> Unit
+) {
+  val scope = rememberCoroutineScope()
+  var key by remember { mutableStateOf("") }
+  var ref by remember { mutableStateOf("DEEPSEEK_API_KEY") }
+  var status by remember { mutableStateOf<RemoteCredentialStatus?>(null) }
+  var busy by remember { mutableStateOf(true) }
+  var error by remember { mutableStateOf<String?>(null) }
+  fun load() {
+    scope.launch {
+      busy = true; error = null
+      try { status = controller.credentialStatus(profile.id, ref) }
+      catch (e: Exception) { error = userFacingError(e, "读取主机密钥失败") }
+      finally { busy = false }
+    }
+  }
+  LaunchedEffect(profile.id) { load() }
+  SuperDialog(title = "主机模型密钥", show = true, onDismissRequest = onDismiss) {
+    Column(Modifier.fillMaxWidth().padding(top = 8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+      Text("写入 Host 凭据引用；值不会回显。常见引用是 DEEPSEEK_API_KEY，其他服务商按 Host 配置填写。",
+        style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
+      Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        TextField(value = ref, onValueChange = { ref = it.trim() }, label = "凭据引用", modifier = Modifier.weight(1f))
+        TextButton(text = "读取", enabled = !busy && ref.isNotBlank(), onClick = { load() })
+      }
+      if (busy) Text("正在读取…", style = MiuixTheme.textStyles.footnote2)
+      status?.let {
+        Text(if (it.configured) "已配置${it.source?.let { source -> " · $source" }.orEmpty()}${if (!it.writable) " · 只读" else ""}" else "未配置",
+          style = MiuixTheme.textStyles.footnote2, color = if (it.configured) MiuixColorTokens.Success else MiuixTheme.colorScheme.onSurfaceVariantSummary)
+      }
+      TextField(value = key, onValueChange = { key = it }, label = "新的 API Key",
+        visualTransformation = PasswordVisualTransformation(), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password))
+      error?.let { Text(it, color = MiuixColorTokens.Error, style = MiuixTheme.textStyles.footnote2) }
+      Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+        TextButton(text = "关闭", onClick = onDismiss)
+        if (status?.configured == true && status?.writable == true) TextButton(text = "清除", enabled = !busy, onClick = {
+          scope.launch {
+            busy = true; error = null
+            try { controller.clearCredential(profile.id, ref); key = ""; load() }
+            catch (e: Exception) { error = userFacingError(e, "清除失败") }
+            finally { busy = false }
+          }
+        })
+        TextButton(text = if (busy) "保存中…" else "保存", enabled = !busy && key.isNotBlank(), onClick = {
+          scope.launch {
+            busy = true; error = null
+            try { controller.setCredential(profile.id, ref, key); key = ""; load() }
+            catch (e: Exception) { error = userFacingError(e, "保存失败") }
+            finally { busy = false }
+          }
+        })
+      }
+    }
+  }
+}
+
+
+/** Creates one custom pi-ai route; writes the route first, then its credential if supplied. */
+@Composable
+internal fun RemoteProviderDialog(
+  profile: ServerProfile,
+  controller: LagoonController,
+  onDismiss: () -> Unit
+) {
+  val scope = rememberCoroutineScope()
+  var route by remember { mutableStateOf("") }
+  var displayName by remember { mutableStateOf("") }
+  var api by remember { mutableStateOf("openai-completions") }
+  var baseUrl by remember { mutableStateOf("") }
+  var modelId by remember { mutableStateOf("") }
+  var keyRef by remember { mutableStateOf("") }
+  var apiKey by remember { mutableStateOf("") }
+  var busy by remember { mutableStateOf(false) }
+  var error by remember { mutableStateOf<String?>(null) }
+  fun suggestedRef(value: String) = value.uppercase().replace('-', '_').let { if (it.isBlank()) "" else "${it}_API_KEY" }
+  SuperDialog(title = "自定义模型服务商", show = true, onDismissRequest = onDismiss) {
+    Column(Modifier.fillMaxWidth().heightIn(max = 560.dp).verticalScroll(rememberScrollState()).padding(top = 8.dp),
+      verticalArrangement = Arrangement.spacedBy(8.dp)) {
+      Text("写入 Host 的 llm-pi-ai 配置；Host 会校验 route、协议、模型和密钥引用。",
+        style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
+      TextField(value = route, onValueChange = { route = it.trim(); if (keyRef.isBlank()) keyRef = suggestedRef(it.trim()) }, label = "路由 ID（小写字母/数字/-）")
+      TextField(value = displayName, onValueChange = { displayName = it }, label = "显示名称")
+      TextField(value = api, onValueChange = { api = it.trim() }, label = "协议（openai-completions / openai-responses / anthropic-messages）")
+      TextField(value = baseUrl, onValueChange = { baseUrl = it.trim() }, label = "Base URL")
+      TextField(value = modelId, onValueChange = { modelId = it.trim() }, label = "模型 ID")
+      TextField(value = keyRef, onValueChange = { keyRef = it.trim() }, label = "密钥引用")
+      TextField(value = apiKey, onValueChange = { apiKey = it }, label = "API Key（可留空，稍后再填）",
+        visualTransformation = PasswordVisualTransformation(), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password))
+      error?.let { Text(it, color = MiuixColorTokens.Error, style = MiuixTheme.textStyles.footnote2) }
+      Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+        TextButton(text = "取消", onClick = onDismiss)
+        TextButton(text = if (busy) "保存中…" else "保存", enabled = !busy && route.isNotBlank() && baseUrl.isNotBlank() && modelId.isNotBlank() && keyRef.isNotBlank(), onClick = {
+          scope.launch {
+            busy = true; error = null
+            try {
+              controller.createProviderRoute(profile.id, route, displayName, api, baseUrl, keyRef, modelId, apiKey)
+              onDismiss()
+            } catch (e: Exception) { error = userFacingError(e, "保存模型服务商失败") }
+            finally { busy = false }
+          }
+        })
+      }
+    }
+  }
+}
+
+
+private fun agoText(at: Long): String {
+  val seconds = ((System.currentTimeMillis() - at) / 1000).coerceAtLeast(0)
+  return when {
+    seconds < 5 -> "刚刚"
+    seconds < 60 -> "${seconds} 秒前"
+    seconds < 3600 -> "${seconds / 60} 分钟前"
+    else -> "${seconds / 3600} 小时前"
   }
 }

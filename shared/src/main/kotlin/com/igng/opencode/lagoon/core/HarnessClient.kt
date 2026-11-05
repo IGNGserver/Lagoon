@@ -86,6 +86,28 @@ interface HarnessClient {
   suspend fun setPluginBundle(name: String, enabled: Boolean): Boolean = false
   suspend fun setPluginEntry(entryId: String, enabled: Boolean): Boolean = false
 
+  /** Host credential metadata; values are never returned. */
+  suspend fun credentialStatus(refs: List<String>): Map<String, RemoteCredentialStatus> = emptyMap()
+  suspend fun setCredential(ref: String, value: String): Boolean = false
+  suspend fun clearCredential(ref: String): Boolean = false
+
+  /** Session goal, when the harness exposes durable goals. */
+  suspend fun goal(sessionId: String): RemoteGoal? = null
+  suspend fun createGoal(sessionId: String, objective: String, maxRounds: Int? = null): Boolean = false
+  suspend fun goalAction(sessionId: String, id: String, revision: Int, action: String): Boolean = false
+
+  /** PDF/image bytes, or Office converted to PDF; null when the harness cannot preview this path. */
+  suspend fun previewFile(directory: String, path: String, session: Session?): FilePreview? = null
+
+  /** Host automation reminders bound to this Session; read-only list. */
+  suspend fun schedules(sessionId: String): List<RemoteSchedule> = emptyList()
+
+  /** Creates one custom model route in the Host's pi-ai settings; false when unsupported. */
+  suspend fun createProviderRoute(
+    route: String, displayName: String, api: String, baseUrl: String,
+    apiKeyEnv: String, modelId: String, apiKey: String
+  ): Boolean = false
+
   /** Includes admitted internal inputs (e.g. compaction/move) which have no transcript row. */
   suspend fun hasPendingInput(id: String): Boolean = inbox(id).isNotEmpty()
 

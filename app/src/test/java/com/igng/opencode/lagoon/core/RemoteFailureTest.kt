@@ -21,6 +21,15 @@ class RemoteFailureTest {
     assertSame(changed, remoteFailure(RuntimeException(changed)))
   }
 
+  @Test fun recoveryActionsAreTypedNotMessageParsed() {
+    assertEquals(RemoteRecoveryKind.LOGIN, RemoteFailureKind.AUTH_REQUIRED.recovery())
+    assertEquals(RemoteRecoveryKind.LOGIN, RemoteFailureKind.DEVICE_REVOKED.recovery())
+    assertEquals(RemoteRecoveryKind.TRUST, RemoteFailureKind.TRUST_CHANGED.recovery())
+    assertEquals(RemoteRecoveryKind.HOST, RemoteFailureKind.HOST_NOT_FOUND.recovery())
+    assertEquals(RemoteRecoveryKind.RECONNECT, RemoteFailureKind.CONNECTION_REPLACED.recovery())
+    assertNull(RemoteFailureKind.OFFLINE.recovery())
+  }
+
   @Test fun offlineIsRetryable() {
     val offline = RemoteFailureException(RemoteFailureKind.OFFLINE, "主机现在不在线", retryable = true)
     assertTrue(offline.retryable)
