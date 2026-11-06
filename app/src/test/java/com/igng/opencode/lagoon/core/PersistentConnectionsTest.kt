@@ -259,7 +259,9 @@ class PersistentConnectionsTest {
       val manager = AllServersOverview(store, cache, scope, { snapshots[it.serverId] = it })
       try {
         manager.start(listOf(profile))
-        awaitCondition { snapshots["a"]?.error != null }
+        // Wait for the snapshot that still carries the restored task ledger, not an earlier
+        // connection-only publish that has the error but no cached tasks yet.
+        awaitCondition { snapshots["a"]?.let { it.error != null && it.tasks.containsKey("s") } == true }
         val snapshot = snapshots.getValue("a")
         assertTrue(snapshot.tasks.getValue("s").uncertain)
         assertEquals(0L, snapshot.lastReadAt)
