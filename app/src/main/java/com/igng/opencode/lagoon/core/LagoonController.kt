@@ -514,7 +514,18 @@ class LagoonController private constructor(private val appContext: Context) {
   private val seenEvents = linkedSetOf<String>()
   private val draftWrites = mutableMapOf<String, Job>()
   /** Server, session and text of the latest composer keystroke; see [typeDraft]. */
-  private var typedDraft: Triple<String, String, String>? = null
+  private data class TypedDraft(val server: String, val session: String?, val text: String)
+  private var typedDraft: TypedDraft? = null
+  /**
+   * The server the blank "新会话" page is open on. While it matches [LagoonState.serverId], a
+   * connect/loadAll must not restore that server's last session: the reader asked for a draft, not
+   * for the conversation they had before.
+   */
+  private var draftServerId: String? = null
+  /** Explicit workspace of the open draft; only meaningful while [draftServerId] is set. */
+  private var draftProjectId: String? = null
+  /** 从空白页切换服务器时保留已输入的正文；从首页重新开草稿时从空白开始。 */
+  private var draftKeepsComposer = false
   /** An activity is started (ON_START…ON_STOP). The live stream runs only while foreground or monitoring. */
   @Volatile private var foreground = false
   /** [TaskMonitorService] keeps the process alive for running tasks; the stream may then run in background. */
@@ -1228,6 +1239,7 @@ class LagoonController private constructor(private val appContext: Context) {
     val wasActive = state.value.serverId == profileId
     val currentGroupId = state.value.homeGroupId
     if (!enabled) {
+      if (draftServerId == profileId) clearDraftIntent()
       cancelProfileNotifications(profileId)
       profile.sshHostId?.let(sshHostManager::close)
       allSnapshots.remove(profileId)
@@ -1307,6 +1319,7 @@ class LagoonController private constructor(private val appContext: Context) {
    * writable server until the user picks one.
    */
   private fun showAggregateAfterDisable(profiles: List<ServerProfile>, message: String) {
+    clearDraftIntent()
     stopSingleConnection()
     store.rememberAllServers(true)
     val snapshots = allSnapshots.filterKeys { id -> profiles.any { it.id == id && it.enabled } }
@@ -1470,6 +1483,7 @@ class LagoonController private constructor(private val appContext: Context) {
   }
 
   fun deleteServer(id: String) {
+    if (draftServerId == id) clearDraftIntent()
     val removed = store.profiles().firstOrNull { it.id == id }
     cancelProfileNotifications(id)
     if (mutable.value.serverId == id) {
@@ -1555,9 +1569,12 @@ class LagoonController private constructor(private val appContext: Context) {
       attempt { transcripts.bindServer(id, transcriptIdentity(profile)) }.onFailure { Diagnostics.warn("TranscriptStore", "绑定服务器失败", it) }
     }
     val snapshot = allSnapshots[id]
-    val rememberedProject = projectOverride ?: store.selectedProject(id)
+    // A blank draft owns the page while it is open: never restore the server's last conversation,
+    // even when loadAll reads the catalog again after this connect.
+    val draftIntent = draftServerId == id
+    val rememberedProject = projectOverride ?: draftProjectId.takeIf { draftIntent } ?: store.selectedProject(id)
     // 恢复上次打开的会话时，不把服务端空白草稿恢复成聊天页；回到本地「新会话」草稿。
-    val rememberedSession = (sessionOverride ?: store.selectedSession(id))?.takeIf { selected ->
+    val rememberedSession = if (draftIntent) null else (sessionOverride ?: store.selectedSession(id))?.takeIf { selected ->
       snapshot?.sessions?.firstOrNull { it.id == selected }?.blank != true
     }
     seenEvents.clear(); visibleConversation = null
@@ -1581,7 +1598,17 @@ class LagoonController private constructor(private val appContext: Context) {
       streamDownSince = if (snapshot?.streamConnected == true) 0 else System.currentTimeMillis(),
       connection = ConnectionStatus(ConnectStage.CONNECTING, System.currentTimeMillis()), remoteRecovery = null,
       agent = configuration.agent, model = configuration.model, agentChanged = configuration.agentChanged, modelChanged = configuration.modelChanged,
-      draft = rememberedSession?.let { store.draft(id, it) }.orEmpty(), references = rememberedSession?.let { store.references(id, it) }.orEmpty(),
+      draft = when {
+        draftIntent -> if (draftKeepsComposer) previous.draft else ""
+        else -> rememberedSession?.let { store.draft(id, it) }.orEmpty()
+      },
+      draftRevision = if (draftIntent) previous.draftRevision else 0,
+      references = when {
+        // Files picked on the blank page are kept in pendingAttachments; server file references
+        // belong to the old server and are dropped when the draft moves to another one.
+        draftIntent -> emptyList()
+        else -> rememberedSession?.let { store.references(id, it) }.orEmpty()
+      },
       tasks = snapshot?.tasks ?: TaskReconciliation.restored(store.taskStates(id)), knownParents = store.taskParents(id), notices = store.sessionNotices(id), collapsedSections = store.collapsedSections(id), pinned = store.pinnedSessions(id),
       pendingAttachments = previous.pendingAttachments,
       modelOverrides = store.modelOverrides(id), modelVisibilityConfigured = store.modelVisibilityConfigured(id),
@@ -1612,6 +1639,7 @@ class LagoonController private constructor(private val appContext: Context) {
   }
   /** Opens immediately; loading the transcript does not change the originating home filter. */
   fun openConversation(target: SessionTarget) {
+    clearDraftIntent()
     if (store.profiles().none { it.id == target.serverId && it.enabled }) {
       mutable.update {
         it.copy(message = if (store.profiles().any { profile -> profile.id == target.serverId }) "这个连接已禁用，请先在设备管理中启用"
@@ -1674,7 +1702,8 @@ class LagoonController private constructor(private val appContext: Context) {
         .distinctBy { normalizedDirectory(it.directory) }
         .map { it.copy(serverId = id) }
       val sessions = cachedSessions.map { scoped(id, it) }
-      val sessionId = store.selectedSession(id)?.takeIf { selected -> sessions.any { it.id == selected && !it.blank } }
+      val sessionId = if (draftServerId == id) null
+        else store.selectedSession(id)?.takeIf { selected -> sessions.any { it.id == selected && !it.blank } }
       trace(token, ConnectMilestone.CACHE_PAINT)
       mutable.update { it.copy(loading = false, connected = false, cached = true, error = null,
         projects = projects, sessions = sessions, projectId = store.selectedProject(id) ?: projects.firstOrNull()?.id,
@@ -1981,7 +2010,7 @@ class LagoonController private constructor(private val appContext: Context) {
         permissions = nextPermissions, questions = nextQuestions,
         projectId = (previous.projectId ?: store.selectedProject(serverId))?.takeIf { id -> projects.any { it.id == id } } ?: projects.firstOrNull()?.id,
         scopeProjectId = previous.scopeProjectId?.takeIf { id -> projects.any { it.id == id } },
-        sessionId = (previous.sessionId ?: store.selectedSession(serverId))?.takeIf { id -> nextSessions.any { it.id == id } }))
+        sessionId = if (draftServerId == serverId) null else (previous.sessionId ?: store.selectedSession(serverId))?.takeIf { id -> nextSessions.any { it.id == id } }))
     }
     trace(token, ConnectMilestone.INTERACTIVE)
     trace(token, ConnectMilestone.CONTROL)
@@ -2785,6 +2814,8 @@ class LagoonController private constructor(private val appContext: Context) {
     catch (error: ApiException) { if (error.status == 404) null else throw error }
   fun selectSession(id: String) {
     val session = mutable.value.sessions.firstOrNull { it.id == id } ?: return
+    // A real conversation ends the blank-draft intent: subsequent loads restore sessions normally.
+    clearDraftIntent()
     selectionRevision += 1
     openTrace.begin(selectionRevision, "打开会话")
     val project = resolveSessionProject(session, mutable.value.projects)
@@ -3100,11 +3131,17 @@ class LagoonController private constructor(private val appContext: Context) {
     val current = state.value
     if (current.serverId != expectedServer || current.sessionId != expectedSession) return
     val server = current.serverId ?: return
-    val session = current.sessionId ?: return
+    // The blank page has no session yet: keep its text in state only. The composer owns the live
+    // text, and its stable saveable key carries it across a server switch and rotation; there is no
+    // session id to persist it under (a synthetic id would leak into draftSessionIds()).
+    val session = current.sessionId
     typedDraft = null
-    mutable.update { it.copy(draft = text, draftRevision = it.draftRevision + 1,
-      draftSessions = if (text.isBlank()) it.draftSessions - session else it.draftSessions + session) }
-    persistDraft(server, session, text)
+    mutable.update {
+      val draftSessions = if (session == null) it.draftSessions
+        else if (text.isBlank()) it.draftSessions - session else it.draftSessions + session
+      it.copy(draft = text, draftRevision = it.draftRevision + 1, draftSessions = draftSessions)
+    }
+    if (session != null) persistDraft(server, session, text)
   }
   /**
    * One keystroke in the composer. The text is kept here and saved after a short pause; the state
@@ -3114,15 +3151,15 @@ class LagoonController private constructor(private val appContext: Context) {
     val current = state.value
     if (current.serverId != expectedServer || current.sessionId != expectedSession) return
     val server = current.serverId ?: return
-    val session = current.sessionId ?: return
-    typedDraft = Triple(server, session, text)
-    if ((session in current.draftSessions) == text.isBlank())
+    val session = current.sessionId
+    typedDraft = TypedDraft(server, session, text)
+    if (session != null && (session in current.draftSessions) == text.isBlank())
       mutable.update { it.copy(draftSessions = if (text.isBlank()) it.draftSessions - session else it.draftSessions + session) }
-    persistDraft(server, session, text)
+    if (session != null) persistDraft(server, session, text)
   }
   /** The composer text of [server]/[session] as typed, falling back to the last app-side [LagoonState.draft]. */
   fun draftFor(server: String?, session: String?, fallback: String): String =
-    typedDraft?.takeIf { it.first == server && it.second == session }?.third ?: fallback
+    typedDraft?.takeIf { it.server == server && it.session == session }?.text ?: fallback
   private fun liveDraft(current: LagoonState = state.value) = draftFor(current.serverId, current.sessionId, current.draft)
   private fun persistDraft(server: String, session: String, text: String) {
     val key = "$server:$session"
@@ -3231,11 +3268,85 @@ class LagoonController private constructor(private val appContext: Context) {
   fun setBrowseShowHidden(show: Boolean) {
     mutable.update { it.copy(browseShowHidden = show) }
   }
-  /** Leaves any open session for a blank draft that starts in the scope's (or latest) project. */
-  fun beginDraft() {
+  /**
+   * Opens the blank "新会话" page on [serverId], optionally on [projectId].
+   *
+   * [keepComposer] is true when the reader switches server from the blank page itself: the text on
+   * screen belongs to the draft, not to one server, so it must survive the switch. Opening a new
+   * draft from the home page starts empty, like the previous scope-driven draft.
+   *
+   * While the draft page is open the controller remembers this intent: [connect] and [loadAll] then
+   * skip restoring the server's last session, which would otherwise navigate straight away from the
+   * draft into that conversation.
+   */
+  fun enterDraft(serverId: String, projectId: String? = null, keepComposer: Boolean = false) {
+    if (store.profiles().none { it.id == serverId && it.enabled }) return
     val current = state.value
-    val target = HomeScope.draftTarget(current.sessions, current.projects, current.scopeProjectId, current.projectId) ?: return
-    if (target != current.projectId || current.sessionId != null) selectProject(target)
+    draftServerId = serverId
+    draftProjectId = projectId
+    draftKeepsComposer = keepComposer
+    typedDraft = null
+    if (current.serverId != serverId) {
+      // The overview snapshot carries the device-local project list; fall back to the store for an
+      // enabled profile whose monitor has not published a read yet.
+      val target = current.preferredDraftProject(serverId, projectId)
+        ?: store.localProjects(serverId).firstOrNull()?.copy(serverId = serverId)
+      draftProjectId = target?.id
+      connect(serverId, target?.id, preserveHome = true)
+      return
+    }
+    // Re-tapping the current server (or switching workspace) keeps what is selected; a new draft
+    // opened from the home page uses the scope's target.
+    val target = if (keepComposer) current.project
+      else current.preferredDraftProject(serverId, projectId)
+    draftProjectId = target?.id
+    applyDraftProject(current, target, fresh = !keepComposer || current.sessionId != null)
+  }
+
+  /** The reader left the blank page without sending: later loads may restore sessions again. */
+  fun endDraft() = clearDraftIntent()
+
+  private fun clearDraftIntent() {
+    draftServerId = null
+    draftProjectId = null
+    draftKeepsComposer = false
+  }
+
+  /**
+   * Applies a workspace to the open draft without creating a session. The prompt typed on the blank
+   * page survives a server switch; leaving a conversation for the draft starts it empty.
+   */
+  private fun applyDraftProject(current: LagoonState, project: Project?, fresh: Boolean) {
+    draftProjectId = project?.id
+    selectionRevision += 1
+    visibleConversation = null
+    val text = if (fresh) "" else current.draft
+    val references = if (fresh) emptyList() else current.references
+    mutable.update {
+      withSummary(it.copy(projectId = project?.id, sessionId = null, messages = emptyList(),
+        agent = null, model = null, agentChanged = false, modelChanged = false,
+        draft = text, references = references, resources = it.resources - "messages",
+        files = emptyList(), searchResults = emptyList(), fileText = null, fileBinary = false,
+        filePreview = null, filePreviewMime = null, loadedOlderMessages = false, messagesCursor = null,
+        provisionalMessageIds = emptySet(), transcriptLoadingSince = 0, changes = emptyList()))
+    }
+    store.rememberLocation(project?.id, null)
+    if (project != null) {
+      val token = generation
+      scope.launch { loadChoices(project.directory, token) }
+    }
+  }
+
+  /**
+   * Selects a workspace from the draft picker. A workspace known only to the server is registered
+   * through the existing server-resolved [addProject], so server data stays authoritative and no
+   * catalog is imported behind the reader's back.
+   */
+  fun chooseWorkspace(project: Project) {
+    val unique = normalizedDirectory(project.directory)
+    val existing = state.value.projects.firstOrNull { normalizedDirectory(it.directory) == unique }
+    // Keep the prompt typed on the blank page: changing workspace is not sending or leaving it.
+    if (existing != null) applyDraftProject(state.value, existing, fresh = false) else addProject(project.directory)
   }
   fun conversationVisible(server: String, session: String, visible: Boolean) {
     if (visible) visibleConversation = server to session

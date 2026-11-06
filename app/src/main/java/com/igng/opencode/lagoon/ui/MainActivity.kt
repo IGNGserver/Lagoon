@@ -40,7 +40,6 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.metrics.performance.JankStats
 import com.igng.opencode.lagoon.core.*
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.withTimeoutOrNull
 import top.yukonga.miuix.kmp.basic.*
 import top.yukonga.miuix.kmp.extra.SuperBottomSheet
 import top.yukonga.miuix.kmp.icon.MiuixIcons
@@ -81,6 +80,8 @@ class MainActivity : ComponentActivity() {
     setContent {
       val state by controller.state.collectAsState()
       val home = state.homeProjection()
+      // A device group scopes the new-session server list; 全部设备 leaves every enabled profile open.
+      val draftScope = home.homeGroup?.memberIds?.toSet()
       val preferences = remember { getSharedPreferences("ui", MODE_PRIVATE) }
       var themeMode by remember { mutableStateOf(runCatching { ThemeMode.valueOf(preferences.getString("themeMode", "SYSTEM")!!) }.getOrDefault(ThemeMode.SYSTEM)) }
       val systemDark = isSystemInDarkTheme()
@@ -95,8 +96,7 @@ class MainActivity : ComponentActivity() {
        var addingOpenCodeId by rememberSaveable { mutableStateOf<String?>(null) }
        var addingSshHostId by rememberSaveable { mutableStateOf<String?>(null) }
        var showingProjects by rememberSaveable { mutableStateOf(false) }
-       var showingAllDraftTarget by rememberSaveable { mutableStateOf(false) }
-       var pendingDraftTarget by remember { mutableStateOf<Pair<String, String>?>(null) }
+       var showingNewSession by rememberSaveable { mutableStateOf(false) }
        var showingModelManagement by rememberSaveable { mutableStateOf(false) }
        var showingRemoteEnroll by rememberSaveable { mutableStateOf(false) }
        var showingRemoteHosts by rememberSaveable { mutableStateOf(false) }
@@ -105,7 +105,6 @@ class MainActivity : ComponentActivity() {
        }
        var showingDeviceGroups by rememberSaveable { mutableStateOf(false) }
        var editingGroupId by rememberSaveable { mutableStateOf<String?>(null) }
-       var showingGroupDraftTarget by rememberSaveable { mutableStateOf(false) }
       // Each blank draft gets a fresh saveable scope so a sent draft never reappears.
       var draftNonce by rememberSaveable { mutableIntStateOf(0) }
       var globalMessage by remember { mutableStateOf<String?>(null) }
@@ -127,23 +126,31 @@ class MainActivity : ComponentActivity() {
           else navigator.navigation.open(target.sessionId, child))
         controller.openConversation(target)
       }
+       // A blank draft always opens immediately: connecting is the page's job, not a gate on this
+       // button. The server is the only mandatory choice; its workspace is picked on the page.
+       fun openDraftFor(profile: ServerProfile) {
+         focusManager.clearFocus()
+         navigator.server = profile.id
+         controller.enterDraft(profile.id)
+         draftNonce += 1
+         navigator.navigate(navigator.navigation.copy(sessions = listOf(DRAFT_SESSION)))
+       }
+       // Switching inside the blank page keeps what the reader typed; only the connection changes.
+       fun switchDraftServer(profile: ServerProfile) {
+         navigator.server = profile.id
+         controller.enterDraft(profile.id, keepComposer = true)
+       }
        fun openDraft() {
          focusManager.clearFocus()
-         if (state.enabledProfiles.isEmpty()) {
+         if (home.enabledProfiles.isEmpty()) {
            if (state.profiles.isEmpty()) showingAddDevice = true
            else { globalMessage = "所有连接均已禁用，请先在设备管理中启用"; globalMessageType = MiuixToastType.INFO }
            return
          }
-         if (home.allServers) { showingAllDraftTarget = true; return }
-         if (home.homeGroup != null) { showingGroupDraftTarget = true; return }
-         if (!state.connected) {
-           globalMessage = "设备尚未连接，连接后才能新建会话"; globalMessageType = MiuixToastType.INFO
-           return
-         }
-        if (state.projects.isEmpty()) { globalMessage = "先添加一个项目"; globalMessageType = MiuixToastType.INFO; showingProjects = true; return }
-        controller.beginDraft()
-        draftNonce += 1
-         navigator.navigate(navigator.navigation.copy(sessions = listOf(DRAFT_SESSION)))
+         // 单台候选、或单服务器首页且当前连接可用时直接进空白页；聚合 / 设备组先选 harness。
+         // 离线服务器留在列表里可选：页面会显示连接进度，不再用“设备尚未连接”拦住新建。
+         val direct = state.directDraftServer(draftScope)
+         if (direct != null) openDraftFor(direct.profile) else showingNewSession = true
        }
       fun openPage(page: RootPage) { focusManager.clearFocus(); navigator.navigate(navigator.navigation.push(page)) }
       fun editServer(profile: ServerProfile?) {
@@ -166,6 +173,7 @@ class MainActivity : ComponentActivity() {
       SideEffect {
         navigator.onBack = { from, to ->
           focusManager.clearFocus()
+          if (from.sessions.lastOrNull() == DRAFT_SESSION && to.sessions.isEmpty()) controller.endDraft()
           to.sessions.lastOrNull()?.let(controller::selectSession)
           val current = controller.state.value
           val home = current.homeServerId
@@ -178,9 +186,11 @@ class MainActivity : ComponentActivity() {
       }
       LaunchedEffect(state.serverId) {
         if (navigator.server != state.serverId) {
-          // A disabled current connection can move the writable server (or clear it) while a chat is
-          // still on the stack. Never leave that chat pointing at a different server's session id.
-          if (navigator.navigation.sessions.isNotEmpty()) navigator.navigate(SessionNavigation())
+          // A blank draft belongs to whichever server is current, so it follows the switch instead of
+          // being popped. A chat is bound to one server's session id and must never be left dangling.
+          if (navigator.navigation.sessions.isNotEmpty() && navigator.navigation.sessions.last() != DRAFT_SESSION) {
+            navigator.navigate(SessionNavigation())
+          }
           if (navigator.navigation.sessions.isEmpty()) snapshots.clear()
           navigator.server = state.serverId
         }
@@ -194,25 +204,6 @@ class MainActivity : ComponentActivity() {
              else navigator.navigation.copy(sessions = if (state.session?.parentId == stack.last()) stack + id else stack.dropLast(1) + id))
          }
        }
-       LaunchedEffect(pendingDraftTarget) {
-         val target = pendingDraftTarget ?: return@LaunchedEffect
-         // 只等这一次连接成功：没有超时的等待会让“之后手动连接该服务器”被误当成草稿目标，
-         // 把用户突然拽进空白草稿页；失败则给出明确反馈。
-         // SSH hosts may need a handshake, dsh web bootstrap and a tunnel before the first session.
-         val connected = withTimeoutOrNull(45_000) {
-           while (!(controller.state.value.serverId == target.first && controller.state.value.connected)) delay(200)
-           true
-         } ?: false
-         if (pendingDraftTarget != target) return@LaunchedEffect
-         pendingDraftTarget = null
-         if (connected) {
-           if (controller.state.value.projects.any { it.id == target.second }) controller.selectProject(target.second)
-           draftNonce += 1
-           navigator.navigate(navigator.navigation.copy(sessions = listOf(DRAFT_SESSION)))
-         } else {
-           globalMessage = "无法连接服务器，稍后重试"; globalMessageType = MiuixToastType.ERROR
-         }
-        }
        SideEffect {
         WindowCompat.getInsetsController(window, window.decorView).apply { isAppearanceLightStatusBars = !dark; isAppearanceLightNavigationBars = !dark }
         if (state.sessionId != null) {
@@ -277,12 +268,18 @@ class MainActivity : ComponentActivity() {
           Box(Modifier.fillMaxSize().background(MiuixTheme.colorScheme.surface)) {
             @Composable
             fun Page(target: NavRoute, active: Boolean) {
-              val displayed = if (target.session == state.sessionId && target.serverId == state.serverId) state
+              val displayed = when {
+                // The blank page is not a server-scoped session id: it always follows the live
+                // writable connection, including the moment a server switch is connecting.
+                target.session == DRAFT_SESSION -> state
+                target.session == state.sessionId && target.serverId == state.serverId -> state
                 // 没有快照（例如跨服务器退出动画中）：用路由身份构造空页，不能回退成当前服务器的会话。
-                else snapshots["${target.serverId}:${target.session}"] ?: state.copy(serverId = target.serverId, sessionId = target.session,
+                else -> snapshots["${target.serverId}:${target.session}"] ?: state.copy(serverId = target.serverId, sessionId = target.session,
                   sessions = emptyList(), messages = emptyList(), draft = "")
+              }
               when {
-                target.session == DRAFT_SESSION -> DraftScreen(state, controller, onBack = { goBack() }, onModal = {}, interactive = active)
+                target.session == DRAFT_SESSION -> DraftScreen(state, controller, onBack = { goBack() }, onModal = {}, interactive = active,
+                  profileIds = draftScope, onSwitchServer = { profile -> switchDraftServer(profile) })
                  target.session != null -> ChatScreen(displayed, controller, onBack = { goBack() }, onOpenChild = { child ->
                    controller.state.value.serverId?.let { server -> openSession(SessionTarget(server, child), child = true) }
                  }, onModal = {}, interactive = active)
@@ -335,7 +332,9 @@ class MainActivity : ComponentActivity() {
               }.then(if (active) Modifier else Modifier.pointerInput(Unit) { awaitPointerEventScope { while (true) { awaitPointerEvent().changes.forEach { it.consume() } } } })
                 .background(MiuixTheme.colorScheme.surface)) {
                 val key = when {
-                  target.session == DRAFT_SESSION -> "draft:${target.serverId}:$draftNonce"
+                  // The server is deliberately not part of this key: switching harness from the
+                  // blank page must keep the composer text and its saveable state.
+                  target.session == DRAFT_SESSION -> "draft:$draftNonce"
                   target.session != null -> "chat:${target.serverId}:${target.session}"
                   else -> "page:${if (state.allServers) "all" else state.homeServerId}:${target.page}"
                 }
@@ -356,12 +355,12 @@ class MainActivity : ComponentActivity() {
                if (home.allServers) AllServersScopeSheet(home, controller) { showingProjects = false }
                else ProjectScopeSheet(home, controller) { showingProjects = false }
              }
-             if (showingAllDraftTarget) AllServersDraftTargetSheet(home, onSelect = { profile, project ->
-                showingAllDraftTarget = false
-                pendingDraftTarget = profile.id to project.id
-                navigator.server = profile.id
-                controller.connect(profile.id, project.id, preserveHome = true)
-             }, onDismiss = { showingAllDraftTarget = false })
+             if (showingNewSession) NewSessionServerSheet(
+               state = state,
+               profileIds = draftScope,
+               onSelect = { server -> showingNewSession = false; openDraftFor(server.profile) },
+               onDismiss = { showingNewSession = false }
+             )
              if (showingDeviceGroups) DeviceGroupsSheet(state, controller, editingGroupId, onDismiss = {
                showingDeviceGroups = false; editingGroupId = null
              })
@@ -374,13 +373,6 @@ class MainActivity : ComponentActivity() {
               onLoginHub = { showingAddDevice = false; addingOpenCodeId = null; addingSshHostId = null; showingRemoteEnroll = true },
               onManageHub = { showingAddDevice = false; addingOpenCodeId = null; addingSshHostId = null; showingRemoteHosts = true }
             )
-             if (showingGroupDraftTarget) GroupDraftTargetSheet(home, profiles = home.homeGroupProfiles,
-               onSelect = { profile, project ->
-                 showingGroupDraftTarget = false
-                 pendingDraftTarget = profile.id to project.id
-                 navigator.server = profile.id
-                 controller.connect(profile.id, project.id, preserveHome = true)
-               }, onDismiss = { showingGroupDraftTarget = false })
             if (showingModelManagement) ModelManagementSheet(state, controller) { showingModelManagement = false }
             if (showingRemoteHosts) RemoteHostsSheet(controller, onDismiss = { showingRemoteHosts = false }, onEnroll = {
               showingRemoteHosts = false; showingRemoteEnroll = true

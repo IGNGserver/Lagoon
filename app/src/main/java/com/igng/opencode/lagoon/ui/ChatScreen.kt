@@ -561,40 +561,82 @@ private fun qoderSections(rows: List<TranscriptRow>): List<DetailSection> {
 
 /**
  * 新建会话：先进入空白页，发出第一条消息时才在服务器上创建会话（失败时正文和附件都保留）。
- * 目标项目默认取首页范围里的项目，「全部」时取最近活跃的项目，可在输入框下方切换。
+ * 目标服务器与工作区都在标题里选择；「服务器」永远可换（离线也保留），工作区随服务器变化。
  */
 @Composable
-fun DraftScreen(state: LagoonState, controller: LagoonController, onBack: () -> Unit, onModal: (Boolean) -> Unit, interactive: Boolean = true) {
+fun DraftScreen(
+  state: LagoonState,
+  controller: LagoonController,
+  onBack: () -> Unit,
+  onModal: (Boolean) -> Unit,
+  interactive: Boolean = true,
+  profileIds: Set<String>? = null,
+  onSwitchServer: (ServerProfile) -> Unit = {}
+) {
   var targetPicker by remember { mutableStateOf(false) }
   var composerModal by remember { mutableStateOf(false) }
   val modal = targetPicker || composerModal
   DisposableEffect(modal) { onModal(modal); onDispose { onModal(false) } }
+  val muted = MiuixTheme.colorScheme.onSurfaceVariantSummary
+  val connectionHint = when {
+    state.connected -> null
+    state.loading -> "连接中…"
+    else -> "未连接"
+  }
   Column(Modifier.fillMaxSize()) {
     PageTopBar("新会话", onBack, subtitle = {
-      // The subtitle is where the session will be created; tap it to pick another project.
-      Row(Modifier.clip(miuixCapsuleShape()).clickable(enabled = state.connected) { targetPicker = true }.padding(end = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-        Icon(MiuixIcons.Folder, null, Modifier.size(14.dp), tint = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+      // Where the session will be created: always tappable, even while connecting or offline, so the
+      // reader can switch harness without leaving the blank page.
+      Row(
+        Modifier.clip(miuixCapsuleShape()).clickable { targetPicker = true }.padding(end = 4.dp),
+        verticalAlignment = Alignment.CenterVertically
+      ) {
+        StatusDot(
+          when {
+            state.connected -> MiuixColorTokens.Success
+            state.loading -> MiuixColorTokens.Warning
+            else -> muted
+          }
+        )
+        Spacer(Modifier.width(6.dp))
+        Icon(MiuixIcons.Folder, null, Modifier.size(14.dp), tint = muted)
         Spacer(Modifier.width(4.dp))
-        Text(listOfNotNull(state.server?.name, state.project?.name ?: "选择项目").joinToString(" · "), maxLines = 1, overflow = TextOverflow.Ellipsis,
-          style = MiuixTheme.textStyles.footnote1.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
-        DropdownChevron(14.dp, description = "选择项目")
+        state.server?.let {
+          HarnessBadge(it.kind)
+          Spacer(Modifier.width(4.dp))
+        }
+        Text(
+          listOfNotNull(state.server?.name, state.project?.name ?: "选择工作区", connectionHint).joinToString(" · "),
+          maxLines = 1, overflow = TextOverflow.Ellipsis,
+          style = MiuixTheme.textStyles.footnote1.copy(color = muted)
+        )
+        DropdownChevron(14.dp, description = "选择服务器与工作区")
       }
     })
     Box(Modifier.weight(1f).fillMaxWidth().padding(horizontal = 32.dp), contentAlignment = Alignment.Center) {
       Column(horizontalAlignment = Alignment.CenterHorizontally) {
         Text("要做点什么？", style = MiuixTheme.textStyles.title3)
         Spacer(Modifier.height(8.dp))
-        Text(state.project?.let { "会在「${it.name}」中新建，发出第一条消息后才会创建会话" } ?: "先点标题下方选择一个项目",
-          style = MiuixTheme.textStyles.footnote1.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary),
-          textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+        Text(
+          when {
+            state.project != null -> "会在「${state.project!!.name}」中新建，发出第一条消息后才会创建会话"
+            !state.connected -> "正在等待服务器连接；连上后点标题选择工作区"
+            else -> "先点标题选择服务器与工作区"
+          },
+          style = MiuixTheme.textStyles.footnote1.copy(color = muted),
+          textAlign = androidx.compose.ui.text.style.TextAlign.Center
+        )
       }
     }
     ChatComposer(state, controller, interactive, { composerModal = it }, busy = state.pending("create"), actionKey = "create", ready = state.project != null,
+      // Switching harness from this page must not reset the composer: the text belongs to the
+      // draft, not to one server. The page key (draft nonce) still isolates separate drafts.
+      resetKey = DRAFT_SESSION,
       // The created session inherits the text as its draft until the first send succeeds; each draft page
       // gets a fresh saveable key from MainActivity, so nothing needs clearing here.
       onSend = { text, _ -> controller.startSession("", text, state.agent.takeIf { state.agentChanged }, state.model.takeIf { state.modelChanged }) })
   }
-  if (targetPicker) DraftTargetSheet(state, controller) { targetPicker = false }
+  if (targetPicker) DraftDestinationSheet(state, controller, profileIds, onSwitchServer) { targetPicker = false }
 }
 
 /** “服务器 · 工作区” under a chat title, led by the session's live state (running spinner / waiting / failed). */
@@ -858,16 +900,19 @@ fun MiuixQuestionCard(request: QuestionRequest, controller: LagoonController, pe
 private fun ChatComposer(
   state: LagoonState, controller: LagoonController, interactive: Boolean, onModal: (Boolean) -> Unit,
   busy: Boolean = state.pending("send"), actionKey: String = "send", ready: Boolean = true,
+  /** Stable identity across a server switch (blank draft); null keeps the server/session identity. */
+  resetKey: Any? = null,
   onSend: (String, () -> Unit) -> Unit = { text, clear -> controller.send(text, state.serverId, state.sessionId, clear) },
   onServerFile: (() -> Unit)? = null
 ) {
-  var value by rememberSaveable(state.serverId, state.sessionId, stateSaver = TextFieldValue.Saver) {
+  val identity: Any = resetKey ?: (state.serverId to state.sessionId)
+  var value by rememberSaveable(identity, stateSaver = TextFieldValue.Saver) {
     mutableStateOf(TextFieldValue(controller.draftFor(state.serverId, state.sessionId, state.draft)))
   }
   // Typing stays local (controller.typeDraft does not re-broadcast state); only an app-side set of the
   // draft – restored, returned from the queue, cleared after a send – is adopted here. The applied
   // signature is saved so a recreated composer keeps its restored text instead of the older state value.
-  var applied by rememberSaveable(state.serverId, state.sessionId) { mutableStateOf(state.draft to state.draftRevision) }
+  var applied by rememberSaveable(identity) { mutableStateOf(state.draft to state.draftRevision) }
   var attachMenu by remember { mutableStateOf(false) }
   var focused by remember { mutableStateOf(false) }
   val images = rememberLauncherForActivityResult(ActivityResultContracts.PickMultipleVisualMedia(6)) { controller.addLocalAttachments(it) }
@@ -890,7 +935,7 @@ private fun ChatComposer(
   val muted = MiuixTheme.colorScheme.onSurfaceVariantSummary
   val hint = when {
     queueing -> "未连接 · 现在发送，连接恢复后会自动发出"
-    !state.connected -> "离线 · 草稿保留，恢复连接后可发送"
+    !state.connected -> if (state.loading) "正在连接…草稿会保留" else "离线 · 草稿保留，恢复连接后可发送"
     state.cached -> "消息未同步，刷新后可发送"
     sending -> "正在发送…"
     state.attachments.any { it.image } && state.modelCatalog.firstOrNull { it.choice.modelId == state.model?.modelId && it.choice.providerId == state.model?.providerId }?.imageInput == false -> "当前模型不支持图片，发送前请换一个模型"
