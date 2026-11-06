@@ -10,7 +10,6 @@
 > **2026-11-06 更新**：首页的横向服务器胶囊已删除，设备/分组/项目/工作区统一由左上角标题打开的
 > 范围面板承载。本文中“首页胶囊/服务器胶囊是唯一入口”的措辞仅指当时实现，切换职责已收进左上角。
 >
->
 > 分析对象：`ccch1mneyyy/dsh-Go`（GitHub 约 9.1k Star，2026-11-04 抓取的 `9ac085f`）与
 > `liguobao/ds-harness-remote`（Remote Protocol v1，0.6.x Host 插件）。
 > Lagoon 基线：`cd45f72`。

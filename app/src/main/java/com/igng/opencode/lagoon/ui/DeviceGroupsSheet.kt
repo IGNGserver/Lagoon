@@ -74,7 +74,7 @@ internal fun DeviceGroupsSheet(
       verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
       item {
-        Text("把同一台电脑上的不同连接放进一个组。首页只显示「全部」和这些分组；分组只影响本机展示。已禁用的成员仍保留在组里，重新启用后自动恢复。",
+        Text("把同一台电脑上的不同连接放进一个组。首页左上角范围面板会列出「全部设备」和这些分组；分组只影响本机展示。已禁用的成员仍保留在组里，重新启用后自动恢复。",
           style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
       }
       item { TextField(value = name, onValueChange = { name = it }, label = "分组名称", modifier = Modifier.fillMaxWidth()) }

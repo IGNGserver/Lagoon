@@ -363,6 +363,7 @@ class MainActivity : ComponentActivity() {
               })
              if (showingScope) HomeScopeSheet(
                state = home,
+               allSnapshots = state.allServerSnapshots,
                controller = controller,
                onDismiss = { showingScope = false },
                // Opening the group editor replaces the scope sheet instead of stacking two sheets.

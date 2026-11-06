@@ -31,6 +31,7 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
 @Composable
 internal fun HomeScopeSheet(
   state: LagoonState,
+  allSnapshots: Map<String, ServerOverviewSnapshot>,
   controller: LagoonController,
   onDismiss: () -> Unit,
   onEditGroup: (DeviceGroup) -> Unit,
@@ -39,7 +40,7 @@ internal fun HomeScopeSheet(
   if (state.browsePath != null) { DirectoryBrowserSheet(state, controller); return }
   var removing by remember { mutableStateOf<Project?>(null) }
   val online = state.enabledProfiles.count { profile ->
-    if (profile.id == state.serverId) state.connected else state.allServerSnapshots[profile.id]?.connected == true
+    if (profile.id == state.serverId) state.connected else allSnapshots[profile.id]?.connected == true
   }
   SuperBottomSheet(title = "选择范围", show = true, onDismissRequest = onDismiss) {
     LazyColumn(Modifier.fillMaxWidth().heightIn(max = 680.dp), contentPadding = PaddingValues(bottom = 16.dp)) {
@@ -61,9 +62,9 @@ internal fun HomeScopeSheet(
       if (state.deviceTabs.isNotEmpty()) {
         item { SmallTitle("设备分组", insideMargin = PaddingValues(horizontal = 16.dp, vertical = 8.dp)) }
         items(state.deviceTabs, key = { "group:${it.id}" }) { tab ->
-          GroupScopeRow(tab, state, selected = state.homeGroupId == tab.group?.id,
+          GroupScopeRow(tab, state, allSnapshots, selected = state.homeGroupId == tab.group?.id,
             onSelect = {
-              tab.group?.let { group -> controller.selectGroup(group.id) }
+              if (state.homeGroupId != tab.group?.id) tab.group?.let { group -> controller.selectGroup(group.id) }
               onDismiss()
             },
             onEdit = { tab.group?.let(onEditGroup) })
@@ -74,7 +75,7 @@ internal fun HomeScopeSheet(
         Text("没有启用的连接。请先在设备管理中启用一个连接。", Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
           style = MiuixTheme.textStyles.footnote1.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
       } else items(state.enabledProfiles, key = { "profile:${it.id}" }) { profile ->
-        ProfileScopeRow(profile, state,
+        ProfileScopeRow(profile, state, allSnapshots,
           selected = !state.allServers && state.homeGroupId == null && state.serverId == profile.id) {
           // The selected single-server row needs no reconnect; group/all mode still enters it.
           if (state.multiServerView || profile.id != state.serverId) controller.connect(profile.id)
@@ -100,12 +101,13 @@ internal fun HomeScopeSheet(
 private fun GroupScopeRow(
   tab: DeviceTab,
   state: LagoonState,
+  allSnapshots: Map<String, ServerOverviewSnapshot>,
   selected: Boolean,
   onSelect: () -> Unit,
   onEdit: () -> Unit
 ) {
   val online = tab.profiles.count { profile ->
-    if (profile.id == state.serverId) state.connected else state.allServerSnapshots[profile.id]?.connected == true
+    if (profile.id == state.serverId) state.connected else allSnapshots[profile.id]?.connected == true
   }
   Card(Modifier.fillMaxWidth()) {
     BasicComponent(
@@ -124,11 +126,17 @@ private fun GroupScopeRow(
 
 /** One single-server entry; selecting it enters that server's normal single-server home. */
 @Composable
-private fun ProfileScopeRow(profile: ServerProfile, state: LagoonState, selected: Boolean, onSelect: () -> Unit) {
-  val connected = if (profile.id == state.serverId) state.connected else state.allServerSnapshots[profile.id]?.connected == true
-  val loading = if (profile.id == state.serverId) state.loading else state.allServerSnapshots[profile.id]?.loading == true
+private fun ProfileScopeRow(
+  profile: ServerProfile,
+  state: LagoonState,
+  allSnapshots: Map<String, ServerOverviewSnapshot>,
+  selected: Boolean,
+  onSelect: () -> Unit
+) {
+  val connected = if (profile.id == state.serverId) state.connected else allSnapshots[profile.id]?.connected == true
+  val loading = if (profile.id == state.serverId) state.loading else allSnapshots[profile.id]?.loading == true
   // In a group/all projection `sessions` is the aggregate, so count this server from its own snapshot.
-  val sessions = if (state.multiServerView) state.allServerSnapshots[profile.id]?.sessions.orEmpty() else state.sessions
+  val sessions = if (state.multiServerView) allSnapshots[profile.id]?.sessions.orEmpty() else state.sessions
   val count = sessions.count { it.visibleOnHome }
   val status = when { connected -> "已连接"; loading -> "连接中…"; else -> "未连接" }
   Card(Modifier.fillMaxWidth()) {
