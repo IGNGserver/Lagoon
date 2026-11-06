@@ -138,27 +138,24 @@ class DraftTargetsTest {
     assertEquals(listOf("y"), state.serverWorkspaceCatalogOn("a").map { it.id })
   }
 
-  @Test fun directTargetIsUsedOnlyWhenTheChoiceIsUnambiguous() {
+  @Test fun defaultTargetKeepsTheCurrentDeviceThenFallsBackToAWorkingMember() {
     val a = profile("a", "A")
     val b = profile("b", "B")
-    val alone = LagoonState(profiles = listOf(a), serverId = "a", connected = false, allServers = true)
-    assertEquals("a", alone.directDraftServer()?.id)
-
     val aggregate = LagoonState(
       profiles = listOf(a, b), serverId = "a", connected = true, allServers = true,
       allServerSnapshots = mapOf("b" to snapshot("b", b, connected = true))
     )
-    assertNull(aggregate.directDraftServer())
+    // 当前可写设备优先，即使它离线；空白页会显示连接进度，仍可在页内换设备。
+    assertEquals("a", aggregate.defaultDraftServer()?.id)
+    assertEquals("a", aggregate.copy(connected = false).defaultDraftServer()?.id)
 
-    val singleConnected = aggregate.copy(allServers = false)
-    assertEquals("a", singleConnected.directDraftServer()?.id)
+    // 当前设备不在首页范围（例如设备组）时，选第一台已连接成员。
+    assertEquals("b", aggregate.copy(serverId = "outside").defaultDraftServer()?.id)
 
-    val singleOffline = singleConnected.copy(connected = false)
-    assertNull(singleOffline.directDraftServer())
-
-    val group = aggregate.copy(allServers = false, homeGroupId = "g",
-      deviceGroups = listOf(DeviceGroup("g", "G", listOf("a", "b"))))
-    assertNull(group.directDraftServer(setOf("a", "b")))
+    // 设备组范围只考虑成员；没有启用成员时返回 null，由入口给出提示。
+    assertEquals("a", aggregate.copy(serverId = "b").defaultDraftServer(setOf("a"))?.id)
+    assertNull(aggregate.defaultDraftServer(setOf("missing")))
+    assertNull(LagoonState(profiles = listOf(a.copy(enabled = false))).defaultDraftServer())
   }
 
   @Test fun preferredWorkspaceUsesExplicitChoiceThenHomeScopeThenRecent() {

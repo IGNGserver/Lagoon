@@ -36,44 +36,6 @@ import top.yukonga.miuix.kmp.extra.SuperBottomSheet
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 
 /**
- * First step of a new session: choose the harness/server. Every enabled connection is listed —
- * online, connecting, offline and even with zero registered workspaces — because the blank page is
- * where the workspace is chosen and where a new directory can be added. This replaces the old
- * "server list derived from registered projects" sheet, which went blank whenever the reader had
- * never registered a project on this device.
- */
-@Composable
-internal fun NewSessionServerSheet(
-  state: LagoonState,
-  profileIds: Set<String>?,
-  onSelect: (DraftServer) -> Unit,
-  onDismiss: () -> Unit
-) {
-  val servers = remember(state.profiles, state.serverId, state.connected, state.loading,
-    state.allServerSnapshots, state.projects, state.workspaceCatalog, profileIds) {
-    state.draftServers(profileIds)
-  }
-  SuperBottomSheet(title = "在哪台服务器新建", show = true, onDismissRequest = onDismiss) {
-    LazyColumn(Modifier.fillMaxWidth().heightIn(max = 620.dp), contentPadding = PaddingValues(bottom = 16.dp)) {
-      item {
-        Text("先选服务器（harness），工作区在空白页里选择；没有工作区的服务器也可以进去添加。",
-          Modifier.padding(horizontal = 20.dp, vertical = 8.dp),
-          style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
-      }
-      if (servers.isEmpty()) item {
-        Text("没有启用的连接。请先在设备管理中启用一个连接。", Modifier.padding(20.dp),
-          style = MiuixTheme.textStyles.footnote1.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
-      }
-      items(servers, key = { it.id }) { server ->
-        Card(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 2.dp)) {
-          DraftServerRow(server, current = server.id == state.serverId) { onSelect(server) }
-        }
-      }
-    }
-  }
-}
-
-/**
  * 空白页里的目的地选择：上半部分是服务器，下半部分是当前服务器的工作区。服务器行切换时不关闭面板，
  * 工作区列表随新服务器就地更新；点工作区才关闭面板并选中它。
  */
