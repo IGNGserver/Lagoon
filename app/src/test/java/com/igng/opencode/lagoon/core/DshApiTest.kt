@@ -508,7 +508,13 @@ class DshApiTest {
       assertEquals("q1", field.getString("key"))
       assertEquals("选哪个方案？", field.getString("title"))
       assertEquals(2, field.getJSONArray("options").length())
+      // DSH 选项只有 label；表单必须把 label 同时写成 value，否则整组选项共用一个空身份。
+      assertEquals("A", field.getJSONArray("options").getJSONObject(0).getString("value"))
+      assertEquals("B", field.getJSONArray("options").getJSONObject(1).getString("value"))
       val request = event.properties.obj("form").toForm("/repo")
+      assertEquals(listOf("A", "B"), request.questions.single().options.map { it.value })
+      // 单选（select）必须能通过表单校验，否则卡片里的「提交回答」永远是灰的。
+      assertTrue(runCatching { formAnswer(request, listOf(listOf("A"))) }.isSuccess)
       client.replyQuestion(request, listOf(listOf("A")))
       val settle = generateSequence { server.takeRequest(2, TimeUnit.SECONDS) }.first { it.requestUrl!!.encodedPath == "/api/\$events/result" }
       val value = JSONObject(settle.body.readUtf8()).getJSONObject("payload").getJSONObject("args")
@@ -516,6 +522,7 @@ class DshApiTest {
       val answer = value.getJSONArray("answers").getJSONObject(0)
       assertEquals("q1", answer.getString("id"))
       assertEquals("A", answer.getJSONArray("selected").getString(0))
+      assertFalse(answer.has("custom"))
     } finally {
       server.shutdown()
     }

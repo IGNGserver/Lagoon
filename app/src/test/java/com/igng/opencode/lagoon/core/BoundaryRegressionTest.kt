@@ -102,6 +102,19 @@ class BoundaryRegressionTest {
     val badPatternForm = JSONObject("""{"id":"frm","sessionID":"s","fields":[{"key":"k","type":"string","pattern":"["}]}""").toForm("/repo")
     assertTrue(runCatching { formAnswer(badPatternForm, listOf(listOf("abc"))) }.isFailure)
   }
+  @Test fun questionOptionsWithoutValueFallBackToLabelsAndCustomStaysSeparate() {
+    val form = JSONObject("""{"id":"frm","sessionID":"s","fields":[{"key":"pick","title":"选哪个","type":"select","options":[{"label":"A","description":"a"},{"label":"B"}]}]}""").toForm("/repo")
+    // DSH 只发 label：value 必须回退 label，否则所有选项共享空串身份，点一个会让整组一起选中。
+    assertEquals(listOf("A", "B"), form.questions.single().options.map { it.value })
+    // DSH 的单选类型是 select；缺这个分支时 formAnswer 抛错，卡片的「提交回答」永远是灰的。
+    assertTrue(runCatching { formAnswer(form, listOf(listOf("B"))) }.isSuccess)
+    assertTrue(runCatching { formAnswer(form, listOf(listOf("A", "B"))) }.isFailure)
+    // 自由文本走 DSH 的 custom 栏，不能混进 selected，否则模型会把用户的话当成一个选项 label。
+    val options = form.questions.single().options
+    assertEquals(listOf("B") to null, listOf("B").splitAnswer(options))
+    assertEquals(listOf("B") to "补充", listOf("B", "补充").splitAnswer(options))
+    assertEquals(emptyList<String>() to "只有文本", listOf("只有文本").splitAnswer(options))
+  }
   @Test fun legacyIslandVendorKeysAreIgnoredAndDroppedOnSave() {
     val p=memoryPreferences();val sec=memoryPreferences()
     // 旧版本曾在服务器资料 JSON 里保存厂商通道开关；升级后必须能正常读取，并在下次保存时丢弃这些键。

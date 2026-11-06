@@ -3,10 +3,27 @@ package com.igng.opencode.lagoon.core
 import org.json.JSONArray
 import org.json.JSONObject
 
+/**
+ * `value` 是选项的稳定身份：选中态按它比较，提交时也按它回传。
+ * 服务器可以只给 label（DSH 就是如此，答案也按 label 回显），此时必须回退 label——
+ * 否则所有选项都会拿到空串，点一个会让整组选项一起选中。
+ */
+internal fun JSONObject.toQuestionOption(): QuestionOption {
+  val label = str("label")
+  return QuestionOption(label, str("description"), str("value").ifBlank { label })
+}
+
+/** DSH 的答案分两栏：`selected` 只放选项身份，自由文本走 `custom`。 */
+internal fun List<String>.splitAnswer(options: List<QuestionOption>): Pair<List<String>, String?> {
+  val values = options.mapTo(HashSet()) { it.value }
+  val selected = if (values.isEmpty()) emptyList() else filter { it in values }
+  return selected to firstOrNull { values.isEmpty() || it !in values }
+}
+
 internal fun JSONObject.toForm(directory: String) = QuestionRequest(str("id"), str("sessionID"), directory,
   arr("fields").objects().map { f ->
     val options = if (f.str("type") == "boolean") listOf(QuestionOption("是", "", "true"), QuestionOption("否", "", "false"))
-      else f.arr("options").objects().map { QuestionOption(it.str("label"), it.str("description"), it.str("value")) }
+      else f.arr("options").objects().map { it.toQuestionOption() }
     QuestionPrompt(f.str("title").ifBlank { f.str("key") } + f.str("description").takeIf { it.isNotBlank() }?.let { "\n$it" }.orEmpty(),
       options, f.str("type") == "multiselect", f.str("type") in setOf("string", "number", "integer") && (options.isEmpty() || f.optBoolean("custom")) || f.optBoolean("custom"), f.toString())
   }, form = true)
@@ -36,7 +53,7 @@ internal fun formAnswer(request: QuestionRequest, answers: List<List<String>>): 
       require(!f.optBoolean("required") || row.isNotEmpty() && row.any { it.isNotBlank() }) { "请填写：$label" }
       if (row.isEmpty()) return@forEachIndexed
       val text = row.first()
-      val options = f.arr("options").objects().map { it.str("value") }
+      val options = f.arr("options").objects().map { it.toQuestionOption().value }
       require(options.isEmpty() || f.optBoolean("custom") || row.all { it in options }) { "选项无效：$label" }
       val value: Any = when (f.str("type")) {
         "string" -> {
@@ -57,6 +74,8 @@ internal fun formAnswer(request: QuestionRequest, answers: List<List<String>>): 
           } else number
         }
         "multiselect" -> { require(row.size >= f.optInt("minItems", 0) && row.size <= f.optInt("maxItems", Int.MAX_VALUE)) { "选择数量无效：$label" }; JSONArray(row) }
+        // DSH 的单选字段：恰好一项。缺这个分支时「提交回答」会被误判为不可用。
+        "select" -> { require(row.size == 1) { "只能选择一项：$label" }; text }
         else -> error("暂不支持此表单字段：$label")
       }
       put(f.str("key"), value)
