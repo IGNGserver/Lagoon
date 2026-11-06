@@ -1148,6 +1148,27 @@ class ControllerRegressionTest {
     }
   }
 
+  @Test fun blankDraftTextIsKeptWithoutAnOpenSession() {
+    val (controller, state) = controller(api(MockWebServer()), LagoonState(serverId = "server", sessionId = null))
+    controller.typeDraft("hello", "server", null)
+    // The composer reads this back after a rotation or a harness switch on the blank page.
+    assertEquals("hello", controller.draftFor("server", null, ""))
+    controller.updateDraft("hello", "server", null)
+    assertEquals("hello", state.value.draft)
+    assertEquals(1, state.value.draftRevision)
+    // A different identity (another server or a real session) never borrows the blank draft.
+    assertEquals("fallback", controller.draftFor("other", null, "fallback"))
+    assertEquals("fallback", controller.draftFor("server", "session", "fallback"))
+  }
+
+  @Test fun editingTheBlankDraftDoesNotAddAHomeSessionDraftMarker() {
+    val (controller, state) = controller(api(MockWebServer()), LagoonState(serverId = "server", sessionId = null))
+    controller.updateDraft("hello", "server", null)
+    assertTrue(state.value.draftSessions.isEmpty())
+    controller.updateDraft("", "server", null)
+    assertTrue(state.value.draftSessions.isEmpty())
+  }
+
   @Suppress("UNCHECKED_CAST")
   private fun mutable(controller: LagoonController) =
     LagoonController::class.java.getDeclaredField("mutable").apply { isAccessible = true }.get(controller) as MutableStateFlow<LagoonState>

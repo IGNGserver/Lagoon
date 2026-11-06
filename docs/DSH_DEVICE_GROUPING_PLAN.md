@@ -88,7 +88,7 @@
   - 首页聚合 MacBook 组内全部 profile 的会话；
   - 每条会话显示 DSH / OpenCode 徽标；
   - 组内工作区按名称合并；
-  - “新建会话”先选 harness（组内只有一个在线时自动选）。
+  - “新建会话”先选 harness（只有一个启用成员时自动选；离线成员也可选，进入空白页后等待重连）。
 ```
 
 点某条会话时按该会话自己的 `serverId` 打开，不会串到同组另一台 harness。
@@ -238,12 +238,12 @@ data class DeviceWorkspace(
 
 - 新增 `scopeWorkspaceKey: String?`（与 `scopeProjectId` 分开，避免污染单服务器语义）；
 - `HomeScope.roots/counts/byActivity` 增加 group-aware 重载，按 `workspaceOf(session)` 过滤；
-- “新建会话”：
-  - 先确定目标 `DeviceWorkspace`；
-  - 若组内多个成员，弹出 harness 选择（同一 workspace 的多个 `Project` 作为候选）；
-  - 默认使用该 workspace 最近使用的 profile，否则第一个在线成员；
-  - 目标目录取所选 `Project.directory`；
-  - 组内只有一个成员时跳过选择，保持旧体验。
+- “新建会话”（2026-11-06 起）：
+  - 先选服务器（harness）：聚合 / 设备组弹出服务器列表，列出全部启用连接（含离线、含 0 工作区）；单服务器首页且当前连接可用时直接进入空白页；
+  - 空白页标题再选该服务器的工作区：本机登记项目排在前面，服务器已有工作区（OpenCode `/api/project`、DSH `workspace/follow`）可在同一面板显式登记后选用；
+  - 目标目录取所选 `Project.directory`，发出第一条消息时才创建会话；
+  - 离线、连接中、没有工作区都允许进入空白页；连接进度与可发送状态由页面表达，不再用提示拦住入口；
+  - 空白页切换服务器保留已输入正文；不恢复该服务器上次打开的会话。
 
 ---
 
@@ -300,7 +300,7 @@ data class DeviceWorkspace(
 - 首页“分组方式 → 项目”在设备组内使用 `DeviceWorkspace`；
 - 工作区列表/范围选择器显示合并后的名称、成员数、成员路径；
 - 选择某工作区 → 只显示该工作区会话；
-- 新建会话 → 选择 workspace + harness；
+- 新建会话 → 先选 harness、再在空白页选 workspace（与 4.3 一致）；
 - 保留“日期/状态”分组方式，不受影响。
 
 ### 5.5 设备管理页
