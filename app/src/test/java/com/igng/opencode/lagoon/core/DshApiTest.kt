@@ -1147,6 +1147,62 @@ class DshApiTest {
     }
   }
 
+  @Test fun createSessionSendsWorkspaceIdOnlyForAWorkspaceRoot() = runBlocking {
+    val server = MockWebServer().also { it.start() }
+    try {
+      val created = java.util.concurrent.atomic.AtomicInteger()
+      server.dispatcher = object : Dispatcher() {
+        override fun dispatch(request: RecordedRequest): MockResponse = when {
+          request.path!!.startsWith("/?token") || request.path == "/" -> rootOk()
+          request.path == "/api/remote.mux" -> MockResponse().withWebSocketUpgrade(object : WebSocketListener() {
+            override fun onMessage(webSocket: WebSocket, text: String) {
+              val frame = JSONObject(text)
+              if (frame.optString("type") != "open") return
+              if (frame.getString("endpoint") != "workspace/follow") return
+              val id = frame.getString("streamId")
+              val value = JSONObject().put("type", "baseline").put("value", JSONObject()
+                .put("items", JSONArray().put(JSONObject()
+                  .put("workspaceId", "w1").put("path", "/repo").put("title", "Lagoon")))
+                .put("archivedSessionIds", JSONArray())
+                .put("pinnedSessionIds", JSONArray()))
+              webSocket.send(JSONObject().put("type", "item").put("streamId", id).put("value", value).toString())
+            }
+          })
+          request.path == "/api/session/create" -> envelope("""{"sessionId":"s${created.incrementAndGet()}"}""")
+          request.path == "/api/session/rename" -> envelope("""{"title":"新任务","seq":2}""")
+          else -> MockResponse().setResponseCode(404)
+        }
+      }
+      val client = api(server)
+      // 控制器连上服务器后会先拉一次工作区清单；createSession 只读这份缓存，不再多开一条流。
+      client.projects()
+
+      client.createSession("/repo", "新任务")
+      val attached = createRequests(server).single()
+      assertEquals("w1", attached.getString("workspaceId"))
+      assertFalse(attached.has("cwd"))
+
+      // 工作区子目录不能换成 workspaceId：那会把会话 cwd 强制成工作区根。
+      client.createSession("/repo/sub", "子目录任务")
+      val fallback = createRequests(server).last()
+      assertEquals("/repo/sub", fallback.getString("cwd"))
+      assertFalse(fallback.has("workspaceId"))
+    } finally {
+      server.shutdown()
+    }
+  }
+
+  /** 按到达顺序取出所有 `session/create` 的 `args.request`（`takeRequest` 会把它们从队列里消费掉）。 */
+  private fun createRequests(server: MockWebServer): List<JSONObject> {
+    val requests = mutableListOf<JSONObject>()
+    while (true) {
+      val call = server.takeRequest(1, TimeUnit.SECONDS) ?: break
+      if (call.path != "/api/session/create") continue
+      requests += JSONObject(call.body.readUtf8()).getJSONObject("payload").getJSONObject("args").getJSONObject("request")
+    }
+    return requests
+  }
+
   // ---------------------------------------------------------------- 功能补齐（P1）
 
   @Test fun fileSearchUsesFileReferencesWithAgentScope() = runBlocking {
