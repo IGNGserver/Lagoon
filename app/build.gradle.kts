@@ -59,10 +59,12 @@ android {
   }
   kotlin { jvmToolchain(17) }
   testOptions { unitTests.isReturnDefaultValues = true }
+
 }
 // Unit tests read the shared cross-language contract from the repository root.
 tasks.withType<Test>().configureEach {
   workingDir = rootDir
+  testLogging.exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
   // PopupScopeRegressionTest 直接扫描 UI 源码，源码变化必须触发重跑而不是 UP-TO-DATE。
   inputs.dir("src/main/java")
 }
