@@ -312,7 +312,21 @@ class DshApi(
     withContext(Dispatchers.IO) {
       remoteBackend?.let { remote ->
         try { return@withContext remote.call(endpoint, payload) }
+        catch (cancel: CancellationException) { throw cancel }
+        // Keep typed connection failures intact: the controller uses their kind to offer login,
+        // fingerprint or host recovery. Only untyped I/O is collapsed into a transport failure.
+        catch (error: RemoteFailureException) { throw error }
+        catch (error: RemoteServerException) { throw remoteServerFailure(error) }
         catch (error: RemoteGatewayException) { throw ApiException(502, friendlyMessage(error.code, error.message.orEmpty()), error.code) }
+        // The transport died, or its pending RPC could not finish. This is not a Host contract
+        // rejection: name it as a connection problem (and keep the upstream code) so the controller
+        // can reconnect instead of toasting “transfer closed” / WebSocket internals.
+        catch (error: RemoteRpcException) {
+          throw ApiException(502, "与主机的加密中继已断开，正在重连", error.code.ifBlank { "TRANSPORT_CLOSED" })
+        }
+        catch (error: IOException) {
+          throw ApiException(0, "与主机的连接中断，正在重连", "TRANSPORT_CLOSED")
+        }
       }
       val current = cookie()
       val url = base.newBuilder().addEncodedPathSegment("api").addEncodedPathSegments(endpoint).build()

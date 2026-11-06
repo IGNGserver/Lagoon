@@ -185,7 +185,7 @@ private fun GlobalTaskStrip(state: LagoonState, controller: LagoonController, on
       Text(if (grouped) "${state.homeGroup?.name.orEmpty()} · 全部项目" else "全部设备 · 全部项目",
         Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis,
         style = MiuixTheme.textStyles.footnote2.copy(color = muted))
-      if (grouped || !state.allServers || state.scopeProjectId != null || state.scopeWorkspaceKey != null) {
+      if (state.showsGlobalViewAll()) {
         Text("查看全部", Modifier.clip(CircleShape).clickable(role = Role.Button) {
           controller.setScope(null)
           controller.setAllServers(true)
@@ -416,11 +416,10 @@ private fun SessionList(
         try { do { val event = awaitPointerEvent() } while (event.changes.any { it.pressed }) } finally { touching = false }
       }
     }, state = list, contentPadding = PaddingValues(top = 4.dp, bottom = 120.dp)) {
-      if (state.cached || state.degraded || !state.connected && !state.loading && state.enabledProfiles.isNotEmpty()) item(key = "sync") {
-        Text(when { state.cached -> "离线缓存 · 下拉重试"; state.degraded -> "部分数据待同步 · 下拉重试"; else -> "尚未连接 · 点按重试" },
-          style = MiuixTheme.textStyles.footnote1, color = MiuixColorTokens.Warning,
+      state.homeSyncNotice()?.let { notice -> item(key = "sync") {
+        Text(notice, style = MiuixTheme.textStyles.footnote1, color = MiuixColorTokens.Warning,
           modifier = Modifier.fillMaxWidth().clickable(role = Role.Button) { controller.reload() }.padding(horizontal = 24.dp, vertical = 8.dp))
-      }
+      } }
       visibleSections.forEach { section ->
         // While searching every match stays visible, whatever was collapsed.
         val collapsed = query.isBlank() && section.key in state.collapsedSections

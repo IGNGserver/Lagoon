@@ -817,7 +817,12 @@ class LagoonController private constructor(private val appContext: Context) {
       try { loadAll(token, controlOnly = true) } catch (error: Exception) {
         if (error is CancellationException) throw error
         Diagnostics.warn("LagoonController", "实时连接恢复后的对账失败", error)
-        if (token == generation) mutable.update { it.copy(degraded = true) }
+        if (token != generation) return@launch
+        if (error.isRetryableTransportFailure()) {
+          val serverId = state.value.serverId ?: return@launch
+          mutable.update { it.copy(connected = false, error = null) }
+          scheduleReconnect(serverId, token, attempt = 1, reason = "实时同步恢复失败，正在重连")
+        } else mutable.update { it.copy(degraded = true) }
       }
     }
   }
@@ -952,7 +957,7 @@ class LagoonController private constructor(private val appContext: Context) {
     val id = state.value.serverId ?: return
     if (api == null) connect(id, preserveHome = true) else reload()
   }
-  private fun retryReason(error: String?): String = error?.removePrefix("离线缓存：")?.takeIf { it.isNotBlank() } ?: "连接失败"
+  private fun retryReason(error: String?): String = error?.takeIf { it.isNotBlank() } ?: "连接失败"
   private fun setStage(token: Int, stage: ConnectStage) {
     if (token != generation) return
     mutable.update { if (it.connection.stage == stage) it else it.copy(connection = ConnectionStatus(stage, System.currentTimeMillis())) }
@@ -1594,13 +1599,14 @@ class LagoonController private constructor(private val appContext: Context) {
       } catch (error: Exception) {
         if (error is CancellationException) throw error
         if (token != generation) return@launch
-        connectTrace.fail(token.toLong(), userFacingError(error, "连接失败"))
-        showOffline(id, token, userFacingError(error, "连接失败"))
+        val reason = userFacingError(error, "连接失败")
+        connectTrace.fail(token.toLong(), reason)
+        showOffline(id, token, reason)
         if (token == generation) mutable.update { it.copy(remoteRecovery = remoteFailure(error)?.kind?.recovery()) }
         // A refresh while offline must be able to recover: retry the connection with backoff instead
         // of leaving the user on a stale snapshot with no path back to a live stream (A10).
         // Expired credentials do not heal by retrying quickly; keep probing at the slowest pace.
-        scheduleReconnect(id, token, if (error.isAuthFailure) AUTH_RETRY_ATTEMPT else 0)
+        scheduleReconnect(id, token, if (error.isAuthFailure) AUTH_RETRY_ATTEMPT else 0, reason)
       }
     }
   }
@@ -1622,12 +1628,12 @@ class LagoonController private constructor(private val appContext: Context) {
       resolveSession(target.sessionId) { if (state.value.serverId == target.serverId && state.value.sessionId == target.sessionId) selectSession(target.sessionId) }
     }
   }
-  private fun scheduleReconnect(id: String, token: Int, attempt: Int = 0) {
+  private fun scheduleReconnect(id: String, token: Int, attempt: Int = 0, reason: String? = null) {
     if (token != generation || state.value.serverId != id) return
     if (store.profiles().none { it.id == id && it.enabled }) return
     val delayMillis = (2_000L shl attempt.coerceAtMost(4)).coerceAtMost(60_000L)
     val now = System.currentTimeMillis()
-    mutable.update { it.copy(connection = ConnectionStatus(ConnectStage.RETRYING, now, now + delayMillis, retryReason(it.error))) }
+    mutable.update { it.copy(connection = ConnectionStatus(ConnectStage.RETRYING, now, now + delayMillis, reason ?: retryReason(it.error))) }
     scope.launch {
       delay(delayMillis)
       if (token == generation && state.value.serverId == id && !state.value.connected) reconnect(id, token, attempt)
@@ -1644,9 +1650,10 @@ class LagoonController private constructor(private val appContext: Context) {
       if (streamAllowed()) startStream(token)
     } catch (error: Exception) {
       if (error is CancellationException) throw error
-      if (token == generation) connectTrace.fail(token.toLong(), userFacingError(error, "连接失败"))
-      if (token == generation) showOffline(id, token, if (error.isAuthFailure) userFacingError(error) else "连接失败，正在重试")
-      scheduleReconnect(id, token, if (error.isAuthFailure) AUTH_RETRY_ATTEMPT else attempt + 1)
+      val reason = userFacingError(error, "连接失败")
+      if (token == generation) connectTrace.fail(token.toLong(), reason)
+      if (token == generation) showOffline(id, token, reason)
+      scheduleReconnect(id, token, if (error.isAuthFailure) AUTH_RETRY_ATTEMPT else attempt + 1, reason)
     }
   }
   private suspend fun showOffline(id: String, token: Int, reason: String) {
@@ -1656,7 +1663,11 @@ class LagoonController private constructor(private val appContext: Context) {
       Triple(catalog.first, catalog.second, cache.catalogComplete(id))
     }
     if (token != generation || state.value.serverId != id) return
-    if (loaded == null) mutable.update { it.copy(loading = false, connected = false, error = reason) }
+    // Expected offline/retry states belong in the banner and the connection strip, not in a toast.
+    // The raw reason stays in diagnostics; repeating it on every backoff attempt used to raise a
+    // new toast each time the app tried to reconnect.
+    Diagnostics.warn("LagoonController", "显示离线缓存：$reason")
+    if (loaded == null) mutable.update { it.copy(loading = false, connected = false, error = null) }
     else {
       val (cachedProjects, cachedSessions, catalogComplete) = loaded
       val projects = (cachedProjects + store.localProjects(id))
@@ -1665,7 +1676,7 @@ class LagoonController private constructor(private val appContext: Context) {
       val sessions = cachedSessions.map { scoped(id, it) }
       val sessionId = store.selectedSession(id)?.takeIf { selected -> sessions.any { it.id == selected && !it.blank } }
       trace(token, ConnectMilestone.CACHE_PAINT)
-      mutable.update { it.copy(loading = false, connected = false, cached = true, error = "离线缓存：$reason",
+      mutable.update { it.copy(loading = false, connected = false, cached = true, error = null,
         projects = projects, sessions = sessions, projectId = store.selectedProject(id) ?: projects.firstOrNull()?.id,
         sessionId = sessionId, messages = withPending(id, sessionId, emptyList()), catalogComplete = catalogComplete) }
       if (sessionId != null) {
@@ -2071,10 +2082,24 @@ class LagoonController private constructor(private val appContext: Context) {
         if (token == generation && stream?.isActive != true && streamAllowed()) startStream(token)
       } catch (error: Exception) {
         if (error is CancellationException) throw error
-        if (token == generation) connectTrace.fail(token.toLong(), userFacingError(error, "刷新失败"))
-        if (token == generation) mutable.update { state -> state.copy(error = userFacingError(error, "刷新失败"),
-          connection = if (state.connection.stage == ConnectStage.READY) state.connection
-            else ConnectionStatus(ConnectStage.RETRYING, System.currentTimeMillis(), state.connection.retryAt, retryReason(userFacingError(error, "刷新失败")))) }
+        val reason = userFacingError(error, "刷新失败")
+        if (token == generation) connectTrace.fail(token.toLong(), reason)
+        if (token != generation) return@launch
+        val serverId = state.value.serverId ?: return@launch
+        if (error.isRetryableTransportFailure()) {
+          // A relay/RPC drop during a read is transient. Keep the last known list visible, mark the
+          // page off-line and let the normal backoff reconnect; do not toast the library text or
+          // leave the user with no path back to a live stream.
+          Diagnostics.warn("LagoonController", "刷新时连接中断，保留现有数据并重连", error)
+          mutable.update { state -> state.copy(connected = false, loading = false, error = null) }
+          scheduleReconnect(serverId, token, reason = "连接中断，正在重连")
+        } else {
+          mutable.update { state -> state.copy(error = reason,
+            remoteRecovery = remoteFailure(error)?.kind?.recovery()
+              ?: if (error.isAuthFailure) RemoteRecoveryKind.LOGIN else state.remoteRecovery,
+            connection = if (state.connection.stage == ConnectStage.READY) state.connection
+              else ConnectionStatus(ConnectStage.RETRYING, System.currentTimeMillis(), state.connection.retryAt, retryReason(reason))) }
+        }
       }
     }.also { refresh = it }
   }

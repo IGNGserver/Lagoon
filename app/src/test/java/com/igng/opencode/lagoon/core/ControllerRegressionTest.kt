@@ -576,6 +576,25 @@ class ControllerRegressionTest {
       assertTrue(state.value.connected);assertFalse(state.value.cached);assertEquals("new connection",state.value.error)
     }
   }
+  @Test fun showingTheOfflineCatalogDoesNotRaiseAToast() = runBlocking {
+    MockWebServer().use { server ->
+      val (c, state) = controller(api(server), LagoonState(serverId = "server", connected = true))
+      val cache = OfflineCache(memoryPreferences(), { it }, { it })
+      cache.saveCatalog("server", emptyList(), emptyList()); cache.awaitWrites(); put(c, "cache", cache)
+      suspendCoroutine<Unit> { cont ->
+        try {
+          val method = LagoonController::class.java.getDeclaredMethod("showOffline", String::class.java,
+            Int::class.javaPrimitiveType, String::class.java, Continuation::class.java).apply { isAccessible = true }
+          val result = method.invoke(c, "server", 1, "连接失败", cont)
+          if (result !== COROUTINE_SUSPENDED) cont.resume(Unit)
+        } catch (error: Throwable) { cont.resumeWithException(error.cause ?: error) }
+      }
+      assertFalse(state.value.connected)
+      assertTrue(state.value.cached)
+      // The banner says “离线缓存”; retrying the same failure must not toast on every backoff.
+      assertNull(state.value.error)
+    }
+  }
   @Test fun oldProjectFileResponseCannotOverwriteNewProject() = runBlocking {
     MockWebServer().use { s ->
       s.enqueue(MockResponse().setBody("""{"healthy":true}"""))

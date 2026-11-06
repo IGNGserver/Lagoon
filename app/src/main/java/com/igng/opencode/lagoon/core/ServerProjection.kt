@@ -58,7 +58,31 @@ internal fun LagoonState.homeUnseenSessions(): Set<String> =
   if (multiServerView) allUnseenSessions
   else notices.filterNot { it.viewed }.map { it.sessionId }.toSet()
 
-/** Server-scoped candidates for the independent “服务端已读” action. */
+/**
+ * The one sync line above the session list, or null when the page does not need a warning.
+ *
+ * The off-line wording belongs to the page, not to one device: an aggregate with at least one live
+ * server is still usable, and a connected server whose *transcript* came from cache (the `cached`
+ * flag) is not an off-line catalog. A single off-line member is shown by its device chip instead.
+ */
+internal fun LagoonState.homeSyncNotice(): String? = when {
+  connected && degraded -> "部分数据待同步 · 下拉重试"
+  connected -> null
+  loading -> null
+  enabledProfiles.isEmpty() -> null
+  sessions.isNotEmpty() -> "离线缓存 · 下拉重试"
+  else -> "尚未连接 · 点按重试"
+}
+
+/**
+ * The global strip may clear a project/workspace filter and widen a single server to every device.
+ * A device group is a container, not a filter: “查看全部” there would silently leave the group.
+ */
+internal fun LagoonState.showsGlobalViewAll(): Boolean =
+  homeGroup == null && (!allServers || scopeProjectId != null || scopeWorkspaceKey != null)
+
+/**
+ * Server-scoped candidates for the independent “服务端已读” action. */
 internal fun LagoonState.serverReadTargets(): Map<String, List<Session>> =
   homeReadSnapshots().mapNotNull { (server, snapshot) ->
     snapshot.serverReadCandidates().takeIf { it.isNotEmpty() }?.let { server to it }
@@ -116,7 +140,10 @@ fun LagoonState.homeProjection(): LagoonState {
     streamConnected = snapshots.values.any { it.streamConnected },
     // “离线”与“数据待同步”是两回事：某台服务器没连上时由 chip 的状态点表达，不再把整页钉在
     // “部分数据待同步”上；只有已连接服务器上影响可见状态的读取失败才计 degraded。
-    degraded = snapshots.values.any { it.degraded },
+    degraded = snapshots.values.any { it.connected && it.degraded },
+    // `cached` 描述的是“当前对话的消息是否为缓存”，不能拿来给整页的目录数据下结论。聚合页只有在
+    // 一台服务器都没连上时才可能整页都是缓存；否则由各设备的 chip 状态点表达。
+    cached = snapshots.values.none { it.connected } && snapshots.values.any { it.cached },
     summary = if (snapshots.isEmpty()) TaskSummary.EMPTY else globalSummary,
     allServerSnapshots = snapshots, allSessionStatuses = statuses,
     allUnseenSessions = snapshots.values.flatMap { snapshot -> snapshot.notices.filterNot { it.viewed }.map { scopedKey(snapshot.serverId, it.sessionId) } }.toSet())
@@ -154,7 +181,8 @@ private fun LagoonState.groupHomeProjection(
     knownParents = emptyMap(), backgroundRunning = emptySet(), pinned = emptySet(),
     sessionCursors = emptyMap(), catalogComplete = true,
     connected = scoped.values.any { it.connected }, loading = scoped.values.any { it.loading },
-    cached = scoped.values.any { it.cached }, degraded = scoped.values.any { it.degraded },
+    cached = scoped.values.none { it.connected } && scoped.values.any { it.cached },
+    degraded = scoped.values.any { it.connected && it.degraded },
     streamConnected = scoped.values.any { it.streamConnected },
     lastContactAt = scoped.values.maxOfOrNull { it.lastReadAt } ?: lastContactAt,
     autoApprovalFailures = scoped.values.flatMap { it.autoApprovalFailures }.toSet(),

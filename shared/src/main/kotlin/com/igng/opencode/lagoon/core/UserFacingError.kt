@@ -21,6 +21,9 @@ import javax.net.ssl.SSLException
 internal fun userFacingError(error: Throwable, fallback: String = "操作失败"): String {
   if (error is CancellationException) return fallback
   val message = error.message?.trim().orEmpty()
+  // A dead relay/handshake leaks library phrases such as “transfer closed” or “WebSocket” into the
+  // message. They describe the path, not the operation, and are retried by the connection layer.
+  if (error.looksLikeTransportFailureText()) return fallback
   if (error is ApiException && message.isNotBlank()) return message
   if (message.isNotBlank() && message.any(::isCjk)) return message
   return when (error) {

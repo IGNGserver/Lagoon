@@ -2,6 +2,7 @@ package com.igng.opencode.lagoon.core
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -69,6 +70,37 @@ class DeviceGroupProjectionTest {
     assertEquals(listOf("B title"), home.workspaceCatalog.map { it.name })
     val session = home.sessions.single { it.id == "s2" }
     assertEquals("B title", resolveSessionWorkspace(session, home.projects, home.workspaceCatalogFor(session))!!.name)
+  }
+
+  @Test fun oneOfflineCachedMemberDoesNotPinTheWholeGroup() {
+    val a = profile("a", "A")
+    val b = profile("b", "B")
+    val group = DeviceGroup("g", "MacBook", listOf("a", "b"))
+    val online = snapshot("a", ServerKind.OPENCODE, true, listOf(Session("s1", "/repo", "one", 1)), emptyList())
+      .copy(cached = true, loading = false)
+    val offline = snapshot("b", ServerKind.DSH_REMOTE, false, listOf(Session("s2", "/repo", "two", 2)), emptyList())
+      .copy(cached = true, loading = false, degraded = true)
+    val state = LagoonState(profiles = listOf(a, b), deviceGroups = listOf(group), homeGroupId = "g",
+      serverId = "a", allServerSnapshots = mapOf("a" to online, "b" to offline))
+    val home = state.homeProjection()
+    assertTrue(home.connected)
+    assertFalse("一台设备离线不能把整个设备组标成缓存页", home.cached)
+    assertFalse("离线设备的读失败不能点亮全组的待同步横幅", home.degraded)
+    assertNull(home.homeSyncNotice())
+  }
+
+  @Test fun aGroupWithEveryMemberOfflineStillShowsItsCache() {
+    val a = profile("a", "A")
+    val b = profile("b", "B")
+    val group = DeviceGroup("g", "MacBook", listOf("a", "b"))
+    val state = LagoonState(profiles = listOf(a, b), deviceGroups = listOf(group), homeGroupId = "g",
+      serverId = "a", allServerSnapshots = mapOf(
+        "a" to snapshot("a", ServerKind.OPENCODE, false, listOf(Session("s1", "/repo", "one", 1)), emptyList()).copy(cached = true, loading = false, degraded = true),
+        "b" to snapshot("b", ServerKind.DSH_REMOTE, false, listOf(Session("s2", "/repo", "two", 2)), emptyList()).copy(cached = true, loading = false, degraded = true)
+      ))
+    val home = state.homeProjection()
+    assertTrue(home.cached)
+    assertEquals("离线缓存 · 下拉重试", home.homeSyncNotice())
   }
 
   @Test fun noGroupKeepsSingleServerBehavior() {

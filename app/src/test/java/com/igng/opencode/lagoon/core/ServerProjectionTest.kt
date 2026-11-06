@@ -58,8 +58,49 @@ class ServerProjectionTest {
     val state = LagoonState(profiles = listOf(a, b), allServers = true,
       allServerSnapshots = mapOf(
         "a" to snapshot(a, TaskPhase.THINKING),
-        "b" to snapshot(b, TaskPhase.THINKING).copy(connected = false, loading = false)))
-    assertFalse(state.homeProjection().degraded)
+        // A failed read on an off-line member marks that snapshot degraded; the aggregate must not
+        // inherit it, otherwise one sleeping device pins “部分数据待同步” on the whole page.
+        "b" to snapshot(b, TaskPhase.THINKING).copy(connected = false, loading = false, cached = true, degraded = true)))
+    val home = state.homeProjection()
+    assertFalse(home.degraded)
+    assertNull(home.homeSyncNotice())
+  }
+
+  @Test fun transcriptCacheDoesNotBecomeAnOfflineCatalogBanner() {
+    val session = Session("same", "/repo", "A", 0, serverId = "a")
+    val liveButCached = LagoonState(profiles = listOf(a), serverId = "a", connected = true, cached = true,
+      sessions = listOf(session))
+    // A cached transcript on a connected server is not an off-line catalog.
+    assertNull(liveButCached.homeSyncNotice())
+
+    val offline = liveButCached.copy(connected = false, loading = false)
+    assertEquals("离线缓存 · 下拉重试", offline.homeSyncNotice())
+    assertEquals("尚未连接 · 点按重试", offline.copy(sessions = emptyList()).homeSyncNotice())
+    assertEquals("部分数据待同步 · 下拉重试", liveButCached.copy(degraded = true).homeSyncNotice())
+  }
+
+  @Test fun aggregateCacheFlagNeedsEveryMemberToBeOffline() {
+    val session = Session("same", "/repo", "A", 0, serverId = "a")
+    val online = snapshot(a, TaskPhase.IDLE).copy(cached = true, sessions = listOf(session))
+    val offline = snapshot(b, TaskPhase.IDLE).copy(connected = false, loading = false, cached = true)
+    val oneLive = LagoonState(profiles = listOf(a, b), allServers = true,
+      allServerSnapshots = mapOf("a" to online, "b" to offline))
+    assertFalse(oneLive.homeProjection().cached)
+    assertNull(oneLive.homeProjection().homeSyncNotice())
+
+    val allOffline = LagoonState(profiles = listOf(a, b), allServers = true,
+      allServerSnapshots = mapOf("a" to online.copy(connected = false), "b" to offline))
+    assertTrue(allOffline.homeProjection().cached)
+    assertEquals("离线缓存 · 下拉重试", allOffline.homeProjection().homeSyncNotice())
+  }
+
+  @Test fun groupViewHasNoGlobalViewAllButSingleServerAndFilteredAllDo() {
+    val group = DeviceGroup("g", "A", listOf("a"))
+    val grouped = LagoonState(profiles = listOf(a), deviceGroups = listOf(group), homeGroupId = "g")
+    assertFalse(grouped.showsGlobalViewAll())
+    assertTrue(grouped.copy(homeGroupId = null, allServers = false).showsGlobalViewAll())
+    assertFalse(grouped.copy(homeGroupId = null, allServers = true).showsGlobalViewAll())
+    assertTrue(grouped.copy(homeGroupId = null, allServers = true, scopeProjectId = "p").showsGlobalViewAll())
   }
 
   @Test fun aConnectedServerWithFailedReadsKeepsTheAggregateDegraded() {
