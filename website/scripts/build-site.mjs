@@ -17,8 +17,13 @@ const response = await fetch(`https://api.github.com/repos/${REPO}/releases?per_
 if (!response.ok) throw new Error(`GitHub API ${response.status}`);
 const releases = await response.json();
 
-const stable = releases.find((release) => !release.draft && !release.prerelease);
-const preview = releases.find((release) => !release.draft && release.prerelease);
+// GitHub's release list is not reliably ordered by semver (and its ordering changed after a few
+// failed tag-only releases). Pick the highest tag explicitly so a newer preview cannot be skipped
+// just because it was created out of API order.
+const newest = (list) => [...list].sort((a, b) =>
+  b.tag_name.localeCompare(a.tag_name, undefined, { numeric: true }))[0];
+const stable = newest(releases.filter((release) => !release.draft && !release.prerelease));
+const preview = newest(releases.filter((release) => !release.draft && release.prerelease));
 if (!stable) throw new Error('No stable release found');
 if (!preview) throw new Error('No preview release found');
 
