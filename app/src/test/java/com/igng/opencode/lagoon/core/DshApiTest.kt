@@ -66,6 +66,67 @@ class DshApiTest {
     .put("projections", JSONObject().put("kind", "sequenced").put("asOfSeq", 3)
       .put("values", JSONObject().put("title", title).put("agentPreset", "standard")))
 
+  /** One durable `session/follow` record. */
+  private fun event(type: String, seq: Int, time: Long, data: JSONObject) = JSONObject()
+    .put("type", "event").put("event", JSONObject().put("type", type).put("seq", seq).put("time", time).put("data", data))
+
+  /** A turn-aligned Host snapshot, like `session/follow` produces. */
+  private fun snapshotFrame(records: JSONArray, cursor: Long, hasMore: Boolean) = JSONObject()
+    .put("type", "snapshot")
+    .put("header", JSONObject().put("version", 4).put("id", "s1").put("createdAt", 1).put("cwd", "/repo"))
+    .put("cursor", cursor).put("hasMore", hasMore).put("records", records)
+
+  /** [turns] turns with [steps] assistant steps each; [goalTurns] are injected goal rounds without a user row. */
+  private fun conversationRecords(turns: Int, steps: Int, goalTurns: Set<Int> = emptySet()): JSONArray {
+    val records = JSONArray()
+    var seq = 0
+    var time = 1_000L
+    for (turn in 1..turns) {
+      records.put(event("turn/start", ++seq, ++time, JSONObject().put("turn", turn)))
+      val goal = turn in goalTurns
+      val prompt = if (goal) "<goal_round>\nObjective: \"目标 $turn\"\nRound: 1/30" else "问题 $turn"
+      records.put(event("user/message", ++seq, ++time, JSONObject()
+        .put("content", JSONArray().put(JSONObject().put("type", "text").put("text", prompt)))
+        .put("source", JSONObject().put("kind", if (goal) "goal" else "user"))
+        .put("role", "user").put("id", "u$turn")))
+      for (step in 1..steps) {
+        records.put(event("step/start", ++seq, ++time, JSONObject().put("turn", turn).put("step", step)))
+        records.put(event("assistant/message", ++seq, ++time, JSONObject().put("turn", turn).put("step", step)
+          .put("message", JSONObject().put("role", "assistant").put("content", JSONArray()
+            .put(JSONObject().put("type", "reasoning").put("text", "思考 $turn/$step"))
+            .put(JSONObject().put("type", "text").put("text", "回复 $turn/$step"))))))
+        records.put(event("step/end", ++seq, ++time, JSONObject().put("turn", turn).put("step", step)))
+      }
+      records.put(event("turn/end", ++seq, ++time, JSONObject().put("turn", turn)
+        .put("reason", JSONObject().put("kind", "completed"))))
+    }
+    return records
+  }
+
+  /** A MockWebServer that serves the token exchange, the session row and one `session/follow` snapshot. */
+  private fun snapshotServer(snapshot: JSONObject,
+    onPage: (RecordedRequest) -> MockResponse = { envelope("""{"records":[],"hasMore":false}""") }): MockWebServer {
+    val server = MockWebServer()
+    server.dispatcher = object : Dispatcher() {
+      override fun dispatch(request: RecordedRequest): MockResponse = when {
+        request.path.orEmpty().startsWith("/?token") || request.path == "/" -> rootOk()
+        request.path == "/api/session/list" -> envelope("""{"items":[${sessionRow()}]}""")
+        request.path == "/api/remote.mux" -> MockResponse().withWebSocketUpgrade(object : WebSocketListener() {
+          override fun onMessage(webSocket: WebSocket, text: String) {
+            val frame = JSONObject(text)
+            if (frame.optString("type") != "open" || frame.optString("endpoint") != "session/follow") return
+            webSocket.send(JSONObject().put("type", "item")
+              .put("streamId", frame.getString("streamId")).put("value", snapshot).toString())
+          }
+        })
+        request.path == "/api/session/page" -> onPage(request)
+        else -> MockResponse().setResponseCode(404)
+      }
+    }
+    server.start()
+    return server
+  }
+
   @Test fun customProviderRouteUsesSettingsMutateAndCredential() = runBlocking {
     MockWebServer().use { server ->
       server.enqueue(rootOk())
@@ -507,6 +568,47 @@ class DshApiTest {
       assertTrue(tool.output.orEmpty().contains("README.md"))
     } finally {
       server.shutdown()
+    }
+  }
+
+  @Test fun openingWindowKeepsWholeTurnWindowAndHasMoreCursor() = runBlocking {
+    val snapshot = snapshotFrame(conversationRecords(turns = 3, steps = 25), cursor = 1000, hasMore = true)
+    snapshotServer(snapshot).use { server ->
+      val page = api(server).messagesPage("s1", null, HarnessClient.MESSAGE_PAGE)
+      // 3 users + 3*25 assistant steps: the old takeLast(20) returned only 20 and next=null.
+      assertEquals(78, page.items.size)
+      assertEquals("1", page.next)
+    }
+  }
+
+  @Test fun goalTurnKeepsItsOwnBoundaryAndNotice() = runBlocking {
+    val snapshot = snapshotFrame(conversationRecords(turns = 2, steps = 25, goalTurns = setOf(1)), cursor = 1000, hasMore = false)
+    snapshotServer(snapshot).use { server ->
+      val messages = api(server).messagesPage("s1", null, HarnessClient.MESSAGE_PAGE).items
+      val rows = TranscriptRows.build(messages)
+      assertEquals(2, rows.count { it.kind == "tool-group" })
+      assertEquals(1, rows.count { it.kind == "user" })
+      assertEquals("目标轮次", rows.single { it.kind == "note" }.title)
+    }
+  }
+
+  @Test fun olderPageAsksForTurnAlignedWindow() = runBlocking {
+    val snapshot = snapshotFrame(conversationRecords(turns = 1, steps = 2), cursor = 1000, hasMore = true)
+    var captured: JSONObject? = null
+    snapshotServer(snapshot) { request ->
+      captured = JSONObject(request.body.readUtf8()).getJSONObject("payload")
+        .getJSONObject("args").getJSONObject("request")
+      envelope("""{"records":[],"hasMore":false}""")
+    }.use { server ->
+      val client = api(server)
+      val first = client.messagesPage("s1", null, HarnessClient.MESSAGE_PAGE)
+      assertNotNull(first.next)
+      val older = client.messagesPage("s1", first.next, HarnessClient.HISTORY_PAGE)
+      assertTrue(older.items.isEmpty())
+      val request = requireNotNull(captured)
+      assertEquals(HarnessClient.HISTORY_PAGE, request.getInt("maxMessages"))
+      assertEquals(50, request.getJSONObject("turnWindow").getInt("minMessages"))
+      assertEquals(2, request.getJSONObject("turnWindow").getInt("minTurns"))
     }
   }
 

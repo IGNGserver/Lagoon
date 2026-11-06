@@ -155,7 +155,7 @@ class OfflineCache internal constructor(
       fun items(list: List<Message>) = JSONArray().apply { list.forEach { message ->
         put(JSONObject().put("id", message.id).put("role", message.role).put("type", message.type).put("created", message.created).put("error", message.error)
           .put("errorType", message.errorType).put("completedAt", message.completedAt).put("finish", message.finish).put("agent", message.agent)
-          .put("retry", message.retry).put("queued", message.queued)
+          .put("retry", message.retry).put("queued", message.queued).put("turnId", message.turnId)
           .put("model", message.model?.let { model -> JSONObject().put("providerID", model.providerId).put("id", model.modelId).put("name", model.label).put("variant", model.variant) })
           .put("notice", message.notice?.let { notice -> JSONObject().put("label", notice.label).put("detail", notice.detail).put("items", JSONArray(notice.items))
             .put("target", notice.target).put("error", notice.error).put("running", notice.running) })
@@ -193,7 +193,8 @@ class OfflineCache internal constructor(
           part.arr("files").strings(), part.str("mime"), part.arr("attachments").toAttachments(), part.str("target").ifBlank { null }, part.optBoolean("background"))
       }, item.str("error").ifBlank { null }, item.str("agent").ifBlank { null }, item.obj("model").toModelChoice(),
         item.optLong("completedAt").takeIf { it > 0 }, item.str("finish").ifBlank { null }, item.str("errorType").ifBlank { null },
-        item.str("retry").ifBlank { null }, notice = notice, queued = item.optBoolean("queued"), type = item.str("type").ifBlank { role })
+        item.str("retry").ifBlank { null }, notice = notice, queued = item.optBoolean("queued"), type = item.str("type").ifBlank { role },
+        turnId = item.str("turnId").ifBlank { null })
     }
   } catch (cancel: CancellationException) {
     throw cancel

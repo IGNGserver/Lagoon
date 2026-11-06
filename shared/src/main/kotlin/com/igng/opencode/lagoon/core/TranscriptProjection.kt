@@ -36,14 +36,16 @@ internal fun mergeTranscript(existing: List<Message>, fetched: List<Message>, pe
 /**
  * Mirrors the official client's `needsOlderTurnRoot`: true when the oldest loaded boundary is an
  * assistant message, i.e. the window starts in the middle of a turn. The initial load then pulls one
- * more page so the first screen begins on a whole turn instead of a half reply.
+ * more page so the first screen begins on a whole turn instead of a half reply. A DSH assistant
+ * message carries a server turn id, so the Host already cut this window on `turn/start`; no extra
+ * page is needed (and fetching one would only load turns the user did not ask for).
  */
 internal fun needsOlderTurnRoot(messages: List<Message>): Boolean {
   val boundary = messages.firstOrNull { message ->
     message.role == "user" || message.role == "shell" || message.role == "assistant" ||
       (message.type == "synthetic" && (message.notice?.detail?.isNotBlank() == true || message.notice?.label?.isNotBlank() == true))
   }
-  return boundary?.role == "assistant"
+  return boundary?.role == "assistant" && boundary.turnId == null
 }
 
 /**
@@ -74,6 +76,13 @@ object TranscriptProjection {
 
   /** Event ids become message ids for records projected from that event (`messageIDFromEvent`). */
   fun messageId(event: ServerEvent): String = event.id.replace(Regex("^evt_"), "msg_")
+
+  /** DSH assistant ids are `msg_<turn>:<step>`; the turn prefix is the durable turn boundary. */
+  private fun turnIdOf(messageId: String): String? {
+    if (!messageId.startsWith("msg_") || !messageId.contains(':')) return null
+    val turn = messageId.removePrefix("msg_").substringBefore(':').toLongOrNull() ?: return null
+    return "turn:$turn"
+  }
 
   /** Null when the event does not touch the transcript. */
   fun apply(messages: List<Message>, event: ServerEvent): Result? {
@@ -112,11 +121,13 @@ object TranscriptProjection {
         val started = p.optLong("started").takeIf { it > 0 } ?: at
         if (existing >= 0) result(messages.toMutableList().also {
           it[existing] = it[existing].copy(agent = agent ?: it[existing].agent, model = model ?: it[existing].model, retry = null, error = null,
-            errorType = null, finish = null, completedAt = null, created = started)
+            errorType = null, finish = null, completedAt = null, created = started,
+            turnId = it[existing].turnId ?: turnIdOf(assistantId))
         }) else {
           val active = messages.indexOfLast { it.role == "assistant" && it.completedAt == null }
           val closed = if (active < 0) messages else messages.toMutableList().also { it[active] = it[active].copy(retry = null, completedAt = at) }
-          result(closed + Message(assistantId, "assistant", started, emptyList(), agent = agent, model = model, type = "assistant"))
+          result(closed + Message(assistantId, "assistant", started, emptyList(), agent = agent, model = model,
+            type = "assistant", turnId = turnIdOf(assistantId)))
         }
       }
       "session.step.ended" -> editAssistant { it.copy(completedAt = at, finish = p.str("finish").ifBlank { "stop" }) }

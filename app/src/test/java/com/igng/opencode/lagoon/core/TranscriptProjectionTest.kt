@@ -29,6 +29,12 @@ class TranscriptProjectionTest {
     assertNotNull(ended.last().completedAt)
   }
 
+  @Test fun dshLiveStepCarriesTheTurnBoundary() {
+    val messages = emptyList<Message>()
+      .apply("session.step.started", """{"sessionID":"s","assistantMessageID":"msg_7:3","agent":"build","started":5}""")
+    assertEquals("turn:7", messages.single().turnId)
+  }
+
   @Test fun eventsForAnAssistantThatWasNeverLoadedAreDropped() {
     val result = TranscriptProjection.apply(emptyList(), event("session.text.delta", """{"sessionID":"s","assistantMessageID":"msg_x","ordinal":0,"delta":"lost"}"""))!!
     assertTrue(result.messages.isEmpty())
@@ -174,6 +180,8 @@ class TranscriptProjectionTest {
     assertTrue(needsOlderTurnRoot(listOf(Message("a", "assistant", 2, emptyList()))))
     assertFalse(needsOlderTurnRoot(listOf(Message("u", "user", 1, emptyList()), Message("a", "assistant", 2, emptyList()))))
     assertFalse(needsOlderTurnRoot(listOf(Message("s", "shell", 1, emptyList()), Message("a", "assistant", 2, emptyList()))))
+    // DSH: a turn-aligned Host window already starts on turn/start, so the assistant is not a mid-turn cut.
+    assertFalse(needsOlderTurnRoot(listOf(Message("a", "assistant", 2, emptyList(), turnId = "turn:1"))))
     assertFalse(needsOlderTurnRoot(emptyList()))
   }
 }

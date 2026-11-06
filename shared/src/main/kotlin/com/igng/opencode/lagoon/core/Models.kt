@@ -88,7 +88,13 @@ data class Message(val id: String, val role: String, val created: Long, val part
   val agent: String? = null, val model: ModelChoice? = null, val completedAt: Long? = null, val finish: String? = null,
   val errorType: String? = null, val retry: String? = null, val notice: Notice? = null,
   /** Admitted input not yet delivered to the agent (`/inbox`); `queue` items wait for the current turn. */
-  val queued: Boolean = false, val type: String = role)
+  val queued: Boolean = false, val type: String = role,
+  /**
+   * Log turn identity for harnesses that expose one (DSH `turn/start`). It survives history pages and
+   * live events so one turn's assistant steps never merge into the previous turn when the new turn
+   * has no displayable user prompt (goal rounds, automatic continuation, compaction checkpoints).
+   */
+  val turnId: String? = null)
 
 /** Official `Notice` row: a label, optional detail/items and, for subagent results, the child session. */
 data class Notice(val label: String, val detail: String = "", val items: List<String> = emptyList(), val target: String? = null,
@@ -305,7 +311,8 @@ internal fun JSONObject.toMessage(): Message {
       val retry = optJSONObject("retry")
       Message(id, "assistant", created, parts, errorText("error").ifBlank { null }, str("agent").ifBlank { null }, obj("model").toModelChoice(),
         longPath("time", "completed").takeIf { it > 0 }, str("finish").ifBlank { null }, error?.str("type")?.ifBlank { null },
-        retry?.let { "第 ${it.optInt("attempt")} 次重试：${it.errorText("error")}" }, type = type)
+        retry?.let { "第 ${it.optInt("attempt")} 次重试：${it.errorText("error")}" }, type = type,
+        turnId = str("turnId").ifBlank { null })
     }
     "shell" -> Message(id, "shell", created, listOf(shellPart(id, str("command"), str("status"), opt("exit") as? Number, obj("output").str("output"))
       .copy(target = str("shellID").ifBlank { null })),

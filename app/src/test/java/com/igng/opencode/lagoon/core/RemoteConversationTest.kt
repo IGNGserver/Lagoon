@@ -118,7 +118,49 @@ class RemoteConversationTest {
       val (session, backend) = backend(host)
       try {
         val page = backend.client.messagesPage(id)
-        assertEquals(20, page.items.size)
+        // The whole Host window is installed; the old code truncated this to 20 and returned next=null.
+        assertEquals(500, page.items.size)
+      } finally { backend.close(); session.close() }
+    }
+  }
+
+  @Test fun openingWindowKeepsHasMoreAndPagesOlderOverRemote() = runBlocking {
+    val id = "session-${UUID.randomUUID()}"
+    val records = JSONArray()
+    repeat(30) { index ->
+      val step = index + 1
+      records.put(JSONObject().put("type", "event").put("event", JSONObject().put("type", "assistant/message")
+        .put("seq", step).put("time", 100L + step).put("data", JSONObject().put("turn", 1).put("step", step)
+          .put("message", JSONObject().put("role", "assistant")
+            .put("content", JSONArray().put(JSONObject().put("type", "text").put("text", "第 $step 段")))))))
+    }
+    val snapshot = JSONObject().put("type", "snapshot")
+      .put("header", JSONObject().put("version", 4).put("id", id).put("createdAt", 1).put("cwd", "/repo"))
+      .put("cursor", 1000).put("records", records).put("hasMore", true)
+      .put("projections", JSONObject().put("asOfSeq", 30).put("values", JSONObject()))
+    FakeRemoteHost().use { host ->
+      host.call = { endpoint, _ ->
+        when (endpoint) {
+          "session/list" -> host.ok(JSONObject().put("items", JSONArray().put(sessionRow(id))))
+          "session/page" -> host.ok(JSONObject().put("records", JSONArray()).put("hasMore", false))
+          else -> host.ok(JSONObject())
+        }
+      }
+      host.streamFrames = { endpoint, _ -> if (endpoint == "session/follow") listOf(snapshot) else emptyList() }
+      host.start()
+      val (session, backend) = backend(host)
+      try {
+        val page = backend.client.messagesPage(id)
+        assertEquals(30, page.items.size)
+        assertTrue("hasMore 必须变成 older cursor", page.next != null)
+        val older = backend.client.messagesPage(id, page.next, HarnessClient.HISTORY_PAGE)
+        assertTrue(older.items.isEmpty())
+        val request = host.rpcCalls.last { it.getString("method") == "harness.remote.call" &&
+          it.getJSONObject("params").getString("endpoint") == "session/page" }
+          .getJSONObject("params").getJSONObject("payload").getJSONObject("args").getJSONObject("request")
+        assertEquals(HarnessClient.HISTORY_PAGE, request.getInt("maxMessages"))
+        assertEquals(50, request.getJSONObject("turnWindow").getInt("minMessages"))
+        assertEquals(2, request.getJSONObject("turnWindow").getInt("minTurns"))
       } finally { backend.close(); session.close() }
     }
   }

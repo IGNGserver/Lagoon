@@ -2838,7 +2838,7 @@ class LagoonController private constructor(private val appContext: Context) {
       val page = async { attempt {
         // A cacheable conversation opens from its verified stored run plus only what is new on the server.
         if (sync != null && initialWindow) sync.open(client, serverId, session).also { opened = it; nextCursor = it.olderCursor }.messages
-        else client.messageRecords(session.id).let { nextCursor = it.next; records = it.items; reachedStart = it.items.size < HarnessClient.MESSAGE_PAGE; it.items.map(MessageRecord::message) }
+        else client.messageRecords(session.id).let { nextCursor = it.next; records = it.items; reachedStart = it.next == null; it.items.map(MessageRecord::message) }
       } }
       val inbox = async { attempt { client.inbox(session.id) } }
       page.await() to inbox.await().getOrDefault(emptyList())
@@ -2853,10 +2853,10 @@ class LagoonController private constructor(private val appContext: Context) {
         var extra = 0
         while (cursor != null && extra < MAX_INITIAL_PAGES && needsOlderTurnRoot(merged) && current()) {
           val older = attempt { client.messageRecords(session.id, cursor, HarnessClient.MESSAGE_PAGE) }.getOrElse { break }
-          if (older.items.isEmpty()) { nextCursor = older.next; reachedStart = true; break }
+          if (older.items.isEmpty()) { nextCursor = older.next; reachedStart = older.next == null; break }
           merged.addAll(0, older.items.map(MessageRecord::message))
           records = older.items + records
-          reachedStart = older.items.size < HarnessClient.MESSAGE_PAGE
+          reachedStart = older.next == null
           nextCursor = older.next
           cursor = older.next
           extra++

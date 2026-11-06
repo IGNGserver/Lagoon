@@ -36,4 +36,13 @@ class OfflineCacheTruncationTest {
     assertTrue(restored.queued)
     assertTrue(cache.messagesComplete("s", "sess"))
   }
+
+  @Test fun dshTurnBoundarySurvivesTheOfflineCache() = runBlocking {
+    val cache = cache()
+    val message = Message("msg_7:1", "assistant", 1, listOf(MessagePart("p", "text", text = "hi")),
+      type = "assistant", turnId = "turn:7")
+    cache.saveMessages("s", "sess", listOf(message), complete = true)
+    cache.awaitWrites()
+    assertEquals("turn:7", cache.messages("s", "sess").single().turnId)
+  }
 }

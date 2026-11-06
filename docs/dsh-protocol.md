@@ -167,6 +167,14 @@
 - 时间线由 `turn/step/assistant/tool` 事件折算为控制器认识的 `session.*` 事件；
   实时文本来自 `assistant-stream` 帧（`text-delta`/`reasoning-delta` 折算为
   `session.text.delta` / `session.reasoning.delta`，耐久消息到达时用 `*.ended` 收口）。
+- 历史窗口：首屏直接装入 `session/follow` 快照的 turn 窗口（与官方客户端一致：最多 500 条消息、
+  至少 50 条 / 2 轮），不再用消息级 `size` 二次截断；`hasMore=true` 时把本页最早 record 的 seq
+  作为 `session/page` 的 `beforeSeq`。更早页同样带 `turnWindow{minMessages:min(size,50),minTurns:2}`，
+  让窗口从 `turn/start` 开始，而不是从一轮中间开始。
+- 轮次边界：`turn/start` 折算为 `Message.turnId`（`turn:<n>`），`TranscriptRows` 按它切 turn，
+  因此 goal 轮、自动继续、压缩检查点这类没有可显示用户提问的轮次不会并入上一轮。
+  `goal` / `tool-goal` / `compact-checkpoint` 注入轮次折成一行 notice（“目标轮次”/“目标完成”/
+  “上下文已压缩”），不展示模型侧原文；`time-context`、runtime context、skill catalog 等继续隐藏。
 - 审批/问答：瀑布事件折算为 `permission.asked` / `form.created`，回应走 `$events/result`；
   其他客户端结算时收到 `cancel` 帧，按本地待办移除并折算为 `permission.replied` / `form.cancelled`。
   `$events` 重连后 Host 会把仍在等待的瀑布按原 eventId 重新投递给新客户端；宽限 3 秒内没有重新投递的本地待办

@@ -578,9 +578,11 @@ class DshApi(
   override suspend fun messagesPage(id: String, cursor: String?, size: Int): ApiPage<Message> = withContext(Dispatchers.IO) {
     val session = sessionOrFetch(id)
     rememberWatched(listOf(session))
-    val wanted = size.coerceAtLeast(1)
+    val wanted = size.coerceIn(1, SNAPSHOT_MAX_MESSAGES)
     if (cursor == null) {
-      // 首屏：`session/follow` 的首帧快照直接给出完整日志（`records` + 切点 `cursor`）。
+      // 首屏：`session/follow` 的首帧快照是 Host 按 maxMessages/turnWindow 切好的 turn 窗口
+      // （与官方客户端一致：最多 500 条、至少 2 轮）。整窗装入，不再用消息级 size 二次截断；
+      // size 只用于后续 `session/page`。二次截断会从轮次中间开始，丢掉这一轮的用户提问。
       // 取快照的流会继续留着做实时流，不再取完就取消。
       val snapshot = snapshotFor(session)
       val through = snapshot.optDouble("cursor", 0.0).toLong()
@@ -591,14 +593,19 @@ class DshApi(
       // 空白会话排障：记录“拿到了什么”，不记录任何消息内容。
       val snapshotCursor = snapshot.optDouble("cursor", -1.0).toLong()
       val snapshotHasMore = snapshot.optBoolean("hasMore")
+      // 与官方 `installWindow(entries, hasMore)` 对齐：hasMore 就是“还能向更早翻页”，
+      // next 取本页最早一条记录的 seq（等价于官方的 baseSeq / beforeSeq）。
+      val next = if (snapshotHasMore && records.isNotEmpty()) earlierCursor(records) else null
       snapshotStats[session.id] = RemoteSnapshotStats(session.id, records.size, messages.size,
-        snapshotCursor, snapshotHasMore)
+        snapshotCursor, snapshotHasMore, pageNext = next?.toLongOrNull())
       Diagnostics.info("DshApi", "session/follow 快照 · ${address(id).str("kind")} · records=${records.size} " +
-        "messages=${messages.size} cursor=$snapshotCursor hasMore=$snapshotHasMore")
+        "messages=${messages.size} cursor=$snapshotCursor hasMore=$snapshotHasMore next=${next ?: "-"}")
       // 时间线被整页替换：清掉实时部件记录，让后续增量重建部件而不是写进已消失的行。
       liveParts.keys.filter { it.startsWith("${session.id}|") }.forEach { liveParts.remove(it) }
       advanceSeq(id, records.mapNotNull { it.obj("event").optDouble("seq", 0.0).toLong().takeIf { value -> value > 0 } }.maxOrNull())
-      ApiPage(messages.takeLast(wanted), null)
+      // 不截断：Host 已经限制了窗口大小，且窗口起点是 turn/start。这里再 takeLast(size)
+      // 会把用户提问切掉，UI 只剩最新一轮的 assistant 步骤。
+      ApiPage(messages, next)
     } else {
       val through = cursors[id] ?: run {
         val snapshot = snapshotFor(session)
@@ -611,7 +618,19 @@ class DshApi(
         .put("throughSeq", through)
         .put("beforeSeq", before)
         .put("maxMessages", wanted)
-      val page = callObject("session/page", requestArgs(request))
+        // 与官方翻页一致：至少 50 条、至少 2 个 turn 再切，避免一页从轮次中间开始。
+        // 0.2.x 早期 Host 若不认识 turnWindow，下面会降级重试一次。
+        .put("turnWindow", JSONObject()
+          .put("minMessages", wanted.coerceAtMost(SNAPSHOT_MIN_MESSAGES))
+          .put("minTurns", 2))
+      val page = try {
+        callObject("session/page", requestArgs(request))
+      } catch (error: Exception) {
+        if (!isGatewayArgumentsInvalid(error)) throw error
+        request.remove("turnWindow")
+        Diagnostics.info("DshApi", "session/page 不接受 turnWindow，已降级为消息窗口")
+        callObject("session/page", requestArgs(request))
+      }
       val records = page.arr("records").objects()
       val messages = recordsToMessages(session, records)
       val next = if (page.optBoolean("hasMore")) earlierCursor(records) else null
@@ -1571,32 +1590,63 @@ class DshApi(
   /**
    * 把 DSH 的事件日志折算成 OpenCode 形状的消息：一条 `(turn, step)` 就是一条 assistant 消息，
    * `user/message` 是一条用户消息。工具调用的输入来自 `tool/call`，输出来自 `tool/result`。
+   *
+   * 每个 assistant 消息带上 `turnId`：DSH 的 `turn/start` 是真正的轮次边界，但 goal 轮、自动继续、
+   * 压缩检查点这些轮次没有可显示的用户提问；只按 user 消息切轮会让它们和上一轮合并。
+   * 注入类 turn root（goal / goal complete / compaction checkpoint）折成一行 notice，既不展示
+   * 模型侧原文，也不丢失轮次起点。
    */
   private fun recordsToMessages(session: Session, records: List<JSONObject>): List<Message> {
     data class ToolEntry(val id: String, val name: String, val input: JSONObject, var output: String, var done: Boolean)
-    data class Step(val turn: Long, val step: Long, var started: Long, val blocks: MutableList<JSONObject>, val tools: MutableMap<String, ToolEntry>, var ended: Long)
+    data class Step(val turn: Long, val step: Long, var started: Long, var order: Int,
+      val blocks: MutableList<JSONObject>, val tools: MutableMap<String, ToolEntry>, var ended: Long)
+    data class UserEntry(val created: Long, val order: Int, val turn: Long?, val data: JSONObject)
+    data class NoticeEntry(val created: Long, val order: Int, val turn: Long?, val id: String,
+      val label: String, val detail: String, val type: String)
 
     val steps = LinkedHashMap<Pair<Long, Long>, Step>()
-    val users = mutableListOf<Pair<Long, JSONObject>>()
+    val users = mutableListOf<UserEntry>()
+    val notices = mutableListOf<NoticeEntry>()
+    var currentTurn: Long? = null
+    var order = 0
     fun stepOf(data: JSONObject): Step {
       val turn = data.optDouble("turn", 0.0).toLong()
       val number = data.optDouble("step", 0.0).toLong()
-      return steps.getOrPut(turn to number) { Step(turn, number, 0, mutableListOf(), mutableMapOf(), 0) }
+      return steps.getOrPut(turn to number) { Step(turn, number, 0, order, mutableListOf(), mutableMapOf(), 0) }
     }
 
     for (record in records) {
+      order++
       val event = record.obj("event")
       val type = event.str("type")
+      val seq = event.optDouble("seq", 0.0).toLong()
       val time = event.optDouble("time", 0.0).toLong()
       val data = event.obj("data")
       when (type) {
+        "turn/start" -> currentTurn = data.optDouble("turn", 0.0).toLong().takeIf { it > 0 }
         "step/start" -> stepOf(data).let { if (it.started == 0L) it.started = time }
         "step/end" -> stepOf(data).ended = time
         // DSH also writes model-facing context (runtime / time snapshots) as user messages; only the
         // user's own prompts (`source.kind` = user, or no source on older hosts) are timeline rows.
-        "user/message" -> if (data.obj("source").str("kind").let { it.isBlank() || it == "user" }) users += time to data
+        "user/message" -> {
+          val kind = data.obj("source").str("kind")
+          val rawId = data.str("id")
+          when {
+            kind.isBlank() || kind == "user" -> users += UserEntry(time, order, currentTurn, data)
+            kind == "goal" || kind == "tool-goal" || kind == "compact-checkpoint" -> {
+              val text = data.arr("content").objects().mapNotNull { block -> block.str("text").takeIf(String::isNotBlank) }.joinToString("\n")
+              val notice = injectedNotice(kind, text)
+              if (notice != null) {
+                notices += NoticeEntry(time, order, currentTurn, rawId.ifBlank { "notice:$seq" }, notice.first, notice.second, kind)
+              }
+            }
+            // time-context / runtime-context / skill-catalog / agent-instructions are model-facing
+            // context, not timeline rows; keep them out like the official transcript does.
+          }
+        }
         "assistant/message" -> {
           val step = stepOf(data)
+          if (step.started == 0L) step.started = time
           for (block in data.obj("message").arr("content").objects()) {
             if (block.str("type") == "tool-call") continue
             step.blocks += block
@@ -1604,11 +1654,13 @@ class DshApi(
         }
         "tool/call" -> {
           val step = stepOf(data)
+          if (step.started == 0L) step.started = time
           val callId = data.str("callId")
           if (callId.isNotBlank()) step.tools[callId] = ToolEntry(callId, data.str("name"), parseArguments(data.str("arguments")) as? JSONObject ?: JSONObject(), "", false)
         }
         "tool/result" -> {
           val step = stepOf(data)
+          if (step.started == 0L) step.started = time
           val message = data.obj("message")
           val callId = message.str("toolCallId").ifBlank { data.str("callId") }
           step.tools[callId]?.let { entry ->
@@ -1619,17 +1671,25 @@ class DshApi(
       }
     }
 
-    val entries = mutableListOf<Pair<Long, Message>>()
-    for ((created, data) in users) {
-      val text = data.arr("content").objects().mapNotNull { it.str("text").takeIf(String::isNotBlank) }.joinToString("\n")
-      val id = data.str("id").ifBlank { "user:${data.optDouble("seq", 0.0).toLong()}" }
+    // Sort by the event time and use the record position as a tie-breaker: a page can contain a user
+    // prompt, an injected goal row and a step at the same millisecond.
+    val entries = mutableListOf<Triple<Long, Int, Message>>()
+    for (user in users) {
+      val text = user.data.arr("content").objects().mapNotNull { it.str("text").takeIf(String::isNotBlank) }.joinToString("\n")
+      val id = user.data.str("id").ifBlank { "user:${user.created}" }
       val json = JSONObject()
         .put("id", id)
         .put("type", "user")
         .put("text", text)
-        .put("time", JSONObject().put("created", created))
+        .put("time", JSONObject().put("created", user.created))
         .put("metadata", JSONObject().put("displayText", text))
-      entries += created to json.toMessage()
+      entries += Triple(user.created, user.order,
+        json.toMessage().copy(turnId = user.turn?.let { "turn:$it" }))
+    }
+    for (notice in notices) {
+      entries += Triple(notice.created, notice.order, Message(notice.id, "notice", notice.created, emptyList(),
+        notice = Notice(notice.label, notice.detail), type = notice.type,
+        turnId = notice.turn?.let { "turn:$it" }))
     }
     for (step in steps.values) {
       val id = "msg_${step.turn}:${step.step}"
@@ -1661,10 +1721,26 @@ class DshApi(
       if (model != null) {
         json.put("model", JSONObject().put("providerID", model.providerId).put("id", model.modelId).put("name", model.label))
       }
-      entries += step.started to json.toMessage()
+      entries += Triple(step.started, step.order,
+        json.toMessage().copy(turnId = "turn:${step.turn}"))
     }
-    entries.sortBy { it.first }
-    return entries.map { it.second }
+    entries.sortWith(compareBy<Triple<Long, Int, Message>> { it.first }.thenBy { it.second })
+    return entries.map { it.third }
+  }
+
+  /** Turn roots that DSH injects as model-facing user messages; show a compact label, never the prompt. */
+  private fun injectedNotice(kind: String, text: String): Pair<String, String>? = when (kind) {
+    "goal" -> "目标轮次" to goalDetail(text)
+    "tool-goal" -> "目标完成" to goalDetail(text)
+    "compact-checkpoint" -> "上下文已压缩" to ""
+    else -> null
+  }
+
+  private fun goalDetail(text: String): String {
+    val round = Regex("Round:\\s*(\\d+/\\d+)").find(text)?.groupValues?.get(1).orEmpty()
+    val objective = Regex("Objective:\\s*\"([^\"]*)\"").find(text)?.groupValues?.get(1)?.trim().orEmpty()
+    val excerpt = objective.take(160).let { if (objective.length > 160) "$it…" else it }
+    return listOf(round, excerpt).filter(String::isNotBlank).joinToString(" · ")
   }
 
   // ---------------------------------------------------------------- 写操作

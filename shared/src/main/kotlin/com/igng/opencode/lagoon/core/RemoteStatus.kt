@@ -68,7 +68,9 @@ data class RemoteSnapshotStats(
   val cursor: Long,
   val hasMore: Boolean,
   val at: Long = System.currentTimeMillis(),
-  val error: String? = null
+  val error: String? = null,
+  /** 首屏返回给 UI 的 older cursor（`session/page` 的 beforeSeq）；null 表示没有更早历史。 */
+  val pageNext: Long? = null
 )
 
 data class RemoteFollowStats(
@@ -145,7 +147,7 @@ data class RemoteDoctor(
   }
 
   private fun snapshotLabel(value: RemoteSnapshotStats): String = buildString {
-    append("records=${value.records} messages=${value.messages} cursor=${value.cursor} hasMore=${value.hasMore}")
+    append("records=${value.records} messages=${value.messages} cursor=${value.cursor} hasMore=${value.hasMore} next=${value.pageNext ?: "-"}")
     append(" · ${ago(value.at)}")
     value.error?.let { append(" · 失败: $it") }
   }

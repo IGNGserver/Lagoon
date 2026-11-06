@@ -38,6 +38,40 @@ class TranscriptRowsTest {
     assertEquals(2, far.count { it.kind == "time" })
   }
 
+  @Test fun assistantOnlyTurnsSplitByTurnId() {
+    val first = assistant("msg_1:1", t0 + 500, tool("t1", "bash", input = """{"command":"ls"}"""))
+      .copy(turnId = "turn:1")
+    val second = assistant("msg_2:1", t0 + 1_500, tool("t2", "bash", input = """{"command":"pwd"}"""))
+      .copy(turnId = "turn:2")
+    val rows = TranscriptRows.build(listOf(first, second))
+    // Without turnId these two assistant-only turns merged into one group.
+    assertEquals(2, rows.count { it.kind == "tool-group" })
+  }
+
+  @Test fun injectedTurnRootNoticeStartsANewTurn() {
+    val goal = Message("goal-1", "notice", t0, emptyList(), notice = Notice("目标轮次", "目标 1"),
+      type = "goal", turnId = "turn:1")
+    val first = assistant("msg_1:1", t0 + 500, tool("t1", "bash", input = """{"command":"ls"}"""))
+      .copy(turnId = "turn:1")
+    val second = assistant("msg_2:1", t0 + 1_500, tool("t2", "bash", input = """{"command":"pwd"}"""))
+      .copy(turnId = "turn:2")
+    val rows = TranscriptRows.build(listOf(goal, first, second))
+    assertEquals(1, rows.count { it.kind == "note" && it.title == "目标轮次" })
+    assertEquals(2, rows.count { it.kind == "tool-group" })
+  }
+
+  @Test fun userPromptJoinsTheNoticeTurnWithTheSameTurnId() {
+    val goal = Message("goal-1", "notice", t0, emptyList(), notice = Notice("目标轮次", "目标 1"),
+      type = "goal", turnId = "turn:1")
+    val prompt = user("u1", t0 + 100).copy(turnId = "turn:1")
+    val first = assistant("msg_1:1", t0 + 500, tool("t1", "bash", input = """{"command":"ls"}"""))
+      .copy(turnId = "turn:1")
+    val rows = TranscriptRows.build(listOf(goal, prompt, first))
+    assertEquals(1, rows.count { it.kind == "user" })
+    assertEquals(1, rows.count { it.kind == "tool-group" })
+    assertEquals(1, rows.count { it.kind == "note" && it.title == "目标轮次" })
+  }
+
   @Test fun mixedToolCallsBetweenTextsFoldIntoOneGroup() {
     val parts = listOf(
       tool("t1", "read", input = """{"filePath":"a.kt"}"""),

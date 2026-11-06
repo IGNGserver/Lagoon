@@ -56,7 +56,7 @@ object TranscriptRows {
   private val ACTIVE_STATUSES = setOf("running", "pending")
   private val clock: DateTimeFormatter = DateTimeFormatter.ofPattern("M月d日 HH:mm").withZone(ZoneId.systemDefault())
 
-  private class Turn(val id: String, val created: Long, val user: Message? = null, val shell: Message? = null) {
+  private class Turn(val id: String, val created: Long, var user: Message? = null, val shell: Message? = null, var turnId: String? = null) {
     val entries = mutableListOf<Message>()
   }
 
@@ -74,13 +74,47 @@ object TranscriptRows {
     var current: Turn? = null
     visible.forEach { message ->
       when (message.role) {
-        "notice" -> current?.entries?.add(message) ?: leading.add(message)
-        "shell" -> Turn(message.id, message.created, shell = message).also { turns += it; current = it }
-        "user" -> if (users.add(message.id)) Turn(message.id, message.created, user = message).also { turns += it; current = it }
+        "notice" -> {
+          val turn = current
+          if (turn == null) {
+            if (message.turnId != null) {
+              // A turn-aligned page can start on an injected root (goal / compaction) with no user row.
+              Turn(message.id, message.created, turnId = message.turnId).also { it.entries += message; turns += it; current = it }
+            } else {
+              leading.add(message)
+            }
+          } else if ((turn.shell != null && message.turnId != null) ||
+            (message.turnId != null && turn.turnId != null && message.turnId != turn.turnId)) {
+            Turn(message.id, message.created, turnId = message.turnId).also { it.entries += message; turns += it; current = it }
+          } else {
+            turn.entries += message
+            if (turn.turnId == null) turn.turnId = message.turnId
+          }
+        }
+        "shell" -> Turn(message.id, message.created, shell = message, turnId = message.turnId).also { turns += it; current = it }
+        "user" -> if (users.add(message.id)) {
+          val turn = current
+          if (turn != null && turn.shell == null && turn.user == null &&
+            message.turnId != null && message.turnId == turn.turnId) {
+            // A notice (goal / compaction root) may already have opened this turn; attach the prompt
+            // instead of splitting one log turn into two UI turns.
+            turn.user = message
+          } else {
+            Turn(message.id, message.created, user = message, turnId = message.turnId).also { turns += it; current = it }
+          }
+        }
         "assistant" -> {
           val turn = current
-          if (turn != null && turn.shell == null) turn.entries += message
-          else Turn(message.id, message.created).also { it.entries += message; turns += it; current = it }
+          // DSH turn boundaries survive even when a turn has no displayable user prompt (goal rounds,
+          // automatic continuation, compaction checkpoints). Without turnId those assistant steps
+          // would merge into the previous turn and collapse into one tool group.
+          if (turn != null && turn.shell == null &&
+            (message.turnId == null || turn.turnId == null || message.turnId == turn.turnId)) {
+            turn.entries += message
+            if (turn.turnId == null) turn.turnId = message.turnId
+          } else {
+            Turn(message.id, message.created, turnId = message.turnId).also { it.entries += message; turns += it; current = it }
+          }
         }
       }
     }
