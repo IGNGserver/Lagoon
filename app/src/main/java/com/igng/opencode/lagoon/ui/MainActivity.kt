@@ -95,7 +95,7 @@ class MainActivity : ComponentActivity() {
        var showingAddDevice by rememberSaveable { mutableStateOf(false) }
        var addingOpenCodeId by rememberSaveable { mutableStateOf<String?>(null) }
        var addingSshHostId by rememberSaveable { mutableStateOf<String?>(null) }
-       var showingProjects by rememberSaveable { mutableStateOf(false) }
+       var showingScope by rememberSaveable { mutableStateOf(false) }
        var showingModelManagement by rememberSaveable { mutableStateOf(false) }
        var showingRemoteEnroll by rememberSaveable { mutableStateOf(false) }
        var showingRemoteHosts by rememberSaveable { mutableStateOf(false) }
@@ -300,9 +300,7 @@ class MainActivity : ComponentActivity() {
                    else startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, packageName))
                  }, onManageModels = { showingModelManagement = true },
                    onManageDevices = { openPage(RootPage.DEVICES) }, onAddDevice = { addDevice() }, onBack = { goBack() })
-                 else -> HomeScreen(home, controller, onOpen = { openSession(it) }, onNewSession = { openDraft() }, onProjects = { showingProjects = true },
-                    onSelectGroup = { group -> controller.selectGroup(group.id) },
-                    onEditGroup = { group -> editingGroupId = group.id; showingDeviceGroups = true },
+                 else -> HomeScreen(home, controller, onOpen = { openSession(it) }, onNewSession = { openDraft() }, onScope = { showingScope = true },
                     onManageDevices = { openPage(RootPage.DEVICES) },
                     onPage = ::openPage)
               }
@@ -363,10 +361,21 @@ class MainActivity : ComponentActivity() {
                 showingServerForm = false; editingServerId = null
                 if (add) showingRemoteEnroll = true else showingRemoteHosts = true
               })
-             if (showingProjects) {
-               if (home.allServers) AllServersScopeSheet(home, controller) { showingProjects = false }
-               else ProjectScopeSheet(home, controller) { showingProjects = false }
-             }
+             if (showingScope) HomeScopeSheet(
+               state = home,
+               controller = controller,
+               onDismiss = { showingScope = false },
+               // Opening the group editor replaces the scope sheet instead of stacking two sheets.
+               onEditGroup = { group ->
+                 showingScope = false
+                 editingGroupId = group.id
+                 showingDeviceGroups = true
+               },
+               onManageDevices = {
+                 showingScope = false
+                 openPage(RootPage.DEVICES)
+               }
+             )
              if (showingDeviceGroups) DeviceGroupsSheet(state, controller, editingGroupId, onDismiss = {
                showingDeviceGroups = false; editingGroupId = null
              })

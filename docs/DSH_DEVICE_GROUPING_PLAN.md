@@ -4,6 +4,9 @@
 > 首页不再为未分组 profile 显示单例 tab，设备管理与添加设备页见
 > [`DEVICE_MANAGEMENT.md`](DEVICE_MANAGEMENT.md)。SSH 主机见 [`SSH_HOSTS.md`](SSH_HOSTS.md)。
 > 本文 M0–M4 保留为当时的实现记录，其中“未分组 profile 仍是 tab”“顶栏保留加号”等描述已过时。
+>
+> **2026-11-06 更新**：首页的 `DeviceChips` 横向胶囊已删除；设备、分组、项目与工作区现在统一由
+> 左上角标题打开的 `HomeScopeSheet` 承载。本文中关于顶栏 chip 的描述均为历史实现。
 
 本文是 [`DSH_REMOTE_MULTI_HOST.md`](DSH_REMOTE_MULTI_HOST.md) 的落地计划。目标是在**不修改 ds-harness-remote Hub、不给 Host 插件打补丁、不要求开发机改配置**的前提下：
 

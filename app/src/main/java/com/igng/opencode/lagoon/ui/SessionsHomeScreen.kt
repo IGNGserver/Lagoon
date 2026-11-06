@@ -8,7 +8,6 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
@@ -20,6 +19,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.graphics.Color
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.ui.input.pointer.pointerInput
@@ -38,14 +38,15 @@ import top.yukonga.miuix.kmp.extra.SuperDialog
 import top.yukonga.miuix.kmp.icon.MiuixIcons
 import top.yukonga.miuix.kmp.icon.extended.*
 import top.yukonga.miuix.kmp.theme.MiuixTheme
-import top.yukonga.miuix.kmp.utils.PressFeedbackType
 import top.yukonga.miuix.kmp.utils.overScrollVertical
 
 /**
- * 会话首页，结构对齐 Qoder 的任务列表：标题「全部会话 ⌄」选择项目范围，右上角 ⋯ 收纳分组方式、搜索与设置，
- * 标题下一行是服务器胶囊（点按切换、长按编辑、＋ 添加），列表按日期 / 项目 / 状态分组且每组可收起，
+ * 会话首页，结构对齐 Qoder 的任务列表：标题「全部设备 ⌄」打开统一范围面板（全部设备 / 设备分组 /
+ * 单台连接，以及当前服务器的项目或工作区），右上角 ⋯ 收纳分组方式、搜索与设置。首页不再有横向的
+ * 服务器胶囊行：标题旁的小圆点聚合当前范围的连接健康。列表按日期 / 项目 / 状态分组且每组可收起，
  * 长按会话弹出置顶 / 重命名 / 删除，右下角悬浮按钮新建会话。
- * 状态与未读语义沿用 docs/HOME_REDESIGN.md（未读账本、父链汇总），分组从不改变会话的活动时间顺序。
+ * 状态与未读语义沿用 docs/HOME_REDESIGN.md（未读账本、父链汇总）；日期分组按状态优先级排序，
+ * 其他分组仍保持活动时间顺序。
  */
 @Composable
 internal fun HomeScreen(
@@ -53,9 +54,7 @@ internal fun HomeScreen(
   controller: LagoonController,
   onOpen: (SessionTarget) -> Unit,
   onNewSession: () -> Unit,
-  onProjects: () -> Unit,
-  onSelectGroup: (DeviceGroup) -> Unit = {},
-  onEditGroup: (DeviceGroup) -> Unit = {},
+  onScope: () -> Unit,
   onManageDevices: () -> Unit = {},
   onPage: (RootPage) -> Unit
 ) {
@@ -89,7 +88,8 @@ internal fun HomeScreen(
            else -> state.scopeProjectId?.let { id -> state.projects.firstOrNull { it.id == id }?.name }
              ?: state.server?.name ?: "全部会话"
          },
-        onTitleClick = onProjects,
+        statusDot = homeScopeDot(state),
+        onTitleClick = onScope,
         action = if (hasUnread) {
           {
             Text("全部已读", Modifier.clip(CircleShape).clickable(role = Role.Button) { controller.markAllRead() }
@@ -119,8 +119,6 @@ internal fun HomeScreen(
           }
         }
       )
-      if (!searching) DeviceChips(state, onSelectAll = { controller.setAllServers(true) },
-        onSelectGroup = onSelectGroup, onEditGroup = onEditGroup, onManageDevices = onManageDevices)
       if (!searching) GlobalTaskStrip(state, controller, onArchived = {
         controller.setAllServers(true)
         onPage(RootPage.ARCHIVED)
@@ -211,7 +209,13 @@ private fun GlobalTaskStrip(state: LagoonState, controller: LagoonController, on
 }
 
 @Composable
-private fun HomeTopBar(title: String, onTitleClick: () -> Unit, action: (@Composable () -> Unit)? = null, menu: @Composable () -> Unit) {
+private fun HomeTopBar(
+  title: String,
+  statusDot: Color?,
+  onTitleClick: () -> Unit,
+  action: (@Composable () -> Unit)? = null,
+  menu: @Composable () -> Unit
+) {
   Row(Modifier.fillMaxWidth().statusBarsPadding().heightIn(min = 64.dp).padding(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 4.dp),
     verticalAlignment = Alignment.CenterVertically) {
     Box(Modifier.weight(1f)) {
@@ -221,8 +225,12 @@ private fun HomeTopBar(title: String, onTitleClick: () -> Unit, action: (@Compos
       Spacer(Modifier.width(10.dp))
       Text(title, Modifier.weight(1f, fill = false), maxLines = 1, overflow = TextOverflow.Ellipsis,
         style = MiuixTheme.textStyles.title2.copy(fontWeight = FontWeight.Medium, color = MiuixTheme.colorScheme.onSurface))
+      statusDot?.let {
+        Spacer(Modifier.width(6.dp))
+        StatusDot(it)
+      }
       Spacer(Modifier.width(4.dp))
-      DropdownChevron(20.dp, MiuixTheme.colorScheme.onSurface, "切换项目范围")
+      DropdownChevron(20.dp, MiuixTheme.colorScheme.onSurface, "切换范围")
     }
     }
     Spacer(Modifier.width(8.dp))
@@ -232,104 +240,32 @@ private fun HomeTopBar(title: String, onTitleClick: () -> Unit, action: (@Compos
 }
 
 /**
- * 全部 + explicit device groups. Ungrouped profiles deliberately do not get a tab (they remain in
- * 全部 and in 设备管理), and there is no trailing ＋: adding a device lives in 设备管理.
+ * Aggregate connection health of the current scope, replacing the dots the old capsule row showed.
+ * Green means at least one member is streaming, amber means connected or connecting, and muted means
+ * nothing is reachable. It is one small dot, not another selector row.
  */
 @Composable
-private fun DeviceChips(
-  state: LagoonState,
-  onSelectAll: () -> Unit,
-  onSelectGroup: (DeviceGroup) -> Unit,
-  onEditGroup: (DeviceGroup) -> Unit,
-  onManageDevices: () -> Unit
-) {
+private fun homeScopeDot(state: LagoonState): Color? {
+  val profiles = when {
+    state.allServers -> state.enabledProfiles
+    state.homeGroupId != null -> state.deviceTabs.firstOrNull { it.group?.id == state.homeGroupId }?.profiles.orEmpty()
+    else -> listOfNotNull(state.server)
+  }
   fun connected(profile: ServerProfile): Boolean =
     if (profile.id == state.serverId) state.connected else state.allServerSnapshots[profile.id]?.connected == true
   fun streaming(profile: ServerProfile): Boolean =
     if (profile.id == state.serverId) state.streamConnected else state.allServerSnapshots[profile.id]?.streamConnected == true
   fun loading(profile: ServerProfile): Boolean =
     if (profile.id == state.serverId) state.loading else state.allServerSnapshots[profile.id]?.loading == true
-  @Composable
-  fun dot(profiles: List<ServerProfile>, current: Boolean): androidx.compose.ui.graphics.Color? {
-    val anyConnected = profiles.any(::connected)
-    val anyStreaming = profiles.any(::streaming)
-    val anyLoading = profiles.any(::loading)
-    return when {
-      anyConnected && anyStreaming -> MiuixColorTokens.Success
-      anyConnected || anyLoading -> MiuixColorTokens.Warning
-      current || state.allServers || profiles.isEmpty() -> MiuixTheme.colorScheme.onSurfaceVariantSummary
-      else -> null
-    }
-  }
-  LazyRow(Modifier.fillMaxWidth(), contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
-    horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-    item(key = "all-devices") {
-      val current = state.allServers
-      val color = dot(state.enabledProfiles, current)
-      Card(
-        cornerRadius = 20.dp,
-        insideMargin = PaddingValues(horizontal = 16.dp),
-        colors = CardDefaults.defaultColors(color = if (current) MiuixColorTokens.PrimarySubtle else MiuixTheme.colorScheme.secondaryContainer),
-        pressFeedbackType = PressFeedbackType.Sink,
-        onClick = onSelectAll,
-        onLongPress = onManageDevices
-      ) {
-        Row(Modifier.heightIn(min = 40.dp), verticalAlignment = Alignment.CenterVertically) {
-          color?.let { StatusDot(it); Spacer(Modifier.width(8.dp)) }
-          Text("全部", style = MiuixTheme.textStyles.body2.copy(fontWeight = if (current) FontWeight.Medium else FontWeight.Normal,
-            color = if (current) MiuixTheme.colorScheme.primary else MiuixTheme.colorScheme.onSurfaceVariantSummary))
-        }
-      }
-    }
-    if (!state.allServers && state.homeGroupId == null) {
-      val profile = state.server
-      if (profile != null) item(key = "single:${profile.id}") {
-        Card(
-          cornerRadius = 20.dp,
-          insideMargin = PaddingValues(horizontal = 16.dp),
-          colors = CardDefaults.defaultColors(color = MiuixColorTokens.PrimarySubtle),
-          pressFeedbackType = PressFeedbackType.Sink,
-          onClick = {},
-          onLongPress = onManageDevices
-        ) {
-          Row(Modifier.heightIn(min = 40.dp), verticalAlignment = Alignment.CenterVertically) {
-            StatusDot(if (connected(profile)) MiuixColorTokens.Success else MiuixTheme.colorScheme.onSurfaceVariantSummary)
-            Spacer(Modifier.width(8.dp))
-            Text(profile.name, Modifier.widthIn(max = 160.dp), maxLines = 1, overflow = TextOverflow.Ellipsis,
-              style = MiuixTheme.textStyles.body2.copy(fontWeight = FontWeight.Medium,
-                color = MiuixTheme.colorScheme.primary))
-          }
-        }
-      }
-    }
-    items(state.deviceTabs, key = { it.id }) { tab ->
-      val group = tab.group
-      val current = !state.allServers && group != null && state.homeGroupId == group.id
-      val color = dot(tab.profiles, current)
-      Card(
-        cornerRadius = 20.dp,
-        insideMargin = PaddingValues(horizontal = 16.dp),
-        colors = CardDefaults.defaultColors(color = if (current) MiuixColorTokens.PrimarySubtle else MiuixTheme.colorScheme.secondaryContainer),
-        pressFeedbackType = PressFeedbackType.Sink,
-        onClick = { group?.let(onSelectGroup) },
-        onLongPress = { group?.let(onEditGroup) }
-      ) {
-        Row(Modifier.heightIn(min = 40.dp), verticalAlignment = Alignment.CenterVertically) {
-          color?.let { StatusDot(it); Spacer(Modifier.width(8.dp)) }
-          Text(tab.label, Modifier.widthIn(max = 160.dp), maxLines = 1, overflow = TextOverflow.Ellipsis,
-            style = MiuixTheme.textStyles.body2.copy(fontWeight = if (current) FontWeight.Medium else FontWeight.Normal,
-              color = if (current) MiuixTheme.colorScheme.primary else MiuixTheme.colorScheme.onSurfaceVariantSummary))
-          if (tab.profiles.size > 1) {
-            Spacer(Modifier.width(4.dp))
-            Text("${tab.profiles.count(::connected)}/${tab.profiles.size}",
-              style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
-          }
-        }
-      }
-    }
+  val anyConnected = profiles.any(::connected)
+  val anyStreaming = profiles.any(::streaming)
+  val anyLoading = profiles.any(::loading)
+  return when {
+    anyConnected && anyStreaming -> MiuixColorTokens.Success
+    anyConnected || anyLoading -> MiuixColorTokens.Warning
+    else -> MiuixTheme.colorScheme.onSurfaceVariantSummary
   }
 }
-
 
 @Composable
 private fun SessionList(
@@ -367,7 +303,9 @@ private fun SessionList(
           workspaceLabels[session.key]?.name?.contains(query, true) == true
       }
   }
-  val sections = remember(grouping, roots, state.projects, state.pinned, state.homeGroup?.id, now) {
+  // Status is an input: the DATE view promotes live/unread rows and ranks each date section by it,
+  // so a status change must reorder immediately instead of waiting for the 60-second clock tick.
+  val sections = remember(grouping, roots, state.projects, statuses, state.pinned, state.homeGroup?.id, now) {
     val group = state.homeGroup
     if (group != null && grouping == HomeGrouping.PROJECT) {
       val visible = roots.mapTo(HashSet()) { it.key }
@@ -378,9 +316,9 @@ private fun SessionList(
       }
     } else HomeSections.build(grouping, roots, state.projects, statuses, state.pinned, now)
   }
-  // Running sessions move to the top as they report activity. While the reader touches or scrolls the
-  // list the order is held, so the row under the finger is still the one they meant when they lift it;
-  // statuses stay live. Moves then animate instead of jumping.
+  // Priority changes can move rows (or promote an unread result into 今天). While the reader touches
+  // or scrolls the list the order is held, so the row under the finger is still the one they meant
+  // when they lift it; statuses stay live. Moves then animate instead of jumping.
   var touching by remember { mutableStateOf(false) }
   val latestSections by rememberUpdatedState(sections)
   var shownSections by remember { mutableStateOf(sections) }
