@@ -8,6 +8,7 @@ import kotlinx.coroutines.withTimeout
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
@@ -307,6 +308,117 @@ class RemoteConversationTest {
           .getJSONObject("params").getJSONObject("payload").getJSONObject("args").getJSONObject("request")
         assertEquals(5, request.getInt("beforeSeq"))
         assertEquals(8, request.getInt("throughSeq"))
+        collector.cancelAndJoin()
+      } finally { backend.close(); session.close() }
+    }
+  }
+
+  /** 首页只应为运行中的会话开 follow；空闲会话不该占长期流预算。 */
+  @Test fun homeListFollowsOnlyRunningSessions() = runBlocking {
+    val ids = (1..20).map { "s%02d".format(it) }
+    val running = ids.take(3).toSet()
+    FakeRemoteHost().use { host ->
+      host.call = { endpoint, _ ->
+        when (endpoint) {
+          "session/list" -> host.ok(JSONObject().put("items", JSONArray().apply {
+            ids.forEach { id ->
+              put(JSONObject().put("sessionId", id).put("updatedAt", 100)
+                .put("running", id in running).put("cwd", "/repo"))
+            }
+          }))
+          "session/page" -> host.ok(JSONObject().put("records", JSONArray()).put("hasMore", false))
+          else -> host.ok(JSONObject())
+        }
+      }
+      host.streamFrames = { endpoint, _ -> if (endpoint == "session/follow") listOf(snapshot("s01", 4)) else emptyList() }
+      host.start()
+      val (session, backend) = backend(host)
+      try {
+        backend.client.rootSessionsPage()
+        val collector = launch { backend.client.events {}.collect { } }
+        delay(500)
+        backend.client.rootSessionsPage()
+        delay(700)
+        val follows = host.streamOpens.filter { it.optString("endpoint") == "session/follow" }
+        println("REMOTE running-only follows=${follows.size} total=${host.streamOpens.size}")
+        assertEquals("只为运行中的 3 个会话开 follow", 3, follows.size)
+        collector.cancelAndJoin()
+      } finally { backend.close(); session.close() }
+    }
+  }
+
+  /** 后台 job/follow 不能把核心事件流和会话流挤出预算；打开旧会话仍应成功。 */
+  @Test fun backgroundStreamsDoNotStarveCoreStreams() = runBlocking {
+    val ids = (1..20).map { "s%02d".format(it) }
+    FakeRemoteHost().use { host ->
+      host.call = { endpoint, _ ->
+        when (endpoint) {
+          "session/list" -> host.ok(JSONObject().put("items", JSONArray().apply {
+            ids.forEach { id ->
+              put(JSONObject().put("sessionId", id).put("updatedAt", 100)
+                .put("running", true).put("cwd", "/repo"))
+            }
+          }))
+          "session/page" -> host.ok(JSONObject().put("records", JSONArray()).put("hasMore", false))
+          else -> host.ok(JSONObject())
+        }
+      }
+      host.streamFrames = { endpoint, _ -> if (endpoint == "session/follow") listOf(snapshot("s01", 4)) else emptyList() }
+      host.start()
+      val (session, backend) = backend(host)
+      try {
+        repeat(8) { index ->
+          launch { runCatching { backend.client.followJobOutput("s01", "job-$index") { _, _, _ -> } } }
+        }
+        delay(500)
+        backend.client.rootSessionsPage()
+        val collector = launch { backend.client.events {}.collect { } }
+        delay(700)
+        backend.client.rootSessionsPage()
+        delay(500)
+        val opens = host.streamOpens.map { it.optString("endpoint") }
+        println("REMOTE saturation opens=$opens")
+        assertTrue("核心事件流应能打开", "\$events" in opens)
+        assertTrue("工作区流应能打开", "workspace/follow" in opens)
+        val error = runCatching { backend.client.messagesPage(ids.last()) }.exceptionOrNull()
+        println("REMOTE saturation open error=${error?.message}")
+        assertNull("后台流不应导致会话打开失败", error)
+        collector.cancelAndJoin()
+      } finally { backend.close(); session.close() }
+    }
+  }
+
+  /** 当前阅读的会话固定在 watch 集合里，首页刷新不能把它挤掉。 */
+  @Test fun activeConversationFollowSurvivesHomeRefresh() = runBlocking {
+    val ids = (1..20).map { "s%02d".format(it) }
+    FakeRemoteHost().use { host ->
+      host.call = { endpoint, _ ->
+        when (endpoint) {
+          "session/list" -> host.ok(JSONObject().put("items", JSONArray().apply {
+            ids.forEach { id ->
+              put(JSONObject().put("sessionId", id).put("updatedAt", 100)
+                .put("running", true).put("cwd", "/repo"))
+            }
+          }))
+          "session/page" -> host.ok(JSONObject().put("records", JSONArray()).put("hasMore", false))
+          else -> host.ok(JSONObject())
+        }
+      }
+      host.streamFrames = { endpoint, _ -> if (endpoint == "session/follow") listOf(snapshot("s01", 4)) else emptyList() }
+      host.start()
+      val (session, backend) = backend(host)
+      try {
+        backend.client.rootSessionsPage()
+        val collector = launch { backend.client.events {}.collect { } }
+        delay(500)
+        backend.client.messagesPage(ids.first())
+        delay(300)
+        backend.client.rootSessionsPage()
+        delay(500)
+        val follows = (backend.client as DshApi).followDiagnostics()
+        println("REMOTE active-pin follows=${follows.map { it.sessionId }}")
+        assertTrue("当前会话应仍在 watch 集合", follows.any { it.sessionId == ids.first() })
+        assertTrue("follow 数不应超过 WATCH_LIMIT", follows.size <= DshApi.WATCH_LIMIT)
         collector.cancelAndJoin()
       } finally { backend.close(); session.close() }
     }

@@ -18,13 +18,19 @@ import java.util.concurrent.ConcurrentHashMap
 
 /** Typert carrier bound to one Noise connection and its owner peer. Never retries business calls. */
 internal class RemoteGateway(private val transferFrames: Boolean = false, private val rpc: suspend (String, JSONObject) -> Any?) : AutoCloseable {
-  private data class StreamState(val output: Channel<Any>, val frames: Channel<JSONObject>,
+  private data class StreamState(val endpoint: String, val output: Channel<Any>, val frames: Channel<JSONObject>,
     var worker: Job? = null, var failure: IOException? = null)
   private val streams = ConcurrentHashMap<String, StreamState>()
   private val transfers = Mutex()
   @Volatile private var closed = false
   /** 最近一次流级失败的原因，供连接详情/日志定位；不参与控制流。 */
   @Volatile internal var lastError: String? = null
+  /** 当前占用的逻辑流数量；连接医生用它判断是否接近上限。 */
+  internal val activeStreamCount: Int get() = streams.size
+  /** 硬上限，供连接医生展示；真正的配额由 [DshApi] 管理。 */
+  internal val maxStreams: Int get() = MAX_STREAMS
+  /** 按 endpoint 统计当前流占用，用于定位是 follow、后台作业还是瞬态读取占满了预算。 */
+  internal fun streamCounts(): Map<String, Int> = streams.values.groupingBy { it.endpoint }.eachCount()
 
   suspend fun call(endpoint: String, payload: JSONObject): Any? {
     require(validEndpoint(endpoint))
@@ -132,10 +138,10 @@ internal class RemoteGateway(private val transferFrames: Boolean = false, privat
     if (closed) throw IOException("Remote Gateway 已关闭")
     require(validEndpoint(endpoint))
     val id = UUID.randomUUID().toString()
-    val stream = StreamState(Channel(capacity = 256), Channel(capacity = 256))
+    val stream = StreamState(endpoint, Channel(capacity = 256), Channel(capacity = 256))
     synchronized(streams) {
       if (closed) throw IOException("Remote Gateway 已关闭")
-      if (streams.size >= 16) throw IOException("Remote 流数量超过上限")
+      if (streams.size >= MAX_STREAMS) throw RemoteStreamLimitException("Remote 流数量超过上限（$MAX_STREAMS）")
       streams[id] = stream
     }
     stream.worker = SharedHttp.ioScope.launch(start = CoroutineStart.UNDISPATCHED) {
@@ -211,8 +217,28 @@ internal class RemoteGateway(private val transferFrames: Boolean = false, privat
 
   internal suspend fun closeStream(id: String) {
     val stream = streams.remove(id) ?: return
-    stream.frames.close(); stream.output.close(); stream.worker?.cancel()
+    // Let the worker unwind on channel closure; cancelling it inside a transfer RPC would close
+    // the whole relay (RemoteRpc treats cancellation as an unknown-delivery failure).
+    stream.frames.close(); stream.output.close()
     if (!closed) withContext(NonCancellable) {
+      try { withTimeout(5_000) { rpc("harness.remote.stream.close", JSONObject().put("streamId", id)) } }
+      catch (_: CancellationException) { } catch (_: Exception) { }
+    }
+  }
+
+  /**
+   * 取消路径的同步释放：先从 [streams] 移除，再异步补发 `stream.close`。
+   * `RemoteBackend.StreamSocket.cancel()` 不能等协程调度，否则被淘汰的 follow / 一次性的
+   * `job/list` 还会占着槽位，新流打开时就会撞上上限。发送失败不影响本地已释放的事实。
+   */
+  internal fun closeStreamNow(id: String) {
+    val stream = streams.remove(id) ?: return
+    // Close both queues and let the worker unwind on its own. Do not cancel it while it may be
+    // inside a transfer RPC: RemoteRpc treats cancellation as an unknown-delivery failure and
+    // would tear down the whole relay, turning one cancelled stream into a connection outage.
+    stream.frames.close(); stream.output.close()
+    if (closed) return
+    SharedHttp.ioScope.launch {
       try { withTimeout(5_000) { rpc("harness.remote.stream.close", JSONObject().put("streamId", id)) } }
       catch (_: CancellationException) { } catch (_: Exception) { }
     }
@@ -245,6 +271,12 @@ internal class RemoteGateway(private val transferFrames: Boolean = false, privat
   }
 
   private companion object {
+    /**
+     * 单条 Host 连接允许同时存在的逻辑流上限。它是兜底而不是配额：正常预算应为
+     * 1 条 `$events` + 1 条 `workspace/follow` + 最多 [DshApi.WATCH_LIMIT] 条 `session/follow`
+     * + 1 条 `job/follow` + 少量 `job/list`。16 太贴近上限，首页刷新或快照重试就会越界。
+     */
+    const val MAX_STREAMS = 32
     const val DIRECT_LIMIT = 2 * 1024 * 1024
     const val MAX_TRANSFER = 288 * 1024 * 1024
     /** Host 允许 288 MiB 的分块响应；设备侧仍留出内存余量，超过就明确报错而不是装作“描述无效”。 */
@@ -268,6 +300,11 @@ internal class RemoteGatewayStream internal constructor(
 ) {
   suspend fun receive(): Any = queue.receive()
   suspend fun close() = gateway.closeStream(id)
+  /** 同步释放本地槽位；用于 `WebSocket.cancel()` 这类不等待挂起的路径。 */
+  fun closeNow() = gateway.closeStreamNow(id)
 }
 
 internal class RemoteGatewayException(val code: String, message: String, val details: JSONObject = JSONObject()) : IOException(message.take(512))
+
+/** The local logical-stream budget is full; callers may evict a stale follow and retry once. */
+internal class RemoteStreamLimitException(message: String) : IOException(message)

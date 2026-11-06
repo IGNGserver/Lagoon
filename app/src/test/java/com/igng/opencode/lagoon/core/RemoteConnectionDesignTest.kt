@@ -140,11 +140,14 @@ class RemoteConnectionDesignTest {
       snapshots = listOf(RemoteSnapshotStats("session-1", 5, 2, 9, false)),
       follows = listOf(RemoteFollowStats("session-1", true, 9, now, 0)),
       events = RemoteEventStats(true, "client-1", 1, now),
+      streams = RemoteStreamStats(14, 32, mapOf("session/follow" to 12, "\$events" to 1, "workspace/follow" to 1)),
       capturedAt = now
     )
     val text = doctor.asText()
     assertTrue(text.contains("records=5"))
     assertTrue(text.contains("self-hosted/0.1.0"))
+    assertTrue("流预算应展示占用与上限", text.contains("14/32"))
+    assertTrue("流预算应展示 endpoint 占用", text.contains("session/follow 12"))
     assertFalse(text.lowercase().contains("token"))
     assertTrue(doctor.diagnosticLines().any { it.first == "路径" })
   }
