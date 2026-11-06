@@ -349,16 +349,22 @@ private fun SessionList(
   val unseen = remember(state.notices, state.allUnseenSessions, state.multiServerView) {
     if (state.multiServerView) state.allUnseenSessions else state.notices.filterNot { it.viewed }.map { it.sessionId }.toSet()
   }
+  // Display-only workspace labels. They never filter, sort, or choose a new-session target.
+  val workspaceLabels = remember(state.sessions, state.projects, state.workspaceCatalog, state.allServerSnapshots, state.serverId) {
+    sessionWorkspaceLabels(state.sessions, state.projects) { session -> state.workspaceCatalogFor(session) }
+  }
   // Remembered on their inputs: the home list used to regroup on every state change (each streamed
   // event of any open conversation), not only when sessions, statuses or the filter changed.
-  val roots = remember(state.sessions, state.projects, state.scopeProjectId, state.scopeWorkspaceKey, state.homeGroupId, query) {
+  val roots = remember(state.sessions, state.projects, state.scopeProjectId, state.scopeWorkspaceKey, state.homeGroupId, query, workspaceLabels) {
     val workspaceScope = state.scopeWorkspaceKey
     val groupId = state.homeGroupId
     HomeScope.roots(state.sessions, state.projects, state.scopeProjectId)
       .filter { session -> state.allServers || workspaceScope == null || groupId == null || deviceWorkspaceKey(session, state.projects, groupId) == workspaceScope }
       .filter { session ->
         query.isBlank() || session.displayTitle().contains(query, true) ||
-          resolveSessionProject(session, state.projects)?.name?.contains(query, true) == true || session.directory.contains(query, true)
+          resolveSessionProject(session, state.projects)?.name?.contains(query, true) == true ||
+          session.directory.contains(query, true) ||
+          workspaceLabels[session.key]?.name?.contains(query, true) == true
       }
   }
   val sections = remember(grouping, roots, state.projects, state.pinned, state.homeGroup?.id, now) {
@@ -425,10 +431,13 @@ private fun SessionList(
           val pinned = session.id in state.pinned
           val background = if (state.multiServerView) session.serverId?.let { id -> state.allServerSnapshots[id]?.backgroundRunning?.contains(session.id) } == true
             else state.backgroundRunning.contains(session.id)
+          val workspace = workspaceLabels[session.key]
+          val showWorkspace = showWorkspaceLabel(section.key, state.scopeProjectId, state.scopeWorkspaceKey, workspace?.projectKey)
           Box(Modifier.animateItem()) { HomeSessionRow(session, statuses[session.key] ?: SessionStatus.NONE, session.key in unseen,
             background = background,
             serverName = if (state.multiServerView) session.serverId?.let { id -> state.profiles.firstOrNull { it.id == id }?.name } else null,
             harness = if (state.multiServerView) session.serverId?.let { id -> state.profiles.firstOrNull { it.id == id }?.kind } else null,
+            workspace = workspace?.name?.takeIf { showWorkspace },
             onClick = { (session.target ?: state.serverId?.let { SessionTarget(it, session.id) })?.let(onOpen) }, actions = { buildList {
             if (!state.multiServerView) {
               add(MenuAction(if (pinned) "取消置顶" else "置顶", if (pinned) MiuixIcons.Unpin else MiuixIcons.Pin) { controller.togglePin(session.id) })
@@ -496,13 +505,16 @@ internal val ARCHIVE_ICON get() = MiuixIcons.Download
 internal val UNARCHIVE_ICON get() = MiuixIcons.Import
 
 /**
- * One session: a 24dp state glyph and the title. Running spins, waiting for a reply shows the warning
- * mark, an unread result is a primary (or error) dot with a medium title; everything else is a quiet dot.
+ * One session: a 24dp state glyph and the title, plus an optional muted meta line (workspace, and on
+ * the aggregate home the harness + device). Running spins, waiting for a reply shows the warning mark,
+ * an unread result is a primary (or error) dot with a medium title; everything else is a quiet dot.
  * Long press opens [actions] (置顶 / 重命名 / 归档 / 删除 on the home list).
  */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-internal fun HomeSessionRow(session: Session, status: SessionStatus, unseen: Boolean, background: Boolean = false, serverName: String? = null, harness: ServerKind? = null, onClick: () -> Unit, actions: () -> List<MenuAction>) {
+internal fun HomeSessionRow(session: Session, status: SessionStatus, unseen: Boolean, background: Boolean = false,
+  serverName: String? = null, harness: ServerKind? = null, workspace: String? = null,
+  onClick: () -> Unit, actions: () -> List<MenuAction>) {
   // Built only on long press: a list of actions (and their lambdas) per row per recomposition was waste.
   var menuItems by remember { mutableStateOf(emptyList<MenuAction>()) }
   var menu by remember { mutableStateOf(false) }
@@ -520,10 +532,11 @@ internal fun HomeSessionRow(session: Session, status: SessionStatus, unseen: Boo
        Column(Modifier.weight(1f)) {
          Text(session.displayTitle(), maxLines = 1, overflow = TextOverflow.Ellipsis,
            style = MiuixTheme.textStyles.body1.copy(fontWeight = if (highlighted) FontWeight.Medium else FontWeight.Normal, color = MiuixTheme.colorScheme.onSurface))
-         if (serverName != null || harness != null) Row(verticalAlignment = Alignment.CenterVertically) {
+         val meta = listOfNotNull(serverName, workspace).joinToString(" · ")
+         if (harness != null || meta.isNotBlank()) Row(Modifier.padding(top = 2.dp), verticalAlignment = Alignment.CenterVertically) {
            harness?.let { HarnessBadge(it); Spacer(Modifier.width(6.dp)) }
-           serverName?.let { Text(it, maxLines = 1, overflow = TextOverflow.Ellipsis,
-             style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary)) }
+           if (meta.isNotBlank()) Text(meta, maxLines = 1, overflow = TextOverflow.Ellipsis,
+             style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
          }
        }
        if (background && status != SessionStatus.RUNNING) {

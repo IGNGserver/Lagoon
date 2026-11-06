@@ -44,6 +44,19 @@ class OpenCodeApiTest {
     }
   }
 
+  @Test fun displayProjectsAreReadOnceAndReusedForRowLabels() = runBlocking {
+    MockWebServer().use { server ->
+      server.enqueue(MockResponse().setBody("""[{"id":"p1","canonical":"/repo","name":"Repo","sandboxes":["/repo/.wt/x"]}]"""))
+      val api = api(server)
+      val first = api.projectsForDisplay()
+      val second = api.projectsForDisplay()
+      assertEquals(listOf("p1" to "Repo"), first.map { it.id to it.name })
+      assertEquals(first, second)
+      // 一次对账读一次就够，行内标签随后只读缓存。
+      assertEquals(1, server.requestCount)
+    }
+  }
+
   @Test fun promptCarriesClientIdDeliveryMetadataAndInlineFilesAfterSwitchingSelection() = runBlocking {
     MockWebServer().use { server ->
       repeat(3) { server.enqueue(MockResponse().setResponseCode(204)) }

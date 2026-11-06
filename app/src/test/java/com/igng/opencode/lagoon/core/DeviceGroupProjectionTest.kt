@@ -53,6 +53,24 @@ class DeviceGroupProjectionTest {
     assertEquals(setOf("a"), home.allServerSnapshots.keys)
   }
 
+  @Test fun groupWorkspaceCatalogFollowsTheWritableProfileNotTheOpenConversation() {
+    val a = profile("a", "A")
+    val b = profile("b", "B")
+    val group = DeviceGroup("g", "MacBook", listOf("a", "b"))
+    val off = snapshot("a", ServerKind.OPENCODE, false, listOf(Session("s1", "/work/a", "one", 1)), emptyList())
+      .copy(workspaceCatalog = listOf(Project("pa", "/work/a", "A title", serverId = "a")))
+    val on = snapshot("b", ServerKind.DSH_REMOTE, true, listOf(Session("s2", "/work/b", "two", 2)), emptyList())
+      .copy(workspaceCatalog = listOf(Project("pb", "/work/b", "B title", serverId = "b")))
+    val state = LagoonState(profiles = listOf(a, b), deviceGroups = listOf(group), homeGroupId = "g", serverId = "a",
+      allServerSnapshots = mapOf("a" to off, "b" to on))
+    val home = state.homeProjection()
+    // a 掉线后组内可写连接切到 b，行内标签必须跟着 b，而不是当前打开会话所在的 a。
+    assertEquals("b", home.serverId)
+    assertEquals(listOf("B title"), home.workspaceCatalog.map { it.name })
+    val session = home.sessions.single { it.id == "s2" }
+    assertEquals("B title", resolveSessionWorkspace(session, home.projects, home.workspaceCatalogFor(session))!!.name)
+  }
+
   @Test fun noGroupKeepsSingleServerBehavior() {
     val a = profile("a", "A")
     val state = LagoonState(profiles = listOf(a), serverId = "a",

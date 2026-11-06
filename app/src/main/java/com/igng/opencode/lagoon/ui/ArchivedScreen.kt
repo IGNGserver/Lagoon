@@ -31,6 +31,10 @@ internal fun ArchivedScreen(state: LagoonState, controller: LagoonController, on
   val unseen = remember(state.notices, state.allUnseenSessions, state.multiServerView) {
     if (state.multiServerView) state.allUnseenSessions else state.notices.filterNot { it.viewed }.map { it.sessionId }.toSet()
   }
+  // 已归档页不复用首页的范围与分组标题，所以每一行都直接说明所属工作区。
+  val workspaceLabels = remember(state.sessions, state.projects, state.workspaceCatalog, state.allServerSnapshots, state.serverId) {
+    sessionWorkspaceLabels(state.sessions, state.projects) { session -> state.workspaceCatalogFor(session) }
+  }
   val muted = MiuixTheme.colorScheme.onSurfaceVariantSummary
   Column(Modifier.fillMaxSize()) {
     PageTopBar("已归档", onBack)
@@ -41,6 +45,7 @@ internal fun ArchivedScreen(state: LagoonState, controller: LagoonController, on
         HomeSessionRow(session, statuses[session.key] ?: SessionStatus.NONE, unseen = session.key in unseen, background = background,
           serverName = if (state.multiServerView) session.serverId?.let { id -> state.profiles.firstOrNull { it.id == id }?.name } else null,
           harness = if (state.multiServerView) session.serverId?.let { id -> state.profiles.firstOrNull { it.id == id }?.kind } else null,
+          workspace = workspaceLabels[session.key]?.name,
           onClick = { (session.target ?: state.serverId?.let { SessionTarget(it, session.id) })?.let(onOpen) }, actions = { buildList {
           if (!state.multiServerView && state.connected && state.capabilities.archive?.restorable == true) add(MenuAction("取消归档", UNARCHIVE_ICON) { controller.setArchived(session.id, false) })
           if (!state.multiServerView && state.connected && state.capabilities.deleteSession) add(MenuAction("删除", MiuixIcons.Delete, danger = true) { deleting = session })

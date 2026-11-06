@@ -10,7 +10,7 @@ Lagoon 目前只维护 Android 客户端。v3 曾提供自托管中枢与网页�
 
 - 首发支持 OpenCode 2.x 服务端（`/api/*` 接口，以 `/api/info` 识别版本；1.x 已不再支持）；多服务器连接、Basic Auth/官方 pair 链接、Android Keystore 保护的密码与会话 Cookie、离线缓存、SSE 自动重连
 - 支持 DeepSeek Harness：一个 DSH Remote Hub（浏览器/邮箱登录、主机目录、逐台指纹核对）或任意数量的 SSH 主机（密码/私钥、Host Key 固定、远端 `dsh web` 启停/复用、稳定本地转发与断线重连）；走 Typert RPC（一元调用 + mux 事件流），时间线、任务状态、审批与问答和其它 harness 共用同一套界面与通知；详见 [`docs/SSH_HOSTS.md`](docs/SSH_HOSTS.md) 与下文「DeepSeek Harness 支持」
-- 项目与会话、异步任务（运行中可继续发送以引导当前轮次）、Agent/Model、斜杠命令（走服务端 `/command`）、文本/Reasoning/Tool 消息、停止与权限/表单处理；时间线按官方客户端规则投影，系统指令、合成输入、技能等给模型看的记录只显示一行通知
+- 项目与会话、异步任务（运行中可继续发送以引导当前轮次）、Agent/Model、斜杠命令（走服务端 `/command`）、文本/Reasoning/Tool 消息、停止与权限/表单处理；时间线按官方客户端规则投影，系统指令、合成输入、技能等给模型看的记录只显示一行通知；会话列表在标题下显示所属工作区（OpenCode 项目 / DSH Workspace，只做展示，不改变筛选与新建目标）
 - 子会话、改动、文件浏览与搜索、重命名、删除；随版本变化的接口（重命名、恢复撤销、改动、已读同步）按实例 `/openapi.json` 选择
 - 设备管理：首页只保留「全部」和显式设备组，添加设备页用 OpenCode / DeepSeek Harness 分页；DSH 页支持一个 Remote Hub + 无限 SSH 主机，设备组可混合设备与 Harness；每个连接可单独启用/禁用，禁用后不再连接，其对话、归档、任务汇总和通知从本机隐藏，凭据、草稿和缓存保留；分组 v1 升级时只清空一次，旧服务器资料/凭据/缓存不受影响；详见 [`docs/DEVICE_MANAGEMENT.md`](docs/DEVICE_MANAGEMENT.md)
 - 全服务器任务总览：实时显示运行中、未读完成、待回复与失败计数，并可从首页直接打开最需关注的任务；Android 16+ 使用系统实时更新（Live Updates），Android 15 及以下使用普通任务通知与应用内首页概览，详见 `docs/LIVE_UPDATES.md`

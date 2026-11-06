@@ -1,15 +1,118 @@
 package com.igng.opencode.lagoon.core
 
-/** Server identities and execution directories are separate: a worktree is still the same project. */
-fun resolveSessionProject(session: Session, projects: List<Project>): Project? {
-  session.projectId?.let { id ->
-    projects.firstOrNull { project ->
-      project.id == id && (session.serverId == null || project.serverId == null || project.serverId == session.serverId)
-    }?.let { return it }
+/** Where a session row's workspace label came from. Presentation only; never a filter identity. */
+enum class WorkspaceSource { PROJECT, SERVER, DIRECTORY }
+
+/** Row labels are cosmetic: never let a title read delay the catalog or the home projection. */
+const val WORKSPACE_CATALOG_TIMEOUT_MILLIS = 5_000L
+
+/**
+ * One session's display-only workspace. [name] is what the home row shows; [path] is only used to
+ * disambiguate same-named workspaces. It never filters, scopes, or chooses a new-session target:
+ * those stay on the device-local [Project] registry.
+ */
+data class SessionWorkspace(
+  val name: String,
+  val path: String = "",
+  val source: WorkspaceSource = WorkspaceSource.DIRECTORY,
+  val serverId: String? = null,
+  /** Server-scoped project key when [source] is PROJECT; a project section header already names it. */
+  val projectKey: String? = null
+)
+
+/**
+ * Resolves the workspace a session belongs to, in display precedence:
+ * device-registered project → server project/workspace catalog → session directory name.
+ *
+ * [catalog] is a read-only list of the server's projects/workspaces (DSH's Workspace is its project).
+ * It must never be merged into the registered [projects] list: that registry drives the scope picker,
+ * project counts and the new-session target.
+ */
+fun resolveSessionWorkspace(
+  session: Session,
+  projects: List<Project>,
+  catalog: List<Project> = emptyList()
+): SessionWorkspace? {
+  matchSessionProject(session, projects)?.let { project ->
+    return SessionWorkspace(
+      name = projectDisplayName(project),
+      path = project.directory,
+      source = WorkspaceSource.PROJECT,
+      serverId = project.serverId ?: session.serverId,
+      projectKey = project.key
+    )
   }
-  val directory = normalizedDirectory(session.directory)
+  if (catalog.isNotEmpty()) matchSessionProject(session, catalog)?.let { project ->
+    return SessionWorkspace(
+      name = projectDisplayName(project),
+      path = project.directory,
+      source = WorkspaceSource.SERVER,
+      serverId = project.serverId ?: session.serverId
+    )
+  }
+  val directory = session.directory.trim()
+  val name = directoryDisplayName(directory) ?: return null
+  return SessionWorkspace(name, directory, WorkspaceSource.DIRECTORY, session.serverId)
+}
+
+/**
+ * Labels for a page of sessions, keyed by [Session.key]. Same-named workspaces on one server are
+ * qualified with their parent segment (`work/Lagoon`) so two rows never look identical by accident.
+ * Labels are presentation only: they never feed filtering, sorting or a create target.
+ */
+fun sessionWorkspaceLabels(
+  sessions: List<Session>,
+  projects: List<Project>,
+  catalogFor: (Session) -> List<Project> = { emptyList() }
+): Map<String, SessionWorkspace> {
+  val labels = LinkedHashMap<String, SessionWorkspace>()
+  sessions.forEach { session ->
+    resolveSessionWorkspace(session, projects, catalogFor(session))?.let { labels[session.key] = it }
+  }
+  val collisions = labels.entries
+    .groupBy { (_, workspace) -> (workspace.serverId ?: "") to workspace.name }
+    .filterValues { entries -> entries.map { it.value.path }.distinct().size > 1 }
+  if (collisions.isEmpty()) return labels
+  val qualified = LinkedHashMap(labels)
+  collisions.values.flatten().forEach { (sessionKey, workspace) ->
+    qualified[sessionKey] = workspace.copy(name = qualifiedName(workspace.path, workspace.name))
+  }
+  return qualified
+}
+
+/** `/home/me/work/Lagoon` + `Lagoon` → `work/Lagoon`; roots keep the bare name. */
+private fun qualifiedName(path: String, name: String): String {
+  val parts = path.trim().replace('\\', '/').trimEnd('/').split('/').filter { it.isNotBlank() }
+  if (parts.size < 2) return name
+  val parent = parts[parts.size - 2]
+  return if (parent.isBlank() || parent == name) name else "$parent/$name"
+}
+
+/** Last path segment, or null for blank directories, filesystem roots and `~`. */
+fun directoryDisplayName(directory: String): String? {
+  val path = directory.trim().replace('\\', '/').trimEnd('/')
+  if (path.isBlank() || path == "/" || path == "~") return null
+  if (Regex("^[A-Za-z]:$").matches(path)) return null
+  return path.substringAfterLast('/').trim().ifBlank { null }
+}
+
+private fun projectDisplayName(project: Project): String =
+  project.name.trim().takeIf { it.isNotBlank() }
+    ?: directoryDisplayName(project.directory)
+    ?: project.directory
+
+/** Server identities and execution directories are separate: a worktree is still the same project. */
+fun resolveSessionProject(session: Session, projects: List<Project>): Project? =
+  matchSessionProject(session, projects)
+
+/** projectID first, then an exact directory/sandbox, then the most specific ancestor. */
+private fun matchSessionProject(session: Session, projects: List<Project>): Project? {
   fun belongsToSource(project: Project): Boolean =
     session.serverId == null || project.serverId == null || project.serverId == session.serverId
+  session.projectId?.let { id ->
+    projects.firstOrNull { project -> project.id == id && belongsToSource(project) }?.let { return it }
+  }
+  val directory = normalizedDirectory(session.directory)
   projects.firstOrNull { project -> belongsToSource(project) && project.directories.any { normalizedDirectory(it) == directory } }?.let { return it }
   return projects.flatMap { project -> project.directories.map { project to normalizedDirectory(it) } }
     .filter { (project, root) -> belongsToSource(project) && root.isNotEmpty() && (directory == root || directory.startsWith(if (root == "/") root else "$root/")) }

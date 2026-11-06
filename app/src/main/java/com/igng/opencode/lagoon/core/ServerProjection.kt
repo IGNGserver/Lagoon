@@ -24,7 +24,18 @@ internal fun LagoonState.serverSnapshots(): Map<String, ServerOverviewSnapshot> 
     cached = cached, loading = loading, lastReadAt = lastContactAt, error = error, degraded = degraded,
     streamConnected = streamConnected, projects = projects, sessions = sessions, parents = parents, tasks = tasks,
     notices = notices, permissions = permissions, questions = questions, backgroundRunning = backgroundRunning,
-    summary = summary, autoApprovalFailures = autoApprovalFailures, shells = shells))
+    summary = summary, autoApprovalFailures = autoApprovalFailures, shells = shells,
+    workspaceCatalog = workspaceCatalog))
+}
+
+/**
+ * Display-only project/workspace titles for the server a session belongs to. The device-local
+ * [LagoonState.projects] registry is deliberately not consulted for other servers: a row must keep
+ * the titles of its own server, never borrow the writable server's catalog.
+ */
+fun LagoonState.workspaceCatalogFor(session: Session): List<Project> {
+  val id = session.serverId ?: serverId ?: return emptyList()
+  return if (id == serverId) workspaceCatalog else allServerSnapshots[id]?.workspaceCatalog.orEmpty()
 }
 
 /** The servers the home page is currently projecting: one server, one device group, or every server. */
@@ -74,19 +85,19 @@ fun LagoonState.homeProjection(): LagoonState {
           sessionId = null, projectId = null, scopeProjectId = null, scopeWorkspaceKey = null,
           sessions = emptyList(), projects = emptyList(), messages = emptyList(), tasks = emptyMap(), permissions = emptyList(),
           questions = emptyList(), notices = emptyList(), knownParents = emptyMap(), backgroundRunning = emptySet(),
-          connected = false, loading = false, cached = false, summary = TaskSummary.EMPTY,
+          connected = false, loading = false, cached = false, summary = TaskSummary.EMPTY, workspaceCatalog = emptyList(),
           allServerSnapshots = snapshots, allSessionStatuses = emptyMap(), allUnseenSessions = emptySet())
       if (id == serverId) return copy(allServers = false, homeServerId = id, allServerSnapshots = snapshots)
       val snapshot = snapshots[id] ?: return copy(serverId = id, homeServerId = id, sessions = emptyList(), projects = emptyList(), tasks = emptyMap(),
         permissions = emptyList(), questions = emptyList(), notices = emptyList(), connected = false, loading = true, allServers = false,
-        allServerSnapshots = snapshots)
+        workspaceCatalog = emptyList(), allServerSnapshots = snapshots)
       return copy(serverId = id, homeServerId = id, version = snapshot.version, connected = snapshot.connected, streamConnected = snapshot.streamConnected,
         cached = snapshot.cached, loading = snapshot.loading, degraded = snapshot.degraded, sessions = snapshot.sessions,
         projects = snapshot.projects, tasks = snapshot.tasks, permissions = snapshot.permissions, questions = snapshot.questions,
         notices = snapshot.notices, knownParents = snapshot.parents, backgroundRunning = snapshot.backgroundRunning,
         summary = snapshot.displaySummary(permissionPolicy), lastContactAt = snapshot.lastReadAt,
         autoApprovalFailures = snapshot.autoApprovalFailures, sessionId = null, projectId = null, scopeProjectId = null,
-        serverReadPending = serverReadPending,
+        serverReadPending = serverReadPending, workspaceCatalog = snapshot.workspaceCatalog,
         allServerSnapshots = snapshots)
     }
     // The selected group has no enabled member left: fall through to the aggregate projection.
@@ -94,7 +105,7 @@ fun LagoonState.homeProjection(): LagoonState {
   val statuses = allServerStatuses()
   return copy(serverId = null, homeGroupId = null, allServers = true,
     homeServerId = homeServerId?.takeIf { it in enabledIds },
-    sessionId = null, projectId = null, scopeProjectId = null,
+    sessionId = null, projectId = null, scopeProjectId = null, workspaceCatalog = emptyList(),
     sessions = snapshots.values.flatMap { it.sessions }.distinctBy { it.key }.sortedWith(sessionActivityOrder),
     projects = snapshots.values.flatMap { it.projects }.distinctBy { it.key }, tasks = emptyMap(), permissions = emptyList(),
     questions = emptyList(), notices = emptyList(), knownParents = emptyMap(), backgroundRunning = emptySet(),
@@ -137,6 +148,8 @@ private fun LagoonState.groupHomeProjection(
     sessionId = null, projectId = null, scopeProjectId = null,
     sessions = scoped.values.flatMap { it.sessions }.distinctBy { it.key }.sortedWith(sessionActivityOrder),
     projects = scoped.values.flatMap { it.projects }.distinctBy { it.key },
+    // The writable profile of a group can differ from the conversation's server; labels follow it.
+    workspaceCatalog = active?.let { scoped[it]?.workspaceCatalog }.orEmpty(),
     tasks = emptyMap(), permissions = emptyList(), questions = emptyList(), notices = emptyList(),
     knownParents = emptyMap(), backgroundRunning = emptySet(), pinned = emptySet(),
     sessionCursors = emptyMap(), catalogComplete = true,

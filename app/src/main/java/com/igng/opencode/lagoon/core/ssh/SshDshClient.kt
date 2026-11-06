@@ -30,6 +30,8 @@ internal class SshDshClient(
 
   override suspend fun projects(): List<Project> = api().projects()
 
+  override suspend fun projectsForDisplay(): List<Project> = api().projectsForDisplay()
+
   override suspend fun session(id: String): Session = api().session(id)
 
   override suspend fun projectAt(directory: String): Project? = api().projectAt(directory)

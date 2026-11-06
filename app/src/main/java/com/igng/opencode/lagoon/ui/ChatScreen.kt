@@ -597,7 +597,7 @@ fun DraftScreen(state: LagoonState, controller: LagoonController, onBack: () -> 
   if (targetPicker) DraftTargetSheet(state, controller) { targetPicker = false }
 }
 
-/** “服务器 · 项目” under a chat title, led by the session's live state (running spinner / waiting / failed). */
+/** “服务器 · 工作区” under a chat title, led by the session's live state (running spinner / waiting / failed). */
 @Composable
 private fun SessionSubtitle(state: LagoonState, session: Session) {
   // 子会话不在根聚合里：优先用该会话自己的实时任务，再退回根聚合 / 未读账本。
@@ -614,7 +614,9 @@ private fun SessionSubtitle(state: LagoonState, session: Session) {
   }
   val profile = session.serverId?.let { id -> state.profiles.firstOrNull { it.id == id } } ?: state.server
   if (state.multiServerView) profile?.let { HarnessBadge(it.kind); Spacer(Modifier.width(4.dp)) }
-  Text(listOfNotNull(profile?.name, resolveSessionProject(session, state.projects)?.name).joinToString(" · "), maxLines = 1, overflow = TextOverflow.Ellipsis,
+  // 与首页行使用同一套解析，切进会话后工作区名不会变。
+  val workspace = resolveSessionWorkspace(session, state.projects, state.workspaceCatalogFor(session))?.name
+  Text(listOfNotNull(profile?.name, workspace).joinToString(" · "), maxLines = 1, overflow = TextOverflow.Ellipsis,
     style = MiuixTheme.textStyles.footnote1.copy(color = muted))
 }
 
