@@ -1314,9 +1314,12 @@ class DshApi(
         for (question in request.arr("questions").objects()) {
           val options = JSONArray()
           for (option in question.arr("options").objects()) {
+            val label = option.str("label")
+            // DSH 没有独立的选项 value：答案按 label 回显，表单身份也只能取 label。
             options.put(JSONObject()
-              .put("label", option.str("label"))
-              .put("description", option.str("description")))
+              .put("label", label)
+              .put("description", option.str("description"))
+              .put("value", label))
           }
           fields.put(JSONObject()
             .put("key", question.str("id"))
@@ -2441,13 +2444,14 @@ class DshApi(
     pendingQuestions.remove(request.id)
     val payload = JSONArray()
     request.questions.forEachIndexed { index, prompt ->
-      val selected = answers.getOrNull(index).orEmpty().filter(String::isNotBlank)
+      val row = answers.getOrNull(index).orEmpty().filter(String::isNotBlank)
       // `field` 是 OpenCode 形状的表单字段 JSON，问题 id 存在 `key` 里。
       val questionId = runCatching { JSONObject(prompt.field).str("key") }.getOrNull()?.takeIf(String::isNotBlank)
         ?: prompt.field.ifBlank { prompt.title }
-      payload.put(JSONObject()
-        .put("id", questionId)
-        .put("selected", JSONArray(selected)))
+      val (selected, custom) = row.splitAnswer(prompt.options)
+      val answer = JSONObject().put("id", questionId).put("selected", JSONArray(selected))
+      if (custom != null) answer.put("custom", custom)
+      payload.put(answer)
     }
     settle(request.id, JSONObject().put("answers", payload))
   }
