@@ -187,6 +187,7 @@ internal class AllServersOverview(
     clients.remove(id)?.close(); configurations.remove(id); locks.remove(id); snapshots.remove(id)
     handoffs.remove(id)
     childDiscoveries.remove(id)
+    firstReads.remove(id)
     onSnapshotRemoved(id)
   }
 
