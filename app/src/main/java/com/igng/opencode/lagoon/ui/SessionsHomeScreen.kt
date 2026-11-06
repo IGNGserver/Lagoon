@@ -251,12 +251,17 @@ private fun homeScopeDot(state: LagoonState): Color? {
     state.homeGroupId != null -> state.deviceTabs.firstOrNull { it.group?.id == state.homeGroupId }?.profiles.orEmpty()
     else -> listOfNotNull(state.server)
   }
+  // Aggregate/group projections expose "any member connected", not the active profile's state; the
+  // per-profile snapshot is the only truthful source there. A single-server home can use its live one.
   fun connected(profile: ServerProfile): Boolean =
-    if (profile.id == state.serverId) state.connected else state.allServerSnapshots[profile.id]?.connected == true
+    if (!state.multiServerView && profile.id == state.serverId) state.connected
+    else state.allServerSnapshots[profile.id]?.connected == true
   fun streaming(profile: ServerProfile): Boolean =
-    if (profile.id == state.serverId) state.streamConnected else state.allServerSnapshots[profile.id]?.streamConnected == true
+    if (!state.multiServerView && profile.id == state.serverId) state.streamConnected
+    else state.allServerSnapshots[profile.id]?.streamConnected == true
   fun loading(profile: ServerProfile): Boolean =
-    if (profile.id == state.serverId) state.loading else state.allServerSnapshots[profile.id]?.loading == true
+    if (!state.multiServerView && profile.id == state.serverId) state.loading
+    else state.allServerSnapshots[profile.id]?.loading == true
   val anyConnected = profiles.any(::connected)
   val anyStreaming = profiles.any(::streaming)
   val anyLoading = profiles.any(::loading)

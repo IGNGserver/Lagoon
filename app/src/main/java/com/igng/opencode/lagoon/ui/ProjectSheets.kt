@@ -40,7 +40,10 @@ internal fun HomeScopeSheet(
   if (state.browsePath != null) { DirectoryBrowserSheet(state, controller); return }
   var removing by remember { mutableStateOf<Project?>(null) }
   val online = state.enabledProfiles.count { profile ->
-    if (profile.id == state.serverId) state.connected else allSnapshots[profile.id]?.connected == true
+    // Aggregate/group projections set `connected` to "any member connected"; only a single-server
+    // home can trust it for the current profile. Every other case reads that profile's snapshot.
+    if (!state.multiServerView && profile.id == state.serverId) state.connected
+    else allSnapshots[profile.id]?.connected == true
   }
   SuperBottomSheet(title = "选择范围", show = true, onDismissRequest = onDismiss) {
     LazyColumn(Modifier.fillMaxWidth().heightIn(max = 680.dp), contentPadding = PaddingValues(bottom = 16.dp)) {
@@ -107,7 +110,8 @@ private fun GroupScopeRow(
   onEdit: () -> Unit
 ) {
   val online = tab.profiles.count { profile ->
-    if (profile.id == state.serverId) state.connected else allSnapshots[profile.id]?.connected == true
+    if (!state.multiServerView && profile.id == state.serverId) state.connected
+    else allSnapshots[profile.id]?.connected == true
   }
   Card(Modifier.fillMaxWidth()) {
     BasicComponent(
@@ -133,8 +137,10 @@ private fun ProfileScopeRow(
   selected: Boolean,
   onSelect: () -> Unit
 ) {
-  val connected = if (profile.id == state.serverId) state.connected else allSnapshots[profile.id]?.connected == true
-  val loading = if (profile.id == state.serverId) state.loading else allSnapshots[profile.id]?.loading == true
+  val connected = if (!state.multiServerView && profile.id == state.serverId) state.connected
+  else allSnapshots[profile.id]?.connected == true
+  val loading = if (!state.multiServerView && profile.id == state.serverId) state.loading
+  else allSnapshots[profile.id]?.loading == true
   // In a group/all projection `sessions` is the aggregate, so count this server from its own snapshot.
   val sessions = if (state.multiServerView) allSnapshots[profile.id]?.sessions.orEmpty() else state.sessions
   val count = sessions.count { it.visibleOnHome }
