@@ -31,7 +31,14 @@ internal class RootNavigator(initial: SessionNavigation = SessionNavigation(), s
   var navigation by mutableStateOf(initial); private set
   /** 当前会话链所属的服务器；回到会话列表后路由不再带服务器。 */
   var server by mutableStateOf(server)
-  val route get() = navigation.route.copy(serverId = if (navigation.sessions.isNotEmpty()) server else null)
+  /**
+   * 空白草稿页不属于某台服务器：它始终跟随当前可写连接，切换服务器时仍是同一个页面。
+   * 若把 serverId 放进草稿路由，`AnimatedContent` 会把换服务器当成换页，让新旧两个草稿页
+   * 同时持有同一个 saveable key，Compose 会直接抛 “Key draft:N was used multiple times”。
+   */
+  val route get() = navigation.route.copy(
+    serverId = navigation.sessions.lastOrNull()?.takeIf { it != DRAFT_SESSION }?.let { server }
+  )
 
   var gesture by mutableStateOf<BackGesture?>(null); private set
   /** 手势进度与方向每帧都变，只应在绘制阶段（graphicsLayer）读取，避免整棵树随手指重组。 */

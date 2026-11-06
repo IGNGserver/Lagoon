@@ -96,7 +96,6 @@ class MainActivity : ComponentActivity() {
        var addingOpenCodeId by rememberSaveable { mutableStateOf<String?>(null) }
        var addingSshHostId by rememberSaveable { mutableStateOf<String?>(null) }
        var showingProjects by rememberSaveable { mutableStateOf(false) }
-       var showingNewSession by rememberSaveable { mutableStateOf(false) }
        var showingModelManagement by rememberSaveable { mutableStateOf(false) }
        var showingRemoteEnroll by rememberSaveable { mutableStateOf(false) }
        var showingRemoteHosts by rememberSaveable { mutableStateOf(false) }
@@ -142,15 +141,18 @@ class MainActivity : ComponentActivity() {
        }
        fun openDraft() {
          focusManager.clearFocus()
-         if (home.enabledProfiles.isEmpty()) {
-           if (state.profiles.isEmpty()) showingAddDevice = true
-           else { globalMessage = "所有连接均已禁用，请先在设备管理中启用"; globalMessageType = MiuixToastType.INFO }
+         // 加号直接进入空白页：默认选当前可写设备（不在首页范围时选第一台在线/启用的设备），
+         // 进入后仍可在标题的「服务器与工作区」面板里改。没有可用设备时才退回提示。
+         val target = state.defaultDraftServer(draftScope)
+         if (target == null) {
+           when {
+             state.profiles.isEmpty() -> showingAddDevice = true
+             draftScope != null -> { globalMessage = "这个设备组没有启用的连接"; globalMessageType = MiuixToastType.INFO }
+             else -> { globalMessage = "所有连接均已禁用，请先在设备管理中启用"; globalMessageType = MiuixToastType.INFO }
+           }
            return
          }
-         // 单台候选、或单服务器首页且当前连接可用时直接进空白页；聚合 / 设备组先选 harness。
-         // 离线服务器留在列表里可选：页面会显示连接进度，不再用“设备尚未连接”拦住新建。
-         val direct = state.directDraftServer(draftScope)
-         if (direct != null) openDraftFor(direct.profile) else showingNewSession = true
+         openDraftFor(target.profile)
        }
       fun openPage(page: RootPage) { focusManager.clearFocus(); navigator.navigate(navigator.navigation.push(page)) }
       fun editServer(profile: ServerProfile?) {
@@ -321,6 +323,16 @@ class MainActivity : ComponentActivity() {
                 (fadeIn(tween(220, delayMillis = 40)) + slideInHorizontally(motion) { it * direction / 4 }) togetherWith
                   (fadeOut(tween(160)) + slideOutHorizontally(motion) { -it * direction / 4 })
               }
+            }, contentKey = { target ->
+              // Content identity must match the saveable-scope identity. A draft is one page no
+              // matter which server it is currently connected to; keying it by server made
+              // AnimatedContent keep the old and new draft composed at once, which collides on
+              // the shared "draft:<nonce>" saveable key.
+              when {
+                target.session == DRAFT_SESSION -> "draft:$draftNonce"
+                target.session != null -> "chat:${target.serverId}:${target.session}"
+                else -> "page:${target.page}"
+              }
             }, label = "navigation") { target ->
               val active = target == route
               Box(Modifier.fillMaxSize().graphicsLayer {
@@ -355,12 +367,6 @@ class MainActivity : ComponentActivity() {
                if (home.allServers) AllServersScopeSheet(home, controller) { showingProjects = false }
                else ProjectScopeSheet(home, controller) { showingProjects = false }
              }
-             if (showingNewSession) NewSessionServerSheet(
-               state = state,
-               profileIds = draftScope,
-               onSelect = { server -> showingNewSession = false; openDraftFor(server.profile) },
-               onDismiss = { showingNewSession = false }
-             )
              if (showingDeviceGroups) DeviceGroupsSheet(state, controller, editingGroupId, onDismiss = {
                showingDeviceGroups = false; editingGroupId = null
              })

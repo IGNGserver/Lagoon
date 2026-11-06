@@ -89,18 +89,15 @@ fun LagoonState.draftWorkspaces(serverId: String): List<DraftWorkspace> {
 }
 
 /**
- * The server the new-session button can open directly, or null when the reader must choose one.
+ * The device the new-session button opens without showing a chooser.
  *
- * One enabled candidate never needs a choice, and a single-server home whose connection is up opens
- * straight into the blank page. Aggregate and device-group homes ask first; so does an offline
- * single server, because the list is the only way to reach another harness from there.
+ * [draftServers] already orders candidates as current writable device → connected → saved order,
+ * so its first item keeps continuity on the current device and falls back to a working member when
+ * the current device is outside the home scope. The blank page can still switch devices afterwards.
+ * Null only when no enabled device is available in the scope.
  */
-fun LagoonState.directDraftServer(profileIds: Set<String>? = null): DraftServer? {
-  val candidates = draftServers(profileIds)
-  if (candidates.size == 1) return candidates.first()
-  if (allServers || homeGroupId != null) return null
-  return candidates.firstOrNull { it.id == serverId && it.connected }
-}
+fun LagoonState.defaultDraftServer(profileIds: Set<String>? = null): DraftServer? =
+  draftServers(profileIds).firstOrNull()
 
 /**
  * The workspace a blank draft opens on when the caller has no explicit choice: the preferred id,

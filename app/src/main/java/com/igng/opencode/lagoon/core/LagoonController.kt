@@ -1564,7 +1564,6 @@ class LagoonController private constructor(private val appContext: Context) {
     val token = generation
     connectTrace.begin(token.toLong(), "连接 ${profile.kind.label}")
     allOverview.start(profiles, include = setOfNotNull(id))
-    api = allOverview.client(id)
     if (transcripts != null && profile.kind == ServerKind.OPENCODE) scope.launch(storeDispatcher) {
       attempt { transcripts.bindServer(id, transcriptIdentity(profile)) }.onFailure { Diagnostics.warn("TranscriptStore", "绑定服务器失败", it) }
     }
@@ -1617,6 +1616,19 @@ class LagoonController private constructor(private val appContext: Context) {
     else paintCachedCatalog(id, token)
     rememberedSession?.let { openTrace.begin(selectionRevision, "恢复会话"); showCachedTranscript(id, it, selectionRevision) }
     allOverview.selectionChanged(previousServer)
+    // A broken DSH Remote / SSH profile can fail while the client is being constructed (missing
+    // host, blank account). That used to escape connect() on the main thread and close the app;
+    // keep the page on its offline state and let the normal retry loop pick up a fixed profile.
+    api = try {
+      allOverview.client(id)
+    } catch (error: Exception) {
+      if (error is CancellationException) throw error
+      val reason = userFacingError(error, "连接失败")
+      connectTrace.fail(token.toLong(), reason)
+      mutable.update { it.copy(loading = false, connected = false, error = reason) }
+      scheduleReconnect(id, token, if (error.isAuthFailure) AUTH_RETRY_ATTEMPT else 0, reason)
+      return
+    }
     connecting = scope.launch {
       try {
         loadAll(token)
@@ -1671,7 +1683,20 @@ class LagoonController private constructor(private val appContext: Context) {
     val profile = store.profiles().firstOrNull { it.id == id && it.enabled } ?: return
     connectTrace.begin(token.toLong(), "重连 ${profile.kind.label} 第 ${attempt + 1} 次")
     setStage(token, ConnectStage.CONNECTING)
-    api = allOverview.client(id)
+    // Rebuilds the client from the current profile; a still-broken DSH Remote / SSH setup must
+    // surface as an offline banner + retry, not as an uncaught coroutine exception.
+    api = try {
+      allOverview.client(id)
+    } catch (error: Exception) {
+      if (error is CancellationException) throw error
+      val reason = userFacingError(error, "连接失败")
+      if (token == generation) {
+        connectTrace.fail(token.toLong(), reason)
+        showOffline(id, token, reason)
+        scheduleReconnect(id, token, if (error.isAuthFailure) AUTH_RETRY_ATTEMPT else attempt + 1, reason)
+      }
+      return
+    }
     try {
       loadAll(token)
       if (token != generation) return
@@ -2542,9 +2567,12 @@ class LagoonController private constructor(private val appContext: Context) {
       val question = snapshot.questions.firstOrNull { it.sessionId == sessionId }
       if (permission == null && question == null) return@launch
       if (permission != null) {
-        val client = allOverview.client(server)
+        // A profile can be edited/disabled between the snapshot and this debounce; client setup
+        // must not throw out of the attention coroutine.
+        val client = runCatching { allOverview.client(server) }.getOrNull() ?: return@launch
         val pending = attempt { client.sessionPermissions(session) }.getOrNull()
-        if (store.profiles().none { it.id == server } || state.value.serverId == server || allOverview.client(server) !== client) return@launch
+        val sameClient = runCatching { allOverview.client(server) === client }.getOrDefault(false)
+        if (store.profiles().none { it.id == server } || state.value.serverId == server || !sameClient) return@launch
         if (pending != null && pending.none { it.id == permission.id }) { allOverview.settled(server, permission.id); allOverview.refresh(server); return@launch }
         if (!state.value.permissionPolicy.visible(permission.id, allSnapshots[server]?.autoApprovalFailures.orEmpty())) return@launch
       }

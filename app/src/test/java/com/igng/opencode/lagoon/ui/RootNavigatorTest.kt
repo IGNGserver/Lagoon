@@ -136,6 +136,22 @@ class RootNavigatorTest {
     assertTrue(selected.isEmpty())
   }
 
+  @Test fun theBlankDraftRouteDoesNotChangeWhenTheServerChanges() {
+    navigator.server = "srv-a"
+    navigator.navigate(navigator.navigation.copy(sessions = listOf(DRAFT_SESSION)))
+    val draftRoute = navigator.route
+    assertEquals(NavRoute(RootPage.HOME, DRAFT_SESSION, 1, null), draftRoute)
+
+    // Switching the harness from the blank page must not make AnimatedContent treat the draft as
+    // a new page: both old and new draft would otherwise register the same saveable key.
+    navigator.server = "srv-b"
+    assertEquals(draftRoute, navigator.route)
+
+    // Real conversations still carry their server so snapshots/back gestures stay server-scoped.
+    navigator.navigate(navigator.navigation.open("session"))
+    assertEquals("srv-b", navigator.route.serverId)
+  }
+
   @Test fun peekShowsTheOriginatingPageOnlyWhenLeavingTheOutermostSession() {
     navigator.server = "srv"
     navigator.navigate(SessionNavigation(RootPage.ARCHIVED).open("parent"))
