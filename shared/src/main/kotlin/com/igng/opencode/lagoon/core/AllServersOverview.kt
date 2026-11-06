@@ -81,6 +81,8 @@ internal class AllServersOverview(
   private val approvers = mutableMapOf<String, PermissionAutoApprover>()
   private val snapshots = mutableMapOf<String, ServerOverviewSnapshot>()
   private val handoffs = mutableMapOf<String, ServerOverviewSnapshot>()
+  /** One deep read per server/process populates shells/workspaces; later reads are control-only. */
+  private val firstReads = mutableSetOf<String>()
   private val childDiscoveries = mutableMapOf<String, ChildDiscovery>()
   /** The collecting job of each server's live event stream, so it can be dropped on purpose. */
   private val liveStreams = mutableMapOf<String, Job>()
@@ -108,6 +110,7 @@ internal class AllServersOverview(
       wakes[id] = Channel(Channel.CONFLATED)
       reconnectHints[id] = Channel(Channel.CONFLATED)
       publish(ServerOverviewSnapshot(id, profile, notices = store.sessionNotices(id), loading = selectedServer() != id))
+      firstReads += id
       jobs[id] = scope.launch { monitor(profile) }
     }
   }
@@ -269,7 +272,8 @@ internal class AllServersOverview(
       val next = lock.withLock {
         val previous = snapshot
         try {
-          readInternal(profile, client, previous, light = true) { revision == waitingRevision }
+          val first = firstReads.remove(id)
+          readInternal(profile, client, previous, light = !first) { revision == waitingRevision }
         } catch (cancel: CancellationException) {
           throw cancel
         } catch (error: Exception) {

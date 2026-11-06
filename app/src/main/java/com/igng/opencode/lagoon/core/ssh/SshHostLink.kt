@@ -1,5 +1,6 @@
 package com.igng.opencode.lagoon.core.ssh
 
+import com.igng.opencode.lagoon.core.Diagnostics
 import com.igng.opencode.lagoon.core.DshApi
 import com.igng.opencode.lagoon.core.DshAuthMode
 import com.igng.opencode.lagoon.core.PresentedSshHostKey
@@ -223,7 +224,15 @@ internal class SshHostLink(
       client = api
       workspaceCollector?.cancel()
       workspaceCollector = api.workspaceUpdates?.let { updates ->
-        scope.launch { updates.collect { workspacePublisher.emit(it) } }
+        scope.launch {
+          try {
+            updates.collect { workspacePublisher.emit(it) }
+          } catch (cancel: CancellationException) {
+            throw cancel
+          } catch (error: Exception) {
+            Diagnostics.warn("SshHostLink", "工作区流结束", error)
+          }
+        }
       }
       attempt = 0
       publish(SshLinkPhase.CONNECTED, SshLinkStep.CONNECTED, "已连接 · SSH ${config.address}")

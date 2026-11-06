@@ -11,7 +11,8 @@ SessionViewCache     最近打开的会话窗口（切回先显示，再后台�
 ```
 
 - 事件流是主实时源；轮询只做“漏帧兜底”，不是刷新手段。
-- 当前设备保留完整内容订阅；后台设备只保留控制事件，不打开 `workspace/follow`、`session/follow` 或 `job/list`。
+- 当前设备保留完整内容订阅；后台设备首次连接做一次深度读（shell/workspace 基线），之后只保留控制事件，
+  不再周期打开 `workspace/follow`、`session/follow` 或 `job/list`。
 - 页面切换不重新 `connect`；只有连接不存在时才在后台建立连接。
 
 ## 2. 读取预算
