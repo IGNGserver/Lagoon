@@ -113,7 +113,24 @@ internal class SshDshClient(
 
   override suspend fun removeShell(id: String, directory: String) = api().removeShell(id, directory)
 
-  override suspend fun createSession(directory: String, title: String): Session = api().createSession(directory, title)
+  override suspend fun createSession(directory: String, title: String, workspaceId: String?): Session =
+    api().createSession(directory, title, workspaceId)
+
+  override fun setContentWatching(enabled: Boolean) = link.setContentWatching(enabled)
+
+  override fun transportStatus(): String? {
+    val status = link.status.value
+    val phase = when (status.phase) {
+      SshLinkPhase.IDLE -> return null
+      SshLinkPhase.CONNECTING -> "SSH 连接中"
+      SshLinkPhase.RECONNECTING -> "SSH 重连中"
+      SshLinkPhase.CONNECTED -> "SSH 已连接"
+      SshLinkPhase.FAILED -> "SSH 连接失败"
+    }
+    return listOf(phase, status.detail.takeIf(String::isNotBlank)).joinToString(" · ")
+  }
+
+  override val workspaceUpdates: Flow<List<Project>>? get() = link.workspaceUpdates
 
   override suspend fun renameSession(session: Session, title: String) = api().renameSession(session, title)
 

@@ -80,6 +80,14 @@ internal fun ConnectionStrip(state: LagoonState, controller: LagoonController, m
       else if (shown.retry) TextButton(text = "立即重试", onClick = { controller.retryNow() })
     }
   }
+  // Transport-specific substep (SSH: start dsh / tunnel / login; Remote: credentials / handshake).
+  // It is not a network read and only appears while the connection is not READY.
+  val detail = state.transportDetail
+  if (!detail.isNullOrBlank() && (state.connection.stage != com.igng.opencode.lagoon.core.ConnectStage.READY ||
+      detail.contains("重连") || detail.contains("失败"))) {
+    Text(detail, Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 1.dp),
+      style = MiuixTheme.textStyles.footnote2, color = MiuixTheme.colorScheme.onSurfaceVariantSummary, maxLines = 1)
+  }
 }
 
 /** Placeholder bars while a list has nothing to show yet; they pulse so the wait reads as progress. */

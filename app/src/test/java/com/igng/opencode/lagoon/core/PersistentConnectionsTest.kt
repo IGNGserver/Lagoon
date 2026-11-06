@@ -328,4 +328,25 @@ class PersistentConnectionsTest {
     }
   }
 
+  @Test fun anIdleOverviewDoesNotPollTheServerEveryFewSeconds() = runBlocking {
+    MockWebServer().use { server ->
+      val streams = AtomicInteger()
+      server.dispatcher = dispatcher(streams)
+      val store = store(); val profile = profile("a", server); store.save(profile, null)
+      val scope = CoroutineScope(coroutineContext + SupervisorJob())
+      val snapshots = ConcurrentHashMap<String, ServerOverviewSnapshot>()
+      val manager = AllServersOverview(store, cache(), scope, { snapshots[it.serverId] = it })
+      try {
+        manager.start(listOf(profile))
+        awaitCondition { snapshots["a"]?.connected == true }
+        delay(300)
+        val before = server.requestCount
+        delay(500)
+        assertEquals("空闲监控只应保留事件流，不应周期全量轮询", before, server.requestCount)
+      } finally {
+        manager.stop(); scope.cancel()
+      }
+    }
+  }
+
 }

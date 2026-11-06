@@ -317,14 +317,14 @@ class ControllerRegressionTest {
       val job = ShellJob("sh", "root", "sleep", 100, "/repo")
       val (controller, state) = controller(api(server), LagoonState(serverId = "server", connected = true,
         sessions = listOf(root), tasks = mapOf("root" to TaskState("root", TaskPhase.THINKING, since = 100)), shells = mapOf("sh" to job)))
-      val pending = async { refresh(controller) }
+      val pending = async { refresh(controller, controlOnly = false) }
       assertTrue(withContext(Dispatchers.IO) { reading.await(5, TimeUnit.SECONDS) })
       LagoonController::class.java.getDeclaredMethod("handleEvent", ServerEvent::class.java).apply { isAccessible = true }
         .invoke(controller, ServerEvent("exit", "/repo", "shell.exited", org.json.JSONObject().put("id", "sh"), 210))
       pending.await()
       assertTrue("旧的 shell HTTP 响应不能覆盖更新的退出事件", state.value.shells.isEmpty())
       oldRead = false
-      refresh(controller)
+      refresh(controller, controlOnly = false)
       assertFalse(state.value.tasks["root"]?.active == true)
     }
   }
@@ -369,7 +369,7 @@ class ControllerRegressionTest {
       val (controller, state) = controller(api(server), LagoonState(serverId = "server", connected = true,
         sessions = listOf(Session("root", "/repo", "Root", 200)),
         tasks = mapOf("root" to TaskState("root", TaskPhase.THINKING, since = 100))))
-      val pending = async { refresh(controller) }
+      val pending = async { refresh(controller, controlOnly = false) }
       assertTrue(withContext(Dispatchers.IO) { reading.await(5, TimeUnit.SECONDS) })
       val props = org.json.JSONObject().put("sessionID", "root").put("status", org.json.JSONObject().put("type", "idle"))
       LagoonController::class.java.getDeclaredMethod("handleEvent", ServerEvent::class.java).apply { isAccessible = true }
@@ -495,7 +495,7 @@ class ControllerRegressionTest {
       val (controller, state) = controller(api(server), LagoonState(serverId = "server", connected = true,
         projects = listOf(Project("p", "/repo", "Repo")), sessions = listOf(root),
         tasks = mapOf("root" to TaskState("root", TaskPhase.THINKING, since = 10, activeAt = 10))))
-      refresh(controller, controlOnly = true)
+      refresh(controller, controlOnly = false)
 
       assertEquals("root", state.value.parents["child"])
       assertTrue(state.value.tasks["child"]?.active == true)
@@ -1172,4 +1172,33 @@ class ControllerRegressionTest {
   @Suppress("UNCHECKED_CAST")
   private fun mutable(controller: LagoonController) =
     LagoonController::class.java.getDeclaredField("mutable").apply { isAccessible = true }.get(controller) as MutableStateFlow<LagoonState>
+  @Test fun anOfflineDraftQueuesTheFirstPromptUntilTheConnectionReturns() = runBlocking {
+    MockWebServer().use { server ->
+      server.dispatcher = object : Dispatcher() {
+        override fun dispatch(request: RecordedRequest): MockResponse = when (request.requestUrl!!.encodedPath) {
+          "/api/info" -> MockResponse().setBody("""{"version":"2.0.22"}""")
+          "/api/session" -> MockResponse().setBody("""{"data":{"id":"created","location":{"directory":"/repo"},"title":"","time":{}}}""")
+          "/api/session/created/agent" -> MockResponse().setResponseCode(204)
+          "/api/session/created/prompt" -> MockResponse().setResponseCode(204)
+          else -> MockResponse().setBody("""{"data":[]}""")
+        }
+      }
+      val api = api(server); api.health()
+      val (controller, state) = controller(api, LagoonState(serverId = "server", connected = false,
+        projects = listOf(Project("project", "/repo", "Repo")), projectId = "project"))
+      val before = server.requestCount
+      controller.startSession("", "queued hello").join()
+      delay(100)
+      assertEquals("offline draft must not dial", before, server.requestCount)
+      state.value = state.value.copy(connected = true)
+      LagoonController::class.java.getDeclaredMethod("flushPendingDraft").apply { isAccessible = true }.invoke(controller)
+      withTimeout(3_000) { while (state.value.pending("create") || state.value.pending("send")) delay(10) }
+      assertEquals("created", state.value.sessionId)
+      assertEquals(1, List(server.requestCount) { server.takeRequest() }.count {
+        it.method == "POST" && it.requestUrl!!.encodedPath == "/api/session"
+      })
+      Unit
+    }
+  }
+
 }

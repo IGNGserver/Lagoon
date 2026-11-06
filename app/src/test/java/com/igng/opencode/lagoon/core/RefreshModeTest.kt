@@ -17,7 +17,8 @@ class RefreshModeTest {
   }
 
   @Test fun storeRemembersTheChosenMode() {
-    // 缺省即为「更快」，避免旧用户升级后仍觉得刷新慢。
-    assertEquals(RefreshMode.FAST, RefreshMode.entries.first { it.label == "更快" })
+    // The default is the quieter mode; "更快" remains an explicit opt-in.
+    assertEquals("标准", RefreshMode.STANDARD.label)
+    assertEquals("更快", RefreshMode.FAST.label)
   }
 }

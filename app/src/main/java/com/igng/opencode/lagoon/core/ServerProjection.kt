@@ -96,6 +96,11 @@ internal fun LagoonState.allServerStatuses(now: Long = System.currentTimeMillis(
 
 /** A home filter is a projection, not a connection switch. */
 fun LagoonState.homeProjection(): LagoonState {
+  homeProjectionCache?.let { return it }
+  return computeHomeProjection().also { homeProjectionCache = it }
+}
+
+private fun LagoonState.computeHomeProjection(): LagoonState {
   val snapshots = serverSnapshots()
   val enabledIds = enabledProfiles.mapTo(HashSet()) { it.id }
   if (!allServers) {

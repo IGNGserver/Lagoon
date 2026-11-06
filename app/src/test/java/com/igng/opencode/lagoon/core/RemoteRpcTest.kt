@@ -39,8 +39,15 @@ class RemoteRpcTest {
     val result = async { try { rpc.call("harness.remote.call", JSONObject(), 25); "unexpected" } catch (error: RemoteRpcException) { error.code } }
     val sent = transport.sent.receive()
     assertEquals("RPC_TIMEOUT", result.await())
+    assertFalse("一个慢 RPC 不能关掉整条连接", transport.closed)
     rpc.receive(response(sent.getString("id"), "late"))
     assertTrue(transport.sent.tryReceive().isFailure)
+    // The mux is still usable after one timed-out request.
+    val next = async { rpc.call("harness.remote.call", JSONObject()) }
+    val nextRequest = transport.sent.receive()
+    rpc.receive(response(nextRequest.getString("id"), "ok"))
+    assertEquals("ok", next.await())
+    assertFalse(transport.closed)
     rpc.close()
   }
 
@@ -69,4 +76,20 @@ class RemoteRpcTest {
     assertEquals(1, rpc.unknownTypes.get())
     assertFalse(transport.closed)
   }
+  /** 取消一个等待中的请求只丢弃该请求，不能把整条 mux 关掉。 */
+  @Test fun cancellingOneCallKeepsTheMuxAndOtherCallsAlive() = runBlocking {
+    val transport = FakeChannel()
+    val rpc = RemoteRpc(transport)
+    val cancelled = async { rpc.call("harness.remote.call", JSONObject()) }
+    val request = transport.sent.receive()
+    cancelled.cancel()
+    assertFalse("取消单个 RPC 不能断开 mux", transport.closed)
+    val next = async { rpc.call("harness.remote.call", JSONObject()) }
+    val nextRequest = transport.sent.receive()
+    rpc.receive(response(nextRequest.getString("id"), "ok"))
+    assertEquals("ok", next.await())
+    rpc.receive(response(request.getString("id"), "late"))
+    rpc.close()
+  }
+
 }

@@ -99,12 +99,15 @@ internal class AllServersOverview(
       val config = profile to store.credentials(id)
       val previous = configurations[id]
       if (jobs[id]?.isActive == true && previous?.second == config.second &&
-        previous.first.copy(name = "", autoConnect = true, notifications = true) == profile.copy(name = "", autoConnect = true, notifications = true)) return@forEach
+        previous.first.copy(name = "", autoConnect = true, notifications = true) == profile.copy(name = "", autoConnect = true, notifications = true)) {
+        clients[id]?.setContentWatching(id == selectedServer())
+        return@forEach
+      }
       remove(id)
       configurations[id] = config
       wakes[id] = Channel(Channel.CONFLATED)
       reconnectHints[id] = Channel(Channel.CONFLATED)
-      publish(ServerOverviewSnapshot(id, profile, notices = store.sessionNotices(id), loading = true))
+      publish(ServerOverviewSnapshot(id, profile, notices = store.sessionNotices(id), loading = selectedServer() != id))
       jobs[id] = scope.launch { monitor(profile) }
     }
   }
@@ -137,6 +140,21 @@ internal class AllServersOverview(
   }
   fun refreshAll() { wakes.values.forEach { it.trySend(Unit) }; reconnectHints.values.forEach { it.trySend(Unit) } }
 
+  /** Stop (`false`) or resume content streams for every client; used when the app leaves the foreground. */
+  fun setContentWatching(enabled: Boolean) {
+    clients.values.forEach { it.setContentWatching(enabled) }
+  }
+
+  /**
+   * The writable server changed: only it keeps the expensive content subscription. The previous
+   * server goes back to control-only (`$events`) and keeps its home/notification state without
+   * opening workspace or per-session follows.
+   */
+  fun contentWatchingChanged(previous: String?) {
+    previous?.let { id -> clients[id]?.setContentWatching(false); refresh(id) }
+    selectedServer()?.let { id -> clients[id]?.setContentWatching(true) }
+  }
+
   /**
    * Drops every live event stream so each reconnects at once. After a network switch, or after the
    * app slept in the background, a socket can be half-open: it looks connected but will never deliver
@@ -145,7 +163,7 @@ internal class AllServersOverview(
    */
   fun restartStreams() { liveStreams.values.toList().forEach { it.cancel(CancellationException(STREAM_RESTART)) } }
   fun refresh(id: String) { wakes[id]?.trySend(Unit) }
-  fun selectionChanged(previous: String?) { previous?.let(::refresh) }
+  fun selectionChanged(previous: String?) { contentWatchingChanged(previous) }
   fun handoff(snapshot: ServerOverviewSnapshot) { handoffs[snapshot.serverId] = snapshot }
   fun consider(id: String, requests: List<PermissionRequest>) { requests.forEach { approvers[id]?.consider(it) } }
   fun pending(id: String, requests: List<PermissionRequest>): List<PermissionRequest> = approvers[id]?.pending(requests) ?: requests
@@ -176,7 +194,7 @@ internal class AllServersOverview(
   private suspend fun monitor(profile: ServerProfile) {
     val id = profile.id
     val client = try {
-      client(id)
+      client(id).also { it.setContentWatching(id == selectedServer()) }
     } catch (cancel: CancellationException) {
       throw cancel
     } catch (error: Exception) {
@@ -251,7 +269,7 @@ internal class AllServersOverview(
       val next = lock.withLock {
         val previous = snapshot
         try {
-          read(profile, client, previous) { revision == waitingRevision }
+          readInternal(profile, client, previous, light = true) { revision == waitingRevision }
         } catch (cancel: CancellationException) {
           throw cancel
         } catch (error: Exception) {
@@ -282,9 +300,9 @@ internal class AllServersOverview(
       launch {
         refresh()
         while (isActive) {
-          kotlinx.coroutines.withTimeoutOrNull(if (snapshot.tasks.values.any { it.active }) store.refreshMode().activeReconcileMs else store.refreshMode().idleReconcileMs) {
-            wakes[id]?.receive()
-          }
+          // Control state is event-driven now. This is only a safety net for a dropped frame; a
+          // background host must not issue a full catalog/child/shell read every few seconds.
+          kotlinx.coroutines.withTimeoutOrNull(SAFETY_REFRESH_MILLIS) { wakes[id]?.receive() }
           refresh()
         }
       }
@@ -361,6 +379,28 @@ internal class AllServersOverview(
                         sessions = (listOf(session) + snapshot.sessions.filterNot { it.id == session.id }),
                         parents = snapshot.parents + listOfNotNull(session.parentId?.let { session.id to it }).toMap())
                     }
+                    if (event.type == "session.renamed") {
+                      val title = props.str("title")
+                      snapshot = snapshot.copy(sessions = snapshot.sessions.map { session ->
+                        if (session.id == sessionId) session.copy(title = title) else session
+                      })
+                    }
+                    if (event.type == "session.moved") {
+                      val directory = props.obj("location").str("directory")
+                      val subpath = props.str("subpath")
+                      snapshot = snapshot.copy(sessions = snapshot.sessions.map { session ->
+                        if (session.id == sessionId) session.copy(
+                          directory = if (subpath.isBlank()) directory else "${directory.trimEnd('/')}/${subpath.trim('/')}",
+                          projectId = props.str("projectID").ifBlank { session.projectId })
+                        else session
+                      })
+                    }
+                    if (event.type == "session.viewed") {
+                      val idle = props.optLong("idle")
+                      snapshot = snapshot.copy(sessions = snapshot.sessions.map { session ->
+                        if (session.id == sessionId) session.copy(viewed = maxOf(session.viewed, idle)) else session
+                      })
+                    }
                     if (event.type == "session.deleted") {
                       waitingRevision++
                       store.forgetSession(id, sessionId)
@@ -409,8 +449,8 @@ internal class AllServersOverview(
                   }
                   emit(snapshot)
                   if (event.type == "permission.asked") approver.consider(props.toPermission(event.directory))
-                  // Conflation keeps event consumption fast; never do a full HTTP round per token.
-                  refresh(id)
+                  // Events update the snapshot directly. A full HTTP read per event burst was the
+                  // main source of "constant loading"; the 5-minute safety loop repairs gaps.
                   retry = 1_000L
                 }
               }
@@ -437,13 +477,18 @@ internal class AllServersOverview(
   }
 
   private suspend fun read(profile: ServerProfile, client: HarnessClient, previous: ServerOverviewSnapshot,
-    unchanged: () -> Boolean): ServerOverviewSnapshot {
+    unchanged: () -> Boolean): ServerOverviewSnapshot =
+    readInternal(profile, client, previous, light = false, unchanged = unchanged)
+
+  private suspend fun readInternal(profile: ServerProfile, client: HarnessClient, previous: ServerOverviewSnapshot,
+    light: Boolean, unchanged: () -> Boolean): ServerOverviewSnapshot {
     val id = profile.id
+    LoadMetrics.record(if (light) "overview-control" else "overview-deep")
     val version = client.health()
     val projects = store.localProjects(id).map { it.copy(serverId = id) }
     // Row labels only. The selected server's catalog is owned by the controller (this read is
     // discarded for it), so do not spend a request here; a failure keeps the last published titles.
-    val workspaceCatalog = if (selectedServer() == id) previous.workspaceCatalog
+    val workspaceCatalog = if (light || selectedServer() == id) previous.workspaceCatalog
       else attempt { client.projectsForDisplay() }.getOrElse { previous.workspaceCatalog }.map { it.copy(serverId = id) }
     val page = client.rootSessionsPage()
     val activeResult = attempt { client.activeSessions() }
@@ -471,7 +516,7 @@ internal class AllServersOverview(
     }
     val knownParents = store.taskParents(id) + identityMap.values.mapNotNull { it.parentId?.let { parent -> it.id to parent } }
     val candidateRoots = (oldTasks.filterValues { it.active }.keys + active.orEmpty()).map { BackgroundWork.rootOf(it, knownParents) }.toSet()
-    val childRead = TaskReconciliation.children(client, identityMap.values.filter {
+    val childRead = if (light) ChildDiscovery.Result(emptyList(), emptySet()) else TaskReconciliation.children(client, identityMap.values.filter {
       it.parentId == null && it.id in candidateRoots && it.id !in active.orEmpty() && it.id !in deletedSessions
     }, knownParents, childDiscoveries.getOrPut(id) { ChildDiscovery() })
     childRead.sessions.forEach { fetched(it.copy(serverId = id)) }
@@ -481,7 +526,8 @@ internal class AllServersOverview(
     // auto-approver, matching the controller: sweeping every known directory hammered deleted
     // worktrees (HTTP 500) and pinned `degraded` on every reconciliation.
     val activeIds = active.orEmpty()
-    val waitingSessions = (activeIds + previous.permissions.map { it.sessionId } + previous.questions.map { it.sessionId })
+    val waitingSessions = (activeIds + previous.permissions.map { it.sessionId } + previous.questions.map { it.sessionId } +
+      previous.tasks.values.filter { it.phase in TaskState.WAITING_PHASES }.map { it.sessionId })
       .distinct().mapNotNull { identityMap[it] }
     val skippedPermissionSessions = waitingSessions.filter { directoryHealth.isDown(it.directory) }.map { it.id }.toSet()
     val readableSessions = waitingSessions.filterNot { it.id in skippedPermissionSessions }
@@ -498,7 +544,8 @@ internal class AllServersOverview(
       batch.map { directory -> async { directory to attempt { client.pendingPermissions(directory) } } }.awaitAll()
     } }
     sweepPermissionResults.forEach { (directory, result) -> if (result.isSuccess) directoryHealth.succeeded(directory) else directoryHealth.failed(directory) }
-    val formDirectories = (readableSessions.map { it.directory } + previous.questions.map { it.directory })
+    val formDirectories = (readableSessions.map { it.directory } + previous.questions.map { it.directory } +
+      previous.tasks.values.filter { it.phase == TaskPhase.WAITING_QUESTION }.mapNotNull { identityMap[it.sessionId]?.directory })
       .filter(String::isNotBlank).distinctBy(::normalizedDirectory).filterNot { directoryHealth.isDown(it) }
     val formResults = formDirectories.chunked(4).flatMap { batch -> coroutineScope {
       batch.map { directory -> async { directory to attempt { client.forms(directory) } } }.awaitAll()
@@ -540,8 +587,8 @@ internal class AllServersOverview(
         oldTasks[session.id]?.active == true || session.id in unseenNoticeSessions)
     }.sortedWith(sessionActivityOrder)
     var sessions = visibleSessions()
-    val shellDirectories = TaskReconciliation.shellDirectories(oldTasks, previous.shells,
-      sessions, projects, activeIds).filterNot { directoryHealth.isDown(it) }
+    val shellDirectories = if (light) emptyList() else TaskReconciliation.shellDirectories(oldTasks, previous.shells,
+      sessions, emptyList(), activeIds).filterNot { directoryHealth.isDown(it) }.take(MAX_SHELL_DIRECTORIES)
     val shellResults = coroutineScope { shellDirectories.map { directory ->
       async { directory to attempt { client.shells(directory) } }
     }.map { it.await() } }
@@ -664,6 +711,9 @@ internal class AllServersOverview(
     const val MAX_PARENT_ROUNDS = 8
     /** Upper bound of directories the auto-approver may sweep in one read. */
     const val MAX_SWEEP_DIRECTORIES = 12
+    const val MAX_SHELL_DIRECTORIES = 2
+    /** Event-driven control state; this loop only repairs a dropped frame. */
+    const val SAFETY_REFRESH_MILLIS = 5 * 60_000L
     /** Streaming bursts coalesce for this long before one control-plane read is issued. */
     const val EVENT_READ_COALESCE_MILLIS = 3_000L
     const val STREAM_RESTART = "实时连接重建"

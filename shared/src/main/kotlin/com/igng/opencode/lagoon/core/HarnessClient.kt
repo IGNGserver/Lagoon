@@ -136,7 +136,12 @@ interface HarnessClient {
   /** Terminate/remove a shell command and its retained output. */
   suspend fun removeShell(id: String, directory: String) = Unit
 
-  suspend fun createSession(directory: String, title: String): Session
+  /**
+   * Creates a session. [workspaceId] is the server's workspace identity for DSH hosts: without it
+   * the Host creates an ungrouped session that other clients cannot see. Harnesses with a single
+   * directory namespace ignore it.
+   */
+  suspend fun createSession(directory: String, title: String, workspaceId: String? = null): Session
 
   suspend fun renameSession(session: Session, title: String)
 
@@ -208,8 +213,29 @@ interface HarnessClient {
 
   suspend fun searchFiles(directory: String, query: String, session: Session? = null): List<String>
 
-  /** 服务端事件流；[onOpen] 在流真正建立（握手成功）时回调一次。 */
+  /**
+   * Full content subscription. Only the selected connection may watch content; background monitors
+   * call [setContentWatching] with `false` so they keep the control stream but do not open a
+   * `session/follow` for every running session.
+   */
   fun events(onOpen: () -> Unit = {}): Flow<ServerEvent>
+
+  /**
+   * Enables or disables the expensive half of [events] (workspace stream and per-session follows).
+   * The selected harness is the only one that needs it; background monitoring only needs control
+   * events (running state, permissions, results). Default: no-op for harnesses whose event stream is
+   * already cheap.
+   */
+  fun setContentWatching(enabled: Boolean) {}
+
+  /**
+   * Live server workspace titles, when the harness maintains them. The controller uses this to make
+   * a newly created/renamed workspace selectable without waiting for the next catalog reconciliation.
+   */
+  val workspaceUpdates: Flow<List<Project>>? get() = null
+
+  /** Low-cardinality transport step for the connection strip (SSH bootstrap, relay handshake). */
+  fun transportStatus(): String? = null
 
   companion object {
     /** 一次消息翻页的默认条数。 */

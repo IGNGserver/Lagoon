@@ -79,7 +79,9 @@ class MainActivity : ComponentActivity() {
     })
     setContent {
       val state by controller.state.collectAsState()
-      val home = state.homeProjection()
+      // Chat/draft pages do not need the home aggregate; computing it on every streamed token was
+      // pure CPU. Only root/list pages (no session in the stack) use it.
+      val home = if (navigator.navigation.sessions.isEmpty()) state.homeProjection() else state
       // A device group scopes the new-session server list; 全部设备 leaves every enabled profile open.
       val draftScope = home.homeGroup?.memberIds?.toSet()
       val preferences = remember { getSharedPreferences("ui", MODE_PRIVATE) }
@@ -351,7 +353,8 @@ class MainActivity : ComponentActivity() {
                 holder.SaveableStateProvider(key) { Page(target, active) }
               }
             }
-            if (state.loading || state.pendingOperations.any { ":open:" in it }) InfiniteProgressIndicator(Modifier.fillMaxWidth().align(Alignment.TopCenter).height(3.dp))
+            // Per-page first-load states own their own placeholders. A global bar here meant any
+            // background server's read made the whole app look busy.
             MiuixToastHost(globalMessage, globalMessageType, { globalMessage = null }, Modifier.align(Alignment.TopCenter).statusBarsPadding().padding(top = 16.dp))
             // MIUIX popups must stay inside this Scaffold content's popup registry.
             if (showingServerForm) ServersModal(state, controller, state.profiles.firstOrNull { it.id == editingServerId },
