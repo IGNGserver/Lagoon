@@ -2149,14 +2149,31 @@ class DshApi(
     // 多带 title 会以 gateway/arguments-invalid 失败；标题在创建后用 rename 设置。
     // 复用同目录已有的空白会话：DSH Web 也是这么做的，否则每次新建都会留下一个服务端草稿。
     val reusable = reusableBlank(directory)
+    // Host 只在请求带 workspaceId 时把新会话记进工作区（`session.create` 里的 attachSession）。
+    // 只带 cwd 会建出「未分组」的孤儿会话：远端按工作区枚举会话的客户端（Remote 中枢的会话目录、
+    // 电脑端工作区视图）都看不到它，而且没有任何 RPC 能事后补挂。
+    val workspaceId = workspaceIdFor(directory)
     try {
-      createSessionOnce(directory, title, reusable)
+      createSessionOnce(directory, title, reusable, workspaceId)
     } catch (error: ApiException) {
       // 这些错误明确表示“没有创建/没有复用”，换一次不带 sessionId 的请求是安全的；
       // 网络错误不能重试，否则可能重复创建。
       if (reusable == null || error.code !in BLANK_REUSE_DECLINED) throw error
-      createSessionOnce(directory, title, null)
+      createSessionOnce(directory, title, null, workspaceId)
     }
+  }
+
+  /**
+   * 目录恰好是某个已注册工作区的根目录时返回它的 workspaceId，否则返回 null 退回 cwd 语义。
+   * 只读 `workspace/follow` 已经维护好的本地清单（连上服务器后控制器会先拉一次），建会话时不再多开一条流；
+   * 目录是工作区子目录时不能换成 workspaceId —— 那会把会话的 cwd 强制成工作区根。
+   */
+  private fun workspaceIdFor(directory: String): String? {
+    val wanted = normalizedDirectory(directory)
+    if (wanted.isEmpty()) return null
+    return workspaceItems.orEmpty()
+      .firstOrNull { normalizedDirectory(it.str("path")) == wanted }
+      ?.str("workspaceId")?.ifBlank { null }
   }
 
   /** 同目录、未归档、未开始的空白会话；取最新的一条，避免把历史草稿全部翻出来。 */
@@ -2168,8 +2185,10 @@ class DshApi(
       .maxByOrNull { it.updated }?.id
   }
 
-  private suspend fun createSessionOnce(directory: String, title: String, reuse: String?): Session {
-    val request = JSONObject().put("cwd", directory)
+  private suspend fun createSessionOnce(directory: String, title: String, reuse: String?, workspaceId: String?): Session {
+    // workspaceId 与 cwd 互斥（网关严格校验）：给 workspaceId 时 Host 用它自己的工作区路径作为 cwd。
+    val request = if (workspaceId != null) JSONObject().put("workspaceId", workspaceId)
+    else JSONObject().put("cwd", directory)
     if (reuse != null) request.put("sessionId", reuse)
     val result = callObject("session/create", requestArgs(request))
     val id = result.str("sessionId").ifBlank { throw ApiException(502, "服务器没有返回新会话 id") }

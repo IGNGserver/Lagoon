@@ -105,6 +105,11 @@
 
 - `session/create`：`{request:{cwd?, workspaceId?, sessionId?, agentPreset?}}`（没有 `title`；网关严格校验，多带字段会
   `gateway/arguments-invalid`，标题在创建后用 `session/rename` 设置）。
+  **`workspaceId` 与 `cwd` 互斥，且只有带 `workspaceId` 时 Host 才会把新会话记进工作区**
+  （`session.create` 内部的 `workspace.attachSession()`）。只带 `cwd` 会留下「未分组」会话：远端按工作区
+  枚举的客户端（Remote 中枢的会话目录、电脑端工作区视图）看不到它，且 DSH 没有事后补挂的 RPC。
+  目标目录正好是某个工作区根目录时必须传 `workspaceId`；工作区子目录只能传 `cwd`，否则会话的 cwd 会被
+  强制成工作区根。
 - `session/prompt`：`{request:{requestId, sessionId, mode:"queue"|"steer", content:[…], clientTimeZone?}}`。
   `content` 支持 `{type:"text",text}`、`{type:"image",mediaType,data,name?}`、
   `{type:"file",receiptId}`（receipt 需要先上传）。
