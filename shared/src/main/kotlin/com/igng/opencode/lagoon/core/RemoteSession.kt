@@ -34,6 +34,12 @@ internal class RemoteSession(
   internal val accountId: String get() = account
   internal fun credentials(): RemoteCredentialSummary = devices.status()
 
+  /** Doctor snapshot of the current gateway budget; null before the first connection. */
+  internal fun streamStats(): RemoteStreamStats? = active?.let { current ->
+    RemoteStreamStats(current.gateway.activeStreamCount, current.gateway.maxStreams,
+      current.gateway.streamCounts(), current.gateway.lastError)
+  }
+
   suspend fun gateway(): RemoteGateway = ensure().gateway
   suspend fun capabilities(): RemoteCapabilities = ensure().capabilities
 

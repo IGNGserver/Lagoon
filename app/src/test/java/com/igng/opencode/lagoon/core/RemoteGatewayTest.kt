@@ -140,4 +140,34 @@ class RemoteGatewayTest {
     assertNotNull(gateway.lastError)
     assertTrue(calls >= 2)
   }
+
+  /** closeNow 同步归还槽位，取消路径不能等协程调度后才让出上限。 */
+  @Test fun streamBudgetIsEnforcedAndCloseNowReleasesSlot() = runBlocking {
+    val gateway = RemoteGateway { method, _ ->
+      when (method) {
+        "harness.remote.stream.open" -> JSONObject().put("opened", true)
+        "harness.remote.stream.close" -> JSONObject()
+        else -> JSONObject()
+      }
+    }
+    val opened = mutableListOf<RemoteGatewayStream>()
+    try {
+      repeat(gateway.maxStreams) { opened += gateway.open("session/follow", JSONObject()) }
+      assertEquals(gateway.maxStreams, gateway.activeStreamCount)
+      assertEquals(mapOf("session/follow" to gateway.maxStreams), gateway.streamCounts())
+      try {
+        gateway.open("session/follow", JSONObject())
+        fail("超过上限必须拒绝")
+      } catch (_: RemoteStreamLimitException) { }
+      opened.first().closeNow()
+      assertEquals(gateway.maxStreams - 1, gateway.activeStreamCount)
+      val replacement = gateway.open("session/follow", JSONObject())
+      assertEquals(gateway.maxStreams, gateway.activeStreamCount)
+      replacement.closeNow()
+      opened.drop(1).forEach { it.closeNow() }
+      assertEquals(0, gateway.activeStreamCount)
+    } finally {
+      gateway.close()
+    }
+  }
 }

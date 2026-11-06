@@ -181,6 +181,8 @@
   视为断线期间已被结算，同样撤回。审批 outcome 只有 `allowed-once` 一种授权，界面不提供「始终允许」。
 - 实时流：mux WebSocket 20 秒 ping；单条 `session/follow` 意外断开时按 2 秒起、最长 60 秒退避重连，
   重连后的快照把 seq 大于已投影位置的事件补投进时间线。服务端关闭整条连接按异常断开处理，上层重连。
+  客户端按 Host 限制逻辑流：长期 follow 只保留最近活跃的 12 个（当前会话固定），首页只为运行中会话
+  开 follow，`job/list` 最多并发 2 条，网关硬上限 32 条（`RemoteGateway.MAX_STREAMS`）。
 - 附件：Lagoon 的附件是 `data:` URI。图片折算为 `{type:"image", mediaType, data, name}`，文本文件内联为带文件名的
   `text` 块；都不经 `fileUploads`，也不写进服务器上的项目。
 - 删除会话 = 归档（DSH 没有删除），界面按能力隐藏「删除」、提供「分叉」；回退（revert）在 DSH 里没有对应语义，

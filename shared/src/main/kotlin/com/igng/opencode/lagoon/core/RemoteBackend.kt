@@ -28,6 +28,7 @@ class RemoteBackend internal constructor(
   internal val hostId: String get() = session.host
   internal fun connectionStatus(): RemoteConnectionStatus = session.status.value
   internal fun credentials(): RemoteCredentialSummary = session.credentials()
+  internal fun streamStats(): RemoteStreamStats? = session.streamStats()
   internal suspend fun supportsWorkspaceUpload(): Boolean = session.capabilities().supportsWorkspaceUpload
 
   internal suspend fun probe(): RemoteProbe {
@@ -87,6 +88,9 @@ class RemoteBackend internal constructor(
     override fun send(bytes: ByteString): Boolean = false
     override fun close(code: Int, reason: String?): Boolean { cancel(); return true }
     override fun cancel() {
+      // Remove the logical stream before cancelling the pump: the next open must see the freed slot
+      // immediately, not after the coroutine scheduler runs.
+      stream.closeNow()
       job.cancel()
       finish(null)
     }

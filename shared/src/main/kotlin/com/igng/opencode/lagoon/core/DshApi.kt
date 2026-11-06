@@ -12,7 +12,9 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import okhttp3.HttpUrl
@@ -122,6 +124,8 @@ class DshApi(
   private val cursors = ConcurrentHashMap<String, Long>()
   /** 需要实时事件（`session/follow`）的会话，最近打开的放最后。 */
   private val watched = LinkedHashSet<String>()
+  /** 当前打开的会话；容量淘汰时优先保留，避免首页刷新把正在阅读的 follow 挤掉。 */
+  @Volatile private var activeSessionId: String? = null
   /**
    * 每个会话只有一条长期 `session/follow`。快照从这条流取，实时事件也从这条流进；
    * 不再“先开一条取快照、再开一条做实时”。[followOpenLock] 串行化首次打开，
@@ -154,6 +158,11 @@ class DshApi(
   private val workspaceLock = Any()
   /** 每个会话的作业清单缓存：`job/list` 是每会话一条流，短 TTL 避免对账风暴。 */
   private val jobCache = ConcurrentHashMap<String, Pair<Long, List<JSONObject>>>()
+  /**
+   * 一次性读取（当前只有 `job/list`）的并发闸门。首页会按最多 8 个目录并发读作业，
+   * 每条 `job/list` 都是一条流；不限流会和 `$events`/`session/follow` 抢预算。
+   */
+  private val oneShotStreams = Semaphore(2)
   /** 实时流里已经建立文本/推理部件的 `sessionId|turn|step` 键与部件种类。 */
   private val liveParts = ConcurrentHashMap<String, MutableSet<String>>()
   /** 活跃 attempt 的 `attemptId → sessionId|turn|step`（chunk 帧不带 turn/step）。 */
@@ -167,6 +176,7 @@ class DshApi(
 
   override fun close() {
     closed = true
+    activeSessionId = null
     eventChannel?.close()
     followStates.values.toList().forEach(::stopFollowState)
     followStates.clear()
@@ -582,7 +592,8 @@ class DshApi(
 
   override suspend fun rootSessionsPage(directory: String?, cursor: String?, size: Int): ApiPage<Session> =
     withContext(Dispatchers.IO) {
-      val items = listing().items
+      val listing = listing()
+      val items = listing.items
       val sessions = items.mapNotNull { itemToSession(it) }
         .filter { directory == null || it.directory.trimEnd('/') == directory.trimEnd('/') }
         .filter { it.parentId == null }
@@ -590,7 +601,9 @@ class DshApi(
         // 下次新建同目录会话时可以复用。
         .filterNot { it.blank }
         .sortedByDescending { it.activityAt }
-      rememberWatched(sessions)
+      // 首页只关注真正在跑的会话：空闲会话没有实时内容，长期 follow 只会占流预算。
+      // 打开的会话由 messagesPage 单独加入并在淘汰时固定。
+      rememberWatched(sessions.filter { it.id in listing.running })
       ApiPage(sessions, null)
     }
 
@@ -600,6 +613,8 @@ class DshApi(
 
   override suspend fun messagesPage(id: String, cursor: String?, size: Int): ApiPage<Message> = withContext(Dispatchers.IO) {
     val session = sessionOrFetch(id)
+    // 当前阅读的会话固定保留；首页刷新只能替换其他 follow。
+    activeSessionId = session.id
     rememberWatched(listOf(session))
     val wanted = size.coerceIn(1, SNAPSHOT_MAX_MESSAGES)
     if (cursor == null) {
@@ -1233,6 +1248,7 @@ class DshApi(
         val id = args.optString(0).takeUnless { it == "null" }.orEmpty()
         if (id.isNotBlank()) {
           known.remove(id)
+          if (activeSessionId == id) activeSessionId = null
           synchronized(watched) { watched.remove(id) }
           stopFollow(id)
           push(ServerEvent(id = "dsh:removed:$id", directory = "", type = "session.deleted",
@@ -1397,29 +1413,64 @@ class DshApi(
   }
 
   private suspend fun openFollow(session: Session, state: FollowState) {
-    try {
-      val payload = requestArgs(JSONObject()
-        .put("address", address(session.id))
-        .put("assistantStream", true)
-        .put("maxMessages", SNAPSHOT_MAX_MESSAGES)
-        .put("turnWindow", JSONObject().put("minMessages", SNAPSHOT_MIN_MESSAGES).put("minTurns", 2)))
-      val socket = openMux("session/follow", payload,
-        onItem = { frame -> onFollowFrame(session, state, frame) },
-        onClosed = { cause -> onFollowClosed(session, state, cause) })
-      state.opening = false
-      state.socket = socket
-      if (state.closed) socket.cancel()
-    } catch (cancel: CancellationException) {
-      state.opening = false
-      if (!state.snapshot.isCompleted) state.snapshot.completeExceptionally(cancel)
-      throw cancel
-    } catch (error: Exception) {
-      state.opening = false
-      state.error = error.message?.takeIf { it.isNotBlank() } ?: error.javaClass.simpleName
-      if (!state.snapshot.isCompleted) state.snapshot.completeExceptionally(error)
-      followStates.remove(session.id, state)
-      Diagnostics.warn("DshApi", "会话 follow 未建立：${state.error}")
+    var retriedLimit = false
+    while (true) {
+      try {
+        val payload = requestArgs(JSONObject()
+          .put("address", address(session.id))
+          .put("assistantStream", true)
+          .put("maxMessages", SNAPSHOT_MAX_MESSAGES)
+          .put("turnWindow", JSONObject().put("minMessages", SNAPSHOT_MIN_MESSAGES).put("minTurns", 2)))
+        val socket = openMux("session/follow", payload,
+          onItem = { frame -> onFollowFrame(session, state, frame) },
+          onClosed = { cause -> onFollowClosed(session, state, cause) })
+        state.opening = false
+        state.socket = socket
+        if (state.closed) socket.cancel()
+        return
+      } catch (cancel: CancellationException) {
+        state.opening = false
+        if (!state.snapshot.isCompleted) state.snapshot.completeExceptionally(cancel)
+        throw cancel
+      } catch (limit: RemoteStreamLimitException) {
+        // The local gateway is full. Do not cancel the in-flight open RPC (RemoteRpc treats that as
+        // an unknown-delivery failure and closes the whole relay); evict a different live follow,
+        // which releases its slot synchronously via StreamSocket.closeNow(), then retry once.
+        if (!retriedLimit && !state.closed && releaseFollowForRetry(session.id)) {
+          retriedLimit = true
+          delay(STREAM_LIMIT_RETRY_DELAY_MILLIS)
+          if (!state.closed) continue
+        }
+        failFollow(session, state, limit)
+        return
+      } catch (error: Exception) {
+        failFollow(session, state, error)
+        return
+      }
     }
+  }
+
+  private fun failFollow(session: Session, state: FollowState, error: Exception) {
+    state.opening = false
+    state.error = error.message?.takeIf { it.isNotBlank() } ?: error.javaClass.simpleName
+    if (!state.snapshot.isCompleted) state.snapshot.completeExceptionally(error)
+    followStates.remove(session.id, state)
+    Diagnostics.warn("DshApi", "会话 follow 未建立：${state.error}")
+  }
+
+  /**
+   * Drop one non-active live follow to make room for [exclude]. Only states with a socket are
+   * eligible: an in-flight open owns no local slot yet and cannot be cancelled safely.
+   */
+  private fun releaseFollowForRetry(exclude: String): Boolean {
+    val victim = synchronized(watched) {
+      watched.firstOrNull { id ->
+        id != activeSessionId && id != exclude && followStates[id]?.socket != null
+      }?.also { watched.remove(it) }
+    } ?: return false
+    Diagnostics.warn("DshApi", "流预算已满，释放旧的会话 follow：${victim.take(24)}")
+    stopFollow(victim)
+    return true
   }
 
   private fun onFollowFrame(session: Session, state: FollowState, frame: JSONObject) {
@@ -1482,14 +1533,16 @@ class DshApi(
     state.error = cause?.message?.takeIf { it.isNotBlank() } ?: "会话流已关闭"
     followStates.remove(session.id, state)
     val watchedNow = synchronized(watched) { session.id in watched }
-    if (!watchedNow && eventChannel == null) return
+    // 只有仍在观察集合里的会话才重连；否则首页/历史会话的每条 follow 都会在断开后被复活，
+    // 重新占满 RemoteGateway 的流预算。
+    if (!watchedNow) return
     Diagnostics.warn("DshApi", "会话 follow 断开，准备重连：${state.error}")
     val reconnects = state.reconnects + 1
     val wait = (FOLLOW_RETRY_MIN_MILLIS shl (reconnects - 1).coerceAtMost(5)).coerceAtMost(FOLLOW_RETRY_MAX_MILLIS)
     ioScope.launch {
       delay(wait)
       if (closed) return@launch
-      if (!synchronized(watched) { session.id in watched } && eventChannel == null) return@launch
+      if (!synchronized(watched) { session.id in watched }) return@launch
       val next = followFor(session)
       next.reconnects = reconnects
     }
@@ -1554,21 +1607,33 @@ class DshApi(
     if (!state.snapshot.isCompleted) state.snapshot.completeExceptionally(IOException("会话流已关闭"))
   }
 
-  /** 记录最近打开的会话并限制 follow 数量，避免长连堆积。 */
+  /**
+   * 记录需要实时 follow 的会话，并把长期 follow 严格限制在 [WATCH_LIMIT] 条。
+   *
+   * 旧实现先裁到 12 条，却对传入列表里的**每个**会话调用 [startFollow]；首页有 20 个会话时
+   * 实际会开 14 条 follow，正好把 RemoteGateway 的 16 条预算占满。这里只对保留下来的集合
+   * 启动 follow，并保证淘汰顺序与“最近活跃”一致；[activeSessionId] 不参与淘汰。
+   */
   private fun rememberWatched(sessions: List<Session>) {
+    val retained: List<String>
+    val evicted = mutableListOf<String>()
     synchronized(watched) {
-      for (session in sessions) {
+      // 输入通常按“最新在前”排序；按 updated 从旧到新加入，LinkedHashSet 的尾部才是最近活跃。
+      for (session in sessions.sortedBy { it.updated }) {
         watched.remove(session.id)
         watched.add(session.id)
       }
       while (watched.size > WATCH_LIMIT) {
-        val oldest = watched.first()
+        val oldest = watched.firstOrNull { it != activeSessionId } ?: break
         watched.remove(oldest)
-        stopFollow(oldest)
+        evicted += oldest
       }
+      retained = watched.toList()
     }
+    // 先停掉被淘汰的，释放槽位后再启动新流。
+    evicted.forEach(::stopFollow)
     if (eventChannel == null) return
-    sessions.forEach { startFollow(it.id) }
+    retained.forEach(::startFollow)
   }
 
   /** 连接医生用：每条 follow 的最近状态，只有会话 id 与计数，没有消息正文。 */
@@ -1592,7 +1657,8 @@ class DshApi(
       snapshots = snapshotStats.values.sortedByDescending { it.at }.take(8),
       follows = followDiagnostics(),
       events = RemoteEventStats(eventsReady, eventsClientId, readyGeneration.get(), eventsLastFrameAt,
-        eventsReconnects, eventsError)
+        eventsReconnects, eventsError),
+      streams = backend.streamStats() ?: RemoteStreamStats()
     )
   }
 
@@ -2059,16 +2125,19 @@ class DshApi(
 
   /** `job/list` 是每会话一条流；短 TTL 缓存把同一轮对账里的重复读取收敛掉。 */
   private suspend fun runningJobs(session: Session): List<JSONObject> {
-    val now = System.currentTimeMillis()
-    jobCache[session.id]?.takeIf { now - it.first < JOB_CACHE_MILLIS }?.let { return it.second }
+    jobCache[session.id]?.takeIf { System.currentTimeMillis() - it.first < JOB_CACHE_MILLIS }?.let { return it.second }
     val jobs = try {
-      fetchFirstFrame("job/list", requestArgs(JSONObject().put("sessionId", session.id))).arr("jobs").objects()
+      oneShotStreams.withPermit {
+        // 等许可期间别的目录可能已经写过缓存；再查一次，避免重复开流。
+        jobCache[session.id]?.takeIf { System.currentTimeMillis() - it.first < JOB_CACHE_MILLIS }?.second
+          ?: fetchFirstFrame("job/list", requestArgs(JSONObject().put("sessionId", session.id))).arr("jobs").objects()
+      }
     } catch (cancel: CancellationException) {
       throw cancel
     } catch (_: Exception) {
       emptyList()
     }
-    jobCache[session.id] = now to jobs
+    jobCache[session.id] = System.currentTimeMillis() to jobs
     return jobs
   }
 
@@ -2560,6 +2629,8 @@ class DshApi(
     /** 首屏快照的尝试次数：拿到非 snapshot 帧或流错误时重开一次，仍失败才报错。 */
     const val SNAPSHOT_ATTEMPTS = 2
     const val SNAPSHOT_RETRY_DELAY_MILLIS = 400L
+    /** 流预算满时，释放一条旧 follow 后给对端关闭帧留出的调度时间。 */
+    const val STREAM_LIMIT_RETRY_DELAY_MILLIS = 150L
     /** 与官方客户端一致的窗口：限制单帧体积，更早的历史由 `session/page` 补。 */
     const val SNAPSHOT_MAX_MESSAGES = 500
     const val SNAPSHOT_MIN_MESSAGES = 50

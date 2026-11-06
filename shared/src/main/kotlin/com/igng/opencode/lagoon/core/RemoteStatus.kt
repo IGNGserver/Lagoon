@@ -91,6 +91,14 @@ data class RemoteEventStats(
   val error: String? = null
 )
 
+/** One Host's logical-stream budget; counts and endpoint names only, never message bodies. */
+data class RemoteStreamStats(
+  val active: Int = 0,
+  val limit: Int = 0,
+  val byEndpoint: Map<String, Int> = emptyMap(),
+  val lastError: String? = null
+)
+
 /**
  * Everything needed to answer "which hop failed?" without reading any message body.
  * Copied from the connection dialog into bug reports.
@@ -106,6 +114,7 @@ data class RemoteDoctor(
   val snapshots: List<RemoteSnapshotStats>,
   val follows: List<RemoteFollowStats>,
   val events: RemoteEventStats,
+  val streams: RemoteStreamStats = RemoteStreamStats(),
   val capturedAt: Long = System.currentTimeMillis()
 ) {
   fun diagnosticLines(): List<Pair<String, String>> = buildList {
@@ -126,7 +135,8 @@ data class RemoteDoctor(
     add("快照" to (snapshots.lastOrNull()?.let { snapshotLabel(it) } ?: "尚未读取"))
     add("会话流" to (follows.maxByOrNull { it.lastFrameAt }?.let { followLabel(it) } ?: "未打开"))
     add("事件流" to eventLabel(events))
-    add("最近错误" to (status.lastError?.let { failureLabel(it) } ?: events.error ?: "无"))
+    add("流预算" to streamLabel(streams))
+    add("最近错误" to (status.lastError?.let { failureLabel(it) } ?: streams.lastError ?: events.error ?: "无"))
     add("采集时间" to time(capturedAt))
   }
 
@@ -168,6 +178,18 @@ data class RemoteDoctor(
     if (value.lastEventAt > 0) append(" · ${ago(value.lastEventAt)}有事件")
     if (value.reconnects > 0) append(" · 重连${value.reconnects}次")
     value.error?.let { append(" · $it") }
+  }
+
+  private fun streamLabel(value: RemoteStreamStats): String {
+    if (value.limit <= 0) return "未知"
+    return buildString {
+      append("${value.active}/${value.limit}")
+      if (value.byEndpoint.isNotEmpty()) {
+        append(" · ")
+        append(value.byEndpoint.entries.sortedByDescending { it.value }.joinToString(", ") { "${it.key} ${it.value}" })
+      }
+      value.lastError?.let { append(" · 最近失败: $it") }
+    }
   }
 
   private fun failureLabel(value: RemoteFailureSnapshot): String = buildString {

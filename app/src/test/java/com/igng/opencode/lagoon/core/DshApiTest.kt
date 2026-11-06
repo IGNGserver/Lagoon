@@ -929,7 +929,7 @@ class DshApiTest {
       server.dispatcher = object : Dispatcher() {
         override fun dispatch(request: RecordedRequest): MockResponse = when {
           request.path!!.startsWith("/?token") || request.path == "/" -> rootOk()
-          request.path == "/api/session/list" -> envelope("""{"items":[${sessionRow()}]}""")
+          request.path == "/api/session/list" -> envelope("""{"items":[${sessionRow(running = true)}]}""")
           request.path == "/api/remote.mux" -> MockResponse().withWebSocketUpgrade(object : WebSocketListener() {
             override fun onMessage(webSocket: WebSocket, text: String) {
               val frame = JSONObject(text)

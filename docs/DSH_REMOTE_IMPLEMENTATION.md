@@ -191,6 +191,23 @@ Noise + relay + `harness.remote.stream.open` + 1.5 MB 分片快照 + `session/fo
 
 打开动作由 `followOpenLock` 串行化，消息页和 `$events` 不会再各开一条。
 
+### 每台 Host 的流预算
+
+`RemoteGateway` 的逻辑流上限是**每台 Host 共用**的，首页监控、会话页和后台作业都算在一起。
+旧的 16 条上限过于贴近实际占用：12 条 follow 加 `$events`/`workspace/follow` 已到 14 条，
+首页刷新再并发读 8 个目录的 `job/list` 就会越界，表现为打开某些会话时报
+`Remote 流数量超过上限`。
+
+现在的配额与兜底：
+
+- `$events` 1 条 + `workspace/follow` 1 条；
+- `session/follow` 严格不超过 `WATCH_LIMIT`（12）条；按最近活跃淘汰，当前打开的会话固定保留；
+- `job/follow` 1 条；`job/list` 用 `Semaphore(2)` 限流，且取消时同步从网关移除；
+- `RemoteGateway` 的硬上限提升到 32，仅作兜底；
+- 首页只为运行中的会话开 follow，空闲会话由列表轮询维护；
+- follow 意外断开时只重连仍在 watch 集合里的会话；
+- 连接医生增加“流预算”一行（占用/上限、按 endpoint 的计数、最近流错误）。
+
 ### 内容与状态解耦
 
 - `events()` 不再因为 `$events` 失败而结束：只把 `eventsReady` 置 false、按 1s→30s 退避重连，
@@ -214,11 +231,14 @@ Noise + relay + `harness.remote.stream.open` + 1.5 MB 分片快照 + `session/fo
 - 最近快照 `records/messages/cursor/hasMore`；
 - 每条 follow 的 `lastSeq/最后帧/重连次数/错误`；
 - `$events` 的 ready/generation/clientId/最后事件/重连次数；
+- 逻辑流预算：当前占用/硬上限、按 endpoint 的计数、最近一次流错误；
 - 最近错误与上游 code，可一键复制。报告只含计数和错误码，不含消息正文或令牌。
 
 ### 验证
 
 - 新增 `RemoteConnectionDesignTest`：状态机 READY/generation、单会话一条 follow、`$events` 失败
   不结束事件流、90s 后刷新状态自愈、诊断文本不含令牌。
+- 新增流预算回归：首页只为运行中会话开 follow、20 个会话仍限制在 `WATCH_LIMIT`、后台流占满时
+  核心事件流仍可建立、`closeNow` 同步归还槽位、网关超过硬上限时拒绝。
 - `RemoteRelayTest` 新增 hello `clientVersion` 与 capability 子集协商用例。
 - 可重复的真实链路：`scripts/remote-e2e.sh`（自建 Hub + 隔离 `dsh web` Host + `RemoteLiveProbeTest`）。
