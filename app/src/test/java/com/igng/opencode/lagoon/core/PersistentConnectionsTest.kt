@@ -331,7 +331,14 @@ class PersistentConnectionsTest {
   @Test fun anIdleOverviewDoesNotPollTheServerEveryFewSeconds() = runBlocking {
     MockWebServer().use { server ->
       val streams = AtomicInteger()
-      server.dispatcher = dispatcher(streams)
+      val reads = AtomicInteger()
+      val base = dispatcher(streams)
+      server.dispatcher = object : Dispatcher() {
+        override fun dispatch(request: RecordedRequest): MockResponse {
+          if (request.requestUrl!!.encodedPath != "/api/event") reads.incrementAndGet()
+          return base.dispatch(request)
+        }
+      }
       val store = store(); val profile = profile("a", server); store.save(profile, null)
       val scope = CoroutineScope(coroutineContext + SupervisorJob())
       val snapshots = ConcurrentHashMap<String, ServerOverviewSnapshot>()
@@ -339,10 +346,10 @@ class PersistentConnectionsTest {
       try {
         manager.start(listOf(profile))
         awaitCondition { snapshots["a"]?.connected == true }
-        delay(300)
-        val before = server.requestCount
+        delay(700)
+        val before = reads.get()
         delay(500)
-        assertEquals("空闲监控只应保留事件流，不应周期全量轮询", before, server.requestCount)
+        assertEquals("空闲监控只应保留事件流，不应周期全量轮询", before, reads.get())
       } finally {
         manager.stop(); scope.cancel()
       }
