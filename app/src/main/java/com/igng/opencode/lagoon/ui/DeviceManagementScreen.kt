@@ -155,7 +155,7 @@ internal fun DeviceManagementScreen(
           if (state.deviceGroups.isEmpty()) {
             Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
               Text(
-                "把同一台电脑上的多个连接放进一个分组，首页只显示「全部」和这些分组。",
+                "把同一台电脑上的多个连接放进一个分组，首页左上角范围面板会列出「全部设备」和这些分组。",
                 style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
               )
               TextButton(

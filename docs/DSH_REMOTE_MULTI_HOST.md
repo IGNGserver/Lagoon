@@ -1,5 +1,8 @@
 # DSH Remote 多 Host 接入与设备分组
 
+> **2026-11-06 更新**：首页的横向服务器胶囊已删除，设备/分组/项目/工作区统一由左上角标题打开的
+> 范围面板承载；本文中关于“胶囊”的描述为当时实现。
+
 本文分析 Android 端 DSH 全面改用 [ds-harness-remote](https://github.com/liguobao/ds-harness-remote) 后，为什么当前一次只能连一台 Host，以及如何做到：
 
 1. 同时连接账号下的全部 Host；

@@ -22,40 +22,56 @@ class HomeSectionsTest {
   }
 
   @Test fun sixDaysAgoIsStillThisWeekAndSevenIsNot() {
-    val sections = HomeSections.byDate(listOf(session("six", at(5, 9) - 6 * 86_400_000L), session("seven", at(5, 9) - 7 * 86_400_000L)), now, zone)
+    val sessions = listOf(session("six", at(5, 9) - 6 * 86_400_000L), session("seven", at(5, 9) - 7 * 86_400_000L))
+    val sections = HomeSections.byDate(sessions, now, zone)
     assertEquals(listOf("近 7 天", "近 30 天"), sections.map { it.title })
   }
 
-  @Test fun oldLiveTasksBelongToTodayWithoutChangingTheirActivity() {
+  @Test fun oldLiveTasksBelongToTodayAndLeadByPriority() {
     val live = listOf(SessionStatus.RUNNING, SessionStatus.WAITING_PERMISSION,
       SessionStatus.WAITING_QUESTION, SessionStatus.WAITING_SERVER)
     val sessions = live.mapIndexed { index, status -> session(status.name, at(5, 9) - (40 + index) * 86_400_000L) }
-    val timestamps = sessions.map { it.activityAt }
     val statuses = sessions.zip(live).associate { (session, status) -> session.key to status }
 
     val sections = HomeSections.build(HomeGrouping.DATE, sessions, emptyList(), statuses, now = now, zone = zone)
 
     assertEquals(listOf("date:today"), sections.map { it.key })
     assertEquals(listOf("今天"), sections.map { it.title })
-    assertEquals(sessions, sections.single().sessions)
-    assertEquals(timestamps, sections.single().sessions.map { it.activityAt })
+    assertEquals(listOf("WAITING_PERMISSION", "WAITING_QUESTION", "RUNNING", "WAITING_SERVER"),
+      sections.single().sessions.map { it.id })
   }
 
   @Test fun nonLiveAndMissingStatusesKeepTheirRealActivityDates() {
-    val sessions = listOf(session("unknown", at(4, 23)), session("done", at(1, 12)),
-      session("failed", now - 10 * 86_400_000L), session("idle", now - 40 * 86_400_000L),
+    val sessions = listOf(session("unknown", at(4, 23)), session("idle", now - 40 * 86_400_000L),
       session("missing", now - 41 * 86_400_000L))
-    val statuses = mapOf("unknown" to SessionStatus.NONE, "done" to SessionStatus.COMPLETED,
-      "failed" to SessionStatus.FAILED, "idle" to SessionStatus.NONE)
+    val statuses = mapOf("unknown" to SessionStatus.NONE, "idle" to SessionStatus.NONE)
 
     val sections = HomeSections.build(HomeGrouping.DATE, sessions, emptyList(), statuses, now = now, zone = zone)
 
-    assertEquals(listOf("昨天", "近 7 天", "近 30 天", "更早"), sections.map { it.title })
-    assertEquals(listOf(listOf("unknown"), listOf("done"), listOf("failed"), listOf("idle", "missing")),
+    assertEquals(listOf("昨天", "更早"), sections.map { it.title })
+    assertEquals(listOf(listOf("unknown"), listOf("idle", "missing")),
       sections.map { section -> section.sessions.map { it.id } })
   }
 
-  @Test fun promotedTodaySectionLeadsOlderBucketsAndPreservesActivityOrder() {
+  @Test fun unreadResultsArePromotedToTodayUntilViewed() {
+    val sessions = listOf(session("done", at(1, 12)), session("failed", now - 10 * 86_400_000L),
+      session("quietToday", at(5, 8)))
+    val unread = mapOf("done" to SessionStatus.COMPLETED, "failed" to SessionStatus.FAILED,
+      "quietToday" to SessionStatus.NONE)
+
+    val promoted = HomeSections.build(HomeGrouping.DATE, sessions, emptyList(), unread, now = now, zone = zone)
+    assertEquals(listOf("今天"), promoted.map { it.title })
+    assertEquals(listOf("done", "failed", "quietToday"), promoted.single().sessions.map { it.id })
+
+    val viewed = HomeSections.build(HomeGrouping.DATE, sessions, emptyList(),
+      mapOf("done" to SessionStatus.NONE, "failed" to SessionStatus.NONE, "quietToday" to SessionStatus.NONE),
+      now = now, zone = zone)
+    assertEquals(listOf("今天", "近 7 天", "近 30 天"), viewed.map { it.title })
+    assertEquals(listOf(listOf("quietToday"), listOf("done"), listOf("failed")),
+      viewed.map { section -> section.sessions.map { it.id } })
+  }
+
+  @Test fun promotedTodaySectionLeadsOlderBuckets() {
     val sessions = listOf(session("yesterday", at(4, 23)), session("week", at(1, 12)),
       session("running", now - 10 * 86_400_000L), session("month", now - 11 * 86_400_000L),
       session("earlier", now - 41 * 86_400_000L))
@@ -68,32 +84,67 @@ class HomeSectionsTest {
     assertEquals(listOf("month"), sections[3].sessions.map { it.id })
   }
 
-  @Test fun datePromotionUsesServerScopedKeysAndExpiresWithLiveStatus() {
+  @Test fun datePromotionUsesServerScopedKeysAndReturnsViewedUnreadToItsDate() {
     val running = session("same", now - 40 * 86_400_000L).copy(serverId = "a")
     val idle = running.copy(serverId = "b")
     val sessions = listOf(idle, running)
-    val sections = HomeSections.build(HomeGrouping.DATE, sessions, emptyList(),
-      mapOf(running.key to SessionStatus.RUNNING), now = now, zone = zone)
 
-    assertEquals(listOf("今天", "更早"), sections.map { it.title })
-    assertEquals(listOf(running), sections.first().sessions)
-    assertEquals(listOf(idle), sections.last().sessions)
-    for (status in listOf(SessionStatus.COMPLETED, SessionStatus.NONE)) {
-      val settled = HomeSections.build(HomeGrouping.DATE, sessions, emptyList(),
-        mapOf(running.key to status), now = now, zone = zone)
-      assertEquals(listOf("更早"), settled.map { it.title })
-      assertEquals(sessions, settled.single().sessions)
-    }
+    val live = HomeSections.build(HomeGrouping.DATE, sessions, emptyList(),
+      mapOf(running.key to SessionStatus.RUNNING), now = now, zone = zone)
+    assertEquals(listOf("今天", "更早"), live.map { it.title })
+    assertEquals(listOf(running), live.first().sessions)
+    assertEquals(listOf(idle), live.last().sessions)
+
+    val unread = HomeSections.build(HomeGrouping.DATE, sessions, emptyList(),
+      mapOf(running.key to SessionStatus.COMPLETED), now = now, zone = zone)
+    assertEquals(listOf("今天", "更早"), unread.map { it.title })
+    assertEquals(listOf(running), unread.first().sessions)
+
+    val settled = HomeSections.build(HomeGrouping.DATE, sessions, emptyList(),
+      mapOf(running.key to SessionStatus.NONE), now = now, zone = zone)
+    assertEquals(listOf("更早"), settled.map { it.title })
+    assertEquals(sessions, settled.single().sessions)
   }
 
-  @Test fun todaysActivityAndPromotedWorkKeepTheirRelativeInputOrder() {
-    val sessions = listOf(session("today", at(5, 8)), session("yesterday", at(4, 23)),
-      session("running", at(1, 12)), session("waiting", now - 40 * 86_400_000L))
-    val sections = HomeSections.byDate(sessions, now, zone,
-      mapOf("running" to SessionStatus.RUNNING, "waiting" to SessionStatus.WAITING_QUESTION))
+  @Test fun dateViewRanksQuestionsThenLiveWorkThenUnreadThenQuiet() {
+    val sessions = listOf(session("quiet", at(5, 8)), session("unread", at(5, 7)),
+      session("running", at(5, 6)), session("waiting", at(5, 5)))
+    val statuses = mapOf("quiet" to SessionStatus.NONE, "unread" to SessionStatus.COMPLETED,
+      "running" to SessionStatus.RUNNING, "waiting" to SessionStatus.WAITING_QUESTION)
 
-    assertEquals(listOf("今天", "昨天"), sections.map { it.title })
-    assertEquals(listOf("today", "running", "waiting"), sections.first().sessions.map { it.id })
+    val sections = HomeSections.byDate(sessions, now, zone, statuses)
+
+    assertEquals(listOf("waiting", "running", "unread", "quiet"),
+      sections.single().sessions.map { it.id })
+  }
+
+  @Test fun waitingOnServerRanksWithRunningNotWithQuestions() {
+    val sessions = listOf(session("server", at(5, 8)), session("run", at(5, 7)), session("ask", at(5, 6)))
+    val statuses = mapOf("server" to SessionStatus.WAITING_SERVER, "run" to SessionStatus.RUNNING,
+      "ask" to SessionStatus.WAITING_QUESTION)
+
+    val sections = HomeSections.byDate(sessions, now, zone, statuses)
+
+    assertEquals(listOf("ask", "server", "run"), sections.single().sessions.map { it.id })
+  }
+
+  @Test fun sameDatePriorityKeepsTheCallersActivityOrder() {
+    val sessions = listOf(session("quiet", at(5, 9)), session("newerRun", at(5, 8)),
+      session("newerUnread", at(5, 7)), session("olderRun", at(5, 6)), session("olderUnread", at(5, 5)))
+    val statuses = mapOf("quiet" to SessionStatus.NONE, "newerRun" to SessionStatus.RUNNING,
+      "newerUnread" to SessionStatus.COMPLETED, "olderRun" to SessionStatus.RUNNING,
+      "olderUnread" to SessionStatus.COMPLETED)
+
+    val sections = HomeSections.byDate(sessions, now, zone, statuses)
+
+    assertEquals(listOf("newerRun", "olderRun", "newerUnread", "olderUnread", "quiet"),
+      sections.single().sessions.map { it.id })
+  }
+
+  @Test fun todaysQuietRowsKeepActivityOrder() {
+    val sessions = listOf(session("a", at(5, 8)), session("b", at(5, 7)), session("c", at(5, 6)))
+    val sections = HomeSections.byDate(sessions, now, zone, sessions.associate { it.key to SessionStatus.NONE })
+    assertEquals(listOf("a", "b", "c"), sections.single().sessions.map { it.id })
   }
 
   @Test fun pinnedLiveSessionsStayPinnedWithoutDuplicatingIntoToday() {
@@ -106,6 +157,19 @@ class HomeSectionsTest {
     assertEquals(listOf("置顶", "今天", "昨天"), sections.map { it.title })
     assertEquals(listOf(listOf("pinned"), listOf("running"), listOf("yesterday")),
       sections.map { section -> section.sessions.map { it.id } })
+  }
+
+  @Test fun pinnedSectionStaysFirstAndKeepsItsOwnOrder() {
+    val sessions = listOf(session("pinnedIdle", at(5, 9)), session("pinnedWaiting", at(4, 23)),
+      session("running", now - 40 * 86_400_000L))
+    val sections = HomeSections.build(HomeGrouping.DATE, sessions, emptyList(),
+      mapOf("pinnedIdle" to SessionStatus.NONE, "pinnedWaiting" to SessionStatus.WAITING_QUESTION,
+        "running" to SessionStatus.RUNNING),
+      pinned = setOf("pinnedIdle", "pinnedWaiting"), now = now, zone = zone)
+
+    assertEquals(listOf("置顶", "今天"), sections.map { it.title })
+    assertEquals(listOf("pinnedIdle", "pinnedWaiting"), sections.first().sessions.map { it.id })
+    assertEquals(listOf("running"), sections.last().sessions.map { it.id })
   }
 
   @Test fun sectionsKeepTheInputActivityOrder() {
@@ -124,7 +188,7 @@ class HomeSectionsTest {
     assertEquals(listOf("done", "fail"), sections[2].sessions.map { it.id })
   }
 
-  @Test fun waitingOnTheServerRanksWithNeedsAttention() {
+  @Test fun waitingOnTheServerRanksWithNeedsAttentionInTheStatusGrouping() {
     val sections = HomeSections.byStatus(listOf(session("server", at(5, 8))), mapOf("server" to SessionStatus.WAITING_SERVER))
     assertEquals(listOf("需要处理"), sections.map { it.title })
   }
