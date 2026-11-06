@@ -263,10 +263,13 @@ class PersistentConnectionsTest {
         // connection-only publish that has the error but no cached tasks yet.
         awaitCondition { snapshots["a"]?.let { it.error != null && it.tasks.containsKey("s") } == true }
         val snapshot = snapshots.getValue("a")
-        assertTrue(snapshot.tasks.getValue("s").uncertain)
-        assertEquals(0L, snapshot.lastReadAt)
-        assertEquals(0, snapshot.displaySummary(PermissionPolicy()).running)
-        assertEquals(SessionStatus.NONE, LagoonState(allServerSnapshots = mapOf("a" to snapshot)).allServerStatuses()[scopedKey("a", "s")])
+        val detail = "connected=${snapshot.connected} error=${snapshot.error} lastReadAt=${snapshot.lastReadAt} " +
+          "tasks=${snapshot.tasks} notices=${snapshot.notices} summary=${snapshot.summary}"
+        assertTrue("restored task must stay uncertain; $detail", snapshot.tasks.getValue("s").uncertain)
+        assertEquals("failed cold start must not stamp a read; $detail", 0L, snapshot.lastReadAt)
+        assertEquals("uncertain work must not count as running; $detail", 0, snapshot.displaySummary(PermissionPolicy()).running)
+        assertEquals("offline snapshot must not show a running row; $detail", SessionStatus.NONE,
+          LagoonState(allServerSnapshots = mapOf("a" to snapshot)).allServerStatuses()[scopedKey("a", "s")])
       } finally { manager.stop(); scope.cancel() }
     }
   }
