@@ -1,5 +1,6 @@
 package com.igng.opencode.lagoon.core
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
@@ -26,6 +27,7 @@ import java.security.SecureRandom
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resume
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withTimeoutOrNull
 
 data class ServerCredentials(
   val username: String = "opencode",
@@ -96,6 +98,10 @@ class OpenCodeApi(
   private val ioScope = SharedHttp.ioScope
   @Volatile private var version: String? = null
   @Volatile private var discoveredCapabilities: ApiCapabilities? = null
+  /** Row-label titles only; the server's project list is never imported into the local registry. */
+  @Volatile private var displayProjects: List<Project>? = null
+  @Volatile private var displayProjectsAt = 0L
+  @Volatile private var displayProjectsFailedAt = 0L
   override fun capabilities(): ApiCapabilities = discoveredCapabilities ?: ApiCapabilities.BASELINE
 
   /** Reads the instance's own OpenAPI document once; routes that moved between 2.0.x releases are taken from it. */
@@ -302,6 +308,38 @@ class OpenCodeApi(
     return if (directory.isBlank()) emptyList()
     else listOf(Project(location.obj("project").str("id").ifBlank { directory }, directory, directory.substringAfterLast('/')))
   }
+
+  /**
+   * 行内标签只在 TTL 内复用同一份服务端项目清单，避免每次对账都读一次 `/api/project`。
+   * 读取失败时退回上一次结果并退避重试；没有缓存才把错误交给调用方（调用方会回退到目录名）。
+   */
+  override suspend fun projectsForDisplay(): List<Project> {
+    val now = System.currentTimeMillis()
+    val cached = displayProjects
+    if (cached != null && now - displayProjectsAt < DISPLAY_PROJECTS_TTL_MILLIS) return cached
+    if (now - displayProjectsFailedAt < DISPLAY_PROJECTS_RETRY_MILLIS) {
+      return cached ?: throw IOException("项目清单暂不可用")
+    }
+    val refreshed = try {
+      withTimeoutOrNull(DISPLAY_PROJECTS_READ_TIMEOUT_MILLIS) { projects() }
+    } catch (cancel: CancellationException) {
+      throw cancel
+    } catch (error: Exception) {
+      displayProjectsFailedAt = System.currentTimeMillis()
+      Diagnostics.warn("OpenCodeApi", "读取项目清单失败，行内标签使用缓存或目录名", error)
+      cached ?: throw error
+    }
+    if (refreshed != null) {
+      displayProjects = refreshed
+      displayProjectsAt = System.currentTimeMillis()
+      return refreshed
+    }
+    // 超时也要退避，否则每次对账都会为装饰性标题白等一次。
+    displayProjectsFailedAt = System.currentTimeMillis()
+    Diagnostics.warn("OpenCodeApi", "读取项目清单超时，行内标签使用缓存或目录名")
+    return cached ?: throw IOException("项目清单读取超时")
+  }
+
   override suspend fun session(id: String): Session = dataObject(obj(sessionPath(id))).toSession()
 
   /**
@@ -563,6 +601,12 @@ class OpenCodeApi(
     private const val MAX_FILE_BYTES = 8_000_000L
     private const val MAX_PAGES = 40
     private const val MAX_PAGE_ITEMS = 5_000
+    /** Row labels tolerate a stale project title; re-reading it on every 20–60 s reconcile does not. */
+    private const val DISPLAY_PROJECTS_TTL_MILLIS = 10 * 60_000L
+    /** A failed title read falls back to directory names and retries later, not on every reconcile. */
+    private const val DISPLAY_PROJECTS_RETRY_MILLIS = 5 * 60_000L
+    /** 装饰性标题不能占用一次对账的网络等待。 */
+    private const val DISPLAY_PROJECTS_READ_TIMEOUT_MILLIS = 3_000L
     private val TEXT_MIME_TYPES = setOf("application/json", "application/xml", "application/javascript", "application/x-javascript")
     private val TEXT_FILE_NAMES = setOf("dockerfile", "makefile", "license", "readme", "changelog", ".gitignore", ".gitattributes", ".env")
     private val TEXT_EXTENSIONS = setOf(

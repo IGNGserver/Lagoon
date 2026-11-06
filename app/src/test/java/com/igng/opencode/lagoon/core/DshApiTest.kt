@@ -632,6 +632,7 @@ class DshApiTest {
   @Test fun projectsComeFromWorkspaceBaseline() = runBlocking {
     val server = MockWebServer().also { it.start() }
     try {
+      val workspaceStreams = java.util.concurrent.atomic.AtomicInteger()
       server.dispatcher = object : Dispatcher() {
         override fun dispatch(request: RecordedRequest): MockResponse = when {
           request.path!!.startsWith("/?token") || request.path == "/" -> rootOk()
@@ -640,6 +641,7 @@ class DshApiTest {
               val frame = JSONObject(text)
               if (frame.optString("type") != "open") return
               if (frame.getString("endpoint") != "workspace/follow") return
+              workspaceStreams.incrementAndGet()
               val id = frame.getString("streamId")
               val value = JSONObject().put("type", "baseline").put("value", JSONObject()
                 .put("items", JSONArray().put(JSONObject()
@@ -652,11 +654,15 @@ class DshApiTest {
           else -> MockResponse().setResponseCode(404)
         }
       }
-      val projects = api(server).projects()
+      val client = api(server)
+      val projects = client.projects()
       val project = projects.single()
       assertEquals("w1", project.id)
       assertEquals("/repo", project.directory)
       assertEquals("Lagoon", project.name)
+      // 行内标签只读已经维护好的清单，不再为标签单独开一条 workspace/follow。
+      assertEquals(projects, client.projectsForDisplay())
+      assertEquals(1, workspaceStreams.get())
     } finally {
       server.shutdown()
     }

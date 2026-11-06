@@ -23,6 +23,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
 
 internal fun operationKey(server: String?, session: String?, project: String?, action: String): String {
@@ -55,6 +56,12 @@ data class LagoonState(
   /** Non-error feedback (e.g. a share link); kept separate so it is not rendered as a failure. */
   val message: String? = null,
   val projects: List<Project> = emptyList(), val projectId: String? = null,
+  /**
+   * Read-only project/workspace titles of the writable server, used only for row labels. This is
+   * deliberately separate from [projects]: the registry above drives the scope picker, project
+   * counts and the new-session target, while this catalog never filters or creates anything.
+   */
+  val workspaceCatalog: List<Project> = emptyList(),
   /** Home list filter: null = 全部会话 (default), otherwise one project id. Not the execution target. */
   val scopeProjectId: String? = null,
   /** Device-group workspace filter; only meaningful while [homeGroupId] is set. */
@@ -1562,6 +1569,7 @@ class LagoonController private constructor(private val appContext: Context) {
       allServers = if (group != null) false else preserveHome && previous.allServers,
       homeServerId = homeServerId,
       allServerSnapshots = allSnapshots.toMap(), permissionPolicy = store.permissionPolicy(),
+      workspaceCatalog = allSnapshots[id]?.workspaceCatalog.orEmpty(),
       sessions = snapshot?.sessions.orEmpty(), projects = snapshot?.projects ?: store.localProjects(id).map { it.copy(serverId = id) },
       permissions = snapshot?.permissions.orEmpty(), questions = snapshot?.questions.orEmpty(),
       autoApprovalFailures = snapshot?.autoApprovalFailures.orEmpty(), streamConnected = snapshot?.streamConnected == true,
@@ -1677,16 +1685,20 @@ class LagoonController private constructor(private val appContext: Context) {
     // 本设备认为仍在运行的会话；读取后用于判断哪些需要重新拉取会话信息（取得权威 outcome/time.idle）。
     val previousActiveIds = state.value.tasks.filterValues { it.active }.keys.toSet()
     val serverId = state.value.serverId ?: return
-    // Probe, contract, catalog and activity are independent reads: one round trip instead of four.
-    // The probe is awaited first so a wrong address or old server still reports its own error.
+    // Probe, contract, catalog, activity and display titles are independent reads: one round trip
+    // instead of five. The probe is awaited first so a wrong address or old server reports its own error.
     val firstRound = coroutineScope {
       val versionTask = async { client.health() }
       val capabilitiesTask = async { client.discoverCapabilities() }
       val pageTask = async { attempt { client.rootSessionsPage() } }
       val activeTask = async { attempt { client.activeSessions() } }
+      // Display-only titles; a failure or timeout keeps the last known catalog, it never fails the load.
+      val workspaceTask = async {
+        attempt { withTimeoutOrNull(WORKSPACE_CATALOG_TIMEOUT_MILLIS) { client.projectsForDisplay() } }
+      }
       val version = versionTask.await()
       if (token == generation) advanceStage(token, ConnectStage.READING)
-      FirstRound(version, capabilitiesTask.await(), pageTask.await().getOrThrow(), activeTask.await())
+      FirstRound(version, capabilitiesTask.await(), pageTask.await().getOrThrow(), activeTask.await(), workspaceTask.await())
     }
     val version = firstRound.version
     val capabilities = firstRound.capabilities
@@ -1694,6 +1706,11 @@ class LagoonController private constructor(private val appContext: Context) {
     // The project list is device-local: the user registers a server directory, and the server's own
     // list is never auto-imported. A control-only refresh keeps the current list to avoid flicker.
     val projects = if (controlOnly && state.value.projects.isNotEmpty()) state.value.projects else store.localProjects(serverId).map { it.copy(serverId = serverId) }
+    // Row label titles stay separate from [projects]: display only, never a filter or create target.
+    // A failed or timed-out read (null) keeps the previous titles; a successful empty list clears them.
+    val workspaceCatalog = firstRound.workspaces.getOrNull()
+      ?.map { it.copy(serverId = serverId) }
+      ?: state.value.workspaceCatalog
     // Official home index: one global, newest-first listing of root sessions (directory filters are
     // exact, so per-project queries would miss worktrees). Reconciliation re-reads its first page too,
     // so a session created elsewhere while an event was missed still appears.
@@ -1711,7 +1728,7 @@ class LagoonController private constructor(private val appContext: Context) {
     var earlySession: Session? = null
     if (!controlOnly) {
       mutable.update { current -> withSummary(current.copy(version = version, capabilities = capabilities, connected = true, loading = false,
-        error = null, lastContactAt = System.currentTimeMillis(),
+        error = null, lastContactAt = System.currentTimeMillis(), workspaceCatalog = workspaceCatalog,
         sessions = (sessions + current.sessions).distinctBy { it.id }.sortedWith(sessionActivityOrder))) }
       trace(token, ConnectMilestone.INTERACTIVE)
       flushQueuedSends()
@@ -1949,7 +1966,7 @@ class LagoonController private constructor(private val appContext: Context) {
         error = null, degraded = degraded, lastContactAt = System.currentTimeMillis(),
         connection = if (previous.connection.stage == ConnectStage.READY) previous.connection else ConnectionStatus(ConnectStage.READY, System.currentTimeMillis()),
         remoteRecovery = null,
-        projects = projects, sessions = nextSessions, knownParents = store.taskParents(serverId), tasks = states, shells = nextShells, notices = store.sessionNotices(serverId), collapsedSections = store.collapsedSections(serverId), sessionCursors = cursors, catalogComplete = cursors.isEmpty(),
+        projects = projects, workspaceCatalog = workspaceCatalog, sessions = nextSessions, knownParents = store.taskParents(serverId), tasks = states, shells = nextShells, notices = store.sessionNotices(serverId), collapsedSections = store.collapsedSections(serverId), sessionCursors = cursors, catalogComplete = cursors.isEmpty(),
         permissions = nextPermissions, questions = nextQuestions,
         projectId = (previous.projectId ?: store.selectedProject(serverId))?.takeIf { id -> projects.any { it.id == id } } ?: projects.firstOrNull()?.id,
         scopeProjectId = previous.scopeProjectId?.takeIf { id -> projects.any { it.id == id } },
@@ -3646,8 +3663,9 @@ class LagoonController private constructor(private val appContext: Context) {
     catch (error: Exception) { Result.failure(error) }
 }
 
-/** The four independent reads of a control-plane load's first round trip. */
-private data class FirstRound(val version: String, val capabilities: ApiCapabilities, val page: ApiPage<Session>, val active: Result<Set<String>>)
+/** The independent reads of a control-plane load's first round trip. */
+private data class FirstRound(val version: String, val capabilities: ApiCapabilities, val page: ApiPage<Session>,
+  val active: Result<Set<String>>, val workspaces: Result<List<Project>?>)
 
 /** A prompt held while its server is unreachable (see `LagoonController.queuePrompt`). */
 private data class QueuedPrompt(val serverId: String, val sessionId: String, val text: String, val messageId: String, val created: Long) {

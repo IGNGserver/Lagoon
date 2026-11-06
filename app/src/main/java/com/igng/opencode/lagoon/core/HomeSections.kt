@@ -9,6 +9,24 @@ enum class HomeGrouping(val label: String) { DATE("日期"), PROJECT("项目"), 
 data class HomeSection(val key: String, val title: String, val sessions: List<Session>)
 
 /**
+ * Whether a row must repeat its workspace name. The list scope or the section header already states
+ * it when the list is scoped to one project/workspace, when the section is a workspace section, or
+ * when the section is exactly the session's registered project. The “未归入项目” section is not a
+ * statement about a session's folder, so those rows keep their resolved label.
+ */
+fun showWorkspaceLabel(
+  sectionKey: String,
+  scopeProjectId: String?,
+  scopeWorkspaceKey: String?,
+  projectKey: String?
+): Boolean {
+  if (scopeProjectId != null || scopeWorkspaceKey != null) return false
+  if (sectionKey.startsWith("workspace:")) return false
+  if (sectionKey.startsWith("project:")) return sectionKey.removePrefix("project:") != projectKey
+  return true
+}
+
+/**
  * Sections of the home list. Input sessions keep their activity order inside every section;
  * date grouping places live work in 今天 without changing server timestamps.
  * Pinned sessions are this device's choice and are lifted into a leading 置顶 section.

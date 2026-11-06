@@ -480,14 +480,23 @@ class DshApi(
   override suspend fun projects(): List<Project> = withContext(Dispatchers.IO) {
     // DSH 的 Workspace 就是「项目」：workspace/follow 的 baseline 给出全量清单。
     val items = workspaceItems ?: fetchWorkspaceBaseline()
-    items.mapNotNull { workspace ->
-      val path = workspace.str("path").ifBlank { return@mapNotNull null }
-      Project(
-        id = workspace.str("workspaceId").ifBlank { path },
-        directory = path,
-        name = workspace.str("title").ifBlank { path.trimEnd('/').substringAfterLast('/').ifBlank { path } }
-      )
-    }
+    workspaceProjects(items)
+  }
+
+  /**
+   * 行内标签用的标题。`workspace/follow` 已经在持续维护清单，这里只读本地副本，不开新流；
+   * 尚未收到 baseline 时返回空列表，界面回退到目录名，下一次对账再补上。
+   */
+  override suspend fun projectsForDisplay(): List<Project> =
+    workspaceItems?.let(::workspaceProjects).orEmpty()
+
+  private fun workspaceProjects(items: List<JSONObject>): List<Project> = items.mapNotNull { workspace ->
+    val path = workspace.str("path").ifBlank { return@mapNotNull null }
+    Project(
+      id = workspace.str("workspaceId").ifBlank { path },
+      directory = path,
+      name = workspace.str("title").ifBlank { path.trimEnd('/').substringAfterLast('/').ifBlank { path } }
+    )
   }
 
   /**

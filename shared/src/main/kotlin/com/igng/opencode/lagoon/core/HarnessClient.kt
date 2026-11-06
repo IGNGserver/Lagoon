@@ -42,6 +42,12 @@ interface HarnessClient {
 
   suspend fun projects(): List<Project>
 
+  /**
+   * 行内展示用的项目/工作区标题，绝不参与筛选、计数或新建会话目标。
+   * 已经持续维护工作区清单的 harness 直接返回本地清单，不额外开流；其余可以按需做一次廉价读取。
+   */
+  suspend fun projectsForDisplay(): List<Project> = projects()
+
   suspend fun session(id: String): Session
 
   suspend fun projectAt(directory: String): Project?

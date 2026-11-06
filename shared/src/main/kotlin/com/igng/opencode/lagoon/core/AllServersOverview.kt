@@ -13,6 +13,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.channels.Channel
 
 /**
@@ -33,6 +34,8 @@ data class ServerOverviewSnapshot(
   /** The instance accepts `POST /api/session/{id}/view`; DSH and documented-absent instances do not. */
   val canSyncRead: Boolean = false,
   val projects: List<Project> = emptyList(),
+  /** Server project/workspace titles for row labels; never used for filtering or a create target. */
+  val workspaceCatalog: List<Project> = emptyList(),
   val sessions: List<Session> = emptyList(),
   val parents: Map<String, String> = emptyMap(),
   val tasks: Map<String, TaskState> = emptyMap(),
@@ -438,6 +441,10 @@ internal class AllServersOverview(
     val id = profile.id
     val version = client.health()
     val projects = store.localProjects(id).map { it.copy(serverId = id) }
+    // Row labels only. The selected server's catalog is owned by the controller (this read is
+    // discarded for it), so do not spend a request here; a failure keeps the last published titles.
+    val workspaceCatalog = if (selectedServer() == id) previous.workspaceCatalog
+      else attempt { client.projectsForDisplay() }.getOrElse { previous.workspaceCatalog }.map { it.copy(serverId = id) }
     val page = client.rootSessionsPage()
     val activeResult = attempt { client.activeSessions() }
     val active = activeResult.getOrNull()
@@ -596,6 +603,7 @@ internal class AllServersOverview(
       error = null,
       degraded = degraded,
       projects = projects,
+      workspaceCatalog = workspaceCatalog,
       sessions = sessions,
       parents = parentMap,
       tasks = folded,
