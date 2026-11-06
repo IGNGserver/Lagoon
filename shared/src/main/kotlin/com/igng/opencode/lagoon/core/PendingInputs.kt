@@ -13,7 +13,7 @@ internal object PendingInputs {
     if (active == null) return Read()
     val identities = sessions.map { it.id }.toSet()
     val candidates = tasks.values.filter { it.active && it.sessionId !in active && it.sessionId in identities }
-      .sortedByDescending { it.pendingInput }.take(100)
+      .sortedByDescending { it.pendingInput }.take(24)
     val pending = mutableSetOf<String>()
     val verified = mutableSetOf<String>()
     candidates.chunked(4).forEach { batch ->

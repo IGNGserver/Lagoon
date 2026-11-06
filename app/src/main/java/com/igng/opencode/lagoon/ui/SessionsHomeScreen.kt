@@ -391,7 +391,7 @@ private fun SessionList(
         }
       }
       if (visibleSections.isEmpty()) item(key = "empty") {
-        if (state.loading && query.isBlank()) SessionRowsSkeleton()
+        if (state.loading && state.sessions.isEmpty() && query.isBlank()) SessionRowsSkeleton()
         else Column(Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 48.dp), horizontalAlignment = Alignment.CenterHorizontally) {
           val allDisabled = state.enabledProfiles.isEmpty() && state.profiles.isNotEmpty()
           Text(when {
@@ -404,13 +404,13 @@ private fun SessionList(
           }, color = muted)
           if (!state.loading && query.isBlank()) {
             val action = when {
-              state.connected -> "新建会话"
+              state.connected || state.enabledProfiles.isNotEmpty() -> "新建会话"
               allDisabled || state.profiles.isEmpty() -> "管理设备"
               else -> "重新连接"
             }
             TextButton(text = action, onClick = {
               when {
-                state.connected -> onNewSession()
+                state.connected || state.enabledProfiles.isNotEmpty() -> onNewSession()
                 allDisabled || state.profiles.isEmpty() -> onManageDevices()
                 else -> controller.reload()
               }

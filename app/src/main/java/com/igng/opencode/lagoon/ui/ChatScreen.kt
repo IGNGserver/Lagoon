@@ -83,6 +83,9 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
   var goalDialog by remember(state.serverId, state.sessionId) { mutableStateOf(false) }
   var goalText by remember(state.serverId, state.sessionId) { mutableStateOf("") }
   val activity = remember(state.sessions, state.presentedTasks, state.shells, state.parents, state.sessionId) { state.sessionActivity() }
+  LaunchedEffect(sheet, state.sessionId) {
+    if (sheet == ChatSheet.CHANGES || sheet == ChatSheet.ACTIVITY) controller.loadAncillary()
+  }
   val focusManager = LocalFocusManager.current
   val keyboard = LocalSoftwareKeyboardController.current
   val modal = sheet != null || menu || rename || delete || composerModal || requestModal || activityGroup != null || state.shellOutput != null
@@ -124,6 +127,15 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
           }
         }
         ConnectionStrip(state, controller)
+        val transcriptStatus = state.resource("messages")
+        if (transcriptStatus.state == ResourceState.STALE || transcriptStatus.state == ResourceState.ERROR) {
+          Text(
+            if (transcriptStatus.state == ResourceState.STALE) "保留上次内容 · 正在后台重试" else (transcriptStatus.error ?: "加载失败"),
+            Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 2.dp),
+            style = MiuixTheme.textStyles.footnote2,
+            color = if (transcriptStatus.state == ResourceState.STALE) MiuixColorTokens.Warning else MiuixColorTokens.Error
+          )
+        }
         Conversation(state, controller, Modifier.weight(1f).fillMaxWidth(), ::openFile, { requestModal = it }, onOpenChild,
           onActivityGroup = {
             focusManager.clearFocus(); keyboard?.hide()
@@ -171,7 +183,10 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
     val resource = when (which) { ChatSheet.CHANGES -> "changes"; ChatSheet.FILES -> "files"; ChatSheet.ACTIVITY -> "children"; ChatSheet.SCHEDULES -> "schedules" }
     SuperBottomSheet(title = when (which) { ChatSheet.CHANGES -> "代码改动"; ChatSheet.FILES -> "文件"; ChatSheet.ACTIVITY -> "子会话与后台"; ChatSheet.SCHEDULES -> "定时任务" }, show = true, onDismissRequest = { sheet = null }) {
       Column(Modifier.fillMaxWidth().fillMaxHeight(0.72f).padding(vertical = 8.dp)) {
-        if (which != ChatSheet.FILES && which != ChatSheet.SCHEDULES) ResourceHint(state.resource(resource), "暂无记录", retry = controller::reload)
+        if (which != ChatSheet.FILES && which != ChatSheet.SCHEDULES) {
+          ResourceHint(state.resource(resource), "暂无记录",
+            retry = if (which == ChatSheet.CHANGES || which == ChatSheet.ACTIVITY) ({ controller.loadAncillary() }) else ({ controller.reload() }))
+        }
         when (which) {
           // Server lists may repeat an entry; LazyColumn crashes on a duplicate key, so keys never come from data alone.
           ChatSheet.CHANGES -> LazyColumn { itemsIndexed(state.changes, key = { index, change -> "$index:${change.path}" }) { _, change ->
@@ -613,6 +628,7 @@ fun DraftScreen(
         DropdownChevron(14.dp, description = "选择服务器与工作区")
       }
     })
+    ConnectionStrip(state, controller)
     Box(Modifier.weight(1f).fillMaxWidth().padding(horizontal = 32.dp), contentAlignment = Alignment.Center) {
       Column(horizontalAlignment = Alignment.CenterHorizontally) {
         Text("要做点什么？", style = MiuixTheme.textStyles.title3)
@@ -931,12 +947,12 @@ private fun ChatComposer(
   // Like the official composer, a prompt typed while the agent works steers the running turn.
   // While the server is connecting or retrying, a typed prompt is held and delivered once it answers.
   val queueing = actionKey == "send" && state.canQueueSend
-  val canSend = ready && !sending && hasContent && (state.connected && !state.cached || queueing && value.text.isNotBlank())
+  val canSend = ready && !sending && hasContent && (state.connected || queueing && value.text.isNotBlank())
   val muted = MiuixTheme.colorScheme.onSurfaceVariantSummary
   val hint = when {
     queueing -> "未连接 · 现在发送，连接恢复后会自动发出"
     !state.connected -> if (state.loading) "正在连接…草稿会保留" else "离线 · 草稿保留，恢复连接后可发送"
-    state.cached -> "消息未同步，刷新后可发送"
+    state.cached -> "后台校验缓存中，可直接发送"
     sending -> "正在发送…"
     state.attachments.any { it.image } && state.modelCatalog.firstOrNull { it.choice.modelId == state.model?.modelId && it.choice.providerId == state.model?.providerId }?.imageInput == false -> "当前模型不支持图片，发送前请换一个模型"
     else -> null

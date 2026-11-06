@@ -423,7 +423,7 @@ class OpenCodeApi(
     request("DELETE", "api/shell/${segment(id)}", locationQuery(directory))
   }
 
-  override suspend fun createSession(directory: String, title: String): Session =
+  override suspend fun createSession(directory: String, title: String, workspaceId: String?): Session =
     dataObject(requestObject("POST", "api/session", JSONObject().put("location", JSONObject().put("directory", directory)).apply {
       if (title.isNotBlank()) put("title", title.trim())
     })).toSession()

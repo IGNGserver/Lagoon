@@ -30,6 +30,9 @@ class OfflineCache internal constructor(
   private var sequence = 0L
   private val index = ArrayList<String>()
   private var writer: Job? = null
+  /** Cheap change gates: a 10–30s reconcile must not re-encrypt an unchanged catalog/transcript. */
+  private val catalogSignatures = HashMap<String, Int>()
+  private val messageSignatures = HashMap<String, Int>()
 
   private fun nextSequence(name: String): Long {
     val value = ++sequence
@@ -119,6 +122,11 @@ class OfflineCache internal constructor(
     null
   }
   fun saveCatalog(serverId: String, projects: List<Project>, sessions: List<Session>, complete: Boolean = true) {
+    val signature = 31 * (projects.hashCode()) + sessions.hashCode() + complete.hashCode()
+    synchronized(pendingLock) {
+      if (catalogSignatures[serverId] == signature) return
+      catalogSignatures[serverId] = signature
+    }
     write("catalog:$serverId") {
       JSONObject().put("complete", complete && sessions.size <= 300).put("projects", JSONArray().apply { projects.forEach { put(JSONObject().put("id", it.id).put("directory", it.directory).put("name", it.name).put("sandboxes", JSONArray(it.sandboxes))) } })
         .put("sessions", JSONArray().apply { sessions.take(300).forEach { put(JSONObject().put("id", it.id).put("directory", it.directory).put("revertMessageId", it.revertMessageId)
@@ -145,6 +153,12 @@ class OfflineCache internal constructor(
   }
   }
   fun saveMessages(serverId: String, sessionId: String, messages: List<Message>, complete: Boolean = true) {
+    val key = "$serverId:$sessionId"
+    val signature = 31 * messages.hashCode() + complete.hashCode()
+    synchronized(pendingLock) {
+      if (messageSignatures[key] == signature) return
+      messageSignatures[key] = signature
+    }
     write("messages:$serverId:$sessionId") {
       val clipped = messages.size > 100 || messages.any { message -> message.parts.any { part ->
         part.text.length > 20_000 || part.input.length > 4_000 || part.output.length > 4_000 || part.error.length > 4_000 || part.patch.length > 20_000 ||
@@ -211,6 +225,8 @@ class OfflineCache internal constructor(
   }.getOrDefault(false)
   fun delete(serverId: String) {
     synchronized(pendingLock) {
+      catalogSignatures.remove(serverId)
+      messageSignatures.keys.removeAll { it.startsWith("$serverId:") }
       val matches = (index + preferences.all.keys + pending.keys + inFlight + nameSequence.keys).filter { it == "catalog:$serverId" || it.startsWith("messages:$serverId:") }.toSet()
       matches.forEach { name ->
         pending.remove(name)
@@ -225,6 +241,7 @@ class OfflineCache internal constructor(
   /** Drops every cached transcript of one server; its catalog stays. */
   fun deleteTranscripts(serverId: String) {
     synchronized(pendingLock) {
+      messageSignatures.keys.removeAll { it.startsWith("$serverId:") }
       val matches = (index + preferences.all.keys + pending.keys + inFlight + nameSequence.keys).filter { it.startsWith("messages:$serverId:") }.toSet()
       if (matches.isEmpty()) return
       matches.forEach { name ->
@@ -241,6 +258,7 @@ class OfflineCache internal constructor(
   fun deleteMessages(serverId: String, sessionId: String) {
     val name = "messages:$serverId:$sessionId"
     synchronized(pendingLock) {
+      messageSignatures.remove("$serverId:$sessionId")
       pending.remove(name)
       nextSequence(name)
       preferences.edit().remove(name).apply()

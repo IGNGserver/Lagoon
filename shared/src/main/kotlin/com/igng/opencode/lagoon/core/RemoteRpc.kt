@@ -54,15 +54,16 @@ internal class RemoteRpc(
         result.await()
       }
     } catch (_: TimeoutCancellationException) {
-      // A blocked write may still be unwinding. A timed-out channel cannot safely send another
-      // mutation with an unknown delivery result; close it and force a fresh handshake/resync.
-      close()
+      // A slow or cancelled request must not tear down the whole multiplexer: the Host may still
+      // answer this request later, and every other stream on the connection is healthy. The caller
+      // treats the failure as "delivery unknown" and never retries a mutation blindly.
       throw RemoteRpcException("RPC_TIMEOUT")
     } catch (error: CancellationException) {
-      // The request may have reached the Host even if its caller was cancelled.
-      close()
+      // A caller that navigated away may already have reached the Host. Drop this request only;
+      // the connection and its other streams keep working.
       throw error
     } catch (error: Exception) {
+      // A transport-level failure (the channel itself) is the only case that closes the RPC layer.
       if (error !is RemoteRpcException) close()
       throw error
     } finally {

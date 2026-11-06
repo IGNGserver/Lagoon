@@ -1375,4 +1375,46 @@ class DshApiTest {
     assertNull("连续事件不是缺口", api.gapRepairWindow(4, 5))
     assertNull("过大缺口交给快照", api.gapRepairWindow(4, 4 + DshApi.MAX_GAP_REPAIR + 2))
   }
+  @Test fun sessionListPagesLocallyAndNeverRepeatsACursor() = runBlocking {
+    MockWebServer().use { server ->
+      val rows = JSONArray()
+      repeat(150) { index -> rows.put(sessionRow(id = "s$index", title = "S$index")) }
+      server.enqueue(rootOk())
+      server.enqueue(envelope(JSONObject().put("items", rows).toString()))
+      server.enqueue(envelope(JSONObject().put("items", rows).toString()))
+      val client = api(server)
+      val page = client.rootSessionsPage()
+      assertEquals(100, page.items.size)
+      assertEquals("100", page.next)
+      val second = client.rootSessionsPage(cursor = page.next)
+      assertEquals(50, second.items.size)
+      assertNull(second.next)
+    }
+  }
+
+  @Test fun explicitWorkspaceIdWinsOverDirectoryMatching() = runBlocking {
+    MockWebServer().use { server ->
+      server.enqueue(rootOk())
+      server.enqueue(envelope("""{"sessionId":"s1"}"""))
+      server.enqueue(envelope("""{"title":"x","seq":2}"""))
+      val calls = mutableListOf<JSONObject>()
+      server.dispatcher = object : Dispatcher() {
+        override fun dispatch(request: RecordedRequest): MockResponse = when {
+          request.path!!.startsWith("/?token") || request.path == "/" -> rootOk()
+          request.path == "/api/session/create" -> {
+            calls += JSONObject(request.body.readUtf8()).getJSONObject("payload").getJSONObject("args").getJSONObject("request")
+            envelope("""{"sessionId":"s1"}""")
+          }
+          request.path == "/api/session/rename" -> envelope("""{"title":"x","seq":2}""")
+          else -> MockResponse().setResponseCode(404)
+        }
+      }
+      // Replace the queued responses: the dispatcher owns the exchange and request.
+      api(server).createSession("/anywhere", "", "workspace-from-cache")
+      val create = calls.single()
+      assertEquals("workspace-from-cache", create.getString("workspaceId"))
+      assertFalse(create.has("cwd"))
+    }
+  }
+
 }

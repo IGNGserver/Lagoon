@@ -1,8 +1,10 @@
 package com.igng.opencode.lagoon.core.ssh
 
+import com.igng.opencode.lagoon.core.Diagnostics
 import com.igng.opencode.lagoon.core.DshApi
 import com.igng.opencode.lagoon.core.DshAuthMode
 import com.igng.opencode.lagoon.core.PresentedSshHostKey
+import com.igng.opencode.lagoon.core.Project
 import com.igng.opencode.lagoon.core.RemoteDshEndpoint
 import com.igng.opencode.lagoon.core.ServerCredentials
 import com.igng.opencode.lagoon.core.ServerProfile
@@ -19,8 +21,11 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -52,13 +57,17 @@ internal class SshHostLink(
   @Volatile private var endpoint: RemoteDshEndpoint? = null
   @Volatile private var forwarder: SshForwarder? = null
   @Volatile private var client: DshApi? = null
+  @Volatile private var contentWatching = false
   @Volatile private var ready = CompletableDeferred<DshApi>()
+  /** Stable across DSH generations; mirror of the current client's workspace stream. */
+  private val workspacePublisher = MutableSharedFlow<List<Project>>(replay = 1, extraBufferCapacity = 1)
+  private var workspaceCollector: Job? = null
   @Volatile private var connectJob: Job? = null
   @Volatile private var keepAliveJob: Job? = null
   @Volatile private var attempt = 0
 
   /** Waits until this link has an authenticated DshApi; starts the link on first use. */
-  suspend fun awaitClient(timeoutMillis: Long = 90_000): DshApi {
+  suspend fun awaitClient(timeoutMillis: Long = 20_000): DshApi {
     if (closed) throw SshFailure(SshFailureKind.DISCONNECTED, "SSH 主机已移除", retryable = false)
     client?.takeIf { mutableStatus.value.isConnected }?.let { return it }
     val failed = mutableStatus.value
@@ -78,6 +87,15 @@ internal class SshHostLink(
       throw cancel
     }
   }
+
+  /** Keeps the expensive content subscription off for background monitoring. */
+  fun setContentWatching(enabled: Boolean) {
+    contentWatching = enabled
+    client?.setContentWatching(enabled)
+  }
+
+  /** Stable across reconnects: the current DSH generation's workspace titles. */
+  val workspaceUpdates: Flow<List<Project>> get() = workspacePublisher.asSharedFlow()
 
   /** Starts connecting in the background; safe to call repeatedly. */
   fun start() {
@@ -202,7 +220,20 @@ internal class SshHostLink(
         runCatching { api.close() }
         throw SshFailure(SshFailureKind.DISCONNECTED, "SSH 主机已移除", retryable = false)
       }
+      api.setContentWatching(contentWatching)
       client = api
+      workspaceCollector?.cancel()
+      workspaceCollector = api.workspaceUpdates?.let { updates ->
+        scope.launch {
+          try {
+            updates.collect { workspacePublisher.emit(it) }
+          } catch (cancel: CancellationException) {
+            throw cancel
+          } catch (error: Exception) {
+            Diagnostics.warn("SshHostLink", "工作区流结束", error)
+          }
+        }
+      }
       attempt = 0
       publish(SshLinkPhase.CONNECTED, SshLinkStep.CONNECTED, "已连接 · SSH ${config.address}")
       ready.complete(api)
@@ -301,6 +332,8 @@ internal class SshHostLink(
     closed = true
     connectJob?.cancel()
     keepAliveJob?.cancel()
+    workspaceCollector?.cancel()
+    workspaceCollector = null
     val pending = ready
     if (!pending.isCompleted) pending.completeExceptionally(SshFailure(SshFailureKind.DISCONNECTED, "SSH 主机已关闭", retryable = false))
     runCatching { client?.close() }

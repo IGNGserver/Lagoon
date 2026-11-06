@@ -153,8 +153,8 @@ class ServerStore internal constructor(private val preferences: SharedPreference
   }
   /** 自动刷新频率（标准 / 更快）；缺省「更快」。 */
   override fun refreshMode(): RefreshMode = runCatching {
-    RefreshMode.valueOf(preferences.getString("refreshMode", RefreshMode.FAST.name)!!)
-  }.getOrDefault(RefreshMode.FAST)
+    RefreshMode.valueOf(preferences.getString("refreshMode", RefreshMode.STANDARD.name)!!)
+  }.getOrDefault(RefreshMode.STANDARD)
   fun rememberRefreshMode(mode: RefreshMode) {
     preferences.edit().putString("refreshMode", mode.name).apply()
   }

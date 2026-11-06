@@ -5,16 +5,22 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import okhttp3.HttpUrl
@@ -32,6 +38,7 @@ import java.io.IOException
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
+import kotlin.coroutines.resume
 
 /**
  * DeepSeek Harness（DSH）客户端。
@@ -156,6 +163,20 @@ class DshApi(
   /** `workspace/follow` 的最新工作区清单；null 表示尚未读取。 */
   @Volatile private var workspaceItems: List<JSONObject>? = null
   private val workspaceLock = Any()
+  /** Replays the current workspace titles to a controller that starts watching mid-session. */
+  private val workspacePublisher = MutableSharedFlow<List<Project>>(replay = 1, extraBufferCapacity = 1)
+  override val workspaceUpdates: Flow<List<Project>> = workspacePublisher.asSharedFlow()
+  /** False for background notification monitors: keep `$events`, skip workspace/follows. */
+  private val contentWatching = MutableStateFlow(true)
+  override fun setContentWatching(enabled: Boolean) { contentWatching.value = enabled }
+  override fun transportStatus(): String? = remoteBackend?.connectionStatus()?.let { status ->
+    val transport = when {
+      status.relayAssignment -> "Relay"
+      status.transport.isNotBlank() -> status.transport
+      else -> null
+    }
+    listOfNotNull(status.phaseLabel(), transport).joinToString(" · ")
+  }
   /** 每个会话的作业清单缓存：`job/list` 是每会话一条流，短 TTL 避免对账风暴。 */
   private val jobCache = ConcurrentHashMap<String, Pair<Long, List<JSONObject>>>()
   /**
@@ -284,22 +305,23 @@ class DshApi(
     val builder = Request.Builder().url(url).get()
     // 根路径交换是浏览器入口；带上 Accept 与浏览器一致，避免被按静态资源处理。
     if (browser) builder.header("Accept", "text/html,application/xhtml+xml")
-    val response = try {
-      http.newCall(builder.build()).execute()
+    return try {
+      runHttpCall(builder.build()) { value ->
+        value.use {
+          when (value.code) {
+            401 -> throw ApiException(401, if (cookieRejected) REPAIR_MESSAGE else "启动令牌无效：dsh 每次启动都会换新令牌，请填写当前启动链接里的 token", AUTH_EXPIRED)
+            403 -> throw ApiException(403, UNTRUSTED_HOST_MESSAGE, "http/403")
+            !in 200..399 -> throw ApiException(value.code, "连接失败：HTTP ${value.code}")
+          }
+          value.headers("Set-Cookie").firstNotNullOfOrNull { raw ->
+            raw.substringBefore(';').trim().takeIf { it.startsWith("dsh-auth-") }
+          }
+        }
+      }
+    } catch (error: ApiException) {
+      throw error
     } catch (error: IOException) {
       throw ApiException(0, "无法连接 DeepSeek Harness：${error.message ?: "网络不可达"}")
-    }
-    response.use { value ->
-      when (value.code) {
-        401 -> throw ApiException(401, if (cookieRejected) REPAIR_MESSAGE else "启动令牌无效：dsh 每次启动都会换新令牌，请填写当前启动链接里的 token", AUTH_EXPIRED)
-        403 -> throw ApiException(403, UNTRUSTED_HOST_MESSAGE, "http/403")
-        !in 200..399 -> throw ApiException(value.code, "连接失败：HTTP ${value.code}")
-      }
-      for (raw in value.headers("Set-Cookie")) {
-        val pair = raw.substringBefore(';').trim()
-        if (pair.startsWith("dsh-auth-")) return pair
-      }
-      return null
     }
   }
 
@@ -316,6 +338,31 @@ class DshApi(
   private fun requestArgs(request: JSONObject): JSONObject = envelope(argsOf("request" to request))
 
   private fun noArgs(): JSONObject = envelope(JSONObject())
+
+  /**
+   * Runs one blocking OkHttp call on the shared IO dispatcher, but cancels the socket as soon as the
+   * caller is cancelled. A page switch must not leave a 25–60 second request (and its ranked
+   * connection slot) running in the background. The body is consumed inside the worker so a large
+   * response is also interrupted by cancellation.
+   */
+  private suspend fun <T> runHttpCall(request: Request, read: (Response) -> T): T =
+    suspendCancellableCoroutine { continuation ->
+      val call = http.newCall(request)
+      val worker = ioScope.launch {
+        try {
+          val value = call.execute().use(read)
+          if (continuation.isActive) continuation.resume(value)
+        } catch (cancel: CancellationException) {
+          if (continuation.isActive) continuation.cancel(cancel)
+        } catch (error: Throwable) {
+          if (continuation.isActive) continuation.resumeWith(Result.failure(error))
+        }
+      }
+      continuation.invokeOnCancellation {
+        call.cancel()
+        worker.cancel()
+      }
+    }
 
   /** 一元调用的请求信封是 `{type, rpcId, method, payload}`；响应是 `{type, rpcId, result}`。 */
   private suspend fun call(endpoint: String, payload: JSONObject = noArgs(), retried: Boolean = false): Any? =
@@ -351,13 +398,13 @@ class DshApi(
         .header("Cookie", current)
         .post(envelope.toString().toRequestBody(JSON_MEDIA_TYPE))
         .build()
-      val response = try {
-        http.newCall(request).execute()
+      val (status, text) = try {
+        runHttpCall(request) { response -> response.code to response.use { it.body?.string().orEmpty() } }
+      } catch (error: ApiException) {
+        throw error
       } catch (error: IOException) {
         throw ApiException(0, "无法连接 DeepSeek Harness：${error.message ?: "网络不可达"}")
       }
-      val status = response.code
-      val text = response.use { it.body?.string().orEmpty() }
       if (status == 401 && !retried) {
         // Cookie 失效（过期、签名密钥被撤销，或 API Peer 随连接/进程消失）：丢弃后重新换一张。
         rejectCookie(current)
@@ -409,10 +456,11 @@ class DshApi(
     if (remoteBackend != null) return@withContext null
     val request = Request.Builder().url(url).header("Cookie", cookie()).get().build()
     try {
-      http.newCall(request).execute().use { response ->
-        if (response.code !in 200..299) return@withContext null
-        val text = response.body?.string().orEmpty()
-        runCatching { JSONObject(text) }.getOrNull()
+      runHttpCall(request) { response ->
+        response.use {
+          if (it.code !in 200..299) null
+          else runCatching { JSONObject(it.body?.string().orEmpty()) }.getOrNull()
+        }
       }
     } catch (error: IOException) {
       null
@@ -554,7 +602,7 @@ class DshApi(
 
   /** baseline / upsert / remove / order / archived 帧；pinned 暂不消费。 */
   private fun applyWorkspaceFrame(frame: JSONObject) {
-    synchronized(workspaceLock) {
+    val snapshot = synchronized(workspaceLock) {
       when (frame.str("type")) {
         "baseline" -> {
           val value = frame.obj("value")
@@ -573,16 +621,20 @@ class DshApi(
         }
         "order" -> {
           val order = frame.arr("workspaceIds").strings()
-          val list = workspaceItems ?: return
-          workspaceItems = order.mapNotNull { id -> list.firstOrNull { it.str("workspaceId") == id } } +
-            list.filterNot { it.str("workspaceId") in order }
+          val list = workspaceItems
+          if (list != null) {
+            workspaceItems = order.mapNotNull { id -> list.firstOrNull { it.str("workspaceId") == id } } +
+              list.filterNot { it.str("workspaceId") in order }
+          }
         }
         "archived" -> {
           archivedSessions.clear()
           archivedSessions += frame.arr("archivedSessionIds").strings()
         }
       }
+      workspaceItems
     }
+    snapshot?.let { workspacePublisher.tryEmit(workspaceProjects(it)) }
   }
 
   override suspend fun projectAt(directory: String): Project? {
@@ -604,7 +656,11 @@ class DshApi(
       // 首页只关注真正在跑的会话：空闲会话没有实时内容，长期 follow 只会占流预算。
       // 打开的会话由 messagesPage 单独加入并在淘汰时固定。
       rememberWatched(sessions.filter { it.id in listing.running })
-      ApiPage(sessions, null)
+      // session/list 没有服务端分页；在本地切片，避免首页每次物化并下发全部历史会话。
+      val start = cursor?.toIntOrNull()?.coerceAtLeast(0) ?: 0
+      val page = sessions.drop(start).take(size.coerceIn(1, 200))
+      val next = (start + page.size).takeIf { it < sessions.size }?.toString()
+      ApiPage(page, next)
     }
 
   override suspend fun viewSession(session: Session, idle: Long) {
@@ -613,6 +669,9 @@ class DshApi(
 
   override suspend fun messagesPage(id: String, cursor: String?, size: Int): ApiPage<Message> = withContext(Dispatchers.IO) {
     val session = sessionOrFetch(id)
+    // Reading a transcript always needs a follow, even if a background monitor had switched
+    // content off before this server became writable.
+    setContentWatching(true)
     // 当前阅读的会话固定保留；首页刷新只能替换其他 follow。
     activeSessionId = session.id
     rememberWatched(listOf(session))
@@ -1037,21 +1096,42 @@ class DshApi(
     flushFollowBuffers(push)
 
     val eventsJob = launch { runEventsLoop(push, onOpen) { closed } }
-    val workspaceJob = launch { runWorkspaceLoop { closed } }
     val statusJob = launch { runStatusFallback(push) { closed } }
 
     val pump = launch {
       for (event in channel) send(event)
     }
 
-    // 已在观察中的会话补上 follow，运行中的会话也会从 $events 的 api-session/status 补进来。
-    synchronized(watched) { watched.toList() }.forEach { startFollow(it) }
+    // Content is expensive (workspace/follow + one follow per running session). Background monitors
+    // keep only `$events`; the selected connection switches this on. Switching it off stops the
+    // follows so an idle background host cannot consume the Host's stream budget.
+    var contentJob: Job? = null
+    val contentWatcher = launch {
+      contentWatching.collect { enabled ->
+        contentJob?.cancel()
+        contentJob = null
+        if (!enabled) {
+          followStates.values.toList().forEach(::stopFollowState)
+          return@collect
+        }
+        contentJob = launch {
+          val workspace = launch { runWorkspaceLoop { closed } }
+          try {
+            synchronized(watched) { watched.toList() }.forEach(::startFollow)
+            awaitCancellation()
+          } finally {
+            workspace.cancel()
+          }
+        }
+      }
+    }
 
     awaitClose {
       closed = true
       eventsJob.cancel()
-      workspaceJob.cancel()
       statusJob.cancel()
+      contentWatcher.cancel()
+      contentJob?.cancel()
       followStates.values.toList().forEach(::stopFollowState)
       pump.cancel()
       channel.close()
@@ -1403,9 +1483,17 @@ class DshApi(
    */
   private fun followFor(session: Session, fresh: Boolean = false): FollowState = synchronized(followOpenLock) {
     val existing = followStates[session.id]
+    // A live follow whose snapshot already covers every durable event is safe to reuse even when
+    // the caller wanted a "fresh" page: there is nothing new to fetch. A follow that received
+    // events after its snapshot must be replaced for a cold initial page, otherwise those events
+    // would be missing from the fetched window.
+    val snapshotCursor = snapshotStats[session.id]?.cursor ?: -1L
+    val snapshotStillCurrent = existing?.snapshot?.isCompleted == true && snapshotCursor >= 0 &&
+      lastSeq(session.id) <= snapshotCursor
     val reusable = existing != null && !existing.closed &&
       (existing.opening || existing.socket != null || existing.snapshot.isCompleted) &&
-      (!fresh || !existing.snapshot.isCompleted || System.currentTimeMillis() - existing.snapshotAt <= SNAPSHOT_REUSE_MILLIS)
+      (!fresh || !existing.snapshot.isCompleted || snapshotStillCurrent ||
+        System.currentTimeMillis() - existing.snapshotAt <= SNAPSHOT_REUSE_MILLIS)
     if (reusable) return existing
     existing?.let(::stopFollowState)
     val state = FollowState(session.id)
@@ -1635,7 +1723,7 @@ class DshApi(
     }
     // 先停掉被淘汰的，释放槽位后再启动新流。
     evicted.forEach(::stopFollow)
-    if (eventChannel == null) return
+    if (eventChannel == null || !contentWatching.value) return
     retained.forEach(::startFollow)
   }
 
@@ -2144,7 +2232,7 @@ class DshApi(
     return jobs
   }
 
-  override suspend fun createSession(directory: String, title: String): Session = withContext(Dispatchers.IO) {
+  override suspend fun createSession(directory: String, title: String, workspaceId: String?): Session = withContext(Dispatchers.IO) {
     // `session/create` 的请求只有 cwd/workspaceId/sessionId/agentPreset，网关按严格 schema 校验，
     // 多带 title 会以 gateway/arguments-invalid 失败；标题在创建后用 rename 设置。
     // 复用同目录已有的空白会话：DSH Web 也是这么做的，否则每次新建都会留下一个服务端草稿。
@@ -2152,14 +2240,14 @@ class DshApi(
     // Host 只在请求带 workspaceId 时把新会话记进工作区（`session.create` 里的 attachSession）。
     // 只带 cwd 会建出「未分组」的孤儿会话：远端按工作区枚举会话的客户端（Remote 中枢的会话目录、
     // 电脑端工作区视图）都看不到它，而且没有任何 RPC 能事后补挂。
-    val workspaceId = workspaceIdFor(directory)
+    val resolvedWorkspaceId = workspaceId?.takeIf(String::isNotBlank) ?: workspaceIdFor(directory)
     try {
-      createSessionOnce(directory, title, reusable, workspaceId)
+      createSessionOnce(directory, title, reusable, resolvedWorkspaceId)
     } catch (error: ApiException) {
       // 这些错误明确表示“没有创建/没有复用”，换一次不带 sessionId 的请求是安全的；
       // 网络错误不能重试，否则可能重复创建。
       if (reusable == null || error.code !in BLANK_REUSE_DECLINED) throw error
-      createSessionOnce(directory, title, null, workspaceId)
+      createSessionOnce(directory, title, null, resolvedWorkspaceId)
     }
   }
 

@@ -23,6 +23,9 @@ internal class RemoteSession(
   @Volatile private var active: Active? = null
   @Volatile private var closed = false
   @Volatile private var generation = 0
+  /** A failed connect is shared for a short window so N callers cannot start N handshakes. */
+  @Volatile private var failedAt = 0L
+  @Volatile private var lastFailure: RemoteFailureException? = null
   private val statusFlow = MutableStateFlow(RemoteConnectionStatus(hostId = hostId))
   private data class Active(val connection: RemoteConnection, val gateway: RemoteGateway, val capabilities: RemoteCapabilities)
 
@@ -48,6 +51,8 @@ internal class RemoteSession(
     active?.takeUnless { it.connection.isClosed }?.let { return@withLock it }
     active?.gateway?.close()
     active = null
+    val recent = lastFailure
+    if (recent != null && System.currentTimeMillis() - failedAt < FAILURE_REUSE_MILLIS) throw recent
     val attempt = ++generation
     statusFlow.value = statusFlow.value.copy(phase = RemotePhase.CREDENTIALS, generation = attempt,
       startedAt = System.currentTimeMillis(), readyAt = 0, lastError = null, capabilities = emptySet())
@@ -57,6 +62,7 @@ internal class RemoteSession(
       throw error
     } catch (error: Throwable) {
       recordFailure(error, attempt)
+      (error as? RemoteFailureException)?.let { lastFailure = it; failedAt = System.currentTimeMillis() }
       throw error
     }
   }
@@ -106,6 +112,8 @@ internal class RemoteSession(
       Active(connection, nextGateway, capabilities).also { current ->
         if (closed) { nextGateway.close(); connection.close(); throw IOException("Remote 会话已关闭") }
         active = current
+        lastFailure = null
+        failedAt = 0L
         statusFlow.value = statusFlow.value.copy(phase = RemotePhase.READY, generation = attempt,
           readyAt = System.currentTimeMillis(), hostId = host.deviceId, hostName = host.name,
           serverVersion = connection.serverVersion, pluginVersion = host.clientVersion,
@@ -136,6 +144,11 @@ internal class RemoteSession(
     val code = (error as? RemoteRpcException)?.code ?: (error as? RemoteGatewayException)?.code
     statusFlow.value = statusFlow.value.copy(phase = if (closed) RemotePhase.CLOSED else RemotePhase.FAILED,
       readyAt = 0, lastError = RemoteFailureSnapshot(kind, message, retryable, code))
+  }
+
+  private companion object {
+    /** Reuse one failed connect for this long instead of starting another handshake per caller. */
+    const val FAILURE_REUSE_MILLIS = 2_000L
   }
 
   private fun publishClosed() {
