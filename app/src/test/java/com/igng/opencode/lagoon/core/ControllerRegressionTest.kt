@@ -191,7 +191,9 @@ class ControllerRegressionTest {
 
   private fun v2Server(paths: MutableList<String>, sessionsBody: () -> String, active: () -> String, sessionBody: (String) -> String? = { null }): Dispatcher = object : Dispatcher() {
     override fun dispatch(request: RecordedRequest): MockResponse {
-      paths += request.path.orEmpty()
+      // MockWebServer calls a dispatcher from several request threads; the first round fans out
+      // five reads at once, so a plain ArrayList here corrupts under CI timing.
+      synchronized(paths) { paths += request.path.orEmpty() }
       val path = request.requestUrl!!.encodedPath
       sessionBody(path)?.let { return MockResponse().setBody(it) }
       val body = when (path) {
