@@ -3,6 +3,7 @@ package com.igng.opencode.lagoon.core
 import kotlinx.coroutines.flow.take
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.async
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
@@ -908,7 +909,7 @@ class DshApiTest {
                   webSocket.send(JSONObject().put("type", "item").put("streamId", id).put("value", snapshot).toString())
                   webSocket.send("""{"type":"item","streamId":"$id","value":{"type":"assistant-stream","frame":{"type":"start","attemptId":"a1","revision":1,"startedAfterSeq":3,"turn":1,"step":1}}}""")
                   webSocket.send("""{"type":"item","streamId":"$id","value":{"type":"assistant-stream","frame":{"type":"chunk","attemptId":"a1","revision":1,"index":0,"time":10,"chunk":{"type":"text-delta","index":0,"text":"你"}}}}""")
-                  webSocket.send("""{"type":"item","streamId":"$id","value":{"type":"assistant-stream","frame":{"type":"chunk","attemptId":"a1","revision":1,"index":1,"time":11,"chunk":{"type":"text-delta","index":0,"text":"好"}}}}""")
+                  webSocket.send("""{"type":"item","streamId":"$id","value":{"type":"assistant-stream","frame":{"type":"chunk","attemptId":"a1","revision":1,"index":1,"time":10,"chunk":{"type":"text-delta","index":0,"text":"好"}}}}""")
                 }
               }
             }
@@ -918,12 +919,72 @@ class DshApiTest {
       }
       val client = api(server)
       client.rootSessionsPage("/repo")
-      val events = withTimeout(20_000) { client.events {}.take(3).toList() }
+      val events = withTimeout(20_000) { client.events {}.take(4).toList() }
       assertEquals("session.step.started", events[0].type)
       assertEquals("session.text.started", events[1].type)
-      assertEquals("session.text.delta", events[2].type)
-      assertEquals("你", events[2].properties.getString("delta"))
+      assertEquals(listOf("session.text.delta", "session.text.delta"), events.drop(2).map { it.type })
+      assertEquals(listOf("你", "好"), events.drop(2).map { it.properties.getString("delta") })
       assertEquals("msg_1:1", events[2].properties.getString("assistantMessageID"))
+      // Both chunks intentionally have time=10. Wall time is not an event identity.
+      assertEquals(4, events.map { it.id }.distinct().size)
+    } finally {
+      server.shutdown()
+    }
+  }
+
+  @Test fun liveUserMessagesAreSourceGatedAndDurableIdsIncludeSession() = runBlocking {
+    val server = MockWebServer().also { it.start() }
+    try {
+      server.dispatcher = object : Dispatcher() {
+        override fun dispatch(request: RecordedRequest): MockResponse = when {
+          request.path!!.startsWith("/?token") || request.path == "/" -> rootOk()
+          request.path == "/api/session/list" -> envelope("""{"items":[${sessionRow(id = "s1", running = true)},${sessionRow(id = "s2", running = true)}]}""")
+          request.path == "/api/remote.mux" -> MockResponse().withWebSocketUpgrade(object : WebSocketListener() {
+            override fun onMessage(webSocket: WebSocket, text: String) {
+              val frame = JSONObject(text)
+              if (frame.str("type") != "open") return
+              val id = frame.str("streamId")
+              when (frame.str("endpoint")) {
+                "\$events" -> webSocket.send("""{"type":"item","streamId":"$id","value":{"type":"ready","clientId":"c1"}}""")
+                "session/follow" -> {
+                  val sessionId = frame.obj("payload").obj("args").obj("request").obj("address").str("sessionId")
+                  val snapshot = JSONObject().put("type", "snapshot")
+                    .put("header", JSONObject().put("version", 4).put("id", sessionId).put("createdAt", 1).put("cwd", "/repo"))
+                    .put("cursor", 0).put("hasMore", false).put("records", JSONArray())
+                  fun send(value: JSONObject) { webSocket.send(JSONObject().put("type", "item").put("streamId", id).put("value", value).toString()) }
+                  send(snapshot)
+                  fun user(seq: Int, messageId: String, kind: String?, body: String) {
+                    val source = if (kind == null) JSONObject() else JSONObject().put("kind", kind)
+                    send(event("user/message", seq, 1_000 + seq.toLong(), JSONObject().put("id", messageId).put("role", "user")
+                      .put("source", source).put("content", JSONArray().put(JSONObject().put("type", "text").put("text", body)))))
+                  }
+                  if (sessionId == "s1") {
+                    user(6, "injected", "runtime-context", "Current runtime context")
+                    user(7, "u1", "user", "来自另一个客户端")
+                  } else {
+                    // Same session-scoped seq as s1: this event must not collide in global deduplication.
+                    user(7, "u2", "user", "第二个会话")
+                  }
+                }
+              }
+            }
+          })
+          else -> MockResponse().setResponseCode(404)
+        }
+      }
+      val client = api(server)
+      client.rootSessionsPage("/repo")
+      val events = withTimeout(20_000) { client.events {}.take(2).toList() }
+      assertEquals(setOf("u1", "u2"), events.map { it.properties.str("messageID") }.toSet())
+      assertEquals(setOf("s1", "s2"), events.map { it.properties.str("sessionID") }.toSet())
+      assertEquals(2, events.map { it.id }.distinct().size)
+      assertTrue(events.all { it.type == "session.user.message" && !it.properties.str("text").contains("runtime") })
+      val first = events.single { it.properties.str("messageID") == "u1" }
+      val optimistic = Message("u1", "user", 1, listOf(MessagePart("u1:text", "text", text = "本地乐观行")))
+      val projected = TranscriptProjection.apply(listOf(optimistic), first)!!.messages.single()
+      assertEquals("u1", projected.id)
+      assertEquals("来自另一个客户端", projected.parts.single().text)
+      assertEquals(1_007L, projected.created)
     } finally {
       server.shutdown()
     }
@@ -1418,6 +1479,38 @@ class DshApiTest {
       val second = client.rootSessionsPage(cursor = page.next)
       assertEquals(50, second.items.size)
       assertNull(second.next)
+    }
+  }
+
+  @Test fun eventsReadyTimeoutClosesAndReconnectsTheLogicalStream() = runBlocking {
+    val server = MockWebServer().also { it.start() }
+    val attempts = java.util.concurrent.atomic.AtomicInteger()
+    val opened = kotlinx.coroutines.CompletableDeferred<Unit>()
+    try {
+      server.dispatcher = object : Dispatcher() {
+        override fun dispatch(request: RecordedRequest): MockResponse = when {
+          request.path!!.startsWith("/?token") || request.path == "/" -> rootOk()
+          request.path == "/api/remote.mux" -> MockResponse().withWebSocketUpgrade(object : WebSocketListener() {
+            override fun onMessage(webSocket: WebSocket, text: String) {
+              val frame = JSONObject(text)
+              if (frame.str("type") != "open" || frame.str("endpoint") != "\$events") return
+              if (attempts.incrementAndGet() >= 2) {
+                val id = frame.str("streamId")
+                webSocket.send("""{"type":"item","streamId":"$id","value":{"type":"ready","clientId":"c2"}}""")
+              }
+            }
+          })
+          else -> MockResponse().setResponseCode(404)
+        }
+      }
+      val client = DshApi(profile(server), ServerCredentials("dsh", "tok"), eventsReadyTimeoutMillis = 100)
+      val collector = launch { client.events { opened.complete(Unit) }.collect { } }
+      withTimeout(5_000) { opened.await() }
+      assertTrue("the silent first generation must be replaced", attempts.get() >= 2)
+      collector.cancel()
+      client.close()
+    } finally {
+      server.shutdown()
     }
   }
 

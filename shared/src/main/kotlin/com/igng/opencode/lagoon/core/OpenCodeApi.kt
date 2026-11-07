@@ -567,8 +567,10 @@ class OpenCodeApi(
         } catch (cancel: kotlinx.coroutines.CancellationException) {
           throw cancel
         } catch (error: Exception) {
-          // Ignore malformed event; next event or refresh repairs state. Logged for diagnosis.
-          Diagnostics.warn("SSE", "忽略无法解析的事件", error)
+          // A malformed frame may be the only terminal/permission event. Keep the failure explicit so
+          // the caller reconnects and performs an authoritative reconciliation instead of trusting a gap.
+          Diagnostics.warn("SSE", "事件无法解析，触发重新同步", error)
+          close(IOException("SSE 事件无法解析，已触发全量对账", error))
         }
       }
       override fun onFailure(eventSource: EventSource, t: Throwable?, response: Response?) {
@@ -643,5 +645,7 @@ internal fun String.toServerEvent(sseId: String): ServerEvent {
   val json = JSONObject(this)
   val properties = json.optJSONObject("data") ?: json.obj("properties")
   val created = json.optLong("created")
-  return ServerEvent(json.str("id").ifBlank { sseId }, json.obj("location").str("directory"), json.str("type"), properties, created)
+  val type = json.str("type")
+  require(type.isNotBlank()) { "SSE 事件缺少类型" }
+  return ServerEvent(json.str("id").ifBlank { sseId }, json.obj("location").str("directory"), type, properties, created)
 }

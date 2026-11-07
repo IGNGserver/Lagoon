@@ -35,8 +35,11 @@ internal class RemoteRelay(
 ) : RemoteSecureChannel {
   private val base = requireNotNull(address.trim().toHttpUrlOrNull()) { "DSH Hub 地址无效" }
   private val http = OkHttpClient.Builder().connectTimeout(10, TimeUnit.SECONDS).readTimeout(0, TimeUnit.SECONDS)
+    .pingInterval(20, TimeUnit.SECONDS)
     .followRedirects(false).followSslRedirects(false).retryOnConnectionFailure(false)
-    .connectionPool(SharedHttp.connectionPool).dispatcher(SharedHttp.dispatcher).build()
+    // Control/data sockets are long-lived. The bounded HTTP dispatcher is for finite RPCs only;
+    // sharing it lets several Remote hosts starve ordinary requests and prevents liveness pings.
+    .connectionPool(SharedHttp.connectionPool).dispatcher(SharedHttp.streamDispatcher).build()
   private val ready = CompletableDeferred<Unit>()
   private val sendLock = Mutex()
   private val incoming = RemoteSecureFragments()
