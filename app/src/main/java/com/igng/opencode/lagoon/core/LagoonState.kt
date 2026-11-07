@@ -53,6 +53,8 @@ data class LagoonState(
   val modelVisibilityConfigured: Boolean = false,
   /** Per-server variant selections keyed by provider/model; values are always server-provided ids. */
   val modelVariants: Map<String, String> = emptyMap(), val recentModels: List<String> = emptyList(),
+  /** Phone-local defaults for the blank "new session" page; they never rewrite server configuration. */
+  val newSessionAgent: String? = null, val newSessionModel: ModelChoice? = null,
   /** Files picked on this phone, per session (`draft` before a session exists), until they are sent. */
   val pendingAttachments: Map<String, List<LocalAttachment>> = emptyMap(),
   val agent: String? = null, val model: ModelChoice? = null,

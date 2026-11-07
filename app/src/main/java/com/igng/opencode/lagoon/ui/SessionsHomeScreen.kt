@@ -31,7 +31,6 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.igng.opencode.lagoon.core.*
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import top.yukonga.miuix.kmp.basic.*
 import top.yukonga.miuix.kmp.extra.SuperDialog
@@ -112,17 +111,13 @@ internal fun HomeScreen(
               add(MenuSection(listOf(
                 MenuAction("搜索", MiuixIcons.Search) { searching = true },
                 MenuAction("设备管理", MiuixIcons.GridView) { onManageDevices() },
-                MenuAction("已归档", ARCHIVE_ICON) { onPage(RootPage.ARCHIVED) },
                 MenuAction("设置", MiuixIcons.Settings) { onPage(RootPage.SETTINGS) }
               )))
             })
           }
         }
       )
-      if (!searching) GlobalTaskStrip(state, controller, onArchived = {
-        controller.setAllServers(true)
-        onPage(RootPage.ARCHIVED)
-      })
+      if (!searching) GlobalTaskStrip(state, controller)
       if (!state.multiServerView) ConnectionStrip(state, controller)
       Box(Modifier.weight(1f).fillMaxWidth()) {
         SessionList(state, controller, grouping, query.trim(), onOpen, onNewSession, onManageDevices,
@@ -167,13 +162,11 @@ private fun SearchTopBar(query: String, onQuery: (String) -> Unit, onClose: () -
  * `globalSummary` (notification-enabled servers, offline TTL applied) as the notification.
  */
 @Composable
-private fun GlobalTaskStrip(state: LagoonState, controller: LagoonController, onArchived: () -> Unit) {
-  val now by produceState(System.currentTimeMillis()) { while (true) { delay(60_000); value = System.currentTimeMillis() } }
+private fun GlobalTaskStrip(state: LagoonState, controller: LagoonController) {
   val grouped = state.homeGroup != null
   val summary = if (grouped) state.summary else state.globalSummary
-  val archived = state.archivedTaskCount(now)
-  val silent = state.silentServersWithTasks(now)
-  if (summary.isEmpty && archived == 0 && silent.isEmpty()) return
+  val silent = state.silentServersWithTasks()
+  if (summary.isEmpty && silent.isEmpty()) return
   val muted = MiuixTheme.colorScheme.onSurfaceVariantSummary
   Column(
     Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 4.dp),
@@ -193,14 +186,6 @@ private fun GlobalTaskStrip(state: LagoonState, controller: LagoonController, on
     }
     if (!summary.isEmpty) Text(summary.countLine, maxLines = 2, overflow = TextOverflow.Ellipsis,
       style = MiuixTheme.textStyles.footnote1.copy(fontWeight = FontWeight.Medium, color = MiuixTheme.colorScheme.onSurface))
-    if (archived > 0) {
-      Text("已归档会话另有 $archived 个任务 · 查看",
-        Modifier.clip(CircleShape).clickable(role = Role.Button) {
-          controller.setAllServers(true)
-          onArchived()
-        }.padding(vertical = 3.dp), maxLines = 2,
-        style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.primary))
-    }
     if (silent.isNotEmpty()) {
       Text("通知已关闭：${silent.joinToString("、")}（未计入灵动岛）", maxLines = 2, overflow = TextOverflow.Ellipsis,
         style = MiuixTheme.textStyles.footnote2.copy(color = MiuixColorTokens.Warning))

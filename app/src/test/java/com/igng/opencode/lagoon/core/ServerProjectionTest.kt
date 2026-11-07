@@ -166,7 +166,7 @@ class ServerProjectionTest {
     assertFalse(aggregate.pending("create"))
   }
 
-  @Test fun archivedTasksStayInTheIslandButAreCountedAsHiddenFromHome() {
+  @Test fun archivedTasksStayInTheIslandButAreHiddenFromHome() {
     val running = Session("run", "/repo", "Running", 0, archived = true, serverId = "a")
     val done = Session("done", "/repo", "Done", 0, archived = true, serverId = "a")
     val snapshot = ServerOverviewSnapshot("a", a, connected = true, lastReadAt = 1, loading = false,
@@ -177,7 +177,6 @@ class ServerProjectionTest {
 
     assertEquals(1, state.globalSummary.running)
     assertEquals(1, state.globalSummary.completed)
-    assertEquals(2, state.archivedTaskCount())
     // The island sees them; the home list's `visibleOnHome` still hides archived rows.
     assertEquals(2, state.homeProjection().sessions.size)
     assertTrue(HomeScope.roots(state.homeProjection().sessions, state.homeProjection().projects, null).isEmpty())

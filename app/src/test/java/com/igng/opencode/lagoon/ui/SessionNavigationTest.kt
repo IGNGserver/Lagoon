@@ -18,24 +18,24 @@ class SessionNavigationTest {
     val settings = SessionNavigation().push(RootPage.SETTINGS)
     assertTrue(settings.canGoBack)
     assertEquals(SessionNavigation(), settings.back())
-    assertEquals(SessionNavigation(), SessionNavigation().push(RootPage.ARCHIVED).back())
+    assertEquals(SessionNavigation(), SessionNavigation().push(RootPage.DEVICES).back())
   }
   @Test fun pushingAPageLeavesAnyOpenChat() {
     assertEquals(SessionNavigation(RootPage.SETTINGS), SessionNavigation().open("s1").push(RootPage.SETTINGS))
   }
   @Test fun childBackRestoresItsParentBeforeTheOriginatingPage() {
-    val nav = SessionNavigation(RootPage.ARCHIVED).open("parent").open("child", child = true).open("grandchild", child = true)
+    val nav = SessionNavigation(RootPage.DEVICES).open("parent").open("child", child = true).open("grandchild", child = true)
     assertEquals(listOf("parent", "child"), nav.back().sessions)
     assertEquals(listOf("parent"), nav.back().back().sessions)
-    assertEquals(SessionNavigation(RootPage.ARCHIVED), nav.back().back().back())
+    assertEquals(SessionNavigation(RootPage.DEVICES), nav.back().back().back())
     assertEquals(SessionNavigation(), nav.back().back().back().back())
     assertFalse(nav.back().back().back().back().canGoBack)
   }
   @Test fun leavingTheOutermostSessionReturnsToItsOriginPage() {
-    val chat = SessionNavigation(RootPage.ARCHIVED).open("session")
+    val chat = SessionNavigation(RootPage.DEVICES).open("session")
     assertTrue(leavesSession(chat, chat.back()))
     assertFalse(leavesSession(chat.open("child", child = true), chat))
-    assertFalse(leavesSession(SessionNavigation(RootPage.ARCHIVED), SessionNavigation()))
+    assertFalse(leavesSession(SessionNavigation(RootPage.DEVICES), SessionNavigation()))
   }
   @Test fun unrelatedSessionDoesNotInheritAnotherSessionsBackChain() {
     val nav = SessionNavigation().open("parent").open("child", true).open("other")
@@ -55,6 +55,6 @@ class SessionNavigationTest {
   @Test fun routeDepthCountsPagesAndChats() {
     assertEquals(1, SessionNavigation().open("s1").route.depth)
     assertEquals(1, SessionNavigation(RootPage.SETTINGS).route.depth)
-    assertEquals(3, SessionNavigation(RootPage.ARCHIVED).open("p").open("c", true).route.depth)
+    assertEquals(3, SessionNavigation(RootPage.DEVICES).open("p").open("c", true).route.depth)
   }
 }

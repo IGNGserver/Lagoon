@@ -247,7 +247,6 @@ class MainActivity : ComponentActivity() {
         FrameStats.page = when {
           route.session == DRAFT_SESSION -> "新会话"
           route.session != null -> "会话"
-          route.page == RootPage.ARCHIVED -> "已归档"
           route.page == RootPage.DEVICES -> "设备管理"
           route.page == RootPage.SETTINGS -> "设置"
           else -> "首页"
@@ -287,7 +286,6 @@ class MainActivity : ComponentActivity() {
                  target.session != null -> ChatScreen(displayed, controller, onBack = { goBack() }, onOpenChild = { child ->
                    controller.state.value.serverId?.let { server -> openSession(SessionTarget(server, child), child = true) }
                  }, onModal = {}, interactive = active)
-                 target.page == RootPage.ARCHIVED -> ArchivedScreen(home, controller, onOpen = { openSession(it) }, onBack = { goBack() })
                  target.page == RootPage.DEVICES -> DeviceManagementScreen(
                    state = state, controller = controller, onBack = { goBack() },
                    onAddDevice = { addDevice() },

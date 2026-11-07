@@ -26,6 +26,35 @@ data class ModelInfo(
 /** Provider IDs cannot contain `/`, so `provider/model` is unambiguous even for model IDs with `/` or `:`. */
 fun modelKey(model: ModelChoice): String = "${model.providerId}/${model.modelId}"
 
+/** Phone-local defaults for sessions created from this device; never written back to the server. */
+data class NewSessionDefaults(val agent: String? = null, val model: ModelChoice? = null)
+
+/** A blank page's effective selection after the current server catalog has been applied. */
+internal data class DraftDefaults(val agent: String?, val model: ModelChoice?)
+
+/**
+ * Resolve the stored defaults against the catalog the server currently offers.  An empty catalog
+ * means it has not loaded yet (offline or first connect), so the stored choice is kept for the
+ * eventual send; once a catalog is known, a missing model or preset falls back to the server
+ * default instead of sending an id the server no longer accepts.  The variant comes from the same
+ * per-model memory the composer uses, so "default strength" has one source of truth.
+ */
+internal fun resolveDraftDefaults(
+  agent: String?,
+  model: ModelChoice?,
+  agents: List<AgentChoice>,
+  catalog: List<ModelInfo>,
+  variants: Map<String, String>
+): DraftDefaults {
+  val validAgent = agent?.takeIf { candidate -> agents.isEmpty() || agents.any { it.name == candidate } }
+  if (model == null) return DraftDefaults(validAgent, null)
+  if (catalog.isEmpty()) return DraftDefaults(validAgent, model)
+  val info = catalog.firstOrNull { it.key == modelKey(model) } ?: return DraftDefaults(validAgent, null)
+  val ids = info.variants.map { it.id }.toSet()
+  val variant = variants[info.key]?.takeIf { it in ids } ?: model.variant?.takeIf { it in ids }
+  return DraftDefaults(validAgent, info.choice.copy(variant = variant))
+}
+
 /**
  * Per-server model visibility.
  *

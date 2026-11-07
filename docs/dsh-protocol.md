@@ -166,7 +166,7 @@
 
 - 项目 = Workspace（`workspace/follow` 首帧 `value.items`）；会话目录取行内 `cwd`。
 - `activeSessions` = 列表行 `running`；后台工作 = `job/list` 的运行作业 + 子会话。
-- `session/list` 里 `blank=true` 是服务端尚未发送任何轮次的草稿：不进入首页、搜索、归档或项目计数，
+- `session/list` 里 `blank=true` 是服务端尚未发送任何轮次的草稿：不进入首页、搜索、归档可见性或项目计数，
   也不会为它单独开 `session/follow`。新建会话时优先复用同目录最新的空白会话（DSH Web 同样这么做），
   避免每次新建/首条发送失败都在服务端留下一个“新会话”。
 - 时间线由 `turn/step/assistant/tool` 事件折算为控制器认识的 `session.*` 事件；

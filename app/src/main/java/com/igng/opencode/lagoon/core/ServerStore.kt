@@ -215,6 +215,23 @@ class ServerStore internal constructor(private val preferences: SharedPreference
     val next = (listOf(key) + recentModels(id).filterNot { it == key }).take(5)
     preferences.edit().putString("recentModels:$id", JSONArray(next).toString()).apply()
   }
+  /**
+   * The blank "new session" defaults configured on this phone.  The model variant is deliberately
+   * not stored here: it is read from [modelVariants], the same per-model memory the composer writes,
+   * so changing the default strength never leaves two disagreeing copies.
+   */
+  fun newSessionDefaults(id: String): NewSessionDefaults = runCatching {
+    val value = JSONObject(preferences.getString("newSessionDefaults:$id", "{}").orEmpty())
+    NewSessionDefaults(
+      agent = value.str("agent").ifBlank { null },
+      model = value.obj("model").toModelChoice()?.copy(variant = null)
+    )
+  }.getOrDefault(NewSessionDefaults())
+  fun rememberNewSessionDefaults(id: String, defaults: NewSessionDefaults) {
+    val model = defaults.model?.let { JSONObject().put("providerID", it.providerId).put("modelID", it.modelId).put("name", it.label) }
+    preferences.edit().putString("newSessionDefaults:$id",
+      JSONObject().put("agent", defaults.agent).put("model", model).toString()).apply()
+  }
 
   /** Home list scope per server: a project id, or null for 全部会话 (the default). */
   fun scope(id: String): String? = preferences.getString("scope:$id", null)?.takeIf(String::isNotBlank)
@@ -448,6 +465,7 @@ class ServerStore internal constructor(private val preferences: SharedPreference
       .remove("directories:$id").remove("sessionNotices:$id").remove("collapsedSections:$id").remove("collapsedProjects:$id").remove("pinned:$id").remove("remoteMigration:$id")
       .remove("backgroundRunning:$id")
       .remove("modelVisibility:$id").remove("modelVisibilityConfigured:$id").remove("modelVariants:$id").remove("recentModels:$id").remove("scope:$id")
+      .remove("newSessionDefaults:$id")
     val prefixes = listOf("location", "preview", "configuration", "taskRead", "taskState", "taskParent", "taskTime", "notification", "taskLedgerVersion").map { "$it:$id:" }
     preferences.all.keys.filter { key -> prefixes.any(key::startsWith) }.forEach(editor::remove)
     editor.apply()
