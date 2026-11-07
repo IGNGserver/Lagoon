@@ -303,15 +303,14 @@ class MainActivity : ComponentActivity() {
                    onAddDevice = { addDevice() },
                    onEditGroup = { groupId -> editingGroupId = groupId; showingDeviceGroups = true },
                    onEditProfile = { profile -> editDevice(profile) },
-                   onEditSshHost = { hostId -> addingSshHostId = hostId; addingOpenCodeId = null; showingAddDevice = true },
-                   onLoginHub = { showingRemoteEnroll = true },
-                   onManageHub = { showingRemoteHosts = true }
+                   onManageHub = { showingRemoteHosts = true },
+                   onManageModels = { showingModelManagement = true }
                  )
                  target.page == RootPage.SETTINGS -> SettingsScreen(state, controller, themeMode, { themeMode = it; preferences.edit().putString("themeMode", it.name).apply() }, previewBack, { previewBack = it; preferences.edit().putBoolean("previewBack", it).apply() }, refreshMode, { refreshMode = it; controller.setRefreshMode(it) }, {
                    if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
                    else startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, packageName))
-                 }, onManageModels = { showingModelManagement = true },
-                   onManageDevices = { openPage(RootPage.DEVICES) }, onAddDevice = { addDevice() }, onBack = { goBack() },
+                 },
+                   onManageDevices = { openPage(RootPage.DEVICES) }, onBack = { goBack() },
                     onMessage = { msg, type -> globalMessage = msg; globalMessageType = type })
                  else -> HomeScreen(home, controller, onOpen = { openSession(it) }, onNewSession = { openDraft() }, onScope = { showingScope = true },
                     onManageDevices = { openPage(RootPage.DEVICES) },

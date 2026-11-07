@@ -27,10 +27,8 @@ import com.igng.opencode.lagoon.core.LagoonController
 import com.igng.opencode.lagoon.core.LagoonState
 import com.igng.opencode.lagoon.core.ServerKind
 import com.igng.opencode.lagoon.core.endpointSummary
-import top.yukonga.miuix.kmp.basic.ButtonDefaults
 import top.yukonga.miuix.kmp.basic.Checkbox
 import top.yukonga.miuix.kmp.basic.Text
-import top.yukonga.miuix.kmp.basic.TextButton
 import top.yukonga.miuix.kmp.basic.TextField
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 
@@ -49,6 +47,7 @@ internal fun DeviceGroupsSheet(
   val editing = state.deviceGroups.firstOrNull { it.id == editingId }
   var name by rememberSaveable(initialGroupId) { mutableStateOf(editing?.name.orEmpty()) }
   var selected by remember(initialGroupId) { mutableStateOf(editing?.memberIds?.toSet().orEmpty()) }
+  var confirmingDelete by remember { mutableStateOf(false) }
   var connectAll by remember(initialGroupId) {
     mutableStateOf(
       editing?.memberIds?.mapNotNull { id -> state.profiles.firstOrNull { it.id == id && it.enabled } }?.let { members ->
@@ -103,7 +102,7 @@ internal fun DeviceGroupsSheet(
         }
       }
       item {
-        TextButton(
+        HyperButton(
           text = if (editing == null) "创建设备组" else "保存",
           enabled = name.isNotBlank() && selected.isNotEmpty(),
           onClick = {
@@ -116,20 +115,33 @@ internal fun DeviceGroupsSheet(
             controller.setDeviceAutoConnect(id, connectAll)
             onDismiss()
           },
-          modifier = Modifier.fillMaxWidth(),
-          colors = ButtonDefaults.textButtonColorsPrimary()
+          modifier = Modifier.fillMaxWidth()
         )
       }
       if (editing != null) item {
-        TextButton(
-          text = "删除设备组（只解除分组）",
-          onClick = {
-            controller.deleteDevice(editing.id)
-            onDismiss()
-          },
-          modifier = Modifier.fillMaxWidth(),
-          colors = ButtonDefaults.textButtonColors(textColor = MiuixColorTokens.Error)
+        HyperButton(
+          text = "删除设备组",
+          variant = HyperButtonVariant.DESTRUCTIVE,
+          onClick = { confirmingDelete = true },
+          modifier = Modifier.fillMaxWidth()
         )
+      }
+    }
+  }
+
+  if (confirmingDelete && editing != null) {
+    top.yukonga.miuix.kmp.extra.SuperDialog(
+      title = "删除设备组“${editing.name}”？",
+      show = true,
+      onDismissRequest = { confirmingDelete = false }
+    ) {
+      Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text("只会解除分组，不会删除设备、工作区或会话。", style = MiuixTheme.textStyles.body1)
+        DialogActions("取消", { confirmingDelete = false }, "确认删除", danger = true) {
+          controller.deleteDevice(editing.id)
+          confirmingDelete = false
+          onDismiss()
+        }
       }
     }
   }

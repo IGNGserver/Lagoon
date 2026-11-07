@@ -41,12 +41,10 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import top.yukonga.miuix.kmp.basic.ButtonDefaults
 import top.yukonga.miuix.kmp.basic.Card
 import top.yukonga.miuix.kmp.basic.CardDefaults
 import top.yukonga.miuix.kmp.basic.SmallTitle
 import top.yukonga.miuix.kmp.basic.Text
-import top.yukonga.miuix.kmp.basic.TextButton
 import top.yukonga.miuix.kmp.basic.TextField
 import top.yukonga.miuix.kmp.extra.SuperDialog
 import top.yukonga.miuix.kmp.theme.MiuixTheme
@@ -76,9 +74,13 @@ internal fun SshHostForm(
   var port by rememberSaveable(initial?.id) { mutableStateOf((initial?.port ?: 22).toString()) }
   var user by rememberSaveable(initial?.id) { mutableStateOf(initial?.user.orEmpty()) }
   var auth by rememberSaveable(initial?.id) { mutableStateOf(initial?.auth ?: SshAuthMethod.PASSWORD) }
-  var password by remember(initial?.id) { mutableStateOf(initialSecrets.password.orEmpty()) }
-  var privateKey by remember(initial?.id) { mutableStateOf(initialSecrets.privateKey.orEmpty()) }
-  var passphrase by remember(initial?.id) { mutableStateOf(initialSecrets.passphrase.orEmpty()) }
+  // Saved secrets stay in Android Keystore. Empty fields mean “keep saved”, never “show saved”.
+  var password by remember(initial?.id) { mutableStateOf("") }
+  var privateKey by remember(initial?.id) { mutableStateOf("") }
+  var passphrase by remember(initial?.id) { mutableStateOf("") }
+  var privateKeyVisible by remember { mutableStateOf(false) }
+  var clearedSecrets by remember { mutableStateOf(setOf<SshSecretField>()) }
+  var confirmingSecretClear by remember { mutableStateOf<SshSecretField?>(null) }
   var command by rememberSaveable(initial?.id) { mutableStateOf(initial?.launchCommand ?: com.igng.opencode.lagoon.core.DEFAULT_DSH_LAUNCH_COMMAND) }
   var workingDirectory by rememberSaveable(initial?.id) { mutableStateOf(initial?.workingDirectory.orEmpty()) }
   var autoConnect by rememberSaveable(initial?.id) {
@@ -100,6 +102,8 @@ internal fun SshHostForm(
   var pendingConfig by remember { mutableStateOf<SshHostConfig?>(null) }
   var importError by remember { mutableStateOf<String?>(null) }
   var confirmingDelete by remember { mutableStateOf(false) }
+  var confirmingFingerprintReset by remember { mutableStateOf(false) }
+  var showAdvanced by rememberSaveable(initial?.id) { mutableStateOf(false) }
 
   // A pinned key belongs to the address it was read from. Clear the display as soon as the user
   // edits host/port so an old fingerprint can never be sent to a different machine.
@@ -130,6 +134,8 @@ internal fun SshHostForm(
         }
         if (!text.contains("PRIVATE KEY-----")) throw IllegalArgumentException("这不是 OpenSSH/PEM 私钥文件")
         privateKey = text.trim()
+        clearedSecrets = clearedSecrets - SshSecretField.PRIVATE_KEY
+        privateKeyVisible = false
         importError = null
       } catch (cancel: CancellationException) {
         throw cancel
@@ -140,9 +146,9 @@ internal fun SshHostForm(
   }
 
   fun secrets(): SshSecrets = SshSecrets(
-    password = password.takeIf { it.isNotEmpty() } ?: initialSecrets.password,
-    privateKey = privateKey.takeIf { it.isNotBlank() } ?: initialSecrets.privateKey,
-    passphrase = passphrase.takeIf { it.isNotEmpty() } ?: initialSecrets.passphrase
+    password = resolveSshSecret(password, initialSecrets.password, SshSecretField.PASSWORD in clearedSecrets),
+    privateKey = resolveSshSecret(privateKey, initialSecrets.privateKey, SshSecretField.PRIVATE_KEY in clearedSecrets),
+    passphrase = resolveSshSecret(passphrase, initialSecrets.passphrase, SshSecretField.PASSPHRASE in clearedSecrets)
   )
 
   fun configOrNull(): SshHostConfig? {
@@ -151,12 +157,12 @@ internal fun SshHostForm(
       result = "填写主机地址、用户名和 1–65535 的端口"
       return null
     }
-    if (auth == SshAuthMethod.PASSWORD && password.isEmpty()) {
-      result = "填写 SSH 密码，或改用私钥"
+    if (auth == SshAuthMethod.PASSWORD && !hasUsableSshSecret(password, initialSecrets.password, SshSecretField.PASSWORD in clearedSecrets)) {
+      result = "填写 SSH 密码，或保留已保存的密码"
       return null
     }
-    if (auth == SshAuthMethod.PRIVATE_KEY && privateKey.isBlank()) {
-      result = "粘贴或导入 SSH 私钥"
+    if (auth == SshAuthMethod.PRIVATE_KEY && !hasUsableSshSecret(privateKey, initialSecrets.privateKey, SshSecretField.PRIVATE_KEY in clearedSecrets)) {
+      result = "粘贴或导入 SSH 私钥，或保留已保存的私钥"
       return null
     }
     // A pinned key belongs to one address; moving the host must force a fresh confirmation.
@@ -289,48 +295,104 @@ internal fun SshHostForm(
       item {
         TextField(
           value = password,
-          onValueChange = { password = it },
-          label = if (initial?.auth == SshAuthMethod.PASSWORD && initialSecrets.password != null) "SSH 密码（留空保持不变）" else "SSH 密码",
+          onValueChange = {
+            password = it
+            clearedSecrets = clearedSecrets - SshSecretField.PASSWORD
+          },
+          label = when {
+            SshSecretField.PASSWORD in clearedSecrets -> "新的 SSH 密码（留空将清除已保存）"
+            initialSecrets.password != null -> "新的 SSH 密码（留空沿用已保存）"
+            else -> "SSH 密码"
+          },
           keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = KeyboardType.Password),
           visualTransformation = PasswordVisualTransformation(),
           modifier = Modifier.fillMaxWidth()
         )
       }
+      if (initialSecrets.password != null) item {
+        Text(
+          if (SshSecretField.PASSWORD in clearedSecrets) "将在保存时清除已保存密码；输入新密码可改为替换" else "已安全保存密码，应用不会显示原值",
+          style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary)
+        )
+        if (SshSecretField.PASSWORD !in clearedSecrets) {
+          HyperTextAction(text = "清除已保存密码", danger = true, onClick = { confirmingSecretClear = SshSecretField.PASSWORD })
+        }
+      }
     } else {
       item {
         TextField(
           value = privateKey,
-          onValueChange = { privateKey = it },
-          label = "私钥（OpenSSH / PEM 全文）",
+          onValueChange = {
+            privateKey = it
+            clearedSecrets = clearedSecrets - SshSecretField.PRIVATE_KEY
+          },
+          label = when {
+            SshSecretField.PRIVATE_KEY in clearedSecrets -> "新的私钥（留空将清除已保存）"
+            initialSecrets.privateKey != null -> "新的私钥（留空沿用已保存）"
+            else -> "私钥（OpenSSH / PEM 全文）"
+          },
           singleLine = false,
+          visualTransformation = if (privateKeyVisible) androidx.compose.ui.text.input.VisualTransformation.None else PasswordVisualTransformation(),
           modifier = Modifier.fillMaxWidth()
         )
       }
       item {
-        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-          TextButton(text = "导入私钥文件", onClick = { keyPicker.launch(arrayOf("text/plain", "application/octet-stream", "*/*")) })
-          Text(if (initialSecrets.privateKey != null) "已保存，可留空沿用" else "只保存在本机加密存储中",
-            style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
+        Text(
+          if (SshSecretField.PRIVATE_KEY in clearedSecrets) "将在保存时清除已保存私钥" else if (initialSecrets.privateKey != null) "已安全保存私钥，应用不会显示原值" else "私钥只保存在本机加密存储中",
+          style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary)
+        )
+        Row(verticalAlignment = Alignment.CenterVertically) {
+          HyperTextAction(text = "导入私钥文件", onClick = { keyPicker.launch(arrayOf("text/plain", "application/octet-stream", "*/*")) })
+          HyperTextAction(text = if (privateKeyVisible) "隐藏新私钥" else "显示新私钥", enabled = privateKey.isNotEmpty(), onClick = { privateKeyVisible = !privateKeyVisible })
+        }
+        if (initialSecrets.privateKey != null && SshSecretField.PRIVATE_KEY !in clearedSecrets) {
+          HyperTextAction(text = "清除已保存私钥", danger = true, onClick = { confirmingSecretClear = SshSecretField.PRIVATE_KEY })
         }
         importError?.let { Text(it, style = MiuixTheme.textStyles.footnote2.copy(color = MiuixColorTokens.Error)) }
       }
       item {
         TextField(
           value = passphrase,
-          onValueChange = { passphrase = it },
-          label = "私钥密码（没有可留空）",
+          onValueChange = {
+            passphrase = it
+            clearedSecrets = clearedSecrets - SshSecretField.PASSPHRASE
+          },
+          label = when {
+            SshSecretField.PASSPHRASE in clearedSecrets -> "新的私钥密码（留空将清除已保存）"
+            initialSecrets.passphrase != null -> "新的私钥密码（留空沿用已保存）"
+            else -> "私钥密码（可选）"
+          },
           keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = KeyboardType.Password),
           visualTransformation = PasswordVisualTransformation(),
           modifier = Modifier.fillMaxWidth()
         )
+        if (initialSecrets.passphrase != null) {
+          Text(
+            if (SshSecretField.PASSPHRASE in clearedSecrets) "将在保存时清除已保存的私钥密码；输入新密码可改为替换" else "已安全保存私钥密码，应用不会显示原值",
+            style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary)
+          )
+        }
+        if (initialSecrets.passphrase != null && SshSecretField.PASSPHRASE !in clearedSecrets) {
+          HyperTextAction(text = "清除已保存的私钥密码", danger = true, onClick = { confirmingSecretClear = SshSecretField.PASSPHRASE })
+        }
       }
     }
-    item { SmallTitle("高级", insideMargin = PaddingValues(horizontal = 4.dp, vertical = 2.dp)) }
     item {
-      TextField(value = command, onValueChange = { command = it }, label = "启动命令", modifier = Modifier.fillMaxWidth())
+      HyperRow(
+        title = "高级连接选项",
+        summary = "启动命令、远端目录与主机指纹",
+        showChevron = false,
+        trailing = { ExpandChevron(showAdvanced) },
+        onClick = { showAdvanced = !showAdvanced }
+      )
     }
-    item {
-      TextField(value = workingDirectory, onValueChange = { workingDirectory = it }, label = "远端工作目录（可选，例如 ~/code）", modifier = Modifier.fillMaxWidth())
+    if (showAdvanced) {
+      item {
+        TextField(value = command, onValueChange = { command = it }, label = "启动命令", modifier = Modifier.fillMaxWidth())
+      }
+      item {
+        TextField(value = workingDirectory, onValueChange = { workingDirectory = it }, label = "远端工作目录（可选，例如 ~/code）", modifier = Modifier.fillMaxWidth())
+      }
     }
     item {
       HyperSwitchRow(title = "自动连接", summary = "保存后在后台保持这条 SSH 连接", checked = autoConnect, onCheckedChange = { autoConnect = it })
@@ -349,32 +411,31 @@ internal fun SshHostForm(
         )
       }
     }
-    item { SmallTitle("主机指纹", insideMargin = PaddingValues(horizontal = 4.dp, vertical = 2.dp)) }
-    item {
-      Card(Modifier.fillMaxWidth(), insideMargin = PaddingValues(14.dp)) {
-        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-          if (hostKeyFingerprint.isBlank()) {
-            Text("首次连接会读出主机指纹，请和电脑上的 ssh-keygen 结果核对后再信任。",
-              style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
-          } else {
-            Text(hostKeyType.ifBlank { "SSH" }, style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
-            Text(hostKeyFingerprint, style = MiuixTheme.textStyles.body2.copy(fontFamily = FontFamily.Monospace),
-              maxLines = 2, overflow = TextOverflow.Ellipsis)
-            TextButton(text = "重置主机指纹", onClick = {
-              hostKeyType = ""; hostKeyFingerprint = ""; result = null
-            }, colors = ButtonDefaults.textButtonColors(textColor = MiuixColorTokens.Error))
+    if (showAdvanced) {
+      item { HyperGroupTitle("主机指纹") }
+      item {
+        HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(14.dp)) {
+          Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            if (hostKeyFingerprint.isBlank()) {
+              Text("首次连接会读出主机指纹，请和电脑上的 ssh-keygen 结果核对后再信任。",
+                style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary))
+            } else {
+              Text(hostKeyType.ifBlank { "SSH" }, style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary))
+              Text(hostKeyFingerprint, style = MiuixTheme.textStyles.body2.copy(fontFamily = FontFamily.Monospace))
+              HyperTextAction(text = "重置主机指纹", danger = true, onClick = { confirmingFingerprintReset = true })
+            }
           }
         }
       }
     }
     item {
       Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        TextButton(text = if (working) "正在测试…" else "测试连接", enabled = !working, onClick = { test() })
+        HyperButton(text = "测试连接", variant = HyperButtonVariant.SECONDARY, enabled = !working, loading = working, onClick = { test() })
         Text(testStatus?.let(::sshStepText).orEmpty(), style = MiuixTheme.textStyles.footnote2.copy(
           color = when (testStatus?.phase) {
             com.igng.opencode.lagoon.core.SshLinkPhase.CONNECTED -> MiuixColorTokens.Success
             com.igng.opencode.lagoon.core.SshLinkPhase.FAILED -> MiuixColorTokens.Error
-            else -> MiuixTheme.colorScheme.onSurfaceVariantSummary
+            else -> HyperTheme.colors.textSecondary
           }
         ))
       }
@@ -388,16 +449,16 @@ internal fun SshHostForm(
     }
     item {
       Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        TextButton(text = "取消", onClick = onCancel, modifier = Modifier.weight(1f))
-        TextButton(text = if (working) "正在保存…" else if (enabled) "保存并连接" else "保存", enabled = !working, onClick = { save() }, modifier = Modifier.weight(1f))
+        HyperButton(text = "取消", variant = HyperButtonVariant.SECONDARY, onClick = onCancel, modifier = Modifier.weight(1f))
+        HyperButton(text = if (enabled) "保存并连接" else "保存", enabled = !working, loading = working, onClick = { save() }, modifier = Modifier.weight(1f))
       }
     }
     if (initial != null) item {
-      TextButton(
-        text = "删除 DSH SSH 主机",
+      HyperButton(
+        text = "删除 SSH 主机",
+        variant = HyperButtonVariant.DESTRUCTIVE,
         onClick = { confirmingDelete = true },
-        modifier = Modifier.fillMaxWidth(),
-        colors = ButtonDefaults.textButtonColors(textColor = MiuixColorTokens.Error)
+        modifier = Modifier.fillMaxWidth()
       )
     }
   }
@@ -411,6 +472,42 @@ internal fun SshHostForm(
           controller.deleteSshHost(initial.id)
           confirmingDelete = false
           onSaved()
+        }
+      }
+    }
+  }
+
+  confirmingSecretClear?.let { field ->
+    val label = when (field) {
+      SshSecretField.PASSWORD -> "SSH 密码"
+      SshSecretField.PRIVATE_KEY -> "SSH 私钥"
+      SshSecretField.PASSPHRASE -> "私钥密码"
+    }
+    SuperDialog(title = "清除已保存的$label？", show = true, onDismissRequest = { confirmingSecretClear = null }) {
+      Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text("保存主机后，本机加密存储中的${label}将被删除。远端主机不会受影响。", style = MiuixTheme.textStyles.body1)
+        DialogActions("取消", { confirmingSecretClear = null }, "确认清除", danger = true) {
+          clearedSecrets = clearedSecrets + field
+          when (field) {
+            SshSecretField.PASSWORD -> password = ""
+            SshSecretField.PRIVATE_KEY -> privateKey = ""
+            SshSecretField.PASSPHRASE -> passphrase = ""
+          }
+          confirmingSecretClear = null
+        }
+      }
+    }
+  }
+
+  if (confirmingFingerprintReset) {
+    SuperDialog(title = "重置主机指纹？", show = true, onDismissRequest = { confirmingFingerprintReset = false }) {
+      Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text("下次连接会重新显示远端指纹，必须重新核对并信任后才能继续。仅在主机确实重装或更换时操作。", style = MiuixTheme.textStyles.body1)
+        DialogActions("取消", { confirmingFingerprintReset = false }, "确认重置", danger = true) {
+          hostKeyType = ""
+          hostKeyFingerprint = ""
+          result = null
+          confirmingFingerprintReset = false
         }
       }
     }

@@ -281,9 +281,10 @@ internal fun MiuixServerForm(
     harness = ServerKind.DSH
     dshAuth = DshAuthMode.TOKEN
     username = "dsh"
+    allowHttp = cleartextConsentAfterUrlEdit(url, link.serverUrl, allowHttp)
     url = link.serverUrl
     password = link.token
-    if (link.serverUrl.startsWith("http://", true)) allowHttp = true
+    // Parsing a link extracts data only; cleartext transport always needs separate user consent.
     if (name.isBlank()) name = "我的 ${ServerKind.DSH.label}"
     return true
   }
@@ -359,8 +360,9 @@ internal fun MiuixServerForm(
         TextField(
           value = url,
           onValueChange = { text: String ->
-             if (!acceptLaunchLink(text)) {
-               if (harness == ServerKind.DSH_REMOTE && text != url) { hosts = emptyList(); selectedHost = ""; hostFingerprint = "" }
+            if (!acceptLaunchLink(text)) {
+              if (harness == ServerKind.DSH_REMOTE && text != url) { hosts = emptyList(); selectedHost = ""; hostFingerprint = "" }
+              allowHttp = cleartextConsentAfterUrlEdit(url, text, allowHttp)
               url = text
               if (name.isBlank() && text.isNotBlank()) name = "我的 ${harness.label}"
             }
@@ -437,6 +439,7 @@ internal fun MiuixServerForm(
       HyperActionRow(
         title = "高级与网络设置",
         summary = if (showAdvanced) "收起额外配置" else "连接与通知行为",
+        trailing = { ExpandChevron(showAdvanced) },
         onClick = { showAdvanced = !showAdvanced }
       )
     }
@@ -506,8 +509,7 @@ internal fun MiuixServerForm(
     }
 
     if (onDelete != null) item {
-      TextButton(text = "从此设备移除", onClick = onDelete, modifier = Modifier.fillMaxWidth(),
-        colors = ButtonDefaults.textButtonColors(textColor = MiuixColorTokens.Error))
+      HyperButton(text = "从此设备移除", variant = HyperButtonVariant.DESTRUCTIVE, onClick = onDelete, modifier = Modifier.fillMaxWidth())
     }
   }
 }
@@ -523,9 +525,7 @@ fun SettingsScreen(
   refreshMode: RefreshMode,
   onRefreshMode: (RefreshMode) -> Unit,
   onNotifications: () -> Unit,
-  onManageModels: () -> Unit,
   onManageDevices: () -> Unit = {},
-  onAddDevice: () -> Unit = {},
   onBack: () -> Unit,
   onMessage: (String, MiuixToastType) -> Unit
 ) {
@@ -541,13 +541,9 @@ fun SettingsScreen(
     mutableStateOf(preview)
   }
   LaunchedEffect(updater) { updater.check(includePrerelease, automatic = true) }
-  LaunchedEffect(state.serverId, state.connected) { controller.loadDefaultCatalog() }
   var installAllowed by remember { mutableStateOf(context.packageManager.canRequestPackageInstalls()) }
   var pendingInstall by rememberSaveable { mutableStateOf(false) }
   var showReleaseNotes by rememberSaveable { mutableStateOf(false) }
-  var hostDialog by rememberSaveable { mutableStateOf<String?>(null) }
-  val hostProfile = state.server
-  LaunchedEffect(hostProfile?.id) { hostDialog = null }
   LaunchedEffect(update.release?.version) { showReleaseNotes = false }
   // 只展示系统标准实时更新的状态；不检测任何厂商通道。检测放到 IO 线程执行。
   var notificationsEnabled by remember { mutableStateOf(true) }
@@ -605,11 +601,15 @@ fun SettingsScreen(
     onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
   }
   val packageInfo = remember { context.packageManager.getPackageInfo(context.packageName, 0) }
-  val versionCode = if (Build.VERSION.SDK_INT >= 28) packageInfo.longVersionCode
-    else @Suppress("DEPRECATION") packageInfo.versionCode.toLong()
   val clipboard = LocalClipboardManager.current
   var crashReport by remember { mutableStateOf<String?>(null) }
-  LaunchedEffect(Unit) { crashReport = withContext(Dispatchers.IO) { CrashLog.read(context) } }
+  var confirmingCacheClear by remember { mutableStateOf(false) }
+  var confirmingCrashClear by remember { mutableStateOf(false) }
+  var cacheUsage by remember { mutableStateOf<String?>(null) }
+  LaunchedEffect(Unit) {
+    crashReport = withContext(Dispatchers.IO) { CrashLog.read(context) }
+    cacheUsage = controller.transcriptCacheUsage()?.let { "已保存 ${it.sessions} 个会话 · ${formatBytes(it.bytes)} / 上限 ${formatBytes(TranscriptStore.DEFAULT_BUDGET_BYTES)}" }
+  }
 
   // HyperOS 4 settings: grouped squircle island cards on the mineral canvas surface.
   Column(Modifier.fillMaxSize().background(HyperTheme.colors.canvas)) {
@@ -626,71 +626,13 @@ fun SettingsScreen(
         HyperRow(
           title = "设备管理",
           summary = buildString {
-            append("${state.enabledProfiles.size} 个启用连接")
-            if (state.disabledProfileCount > 0) append(" · ${state.disabledProfileCount} 个已禁用")
-            append(" · ${state.deviceGroups.size} 个分组")
+            append("${state.enabledProfiles.size} 台启用")
+            if (state.disabledProfileCount > 0) append(" · ${state.disabledProfileCount} 台停用")
+            append(" · ${state.deviceGroups.size} 个设备组")
           },
           showChevron = true,
           onClick = onManageDevices
         )
-        HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
-        HyperRow(
-          title = "添加设备",
-          summary = "OpenCode、DSH Remote Hub 或 SSH 主机",
-          showChevron = true,
-          onClick = onAddDevice
-        )
-        HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
-        HyperRow(
-          title = "模型显示",
-          summary = when {
-            state.serverId == null -> "连接服务器后管理模型下拉框"
-            state.modelVisibilityConfigured -> "已配置 · ${state.visibleModels.size}/${state.modelCatalog.size} 个模型"
-            else -> "未配置过滤 · 显示服务器返回的全部模型"
-          },
-          showChevron = true,
-          onClick = onManageModels
-        )
-      }
-    }
-
-    item {
-      HyperGroupTitle("新会话默认值")
-      NewSessionDefaultsCard(state, controller)
-    }
-
-    if (hostProfile != null && (hostProfile.kind == ServerKind.DSH || hostProfile.kind == ServerKind.DSH_REMOTE)) item {
-      HyperGroupTitle("DSH 主机设置")
-      HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(vertical = 4.dp)) {
-        HyperRow(
-          title = "主机模型密钥",
-          summary = "写入 Host 凭据引用；值不会回显",
-          showChevron = true,
-          onClick = { hostDialog = "model-key" }
-        )
-        HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
-        HyperRow(
-          title = "自定义模型服务商",
-          summary = "写入 Host 的 llm-pi-ai 配置（路由、协议、Base URL、模型）",
-          showChevron = true,
-          onClick = { hostDialog = "provider" }
-        )
-        HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
-        HyperRow(
-          title = "主机扩展（插件开关）",
-          summary = "只列出 Host 允许远程开关的官方 bundle；安装与配置仍在电脑上",
-          showChevron = true,
-          onClick = { hostDialog = "extensions" }
-        )
-        if (hostProfile.kind == ServerKind.DSH_REMOTE) {
-          HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
-          HyperRow(
-            title = "连接详情",
-            summary = "Relay 路径、主机指纹与加密 RPC 诊断",
-            showChevron = true,
-            onClick = { hostDialog = "details" }
-          )
-        }
       }
     }
 
@@ -723,18 +665,26 @@ fun SettingsScreen(
     item {
       HyperGroupTitle("授权")
       HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(vertical = 4.dp)) {
-        HyperSwitchRow(
-          title = "不显示授权窗口",
-          summary = "本手机全部设备：隐藏授权窗口、列表标记和通知；不会因此允许操作，任务可能仍等待电脑端处理",
-          checked = state.permissionPolicy.hide,
-          onCheckedChange = { controller.setPermissionPolicy(state.permissionPolicy.copy(hide = it)) }
+        HyperDropdownRow(
+          title = "权限请求处理",
+          items = listOf("每次询问（推荐）", "隐藏授权提示", "始终允许一次（高风险）"),
+          selectedIndex = when {
+            state.permissionPolicy.autoApprove -> 2
+            state.permissionPolicy.hide -> 1
+            else -> 0
+          },
+          onSelectedIndexChange = { index ->
+            controller.setPermissionPolicy(state.permissionPolicy.copy(hide = index == 1, autoApprove = index == 2))
+          }
         )
-        HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
-        HyperSwitchRow(
-          title = "自动授权",
-          summary = "本手机全部设备：自动对每个权限请求“允许一次”，不保存永久规则；请仅连接可信设备",
-          checked = state.permissionPolicy.autoApprove,
-          onCheckedChange = { controller.setPermissionPolicy(state.permissionPolicy.copy(autoApprove = it)) }
+      }
+      if (state.permissionPolicy.autoApprove || state.permissionPolicy.hide) {
+        HyperInlineNotice(
+          message = if (state.permissionPolicy.autoApprove) "高风险模式：所有设备的权限请求会自动按“允许一次”处理，不会保存永久规则。" else "授权提示已隐藏，任务可能停在等待权限状态；建议恢复“每次询问”。",
+          type = MiuixToastType.WARNING,
+          action = "恢复询问",
+          onAction = { controller.setPermissionPolicy(state.permissionPolicy.copy(hide = false, autoApprove = false)) },
+          modifier = Modifier.padding(top = 8.dp)
         )
       }
     }
@@ -792,8 +742,9 @@ fun SettingsScreen(
       HyperGroupTitle("版本与更新")
       HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(vertical = 4.dp)) {
         HyperRow(
-          title = "Lagoon ${packageInfo.versionName} ($versionCode)",
-          summary = "Android ${Build.VERSION.RELEASE} · API ${Build.VERSION.SDK_INT} · 更新源 GitHub"
+          title = "Lagoon",
+          value = packageInfo.versionName.orEmpty(),
+          summary = "通过 GitHub 检查更新"
         )
         HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
         HyperSwitchRow(
@@ -826,50 +777,68 @@ fun SettingsScreen(
       HyperGroupTitle("关于与诊断")
       HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(vertical = 4.dp)) {
         HyperRow(
-          title = "服务与同步",
-          summary = "服务：${state.version.ifBlank { "未知版本" }} · ${if (state.connected) "可连接" else "未连接"}\n实时同步：${if (state.streamConnected) "正常" else "恢复中"} · ${if (state.degraded || state.cached) "数据待更新" else "数据已同步"}"
-        )
-        var cacheUsage by remember { mutableStateOf<String?>(null) }
-        LaunchedEffect(Unit) {
-          cacheUsage = controller.transcriptCacheUsage()?.let { "已保存 ${it.sessions} 个会话 · ${formatBytes(it.bytes)} / 上限 ${formatBytes(TranscriptStore.DEFAULT_BUDGET_BYTES)}" }
-        }
-        HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
-        HyperRow(
           title = "清除会话缓存",
           summary = (cacheUsage ?: "本机保存的会话内容") + "\n与服务器核对后使用；清除后打开会话时重新读取",
-          showChevron = true,
-          onClick = { controller.clearTranscriptCache { cacheUsage = "已清除" } }
+          showChevron = false,
+          danger = true,
+          onClick = { confirmingCacheClear = true }
         )
         HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
         HyperRow(
           title = "复制诊断信息",
           summary = "版本、系统、连接状态与各阶段耗时，不含凭据",
-          showChevron = true,
+          showChevron = false,
           onClick = {
             clipboard.setText(AnnotatedString("Lagoon ${packageInfo.versionName}\nAndroid ${android.os.Build.VERSION.RELEASE} / API ${android.os.Build.VERSION.SDK_INT}\n${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}\nserver=${state.version}, api=${state.connected}, stream=${state.streamConnected}, stale=${state.degraded}, cached=${state.cached}\ncapabilitiesDocumented=${state.capabilities.documented}, sessions=${state.sessions.size}, messages=${state.messages.size}\n连接耗时：\n${controller.connectionDiagnostics().ifBlank { "暂无记录" }}\n帧耗时（本次启动）：\n${FrameStats.summary().ifBlank { "暂无记录" }}"))
+            onMessage("诊断信息已复制", MiuixToastType.SUCCESS)
           }
         )
         crashReport?.let { report ->
           HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
           HyperRow(title = "上次崩溃", summary = "${report.lineSequence().firstOrNull().orEmpty()}\n${CrashLog.headline(report)}")
           HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
-          HyperRow(title = "复制崩溃日志", showChevron = true, onClick = { clipboard.setText(AnnotatedString(report)) })
+          HyperRow(title = "复制崩溃日志", showChevron = false, onClick = {
+            clipboard.setText(AnnotatedString(report))
+            onMessage("崩溃日志已复制", MiuixToastType.SUCCESS)
+          })
           HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
-          HyperRow(title = "清除崩溃记录", danger = true, onClick = { CrashLog.clear(context); crashReport = null })
+          HyperRow(title = "清除崩溃记录", danger = true, onClick = { confirmingCrashClear = true })
         }
       }
     }
   }
   }
 
-  val releaseForNotes = update.release
-
-  if (hostProfile != null) when (hostDialog) {
-    "extensions" -> RemoteExtensionsDialog(hostProfile, controller) { hostDialog = null }
-    "model-key" -> RemoteModelKeyDialog(hostProfile, controller) { hostDialog = null }
-    "provider" -> RemoteProviderDialog(hostProfile, controller) { hostDialog = null }
-    "details" -> RemoteConnectionDialog(hostProfile, state, controller) { hostDialog = null }
+  if (confirmingCacheClear) {
+    SuperDialog(title = "清除本机会话缓存？", show = true, onDismissRequest = { confirmingCacheClear = false }) {
+      Column {
+        Text("服务器上的会话和消息不会删除；下次打开时需要重新读取，离线期间将暂时无法查看未同步内容。")
+        DialogActions("取消", { confirmingCacheClear = false }, "确认清除", danger = true) {
+          controller.clearTranscriptCache {
+            cacheUsage = "已清除"
+            onMessage("本机会话缓存已清除", MiuixToastType.SUCCESS)
+          }
+          confirmingCacheClear = false
+        }
+      }
+    }
   }
+
+  if (confirmingCrashClear) {
+    SuperDialog(title = "清除崩溃记录？", show = true, onDismissRequest = { confirmingCrashClear = false }) {
+      Column {
+        Text("清除后将无法再从本机复制这份崩溃日志。")
+        DialogActions("取消", { confirmingCrashClear = false }, "确认清除", danger = true) {
+          CrashLog.clear(context)
+          crashReport = null
+          confirmingCrashClear = false
+          onMessage("崩溃记录已清除", MiuixToastType.SUCCESS)
+        }
+      }
+    }
+  }
+
+  val releaseForNotes = update.release
 
   if (showReleaseNotes && releaseForNotes != null) {
     HyperBottomSheet(
@@ -911,7 +880,7 @@ private fun UpdateControls(
     HyperActionRow(
       title = "检查失败",
       summary = failure.userMessage(update.failureDetail),
-      trailing = { TextButton(text = "重试", onClick = onRetryCheck) }
+      trailing = { HyperTextAction(text = "重试", onClick = onRetryCheck) }
     )
     return
   }
@@ -960,8 +929,8 @@ private fun UpdateControls(
     }.joinToString(" · ")
     Text(meta, style = MiuixTheme.textStyles.footnote1, color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
     Row(verticalAlignment = Alignment.CenterVertically) {
-      if (release.notes.isNotBlank()) TextButton(text = "查看更新说明", onClick = onShowNotes)
-      TextButton(
+      if (release.notes.isNotBlank()) HyperTextAction(text = "查看更新说明", onClick = onShowNotes)
+      HyperTextAction(
         text = "重新检查",
         enabled = update.phase != AppUpdatePhase.CHECKING && update.phase != AppUpdatePhase.DOWNLOADING,
         onClick = onRetryCheck
@@ -969,7 +938,7 @@ private fun UpdateControls(
     }
     if (failure != null) {
       Text(
-        (if (update.phase == AppUpdatePhase.READY) "检查更新失败：" else "") + failure.userMessage(update.failureDetail),
+        failure.userMessage(update.failureDetail),
         style = MiuixTheme.textStyles.footnote1,
         color = if (update.phase == AppUpdatePhase.READY) MiuixColorTokens.Warning else MiuixColorTokens.Error
       )
@@ -997,7 +966,7 @@ private fun UpdateControls(
             style = MiuixTheme.textStyles.footnote1,
             color = MiuixTheme.colorScheme.onSurfaceVariantSummary
           )
-          TextButton(text = "取消", onClick = onCancel)
+          HyperTextAction(text = "取消下载", onClick = onCancel)
         }
       }
       AppUpdatePhase.READY -> {
@@ -1006,24 +975,21 @@ private fun UpdateControls(
           style = MiuixTheme.textStyles.footnote1,
           color = if (installAllowed) MiuixColorTokens.Success else MiuixColorTokens.Warning
         )
-        TextButton(
+        HyperButton(
           text = if (installAllowed) "安装更新" else "允许后安装",
           onClick = onInstall,
-          modifier = Modifier.fillMaxWidth(),
-          colors = ButtonDefaults.textButtonColorsPrimary()
+          modifier = Modifier.fillMaxWidth()
         )
       }
-      AppUpdatePhase.FAILED -> TextButton(
+      AppUpdatePhase.FAILED -> HyperButton(
         text = "重新下载",
         onClick = onDownload,
-        modifier = Modifier.fillMaxWidth(),
-        colors = ButtonDefaults.textButtonColorsPrimary()
+        modifier = Modifier.fillMaxWidth()
       )
-      else -> TextButton(
+      else -> HyperButton(
         text = "下载并安装",
         onClick = onDownload,
-        modifier = Modifier.fillMaxWidth(),
-        colors = ButtonDefaults.textButtonColorsPrimary()
+        modifier = Modifier.fillMaxWidth()
       )
     }
   }

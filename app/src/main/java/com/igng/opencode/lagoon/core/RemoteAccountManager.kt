@@ -49,6 +49,13 @@ internal class RemoteAccountManager(
 
   suspend fun providers(): List<RemoteOAuthProvider> = api.oauthProviders()
 
+  /** Restores account metadata only; refresh still requires the saved per-device credential. */
+  fun resume(catalog: RemoteCatalog) {
+    require(canonicalRemoteOrigin(catalog.origin) == origin) { "中枢地址不匹配" }
+    account = catalog.account
+    provider = catalog.provider
+  }
+
   suspend fun beginBrowserLogin(source: RemoteOAuthProvider): RemoteBrowserLogin = api.startQrLogin(source)
 
   suspend fun pollBrowserLogin(login: RemoteBrowserLogin): RemoteQrPoll = api.pollQrLogin(login.qrId)
@@ -106,7 +113,7 @@ internal class RemoteAccountManager(
         failures[candidate.hostId] = userFacingError(error, "接入主机失败")
       }
     }
-    val catalog = RemoteCatalog(origin, name, provider, deviceLabel, catalogHosts, System.currentTimeMillis())
+    val catalog = RemoteCatalog(origin, name, provider, deviceLabel, catalogHosts, System.currentTimeMillis(), allowCleartext)
     catalogs.save(catalog)
     accountToken = null
     this.account = name

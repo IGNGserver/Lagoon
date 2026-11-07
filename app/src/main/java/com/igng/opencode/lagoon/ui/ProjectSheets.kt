@@ -121,9 +121,7 @@ private fun GroupScopeRow(
       onClick = onSelect,
       trailing = {
         if (selected) Icon(MiuixIcons.Ok, "已选择", Modifier.size(20.dp), tint = HyperTheme.colors.primary)
-        IconButton(onClick = onEdit, minWidth = 36.dp, minHeight = 36.dp) {
-          Icon(MiuixIcons.More, "编辑分组", Modifier.size(18.dp), tint = HyperTheme.colors.textSecondary)
-        }
+        CircleIconButton(MiuixIcons.More, "编辑分组", onEdit)
       }
     )
   }
@@ -250,9 +248,7 @@ private fun ProjectChoiceRow(project: Project, summary: String, selected: Boolea
       trailing = {
         if (selected) Icon(MiuixIcons.Ok, "已选择", Modifier.size(20.dp), tint = HyperTheme.colors.primary)
         onRemove?.let {
-          IconButton(onClick = { menu = true }, minWidth = 36.dp, minHeight = 36.dp) {
-            Icon(MiuixIcons.More, "项目操作", Modifier.size(18.dp), tint = HyperTheme.colors.textSecondary)
-          }
+          CircleIconButton(MiuixIcons.More, "项目操作", onClick = { menu = true })
         }
       }
     )
@@ -299,7 +295,7 @@ internal fun DirectoryBrowserSheet(state: LagoonState, controller: LagoonControl
       Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
         crumbs.forEachIndexed { index, (label, target) ->
           if (index > 0) Text("/", Modifier.padding(horizontal = 4.dp), style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary))
-          Text(label.ifBlank { "/" }, Modifier.clickable { controller.browseDirectory(target) },
+          Text(label.ifBlank { "/" }, Modifier.heightIn(min = 48.dp).clickable { controller.browseDirectory(target) }.wrapContentHeight(Alignment.CenterVertically),
             style = MiuixTheme.textStyles.footnote2.copy(
               fontWeight = if (index == crumbs.lastIndex) FontWeight.SemiBold else FontWeight.Normal,
               color = if (index == crumbs.lastIndex) HyperTheme.colors.primary else HyperTheme.colors.textSecondary

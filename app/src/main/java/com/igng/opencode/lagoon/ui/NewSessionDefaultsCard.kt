@@ -15,7 +15,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import com.igng.opencode.lagoon.core.*
 import top.yukonga.miuix.kmp.basic.HorizontalDivider
-import top.yukonga.miuix.kmp.basic.TextButton
 
 private data class PickerOption(val label: String, val summary: String? = null)
 
@@ -140,9 +139,10 @@ internal fun NewSessionDefaultsCard(state: LagoonState, controller: LagoonContro
         summary = "只影响这台手机新建的会话；已有会话保持原设置。服务器不再提供的预设或模型会在发送前自动回退。"
       )
       if (connected && (!agentKnown || !catalogKnown)) {
-        TextButton(
-          text = if (state.resource("models").state == ResourceState.LOADING) "正在读取…" else "重新读取模型目录",
-          enabled = state.resource("models").state != ResourceState.LOADING,
+        HyperButton(
+          text = "重新读取模型目录",
+          variant = HyperButtonVariant.SECONDARY,
+          loading = state.resource("models").state == ResourceState.LOADING,
           onClick = { controller.loadDefaultCatalog(force = true) },
           modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp)
         )
@@ -167,17 +167,32 @@ private fun SettingsPickerRow(
     title = title,
     summary = summary,
     value = selected,
-    showChevron = true,
+    trailing = { DropdownChevron() },
     enabled = enabled && options.size > 1,
     onClick = { if (enabled && options.size > 1) open = true }
   )
   if (open) {
+    var query by remember(open) { mutableStateOf("") }
+    val filtered = options.withIndex().filter { indexed ->
+      query.isBlank() || indexed.value.label.contains(query.trim(), true) || indexed.value.summary?.contains(query.trim(), true) == true
+    }
     HyperBottomSheet(title = title, show = true, onDismissRequest = { open = false }) {
       LazyColumn(
         Modifier.fillMaxWidth().heightIn(max = 560.dp),
         contentPadding = PaddingValues(bottom = 16.dp)
       ) {
-        itemsIndexed(options) { index, option ->
+        if (options.size > 8) item {
+          top.yukonga.miuix.kmp.basic.TextField(
+            value = query,
+            onValueChange = { query = it },
+            label = "搜索选项",
+            useLabelAsPlaceholder = true,
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)
+          )
+        }
+        itemsIndexed(filtered) { _, indexed ->
+          val index = indexed.index
+          val option = indexed.value
           ChoiceRow(
             title = option.label,
             summary = listOfNotNull(option.summary, if (index == selectedIndex) "当前选择" else null)

@@ -1,6 +1,7 @@
 package com.igng.opencode.lagoon.ui
 
 import android.graphics.BitmapFactory
+import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
@@ -27,8 +28,11 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.*
 import androidx.compose.ui.text.font.*
 import androidx.compose.ui.text.style.TextDecoration
@@ -172,8 +176,7 @@ internal fun Conversation(state: LagoonState, controller: LagoonController, modi
       // the newest line is not hidden under it (the reversed list keeps the bottom anchored when this changes).
       contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 12.dp, bottom = if (task?.active == true) 60.dp else 12.dp),
       verticalArrangement = Arrangement.spacedBy(10.dp)) {
-      items(questions.asReversed(), key = { "question:${it.id}" }) { MiuixQuestionCard(it, controller, state.pending("question:${it.id}")) }
-      items(permissions.asReversed(), key = { "permission:${it.id}" }) { MiuixPermissionCard(it, controller, state.pending("permission:${it.id}"), onModal) }
+      // Active requests have one owner: the persistent review dock below the transcript.
       items(mainRows.asReversed(), key = { it.key }, contentType = { it.kind }) { row ->
         TranscriptRowView(row, onFile, onOpenChild, onActivityGroup, onQueuedAction)
       }
@@ -189,11 +192,16 @@ internal fun Conversation(state: LagoonState, controller: LagoonController, modi
     Column(Modifier.align(Alignment.BottomCenter).padding(bottom = 16.dp),
       horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(8.dp)) {
       AnimatedVisibility(!atBottom && rows.isNotEmpty()) {
-        Box(Modifier.size(38.dp).clip(miuixSquircleShape(19.dp)).background(HyperTheme.colors.cardElevated)
-          .border(0.6.dp, HyperTheme.colors.cardBorder, miuixSquircleShape(19.dp))
-          .hyperPress(scaleDown = 0.92f) { follow = true; newContent = false; scope.launch { list.scrollToItem(0) } }, contentAlignment = Alignment.Center) {
-          DropdownChevron(18.dp, tint = if (newContent) HyperTheme.colors.primary else HyperTheme.colors.textSecondary,
-            description = if (newContent) "有新消息，回到最新" else "回到底部")
+        Box(
+          Modifier.size(48.dp)
+            .hyperPress(scaleDown = 0.92f) { follow = true; newContent = false; scope.launch { list.scrollToItem(0) } }
+            .semantics { contentDescription = if (newContent) "有新消息，回到最新" else "回到底部" },
+          contentAlignment = Alignment.Center
+        ) {
+          Box(Modifier.size(40.dp).clip(miuixSquircleShape(20.dp)).background(HyperTheme.colors.cardElevated)
+            .border(0.6.dp, HyperTheme.colors.cardBorder, miuixSquircleShape(20.dp)), contentAlignment = Alignment.Center) {
+            DropdownChevron(18.dp, tint = if (newContent) HyperTheme.colors.primary else HyperTheme.colors.textSecondary)
+          }
         }
       }
       if (task?.active == true || activity?.hasActive == true) {
@@ -242,7 +250,7 @@ private fun WorkingIndicator(task: TaskState?, activity: SessionActivity?, onOpe
       .clip(miuixSquircleShape(16.dp))
       .background(HyperTheme.colors.cardElevated)
       .border(0.6.dp, HyperTheme.colors.cardBorder, miuixSquircleShape(16.dp))
-      .then(if (activityParts.isNotEmpty()) Modifier.hyperPress(scaleDown = 0.96f, onClick = onOpenActivity) else Modifier)
+      .then(if (activityParts.isNotEmpty()) Modifier.heightIn(min = HYPER_TOUCH_TARGET_DP.dp).hyperPress(scaleDown = 0.96f, onClick = onOpenActivity) else Modifier)
       .padding(horizontal = 14.dp, vertical = 7.dp),
     verticalAlignment = Alignment.CenterVertically
   ) {
@@ -278,9 +286,11 @@ private fun TranscriptRowView(row: TranscriptRow, onFile: (String) -> Unit, onOp
     "meta" -> Row(Modifier.fillMaxWidth().padding(top = 2.dp), verticalAlignment = Alignment.CenterVertically) {
       row.copyText?.let { text ->
         val clipboard = LocalClipboardManager.current
-        IconButton(onClick = { clipboard.setText(AnnotatedString(text)) }, minWidth = 40.dp, minHeight = 40.dp) {
-          Icon(MiuixIcons.Copy, "复制回复", Modifier.size(18.dp), tint = MiuixTheme.colorScheme.onSurfaceVariantSummary)
-        }
+        val context = LocalContext.current
+        CircleIconButton(MiuixIcons.Copy, "复制回复", onClick = {
+          clipboard.setText(AnnotatedString(text))
+          Toast.makeText(context, "已复制回复", Toast.LENGTH_SHORT).show()
+        })
         Spacer(Modifier.width(6.dp))
       }
       if (row.meta.isNotBlank()) Text(row.meta, modifier = Modifier.weight(1f), style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
@@ -293,11 +303,11 @@ private fun TranscriptRowView(row: TranscriptRow, onFile: (String) -> Unit, onOp
     "note" -> NoticeRow(row, onOpenChild)
     "tool" -> Column {
       GroupRow(row) { onActivityGroup(row) }
-      row.target?.let { child -> TextButton(text = "打开子会话 ›", onClick = { onOpenChild(child) }, modifier = Modifier.padding(start = 16.dp)) }
+      row.target?.let { child -> HyperTextAction(text = "打开子会话", onClick = { onOpenChild(child) }, modifier = Modifier.padding(start = 16.dp)) }
     }
     "tool-group" -> Column {
       QoderSummaryRow(row) { onActivityGroup(row) }
-      row.target?.let { child -> TextButton(text = "打开子会话 ›", onClick = { onOpenChild(child) }, modifier = Modifier.padding(start = 16.dp)) }
+      row.target?.let { child -> HyperTextAction(text = "打开子会话", onClick = { onOpenChild(child) }, modifier = Modifier.padding(start = 16.dp)) }
     }
     "process-output" -> SelectionContainer { Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) { parsed(row.key, row.text).forEach { block -> MarkdownBlockView(block, selectable = false) } } }
     "reasoning-body" -> SelectionContainer { Column(Modifier.fillMaxWidth().padding(start = 24.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) { parsed(row.key, row.text).forEach { block -> MarkdownBlockView(block, subdued = true, selectable = false) } } }
@@ -350,7 +360,7 @@ private fun UserMessageRow(row: TranscriptRow, onFile: (String) -> Unit, onQueue
       if (row.meta.isNotBlank()) Text(row.meta, style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary))
       if (row.status == "queued") {
         Spacer(Modifier.width(8.dp))
-        TextButton(text = "操作", onClick = { onQueuedAction(row) })
+        HyperTextAction(text = "操作", onClick = { onQueuedAction(row) })
       }
     }
   }
@@ -367,6 +377,7 @@ private fun GroupRow(row: TranscriptRow, onClick: () -> Unit) {
       .clip(shape)
       .background(HyperTheme.colors.cardElevated, shape)
       .border(0.6.dp, HyperTheme.colors.cardBorder, shape)
+      .heightIn(min = 48.dp)
       .hyperPress(onClick = onClick)
       .padding(horizontal = 14.dp, vertical = 11.dp),
     verticalAlignment = Alignment.CenterVertically
@@ -380,7 +391,7 @@ private fun GroupRow(row: TranscriptRow, onClick: () -> Unit) {
     }
     if (row.status == "unverified") { UnverifiedStatus(); Spacer(Modifier.width(8.dp)) }
     if (running) { InfiniteProgressIndicator(color = HyperTheme.colors.primary, size = 15.dp, strokeWidth = 1.5.dp); Spacer(Modifier.width(8.dp)) }
-    QoderIcon(QoderGlyph.CHEVRON, Modifier.size(16.dp), HyperTheme.colors.textTertiary)
+    DropdownChevron(16.dp, tint = HyperTheme.colors.textTertiary)
   }
 }
 
@@ -395,6 +406,7 @@ private fun QoderSummaryRow(row: TranscriptRow, onClick: () -> Unit) {
       .clip(shape)
       .background(HyperTheme.colors.cardElevated, shape)
       .border(0.6.dp, if (error) HyperTheme.colors.error.copy(alpha = 0.35f) else HyperTheme.colors.cardBorder, shape)
+      .heightIn(min = 48.dp)
       .hyperPress(onClick = onClick)
       .padding(horizontal = 14.dp, vertical = 12.dp),
     verticalAlignment = Alignment.CenterVertically
@@ -411,7 +423,7 @@ private fun QoderSummaryRow(row: TranscriptRow, onClick: () -> Unit) {
     }
     if (row.status == "unverified") { UnverifiedStatus(); Spacer(Modifier.width(8.dp)) }
     if (running) { InfiniteProgressIndicator(color = HyperLagoonColors.successColor, size = 16.dp, strokeWidth = 1.5.dp); Spacer(Modifier.width(8.dp)) }
-    QoderIcon(QoderGlyph.CHEVRON, Modifier.size(16.dp), HyperTheme.colors.textTertiary)
+    DropdownChevron(16.dp, tint = HyperTheme.colors.textTertiary)
   }
 }
 
@@ -429,6 +441,7 @@ internal fun QoderActivityItem(
     Row(
       Modifier.fillMaxWidth()
         .height(IntrinsicSize.Min)
+        .heightIn(min = 48.dp)
         .then(if (clickable) Modifier.clickable { onOpenActivity(header) } else Modifier),
       verticalAlignment = Alignment.Top
     ) {
@@ -503,12 +516,14 @@ internal fun DetailMarkdown(text: String) {
 @Composable
 internal fun DetailCode(title: String, text: String, readContent: Boolean = false, copyText: String? = null) {
   val clipboard = LocalClipboardManager.current
+  val context = LocalContext.current
   Column(Modifier.fillMaxWidth()) {
     if (title.isNotBlank()) Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
       Text(title, Modifier.weight(1f), style = MiuixTheme.textStyles.body2.copy(fontWeight = FontWeight.Medium))
-      if (copyText != null) IconButton(onClick = { clipboard.setText(AnnotatedString(copyText)) }, minWidth = 40.dp, minHeight = 40.dp) {
-        Icon(MiuixIcons.Copy, "复制$title", Modifier.size(16.dp), tint = MiuixTheme.colorScheme.onSurfaceVariantSummary)
-      }
+      if (copyText != null) CircleIconButton(MiuixIcons.Copy, "复制$title", onClick = {
+        clipboard.setText(AnnotatedString(copyText))
+        Toast.makeText(context, "已复制$title", Toast.LENGTH_SHORT).show()
+      })
     }
     Spacer(Modifier.height(4.dp))
     CodePanel(text, background = if (readContent) HyperLagoonColors.readContent else HyperLagoonColors.codeColor)
@@ -571,14 +586,16 @@ private fun NoticeRow(row: TranscriptRow, onOpenChild: (String) -> Unit) {
     else -> MiuixTheme.colorScheme.onSurfaceVariantSummary
   }
   val target = row.target
-  Row(Modifier.fillMaxWidth().then(if (target != null) Modifier.clickable { onOpenChild(target) } else Modifier).padding(horizontal = 10.dp, vertical = 4.dp),
+  Row(Modifier.fillMaxWidth()
+    .then(if (target != null) Modifier.heightIn(min = 48.dp).clickable { onOpenChild(target) } else Modifier)
+    .padding(horizontal = 10.dp, vertical = 4.dp),
     verticalAlignment = Alignment.CenterVertically) {
     Text(row.title, style = MiuixTheme.textStyles.footnote1.copy(fontWeight = FontWeight.Medium, color = color))
     if (row.text.isNotBlank()) {
       Spacer(Modifier.width(8.dp))
       Text(row.text, modifier = Modifier.weight(1f), maxLines = 2, overflow = TextOverflow.Ellipsis, style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
     } else Spacer(Modifier.weight(1f))
-    if (target != null) Text("›", style = MiuixTheme.textStyles.body1.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
+    if (target != null) ForwardChevron(16.dp, tint = MiuixTheme.colorScheme.onSurfaceVariantSummary)
   }
 }
 
@@ -665,9 +682,9 @@ private fun ThinkingRow(text: String) {
 internal fun ResourceHint(status: ResourceStatus, empty: String, explanation: String = "", retry: () -> Unit) {
   when (status.state) {
     ResourceState.LOADING, ResourceState.NOT_LOADED -> LoadingSkeleton()
-    ResourceState.ERROR -> Column { Text(status.error ?: "加载失败", color = MiuixColorTokens.Error); TextButton(text = "重试", onClick = retry) }
+    ResourceState.ERROR -> HyperInlineNotice(status.error ?: "加载失败", type = MiuixToastType.ERROR, action = "重试", onAction = retry)
     ResourceState.UNSUPPORTED -> Text("此服务器不提供该功能", style = MiuixTheme.textStyles.footnote1)
-    ResourceState.STALE -> Column { Text("保留上次数据 · ${status.error.orEmpty()}", color = MiuixColorTokens.Warning); TextButton(text = "重新同步", onClick = retry) }
+    ResourceState.STALE -> HyperInlineNotice("保留上次数据 · ${status.error.orEmpty()}", type = MiuixToastType.WARNING, action = "重新同步", onAction = retry)
     ResourceState.EMPTY -> Column { Text(empty, style = MiuixTheme.textStyles.headline2); if (explanation.isNotBlank()) Text(explanation, style = MiuixTheme.textStyles.footnote1) }
     else -> Unit
   }
@@ -759,6 +776,7 @@ internal fun MarkdownBlockView(block: MarkdownBlock, subdued: Boolean = false, s
   val quote = block.prefix.trimStart().startsWith(">")
   val displayPrefix = if (quote) block.prefix.trimStart().trimStart('>').trimStart() else block.prefix
   val clipboard = LocalClipboardManager.current
+  val context = LocalContext.current
   val content: @Composable () -> Unit = {
     when (block.kind) {
       "rule" -> HorizontalDivider(color = HyperTheme.colors.divider)
@@ -786,17 +804,10 @@ internal fun MarkdownBlockView(block: MarkdownBlock, subdued: Boolean = false, s
               )
             )
             block.copyText?.let { copyable ->
-              Row(
-                Modifier
-                  .clip(miuixSquircleShape(8.dp))
-                  .hyperPress(scaleDown = 0.94f) { clipboard.setText(AnnotatedString(copyable)) }
-                  .padding(horizontal = 6.dp, vertical = 2.dp),
-                verticalAlignment = Alignment.CenterVertically
-              ) {
-                Icon(MiuixIcons.Copy, "复制代码", Modifier.size(14.dp), tint = HyperTheme.colors.textSecondary)
-                Spacer(Modifier.width(4.dp))
-                Text("复制", style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary))
-              }
+              CircleIconButton(MiuixIcons.Copy, "复制代码", onClick = {
+                clipboard.setText(AnnotatedString(copyable))
+                Toast.makeText(context, "已复制代码", Toast.LENGTH_SHORT).show()
+              })
             }
           }
           HorizontalDivider(color = HyperTheme.colors.codeBorder)
@@ -947,9 +958,19 @@ internal fun AttachmentView(attachment: Attachment, onFile: (String) -> Unit) {
       if (image != null) Image(image, description, Modifier.fillMaxWidth().height(height))
       else Box(Modifier.fillMaxWidth().height(height).background(MiuixTheme.colorScheme.secondaryContainer, miuixSquircleShape(10.dp)))
     } else image?.let { Image(it, description, Modifier.fillMaxWidth().heightIn(max = 280.dp)) }
-    TextButton(text = attachment.name.ifBlank { if (dataImage) "图片附件" else attachment.url.substringAfterLast('/').take(100).ifBlank { "附件" } }, onClick = {
-      when { attachment.url.startsWith("http://") || attachment.url.startsWith("https://") -> runCatching { uriHandler.openUri(attachment.url) }
-        !attachment.url.startsWith("data:") -> onFile(runCatching { java.net.URI(attachment.url).path }.getOrNull() ?: attachment.url) }
-    })
+    val label = attachment.name.ifBlank { if (dataImage) "图片附件" else attachment.url.substringAfterLast('/').take(100).ifBlank { "附件" } }
+    if (attachmentCanOpen(attachment.url)) {
+      HyperTextAction(text = label, modifier = Modifier.fillMaxWidth(), onClick = {
+        val url = attachment.url.trim()
+        when {
+          url.startsWith("http://", true) || url.startsWith("https://", true) ->
+            runCatching { uriHandler.openUri(url) }
+          else -> onFile(runCatching { java.net.URI(url).path }.getOrNull() ?: url)
+        }
+      })
+    } else {
+      Text(label, Modifier.fillMaxWidth().padding(vertical = 8.dp),
+        style = MiuixTheme.textStyles.footnote1.copy(color = HyperTheme.colors.textSecondary))
+    }
   }
 }

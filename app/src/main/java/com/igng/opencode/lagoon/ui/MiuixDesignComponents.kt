@@ -18,9 +18,7 @@ import com.igng.opencode.lagoon.core.TaskState
 import com.kyant.shapes.RoundedCornerStyle
 import com.kyant.shapes.RoundedRectangle
 import com.kyant.shapes.UnevenRoundedRectangle
-import top.yukonga.miuix.kmp.basic.ButtonDefaults
 import top.yukonga.miuix.kmp.basic.Text
-import top.yukonga.miuix.kmp.basic.TextButton
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 
 /**
@@ -163,11 +161,7 @@ fun MiuixSectionHeader(
       )
     }
     if (action != null && onAction != null) {
-      TextButton(
-        text = action,
-        onClick = onAction,
-        colors = ButtonDefaults.textButtonColorsPrimary()
-      )
+      HyperTextAction(text = action, onClick = onAction)
     }
   }
 }

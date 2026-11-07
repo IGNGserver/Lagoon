@@ -85,27 +85,3 @@ internal fun QoderIcon(glyph: QoderGlyph, modifier: Modifier = Modifier.size(22.
     }
   }
 }
-
-@Composable
-internal fun QoderCircleButton(
-  glyph: QoderGlyph,
-  description: String,
-  onClick: () -> Unit,
-  modifier: Modifier = Modifier,
-  background: Color = HyperTheme.colors.container,
-  foreground: Color = MiuixTheme.colorScheme.onSurface,
-  enabled: Boolean = true
-) {
-  Box(
-    modifier
-      .size(40.dp)
-      .clip(CircleShape)
-      .background(background, CircleShape)
-      .then(if (background.alpha > 0f) Modifier.border(0.5.dp, HyperTheme.colors.cardBorder, CircleShape) else Modifier)
-      .hyperPress(enabled = enabled, scaleDown = 0.92f, onClick = onClick)
-      .semantics { contentDescription = description },
-    contentAlignment = Alignment.Center
-  ) {
-    QoderIcon(glyph, Modifier.size(20.dp), color = if (enabled) foreground else foreground.copy(alpha = 0.4f))
-  }
-}
