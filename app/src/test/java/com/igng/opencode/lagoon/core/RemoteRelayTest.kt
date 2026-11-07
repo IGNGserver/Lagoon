@@ -18,6 +18,21 @@ import java.util.UUID
 
 class RemoteRelayTest {
 
+  @Test fun longLivedSocketsUseTheStreamingDispatcherAndWebSocketHeartbeat() {
+    val client = RemoteIdentity.generate()
+    val host = RemoteIdentity.generate()
+    val relay = RemoteRelay("http://127.0.0.1", client, "device-access-token-123", host.deviceId, host.publicKey, true, {}, {})
+    try {
+      val field = RemoteRelay::class.java.getDeclaredField("http").apply { isAccessible = true }
+      val http = field.get(relay) as okhttp3.OkHttpClient
+      assertSame("finite RPC and long-lived sockets must not share the bounded HTTP dispatcher",
+        SharedHttp.streamDispatcher, http.dispatcher)
+      assertEquals(20_000, http.pingIntervalMillis)
+      assertEquals(0, http.readTimeoutMillis)
+      assertFalse(http.retryOnConnectionFailure)
+    } finally { relay.close() }
+  }
+
   /** `hello` must advertise the app version and only capabilities we can actually serve. */
   @Test fun helloCarriesClientVersionAndAcceptsNegotiatedSubset() = runBlocking {
     val client = RemoteIdentity.generate()

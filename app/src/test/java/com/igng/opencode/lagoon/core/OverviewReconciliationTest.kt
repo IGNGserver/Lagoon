@@ -1,5 +1,6 @@
 package com.igng.opencode.lagoon.core
 
+import java.lang.reflect.Proxy
 import kotlin.coroutines.Continuation
 import kotlin.coroutines.intrinsics.COROUTINE_SUSPENDED
 import kotlin.coroutines.resume
@@ -222,4 +223,68 @@ class OverviewReconciliationTest {
       }
     }
   }
+
+  @Test fun staleCollectorCleanupCannotUnregisterTheReplacementMonitor() = runBlocking {
+    val store = ServerStore(memoryPreferences(), memoryPreferences(), { it }, { it })
+    val profile = ServerProfile("a", "A", "http://127.0.0.1", allowCleartext = true, kind = ServerKind.DSH, sshHostId = "ssh")
+    store.save(profile, password = "secret")
+    val firstStarted = CompletableDeferred<Unit>()
+    val firstCleaning = CompletableDeferred<Unit>()
+    val releaseFirst = CompletableDeferred<Unit>()
+    val secondStarted = CompletableDeferred<Unit>()
+    val secondCancelled = CompletableDeferred<Unit>()
+    val generation = java.util.concurrent.atomic.AtomicInteger()
+    fun client(): HarnessClient {
+      val number = generation.incrementAndGet()
+      var closed = false
+      return Proxy.newProxyInstance(javaClass.classLoader, arrayOf(HarnessClient::class.java)) { _, method, args ->
+        when (method.name) {
+          "capabilities", "discoverCapabilities" -> ApiCapabilities()
+          "health" -> "test"
+          "projects", "projectsForDisplay", "shells", "pendingPermissions", "forms", "sessionPermissions", "inbox" -> emptyList<Any>()
+          "rootSessionsPage" -> ApiPage<Session>(emptyList(), null)
+          "activeSessions" -> emptySet<String>()
+          "isClosed" -> closed
+          "close" -> { closed = true; null }
+          "setContentWatching", "transportStatus", "workspaceUpdates" -> null
+          "events" -> {
+            @Suppress("UNCHECKED_CAST") val onOpen = args[0] as () -> Unit
+            kotlinx.coroutines.flow.flow<ServerEvent> {
+              onOpen()
+              if (number == 1) {
+                firstStarted.complete(Unit)
+                try { awaitCancellation() } finally {
+                  withContext(NonCancellable) { firstCleaning.complete(Unit); releaseFirst.await() }
+                }
+              } else {
+                secondStarted.complete(Unit)
+                try { awaitCancellation() } finally { secondCancelled.complete(Unit) }
+              }
+            }
+          }
+          "toString" -> "fake-$number"
+          "hashCode" -> System.identityHashCode(this)
+          "equals" -> false
+          else -> throw UnsupportedOperationException(method.name)
+        }
+      } as HarnessClient
+    }
+    val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    val overview = AllServersOverview(store, OfflineCache(memoryPreferences(), { it }, { it }), scope, {},
+      sshClientFactory = { _, _ -> client() })
+    try {
+      overview.start(listOf(profile))
+      withTimeout(5_000) { firstStarted.await() }
+      overview.start(listOf(profile.copy(url = "http://127.0.0.2")))
+      withTimeout(5_000) { secondStarted.await(); firstCleaning.await() }
+      releaseFirst.complete(Unit)
+      delay(200)
+      assertFalse("old cleanup must not cancel the replacement stream", secondCancelled.isCompleted)
+    } finally {
+      releaseFirst.complete(Unit)
+      overview.stop()
+      scope.cancel()
+    }
+  }
+
 }

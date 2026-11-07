@@ -3899,23 +3899,33 @@ class LagoonController private constructor(private val appContext: Context) {
    */
   fun send(text: String, expectedServer: String? = state.value.serverId, expectedSession: String? = state.value.sessionId, accepted: (() -> Unit)? = null): Job =
     deliver(text, expectedServer, expectedSession, accepted, onFailed = null)
-  /** [send] with [onFailed] run when the server refuses the prompt (a held prompt then returns to the draft). */
-  private fun deliver(text: String, expectedServer: String?, expectedSession: String?, accepted: (() -> Unit)?, onFailed: (suspend () -> Unit)?): Job {
+  /** [send] with [onFailed]: `true` means delivery is unknown and must not be replayed automatically. */
+  private fun deliver(text: String, expectedServer: String?, expectedSession: String?, accepted: (() -> Unit)?,
+    onFailed: (suspend (deliveryUnknown: Boolean) -> Unit)?): Job {
     if (state.value.serverId != expectedServer || state.value.sessionId != expectedSession) {
-      // 静默丢弃会让用户以为已经发出；明确提示并要求重试。
+      // 静默丢弃会让用户以为已经发出；明确提示并恢复尚未进入请求的内容。
       updateState { it.copy(error = "当前会话已切换，消息未发送，请重试") }
-      return operationScope.launch { }
+      return operationScope.launch { onFailed?.invoke(false) }
     }
     if (state.value.canQueueSend) {
       queuePrompt(text, accepted)
       return operationScope.launch { }
     }
-    return act("send") { op ->
+    var admissionStarted = false
+    var admitted = false
+    return act("send", onError = { error ->
+      // Content must never disappear before admission. Report whether a transport/parse/cancellation
+      // failure leaves the outcome unknown; callbacks restore a manual draft, never an automatic replay.
+      if (!admitted) onFailed?.invoke(admissionStarted && error !is ApiException)
+    }) { op ->
     val attachments = op.snapshot.attachments
     check(text.isNotBlank() || op.snapshot.references.isNotEmpty() || attachments.isNotEmpty()) { "请输入任务" }
     val session = op.snapshot.session ?: error("先打开会话")
     sendMutex.withLock {
-      if (!op.isCurrent(this)) return@act
+      if (!op.isCurrent(this)) {
+        onFailed?.invoke(false)
+        return@act
+      }
       val command = if (text.startsWith('/')) op.snapshot.commands.firstOrNull { text.substringAfter('/').substringBefore(' ') == it.name } else null
       val agent = op.snapshot.agent.takeIf { op.snapshot.agentChanged }
       val model = op.snapshot.model.takeIf { op.snapshot.modelChanged }
@@ -3924,11 +3934,15 @@ class LagoonController private constructor(private val appContext: Context) {
       if (command == null && text.isNotBlank()) op.commit { it.copy(messages = it.messages + Message(id, "user", System.currentTimeMillis(),
         listOf(MessagePart("$id:text", "text", text = text)), agent = agent, model = model, type = "user")) }
       try {
+        admissionStarted = true
         if (command != null) op.client.command(session, command.name, text.substringAfter(' ', ""), agent, model, op.snapshot.references, inline)
         else op.client.send(session, text, agent, model, op.snapshot.references, inline, id)
+        admitted = true
+      } catch (cancel: CancellationException) {
+        op.commit { it.copy(messages = it.messages.filterNot { message -> message.id == id }) }
+        throw cancel
       } catch (error: Exception) {
         op.commit { it.copy(messages = it.messages.filterNot { message -> message.id == id }) }
-        onFailed?.invoke()
         throw error
       }
       // 首条 prompt 已被接受：这个会话不再是服务端草稿。即使随后到达的列表/事件还带旧的
@@ -4123,14 +4137,18 @@ class LagoonController private constructor(private val appContext: Context) {
   private fun isInlineScopedAction(action: String): Boolean =
     action in setOf("send", "create", "delete", "rename", "schedules", "goal", "child-prompt", "queue")
 
-  private fun act(action: String = "", directory: String? = null, surfaceError: Boolean = !isInlineScopedAction(action), block: suspend (OperationContext) -> Unit): Job {
+  private fun act(action: String = "", directory: String? = null, surfaceError: Boolean = !isInlineScopedAction(action),
+    onError: (suspend (Throwable) -> Unit)? = null, block: suspend (OperationContext) -> Unit): Job {
     val captured = attempt { beginOperation(directory) }
     val key = action.takeIf { it.isNotBlank() }?.let { operationKey(state.value.serverId, state.value.sessionId, state.value.projectId, it) }
-    if (key != null && key in state.value.pendingOperations) return operationScope.launch { }
+    if (key != null && key in state.value.pendingOperations) return operationScope.launch {
+      onError?.invoke(IllegalStateException("相同操作仍在进行，本次提交未发送到服务器"))
+    }
     if (key != null) updateState { it.copy(pendingOperations = it.pendingOperations + key,
       resources = it.resources + ("action:$action" to ResourceStatus(ResourceState.LOADING))) }
     return operationScope.launch {
       val op = captured.getOrElse { error ->
+        onError?.invoke(error)
         val text = userFacingError(error)
         updateState {
           it.copy(
@@ -4146,7 +4164,12 @@ class LagoonController private constructor(private val appContext: Context) {
         if (key != null && op.isCurrent(this@LagoonController)) updateState {
           it.copy(resources = it.resources + ("action:$action" to ResourceStatus(ResourceState.READY)))
         }
-      } catch (cancel: CancellationException) { throw cancel } catch (error: Exception) {
+      } catch (error: Exception) {
+        if (error is CancellationException) {
+          kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable) { onError?.invoke(error) }
+          throw error
+        }
+        onError?.invoke(error)
         if (op.connectionCurrent(this@LagoonController)) {
           // Read-like actions keep their last data and show a quiet retry, like the transcript. A
           // transient relay drop must not become a global "加载失败" toast.

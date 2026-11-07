@@ -251,13 +251,23 @@ private class JschSshTransport(private val session: Session) : SshTransport {
     }
   }
 
-  override fun ping(timeoutMillis: Long): Boolean = try {
-    if (!session.isConnected) false else {
-      session.sendKeepAliveMsg()
-      true
+  override fun ping(timeoutMillis: Long): Boolean {
+    if (!session.isConnected) return false
+    val channel = try { session.openChannel("exec") as ChannelExec } catch (_: Exception) { return false }
+    return try {
+      // JSch sendKeepAliveMsg() only writes a request and returns before any SSH response. A half-open
+      // Wi-Fi/cellular socket therefore looked healthy forever. A no-op exec requires a server round
+      // trip and has its own channel-open/command-completion deadlines.
+      channel.setCommand(":")
+      channel.connect(timeoutMillis.toInt().coerceIn(1_000, 30_000))
+      val deadline = System.nanoTime() + timeoutMillis.coerceIn(1_000, 30_000) * 1_000_000L
+      while (!channel.isClosed && System.nanoTime() < deadline) Thread.sleep(25)
+      channel.isClosed && channel.exitStatus == 0
+    } catch (_: Exception) {
+      false
+    } finally {
+      runCatching { channel.disconnect() }
     }
-  } catch (_: Exception) {
-    false
   }
 
   override fun close() {

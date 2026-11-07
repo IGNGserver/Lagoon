@@ -75,7 +75,9 @@ class DshApi(
    * SSH tunnel mode: requests go to a local forwarder, but DSH's loopback Host fence and cookie
    * audience must see the remote authority (`127.0.0.1:<remotePort>`).
    */
-  private val hostHeader: String? = null
+  private val hostHeader: String? = null,
+  /** Test seam for the logical $events handshake; production keeps the shared first-frame deadline. */
+  private val eventsReadyTimeoutMillis: Long = EVENTS_READY_TIMEOUT_MILLIS
 ) : HarnessClient, RemoteDoctorSource {
   constructor(profile: ServerProfile, password: String) : this(profile, ServerCredentials(profile.username, password))
 
@@ -184,6 +186,12 @@ class DshApi(
    * 每条 `job/list` 都是一条流；不限流会和 `$events`/`session/follow` 抢预算。
    */
   private val oneShotStreams = Semaphore(2)
+  /**
+   * 实时事件不是耐久日志，没有可供跨流去重的稳定 ID。每次实际发射都使用单调序号；
+   * 时间戳只能当消息时间，不能当身份（同毫秒可能有多个 chunk，重试的 reset 也必须重新投递）。
+   */
+  private val liveEventSequence = java.util.concurrent.atomic.AtomicLong()
+  private fun nextLiveEventId() = liveEventSequence.incrementAndGet()
   /** 实时流里已经建立文本/推理部件的 `sessionId|turn|step` 键与部件种类。 */
   private val liveParts = ConcurrentHashMap<String, MutableSet<String>>()
   /** 活跃 attempt 的 `attemptId → sessionId|turn|step`（chunk 帧不带 turn/step）。 */
@@ -781,16 +789,30 @@ class DshApi(
           .put("streamId", streamId)
           .put("endpoint", endpoint)
           .put("payload", wirePayload)
-        webSocket.send(open.toString())
+        // false 表示 OkHttp 已拒绝入队（常见原因是 socket 正在关闭）。忽略它会让上层永远等首帧。
+        if (!webSocket.send(open.toString())) finish(webSocket, IOException("mux open 帧发送失败"))
       }
 
       override fun onMessage(webSocket: WebSocket, text: String) {
-        val frame = try { JSONObject(text) } catch (error: Exception) { return }
-        if (frame.optString("streamId") != streamId) return
-        when (frame.optString("type")) {
-          "item" -> frame.optJSONObject("value")?.let(onItem) ?: onItem(JSONObject())
-          "error" -> finish(webSocket, IOException(frame.obj("error").str("message").ifBlank { "会话流出错" }))
-          "end" -> finish(webSocket, null)
+        try {
+          val frame = try { JSONObject(text) } catch (error: Exception) { throw IOException("mux 帧不是有效 JSON", error) }
+          val type = frame.str("type")
+          if (type !in setOf("item", "end", "error")) return // 前向兼容新的控制帧。
+          if (frame.str("streamId") != streamId) throw IOException("mux 流身份不匹配")
+          when (type) {
+            "item" -> {
+              val value = frame.opt("value") as? JSONObject ?: throw IOException("mux item 缺少对象载荷")
+              try { onItem(value) } catch (error: Exception) {
+                Diagnostics.warn("DshApi", "mux 事件翻译失败", error)
+                throw IOException("mux 事件翻译失败", error)
+              }
+            }
+            "error" -> finish(webSocket, IOException(frame.obj("error").str("message").ifBlank { "会话流出错" }))
+            "end" -> finish(webSocket, null)
+          }
+        } catch (error: Exception) {
+          // 坏帧可能正好包含终态或快照；静默跳过会把损坏投影当成权威状态。断开并重连对账。
+          finish(webSocket, if (error is IOException) error else IOException("mux 帧处理失败", error))
         }
       }
 
@@ -906,7 +928,9 @@ class DshApi(
     val data = event.obj("data")
     val output = mutableListOf<ServerEvent>()
     fun emit(name: String, properties: JSONObject) {
-      output += ServerEvent(id = "dsh:$seq:${output.size}", directory = session.directory, type = name, properties = properties, created = time)
+      // DSH seq 只在单个会话的日志内单调；不同会话可以同时拥有 seq=1。
+      // 全局 AllServersOverview 按 ID 去重，因此会话身份必须进入耐久事件 ID。
+      output += ServerEvent(id = "dsh:${session.id}:$seq:${output.size}", directory = session.directory, type = name, properties = properties, created = time)
     }
     val base = JSONObject().put("sessionID", session.id)
     when (type) {
@@ -934,6 +958,17 @@ class DshApi(
       "step/end" -> emit("session.step.ended", base
         .put("assistantMessageID", messageId(data))
         .put("finish", "stop"))
+      "user/message" -> {
+        // Host 也把 runtime/time/goal 等模型上下文写成 user/message。只有明确的用户来源
+        // （以及没有 source 的旧 Host）可以进入用户时间线，其他来源绝不能伪装成手机发送。
+        val kind = data.obj("source").str("kind")
+        if (kind.isBlank() || kind == "user") {
+          val id = data.str("id").ifBlank { "user:${session.id}:$seq" }
+          val text = data.arr("content").objects()
+            .mapNotNull { block -> block.str("text").takeIf(String::isNotBlank) }.joinToString("\n")
+          emit("session.user.message", base.put("messageID", id).put("text", text))
+        }
+      }
       "assistant/message" -> {
         val assistantId = messageId(data)
         val key = liveKey(session.id, data)
@@ -1037,9 +1072,9 @@ class DshApi(
         val parts = liveParts[liveKey(session.id, frame)] ?: return
         if (parts.isNotEmpty()) {
           val message = "msg_$turn:$step"
-          if ("text" in parts) push(ServerEvent(id = "dsh:live:$message:text:reset", directory = session.directory, type = "session.text.ended",
+          if ("text" in parts) push(ServerEvent(id = "dsh:live:${session.id}:${nextLiveEventId()}:text:reset", directory = session.directory, type = "session.text.ended",
             properties = JSONObject().put("sessionID", session.id).put("assistantMessageID", message).put("text", ""), created = at))
-          if ("reasoning" in parts) push(ServerEvent(id = "dsh:live:$message:reasoning:reset", directory = session.directory, type = "session.reasoning.ended",
+          if ("reasoning" in parts) push(ServerEvent(id = "dsh:live:${session.id}:${nextLiveEventId()}:reasoning:reset", directory = session.directory, type = "session.reasoning.ended",
             properties = JSONObject().put("sessionID", session.id).put("assistantMessageID", message).put("text", ""), created = at))
         }
       }
@@ -1070,15 +1105,15 @@ class DshApi(
     val first = parts.isEmpty()
     if (parts.add(kind)) {
       if (first) {
-        // 补出这条 assistant 消息（幂等）：跟随在 attempt 中途打开时也不会丢文本。
-        push(ServerEvent(id = "dsh:live:$key:step", directory = session.directory, type = "session.step.started",
+        // 补出这条 assistant 消息（投影幂等）：跟随在 attempt 中途打开时也不会丢文本。
+        push(ServerEvent(id = "dsh:live:${session.id}:${nextLiveEventId()}:step", directory = session.directory, type = "session.step.started",
           properties = JSONObject().put("sessionID", session.id).put("assistantMessageID", message).put("started", at), created = at))
       }
-      push(ServerEvent(id = "dsh:live:$key:$kind:start", directory = session.directory,
+      push(ServerEvent(id = "dsh:live:${session.id}:${nextLiveEventId()}:$kind:start", directory = session.directory,
         type = if (kind == "reasoning") "session.reasoning.started" else "session.text.started",
         properties = JSONObject().put("sessionID", session.id).put("assistantMessageID", message).put("started", at), created = at))
     }
-    push(ServerEvent(id = "dsh:live:$key:$kind:$at", directory = session.directory,
+    push(ServerEvent(id = "dsh:live:${session.id}:${nextLiveEventId()}:$kind:delta", directory = session.directory,
       type = if (kind == "reasoning") "session.reasoning.delta" else "session.text.delta",
       properties = JSONObject().put("sessionID", session.id).put("assistantMessageID", message).put("delta", text), created = at))
   }
@@ -1150,6 +1185,7 @@ class DshApi(
     var backoff = EVENTS_RETRY_MIN_MILLIS
     while (!isClosed()) {
       val ended = CompletableDeferred<Throwable?>()
+      val readySignal = CompletableDeferred<Unit>()
       var socket: WebSocket? = null
       var wasReady = false
       try {
@@ -1160,6 +1196,7 @@ class DshApi(
               eventsClientId = frame.str("clientId")
               eventsReady = true
               wasReady = true
+              readySignal.complete(Unit)
               eventsError = null
               backoff = EVENTS_RETRY_MIN_MILLIS
               flushFollowBuffers(push)
@@ -1176,6 +1213,18 @@ class DshApi(
           eventsReady = false
           ended.complete(cause)
         })
+        // TCP/TLS 建连成功不等于逻辑事件流可用。对端若一直不发 ready，必须按失败重连，
+        // 否则 connected=true 但控制事件永久停摆，且没有后续快照能补上这段空窗。
+        val readyOrClosed = kotlinx.coroutines.withTimeoutOrNull(eventsReadyTimeoutMillis) {
+          kotlinx.coroutines.selects.select<Boolean> {
+            readySignal.onAwait { true }
+            ended.onAwait { false }
+          }
+        }
+        if (readyOrClosed != true && !ended.isCompleted) {
+          ended.complete(IOException("\$events ready 超时，重新建立事件流"))
+          socket?.cancel()
+        }
         val cause = try { ended.await() } finally { socket?.cancel() }
         if (isClosed()) break
         eventsError = cause?.message?.takeIf { it.isNotBlank() } ?: "事件流已关闭"
@@ -2785,6 +2834,7 @@ class DshApi(
     const val FOLLOW_PENDING_LIMIT = 512
     const val EVENTS_RETRY_MIN_MILLIS = 1_000L
     const val EVENTS_RETRY_MAX_MILLIS = 30_000L
+    const val EVENTS_READY_TIMEOUT_MILLIS = STREAM_FIRST_FRAME_TIMEOUT_MILLIS
     const val WORKSPACE_RETRY_MIN_MILLIS = 2_000L
     const val WORKSPACE_RETRY_MAX_MILLIS = 60_000L
     /** `$events` 不可用时的状态兜底周期。 */

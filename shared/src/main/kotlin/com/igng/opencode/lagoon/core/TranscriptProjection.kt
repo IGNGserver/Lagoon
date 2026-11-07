@@ -239,6 +239,19 @@ object TranscriptProjection {
         val boundary = p.str("to")
         result(messages.filter { it.id < boundary })
       }
+      "session.user.message" -> {
+        val id = p.str("messageID")
+        if (id.isBlank()) null else {
+          val text = p.str("text")
+          val user = JSONObject().put("id", id).put("type", "user").put("text", text)
+            .put("time", JSONObject().put("created", event.created.takeIf { it > 0 } ?: System.currentTimeMillis()))
+            .put("metadata", JSONObject().put("displayText", text)).toMessage()
+          val index = messages.indexOfFirst { it.id == id }
+          if (index >= 0 && messages[index] == user) null
+          else if (index >= 0) result(messages.toMutableList().also { it[index] = user })
+          else result((messages + user).sortedBy { it.created })
+        }
+      }
       // Replay-only: older releases replaced completed assistant content wholesale.
       "session.message.content.updated" -> {
         val index = messages.indexOfFirst { it.id == p.str("messageID") && it.role == "assistant" }

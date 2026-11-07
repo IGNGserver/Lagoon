@@ -3,6 +3,7 @@ package com.igng.opencode.lagoon.core
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.async
@@ -339,9 +340,10 @@ internal class AllServersOverview(
         var retry = 1_000L
         while (isActive) {
           var restarted = false
+          var streamJob: Job? = null
           try {
             coroutineScope {
-              val stream = launch {
+              val stream = launch(start = CoroutineStart.LAZY) {
                 client.events(onOpen = {
                   scope.launch {
                     snapshot = snapshot.copy(streamConnected = true)
@@ -483,7 +485,11 @@ internal class AllServersOverview(
                   retry = 1_000L
                 }
               }
+              streamJob = stream
+              // Register before starting the collector: a network-switch restart can now never miss
+              // the tiny window between collector start and map publication.
               liveStreams[id] = stream
+              stream.start()
               stream.join()
               // A deliberate restart cancels only this collector; the monitor itself keeps running.
               restarted = stream.isCancelled
@@ -493,7 +499,8 @@ internal class AllServersOverview(
           } catch (error: Exception) {
             Diagnostics.warn("AllServers", "服务器 ${profile.name} 实时连接断开", error)
           }
-          liveStreams.remove(id)
+          // A cancelled monitor from an older client must not unregister its replacement's stream.
+          liveStreams.remove(id, streamJob)
           snapshot = snapshot.copy(streamConnected = false)
           emit(snapshot)
           if (restarted) { retry = 1_000L; continue }
