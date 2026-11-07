@@ -259,12 +259,15 @@ class PersistentConnectionsTest {
       val manager = AllServersOverview(store, cache, scope, { snapshots[it.serverId] = it })
       try {
         manager.start(listOf(profile))
-        // Wait for the snapshot that still carries the restored task ledger, not an earlier
-        // connection-only publish that has the error but no cached tasks yet.
-        awaitCondition { snapshots["a"]?.let { it.error != null && it.tasks.containsKey("s") } == true }
+        // Wait for the snapshot that carries both the cached session and the restored task ledger,
+        // not an earlier connection-only publish. The status lookup below needs the session row;
+        // waiting only for the task (as this test used to) raced the cache paint on slower runners.
+        awaitCondition { snapshots["a"]?.let {
+          it.error != null && it.tasks.containsKey("s") && it.sessions.any { session -> session.id == "s" }
+        } == true }
         val snapshot = snapshots.getValue("a")
         val detail = "connected=${snapshot.connected} error=${snapshot.error} lastReadAt=${snapshot.lastReadAt} " +
-          "tasks=${snapshot.tasks} notices=${snapshot.notices} summary=${snapshot.summary}"
+          "sessions=${snapshot.sessions.map { it.id }} tasks=${snapshot.tasks} notices=${snapshot.notices} summary=${snapshot.summary}"
         assertTrue("restored task must stay uncertain; $detail", snapshot.tasks.getValue("s").uncertain)
         assertEquals("failed cold start must not stamp a read; $detail", 0L, snapshot.lastReadAt)
         assertEquals("uncertain work must not count as running; $detail", 0, snapshot.displaySummary(PermissionPolicy()).running)
