@@ -614,92 +614,107 @@ fun SettingsScreen(
   var crashReport by remember { mutableStateOf<String?>(null) }
   LaunchedEffect(Unit) { crashReport = withContext(Dispatchers.IO) { CrashLog.read(context) } }
 
-  // MIUIX settings: white cards on the grey page surface.
-  Column(Modifier.fillMaxSize().background(MiuixTheme.colorScheme.surface)) {
+  // HyperOS 4 settings: grouped squircle island cards on the mineral canvas surface.
+  Column(Modifier.fillMaxSize().background(HyperTheme.colors.canvas)) {
   PageTopBar("设置", onBack)
-  // MIUIX settings layout: 12dp card margin + SmallTitle's 28dp inset aligns titles with row content.
   LazyColumn(
     modifier = Modifier
       .fillMaxSize()
       .overScrollVertical(),
-    contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 4.dp, bottom = 48.dp)
+    contentPadding = PaddingValues(start = 14.dp, end = 14.dp, top = 6.dp, bottom = 48.dp)
   ) {
     item {
-      SmallTitle("设备")
-      Card(Modifier.fillMaxWidth()) {
-        SuperArrow(
+      HyperGroupTitle("设备")
+      HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(vertical = 4.dp)) {
+        HyperRow(
           title = "设备管理",
           summary = buildString {
             append("${state.enabledProfiles.size} 个启用连接")
             if (state.disabledProfileCount > 0) append(" · ${state.disabledProfileCount} 个已禁用")
             append(" · ${state.deviceGroups.size} 个分组")
           },
+          showChevron = true,
           onClick = onManageDevices
         )
-        SuperArrow(
+        HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
+        HyperRow(
           title = "添加设备",
           summary = "OpenCode、DSH Remote Hub 或 SSH 主机",
+          showChevron = true,
           onClick = onAddDevice
         )
-        SuperArrow(
+        HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
+        HyperRow(
           title = "模型显示",
           summary = when {
             state.serverId == null -> "连接服务器后管理模型下拉框"
             state.modelVisibilityConfigured -> "已配置 · ${state.visibleModels.size}/${state.modelCatalog.size} 个模型"
             else -> "未配置过滤 · 显示服务器返回的全部模型"
           },
+          showChevron = true,
           onClick = onManageModels
         )
       }
     }
 
     item {
-      SmallTitle("新会话默认值")
+      HyperGroupTitle("新会话默认值")
       NewSessionDefaultsCard(state, controller)
     }
 
     if (hostProfile != null && (hostProfile.kind == ServerKind.DSH || hostProfile.kind == ServerKind.DSH_REMOTE)) item {
-      SmallTitle("DSH 主机设置")
-      Card(Modifier.fillMaxWidth()) {
-        SuperArrow(
+      HyperGroupTitle("DSH 主机设置")
+      HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(vertical = 4.dp)) {
+        HyperRow(
           title = "主机模型密钥",
           summary = "写入 Host 凭据引用；值不会回显",
+          showChevron = true,
           onClick = { hostDialog = "model-key" }
         )
-        SuperArrow(
+        HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
+        HyperRow(
           title = "自定义模型服务商",
           summary = "写入 Host 的 llm-pi-ai 配置（路由、协议、Base URL、模型）",
+          showChevron = true,
           onClick = { hostDialog = "provider" }
         )
-        SuperArrow(
+        HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
+        HyperRow(
           title = "主机扩展（插件开关）",
           summary = "只列出 Host 允许远程开关的官方 bundle；安装与配置仍在电脑上",
+          showChevron = true,
           onClick = { hostDialog = "extensions" }
         )
-        if (hostProfile.kind == ServerKind.DSH_REMOTE) SuperArrow(
-          title = "连接详情",
-          summary = "Relay 路径、主机指纹与加密 RPC 诊断",
-          onClick = { hostDialog = "details" }
-        )
+        if (hostProfile.kind == ServerKind.DSH_REMOTE) {
+          HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
+          HyperRow(
+            title = "连接详情",
+            summary = "Relay 路径、主机指纹与加密 RPC 诊断",
+            showChevron = true,
+            onClick = { hostDialog = "details" }
+          )
+        }
       }
     }
 
     item {
-      SmallTitle("显示与交互")
-      Card(Modifier.fillMaxWidth()) {
-        SuperDropdown(
+      HyperGroupTitle("显示与交互")
+      HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(vertical = 4.dp)) {
+        HyperDropdownRow(
           title = "深浅色外观",
           items = ThemeMode.entries.map { it.label },
           selectedIndex = ThemeMode.entries.indexOf(themeMode),
           onSelectedIndexChange = { onTheme(ThemeMode.entries[it]) }
         )
-        SuperSwitch(
+        HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
+        HyperSwitchRow(
           title = "返回手势预览",
           summary = "拖动返回手势时轻微预览上一级页面",
           checked = previewBack,
           onCheckedChange = onPreviewBack
         )
-        SuperDropdown(
+        HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
+        HyperDropdownRow(
           title = "自动刷新",
           items = RefreshMode.entries.map { it.label },
           selectedIndex = RefreshMode.entries.indexOf(refreshMode),
@@ -709,34 +724,43 @@ fun SettingsScreen(
     }
 
     item {
-      SmallTitle("授权")
-      Card(Modifier.fillMaxWidth()) {
-        SuperSwitch(title = "不显示授权窗口", summary = "本手机全部设备：隐藏授权窗口、列表标记和通知；不会因此允许操作，任务可能仍等待电脑端处理",
+      HyperGroupTitle("授权")
+      HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(vertical = 4.dp)) {
+        HyperSwitchRow(
+          title = "不显示授权窗口",
+          summary = "本手机全部设备：隐藏授权窗口、列表标记和通知；不会因此允许操作，任务可能仍等待电脑端处理",
           checked = state.permissionPolicy.hide,
-          onCheckedChange = { controller.setPermissionPolicy(state.permissionPolicy.copy(hide = it)) })
-        SuperSwitch(title = "自动授权", summary = "本手机全部设备：自动对每个权限请求“允许一次”，不保存永久规则；请仅连接可信设备",
+          onCheckedChange = { controller.setPermissionPolicy(state.permissionPolicy.copy(hide = it)) }
+        )
+        HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
+        HyperSwitchRow(
+          title = "自动授权",
+          summary = "本手机全部设备：自动对每个权限请求“允许一次”，不保存永久规则；请仅连接可信设备",
           checked = state.permissionPolicy.autoApprove,
-          onCheckedChange = { controller.setPermissionPolicy(state.permissionPolicy.copy(autoApprove = it)) })
+          onCheckedChange = { controller.setPermissionPolicy(state.permissionPolicy.copy(autoApprove = it)) }
+        )
       }
     }
 
     item {
-      SmallTitle("任务通知")
-      Card(Modifier.fillMaxWidth()) {
-        SuperArrow(
+      HyperGroupTitle("任务通知")
+      HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(vertical = 4.dp)) {
+        HyperRow(
           title = "通知权限",
           summary = if (notificationsEnabled) "已开启；待处理与任务结果会通知，点按打开系统通知设置" else "已关闭，后台不会显示系统通知；打开首页仍可查看任务概览，点按开启",
+          showChevron = true,
           onClick = onNotifications
         )
+        HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
         val item = liveUpdate
         if (item == null) {
-          BasicComponent(title = "系统实时更新", summary = "正在检测本机实时更新能力…")
+          HyperRow(title = "系统实时更新", summary = "正在检测本机实时更新能力…")
         } else {
           // 只有系统标准实时更新一条通道，不再罗列任何品牌。
-          BasicComponent(
+          HyperRow(
             title = "系统实时更新",
             summary = item.note,
-            endActions = {
+            trailing = {
               Text(
                 when {
                   !item.supported -> "普通通知"
@@ -744,8 +768,9 @@ fun SettingsScreen(
                   else -> "待授权"
                 },
                 style = MiuixTheme.textStyles.footnote1.copy(
+                  fontWeight = FontWeight.SemiBold,
                   color = when {
-                    !item.supported -> MiuixTheme.colorScheme.onSurfaceVariantSummary
+                    !item.supported -> HyperTheme.colors.textSecondary
                     item.granted -> MiuixColorTokens.Success
                     else -> MiuixColorTokens.Warning
                   }
@@ -753,24 +778,28 @@ fun SettingsScreen(
               )
             }
           )
-          if (item.supported && !item.granted) SuperArrow(
-            title = "开启实时更新权限",
-            summary = "Android 16 实时更新需要单独授权",
-            onClick = { TaskNotifications(context).promotedNotificationSettingsIntent()?.let { runCatching { context.startActivity(it) } } }
-          )
+          if (item.supported && !item.granted) {
+            HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
+            HyperRow(
+              title = "开启实时更新权限",
+              summary = "Android 16 实时更新需要单独授权",
+              showChevron = true,
+              onClick = { TaskNotifications(context).promotedNotificationSettingsIntent()?.let { runCatching { context.startActivity(it) } } }
+            )
+          }
         }
       }
     }
 
     item {
-      SmallTitle("版本与更新")
-      Card(Modifier.fillMaxWidth()) {
-        BasicComponent(
+      HyperGroupTitle("版本与更新")
+      HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(vertical = 4.dp)) {
+        HyperRow(
           title = "Lagoon ${packageInfo.versionName} ($versionCode)",
           summary = "Android ${Build.VERSION.RELEASE} · API ${Build.VERSION.SDK_INT} · 更新源 GitHub"
         )
-        HorizontalDivider()
-        SuperSwitch(
+        HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
+        HyperSwitchRow(
           title = "预发布通道",
           summary = if (includePrerelease) "包含正式版与 rc / beta；只升级，不降级" else "正式通道：只检查正式版，只升级，不降级",
           checked = includePrerelease,
@@ -781,7 +810,7 @@ fun SettingsScreen(
             updater.selectChannel(enabled)
           }
         )
-        HorizontalDivider()
+        HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
         UpdateControls(
           update = update,
           includePrerelease = includePrerelease,
@@ -797,9 +826,9 @@ fun SettingsScreen(
     }
 
     item {
-      SmallTitle("关于与诊断")
-      Card(Modifier.fillMaxWidth()) {
-        BasicComponent(
+      HyperGroupTitle("关于与诊断")
+      HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(vertical = 4.dp)) {
+        HyperRow(
           title = "服务与同步",
           summary = "服务：${state.version.ifBlank { "未知版本" }} · ${if (state.connected) "可连接" else "未连接"}\n实时同步：${if (state.streamConnected) "正常" else "恢复中"} · ${if (state.degraded || state.cached) "数据待更新" else "数据已同步"}"
         )
@@ -807,22 +836,29 @@ fun SettingsScreen(
         LaunchedEffect(Unit) {
           cacheUsage = controller.transcriptCacheUsage()?.let { "已保存 ${it.sessions} 个会话 · ${formatBytes(it.bytes)} / 上限 ${formatBytes(TranscriptStore.DEFAULT_BUDGET_BYTES)}" }
         }
-        SuperArrow(
+        HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
+        HyperRow(
           title = "清除会话缓存",
           summary = (cacheUsage ?: "本机保存的会话内容") + "\n与服务器核对后使用；清除后打开会话时重新读取",
+          showChevron = true,
           onClick = { controller.clearTranscriptCache { cacheUsage = "已清除" } }
         )
-        SuperArrow(
+        HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
+        HyperRow(
           title = "复制诊断信息",
           summary = "版本、系统、连接状态与各阶段耗时，不含凭据",
+          showChevron = true,
           onClick = {
             clipboard.setText(AnnotatedString("Lagoon ${packageInfo.versionName}\nAndroid ${android.os.Build.VERSION.RELEASE} / API ${android.os.Build.VERSION.SDK_INT}\n${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}\nserver=${state.version}, api=${state.connected}, stream=${state.streamConnected}, stale=${state.degraded}, cached=${state.cached}\ncapabilitiesDocumented=${state.capabilities.documented}, sessions=${state.sessions.size}, messages=${state.messages.size}\n连接耗时：\n${controller.connectionDiagnostics().ifBlank { "暂无记录" }}\n帧耗时（本次启动）：\n${FrameStats.summary().ifBlank { "暂无记录" }}"))
           }
         )
         crashReport?.let { report ->
-          BasicComponent(title = "上次崩溃", summary = "${report.lineSequence().firstOrNull().orEmpty()}\n${CrashLog.headline(report)}")
-          SuperArrow(title = "复制崩溃日志", onClick = { clipboard.setText(AnnotatedString(report)) })
-          SuperArrow(title = "清除崩溃记录", onClick = { CrashLog.clear(context); crashReport = null })
+          HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
+          HyperRow(title = "上次崩溃", summary = "${report.lineSequence().firstOrNull().orEmpty()}\n${CrashLog.headline(report)}")
+          HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
+          HyperRow(title = "复制崩溃日志", showChevron = true, onClick = { clipboard.setText(AnnotatedString(report)) })
+          HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
+          HyperRow(title = "清除崩溃记录", danger = true, onClick = { CrashLog.clear(context); crashReport = null })
         }
       }
     }

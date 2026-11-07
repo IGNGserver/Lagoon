@@ -111,8 +111,16 @@ class LagoonController private constructor(private val appContext: Context) {
       // headline task, so tapping the island always lands somewhere, including when tasks are only running.
       summaryTargetId = targetId,
       summaryTarget = targetId?.let { next.serverId?.let { server -> SessionTarget(server, it) } }
-    )
+    ).also { conversationPool.record(it) }
   }
+
+  private var conversationPoolStorage: ConversationStorePool? = null
+  internal val conversationPool: ConversationStorePool
+    get() = conversationPoolStorage ?: ConversationStorePool().also { conversationPoolStorage = it }
+
+  /** 按目标 (serverId, sessionId) 投影独立会话状态，供路由转场与父子会话栈直接读取。 */
+  fun conversationState(base: LagoonState, serverId: String?, sessionId: String?): LagoonState =
+    conversationPool.project(base, serverId, sessionId, sessionViews, transcriptMemory)
 
   private val store = ServerStore(appContext)
   private val remoteBackendFactory = object : RemoteBackendFactory {
@@ -2824,6 +2832,7 @@ class LagoonController private constructor(private val appContext: Context) {
   /** Captures the current transcript before a navigation replaces it; never authoritative. */
   private fun rememberCurrentSessionView() {
     val current = state.value
+    conversationPool.record(current)
     val server = current.serverId ?: return
     val session = current.session ?: return
     if (current.messages.isEmpty() && current.resource("messages").state == ResourceState.LOADING) return

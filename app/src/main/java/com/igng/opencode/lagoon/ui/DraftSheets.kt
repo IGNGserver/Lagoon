@@ -1,6 +1,5 @@
 package com.igng.opencode.lagoon.ui
 
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -29,8 +28,6 @@ import com.igng.opencode.lagoon.core.ServerProfile
 import com.igng.opencode.lagoon.core.draftServers
 import com.igng.opencode.lagoon.core.draftWorkspaces
 import com.igng.opencode.lagoon.core.normalizedDirectory
-import top.yukonga.miuix.kmp.basic.Card
-import top.yukonga.miuix.kmp.basic.SmallTitle
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.extra.SuperBottomSheet
 import top.yukonga.miuix.kmp.theme.MiuixTheme
@@ -59,30 +56,36 @@ internal fun DraftDestinationSheet(
   }
   val registered = workspaces.filter { it.registered }
   val serverOnly = workspaces.filterNot { it.registered }
-  val muted = MiuixTheme.colorScheme.onSurfaceVariantSummary
+  val muted = HyperTheme.colors.textSecondary
   SuperBottomSheet(title = "服务器与工作区", show = true, onDismissRequest = onDismiss) {
     LazyColumn(Modifier.fillMaxWidth().heightIn(max = 680.dp), contentPadding = PaddingValues(bottom = 16.dp)) {
-      item { SmallTitle("服务器", insideMargin = PaddingValues(horizontal = 16.dp, vertical = 8.dp)) }
+      item { HyperGroupTitle("服务器") }
       items(servers, key = { "server:${it.id}" }) { server ->
-        Card(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 2.dp)) {
+        HyperCard(
+          Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 3.dp),
+          insidePadding = PaddingValues(0.dp),
+          borderColor = if (server.id == currentId) HyperTheme.colors.primary.copy(alpha = 0.45f) else HyperTheme.colors.cardBorder
+        ) {
           DraftServerRow(server, current = server.id == currentId) { onSwitchServer(server.profile) }
         }
       }
       item {
-        SmallTitle(
-          listOfNotNull("工作区", state.server?.name?.takeIf { it.isNotBlank() }).joinToString(" · "),
-          insideMargin = PaddingValues(horizontal = 16.dp, vertical = 8.dp)
+        HyperGroupTitle(
+          listOfNotNull("工作区", state.server?.name?.takeIf { it.isNotBlank() }).joinToString(" · ")
         )
       }
       if (workspaces.isEmpty()) item {
-        Text(emptyWorkspaceHint(state), Modifier.padding(horizontal = 20.dp, vertical = 6.dp),
-          style = MiuixTheme.textStyles.footnote2.copy(color = muted))
+        Text(
+          emptyWorkspaceHint(state),
+          Modifier.padding(horizontal = 20.dp, vertical = 6.dp),
+          style = MiuixTheme.textStyles.footnote2.copy(color = muted)
+        )
       }
       items(registered, key = { "workspace:${it.id}" }) { workspace ->
         DraftWorkspaceRow(state, workspace) { controller.chooseWorkspace(workspace.project); onDismiss() }
       }
       if (serverOnly.isNotEmpty()) item {
-        SmallTitle("服务器上的工作区 · 点按登记", insideMargin = PaddingValues(horizontal = 16.dp, vertical = 8.dp))
+        HyperGroupTitle("服务器上的工作区 · 点按登记")
       }
       items(serverOnly, key = { "server-workspace:${it.directory}" }) { workspace ->
         DraftWorkspaceRow(state, workspace) { controller.chooseWorkspace(workspace.project); onDismiss() }
@@ -90,7 +93,10 @@ internal fun DraftDestinationSheet(
       item { Spacer(Modifier.height(10.dp)) }
       if (state.connected) {
         item {
-          Card(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 2.dp)) {
+          HyperCard(
+            Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 2.dp),
+            insidePadding = PaddingValues(0.dp)
+          ) {
             ChoiceRow("浏览服务器目录…", "添加为本机工作区", false) { controller.openDirectoryBrowser() }
           }
         }
@@ -121,14 +127,14 @@ private fun DraftWorkspaceRow(state: LagoonState, workspace: DraftWorkspace, onC
 
 @Composable
 private fun DraftServerRow(server: DraftServer, current: Boolean, onClick: () -> Unit) {
-  val muted = MiuixTheme.colorScheme.onSurfaceVariantSummary
+  val muted = HyperTheme.colors.textSecondary
   val dot = when {
     server.connected -> MiuixColorTokens.Success
     server.loading -> MiuixColorTokens.Warning
     else -> muted
   }
   Row(
-    Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 14.dp, vertical = 12.dp),
+    Modifier.fillMaxWidth().hyperPress(onClick = onClick).padding(horizontal = 14.dp, vertical = 12.dp),
     verticalAlignment = Alignment.CenterVertically
   ) {
     Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
@@ -136,19 +142,23 @@ private fun DraftServerRow(server: DraftServer, current: Boolean, onClick: () ->
         StatusDot(dot)
         Spacer(Modifier.width(8.dp))
         Text(
-          server.name, maxLines = 1, overflow = TextOverflow.Ellipsis,
-          style = MiuixTheme.textStyles.body1.copy(fontWeight = if (current) FontWeight.Medium else FontWeight.Normal)
+          server.name,
+          maxLines = 1,
+          overflow = TextOverflow.Ellipsis,
+          style = MiuixTheme.textStyles.body1.copy(fontWeight = if (current) FontWeight.SemiBold else FontWeight.Medium)
         )
         Spacer(Modifier.width(6.dp))
         HarnessBadge(server.profile.kind)
         if (current) {
           Spacer(Modifier.width(6.dp))
-          Text("当前", style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.primary))
+          Text("当前", style = MiuixTheme.textStyles.footnote2.copy(fontWeight = FontWeight.SemiBold, color = HyperTheme.colors.primary))
         }
       }
       Text(
         listOf(server.connectionLabel, server.statusLabel, workspaceSummary(server)).joinToString(" · "),
-        style = MiuixTheme.textStyles.footnote2.copy(color = muted), maxLines = 1, overflow = TextOverflow.Ellipsis
+        style = MiuixTheme.textStyles.footnote2.copy(color = muted),
+        maxLines = 1,
+        overflow = TextOverflow.Ellipsis
       )
     }
     DropdownChevron(16.dp, muted)

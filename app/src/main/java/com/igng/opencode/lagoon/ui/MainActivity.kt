@@ -111,7 +111,6 @@ class MainActivity : ComponentActivity() {
       var globalMessage by remember { mutableStateOf<String?>(null) }
       var globalMessageType by remember { mutableStateOf(MiuixToastType.INFO) }
        val holder = rememberSaveableStateHolder()
-        val snapshots = remember { mutableMapOf<String, LagoonState>() }
        val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
       val focusManager = LocalFocusManager.current
       val density = LocalDensity.current
@@ -119,7 +118,6 @@ class MainActivity : ComponentActivity() {
       val route = navigator.route
       fun openSession(target: SessionTarget, child: Boolean = false) {
         focusManager.clearFocus()
-        if (state.session != null) snapshots["${state.serverId}:${state.sessionId}"] = state
         // 先落栈（同步启用根返回回调），再打开会话：打开过程占住主线程也不会让返回落到系统。
         navigator.server = target.serverId
         val lineage = controller.state.value.lineage(target.sessionId)
@@ -195,7 +193,6 @@ class MainActivity : ComponentActivity() {
           if (navigator.navigation.sessions.isNotEmpty() && navigator.navigation.sessions.last() != DRAFT_SESSION) {
             navigator.navigate(SessionNavigation())
           }
-          if (navigator.navigation.sessions.isEmpty()) snapshots.clear()
           navigator.server = state.serverId
         }
       }
@@ -210,10 +207,6 @@ class MainActivity : ComponentActivity() {
        }
        SideEffect {
         WindowCompat.getInsetsController(window, window.decorView).apply { isAppearanceLightStatusBars = !dark; isAppearanceLightNavigationBars = !dark }
-        if (state.sessionId != null) {
-          snapshots["${state.serverId}:${state.sessionId}"] = state
-          if (snapshots.size > 8) snapshots.keys.firstOrNull { it != "${state.serverId}:${state.sessionId}" }?.let(snapshots::remove)
-        }
       }
       DisposableEffect(state.serverId, state.sessionId, inChatDetail) {
         val server = state.serverId; val session = state.sessionId
@@ -255,10 +248,24 @@ class MainActivity : ComponentActivity() {
       LaunchedEffect(gesture?.id, gesture?.phase) {
         val current = gesture ?: return@LaunchedEffect
         when (current.phase) {
-          BackPhase.ACTIVE -> { backProgress.snapTo(0f); if (previewBack) snapshotFlow { navigator.progress }.collect { backProgress.snapTo(it) } }
-          // Leave the outgoing surface at its gesture position until its exit transition finishes.
-          BackPhase.COMMITTED -> { delay(240); backProgress.snapTo(0f); navigator.finish(current.id) }
-          BackPhase.CANCELLED -> { backProgress.animateTo(0f, spring(dampingRatio = 0.9f, stiffness = 500f)); navigator.finish(current.id) }
+          BackPhase.ACTIVE -> {
+            backProgress.snapTo(0f)
+            if (previewBack) snapshotFlow { navigator.progress }.collect { backProgress.snapTo(it) }
+          }
+          // 手势松手后以澎湃弹簧无缝走完剩余路程；非手势返回则等待弹出动画自然结束。
+          BackPhase.COMMITTED -> {
+            if (previewBack && backProgress.value > 0.01f) {
+              backProgress.animateTo(1f, HyperMotion.backCommitSpring)
+            } else {
+              delay(260)
+            }
+            backProgress.snapTo(0f)
+            navigator.finish(current.id)
+          }
+          BackPhase.CANCELLED -> {
+            backProgress.animateTo(0f, HyperMotion.backCancelSpring)
+            navigator.finish(current.id)
+          }
         }
       }
       LagoonMiuixTheme(dark) {
@@ -268,17 +275,15 @@ class MainActivity : ComponentActivity() {
           topBar = {},
           bottomBar = {}
         ) { insets ->
-          Box(Modifier.fillMaxSize().background(MiuixTheme.colorScheme.surface)) {
+          Box(Modifier.fillMaxSize().background(HyperTheme.colors.canvas)) {
             @Composable
             fun Page(target: NavRoute, active: Boolean) {
               val displayed = when {
                 // The blank page is not a server-scoped session id: it always follows the live
                 // writable connection, including the moment a server switch is connecting.
                 target.session == DRAFT_SESSION -> state
-                target.session == state.sessionId && target.serverId == state.serverId -> state
-                // 没有快照（例如跨服务器退出动画中）：用路由身份构造空页，不能回退成当前服务器的会话。
-                else -> snapshots["${target.serverId}:${target.session}"] ?: state.copy(serverId = target.serverId, sessionId = target.session,
-                  sessions = emptyList(), messages = emptyList(), draft = "")
+                target.session != null -> controller.conversationState(state, target.serverId, target.session)
+                else -> state
               }
               when {
                 target.session == DRAFT_SESSION -> DraftScreen(state, controller, onBack = { goBack() }, onModal = {}, interactive = active,
@@ -307,19 +312,43 @@ class MainActivity : ComponentActivity() {
             }
             peekRoute?.let { peek ->
               Box(Modifier.fillMaxSize().graphicsLayer {
-                translationX = -navigator.direction * (1f - backProgress.value) * size.width * 0.25f
-              }.pointerInput(Unit) { awaitPointerEventScope { while (true) { awaitPointerEvent().changes.forEach { it.consume() } } } }) { Page(peek, active = false) }
+                val p = backProgress.value.coerceIn(0f, 1f)
+                translationX = -navigator.direction * (1f - p) * size.width * 0.28f
+                val s = 0.94f + 0.06f * p
+                scaleX = s; scaleY = s
+              }.pointerInput(Unit) { awaitPointerEventScope { while (true) { awaitPointerEvent().changes.forEach { it.consume() } } } }) {
+                Page(peek, active = false)
+                Box(Modifier.fillMaxSize().graphicsLayer {
+                  alpha = (1f - backProgress.value.coerceIn(0f, 1f)) * 0.22f
+                }.background(androidx.compose.ui.graphics.Color.Black))
+              }
             }
             AnimatedContent(route, transitionSpec = {
               // The first send turns the draft into the real session in place, without a page change.
               if (initialState.session == DRAFT_SESSION && targetState.depth == initialState.depth && targetState.session != DRAFT_SESSION) {
                 EnterTransition.None togetherWith ExitTransition.None
+              } else if (navigator.gesture?.phase == BackPhase.COMMITTED && previewBack && backProgress.value > 0.01f) {
+                // 预测式返回松手后由 backProgress 弹簧连续驱动新旧两页，AnimatedContent 仅保持离场页存活至动画完成。
+                (fadeIn(tween(1)) togetherWith fadeOut(tween(1, delayMillis = 260))).apply {
+                  targetContentZIndex = 0f
+                }
               } else {
-                // Deeper pages enter from the right, going back enters from the left.
+                // 澎湃 OS 4 原生级推入/弹出：全幅弹簧位移 + 底层 -28% 视差与 0.94 缩放（底层不淡出变透）。
                 val direction = slideDirection(initialState, targetState)
-                val motion = tween<IntOffset>(300, easing = CubicBezierEasing(0.2f, 0f, 0f, 1f))
-                (fadeIn(tween(220, delayMillis = 40)) + slideInHorizontally(motion) { it * direction / 4 }) togetherWith
-                  (fadeOut(tween(160)) + slideOutHorizontally(motion) { -it * direction / 4 })
+                if (direction > 0) {
+                  (slideInHorizontally(HyperMotion.pageOffsetSpring) { it * direction } togetherWith
+                    (slideOutHorizontally(HyperMotion.pageOffsetSpring) { -it * direction * 28 / 100 } +
+                      scaleOut(HyperMotion.pageFloatSpring, targetScale = 0.94f))).apply {
+                    targetContentZIndex = 2f
+                  }
+                } else {
+                  ((slideInHorizontally(HyperMotion.pageOffsetSpring) { it * direction * 28 / 100 } +
+                    scaleIn(HyperMotion.pageFloatSpring, initialScale = 0.94f)) togetherWith
+                    (slideOutHorizontally(HyperMotion.pageOffsetSpring) { -it * direction } +
+                      scaleOut(HyperMotion.pageFloatSpring, targetScale = 0.95f))).apply {
+                    targetContentZIndex = 0f
+                  }
+                }
               }
             }, contentKey = { target ->
               // Content identity must match the saveable-scope identity. A draft is one page no
@@ -333,14 +362,23 @@ class MainActivity : ComponentActivity() {
               }
             }, label = "navigation") { target ->
               val active = target == route
+              val currentGesture = navigator.gesture
               Box(Modifier.fillMaxSize().graphicsLayer {
-                if (target == navigator.gesture?.route) {
-                  translationX = navigator.direction * backProgress.value * size.width * 0.28f
-                  scaleX = 1f - backProgress.value * 0.04f; scaleY = scaleX
-                  alpha = 1f - backProgress.value * 0.12f
+                val p = backProgress.value.coerceIn(0f, 1f)
+                if (target == currentGesture?.route && p > 0f) {
+                  translationX = navigator.direction * p * size.width
+                  val s = 1f - p.coerceAtMost(0.35f) * 0.14f
+                  scaleX = s; scaleY = s
+                  shadowElevation = 24.dp.toPx() * (1f - p * 0.5f)
+                  shape = miuixSquircleShape((28f * p.coerceAtMost(0.4f) / 0.4f).dp)
+                  clip = true
+                } else if (target == route && currentGesture?.phase == BackPhase.COMMITTED && p > 0f) {
+                  translationX = -navigator.direction * (1f - p) * size.width * 0.28f
+                  val s = 0.94f + 0.06f * p
+                  scaleX = s; scaleY = s
                 }
               }.then(if (active) Modifier else Modifier.pointerInput(Unit) { awaitPointerEventScope { while (true) { awaitPointerEvent().changes.forEach { it.consume() } } } })
-                .background(MiuixTheme.colorScheme.surface)) {
+                .background(HyperTheme.colors.canvas)) {
                 val key = when {
                   // The server is deliberately not part of this key: switching harness from the
                   // blank page must keep the composer text and its saveable state.

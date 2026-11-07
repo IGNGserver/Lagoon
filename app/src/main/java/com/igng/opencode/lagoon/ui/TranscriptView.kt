@@ -171,7 +171,7 @@ internal fun Conversation(state: LagoonState, controller: LagoonController, modi
       // While a task runs, the floating 「运行中」 pill sits over the bottom of the list; reserve its height so
       // the newest line is not hidden under it (the reversed list keeps the bottom anchored when this changes).
       contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 12.dp, bottom = if (task?.active == true) 60.dp else 12.dp),
-      verticalArrangement = Arrangement.spacedBy(8.dp)) {
+      verticalArrangement = Arrangement.spacedBy(10.dp)) {
       items(questions.asReversed(), key = { "question:${it.id}" }) { MiuixQuestionCard(it, controller, state.pending("question:${it.id}")) }
       items(permissions.asReversed(), key = { "permission:${it.id}" }) { MiuixPermissionCard(it, controller, state.pending("permission:${it.id}"), onModal) }
       items(mainRows.asReversed(), key = { it.key }, contentType = { it.kind }) { row ->
@@ -184,14 +184,15 @@ internal fun Conversation(state: LagoonState, controller: LagoonController, modi
           if (loadingOlder) InfiniteProgressIndicator(size = 20.dp, strokeWidth = 2.dp)
         }
       }
-      if (state.cached) item(key = "cache-notice") { Text(if (state.cacheComplete) if (state.connected) "会话缓存 · 消息待同步" else "离线缓存 · 恢复连接后更新" else "离线缓存已截断，部分历史与长输出未保留", color = MiuixColorTokens.Warning, style = MiuixTheme.textStyles.footnote1) }
+      if (state.cached) item(key = "cache-notice") { Text(if (state.cacheComplete) if (state.connected) "会话缓存 · 消息待同步" else "离线缓存 · 恢复连接后更新" else "离线缓存已截断，部分历史与长输出未保留", color = HyperTheme.colors.warning, style = MiuixTheme.textStyles.footnote1) }
     }
     Column(Modifier.align(Alignment.BottomCenter).padding(bottom = 16.dp),
       horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(8.dp)) {
       AnimatedVisibility(!atBottom && rows.isNotEmpty()) {
-        Box(Modifier.size(36.dp).clip(miuixCapsuleShape()).background(MiuixTheme.colorScheme.secondaryContainer)
-          .clickable { follow = true; newContent = false; scope.launch { list.scrollToItem(0) } }, contentAlignment = Alignment.Center) {
-          DropdownChevron(18.dp, tint = if (newContent) MiuixTheme.colorScheme.primary else MiuixTheme.colorScheme.onSurfaceVariantSummary,
+        Box(Modifier.size(38.dp).clip(miuixSquircleShape(19.dp)).background(HyperTheme.colors.cardElevated)
+          .border(0.6.dp, HyperTheme.colors.cardBorder, miuixSquircleShape(19.dp))
+          .hyperPress(scaleDown = 0.92f) { follow = true; newContent = false; scope.launch { list.scrollToItem(0) } }, contentAlignment = Alignment.Center) {
+          DropdownChevron(18.dp, tint = if (newContent) HyperTheme.colors.primary else HyperTheme.colors.textSecondary,
             description = if (newContent) "有新消息，回到最新" else "回到底部")
         }
       }
@@ -212,14 +213,18 @@ private fun WorkingIndicator(task: TaskState) {
     while (true) { now = System.currentTimeMillis(); delay(1_000) }
   }
   val elapsed = ((now - task.since) / 1000).coerceAtLeast(0)
-  Row(Modifier.clip(miuixCapsuleShape()).background(MiuixTheme.colorScheme.secondaryContainer)
-    .padding(horizontal = 12.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+  Row(Modifier.clip(miuixSquircleShape(16.dp)).background(HyperTheme.colors.cardElevated)
+    .border(0.6.dp, HyperTheme.colors.cardBorder, miuixSquircleShape(16.dp))
+    .padding(horizontal = 14.dp, vertical = 7.dp), verticalAlignment = Alignment.CenterVertically) {
     if (!waiting) {
-      InfiniteProgressIndicator(color = MiuixTheme.colorScheme.primary, size = 14.dp, strokeWidth = 1.5.dp)
+      InfiniteProgressIndicator(color = HyperTheme.colors.primary, size = 14.dp, strokeWidth = 1.5.dp)
       Spacer(Modifier.width(6.dp))
     }
     Text(if (waiting) "等待你的操作" else "运行中 · ${elapsedText(elapsed)}",
-      style = MiuixTheme.textStyles.footnote2.copy(color = if (waiting) MiuixColorTokens.Warning else MiuixTheme.colorScheme.primary))
+      style = HyperTheme.tabular(MiuixTheme.textStyles.footnote2.copy(
+        fontWeight = FontWeight.SemiBold,
+        color = if (waiting) HyperTheme.colors.warning else HyperTheme.colors.primary
+      )))
   }
 }
 
@@ -294,16 +299,23 @@ private fun UserMessageRow(row: TranscriptRow, onFile: (String) -> Unit, onQueue
     }
     if (row.text.isNotBlank()) {
       Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) {
-        Column(Modifier.widthIn(max = bubbleMax).background(MiuixTheme.colorScheme.secondaryContainer, miuixSquircleShape(22.dp)).padding(horizontal = 16.dp, vertical = 12.dp)) {
+        val bubbleShape = miuixSquircleShape(22.dp)
+        Column(
+          Modifier
+            .widthIn(max = bubbleMax)
+            .background(HyperTheme.colors.userBubble, bubbleShape)
+            .border(0.6.dp, HyperTheme.colors.primary.copy(alpha = 0.18f), bubbleShape)
+            .padding(horizontal = 16.dp, vertical = 12.dp)
+        ) {
           SelectionContainer {
-            BasicText(row.text, style = MiuixTheme.textStyles.body1.copy(color = MiuixTheme.colorScheme.onSurface, lineHeight = 24.sp))
+            BasicText(row.text, style = MiuixTheme.textStyles.body1.copy(color = HyperTheme.colors.onUserBubble, lineHeight = 24.sp))
           }
         }
       }
     }
     Row(Modifier.fillMaxWidth().padding(top = 4.dp), verticalAlignment = Alignment.CenterVertically) {
       Spacer(Modifier.weight(1f))
-      if (row.meta.isNotBlank()) Text(row.meta, style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
+      if (row.meta.isNotBlank()) Text(row.meta, style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary))
       if (row.status == "queued") {
         Spacer(Modifier.width(8.dp))
         TextButton(text = "操作", onClick = { onQueuedAction(row) })
@@ -312,21 +324,31 @@ private fun UserMessageRow(row: TranscriptRow, onFile: (String) -> Unit, onQueue
   }
 }
 
-/** 分组行：点击后打开半屏窗口查看明细（不再内联展开）。 */
+/** 聚合式工具执行轨迹卡（Execution Trace Card）：点击后以澎湃弹簧半屏抽屉展开时间线明细。 */
 @Composable
 private fun GroupRow(row: TranscriptRow, onClick: () -> Unit) {
   val running = row.status in setOf("running", "pending")
-  Row(Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 2.dp, vertical = 7.dp), verticalAlignment = Alignment.CenterVertically) {
+  val shape = miuixSquircleShape(16.dp)
+  Row(
+    Modifier
+      .fillMaxWidth()
+      .clip(shape)
+      .background(HyperTheme.colors.cardElevated, shape)
+      .border(0.6.dp, HyperTheme.colors.cardBorder, shape)
+      .hyperPress(onClick = onClick)
+      .padding(horizontal = 14.dp, vertical = 11.dp),
+    verticalAlignment = Alignment.CenterVertically
+  ) {
     if (row.kind in setOf("tool", "tool-group")) { ToolStatusDot(row.status); Spacer(Modifier.width(10.dp)) }
-    Column(Modifier.weight(1f)) {
+    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
       Text(row.title, maxLines = 1, overflow = TextOverflow.Ellipsis,
-        style = MiuixTheme.textStyles.body1.copy(fontWeight = FontWeight.Medium, color = if (row.status == "error") MiuixColorTokens.Error else MiuixTheme.colorScheme.onSurface))
+        style = MiuixTheme.textStyles.body2.copy(fontWeight = FontWeight.SemiBold, color = if (row.status == "error") HyperTheme.colors.error else HyperTheme.colors.textPrimary))
       if (row.subtitle.isNotBlank()) Text(row.subtitle, maxLines = 1, overflow = TextOverflow.Ellipsis,
-        style = MiuixTheme.textStyles.footnote1.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
+        style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary))
     }
     if (row.status == "unverified") { UnverifiedStatus(); Spacer(Modifier.width(8.dp)) }
-    if (running) { InfiniteProgressIndicator(color = MiuixColorTokens.Primary, size = 15.dp, strokeWidth = 1.5.dp); Spacer(Modifier.width(8.dp)) }
-    Text("›", style = MiuixTheme.textStyles.title4.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
+    if (running) { InfiniteProgressIndicator(color = HyperTheme.colors.primary, size = 15.dp, strokeWidth = 1.5.dp); Spacer(Modifier.width(8.dp)) }
+    QoderIcon(QoderGlyph.CHEVRON, Modifier.size(16.dp), HyperTheme.colors.textTertiary)
   }
 }
 
@@ -334,15 +356,30 @@ private fun GroupRow(row: TranscriptRow, onClick: () -> Unit) {
 private fun QoderSummaryRow(row: TranscriptRow, onClick: () -> Unit) {
   val running = row.status in setOf("running", "pending")
   val error = row.status == "error"
-  Row(Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 2.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-    Column(Modifier.weight(1f)) {
-      Text(row.title, style = MiuixTheme.textStyles.body1.copy(color = if (error) MiuixColorTokens.Error else MiuixTheme.colorScheme.onSurfaceVariantSummary))
+  val shape = miuixSquircleShape(16.dp)
+  Row(
+    Modifier
+      .fillMaxWidth()
+      .clip(shape)
+      .background(HyperTheme.colors.cardElevated, shape)
+      .border(0.6.dp, if (error) HyperTheme.colors.error.copy(alpha = 0.35f) else HyperTheme.colors.cardBorder, shape)
+      .hyperPress(onClick = onClick)
+      .padding(horizontal = 14.dp, vertical = 12.dp),
+    verticalAlignment = Alignment.CenterVertically
+  ) {
+    ToolStatusDot(row.status)
+    Spacer(Modifier.width(10.dp))
+    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+      Text(row.title, style = MiuixTheme.textStyles.body2.copy(
+        fontWeight = FontWeight.SemiBold,
+        color = if (error) HyperTheme.colors.error else HyperTheme.colors.textPrimary
+      ))
       if (row.subtitle.isNotBlank()) Text(row.subtitle, maxLines = 1, overflow = TextOverflow.Ellipsis,
-        style = MiuixTheme.textStyles.footnote1.copy(color = if (error) MiuixColorTokens.Error else MiuixTheme.colorScheme.onSurfaceVariantSummary))
+        style = MiuixTheme.textStyles.footnote2.copy(color = if (error) HyperTheme.colors.error else HyperTheme.colors.textSecondary))
     }
     if (row.status == "unverified") { UnverifiedStatus(); Spacer(Modifier.width(8.dp)) }
-    if (running) { InfiniteProgressIndicator(color = QoderColors.successColor, size = 16.dp, strokeWidth = 1.5.dp); Spacer(Modifier.width(8.dp)) }
-    QoderIcon(QoderGlyph.CHEVRON, Modifier.size(18.dp), MiuixTheme.colorScheme.onSurfaceVariantSummary)
+    if (running) { InfiniteProgressIndicator(color = HyperLagoonColors.successColor, size = 16.dp, strokeWidth = 1.5.dp); Spacer(Modifier.width(8.dp)) }
+    QoderIcon(QoderGlyph.CHEVRON, Modifier.size(16.dp), HyperTheme.colors.textTertiary)
   }
 }
 
@@ -408,11 +445,11 @@ private fun TimelineMarker(status: String, kind: String, hasNext: Boolean) {
     }
     Box(Modifier.padding(top = 6.dp).size(26.dp), contentAlignment = Alignment.Center) {
       when {
-        status == "error" -> QoderIcon(QoderGlyph.ERROR, color = QoderColors.error)
+        status == "error" -> QoderIcon(QoderGlyph.ERROR, color = HyperLagoonColors.error)
         status == "unverified" -> Text("?", color = MiuixTheme.colorScheme.onSurfaceVariantSummary, style = MiuixTheme.textStyles.body1)
-        status in setOf("running", "pending") -> InfiniteProgressIndicator(color = QoderColors.successColor, size = 20.dp, strokeWidth = 2.dp)
+        status in setOf("running", "pending") -> InfiniteProgressIndicator(color = HyperLagoonColors.successColor, size = 20.dp, strokeWidth = 2.dp)
         kind == "reasoning" -> QoderIcon(QoderGlyph.THINK)
-        else -> QoderIcon(QoderGlyph.CHECK, color = QoderColors.successColor)
+        else -> QoderIcon(QoderGlyph.CHECK, color = HyperLagoonColors.successColor)
       }
     }
   }
@@ -444,7 +481,7 @@ internal fun DetailCode(title: String, text: String, readContent: Boolean = fals
       }
     }
     Spacer(Modifier.height(4.dp))
-    CodePanel(text, background = if (readContent) QoderColors.readContent else QoderColors.codeColor)
+    CodePanel(text, background = if (readContent) HyperLagoonColors.readContent else HyperLagoonColors.codeColor)
   }
 }
 
@@ -523,10 +560,10 @@ private fun UnverifiedStatus() {
 @Composable
 private fun ToolStatusDot(status: String) {
   val color = when (status) {
-    "running", "pending" -> MiuixColorTokens.Primary
-    "completed" -> MiuixColorTokens.Success
-    "error" -> MiuixColorTokens.Error
-    else -> MiuixTheme.colorScheme.onSurfaceVariantSummary
+    "running", "pending" -> HyperTheme.colors.primary
+    "completed" -> HyperTheme.colors.success
+    "error" -> HyperTheme.colors.error
+    else -> HyperTheme.colors.textSecondary
   }
   Box(Modifier.size(7.dp).background(color, androidx.compose.foundation.shape.CircleShape))
 }
@@ -569,10 +606,10 @@ private fun CodePanel(text: String, highlight: Boolean = true, background: Color
       }
     }
   }
-  Column(Modifier.fillMaxWidth().background(background, miuixSquircleShape(12.dp)).padding(12.dp)) {
+  Column(Modifier.fillMaxWidth().background(HyperTheme.colors.codeSurface, miuixSquircleShape(12.dp)).padding(12.dp)) {
     SelectionContainer {
       BasicText(annotated, Modifier.horizontalScroll(rememberScrollState()),
-        style = MiuixTheme.textStyles.body2.copy(fontFamily = FontFamily.Monospace, fontSize = 13.sp, lineHeight = 20.sp))
+        style = MiuixTheme.textStyles.body2.copy(fontFamily = FontFamily.Monospace, fontSize = 13.sp, lineHeight = 20.sp, color = HyperTheme.colors.textPrimary))
     }
   }
 }

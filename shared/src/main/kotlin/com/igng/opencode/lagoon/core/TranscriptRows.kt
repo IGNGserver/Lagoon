@@ -60,6 +60,52 @@ object TranscriptRows {
     val entries = mutableListOf<Message>()
   }
 
+  private const val TURN_CACHE_CAPACITY = 256
+  private val turnRowCache = object : LinkedHashMap<String, Pair<String, List<TranscriptRow>>>(TURN_CACHE_CAPACITY, 0.75f, true) {
+    override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Pair<String, List<TranscriptRow>>>?): Boolean =
+      size > TURN_CACHE_CAPACITY
+  }
+
+  /**
+   * 为非展开态的历史 Turn 计算轻量结构签名：
+   * 当流式输出只更新最后一个 Turn 时，历史已完成 Turn 的投影结果直接 O(1) 复用，无需在每帧重复遍历和格式化。
+   */
+  private fun turnSignature(turn: Turn, working: Boolean, unverified: Boolean): String {
+    val sb = StringBuilder(128)
+    sb.append(turn.id).append('|').append(working).append('|').append(unverified).append('|')
+    turn.user?.let { u ->
+      sb.append("u:").append(u.id).append(':').append(u.queued).append(':').append(u.parts.size).append('|')
+    }
+    turn.shell?.let { s ->
+      sb.append("s:").append(s.id).append(':').append(s.parts.size).append('|')
+    }
+    turn.entries.forEach { msg ->
+      sb.append(msg.id).append(':').append(msg.completedAt ?: 0L).append(':')
+        .append(msg.finish.orEmpty()).append(':').append(msg.error?.hashCode() ?: 0).append(':')
+        .append(msg.retry?.hashCode() ?: 0).append(':').append(msg.parts.size)
+      msg.parts.forEach { p ->
+        sb.append(',').append(p.id).append(':').append(p.status).append(':')
+          .append(p.text.length).append(':').append(p.output.length).append(':')
+          .append(p.patch.length).append(':').append(p.attachments.size)
+      }
+      sb.append(';')
+    }
+    return sb.toString()
+  }
+
+  private fun cachedTurnRows(turn: Turn, turnKey: String, expanded: Set<String>, working: Boolean, unverified: Boolean): List<TranscriptRow> {
+    if (expanded.isNotEmpty()) return turnRows(turn, turnKey, expanded, working, unverified)
+    val sig = turnSignature(turn, working, unverified)
+    synchronized(turnRowCache) {
+      turnRowCache[turnKey]?.takeIf { it.first == sig }?.let { return it.second }
+    }
+    val built = turnRows(turn, turnKey, expanded, working, unverified)
+    synchronized(turnRowCache) {
+      turnRowCache[turnKey] = sig to built
+    }
+    return built
+  }
+
   /**
    * [revertMessageId] is the session's staged revert boundary: like the official timeline, messages
    * at or after it are hidden until the revert is cleared or committed.
@@ -124,7 +170,7 @@ object TranscriptRows {
     turns.forEachIndexed { index, turn ->
       if (index == 0 || turn.created - previousEnd >= TIME_GAP_MS) rows += TranscriptRow("time:${turn.id}", "time", text = formatTime(turn.created))
       previousEnd = (listOfNotNull(turn.user, turn.shell) + turn.entries).maxOf { it.completedAt ?: it.created }
-      rows += turnRows(turn, "turn:${turn.id}", expanded, working && !unverified && index == turns.lastIndex, unverified)
+      rows += cachedTurnRows(turn, "turn:${turn.id}", expanded, working && !unverified && index == turns.lastIndex, unverified)
     }
     return rows.withUniqueKeys()
   }

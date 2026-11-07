@@ -4,12 +4,12 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.igng.opencode.lagoon.core.*
 import top.yukonga.miuix.kmp.basic.*
 import top.yukonga.miuix.kmp.extra.SuperBottomSheet
-import top.yukonga.miuix.kmp.extra.SuperSwitch
 import top.yukonga.miuix.kmp.icon.MiuixIcons
 import top.yukonga.miuix.kmp.icon.extended.ContactsCircle
 import top.yukonga.miuix.kmp.theme.MiuixTheme
@@ -25,26 +25,6 @@ private val AGENT_OPTIONS = listOf("build", "plan")
 /** One row of a compact dropdown; a null [value] means "follow the session / default". */
 internal data class DropdownOption(val label: String, val value: String?, val selected: Boolean)
 
-/** Capsule plus an anchored MIUIX popup. */
-@Composable
-private fun Dropdown(
-  text: String,
-  options: List<DropdownOption>,
-  onSelect: (String?) -> Unit,
-  modifier: Modifier = Modifier,
-  enabled: Boolean = true,
-  leading: (@Composable () -> Unit)? = null,
-  maxTextWidth: Dp = 200.dp
-) {
-  var open by remember { mutableStateOf(false) }
-  Box(modifier) {
-    CapsuleSelector(text, { open = true }, enabled = enabled, leading = leading, maxTextWidth = maxTextWidth)
-    MenuPopup(open, { open = false }, listOf(MenuSection(options.map { option ->
-      MenuAction(option.label, selected = option.selected) { onSelect(option.value) }
-    })), alignment = PopupPositionProvider.Align.Start)
-  }
-}
-
 /** Agent selector: 默认 / build / plan. [iconOnly] is the collapsed pill's glyph button. */
 @Composable
 internal fun AgentSelector(
@@ -55,7 +35,6 @@ internal fun AgentSelector(
   iconOnly: Boolean = false
 ) {
   var open by remember { mutableStateOf(false) }
-  // 服务器自报的 agent 优先（自定义 agent 的实例不再只能选 build/plan）；接口不可用时退回内置两项。
   val choices = state.agents.ifEmpty { AGENT_OPTIONS.map { AgentChoice(it, "") } }
   val options = buildList {
     add(DropdownOption("默认 Agent", null, !state.agentChanged))
@@ -64,9 +43,9 @@ internal fun AgentSelector(
   Box(modifier) {
     if (iconOnly) IconButton(onClick = { open = true }, enabled = enabled) {
       Icon(MiuixIcons.ContactsCircle, "Agent：${state.agent ?: "默认"}", Modifier.size(22.dp),
-        tint = if (state.agentChanged) MiuixTheme.colorScheme.primary else MiuixTheme.colorScheme.onSurfaceVariantSummary)
+        tint = if (state.agentChanged) HyperTheme.colors.primary else HyperTheme.colors.textSecondary)
     } else CapsuleSelector(state.agent ?: "默认", { open = true }, enabled = enabled, maxTextWidth = 72.dp,
-      leading = { Icon(MiuixIcons.ContactsCircle, null, Modifier.size(16.dp), tint = if (state.agentChanged) MiuixTheme.colorScheme.primary else MiuixTheme.colorScheme.onSurfaceVariantSummary) })
+      leading = { Icon(MiuixIcons.ContactsCircle, null, Modifier.size(16.dp), tint = if (state.agentChanged) HyperTheme.colors.primary else HyperTheme.colors.textSecondary) })
     MenuPopup(open, { open = false }, listOf(MenuSection(options.map { option ->
       MenuAction(option.label, selected = option.selected) { controller.chooseAgent(option.value) }
     })), alignment = PopupPositionProvider.Align.Start)
@@ -116,9 +95,7 @@ internal fun VariantSelector(state: LagoonState, controller: LagoonController, m
 }
 
 /**
- * Per-server model allow-list.  The first visit is intentionally all-visible; changing one switch
- * materializes that complete list in [LagoonController], after which only checked rows are offered by
- * [ModelSelector].  The reset action removes the local filter and never changes server configuration.
+ * Per-server model allow-list, rendered with HyperOS 4 island card and switches.
  */
 @Composable
 internal fun ModelManagementSheet(state: LagoonState, controller: LagoonController, onDismiss: () -> Unit) {
@@ -139,14 +116,20 @@ internal fun ModelManagementSheet(state: LagoonState, controller: LagoonControll
             if (state.modelVisibilityConfigured) "已选择 $selectedCount/${catalog.size} 个模型"
             else "尚未配置过滤，当前显示服务器返回的全部 ${catalog.size} 个模型",
             Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
-            style = MiuixTheme.textStyles.footnote1.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+            style = HyperTheme.tabular(
+              MiuixTheme.textStyles.footnote1.copy(
+                fontWeight = FontWeight.Medium,
+                color = HyperTheme.colors.textSecondary
+              )
+            )
           )
         }
         item {
-          Card(Modifier.fillMaxWidth()) {
-            catalog.forEach { info ->
+          HyperCard(Modifier.fillMaxWidth().padding(horizontal = 8.dp), insidePadding = PaddingValues(vertical = 4.dp)) {
+            catalog.forEachIndexed { index, info ->
+              if (index > 0) HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
               val checked = !state.modelVisibilityConfigured || state.modelOverrides[info.key] == true
-              SuperSwitch(
+              HyperSwitchRow(
                 title = info.choice.label,
                 summary = buildString {
                   append(info.providerName)
@@ -163,7 +146,7 @@ internal fun ModelManagementSheet(state: LagoonState, controller: LagoonControll
           TextButton(
             text = "恢复显示全部模型",
             onClick = controller::resetModelVisibility,
-            modifier = Modifier.fillMaxWidth()
+            modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
           )
         }
       }

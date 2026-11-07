@@ -10,7 +10,7 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.igng.opencode.lagoon.core.*
 import top.yukonga.miuix.kmp.basic.*
@@ -40,22 +40,18 @@ internal fun HomeScopeSheet(
   if (state.browsePath != null) { DirectoryBrowserSheet(state, controller); return }
   var removing by remember { mutableStateOf<Project?>(null) }
   val online = state.enabledProfiles.count { profile ->
-    // Aggregate/group projections set `connected` to "any member connected"; only a single-server
-    // home can trust it for the current profile. Every other case reads that profile's snapshot.
     if (!state.multiServerView && profile.id == state.serverId) state.connected
     else allSnapshots[profile.id]?.connected == true
   }
   SuperBottomSheet(title = "选择范围", show = true, onDismissRequest = onDismiss) {
     LazyColumn(Modifier.fillMaxWidth().heightIn(max = 680.dp), contentPadding = PaddingValues(bottom = 16.dp)) {
-      // In a scoped home the title names the project/workspace, so its filter stays first; the
-      // device switch follows. The aggregate home has no project filter and leads with devices.
       if (!state.allServers) item {
         if (state.homeGroup != null) WorkspaceScopeSection(state, controller, onDismiss)
         else ProjectScopeSection(state, controller, onDismiss, onRemove = { removing = it })
       }
-      item { SmallTitle(if (state.allServers) "设备" else "切换设备", insideMargin = PaddingValues(horizontal = 16.dp, vertical = 8.dp)) }
+      item { HyperGroupTitle(if (state.allServers) "设备" else "切换设备") }
       item {
-        Card(Modifier.fillMaxWidth()) {
+        HyperCard(Modifier.fillMaxWidth().padding(horizontal = 8.dp), insidePadding = PaddingValues(vertical = 2.dp)) {
           ChoiceRow("全部设备", "${state.enabledProfiles.size} 个连接 · $online 在线", state.allServers) {
             controller.setAllServers(true)
             onDismiss()
@@ -63,31 +59,37 @@ internal fun HomeScopeSheet(
         }
       }
       if (state.deviceTabs.isNotEmpty()) {
-        item { SmallTitle("设备分组", insideMargin = PaddingValues(horizontal = 16.dp, vertical = 8.dp)) }
+        item { HyperGroupTitle("设备分组") }
         items(state.deviceTabs, key = { "group:${it.id}" }) { tab ->
-          GroupScopeRow(tab, state, allSnapshots, selected = state.homeGroupId == tab.group?.id,
+          GroupScopeRow(
+            tab, state, allSnapshots, selected = state.homeGroupId == tab.group?.id,
             onSelect = {
               if (state.homeGroupId != tab.group?.id) tab.group?.let { group -> controller.selectGroup(group.id) }
               onDismiss()
             },
-            onEdit = { tab.group?.let(onEditGroup) })
+            onEdit = { tab.group?.let(onEditGroup) }
+          )
         }
       }
-      item { SmallTitle("单台连接", insideMargin = PaddingValues(horizontal = 16.dp, vertical = 8.dp)) }
+      item { HyperGroupTitle("单台连接") }
       if (state.enabledProfiles.isEmpty()) item {
-        Text("没有启用的连接。请先在设备管理中启用一个连接。", Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
-          style = MiuixTheme.textStyles.footnote1.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
+        Text(
+          "没有启用的连接。请先在设备管理中启用一个连接。",
+          Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+          style = MiuixTheme.textStyles.footnote1.copy(color = HyperTheme.colors.textSecondary)
+        )
       } else items(state.enabledProfiles, key = { "profile:${it.id}" }) { profile ->
-        ProfileScopeRow(profile, state, allSnapshots,
-          selected = !state.allServers && state.homeGroupId == null && state.serverId == profile.id) {
-          // The selected single-server row needs no reconnect; group/all mode still enters it.
+        ProfileScopeRow(
+          profile, state, allSnapshots,
+          selected = !state.allServers && state.homeGroupId == null && state.serverId == profile.id
+        ) {
           if (state.multiServerView || profile.id != state.serverId) controller.connect(profile.id)
           onDismiss()
         }
       }
-      item { Spacer(Modifier.height(8.dp)) }
+      item { Spacer(Modifier.height(10.dp)) }
       item {
-        Card(Modifier.fillMaxWidth()) {
+        HyperCard(Modifier.fillMaxWidth().padding(horizontal = 8.dp), insidePadding = PaddingValues(vertical = 2.dp)) {
           ChoiceRow("设备与分组管理", "管理连接、分组与启用状态", false) {
             onManageDevices()
             onDismiss()
@@ -113,15 +115,15 @@ private fun GroupScopeRow(
     if (!state.multiServerView && profile.id == state.serverId) state.connected
     else allSnapshots[profile.id]?.connected == true
   }
-  Card(Modifier.fillMaxWidth()) {
-    BasicComponent(
+  HyperCard(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 3.dp), insidePadding = PaddingValues(vertical = 2.dp)) {
+    HyperRow(
       title = tab.label,
       summary = "${tab.profiles.size} 个连接 · $online 在线",
       onClick = onSelect,
-      endActions = {
-        if (selected) Icon(MiuixIcons.Ok, "已选择", Modifier.size(20.dp), tint = MiuixTheme.colorScheme.primary)
+      trailing = {
+        if (selected) Icon(MiuixIcons.Ok, "已选择", Modifier.size(20.dp), tint = HyperTheme.colors.primary)
         IconButton(onClick = onEdit, minWidth = 36.dp, minHeight = 36.dp) {
-          Icon(MiuixIcons.More, "编辑分组", Modifier.size(18.dp), tint = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+          Icon(MiuixIcons.More, "编辑分组", Modifier.size(18.dp), tint = HyperTheme.colors.textSecondary)
         }
       }
     )
@@ -141,11 +143,10 @@ private fun ProfileScopeRow(
   else allSnapshots[profile.id]?.connected == true
   val loading = if (!state.multiServerView && profile.id == state.serverId) state.loading
   else allSnapshots[profile.id]?.loading == true
-  // In a group/all projection `sessions` is the aggregate, so count this server from its own snapshot.
   val sessions = if (state.multiServerView) allSnapshots[profile.id]?.sessions.orEmpty() else state.sessions
   val count = sessions.count { it.visibleOnHome }
   val status = when { connected -> "已连接"; loading -> "连接中…"; else -> "未连接" }
-  Card(Modifier.fillMaxWidth()) {
+  HyperCard(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 3.dp), insidePadding = PaddingValues(vertical = 2.dp)) {
     ChoiceRow(profile.name, "${profile.connectionTypeLabel} · $status · $count 个会话", selected, onSelect)
   }
 }
@@ -166,25 +167,28 @@ private fun ProjectScopeSection(
   Column(Modifier.fillMaxWidth()) {
     if (state.projects.size > 8) TextField(query, { query = it }, label = "搜索项目",
       useLabelAsPlaceholder = true, modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp))
-    Card(Modifier.fillMaxWidth()) {
+    HyperCard(Modifier.fillMaxWidth().padding(horizontal = 8.dp), insidePadding = PaddingValues(vertical = 2.dp)) {
       ChoiceRow("全部会话", "${state.sessions.count { it.visibleOnHome }} 个会话", state.scopeProjectId == null) {
         controller.setScope(null)
         onDismiss()
       }
     }
-    SmallTitle("项目", insideMargin = PaddingValues(horizontal = 16.dp, vertical = 8.dp))
+    HyperGroupTitle("项目")
     if (projects.isEmpty()) Text("尚未添加项目。点下面的「添加服务器目录」，浏览服务器并选一个目录加入。",
-      Modifier.padding(16.dp), style = MiuixTheme.textStyles.footnote1.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
-    else Card(Modifier.fillMaxWidth()) {
-      projects.forEach { project ->
-        ProjectChoiceRow(project, "${HomeScope.displayPath(project.directory, null)} · ${counts[project.key] ?: 0} 个会话",
+      Modifier.padding(16.dp), style = MiuixTheme.textStyles.footnote1.copy(color = HyperTheme.colors.textSecondary))
+    else HyperCard(Modifier.fillMaxWidth().padding(horizontal = 8.dp), insidePadding = PaddingValues(vertical = 2.dp)) {
+      projects.forEachIndexed { index, project ->
+        if (index > 0) HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
+        ProjectChoiceRow(
+          project, "${HomeScope.displayPath(project.directory, null)} · ${counts[project.key] ?: 0} 个会话",
           state.scopeProjectId == project.id,
           onSelect = { controller.setScope(project.id); onDismiss() },
-          onRemove = { onRemove(project) })
+          onRemove = { onRemove(project) }
+        )
       }
     }
-    Spacer(Modifier.height(12.dp))
-    Card(Modifier.fillMaxWidth()) {
+    Spacer(Modifier.height(10.dp))
+    HyperCard(Modifier.fillMaxWidth().padding(horizontal = 8.dp), insidePadding = PaddingValues(vertical = 2.dp)) {
       ChoiceRow("添加服务器目录…", "浏览服务器目录并添加为项目", false) { controller.openDirectoryBrowser() }
     }
   }
@@ -198,17 +202,18 @@ private fun WorkspaceScopeSection(state: LagoonState, controller: LagoonControll
     deviceWorkspaces(state.sessions, state.projects, group.id)
   }
   Column(Modifier.fillMaxWidth()) {
-    Card(Modifier.fillMaxWidth()) {
+    HyperCard(Modifier.fillMaxWidth().padding(horizontal = 8.dp), insidePadding = PaddingValues(vertical = 2.dp)) {
       ChoiceRow("全部会话", "${state.sessions.count { it.visibleOnHome }} 个会话", state.scopeWorkspaceKey == null) {
         controller.setWorkspaceScope(null)
         onDismiss()
       }
     }
-    SmallTitle("工作区", insideMargin = PaddingValues(horizontal = 16.dp, vertical = 8.dp))
+    HyperGroupTitle("工作区")
     if (workspaces.isEmpty()) Text("这个设备还没有工作区。先在对应 harness 中添加项目目录。", Modifier.padding(16.dp),
-      style = MiuixTheme.textStyles.footnote1.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
-    else Card(Modifier.fillMaxWidth()) {
-      workspaces.forEach { workspace ->
+      style = MiuixTheme.textStyles.footnote1.copy(color = HyperTheme.colors.textSecondary))
+    else HyperCard(Modifier.fillMaxWidth().padding(horizontal = 8.dp), insidePadding = PaddingValues(vertical = 2.dp)) {
+      workspaces.forEachIndexed { index, workspace ->
+        if (index > 0) HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
         ChoiceRow(
           title = workspace.name,
           summary = listOfNotNull(
@@ -231,15 +236,15 @@ private fun WorkspaceScopeSection(state: LagoonState, controller: LagoonControll
 private fun ProjectChoiceRow(project: Project, summary: String, selected: Boolean, onSelect: () -> Unit, onRemove: (() -> Unit)? = null) {
   var menu by remember { mutableStateOf(false) }
   Box {
-    BasicComponent(
+    HyperRow(
       title = project.name,
       summary = summary,
       onClick = onSelect,
-      endActions = {
-        if (selected) Icon(MiuixIcons.Ok, "已选择", Modifier.size(20.dp), tint = MiuixTheme.colorScheme.primary)
+      trailing = {
+        if (selected) Icon(MiuixIcons.Ok, "已选择", Modifier.size(20.dp), tint = HyperTheme.colors.primary)
         onRemove?.let {
           IconButton(onClick = { menu = true }, minWidth = 36.dp, minHeight = 36.dp) {
-            Icon(MiuixIcons.More, "项目操作", Modifier.size(18.dp), tint = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+            Icon(MiuixIcons.More, "项目操作", Modifier.size(18.dp), tint = HyperTheme.colors.textSecondary)
           }
         }
       }
@@ -286,15 +291,18 @@ internal fun DirectoryBrowserSheet(state: LagoonState, controller: LagoonControl
     Column(Modifier.fillMaxWidth().heightIn(max = 620.dp)) {
       Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
         crumbs.forEachIndexed { index, (label, target) ->
-          if (index > 0) Text("/", Modifier.padding(horizontal = 4.dp), style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
+          if (index > 0) Text("/", Modifier.padding(horizontal = 4.dp), style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary))
           Text(label.ifBlank { "/" }, Modifier.clickable { controller.browseDirectory(target) },
-            style = MiuixTheme.textStyles.footnote2.copy(color = if (index == crumbs.lastIndex) MiuixTheme.colorScheme.primary else MiuixTheme.colorScheme.onSurfaceVariantSummary))
+            style = MiuixTheme.textStyles.footnote2.copy(
+              fontWeight = if (index == crumbs.lastIndex) FontWeight.SemiBold else FontWeight.Normal,
+              color = if (index == crumbs.lastIndex) HyperTheme.colors.primary else HyperTheme.colors.textSecondary
+            ))
         }
-        if (crumbs.isEmpty()) Text("正在定位服务器目录…", style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
+        if (crumbs.isEmpty()) Text("正在定位服务器目录…", style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary))
       }
       TextField(query, { query = it; controller.searchDirectories(it) }, label = "搜索目录或文件", useLabelAsPlaceholder = true, modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp))
-      Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 2.dp), verticalAlignment = Alignment.CenterVertically) {
-        Text("显示隐藏目录", Modifier.weight(1f), style = MiuixTheme.textStyles.footnote1.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
+      Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+        Text("显示隐藏目录", Modifier.weight(1f), style = MiuixTheme.textStyles.footnote1.copy(color = HyperTheme.colors.textSecondary))
         Switch(checked = state.browseShowHidden, onCheckedChange = { controller.setBrowseShowHidden(it) })
       }
       if (searching) {
@@ -305,33 +313,33 @@ internal fun DirectoryBrowserSheet(state: LagoonState, controller: LagoonControl
           results.isNotEmpty() -> LazyColumn(Modifier.fillMaxWidth()) {
             items(results, key = { it }) { result ->
               val name = result.trimEnd('/').substringAfterLast('/')
-              BasicComponent(title = name.ifBlank { result }, summary = result, onClick = { controller.browseDirectory(childPath(path, result)) })
+              HyperRow(title = name.ifBlank { result }, summary = result, showChevron = true, onClick = { controller.browseDirectory(childPath(path, result)) })
             }
           }
           state.browseSearch.isNotEmpty() && !state.browseShowHidden -> Text("匹配项均为隐藏项，开启「显示隐藏目录」后可见",
-            Modifier.padding(16.dp), style = MiuixTheme.textStyles.footnote1.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
-          else -> Text("没有匹配项", Modifier.padding(16.dp), style = MiuixTheme.textStyles.footnote1.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
+            Modifier.padding(16.dp), style = MiuixTheme.textStyles.footnote1.copy(color = HyperTheme.colors.textSecondary))
+          else -> Text("没有匹配项", Modifier.padding(16.dp), style = MiuixTheme.textStyles.footnote1.copy(color = HyperTheme.colors.textSecondary))
         }
       } else {
         ResourceHint(state.resource("browse"), "这个目录是空的", retry = { if (path.isNotBlank()) controller.browseDirectory(path) })
         LazyColumn(Modifier.fillMaxWidth().weight(1f)) {
           if (path.isNotBlank() && path.trimEnd('/') != "") item(key = "..") {
-            BasicComponent(title = "上级目录", summary = HomeScope.parent(path), onClick = { controller.browseDirectory(HomeScope.parent(path)) })
+            HyperRow(title = "上级目录", summary = HomeScope.parent(path), showChevron = true, onClick = { controller.browseDirectory(HomeScope.parent(path)) })
           }
           if (entries.isEmpty() && state.browseEntries.isNotEmpty() && !state.browseShowHidden) item(key = "hidden-only") {
             Text("此目录只有隐藏项，开启「显示隐藏目录」后可见", Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
-              style = MiuixTheme.textStyles.footnote1.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
+              style = MiuixTheme.textStyles.footnote1.copy(color = HyperTheme.colors.textSecondary))
           }
           items(entries, key = { it.path }) { node ->
             val directory = node.type == "directory"
-            if (directory) BasicComponent(title = node.path.trimEnd('/').substringAfterLast('/').ifBlank { node.path }, summary = "文件夹",
+            if (directory) HyperRow(title = node.path.trimEnd('/').substringAfterLast('/').ifBlank { node.path }, summary = "文件夹", showChevron = true,
               onClick = { controller.browseDirectory(childPath(path, node.path)) })
-            else BasicComponent(title = node.path.substringAfterLast('/').ifBlank { node.path }, summary = node.path)
+            else HyperRow(title = node.path.substringAfterLast('/').ifBlank { node.path }, summary = node.path, enabled = false)
           }
         }
       }
       if (path.isNotBlank() && !searching) {
-        Card(Modifier.fillMaxWidth().padding(16.dp)) {
+        HyperCard(Modifier.fillMaxWidth().padding(16.dp), insidePadding = PaddingValues(vertical = 2.dp)) {
           ChoiceRow("添加「${path.trimEnd('/').substringAfterLast('/').ifBlank { path }}」为项目", HomeScope.displayPath(path, null), false) {
             controller.addProject(path)
           }

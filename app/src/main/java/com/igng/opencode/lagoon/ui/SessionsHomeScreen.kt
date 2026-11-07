@@ -4,8 +4,10 @@ import android.content.Context
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -17,15 +19,12 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
-import androidx.compose.foundation.gestures.awaitEachGesture
-import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -40,12 +39,10 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
 import top.yukonga.miuix.kmp.utils.overScrollVertical
 
 /**
- * 会话首页，结构对齐 Qoder 的任务列表：标题「全部设备 ⌄」打开统一范围面板（全部设备 / 设备分组 /
- * 单台连接，以及当前服务器的项目或工作区），右上角 ⋯ 收纳分组方式、搜索与设置。首页不再有横向的
- * 服务器胶囊行：标题旁的小圆点聚合当前范围的连接健康。列表按日期 / 项目 / 状态分组且每组可收起，
- * 长按会话弹出置顶 / 重命名 / 删除，右下角悬浮按钮新建会话。
- * 状态与未读语义沿用 docs/HOME_REDESIGN.md（未读账本、父链汇总）；日期分组按状态优先级排序，
- * 其他分组仍保持活动时间顺序。
+ * 会话首页（澎湃 OS 4 分组岛式架构）：
+ * - 顶栏采用磨砂玻璃层 + 高辨识度范围胶囊（含连接健康度与在线统计），点按打开统一范围面板（onScope）；
+ * - 顶部动态「待处理 / 运行中」焦点岛（GlobalTaskStrip），支持一键聚焦或查看全部；
+ * - 分组岛式会话卡片列表（HomeSessionRow），内联展示实时执行工具摘要、状态角标与等宽相对时间。
  */
 @Composable
 internal fun HomeScreen(
@@ -76,24 +73,40 @@ internal fun HomeScreen(
     if (key != null && groupWorkspaces.none { it.key == key }) controller.setWorkspaceScope(null)
   }
   BackHandler(enabled = searching) { closeSearch() }
-  Box(Modifier.fillMaxSize()) {
+  Box(Modifier.fillMaxSize().background(HyperTheme.colors.canvas)) {
     Column(Modifier.fillMaxSize()) {
       if (searching) SearchTopBar(query, { query = it }, ::closeSearch)
       else HomeTopBar(
-         title = when {
-           state.allServers -> "全部设备"
-           scopeWorkspace != null -> scopeWorkspace.name
-           state.homeGroup != null -> state.homeGroup!!.name
-           else -> state.scopeProjectId?.let { id -> state.projects.firstOrNull { it.id == id }?.name }
-             ?: state.server?.name ?: "全部会话"
-         },
+        title = when {
+          state.allServers -> "全部设备"
+          scopeWorkspace != null -> scopeWorkspace.name
+          state.homeGroup != null -> state.homeGroup!!.name
+          else -> state.scopeProjectId?.let { id -> state.projects.firstOrNull { it.id == id }?.name }
+            ?: state.server?.name ?: "全部会话"
+        },
+        scopeSummary = homeScopeSummary(state),
         statusDot = homeScopeDot(state),
         onTitleClick = onScope,
         action = if (hasUnread) {
           {
-            Text("全部已读", Modifier.clip(CircleShape).clickable(role = Role.Button) { controller.markAllRead() }
-              .padding(horizontal = 12.dp, vertical = 10.dp), maxLines = 1,
-              style = MiuixTheme.textStyles.body2.copy(color = MiuixTheme.colorScheme.primary))
+            val pillShape = miuixSquircleShape(14.dp)
+            Box(
+              Modifier
+                .clip(pillShape)
+                .background(HyperTheme.colors.primarySubtle, pillShape)
+                .border(0.5.dp, HyperTheme.colors.primary.copy(alpha = 0.25f), pillShape)
+                .hyperPress(scaleDown = 0.94f) { controller.markAllRead() }
+                .padding(horizontal = 12.dp, vertical = 8.dp)
+            ) {
+              Text(
+                "全部已读",
+                maxLines = 1,
+                style = MiuixTheme.textStyles.footnote1.copy(
+                  fontWeight = FontWeight.SemiBold,
+                  color = HyperTheme.colors.primary
+                )
+              )
+            }
           }
         } else null,
         menu = {
@@ -101,7 +114,10 @@ internal fun HomeScreen(
             CircleIconButton(MiuixIcons.More, "更多", { menu = true })
             MenuPopup(menu, { menu = false }, buildList {
               add(MenuSection(HomeGrouping.entries.map { option ->
-                MenuAction(option.label, selected = grouping == option) { grouping = option; preferences.edit().putString("homeGrouping", option.name).apply() }
+                MenuAction(option.label, selected = grouping == option) {
+                  grouping = option
+                  preferences.edit().putString("homeGrouping", option.name).apply()
+                }
               }, title = "分组方式"))
               if (serverReadCount > 0 || state.serverReadPending) add(MenuSection(listOf(
                 MenuAction(if (state.serverReadPending) "正在同步服务端已读…" else "服务端已读 · $serverReadCount") {
@@ -117,15 +133,32 @@ internal fun HomeScreen(
           }
         }
       )
-      if (!searching) GlobalTaskStrip(state, controller)
+      if (!searching) GlobalTaskStrip(state, controller, onOpen = onOpen)
       if (!state.multiServerView) ConnectionStrip(state, controller)
       Box(Modifier.weight(1f).fillMaxWidth()) {
-        SessionList(state, controller, grouping, query.trim(), onOpen, onNewSession, onManageDevices,
-          onRename = { renaming = it }, onDelete = { deleting = it })
+        SessionList(
+          state, controller, grouping, query.trim(), onOpen, onNewSession, onManageDevices,
+          onRename = { renaming = it }, onDelete = { deleting = it }
+        )
       }
     }
-    if (!searching) FloatingActionButton(onClick = onNewSession, modifier = Modifier.align(Alignment.BottomEnd).navigationBarsPadding().padding(end = 24.dp, bottom = 24.dp)) {
-      Icon(MiuixIcons.Add, "新建会话", Modifier.size(26.dp), tint = MiuixTheme.colorScheme.onPrimary)
+    if (!searching) {
+      val fabShape = miuixSquircleShape(20.dp)
+      Box(
+        modifier = Modifier
+          .align(Alignment.BottomEnd)
+          .navigationBarsPadding()
+          .padding(end = 22.dp, bottom = 22.dp)
+          .size(58.dp)
+          .shadow(14.dp, fabShape, ambientColor = HyperTheme.colors.primary.copy(alpha = 0.35f), spotColor = HyperTheme.colors.primary.copy(alpha = 0.35f))
+          .clip(fabShape)
+          .background(HyperTheme.colors.primary, fabShape)
+          .border(0.8.dp, Color.White.copy(alpha = 0.22f), fabShape)
+          .hyperPress(scaleDown = 0.92f, onClick = onNewSession),
+        contentAlignment = Alignment.Center
+      ) {
+        Icon(MiuixIcons.Add, "新建会话", Modifier.size(26.dp), tint = HyperTheme.colors.onPrimary)
+      }
     }
   }
   renaming?.let { session -> RenameSessionDialog(state, controller, session) { renaming = null } }
@@ -146,49 +179,129 @@ internal fun HomeScreen(
 private fun SearchTopBar(query: String, onQuery: (String) -> Unit, onClose: () -> Unit) {
   val focus = remember { FocusRequester() }
   LaunchedEffect(Unit) { focus.requestFocus() }
-  Row(Modifier.fillMaxWidth().statusBarsPadding().heightIn(min = 64.dp).padding(start = 12.dp, end = 4.dp, top = 8.dp, bottom = 4.dp),
-    verticalAlignment = Alignment.CenterVertically) {
-    InputField(query = query, onQueryChange = onQuery, onSearch = {}, expanded = true, onExpandedChange = {}, label = "搜索会话标题或项目",
-      modifier = Modifier.weight(1f).focusRequester(focus))
-    Text("取消", Modifier.clip(CircleShape).clickable(role = Role.Button, onClick = onClose).padding(horizontal = 12.dp, vertical = 10.dp),
-      style = MiuixTheme.textStyles.body1.copy(color = MiuixTheme.colorScheme.primary))
+  Column(Modifier.fillMaxWidth().background(HyperTheme.colors.glassChrome)) {
+    Row(
+      Modifier
+        .fillMaxWidth()
+        .statusBarsPadding()
+        .heightIn(min = 64.dp)
+        .padding(start = 12.dp, end = 8.dp, top = 8.dp, bottom = 6.dp),
+      verticalAlignment = Alignment.CenterVertically
+    ) {
+      InputField(
+        query = query,
+        onQueryChange = onQuery,
+        onSearch = {},
+        expanded = true,
+        onExpandedChange = {},
+        label = "搜索会话标题或项目",
+        modifier = Modifier.weight(1f).focusRequester(focus)
+      )
+      Text(
+        "取消",
+        Modifier
+          .clip(CircleShape)
+          .hyperPress(onClick = onClose)
+          .padding(horizontal = 12.dp, vertical = 10.dp),
+        style = MiuixTheme.textStyles.body1.copy(
+          fontWeight = FontWeight.SemiBold,
+          color = HyperTheme.colors.primary
+        )
+      )
+    }
+    HorizontalDivider(color = HyperTheme.colors.divider)
   }
 }
 
 /**
- * The in-app counterpart of the system island. The island is server-wide and project-wide; the
- * session list below is filtered (single server / one project / archived hidden), so this strip is
- * the only place where the two scopes are visible next to each other. It uses the exact same
- * `globalSummary` (notification-enabled servers, offline TTL applied) as the notification.
+ * 澎湃 OS 4 顶部动态焦点岛（Focus Island）：
+ * 聚合跨设备/项目的待处理（权限/问答）与运行中任务摘要，支持一键跳转至最急需处理的会话或切换至全部视图。
  */
 @Composable
-private fun GlobalTaskStrip(state: LagoonState, controller: LagoonController) {
+private fun GlobalTaskStrip(
+  state: LagoonState,
+  controller: LagoonController,
+  onOpen: (SessionTarget) -> Unit = {}
+) {
   val grouped = state.homeGroup != null
   val summary = if (grouped) state.summary else state.globalSummary
   val silent = state.silentServersWithTasks()
   if (summary.isEmpty && silent.isEmpty()) return
-  val muted = MiuixTheme.colorScheme.onSurfaceVariantSummary
+  val hasWaiting = summary.waiting > 0
+  val accentColor = when {
+    hasWaiting -> HyperTheme.colors.warning
+    summary.running > 0 -> HyperTheme.colors.primary
+    else -> HyperTheme.colors.success
+  }
+  val islandBg = when {
+    hasWaiting -> HyperTheme.colors.warningSubtle
+    summary.running > 0 -> HyperTheme.colors.primarySubtle
+    else -> HyperTheme.colors.cardElevated
+  }
+  val islandShape = miuixSquircleShape(18.dp)
+  val target = state.summaryTarget
   Column(
-    Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 4.dp),
-    verticalArrangement = Arrangement.spacedBy(2.dp)
+    modifier = Modifier
+      .fillMaxWidth()
+      .padding(horizontal = 14.dp, vertical = 6.dp)
+      .clip(islandShape)
+      .background(islandBg, islandShape)
+      .border(0.7.dp, accentColor.copy(alpha = 0.28f), islandShape)
+      .then(if (target != null) Modifier.hyperPress { onOpen(target) } else Modifier)
+      .padding(horizontal = 14.dp, vertical = 10.dp),
+    verticalArrangement = Arrangement.spacedBy(4.dp)
   ) {
     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-      Text(if (grouped) "${state.homeGroup?.name.orEmpty()} · 全部项目" else "全部设备 · 全部项目",
-        Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis,
-        style = MiuixTheme.textStyles.footnote2.copy(color = muted))
+      Box(Modifier.size(7.dp).background(accentColor, CircleShape))
+      Spacer(Modifier.width(8.dp))
+      Text(
+        if (grouped) "${state.homeGroup?.name.orEmpty()} · 全部项目" else "全部设备 · 全部项目",
+        Modifier.weight(1f),
+        maxLines = 1,
+        overflow = TextOverflow.Ellipsis,
+        style = MiuixTheme.textStyles.footnote2.copy(
+          fontWeight = FontWeight.SemiBold,
+          color = HyperTheme.colors.textSecondary
+        )
+      )
       if (state.showsGlobalViewAll()) {
-        Text("查看全部", Modifier.clip(CircleShape).clickable(role = Role.Button) {
-          controller.setScope(null)
-          controller.setAllServers(true)
-        }.padding(horizontal = 9.dp, vertical = 6.dp), maxLines = 1,
-          style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.primary))
+        Text(
+          "查看全部",
+          Modifier
+            .clip(CircleShape)
+            .hyperPress(scaleDown = 0.94f) {
+              controller.setScope(null)
+              controller.setAllServers(true)
+            }
+            .padding(horizontal = 8.dp, vertical = 2.dp),
+          maxLines = 1,
+          style = MiuixTheme.textStyles.footnote2.copy(
+            fontWeight = FontWeight.SemiBold,
+            color = HyperTheme.colors.primary
+          )
+        )
       }
     }
-    if (!summary.isEmpty) Text(summary.countLine, maxLines = 2, overflow = TextOverflow.Ellipsis,
-      style = MiuixTheme.textStyles.footnote1.copy(fontWeight = FontWeight.Medium, color = MiuixTheme.colorScheme.onSurface))
+    if (!summary.isEmpty) {
+      Text(
+        summary.countLine,
+        maxLines = 2,
+        overflow = TextOverflow.Ellipsis,
+        style = HyperTheme.tabular(
+          MiuixTheme.textStyles.footnote1.copy(
+            fontWeight = FontWeight.SemiBold,
+            color = HyperTheme.colors.textPrimary
+          )
+        )
+      )
+    }
     if (silent.isNotEmpty()) {
-      Text("通知已关闭：${silent.joinToString("、")}（未计入灵动岛）", maxLines = 2, overflow = TextOverflow.Ellipsis,
-        style = MiuixTheme.textStyles.footnote2.copy(color = MiuixColorTokens.Warning))
+      Text(
+        "通知已关闭：${silent.joinToString("、")}（未计入灵动岛）",
+        maxLines = 2,
+        overflow = TextOverflow.Ellipsis,
+        style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.warning)
+      )
     }
   }
 }
@@ -196,32 +309,91 @@ private fun GlobalTaskStrip(state: LagoonState, controller: LagoonController) {
 @Composable
 private fun HomeTopBar(
   title: String,
+  scopeSummary: String?,
   statusDot: Color?,
   onTitleClick: () -> Unit,
   action: (@Composable () -> Unit)? = null,
   menu: @Composable () -> Unit
 ) {
-  Row(Modifier.fillMaxWidth().statusBarsPadding().heightIn(min = 64.dp).padding(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 4.dp),
-    verticalAlignment = Alignment.CenterVertically) {
-    Box(Modifier.weight(1f)) {
-    Row(Modifier.clip(CircleShape).clickable(role = Role.Button, onClick = onTitleClick).padding(horizontal = 8.dp, vertical = 6.dp),
-      verticalAlignment = Alignment.CenterVertically) {
-      Icon(MiuixIcons.GridView, null, Modifier.size(26.dp), tint = MiuixTheme.colorScheme.onSurface)
-      Spacer(Modifier.width(10.dp))
-      Text(title, Modifier.weight(1f, fill = false), maxLines = 1, overflow = TextOverflow.Ellipsis,
-        style = MiuixTheme.textStyles.title2.copy(fontWeight = FontWeight.Medium, color = MiuixTheme.colorScheme.onSurface))
-      statusDot?.let {
-        Spacer(Modifier.width(6.dp))
-        StatusDot(it)
+  Column(Modifier.fillMaxWidth().background(HyperTheme.colors.glassChrome)) {
+    Row(
+      Modifier
+        .fillMaxWidth()
+        .statusBarsPadding()
+        .heightIn(min = 64.dp)
+        .padding(start = 14.dp, end = 14.dp, top = 8.dp, bottom = 8.dp),
+      verticalAlignment = Alignment.CenterVertically
+    ) {
+      Box(Modifier.weight(1f)) {
+        val pillShape = miuixSquircleShape(18.dp)
+        Row(
+          Modifier
+            .clip(pillShape)
+            .background(HyperTheme.colors.cardElevated, pillShape)
+            .border(0.6.dp, HyperTheme.colors.cardBorder, pillShape)
+            .hyperPress(scaleDown = 0.96f, onClick = onTitleClick)
+            .padding(horizontal = 12.dp, vertical = 8.dp),
+          verticalAlignment = Alignment.CenterVertically
+        ) {
+          Icon(MiuixIcons.GridView, null, Modifier.size(22.dp), tint = HyperTheme.colors.primary)
+          Spacer(Modifier.width(10.dp))
+          Column(Modifier.weight(1f, fill = false)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+              Text(
+                title,
+                Modifier.weight(1f, fill = false),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                style = MiuixTheme.textStyles.title3.copy(
+                  fontWeight = FontWeight.Bold,
+                  color = HyperTheme.colors.textPrimary
+                )
+              )
+              statusDot?.let {
+                Spacer(Modifier.width(6.dp))
+                StatusDot(it)
+              }
+            }
+            if (!scopeSummary.isNullOrBlank()) {
+              Text(
+                scopeSummary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                style = HyperTheme.tabular(
+                  MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary)
+                )
+              )
+            }
+          }
+          Spacer(Modifier.width(6.dp))
+          DropdownChevron(18.dp, HyperTheme.colors.textSecondary, "切换范围")
+        }
       }
-      Spacer(Modifier.width(4.dp))
-      DropdownChevron(20.dp, MiuixTheme.colorScheme.onSurface, "切换范围")
+      Spacer(Modifier.width(8.dp))
+      if (action != null) {
+        action()
+        Spacer(Modifier.width(6.dp))
+      }
+      menu()
     }
-    }
-    Spacer(Modifier.width(8.dp))
-    if (action != null) { action(); Spacer(Modifier.width(2.dp)) }
-    menu()
+    HorizontalDivider(color = HyperTheme.colors.divider)
   }
+}
+
+@Composable
+private fun homeScopeSummary(state: LagoonState): String? {
+  val profiles = when {
+    state.allServers -> state.enabledProfiles
+    state.homeGroupId != null -> state.deviceTabs.firstOrNull { it.group?.id == state.homeGroupId }?.profiles.orEmpty()
+    else -> listOfNotNull(state.server)
+  }
+  if (profiles.isEmpty()) return "未启用设备"
+  fun connected(profile: ServerProfile): Boolean =
+    if (!state.multiServerView && profile.id == state.serverId) state.connected
+    else state.allServerSnapshots[profile.id]?.connected == true
+  val online = profiles.count(::connected)
+  return if (state.multiServerView) "${online}/${profiles.size} 台在线"
+  else if (online > 0) "已连接" else if (state.loading) "正在连接…" else "未连接"
 }
 
 /**
@@ -236,8 +408,6 @@ private fun homeScopeDot(state: LagoonState): Color? {
     state.homeGroupId != null -> state.deviceTabs.firstOrNull { it.group?.id == state.homeGroupId }?.profiles.orEmpty()
     else -> listOfNotNull(state.server)
   }
-  // Aggregate/group projections expose "any member connected", not the active profile's state; the
-  // per-profile snapshot is the only truthful source there. A single-server home can use its live one.
   fun connected(profile: ServerProfile): Boolean =
     if (!state.multiServerView && profile.id == state.serverId) state.connected
     else state.allServerSnapshots[profile.id]?.connected == true
@@ -253,15 +423,21 @@ private fun homeScopeDot(state: LagoonState): Color? {
   return when {
     anyConnected && anyStreaming -> MiuixColorTokens.Success
     anyConnected || anyLoading -> MiuixColorTokens.Warning
-    else -> MiuixTheme.colorScheme.onSurfaceVariantSummary
+    else -> HyperTheme.colors.textTertiary
   }
 }
 
 @Composable
 private fun SessionList(
-  state: LagoonState, controller: LagoonController, grouping: HomeGrouping, query: String,
-   onOpen: (SessionTarget) -> Unit, onNewSession: () -> Unit, onManageDevices: () -> Unit,
-  onRename: (Session) -> Unit, onDelete: (Session) -> Unit
+  state: LagoonState,
+  controller: LagoonController,
+  grouping: HomeGrouping,
+  query: String,
+  onOpen: (SessionTarget) -> Unit,
+  onNewSession: () -> Unit,
+  onManageDevices: () -> Unit,
+  onRename: (Session) -> Unit,
+  onDelete: (Session) -> Unit
 ) {
   var refreshing by remember { mutableStateOf(false) }
   val refreshScope = rememberCoroutineScope()
@@ -275,12 +451,9 @@ private fun SessionList(
   val unseen = remember(state.notices, state.allUnseenSessions, state.multiServerView) {
     if (state.multiServerView) state.allUnseenSessions else state.notices.filterNot { it.viewed }.map { it.sessionId }.toSet()
   }
-  // Display-only workspace labels. They never filter, sort, or choose a new-session target.
   val workspaceLabels = remember(state.sessions, state.projects, state.workspaceCatalog, state.allServerSnapshots, state.serverId) {
     sessionWorkspaceLabels(state.sessions, state.projects) { session -> state.workspaceCatalogFor(session) }
   }
-  // Remembered on their inputs: the home list used to regroup on every state change (each streamed
-  // event of any open conversation), not only when sessions, statuses or the filter changed.
   val roots = remember(state.sessions, state.projects, state.scopeProjectId, state.scopeWorkspaceKey, state.homeGroupId, query, workspaceLabels) {
     val workspaceScope = state.scopeWorkspaceKey
     val groupId = state.homeGroupId
@@ -293,8 +466,6 @@ private fun SessionList(
           workspaceLabels[session.key]?.name?.contains(query, true) == true
       }
   }
-  // Status is an input: the DATE view promotes live/unread rows and ranks each date section by it,
-  // so a status change must reorder immediately instead of waiting for the 60-second clock tick.
   val sections = remember(grouping, roots, state.projects, statuses, state.pinned, state.homeGroup?.id, now) {
     val group = state.homeGroup
     if (group != null && grouping == HomeGrouping.PROJECT) {
@@ -306,19 +477,14 @@ private fun SessionList(
       }
     } else HomeSections.build(grouping, roots, state.projects, statuses, state.pinned, now)
   }
-  // Priority changes can move rows (or promote an unread result into 今天). While the reader touches
-  // or scrolls the list the order is held, so the row under the finger is still the one they meant
-  // when they lift it; statuses stay live. Moves then animate instead of jumping.
   var touching by remember { mutableStateOf(false) }
   val latestSections by rememberUpdatedState(sections)
   var shownSections by remember { mutableStateOf(sections) }
   LaunchedEffect(list) {
     snapshotFlow { (touching || list.isScrollInProgress) to latestSections }.collect { (held, next) -> if (!held) shownSections = next }
   }
-  // Grouping or the search changing is the reader's own action: show it at once.
   LaunchedEffect(grouping, query) { shownSections = latestSections }
   val visibleSections = if (touching || list.isScrollInProgress) shownSections else sections
-  // Older sessions load as the end of the list comes near; a failed page waits until the reader scrolls back.
   val nearEnd by remember { derivedStateOf {
     val info = list.layoutInfo
     val last = info.visibleItemsInfo.lastOrNull()
@@ -333,96 +499,172 @@ private fun SessionList(
       controller.loadMoreSessions()
     }
   }
-  val muted = MiuixTheme.colorScheme.onSurfaceVariantSummary
+  val muted = HyperTheme.colors.textSecondary
 
-  PullToRefresh(isRefreshing = refreshing, onRefresh = { refreshing = true; refreshScope.launch { controller.reload().join(); refreshing = false } },
-    refreshTexts = listOf("下拉刷新", "松开刷新", "正在刷新…", "已刷新")) {
-    LazyColumn(Modifier.fillMaxSize().overScrollVertical().pointerInput(Unit) {
-      awaitEachGesture {
-        awaitFirstDown(requireUnconsumed = false)
-        touching = true
-        try { do { val event = awaitPointerEvent() } while (event.changes.any { it.pressed }) } finally { touching = false }
+  PullToRefresh(
+    isRefreshing = refreshing,
+    onRefresh = { refreshing = true; refreshScope.launch { controller.reload().join(); refreshing = false } },
+    refreshTexts = listOf("下拉刷新", "松开刷新", "正在刷新…", "已刷新")
+  ) {
+    LazyColumn(
+      Modifier
+        .fillMaxSize()
+        .overScrollVertical()
+        .pointerInput(Unit) {
+          awaitEachGesture {
+            awaitFirstDown(requireUnconsumed = false)
+            touching = true
+            try { do { val event = awaitPointerEvent() } while (event.changes.any { it.pressed }) } finally { touching = false }
+          }
+        },
+      state = list,
+      contentPadding = PaddingValues(top = 6.dp, bottom = 120.dp)
+    ) {
+      state.homeSyncNotice()?.let { notice ->
+        item(key = "sync") {
+          Text(
+            notice,
+            style = MiuixTheme.textStyles.footnote1,
+            color = MiuixColorTokens.Warning,
+            modifier = Modifier
+              .fillMaxWidth()
+              .clickable(role = Role.Button) { controller.reload() }
+              .padding(horizontal = 20.dp, vertical = 8.dp)
+          )
+        }
       }
-    }, state = list, contentPadding = PaddingValues(top = 4.dp, bottom = 120.dp)) {
-      state.homeSyncNotice()?.let { notice -> item(key = "sync") {
-        Text(notice, style = MiuixTheme.textStyles.footnote1, color = MiuixColorTokens.Warning,
-          modifier = Modifier.fillMaxWidth().clickable(role = Role.Button) { controller.reload() }.padding(horizontal = 24.dp, vertical = 8.dp))
-      } }
       visibleSections.forEach { section ->
-        // While searching every match stays visible, whatever was collapsed.
         val collapsed = query.isBlank() && section.key in state.collapsedSections
         item(key = "section:${section.key}", contentType = "section") {
-          SectionHeader(section.title, collapsed) { controller.toggleSection(section.key) }
+          SectionHeader(section.title, section.sessions.size, collapsed) { controller.toggleSection(section.key) }
         }
-         if (!collapsed) items(section.sessions, key = { "session:${section.key}:${it.key}" }, contentType = { "session" }) { session ->
+        if (!collapsed) items(section.sessions, key = { "session:${section.key}:${it.key}" }, contentType = { "session" }) { session ->
           val pinned = session.id in state.pinned
           val background = if (state.multiServerView) session.serverId?.let { id -> state.allServerSnapshots[id]?.backgroundRunning?.contains(session.id) } == true
             else state.backgroundRunning.contains(session.id)
           val workspace = workspaceLabels[session.key]
           val showWorkspace = showWorkspaceLabel(section.key, state.scopeProjectId, state.scopeWorkspaceKey, workspace?.projectKey)
-          Box(Modifier.animateItem()) { HomeSessionRow(session, statuses[session.key] ?: SessionStatus.NONE, session.key in unseen,
-            background = background,
-            serverName = if (state.multiServerView) session.serverId?.let { id -> state.profiles.firstOrNull { it.id == id }?.name } else null,
-            harness = if (state.multiServerView) session.serverId?.let { id -> state.profiles.firstOrNull { it.id == id }?.kind } else null,
-            workspace = workspace?.name?.takeIf { showWorkspace },
-            onClick = { (session.target ?: state.serverId?.let { SessionTarget(it, session.id) })?.let(onOpen) }, actions = { buildList {
-            if (!state.multiServerView) {
-              add(MenuAction(if (pinned) "取消置顶" else "置顶", if (pinned) MiuixIcons.Unpin else MiuixIcons.Pin) { controller.togglePin(session.id) })
-              if (state.connected && state.capabilities.supports(SessionAction.RENAME)) add(MenuAction("重命名", MiuixIcons.Rename) { onRename(session) })
-              if (state.connected && state.capabilities.archive != null) add(MenuAction("归档", ARCHIVE_ICON) { controller.setArchived(session.id, true) })
-              if (state.connected && state.capabilities.deleteSession) add(MenuAction("删除", MiuixIcons.Delete, danger = true) { onDelete(session) })
-            }
-          } }) }
+          val liveTask = if (state.multiServerView) {
+            session.serverId?.let { id -> state.allServerSnapshots[id]?.tasks?.get(session.id) }
+          } else active[session.id]
+          Box(Modifier.animateItem()) {
+            HomeSessionRow(
+              session = session,
+              status = statuses[session.key] ?: SessionStatus.NONE,
+              unseen = session.key in unseen,
+              pinned = pinned,
+              background = background,
+              liveDetail = liveTask?.detail?.takeIf { it.isNotBlank() && it != TaskState.RUNNING_DETAIL },
+              relativeTime = formatRelative(session.updated, now),
+              serverName = if (state.multiServerView) session.serverId?.let { id -> state.profiles.firstOrNull { it.id == id }?.name } else null,
+              harness = if (state.multiServerView) session.serverId?.let { id -> state.profiles.firstOrNull { it.id == id }?.kind } else null,
+              workspace = workspace?.name?.takeIf { showWorkspace },
+              onClick = { (session.target ?: state.serverId?.let { SessionTarget(it, session.id) })?.let(onOpen) },
+              actions = {
+                buildList {
+                  if (!state.multiServerView) {
+                    add(MenuAction(if (pinned) "取消置顶" else "置顶", if (pinned) MiuixIcons.Unpin else MiuixIcons.Pin) { controller.togglePin(session.id) })
+                    if (state.connected && state.capabilities.supports(SessionAction.RENAME)) add(MenuAction("重命名", MiuixIcons.Rename) { onRename(session) })
+                    if (state.connected && state.capabilities.archive != null) add(MenuAction("归档", ARCHIVE_ICON) { controller.setArchived(session.id, true) })
+                    if (state.connected && state.capabilities.deleteSession) add(MenuAction("删除", MiuixIcons.Delete, danger = true) { onDelete(session) })
+                  }
+                }
+              }
+            )
+          }
         }
       }
       if (visibleSections.isEmpty()) item(key = "empty") {
         if (state.loading && state.sessions.isEmpty() && query.isBlank()) SessionRowsSkeleton()
-        else Column(Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 48.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-          val allDisabled = state.enabledProfiles.isEmpty() && state.profiles.isNotEmpty()
-          Text(when {
-            state.loading -> "正在读取会话…"
-            query.isNotBlank() -> "没有符合条件的会话"
-            allDisabled -> "所有连接已禁用"
-            state.profiles.isEmpty() -> "还没有添加设备"
-            state.connected -> "暂无会话"
-            else -> "尚未连接"
-          }, color = muted)
-          if (!state.loading && query.isBlank()) {
-            val action = when {
-              state.connected || state.enabledProfiles.isNotEmpty() -> "新建会话"
-              allDisabled || state.profiles.isEmpty() -> "管理设备"
-              else -> "重新连接"
-            }
-            TextButton(text = action, onClick = {
+        else HyperCard(
+          modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 32.dp),
+          insidePadding = PaddingValues(horizontal = 24.dp, vertical = 36.dp)
+        ) {
+          Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            val allDisabled = state.enabledProfiles.isEmpty() && state.profiles.isNotEmpty()
+            Text(
               when {
-                state.connected || state.enabledProfiles.isNotEmpty() -> onNewSession()
-                allDisabled || state.profiles.isEmpty() -> onManageDevices()
-                else -> controller.reload()
+                state.loading -> "正在读取会话…"
+                query.isNotBlank() -> "没有符合条件的会话"
+                allDisabled -> "所有连接已禁用"
+                state.profiles.isEmpty() -> "还没有添加设备"
+                state.connected -> "暂无会话"
+                else -> "尚未连接"
+              },
+              style = MiuixTheme.textStyles.headline2.copy(color = muted)
+            )
+            if (!state.loading && query.isBlank()) {
+              val action = when {
+                state.connected || state.enabledProfiles.isNotEmpty() -> "新建会话"
+                allDisabled || state.profiles.isEmpty() -> "管理设备"
+                else -> "重新连接"
               }
-            })
+              TextButton(
+                text = action,
+                onClick = {
+                  when {
+                    state.connected || state.enabledProfiles.isNotEmpty() -> onNewSession()
+                    allDisabled || state.profiles.isEmpty() -> onManageDevices()
+                    else -> controller.reload()
+                  }
+                },
+                colors = ButtonDefaults.textButtonColorsPrimary()
+              )
+            }
           }
         }
       }
       if (state.sessionCursors.isNotEmpty()) item(key = "more") {
-        TextButton(text = if (state.pending("sessions-more")) "正在加载…" else "加载更多会话", enabled = !state.pending("sessions-more"),
-          onClick = { controller.loadMoreSessions() }, modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp))
+        TextButton(
+          text = if (state.pending("sessions-more")) "正在加载…" else "加载更多会话",
+          enabled = !state.pending("sessions-more"),
+          onClick = { controller.loadMoreSessions() },
+          modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 6.dp)
+        )
       } else if (!state.catalogComplete) item(key = "cached-limit") {
-        Text("缓存仅保留最近会话", modifier = Modifier.padding(horizontal = 24.dp), color = muted, style = MiuixTheme.textStyles.footnote2)
+        Text("缓存仅保留最近会话", modifier = Modifier.padding(horizontal = 24.dp, vertical = 6.dp), color = muted, style = MiuixTheme.textStyles.footnote2)
       }
     }
   }
 }
 
-/** "今天 ⌄" — tap to fold the section; the chevron points right while folded. */
+/** "今天 · N ⌄" — tap to fold the section; the chevron points right while folded. */
 @Composable
-private fun SectionHeader(title: String, collapsed: Boolean, onToggle: () -> Unit) {
-  val muted = MiuixTheme.colorScheme.onSurfaceVariantSummary
-  Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-    Row(Modifier.clip(CircleShape).clickable(role = Role.Button, onClick = onToggle).padding(start = 24.dp, end = 12.dp, top = 10.dp, bottom = 6.dp),
-      verticalAlignment = Alignment.CenterVertically) {
-      Text(title, style = MiuixTheme.textStyles.footnote1.copy(color = muted))
+private fun SectionHeader(title: String, count: Int, collapsed: Boolean, onToggle: () -> Unit) {
+  val muted = HyperTheme.colors.textSecondary
+  Row(Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 2.dp), verticalAlignment = Alignment.CenterVertically) {
+    Row(
+      Modifier
+        .padding(horizontal = 14.dp)
+        .clip(CircleShape)
+        .hyperPress(scaleDown = 0.96f, onClick = onToggle)
+        .padding(horizontal = 10.dp, vertical = 6.dp),
+      verticalAlignment = Alignment.CenterVertically
+    ) {
+      Text(
+        title,
+        style = MiuixTheme.textStyles.footnote1.copy(
+          fontWeight = FontWeight.Bold,
+          color = HyperTheme.colors.textPrimary
+        )
+      )
+      Spacer(Modifier.width(6.dp))
+      Text(
+        "$count",
+        style = HyperTheme.tabular(
+          MiuixTheme.textStyles.footnote2.copy(
+            fontWeight = FontWeight.SemiBold,
+            color = muted
+          )
+        )
+      )
       Spacer(Modifier.width(4.dp))
-      Icon(MiuixIcons.ChevronForward, if (collapsed) "展开" else "收起", Modifier.size(14.dp).rotate(if (collapsed) 0f else 90f), tint = muted)
+      Icon(
+        MiuixIcons.ChevronForward,
+        if (collapsed) "展开" else "收起",
+        Modifier.size(14.dp).rotate(if (collapsed) 0f else 90f),
+        tint = muted
+      )
     }
   }
 }
@@ -432,53 +674,128 @@ internal val ARCHIVE_ICON get() = MiuixIcons.Download
 internal val UNARCHIVE_ICON get() = MiuixIcons.Import
 
 /**
- * One session: a 24dp state glyph and the title, plus an optional muted meta line (workspace, and on
- * the aggregate home the harness + device). Running spins, waiting for a reply shows the warning mark,
- * an unread result is a primary (or error) dot with a medium title; everything else is a quiet dot.
- * Long press opens [actions] (置顶 / 重命名 / 归档 / 删除 on the home list).
+ * 澎湃 OS 4 会话卡片行（Session Island Row）：
+ * 采用独立圆角卡片容器、高对比度标题字重、等宽相对时间，以及运行中的实时步骤摘要。
  */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-internal fun HomeSessionRow(session: Session, status: SessionStatus, unseen: Boolean, background: Boolean = false,
-  serverName: String? = null, harness: ServerKind? = null, workspace: String? = null,
-  onClick: () -> Unit, actions: () -> List<MenuAction>) {
-  // Built only on long press: a list of actions (and their lambdas) per row per recomposition was waste.
+internal fun HomeSessionRow(
+  session: Session,
+  status: SessionStatus,
+  unseen: Boolean,
+  pinned: Boolean = false,
+  background: Boolean = false,
+  liveDetail: String? = null,
+  relativeTime: String = "",
+  serverName: String? = null,
+  harness: ServerKind? = null,
+  workspace: String? = null,
+  onClick: () -> Unit,
+  actions: () -> List<MenuAction>
+) {
   var menuItems by remember { mutableStateOf(emptyList<MenuAction>()) }
   var menu by remember { mutableStateOf(false) }
-  val haptics = LocalHapticFeedback.current
-  val highlighted = unseen || status in setOf(SessionStatus.WAITING_PERMISSION, SessionStatus.WAITING_QUESTION)
-  Box {
-    Row(Modifier.fillMaxWidth().heightIn(min = 56.dp)
-      .combinedClickable(role = Role.Button, onClick = onClick, onLongClick = {
-        val items = actions()
-        if (items.isNotEmpty()) { haptics.performHapticFeedback(HapticFeedbackType.LongPress); menuItems = items; menu = true }
-      })
-      .padding(start = 20.dp, end = 24.dp, top = 12.dp, bottom = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-      Box(Modifier.size(24.dp), contentAlignment = Alignment.Center) { StatusGlyph(status, unseen) }
+  val waiting = status in setOf(SessionStatus.WAITING_PERMISSION, SessionStatus.WAITING_QUESTION)
+  val highlighted = unseen || waiting || status == SessionStatus.RUNNING
+  val cardShape = miuixSquircleShape(18.dp)
+  val borderColor = when {
+    waiting -> HyperTheme.colors.warning.copy(alpha = 0.42f)
+    status == SessionStatus.FAILED -> HyperTheme.colors.error.copy(alpha = 0.38f)
+    unseen -> HyperTheme.colors.primary.copy(alpha = 0.32f)
+    else -> HyperTheme.colors.cardBorder
+  }
+  Box(Modifier.padding(horizontal = 14.dp, vertical = 3.dp)) {
+    Row(
+      Modifier
+        .fillMaxWidth()
+        .heightIn(min = 64.dp)
+        .clip(cardShape)
+        .background(HyperTheme.colors.cardElevated, cardShape)
+        .border(0.65.dp, borderColor, cardShape)
+        .hyperPress(
+          onClick = onClick,
+          onLongClick = {
+            val items = actions()
+            if (items.isNotEmpty()) {
+              menuItems = items
+              menu = true
+            }
+          }
+        )
+        .padding(start = 14.dp, end = 16.dp, top = 12.dp, bottom = 12.dp),
+      verticalAlignment = Alignment.CenterVertically
+    ) {
+      Box(Modifier.size(26.dp), contentAlignment = Alignment.Center) { StatusGlyph(status, unseen) }
       Spacer(Modifier.width(12.dp))
-       Column(Modifier.weight(1f)) {
-         Text(session.displayTitle(), maxLines = 1, overflow = TextOverflow.Ellipsis,
-           style = MiuixTheme.textStyles.body1.copy(fontWeight = if (highlighted) FontWeight.Medium else FontWeight.Normal, color = MiuixTheme.colorScheme.onSurface))
-         val meta = listOfNotNull(serverName, workspace).joinToString(" · ")
-         if (harness != null || meta.isNotBlank()) Row(Modifier.padding(top = 2.dp), verticalAlignment = Alignment.CenterVertically) {
-           harness?.let { HarnessBadge(it); Spacer(Modifier.width(6.dp)) }
-           if (meta.isNotBlank()) Text(meta, maxLines = 1, overflow = TextOverflow.Ellipsis,
-             style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
-         }
-       }
-       if (background && status != SessionStatus.RUNNING) {
-         Spacer(Modifier.width(8.dp))
-         BackgroundMarker()
-       }
-       if (status == SessionStatus.WAITING_SERVER) {
-         Spacer(Modifier.width(8.dp))
-         Text(status.label, style = MiuixTheme.textStyles.footnote1.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
+      Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+          Text(
+            session.displayTitle(),
+            Modifier.weight(1f),
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            style = MiuixTheme.textStyles.body1.copy(
+              fontWeight = if (highlighted) FontWeight.SemiBold else FontWeight.Medium,
+              color = HyperTheme.colors.textPrimary
+            )
+          )
+          if (pinned) {
+            Spacer(Modifier.width(6.dp))
+            Icon(MiuixIcons.Pin, "已置顶", Modifier.size(13.dp), tint = HyperTheme.colors.primary)
+          }
+          if (relativeTime.isNotBlank()) {
+            Spacer(Modifier.width(8.dp))
+            Text(
+              relativeTime,
+              style = HyperTheme.tabular(
+                MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textTertiary)
+              ),
+              maxLines = 1
+            )
+          }
+        }
+        val meta = listOfNotNull(serverName, workspace).joinToString(" · ")
+        if (harness != null || meta.isNotBlank()) {
+          Row(verticalAlignment = Alignment.CenterVertically) {
+            harness?.let {
+              HarnessBadge(it)
+              Spacer(Modifier.width(6.dp))
+            }
+            if (meta.isNotBlank()) {
+              Text(
+                meta,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary)
+              )
+            }
+          }
+        }
+        if (!liveDetail.isNullOrBlank()) {
+          Text(
+            liveDetail,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            style = MiuixTheme.textStyles.footnote2.copy(
+              fontWeight = FontWeight.Medium,
+              color = if (waiting) HyperTheme.colors.warning else HyperTheme.colors.primary
+            )
+          )
+        }
+      }
+      if (background && status != SessionStatus.RUNNING) {
+        Spacer(Modifier.width(8.dp))
+        BackgroundMarker()
+      }
+      if (status == SessionStatus.WAITING_SERVER) {
+        Spacer(Modifier.width(8.dp))
+        StatusPillTag(status.label, HyperTheme.colors.textSecondary, HyperTheme.colors.container)
       } else if (status == SessionStatus.FAILED) {
         Spacer(Modifier.width(8.dp))
-        Text(status.label, style = MiuixTheme.textStyles.footnote1.copy(color = MiuixColorTokens.Error))
-      } else if (status == SessionStatus.WAITING_PERMISSION || status == SessionStatus.WAITING_QUESTION) {
+        StatusPillTag(status.label, HyperTheme.colors.error, HyperTheme.colors.errorSubtle)
+      } else if (waiting) {
         Spacer(Modifier.width(8.dp))
-        Text(status.label, style = MiuixTheme.textStyles.footnote1.copy(color = MiuixColorTokens.Warning))
+        StatusPillTag(status.label, HyperTheme.colors.warning, HyperTheme.colors.warningSubtle)
       }
     }
     MenuPopup(menu, { menu = false }, listOf(MenuSection(menuItems)))
@@ -486,18 +803,38 @@ internal fun HomeSessionRow(session: Session, status: SessionStatus, unseen: Boo
 }
 
 @Composable
+private fun StatusPillTag(label: String, textColor: Color, bgColor: Color) {
+  val shape = miuixSquircleShape(8.dp)
+  Box(
+    Modifier
+      .clip(shape)
+      .background(bgColor, shape)
+      .padding(horizontal = 8.dp, vertical = 3.dp)
+  ) {
+    Text(
+      label,
+      style = MiuixTheme.textStyles.footnote2.copy(
+        fontWeight = FontWeight.SemiBold,
+        color = textColor
+      ),
+      maxLines = 1
+    )
+  }
+}
+
+@Composable
 private fun StatusGlyph(status: SessionStatus, unseen: Boolean) {
-  val muted = MiuixTheme.colorScheme.onSurfaceVariantSummary
+  val muted = HyperTheme.colors.textSecondary
   when {
     status == SessionStatus.RUNNING ->
-      InfiniteProgressIndicator(color = MiuixTheme.colorScheme.primary, size = 16.dp, strokeWidth = 2.dp, orbitingDotSize = 2.dp)
+      InfiniteProgressIndicator(color = HyperTheme.colors.primary, size = 16.dp, strokeWidth = 2.dp, orbitingDotSize = 2.dp)
     status == SessionStatus.WAITING_SERVER ->
       Icon(MiuixIcons.Info, status.label, Modifier.size(20.dp), tint = muted)
     status == SessionStatus.WAITING_PERMISSION || status == SessionStatus.WAITING_QUESTION ->
       Icon(MiuixIcons.Info, status.label, Modifier.size(20.dp), tint = MiuixColorTokens.Warning)
-    status == SessionStatus.FAILED -> Box(Modifier.size(8.dp).background(MiuixColorTokens.Error, CircleShape))
-    unseen || status == SessionStatus.COMPLETED -> Box(Modifier.size(8.dp).background(MiuixTheme.colorScheme.primary, CircleShape))
-    else -> Box(Modifier.size(6.dp).background(muted.copy(alpha = 0.3f), CircleShape))
+    status == SessionStatus.FAILED -> Box(Modifier.size(9.dp).background(MiuixColorTokens.Error, CircleShape))
+    unseen || status == SessionStatus.COMPLETED -> Box(Modifier.size(9.dp).background(HyperTheme.colors.primary, CircleShape))
+    else -> Box(Modifier.size(6.dp).background(muted.copy(alpha = 0.32f), CircleShape))
   }
 }
 
@@ -507,9 +844,9 @@ private fun StatusGlyph(status: SessionStatus, unseen: Boolean) {
  */
 @Composable
 private fun BackgroundMarker() {
-  val muted = MiuixTheme.colorScheme.onSurfaceVariantSummary
-  Box(Modifier.size(7.dp).clip(CircleShape).background(muted.copy(alpha = 0.38f))) {
-    Box(Modifier.fillMaxSize().padding(2.dp).clip(CircleShape).background(MiuixTheme.colorScheme.surface))
+  val muted = HyperTheme.colors.textSecondary
+  Box(Modifier.size(8.dp).clip(CircleShape).background(muted.copy(alpha = 0.42f))) {
+    Box(Modifier.fillMaxSize().padding(2.dp).clip(CircleShape).background(HyperTheme.colors.cardElevated))
   }
 }
 
