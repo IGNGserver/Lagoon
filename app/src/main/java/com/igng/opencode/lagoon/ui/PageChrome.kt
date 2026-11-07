@@ -34,25 +34,31 @@ import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.extra.SuperListPopup
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 
-/** Round 40dp icon button on a filled circle with HyperOS 4 spring press physics, used for back and ⋯ in page headers. */
+/** 48dp touch target with a quiet 40dp circular visual, shared by every page header. */
 @Composable
 internal fun CircleIconButton(icon: ImageVector, description: String, onClick: () -> Unit, enabled: Boolean = true) {
   Box(
     modifier = Modifier
-      .size(40.dp)
-      .clip(CircleShape)
-      .background(HyperTheme.colors.container, CircleShape)
-      .border(0.5.dp, HyperTheme.colors.cardBorder, CircleShape)
-      .hyperPress(enabled = enabled, scaleDown = 0.92f, onClick = onClick)
+      .size(HYPER_TOUCH_TARGET_DP.dp)
+      .hyperPress(enabled = enabled, scaleDown = 0.94f, onClick = onClick)
       .semantics { contentDescription = description },
     contentAlignment = Alignment.Center
   ) {
-    Icon(
-      icon,
-      description,
-      Modifier.size(21.dp),
-      tint = if (enabled) HyperTheme.colors.textPrimary else HyperTheme.colors.textTertiary
-    )
+    Box(
+      Modifier
+        .size(HYPER_ICON_VISUAL_DP.dp)
+        .clip(CircleShape)
+        .background(HyperTheme.colors.container, CircleShape)
+        .border(0.5.dp, HyperTheme.colors.cardBorder, CircleShape),
+      contentAlignment = Alignment.Center
+    ) {
+      Icon(
+        icon,
+        null,
+        Modifier.size(21.dp),
+        tint = if (enabled) HyperTheme.colors.textPrimary else HyperTheme.colors.textTertiary
+      )
+    }
   }
 }
 
@@ -77,6 +83,21 @@ internal fun DropdownChevron(size: Dp = 16.dp, tint: Color = HyperTheme.colors.t
     glyph = QoderGlyph.CHEVRON,
     modifier = Modifier.size(size).rotate(90f).then(if (description != null) Modifier.semantics { contentDescription = description } else Modifier),
     color = tint
+  )
+}
+
+/** Forward chevron rotates downward as a section expands. */
+@Composable
+internal fun ExpandChevron(expanded: Boolean, size: Dp = 16.dp) {
+  val rotation = androidx.compose.animation.core.animateFloatAsState(
+    targetValue = if (expanded) 90f else 0f,
+    animationSpec = HyperMotion.controlSpring(),
+    label = "expandChevron"
+  ).value
+  QoderIcon(
+    glyph = QoderGlyph.CHEVRON,
+    modifier = Modifier.size(size).rotate(rotation),
+    color = HyperTheme.colors.textSecondary
   )
 }
 

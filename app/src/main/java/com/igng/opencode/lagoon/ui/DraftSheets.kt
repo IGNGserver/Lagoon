@@ -133,7 +133,7 @@ private fun DraftServerRow(server: DraftServer, current: Boolean, onClick: () ->
     else -> muted
   }
   Row(
-    Modifier.fillMaxWidth().hyperPress(onClick = onClick).padding(horizontal = 14.dp, vertical = 12.dp),
+    Modifier.fillMaxWidth().heightIn(min = HYPER_TOUCH_TARGET_DP.dp).hyperPress(onClick = onClick).padding(horizontal = 14.dp, vertical = 12.dp),
     verticalAlignment = Alignment.CenterVertically
   ) {
     Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {

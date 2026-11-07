@@ -126,7 +126,7 @@ internal fun RemoteEnrollSheet(
       busy = true; error = null
       try {
         candidates = action()
-        selected = candidates.filter { it.canEnroll && it.meta.online }.map { it.hostId }.toSet()
+        selected = emptySet()
         confirmed = emptySet()
         review = false
       } catch (cancel: CancellationException) { throw cancel }
@@ -144,7 +144,7 @@ internal fun RemoteEnrollSheet(
             Text("登录后选择要接入的电脑。每台主机会在本机注册一个独立设备身份，用于同时保持连接。",
               style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
           }
-          item { TextField(value = origin, onValueChange = { origin = it; allowHttp = it.startsWith("http://", true); error = null }, label = "中枢服务器地址") }
+          item { TextField(value = origin, onValueChange = { origin = it; allowHttp = cleartextConsentAfterUrlEdit(origin, it, allowHttp); error = null }, label = "中枢服务器地址") }
           if (origin.startsWith("http://", true)) item {
             HyperSwitchRow(title = "允许此地址使用 HTTP", summary = "只在你信任的网络中开启", checked = allowHttp, onCheckedChange = { allowHttp = it })
           }
@@ -153,8 +153,8 @@ internal fun RemoteEnrollSheet(
           if (browserProviders.isNotEmpty()) {
             item { Text("在浏览器中登录", style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary)) }
             items(browserProviders, key = { it.id }) { provider ->
-              TextButton(text = "使用 ${provider.displayName} 登录", onClick = {
-                if (pending != null || busy) return@TextButton
+              HyperButton(text = "使用 ${provider.displayName} 登录", onClick = {
+                if (pending != null || busy) return@HyperButton
                 scope.launch {
                   busy = true; error = null
                   try {
@@ -176,7 +176,7 @@ internal fun RemoteEnrollSheet(
             }
           }
           item {
-            TextButton(text = if (showSelfHosted) "收起自建中枢登录" else "自建中枢 · 邮箱登录",
+            HyperButton(text = if (showSelfHosted) "收起自建中枢登录" else "自建中枢 · 邮箱登录", variant = HyperButtonVariant.SECONDARY,
               onClick = { showSelfHosted = !showSelfHosted }, modifier = Modifier.fillMaxWidth())
           }
           if (showSelfHosted) {
@@ -187,7 +187,7 @@ internal fun RemoteEnrollSheet(
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password))
             }
             item {
-              TextButton(text = if (busy) "正在登录…" else "邮箱登录", enabled = !busy && manager != null && account.isNotBlank() && password.isNotBlank(),
+              HyperButton(text = "邮箱登录", loading = busy, enabled = manager != null && account.isNotBlank() && password.isNotBlank(),
                 onClick = { if (manager != null) loadCandidates { manager.loginWithPassword(account.trim(), password) } },
                 modifier = Modifier.fillMaxWidth())
             }
@@ -198,12 +198,13 @@ internal fun RemoteEnrollSheet(
                 InfiniteProgressIndicator(size = 16.dp, strokeWidth = 2.dp)
                 Spacer(Modifier.width(8.dp))
                 Text("在浏览器里完成登录…", Modifier.weight(1f), style = MiuixTheme.textStyles.footnote2)
-                TextButton(text = "取消", onClick = { pending = null })
+                HyperTextAction(text = "取消", onClick = { pending = null })
               }
             }
             item {
-              TextButton(text = "复制登录链接", onClick = {
+              HyperButton(text = "复制登录链接", variant = HyperButtonVariant.SECONDARY, onClick = {
                 clipboard.setText(AnnotatedString(login.loginUrl))
+                android.widget.Toast.makeText(context, "已复制登录链接", android.widget.Toast.LENGTH_SHORT).show()
               }, modifier = Modifier.fillMaxWidth())
             }
           }
@@ -214,7 +215,7 @@ internal fun RemoteEnrollSheet(
                 Text("选择主机", style = MiuixTheme.textStyles.headline2.copy(fontWeight = FontWeight.Medium))
                 Text("已发现 ${candidates.size} 台 · 已选 ${selected.size}", style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
               }
-              TextButton(text = "重新登录", onClick = { candidates = emptyList(); selected = emptySet() })
+              HyperTextAction(text = "重新登录", onClick = { candidates = emptyList(); selected = emptySet() })
             }
           }
           items(candidates, key = { it.hostId }) { candidate ->
@@ -224,7 +225,9 @@ internal fun RemoteEnrollSheet(
               .clickable(enabled = enabled) {
                 selected = if (checked) selected - candidate.hostId else selected + candidate.hostId
               }.padding(horizontal = 8.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
-              Checkbox(checked = checked, onCheckedChange = { if (enabled) selected = if (it) selected + candidate.hostId else selected - candidate.hostId }, enabled = enabled)
+              Box(Modifier.size(48.dp), contentAlignment = Alignment.Center) {
+                Checkbox(checked = checked, onCheckedChange = null, enabled = enabled)
+              }
               Spacer(Modifier.width(8.dp))
               Column(Modifier.weight(1f)) {
                 Text(candidate.meta.name, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MiuixTheme.textStyles.body1)
@@ -244,7 +247,7 @@ internal fun RemoteEnrollSheet(
             }
           }
           item {
-            TextButton(text = "下一步：核对指纹", enabled = selected.isNotEmpty() && !busy, onClick = {
+            HyperButton(text = "下一步：核对指纹", enabled = selected.isNotEmpty() && !busy, onClick = {
               confirmed = emptySet(); review = true
             }, modifier = Modifier.fillMaxWidth())
           }
@@ -259,7 +262,9 @@ internal fun RemoteEnrollSheet(
             Row(Modifier.fillMaxWidth().clip(miuixSquircleShape(14.dp)).clickable {
               confirmed = if (checked) confirmed - candidate.hostId else confirmed + candidate.hostId
             }.padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
-              Checkbox(checked = checked, onCheckedChange = { if (it) confirmed = confirmed + candidate.hostId else confirmed = confirmed - candidate.hostId })
+              Box(Modifier.size(48.dp), contentAlignment = Alignment.Center) {
+                Checkbox(checked = checked, onCheckedChange = null)
+              }
               Spacer(Modifier.width(8.dp))
               Column(Modifier.weight(1f)) {
                 Text(candidate.meta.name, style = MiuixTheme.textStyles.body1)
@@ -268,7 +273,7 @@ internal fun RemoteEnrollSheet(
             }
           }
           item {
-            TextButton(text = if (busy) "正在接入…" else "接入选中主机", enabled = !busy && confirmed.size == chosen.size && chosen.isNotEmpty(), onClick = {
+            HyperButton(text = "接入选中主机", loading = busy, enabled = confirmed.size == chosen.size && chosen.isNotEmpty(), onClick = {
               scope.launch {
                 busy = true; error = null
                 try {
@@ -283,14 +288,14 @@ internal fun RemoteEnrollSheet(
               }
             }, modifier = Modifier.fillMaxWidth())
           }
-          item { TextButton(text = "返回选择", onClick = { review = false }, modifier = Modifier.fillMaxWidth()) }
+          item { HyperButton(text = "返回选择", variant = HyperButtonVariant.SECONDARY, onClick = { review = false }, modifier = Modifier.fillMaxWidth()) }
         }
         resultText?.let { text -> item { Text(text, color = MiuixColorTokens.Success, style = MiuixTheme.textStyles.footnote1) } }
         error?.let { text ->
           item {
             Column {
               Text(text, color = MiuixColorTokens.Error, style = MiuixTheme.textStyles.footnote1)
-              TextButton(text = "关闭", onClick = onDismiss, modifier = Modifier.fillMaxWidth())
+              HyperButton(text = "关闭", variant = HyperButtonVariant.SECONDARY, onClick = onDismiss, modifier = Modifier.fillMaxWidth())
             }
           }
         }
@@ -319,7 +324,7 @@ internal fun RemoteAccountSummary(
           maxLines = 1, overflow = TextOverflow.Ellipsis
         )
       }
-      TextButton(text = if (catalogs.isEmpty()) "登录" else "管理", onClick = onOpen)
+      HyperTextAction(text = if (catalogs.isEmpty()) "登录" else "管理", onClick = onOpen)
     }
   }
 }
@@ -343,22 +348,22 @@ internal fun RemoteServerSummary(
       else "${existing.remoteHostFingerprint?.let { formatFingerprint(it) } ?: "指纹待确认"} · ${existing.url}",
       style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
     )
-    TextButton(text = if (existing == null) "登录中枢并选择主机" else "管理中枢与主机", onClick = onManage, modifier = Modifier.fillMaxWidth())
+    HyperButton(text = if (existing == null) "登录中枢并选择主机" else "管理中枢与主机", onClick = onManage, modifier = Modifier.fillMaxWidth())
     if (existing != null && onDetails != null) {
-      TextButton(text = "网络与连接", onClick = onDetails, modifier = Modifier.fillMaxWidth())
+      HyperButton(text = "网络与连接", variant = HyperButtonVariant.SECONDARY, onClick = onDetails, modifier = Modifier.fillMaxWidth())
     }
     if (existing != null && onExtensions != null) {
-      TextButton(text = "主机扩展（插件开关）", onClick = onExtensions, modifier = Modifier.fillMaxWidth())
+      HyperButton(text = "主机扩展", variant = HyperButtonVariant.SECONDARY, onClick = onExtensions, modifier = Modifier.fillMaxWidth())
     }
     if (existing != null && onModelKey != null) {
-      TextButton(text = "主机模型密钥", onClick = onModelKey, modifier = Modifier.fillMaxWidth())
+      HyperButton(text = "主机模型密钥", variant = HyperButtonVariant.SECONDARY, onClick = onModelKey, modifier = Modifier.fillMaxWidth())
     }
     if (existing != null && onProvider != null) {
-      TextButton(text = "添加自定义模型服务商", onClick = onProvider, modifier = Modifier.fillMaxWidth())
+      HyperButton(text = "添加自定义模型服务商", variant = HyperButtonVariant.SECONDARY, onClick = onProvider, modifier = Modifier.fillMaxWidth())
     }
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-      TextButton(text = "取消", onClick = onCancel)
-      if (onDelete != null) TextButton(text = "从此设备移除", onClick = onDelete, colors = ButtonDefaults.textButtonColors(textColor = MiuixColorTokens.Error))
+      HyperTextAction(text = "取消", onClick = onCancel)
+      if (onDelete != null) HyperTextAction(text = "从此设备移除", danger = true, onClick = onDelete)
     }
   }
 }
@@ -378,6 +383,7 @@ internal fun RemoteConnectionDialog(
   var error by remember { mutableStateOf<String?>(null) }
   var doctor by remember { mutableStateOf<RemoteDoctor?>(null) }
   val clipboard = LocalClipboardManager.current
+  val context = LocalContext.current
   suspend fun reloadDoctor() {
     doctor = runCatching { controller.remoteDoctor(profile.id) }.getOrNull()
   }
@@ -419,22 +425,26 @@ internal fun RemoteConnectionDialog(
       Text("当前版本使用 Relay；中枢下发独立数据通道时自动附加，LAN / P2P / TURN 尚未启用。测量只反映一次加密 RPC，不代表网络层 RTT。",
         style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
       error?.let { Text(it, color = MiuixColorTokens.Error, style = MiuixTheme.textStyles.footnote2) }
-      Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+      Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
         doctor?.let { report ->
-          TextButton(text = "复制诊断", onClick = { clipboard.setText(AnnotatedString(report.asText())) })
+          HyperTextAction(text = "复制诊断", onClick = {
+            clipboard.setText(AnnotatedString(report.asText()))
+            android.widget.Toast.makeText(context, "已复制诊断", android.widget.Toast.LENGTH_SHORT).show()
+          })
         }
-        TextButton(text = "关闭", onClick = onDismiss)
-        TextButton(text = if (busy) "测量中…" else "重新测量", enabled = !busy && current, onClick = {
-          scope.launch {
-            busy = true; error = null
-            try {
-              probe = controller.probeRemote(profile.id)
-              reloadDoctor()
-            } catch (e: Exception) { error = userFacingError(e, "测量失败") }
-            finally { busy = false }
-          }
-        })
+        Spacer(Modifier.weight(1f))
+        HyperTextAction(text = "关闭", onClick = onDismiss)
       }
+      HyperButton(text = "重新测量", loading = busy, enabled = current, modifier = Modifier.fillMaxWidth(), onClick = {
+        scope.launch {
+          busy = true; error = null
+          try {
+            probe = controller.probeRemote(profile.id)
+            reloadDoctor()
+          } catch (e: Exception) { error = userFacingError(e, "测量失败") }
+          finally { busy = false }
+        }
+      })
     }
   }
 }
@@ -485,8 +495,8 @@ internal fun RemoteExtensionsDialog(
       if (!busy && bundles.isEmpty() && error == null) Text("没有可远程开关的插件。", style = MiuixTheme.textStyles.footnote2)
       error?.let { Text(it, color = MiuixColorTokens.Error, style = MiuixTheme.textStyles.footnote2) }
       Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-        TextButton(text = "关闭", onClick = onDismiss)
-        TextButton(text = "刷新", onClick = { reload() }, enabled = !busy)
+        HyperTextAction(text = "关闭", onClick = onDismiss)
+        HyperButton(text = "刷新", loading = busy, onClick = { reload() })
       }
     }
   }
@@ -506,6 +516,7 @@ internal fun RemoteModelKeyDialog(
   var status by remember { mutableStateOf<RemoteCredentialStatus?>(null) }
   var busy by remember { mutableStateOf(true) }
   var error by remember { mutableStateOf<String?>(null) }
+  var confirmingClear by remember { mutableStateOf(false) }
   fun load() {
     scope.launch {
       busy = true; error = null
@@ -521,7 +532,7 @@ internal fun RemoteModelKeyDialog(
         style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
       Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
         TextField(value = ref, onValueChange = { ref = it.trim() }, label = "凭据引用", modifier = Modifier.weight(1f))
-        TextButton(text = "读取", enabled = !busy && ref.isNotBlank(), onClick = { load() })
+        HyperTextAction(text = "读取", enabled = !busy && ref.isNotBlank(), onClick = { load() })
       }
       if (busy) Text("正在读取…", style = MiuixTheme.textStyles.footnote2)
       status?.let {
@@ -532,16 +543,9 @@ internal fun RemoteModelKeyDialog(
         visualTransformation = PasswordVisualTransformation(), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password))
       error?.let { Text(it, color = MiuixColorTokens.Error, style = MiuixTheme.textStyles.footnote2) }
       Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-        TextButton(text = "关闭", onClick = onDismiss)
-        if (status?.configured == true && status?.writable == true) TextButton(text = "清除", enabled = !busy, onClick = {
-          scope.launch {
-            busy = true; error = null
-            try { controller.clearCredential(profile.id, ref); key = ""; load() }
-            catch (e: Exception) { error = userFacingError(e, "清除失败") }
-            finally { busy = false }
-          }
-        })
-        TextButton(text = if (busy) "保存中…" else "保存", enabled = !busy && key.isNotBlank(), onClick = {
+        HyperTextAction(text = "关闭", onClick = onDismiss)
+        if (status?.configured == true && status?.writable == true) HyperTextAction(text = "清除", danger = true, enabled = !busy, onClick = { confirmingClear = true })
+        HyperButton(text = "保存", loading = busy, enabled = key.isNotBlank(), onClick = {
           scope.launch {
             busy = true; error = null
             try { controller.setCredential(profile.id, ref, key); key = ""; load() }
@@ -549,6 +553,23 @@ internal fun RemoteModelKeyDialog(
             finally { busy = false }
           }
         })
+      }
+    }
+  }
+
+  if (confirmingClear) {
+    SuperDialog(title = "清除主机模型密钥？", show = true, onDismissRequest = { confirmingClear = false }) {
+      Column {
+        Text("将清除 Host 上 ${ref.ifBlank { "当前引用" }} 的凭据。依赖它的模型可能立即无法使用。")
+        DialogActions("取消", { confirmingClear = false }, "确认清除", danger = true) {
+          confirmingClear = false
+          scope.launch {
+            busy = true; error = null
+            try { controller.clearCredential(profile.id, ref); key = ""; load() }
+            catch (e: Exception) { error = userFacingError(e, "清除失败") }
+            finally { busy = false }
+          }
+        }
       }
     }
   }
@@ -572,24 +593,30 @@ internal fun RemoteProviderDialog(
   var apiKey by remember { mutableStateOf("") }
   var busy by remember { mutableStateOf(false) }
   var error by remember { mutableStateOf<String?>(null) }
+  val apiOptions = listOf("openai-completions", "openai-responses", "anthropic-messages")
   fun suggestedRef(value: String) = value.uppercase().replace('-', '_').let { if (it.isBlank()) "" else "${it}_API_KEY" }
   SuperDialog(title = "自定义模型服务商", show = true, onDismissRequest = onDismiss) {
     Column(Modifier.fillMaxWidth().heightIn(max = 560.dp).verticalScroll(rememberScrollState()).padding(top = 8.dp),
       verticalArrangement = Arrangement.spacedBy(8.dp)) {
-      Text("写入 Host 的 llm-pi-ai 配置；Host 会校验 route、协议、模型和密钥引用。",
+      Text("在此设备的高级配置中创建模型连接。请按服务商文档填写；密钥值保存后不会回显。",
         style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
       TextField(value = route, onValueChange = { route = it.trim(); if (keyRef.isBlank()) keyRef = suggestedRef(it.trim()) }, label = "路由 ID（小写字母/数字/-）")
       TextField(value = displayName, onValueChange = { displayName = it }, label = "显示名称")
-      TextField(value = api, onValueChange = { api = it.trim() }, label = "协议（openai-completions / openai-responses / anthropic-messages）")
-      TextField(value = baseUrl, onValueChange = { baseUrl = it.trim() }, label = "Base URL")
+      HyperDropdownRow(
+        title = "协议",
+        items = apiOptions,
+        selectedIndex = apiOptions.indexOf(api).coerceAtLeast(0),
+        onSelectedIndexChange = { api = apiOptions[it] }
+      )
+      TextField(value = baseUrl, onValueChange = { baseUrl = it.trim() }, label = "接口地址（Base URL）")
       TextField(value = modelId, onValueChange = { modelId = it.trim() }, label = "模型 ID")
       TextField(value = keyRef, onValueChange = { keyRef = it.trim() }, label = "密钥引用")
       TextField(value = apiKey, onValueChange = { apiKey = it }, label = "API Key（可留空，稍后再填）",
         visualTransformation = PasswordVisualTransformation(), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password))
       error?.let { Text(it, color = MiuixColorTokens.Error, style = MiuixTheme.textStyles.footnote2) }
       Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-        TextButton(text = "取消", onClick = onDismiss)
-        TextButton(text = if (busy) "保存中…" else "保存", enabled = !busy && route.isNotBlank() && baseUrl.isNotBlank() && modelId.isNotBlank() && keyRef.isNotBlank(), onClick = {
+        HyperTextAction(text = "取消", onClick = onDismiss)
+        HyperButton(text = "保存", loading = busy, enabled = route.isNotBlank() && baseUrl.isNotBlank() && modelId.isNotBlank() && keyRef.isNotBlank(), onClick = {
           scope.launch {
             busy = true; error = null
             try {

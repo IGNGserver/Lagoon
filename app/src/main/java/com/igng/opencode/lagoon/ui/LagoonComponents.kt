@@ -9,6 +9,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
@@ -55,7 +57,7 @@ internal fun CapsuleSelector(
       .background(HyperTheme.colors.container, shape)
       .border(0.6.dp, HyperTheme.colors.cardBorder, shape)
       .hyperPress(enabled = enabled, scaleDown = 0.95f, onClick = onClick)
-      .heightIn(min = 34.dp)
+      .heightIn(min = HYPER_TOUCH_TARGET_DP.dp)
       .padding(start = if (leading == null) 12.dp else 10.dp, end = 8.dp),
     verticalAlignment = Alignment.CenterVertically
   ) {
@@ -94,13 +96,20 @@ internal fun RoundAction(
 ) {
   Box(
     Modifier
-      .size(40.dp)
-      .clip(miuixCapsuleShape())
-      .background(if (enabled) container else HyperTheme.colors.container)
-      .hyperPress(enabled = enabled, scaleDown = 0.92f, onClick = onClick),
+      .size(HYPER_TOUCH_TARGET_DP.dp)
+      .hyperPress(enabled = enabled, scaleDown = 0.94f, onClick = onClick)
+      .semantics { contentDescription = description },
     contentAlignment = Alignment.Center
   ) {
-    if (glyph != null) glyph()
-    else if (icon != null) Icon(icon, description, Modifier.size(20.dp), tint = if (enabled) content else HyperTheme.colors.textTertiary)
+    Box(
+      Modifier
+        .size(HYPER_ICON_VISUAL_DP.dp)
+        .clip(miuixCapsuleShape())
+        .background(if (enabled) container else HyperTheme.colors.container),
+      contentAlignment = Alignment.Center
+    ) {
+      if (glyph != null) glyph()
+      else if (icon != null) Icon(icon, null, Modifier.size(20.dp), tint = if (enabled) content else HyperTheme.colors.textTertiary)
+    }
   }
 }

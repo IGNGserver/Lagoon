@@ -28,9 +28,13 @@ internal fun RemoteHostsSheet(
   val scope = rememberCoroutineScope()
   var catalogState by remember { mutableStateOf(controller.activeRemoteCatalog()) }
   val catalog = catalogState
-  val manager = remember(catalog?.origin, catalog?.account) {
-    catalog?.let { runCatching { controller.remoteAccountManager(it.origin, it.origin.startsWith("http://", true)) }.getOrNull() }
+  val managerResult = remember(catalog?.origin, catalog?.account) {
+    catalog?.let { saved ->
+      runCatching { controller.remoteAccountManager(saved.origin, saved.allowCleartext).also { it.resume(saved) } }
+    }
   }
+  val manager = managerResult?.getOrNull()
+  val managerError = managerResult?.exceptionOrNull()?.message
   var busy by remember { mutableStateOf(false) }
   var error by remember { mutableStateOf<String?>(null) }
   var confirmSignOut by remember { mutableStateOf(false) }
@@ -70,7 +74,7 @@ internal fun RemoteHostsSheet(
           item {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
               Text("还没有登录 DSH 远程中枢。登录后选择要接入的电脑。", style = MiuixTheme.textStyles.footnote1)
-              TextButton(text = "登录并接入主机", onClick = onEnroll, modifier = Modifier.fillMaxWidth())
+              HyperButton(text = "登录并接入主机", onClick = onEnroll, modifier = Modifier.fillMaxWidth())
             }
           }
         } else {
@@ -82,14 +86,21 @@ internal fun RemoteHostsSheet(
                   Text(listOfNotNull(catalog.provider?.let { providerLabel(it) }, catalog.origin).joinToString(" · "),
                     style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary), maxLines = 1)
                 }
-                if (catalog.provider != null) Text(providerLabel(catalog.provider), style = MiuixTheme.textStyles.footnote2)
               }
             }
+          }
+          if (manager == null) item {
+            HyperInlineNotice(
+              message = managerError ?: "此连接需要重新登录并明确授权后才能联网",
+              type = MiuixToastType.WARNING,
+              action = "重新登录并授权",
+              onAction = onEnroll
+            )
           }
           item {
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
               Text("托管主机 · ${catalog.hosts.size}", Modifier.weight(1f), style = MiuixTheme.textStyles.footnote1.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
-              TextButton(text = if (busy) "刷新中…" else "刷新", enabled = !busy, onClick = {
+              HyperButton(text = "刷新", variant = HyperButtonVariant.TERTIARY, loading = busy, enabled = manager != null, onClick = {
                 scope.launch {
                   busy = true; error = null
                   try { manager?.refresh(); reload() }
@@ -119,13 +130,13 @@ internal fun RemoteHostsSheet(
                     RemoteTrustState.UNKNOWN -> MiuixTheme.colorScheme.onSurfaceVariantSummary
                   })
               }
-              if (!added(host.hostId)) TextButton(text = "接入", onClick = onEnroll)
+              if (!added(host.hostId)) HyperTextAction(text = "接入", onClick = onEnroll)
             }
           }
           item {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-              TextButton(text = "接入更多主机", onClick = onEnroll, modifier = Modifier.weight(1f))
-              TextButton(text = "退出登录", onClick = { confirmSignOut = true }, modifier = Modifier.weight(1f))
+              HyperButton(text = "接入更多主机", onClick = onEnroll, modifier = Modifier.weight(1f))
+              HyperButton(text = "退出登录", variant = HyperButtonVariant.DESTRUCTIVE, onClick = { confirmSignOut = true }, modifier = Modifier.weight(1f))
             }
           }
         }

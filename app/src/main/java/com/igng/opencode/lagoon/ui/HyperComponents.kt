@@ -18,7 +18,11 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
+import androidx.compose.ui.semantics.toggleableState
+import androidx.compose.ui.state.ToggleableState
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
@@ -36,6 +40,71 @@ import top.yukonga.miuix.kmp.theme.miuixCapsuleShape
  * 澎湃 OS 4 自研组件底座：
  * 提供具备四级表面色阶、连续曲率圆角（Squircle）、微高光描边与弹簧按压触感的核心组件。
  */
+
+enum class HyperButtonVariant { PRIMARY, SECONDARY, TERTIARY, DESTRUCTIVE }
+
+/**
+ * The single button entry point for product UI. Visual chrome may be 40dp, but every action keeps
+ * at least a 48dp touch target. Loading preserves the label and width and blocks duplicate submits.
+ */
+@Composable
+fun HyperButton(
+  text: String,
+  onClick: () -> Unit,
+  modifier: Modifier = Modifier,
+  variant: HyperButtonVariant = HyperButtonVariant.PRIMARY,
+  enabled: Boolean = true,
+  loading: Boolean = false
+) {
+  val actionable = hyperButtonActionable(enabled, loading)
+  val background = when {
+    !actionable -> HyperTheme.colors.container
+    variant == HyperButtonVariant.PRIMARY -> HyperTheme.colors.primary
+    variant == HyperButtonVariant.SECONDARY -> HyperTheme.colors.containerHigh
+    variant == HyperButtonVariant.DESTRUCTIVE -> HyperTheme.colors.errorSubtle
+    else -> Color.Transparent
+  }
+  val foreground = when {
+    !actionable -> HyperTheme.colors.textTertiary
+    variant == HyperButtonVariant.PRIMARY -> HyperTheme.colors.onPrimary
+    variant == HyperButtonVariant.DESTRUCTIVE -> HyperTheme.colors.error
+    variant == HyperButtonVariant.TERTIARY -> HyperTheme.colors.primary
+    else -> HyperTheme.colors.textPrimary
+  }
+  Box(
+    modifier = modifier
+      .heightIn(min = HYPER_TOUCH_TARGET_DP.dp)
+      .widthIn(min = HYPER_TOUCH_TARGET_DP.dp)
+      .clip(miuixCapsuleShape())
+      .background(background, miuixCapsuleShape())
+      .hyperPress(enabled = actionable, scaleDown = 0.96f, onClick = onClick)
+      .semantics { if (loading) stateDescription = "正在处理" }
+      .padding(horizontal = 18.dp, vertical = 12.dp),
+    contentAlignment = Alignment.Center
+  ) {
+    Text(
+      text = text,
+      maxLines = 2,
+      overflow = TextOverflow.Ellipsis,
+      style = MiuixTheme.textStyles.button.copy(color = foreground)
+    )
+  }
+}
+
+@Composable
+fun HyperTextAction(
+  text: String,
+  onClick: () -> Unit,
+  modifier: Modifier = Modifier,
+  enabled: Boolean = true,
+  danger: Boolean = false
+) = HyperButton(
+  text = text,
+  onClick = onClick,
+  modifier = modifier,
+  variant = if (danger) HyperButtonVariant.DESTRUCTIVE else HyperButtonVariant.TERTIARY,
+  enabled = enabled
+)
 
 /**
  * 澎湃 OS 4 连接悬浮岛（HyperConnectionIsland）：
@@ -62,7 +131,7 @@ fun HyperConnectionIsland(
       .background(bgColor, miuixSquircleShape(24.dp))
       .border(0.8.dp, color.copy(alpha = 0.35f), miuixSquircleShape(24.dp))
       .padding(horizontal = 16.dp, vertical = 8.dp)
-      .then(if (onClick != null) Modifier.hyperPress(onClick = onClick) else Modifier),
+      .then(if (onClick != null) Modifier.heightIn(min = HYPER_TOUCH_TARGET_DP.dp).hyperPress(onClick = onClick) else Modifier),
     contentAlignment = Alignment.Center
   ) {
     Text(
@@ -107,14 +176,7 @@ fun HyperInlineNotice(
       modifier = Modifier.weight(1f)
     )
     if (action != null && onAction != null) {
-      Text(
-        text = action,
-        style = MiuixTheme.textStyles.body2.copy(color = color, fontWeight = FontWeight.SemiBold),
-        modifier = Modifier
-          .clip(CircleShape)
-          .hyperPress(onClick = onAction)
-          .padding(horizontal = 8.dp, vertical = 4.dp)
-      )
+      HyperTextAction(text = action, onClick = onAction)
     }
   }
 }
@@ -139,7 +201,7 @@ fun HyperCard(
       .clip(shape)
       .background(backgroundColor, shape)
       .border(0.6.dp, borderColor, shape)
-      .then(if (onClick != null) Modifier.hyperPress(onClick = onClick, surfaceHighlight = surfaceHighlight) else Modifier)
+      .then(if (onClick != null) Modifier.heightIn(min = HYPER_TOUCH_TARGET_DP.dp).hyperPress(onClick = onClick, surfaceHighlight = surfaceHighlight) else Modifier)
       .padding(insidePadding),
     content = content
   )
@@ -217,28 +279,39 @@ fun HyperSwitch(
     animationSpec = HyperMotion.controlSpring(),
     label = "switchThumbSize"
   )
+  // Keep the 46×26dp HyperOS track, but move interaction to a standalone 52×48dp hit box.
   Box(
     modifier = modifier
-      .width(46.dp)
-      .height(26.dp)
-      .clip(CircleShape)
-      .background(trackColor)
+      .size(width = 52.dp, height = HYPER_TOUCH_TARGET_DP.dp)
+      .then(if (onCheckedChange != null) Modifier.semantics {
+        toggleableState = ToggleableState(checked)
+        stateDescription = if (checked) "已开启" else "已关闭"
+      } else Modifier)
       .then(
         if (onCheckedChange != null) {
-          Modifier.hyperPress(enabled = enabled, scaleDown = 0.92f, role = Role.Switch) {
+          Modifier.hyperPress(enabled = enabled, scaleDown = 0.96f, role = Role.Switch) {
             onCheckedChange(!checked)
           }
         } else Modifier
       ),
-    contentAlignment = Alignment.CenterStart
+    contentAlignment = Alignment.Center
   ) {
     Box(
       Modifier
-        .offset(x = thumbOffset)
-        .size(thumbSize)
+        .width(46.dp)
+        .height(26.dp)
         .clip(CircleShape)
-        .background(Color.White.copy(alpha = if (enabled) 1f else 0.6f))
-    )
+        .background(trackColor),
+      contentAlignment = Alignment.CenterStart
+    ) {
+      Box(
+        Modifier
+          .offset(x = thumbOffset)
+          .size(thumbSize)
+          .clip(CircleShape)
+          .background(Color.White.copy(alpha = if (enabled) 1f else 0.6f))
+      )
+    }
   }
 }
 
@@ -266,6 +339,7 @@ fun HyperRow(
   Row(
     modifier = modifier
       .fillMaxWidth()
+      .heightIn(min = HYPER_TOUCH_TARGET_DP.dp)
       .clip(miuixSquircleShape(16.dp))
       .then(if (onClick != null) Modifier.hyperPress(enabled = enabled, onClick = onClick) else Modifier)
       .padding(horizontal = 16.dp, vertical = 13.dp),
@@ -314,11 +388,7 @@ fun HyperRow(
     }
     if (showChevron) {
       Spacer(Modifier.width(4.dp))
-      QoderIcon(
-        glyph = QoderGlyph.CHEVRON,
-        modifier = Modifier.size(16.dp),
-        color = HyperTheme.colors.textTertiary
-      )
+      ForwardChevron(16.dp, HyperTheme.colors.textTertiary)
     }
   }
 }
@@ -338,7 +408,11 @@ fun HyperSwitchRow(
   HyperRow(
     title = title,
     summary = summary,
-    modifier = modifier,
+    modifier = modifier.semantics(mergeDescendants = true) {
+      role = Role.Switch
+      toggleableState = ToggleableState(checked)
+      stateDescription = if (checked) "已开启" else "已关闭"
+    },
     enabled = enabled,
     onClick = { onCheckedChange(!checked) },
     trailing = {
@@ -356,6 +430,7 @@ fun HyperActionRow(
   modifier: Modifier = Modifier,
   summary: String? = null,
   enabled: Boolean = true,
+  showChevron: Boolean = false,
   onClick: (() -> Unit)? = null,
   trailing: @Composable (RowScope.() -> Unit)? = null
 ) {
@@ -365,7 +440,7 @@ fun HyperActionRow(
     modifier = modifier,
     enabled = enabled,
     onClick = onClick,
-    showChevron = onClick != null && trailing == null,
+    showChevron = showChevron && onClick != null && trailing == null,
     trailing = trailing
   )
 }
@@ -386,9 +461,10 @@ fun HyperDropdownRow(
       title = title,
       summary = summary,
       value = currentLabel,
-      showChevron = true,
+      showChevron = false,
       enabled = enabled && items.isNotEmpty(),
-      onClick = { if (enabled && items.isNotEmpty()) open = true }
+      onClick = { if (enabled && items.isNotEmpty()) open = true },
+      trailing = { DropdownChevron(16.dp) }
     )
     MenuPopup(
       show = open,
@@ -440,7 +516,7 @@ fun HyperSegmentedTabs(
       modifier = Modifier
         .offset(x = indicatorOffset)
         .width(tabWidth)
-        .height(36.dp)
+        .height(HYPER_TOUCH_TARGET_DP.dp)
         .clip(pillShape)
         .background(HyperTheme.colors.cardElevated, pillShape)
         .border(0.5.dp, HyperTheme.colors.cardBorder, pillShape)
@@ -455,7 +531,7 @@ fun HyperSegmentedTabs(
         Box(
           modifier = Modifier
             .weight(1f)
-            .height(36.dp)
+            .height(HYPER_TOUCH_TARGET_DP.dp)
             .clip(pillShape)
             .hyperPress(scaleDown = 0.96f) { onTabSelected(index) }
             .padding(horizontal = 8.dp),
@@ -575,13 +651,23 @@ internal fun HyperIconButton(
 ) {
   Box(
     modifier = modifier
-      .size(40.dp)
-      .clip(CircleShape)
-      .background(backgroundColor, CircleShape)
-      .hyperPress(enabled = enabled, scaleDown = 0.92f, onClick = onClick)
+      .size(HYPER_TOUCH_TARGET_DP.dp)
+      .hyperPress(enabled = enabled, scaleDown = 0.94f, onClick = onClick)
       .semantics { contentDescription = description },
     contentAlignment = Alignment.Center
   ) {
-    QoderIcon(glyph = glyph, color = if (enabled) tint else tint.copy(alpha = 0.38f))
+    Box(
+      Modifier
+        .size(HYPER_ICON_VISUAL_DP.dp)
+        .clip(CircleShape)
+        .background(backgroundColor, CircleShape),
+      contentAlignment = Alignment.Center
+    ) {
+      QoderIcon(
+        glyph = glyph,
+        modifier = Modifier.size(20.dp),
+        color = if (enabled) tint else tint.copy(alpha = 0.38f)
+      )
+    }
   }
 }

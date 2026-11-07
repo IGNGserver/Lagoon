@@ -2,7 +2,9 @@ package com.igng.opencode.lagoon.ui
 
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
@@ -40,10 +42,7 @@ internal fun AgentSelector(
     choices.forEach { add(DropdownOption(it.name, it.name, state.agentChanged && state.agent == it.name)) }
   }
   Box(modifier) {
-    if (iconOnly) IconButton(onClick = { open = true }, enabled = enabled) {
-      Icon(MiuixIcons.ContactsCircle, "Agent：${state.agent ?: "默认"}", Modifier.size(22.dp),
-        tint = if (state.agentChanged) HyperTheme.colors.primary else HyperTheme.colors.textSecondary)
-    } else CapsuleSelector(state.agent ?: "默认", { open = true }, enabled = enabled, maxTextWidth = 72.dp,
+    if (iconOnly) CircleIconButton(MiuixIcons.ContactsCircle, "Agent：${state.agent ?: "默认"}", { open = true }, enabled = enabled) else CapsuleSelector(state.agent ?: "默认", { open = true }, enabled = enabled, maxTextWidth = 72.dp,
       leading = { Icon(MiuixIcons.ContactsCircle, null, Modifier.size(16.dp), tint = if (state.agentChanged) HyperTheme.colors.primary else HyperTheme.colors.textSecondary) })
     MenuPopup(open, { open = false }, listOf(MenuSection(options.map { option ->
       MenuAction(option.label, selected = option.selected) { controller.chooseAgent(option.value) }
@@ -73,7 +72,33 @@ internal fun ModelSelector(state: LagoonState, controller: LagoonController, mod
   }
   Box(modifier) {
     CapsuleSelector(state.model?.label ?: "默认模型", { open = true }, enabled = enabled, maxTextWidth = 180.dp)
-    MenuPopup(open, { open = false }, sections, alignment = PopupPositionProvider.Align.Start)
+    if (visible.size > 12) {
+      var query by remember(open) { mutableStateOf("") }
+      val filtered = filterModelCatalog(visible, query)
+      if (open) HyperBottomSheet(title = "选择模型", show = true, onDismissRequest = { open = false }) {
+        LazyColumn(Modifier.fillMaxWidth().heightIn(max = 620.dp), contentPadding = PaddingValues(bottom = 16.dp)) {
+          item {
+            TextField(query, { query = it }, label = "搜索模型或服务商", useLabelAsPlaceholder = true,
+              modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp))
+          }
+          item {
+            ChoiceRow("默认模型", "跟随会话或服务器默认设置", !state.modelChanged) {
+              controller.chooseModel(null); open = false
+            }
+          }
+          items(filtered, key = { it.key }) { model ->
+            ChoiceRow(model.choice.label, model.providerName, state.modelChanged && model.key == currentKey) {
+              controller.chooseModel(model.choice); open = false
+            }
+          }
+          if (filtered.isEmpty()) item {
+            Text("没有匹配的模型", Modifier.padding(16.dp), style = MiuixTheme.textStyles.body2.copy(color = HyperTheme.colors.textSecondary))
+          }
+        }
+      }
+    } else {
+      MenuPopup(open, { open = false }, sections, alignment = PopupPositionProvider.Align.Start)
+    }
   }
 }
 
@@ -99,6 +124,8 @@ internal fun VariantSelector(state: LagoonState, controller: LagoonController, m
 @Composable
 internal fun ModelManagementSheet(state: LagoonState, controller: LagoonController, onDismiss: () -> Unit) {
   val catalog = state.modelCatalog
+  var query by rememberSaveable { mutableStateOf("") }
+  val filtered = filterModelCatalog(catalog, query)
   val selectedCount = catalog.count { !state.modelVisibilityConfigured || state.modelOverrides[it.key] == true }
   HyperBottomSheet(
     title = "管理模型${state.server?.name?.let { " · $it" }.orEmpty()}",
@@ -109,8 +136,19 @@ internal fun ModelManagementSheet(state: LagoonState, controller: LagoonControll
       item {
         ResourceHint(state.resource("models"), "服务器没有可用模型", "模型列表和思考强度均来自服务器。", controller::reload)
       }
-      if (catalog.isNotEmpty()) {
-        item {
+      if (catalog.size > 8) item {
+        TextField(
+          value = query,
+          onValueChange = { query = it },
+          label = "搜索模型或服务商",
+          useLabelAsPlaceholder = true,
+          modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)
+        )
+      }
+      if (catalog.isNotEmpty() && filtered.isEmpty()) item {
+        Text("没有匹配的模型", Modifier.padding(16.dp), style = MiuixTheme.textStyles.body2.copy(color = HyperTheme.colors.textSecondary))
+      }
+      if (filtered.isNotEmpty()) item {
           Text(
             if (state.modelVisibilityConfigured) "已选择 $selectedCount/${catalog.size} 个模型"
             else "尚未配置过滤，当前显示服务器返回的全部 ${catalog.size} 个模型",
@@ -123,18 +161,14 @@ internal fun ModelManagementSheet(state: LagoonState, controller: LagoonControll
             )
           )
         }
-        item {
+        if (filtered.isNotEmpty()) item {
           HyperCard(Modifier.fillMaxWidth().padding(horizontal = 8.dp), insidePadding = PaddingValues(vertical = 4.dp)) {
-            catalog.forEachIndexed { index, info ->
+            filtered.forEachIndexed { index, info ->
               if (index > 0) HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
               val checked = !state.modelVisibilityConfigured || state.modelOverrides[info.key] == true
               HyperSwitchRow(
                 title = info.choice.label,
-                summary = buildString {
-                  append(info.providerName)
-                  if (info.variants.isNotEmpty()) append(" · ${info.variants.size} 个服务器变体")
-                  append("\n${info.key}")
-                },
+                summary = info.providerName,
                 checked = checked,
                 onCheckedChange = { controller.setModelVisible(info, it) }
               )
@@ -142,13 +176,13 @@ internal fun ModelManagementSheet(state: LagoonState, controller: LagoonControll
           }
         }
         if (state.modelVisibilityConfigured) item {
-          TextButton(
+          HyperButton(
             text = "恢复显示全部模型",
+            variant = HyperButtonVariant.SECONDARY,
             onClick = controller::resetModelVisibility,
             modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
           )
         }
-      }
     }
   }
 }

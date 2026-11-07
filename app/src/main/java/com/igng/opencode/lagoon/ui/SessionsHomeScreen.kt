@@ -78,37 +78,9 @@ internal fun HomeScreen(
     Column(Modifier.fillMaxSize()) {
       if (searching) SearchTopBar(query, { query = it }, ::closeSearch)
       else HomeTopBar(
-        title = when {
-          state.allServers -> "全部设备"
-          scopeWorkspace != null -> scopeWorkspace.name
-          state.homeGroup != null -> state.homeGroup!!.name
-          else -> state.scopeProjectId?.let { id -> state.projects.firstOrNull { it.id == id }?.name }
-            ?: state.server?.name ?: "全部会话"
-        },
-        scopeSummary = homeScopeSummary(state),
-        statusDot = homeScopeDot(state),
-        onTitleClick = onScope,
+        title = state.homeGroup?.name ?: "Lagoon",
         action = if (hasUnread) {
-          {
-            val pillShape = miuixSquircleShape(14.dp)
-            Box(
-              Modifier
-                .clip(pillShape)
-                .background(HyperTheme.colors.primarySubtle, pillShape)
-                .border(0.5.dp, HyperTheme.colors.primary.copy(alpha = 0.25f), pillShape)
-                .hyperPress(scaleDown = 0.94f) { controller.markAllRead() }
-                .padding(horizontal = 12.dp, vertical = 8.dp)
-            ) {
-              Text(
-                "全部已读",
-                maxLines = 1,
-                style = MiuixTheme.textStyles.footnote1.copy(
-                  fontWeight = FontWeight.SemiBold,
-                  color = HyperTheme.colors.primary
-                )
-              )
-            }
-          }
+          { HyperTextAction("全部已读", onClick = { controller.markAllRead() }) }
         } else null,
         menu = {
           Box {
@@ -134,7 +106,33 @@ internal fun HomeScreen(
           }
         }
       )
-      if (!searching) GlobalTaskStrip(state, controller, onOpen = onOpen)
+      if (!searching) {
+        val scopeProfiles = when {
+          state.allServers -> state.enabledProfiles
+          state.homeGroup != null -> state.enabledProfiles.filter { it.id in state.homeGroup!!.memberIds }
+          else -> listOfNotNull(state.server).filter { it.enabled }
+        }
+        val online = scopeProfiles.count { profile ->
+          if (!state.multiServerView && profile.id == state.serverId) state.connected
+          else state.allServerSnapshots[profile.id]?.connected == true
+        }
+        HyperCard(
+          Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 6.dp),
+          insidePadding = PaddingValues(vertical = 4.dp)
+        ) {
+          HyperRow(
+            title = scopeWorkspace?.name ?: if (state.allServers || state.homeGroup != null) "全部项目" else state.server?.name ?: "选择设备",
+            summary = buildString {
+              if (scopeWorkspace != null) append("当前项目 · ")
+              append("${scopeProfiles.size} 台设备")
+              if (scopeProfiles.isNotEmpty()) append(" · $online 台在线")
+            },
+            trailing = { DropdownChevron(18.dp, description = "切换设备与项目") },
+            onClick = onScope
+          )
+        }
+        GlobalTaskStrip(state, controller, onOpen = onOpen)
+      }
       if (!state.multiServerView) ConnectionStrip(state, controller)
       Box(Modifier.weight(1f).fillMaxWidth()) {
         SessionList(
@@ -201,17 +199,7 @@ private fun SearchTopBar(query: String, onQuery: (String) -> Unit, onClose: () -
         label = "搜索会话标题或项目",
         modifier = Modifier.weight(1f).focusRequester(focus)
       )
-      Text(
-        "取消",
-        Modifier
-          .clip(CircleShape)
-          .hyperPress(onClick = onClose)
-          .padding(horizontal = 12.dp, vertical = 10.dp),
-        style = MiuixTheme.textStyles.body1.copy(
-          fontWeight = FontWeight.SemiBold,
-          color = HyperTheme.colors.primary
-        )
-      )
+      HyperTextAction("取消", onClick = onClose)
     }
     HorizontalDivider(color = HyperTheme.colors.divider)
   }
@@ -227,84 +215,35 @@ private fun GlobalTaskStrip(
   controller: LagoonController,
   onOpen: (SessionTarget) -> Unit = {}
 ) {
-  val grouped = state.homeGroup != null
-  val summary = if (grouped) state.summary else state.globalSummary
+  val summary = if (state.homeGroup != null) state.summary else state.globalSummary
   val silent = state.silentServersWithTasks()
   if (summary.isEmpty && silent.isEmpty()) return
-  val hasWaiting = summary.waiting > 0
-  val accentColor = when {
-    hasWaiting -> HyperTheme.colors.warning
-    summary.running > 0 -> HyperTheme.colors.primary
-    else -> HyperTheme.colors.success
-  }
-  val islandBg = when {
-    hasWaiting -> HyperTheme.colors.warningSubtle
-    summary.running > 0 -> HyperTheme.colors.primarySubtle
-    else -> HyperTheme.colors.cardElevated
-  }
-  val islandShape = miuixSquircleShape(18.dp)
   val target = state.summaryTarget
-  Column(
-    modifier = Modifier
-      .fillMaxWidth()
-      .padding(horizontal = 14.dp, vertical = 6.dp)
-      .clip(islandShape)
-      .background(islandBg, islandShape)
-      .border(0.7.dp, accentColor.copy(alpha = 0.28f), islandShape)
-      .then(if (target != null) Modifier.hyperPress { onOpen(target) } else Modifier)
-      .padding(horizontal = 14.dp, vertical = 10.dp),
-    verticalArrangement = Arrangement.spacedBy(4.dp)
+  val title = when {
+    summary.waiting > 0 -> "需要你处理"
+    summary.running > 0 -> "正在运行"
+    else -> "任务状态"
+  }
+  val detail = buildList {
+    if (!summary.isEmpty) add(summary.countLine)
+    if (silent.isNotEmpty()) add("${silent.joinToString("、")}已关闭任务通知")
+  }.joinToString("\n")
+  HyperCard(
+    Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 6.dp),
+    insidePadding = PaddingValues(vertical = 4.dp)
   ) {
-    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-      Box(Modifier.size(7.dp).background(accentColor, CircleShape))
-      Spacer(Modifier.width(8.dp))
-      Text(
-        if (grouped) "${state.homeGroup?.name.orEmpty()} · 全部项目" else "全部设备 · 全部项目",
-        Modifier.weight(1f),
-        maxLines = 1,
-        overflow = TextOverflow.Ellipsis,
-        style = MiuixTheme.textStyles.footnote2.copy(
-          fontWeight = FontWeight.SemiBold,
-          color = HyperTheme.colors.textSecondary
-        )
-      )
-      if (state.showsGlobalViewAll()) {
-        Text(
-          "查看全部",
-          Modifier
-            .clip(CircleShape)
-            .hyperPress(scaleDown = 0.94f) {
-              controller.setScope(null)
-              controller.setAllServers(true)
-            }
-            .padding(horizontal = 8.dp, vertical = 2.dp),
-          maxLines = 1,
-          style = MiuixTheme.textStyles.footnote2.copy(
-            fontWeight = FontWeight.SemiBold,
-            color = HyperTheme.colors.primary
-          )
-        )
-      }
-    }
-    if (!summary.isEmpty) {
-      Text(
-        summary.countLine,
-        maxLines = 2,
-        overflow = TextOverflow.Ellipsis,
-        style = HyperTheme.tabular(
-          MiuixTheme.textStyles.footnote1.copy(
-            fontWeight = FontWeight.SemiBold,
-            color = HyperTheme.colors.textPrimary
-          )
-        )
-      )
-    }
-    if (silent.isNotEmpty()) {
-      Text(
-        "通知已关闭：${silent.joinToString("、")}（未计入灵动岛）",
-        maxLines = 2,
-        overflow = TextOverflow.Ellipsis,
-        style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.warning)
+    HyperRow(
+      title = title,
+      summary = detail,
+      value = if (summary.waiting > 0) "${summary.waiting} 项" else null,
+      showChevron = target != null,
+      onClick = if (target != null) ({ onOpen(target) }) else null
+    )
+    if (state.showsGlobalViewAll()) {
+      HyperTextAction(
+        text = "查看全部设备",
+        onClick = { controller.setScope(null); controller.setAllServers(true) },
+        modifier = Modifier.align(Alignment.End).padding(end = 8.dp)
       )
     }
   }
@@ -313,127 +252,25 @@ private fun GlobalTaskStrip(
 @Composable
 private fun HomeTopBar(
   title: String,
-  scopeSummary: String?,
-  statusDot: Color?,
-  onTitleClick: () -> Unit,
   action: (@Composable () -> Unit)? = null,
   menu: @Composable () -> Unit
 ) {
   Column(Modifier.fillMaxWidth().background(HyperTheme.colors.glassChrome)) {
     Row(
-      Modifier
-        .fillMaxWidth()
-        .statusBarsPadding()
-        .heightIn(min = 64.dp)
-        .padding(start = 14.dp, end = 14.dp, top = 8.dp, bottom = 8.dp),
+      Modifier.fillMaxWidth().statusBarsPadding().heightIn(min = 64.dp).padding(horizontal = 12.dp, vertical = 6.dp),
       verticalAlignment = Alignment.CenterVertically
     ) {
-      Box(Modifier.weight(1f)) {
-        val pillShape = miuixSquircleShape(18.dp)
-        Row(
-          Modifier
-            .clip(pillShape)
-            .background(HyperTheme.colors.cardElevated, pillShape)
-            .border(0.6.dp, HyperTheme.colors.cardBorder, pillShape)
-            .hyperPress(scaleDown = 0.96f, onClick = onTitleClick)
-            .padding(horizontal = 12.dp, vertical = 8.dp),
-          verticalAlignment = Alignment.CenterVertically
-        ) {
-          Icon(MiuixIcons.GridView, null, Modifier.size(22.dp), tint = HyperTheme.colors.primary)
-          Spacer(Modifier.width(10.dp))
-          Column(Modifier.weight(1f, fill = false)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-              Text(
-                title,
-                Modifier.weight(1f, fill = false),
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                style = MiuixTheme.textStyles.title3.copy(
-                  fontWeight = FontWeight.Bold,
-                  color = HyperTheme.colors.textPrimary
-                )
-              )
-              statusDot?.let {
-                Spacer(Modifier.width(6.dp))
-                StatusDot(it)
-              }
-            }
-            if (!scopeSummary.isNullOrBlank()) {
-              Text(
-                scopeSummary,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                style = HyperTheme.tabular(
-                  MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary)
-                )
-              )
-            }
-          }
-          Spacer(Modifier.width(6.dp))
-          DropdownChevron(18.dp, HyperTheme.colors.textSecondary, "切换范围")
-        }
-      }
-      Spacer(Modifier.width(8.dp))
-      if (action != null) {
-        action()
-        Spacer(Modifier.width(6.dp))
-      }
+      Text(
+        title,
+        Modifier.weight(1f).padding(start = 8.dp),
+        maxLines = 1,
+        overflow = TextOverflow.Ellipsis,
+        style = MiuixTheme.textStyles.title2.copy(fontWeight = FontWeight.Bold)
+      )
+      action?.invoke()
       menu()
     }
     HorizontalDivider(color = HyperTheme.colors.divider)
-  }
-}
-
-@Composable
-private fun homeScopeSummary(state: LagoonState): String? {
-  val profiles = when {
-    state.allServers -> state.enabledProfiles
-    state.homeGroupId != null -> state.deviceTabs.firstOrNull { it.group?.id == state.homeGroupId }?.profiles.orEmpty()
-    else -> listOfNotNull(state.server)
-  }
-  if (profiles.isEmpty()) return "未启用设备"
-  fun connected(profile: ServerProfile): Boolean =
-    if (!state.multiServerView && profile.id == state.serverId) state.connected
-    else state.allServerSnapshots[profile.id]?.connected == true
-  fun errored(profile: ServerProfile): Boolean =
-    !connected(profile) && state.allServerSnapshots[profile.id]?.loading != true &&
-      !state.allServerSnapshots[profile.id]?.error.isNullOrBlank()
-  val online = profiles.count(::connected)
-  val abnormal = profiles.count(::errored)
-  return if (state.multiServerView) {
-    if (abnormal > 0) "${online}/${profiles.size} 台在线 · $abnormal 台异常"
-    else "${online}/${profiles.size} 台在线"
-  } else if (online > 0) "已连接" else if (state.loading) "正在连接…" else "未连接"
-}
-
-/**
- * Aggregate connection health of the current scope, replacing the dots the old capsule row showed.
- * Green means at least one member is streaming, amber means connected or connecting, and muted means
- * nothing is reachable. It is one small dot, not another selector row.
- */
-@Composable
-private fun homeScopeDot(state: LagoonState): Color? {
-  val profiles = when {
-    state.allServers -> state.enabledProfiles
-    state.homeGroupId != null -> state.deviceTabs.firstOrNull { it.group?.id == state.homeGroupId }?.profiles.orEmpty()
-    else -> listOfNotNull(state.server)
-  }
-  fun connected(profile: ServerProfile): Boolean =
-    if (!state.multiServerView && profile.id == state.serverId) state.connected
-    else state.allServerSnapshots[profile.id]?.connected == true
-  fun streaming(profile: ServerProfile): Boolean =
-    if (!state.multiServerView && profile.id == state.serverId) state.streamConnected
-    else state.allServerSnapshots[profile.id]?.streamConnected == true
-  fun loading(profile: ServerProfile): Boolean =
-    if (!state.multiServerView && profile.id == state.serverId) state.loading
-    else state.allServerSnapshots[profile.id]?.loading == true
-  val anyConnected = profiles.any(::connected)
-  val anyStreaming = profiles.any(::streaming)
-  val anyLoading = profiles.any(::loading)
-  return when {
-    anyConnected && anyStreaming -> MiuixColorTokens.Success
-    anyConnected || anyLoading -> MiuixColorTokens.Warning
-    else -> HyperTheme.colors.textTertiary
   }
 }
 
@@ -546,7 +383,13 @@ private fun SessionList(
         item(key = "section:${section.key}", contentType = "section") {
           SectionHeader(section.title, section.sessions.size, collapsed) { controller.toggleSection(section.key) }
         }
-        if (!collapsed) items(section.sessions, key = { "session:${section.key}:${it.key}" }, contentType = { "session" }) { session ->
+        if (!collapsed) item(key = "sessions:${section.key}", contentType = "sessionGroup") {
+          HyperCard(
+            Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 3.dp),
+            insidePadding = PaddingValues(vertical = 4.dp)
+          ) {
+            section.sessions.forEachIndexed { index, session ->
+              if (index > 0) HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
           val pinned = session.id in state.pinned
           val background = if (state.multiServerView) session.serverId?.let { id -> state.allServerSnapshots[id]?.backgroundRunning?.contains(session.id) } == true
             else state.backgroundRunning.contains(session.id)
@@ -580,6 +423,8 @@ private fun SessionList(
               }
             )
           }
+            }
+          }
         }
       }
       if (visibleSections.isEmpty()) item(key = "empty") {
@@ -607,7 +452,7 @@ private fun SessionList(
                 allDisabled || state.profiles.isEmpty() -> "管理设备"
                 else -> "重新连接"
               }
-              TextButton(
+              HyperButton(
                 text = action,
                 onClick = {
                   when {
@@ -615,17 +460,18 @@ private fun SessionList(
                     allDisabled || state.profiles.isEmpty() -> onManageDevices()
                     else -> controller.reload()
                   }
-                },
-                colors = ButtonDefaults.textButtonColorsPrimary()
+                }
               )
             }
           }
         }
       }
       if (state.sessionCursors.isNotEmpty()) item(key = "more") {
-        TextButton(
-          text = if (state.pending("sessions-more")) "正在加载…" else "加载更多会话",
+        HyperButton(
+          text = "加载更多会话",
+          variant = HyperButtonVariant.SECONDARY,
           enabled = !state.pending("sessions-more"),
+          loading = state.pending("sessions-more"),
           onClick = { controller.loadMoreSessions() },
           modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 6.dp)
         )
@@ -650,6 +496,7 @@ private fun SectionHeader(title: String, count: Int, collapsed: Boolean, onToggl
       Modifier
         .padding(horizontal = 14.dp)
         .clip(CircleShape)
+        .heightIn(min = HYPER_TOUCH_TARGET_DP.dp)
         .hyperPress(scaleDown = 0.96f, onClick = onToggle)
         .padding(horizontal = 10.dp, vertical = 6.dp),
       verticalAlignment = Alignment.CenterVertically
@@ -709,44 +556,23 @@ internal fun HomeSessionRow(
   var menu by remember { mutableStateOf(false) }
   val waiting = status in setOf(SessionStatus.WAITING_PERMISSION, SessionStatus.WAITING_QUESTION)
   val highlighted = unseen || waiting || status == SessionStatus.RUNNING
-  val cardShape = miuixSquircleShape(18.dp)
-  val borderColor = when {
-    waiting -> HyperTheme.colors.warning.copy(alpha = 0.42f)
-    status == SessionStatus.FAILED -> HyperTheme.colors.error.copy(alpha = 0.38f)
-    unseen -> HyperTheme.colors.primary.copy(alpha = 0.32f)
-    else -> HyperTheme.colors.cardBorder
+  fun openMenu() {
+    val items = actions()
+    if (items.isNotEmpty()) { menuItems = items; menu = true }
   }
-  Box(Modifier.padding(horizontal = 14.dp, vertical = 3.dp)) {
+  Box(Modifier.fillMaxWidth()) {
     Row(
-      Modifier
-        .fillMaxWidth()
-        .heightIn(min = 64.dp)
-        .clip(cardShape)
-        .background(HyperTheme.colors.cardElevated, cardShape)
-        .border(0.65.dp, borderColor, cardShape)
-        .hyperPress(
-          surfaceHighlight = true,
-          onClick = onClick,
-          onLongClick = {
-            val items = actions()
-            if (items.isNotEmpty()) {
-              menuItems = items
-              menu = true
-            }
-          }
-        )
-        .padding(start = 14.dp, end = 16.dp, top = 12.dp, bottom = 12.dp),
+      Modifier.fillMaxWidth().heightIn(min = 72.dp)
+        .hyperPress(surfaceHighlight = true, onClick = onClick, onLongClick = ::openMenu)
+        .padding(start = 14.dp, end = 4.dp, top = 11.dp, bottom = 11.dp),
       verticalAlignment = Alignment.CenterVertically
     ) {
-      Box(Modifier.size(26.dp), contentAlignment = Alignment.Center) { StatusGlyph(status, unseen) }
-      Spacer(Modifier.width(12.dp))
+      Box(Modifier.size(24.dp), contentAlignment = Alignment.Center) { StatusGlyph(status, unseen) }
+      Spacer(Modifier.width(10.dp))
       Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
           Text(
-            session.displayTitle(),
-            Modifier.weight(1f),
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
+            session.displayTitle(), Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis,
             style = MiuixTheme.textStyles.body1.copy(
               fontWeight = if (highlighted) FontWeight.SemiBold else FontWeight.Medium,
               color = HyperTheme.colors.textPrimary
@@ -758,60 +584,35 @@ internal fun HomeSessionRow(
           }
           if (relativeTime.isNotBlank()) {
             Spacer(Modifier.width(8.dp))
-            Text(
-              relativeTime,
-              style = HyperTheme.tabular(
-                MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textTertiary)
-              ),
-              maxLines = 1
-            )
+            Text(relativeTime, style = HyperTheme.tabular(MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textTertiary)), maxLines = 1)
           }
         }
-        val meta = listOfNotNull(serverName, workspace).joinToString(" · ")
+        val meta = listOfNotNull(serverName, workspace, if (background) "后台" else null).joinToString(" · ")
         if (harness != null || meta.isNotBlank()) {
           Row(verticalAlignment = Alignment.CenterVertically) {
-            harness?.let {
-              HarnessBadge(it)
-              Spacer(Modifier.width(6.dp))
-            }
-            if (meta.isNotBlank()) {
-              Text(
-                meta,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary)
-              )
-            }
+            harness?.let { HarnessBadge(it); Spacer(Modifier.width(6.dp)) }
+            if (meta.isNotBlank()) Text(meta, maxLines = 1, overflow = TextOverflow.Ellipsis,
+              style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary))
           }
         }
-        if (!liveDetail.isNullOrBlank()) {
-          Text(
-            liveDetail,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            style = MiuixTheme.textStyles.footnote2.copy(
-              fontWeight = FontWeight.Medium,
-              color = if (waiting) HyperTheme.colors.warning else HyperTheme.colors.primary
-            )
-          )
+        val activity = liveDetail?.takeIf { it.isNotBlank() } ?: when (status) {
+          SessionStatus.FAILED -> "执行失败"
+          SessionStatus.WAITING_SERVER -> status.label
+          SessionStatus.WAITING_PERMISSION, SessionStatus.WAITING_QUESTION -> status.label
+          else -> null
         }
+        if (activity != null) Text(activity, maxLines = 1, overflow = TextOverflow.Ellipsis,
+          style = MiuixTheme.textStyles.footnote2.copy(
+            fontWeight = FontWeight.Medium,
+            color = when {
+              status == SessionStatus.FAILED -> HyperTheme.colors.error
+              waiting -> HyperTheme.colors.warning
+              else -> HyperTheme.colors.primary
+            }
+          ))
       }
-      if (background && status != SessionStatus.RUNNING) {
-        Spacer(Modifier.width(8.dp))
-        BackgroundMarker()
-      }
-      if (liveDetail.isNullOrBlank()) {
-        if (status == SessionStatus.WAITING_SERVER) {
-          Spacer(Modifier.width(8.dp))
-          StatusPillTag(status.label, HyperTheme.colors.textSecondary, HyperTheme.colors.container)
-        } else if (status == SessionStatus.FAILED) {
-          Spacer(Modifier.width(8.dp))
-          StatusPillTag(status.label, HyperTheme.colors.error, HyperTheme.colors.errorSubtle)
-        } else if (waiting) {
-          Spacer(Modifier.width(8.dp))
-          StatusPillTag(status.label, HyperTheme.colors.warning, HyperTheme.colors.warningSubtle)
-        }
-      }
+      Spacer(Modifier.width(4.dp))
+      CircleIconButton(MiuixIcons.More, "会话操作", ::openMenu)
     }
     MenuPopup(menu, { menu = false }, listOf(MenuSection(menuItems)))
   }

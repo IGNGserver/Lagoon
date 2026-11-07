@@ -26,9 +26,12 @@ internal data class RemoteCatalog(
   val provider: String?,
   val deviceLabel: String,
   val hosts: List<RemoteHostMeta>,
-  val updatedAt: Long
+  val updatedAt: Long,
+  val allowCleartext: Boolean = false
 ) {
   val key: String get() = "$origin\u0000$account"
+  val requiresCleartextConsent: Boolean
+    get() = origin.trim().startsWith("http://", ignoreCase = true) && !allowCleartext
 }
 
 /** One local record per origin+account. Implementations must replace atomically. */
@@ -43,6 +46,7 @@ internal object RemoteCatalogCodec {
     .put("version", 1).put("origin", catalog.origin).put("account", catalog.account)
     .put("provider", catalog.provider ?: JSONObject.NULL).put("deviceLabel", catalog.deviceLabel)
     .put("updatedAt", catalog.updatedAt)
+    .put("allowCleartext", catalog.allowCleartext)
     .put("hosts", JSONArray().apply {
       catalog.hosts.forEach { host ->
         put(JSONObject().put("hostId", host.hostId).put("name", host.name).put("platform", host.platform)
@@ -85,7 +89,7 @@ internal object RemoteCatalogCodec {
         )
       }
       if (hosts.distinctBy { it.hostId }.size != hosts.size) throw IOException("Remote 主机目录重复")
-      return RemoteCatalog(origin, account, provider, label, hosts, updated)
+      return RemoteCatalog(origin, account, provider, label, hosts, updated, json.optBoolean("allowCleartext", false))
     } catch (error: IOException) { throw error }
     catch (error: Exception) { throw IOException("Remote 主机目录损坏", error) }
   }

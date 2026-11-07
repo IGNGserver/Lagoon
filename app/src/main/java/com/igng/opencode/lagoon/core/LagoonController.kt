@@ -198,6 +198,9 @@ class LagoonController private constructor(private val appContext: Context) {
    * reused, so adding a Host twice does not duplicate it in the home chips.
    */
   internal fun addRemoteProfiles(catalog: RemoteCatalog, selected: List<RemoteHostMeta>): List<ServerProfile> {
+    require(!catalog.requiresCleartextConsent) {
+      "HTTP 明文连接未获授权，请重新登录并明确允许"
+    }
     if (catalog.hosts.isEmpty()) return emptyList()
     val origin = catalog.origin.trimEnd('/')
     val existing = store.profiles()
@@ -221,7 +224,7 @@ class LagoonController private constructor(private val appContext: Context) {
         username = catalog.account,
         autoConnect = true,
         notifications = true,
-        allowCleartext = catalog.origin.startsWith("http://", ignoreCase = true),
+        allowCleartext = catalog.allowCleartext,
         kind = ServerKind.DSH_REMOTE,
         remoteHostId = host.hostId,
         remoteHostFingerprint = host.fingerprint
