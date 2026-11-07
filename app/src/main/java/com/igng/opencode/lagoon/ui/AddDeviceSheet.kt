@@ -1,7 +1,6 @@
 package com.igng.opencode.lagoon.ui
 
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -11,23 +10,20 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -36,16 +32,11 @@ import com.igng.opencode.lagoon.core.LagoonState
 import com.igng.opencode.lagoon.core.PairLinkResolver
 import com.igng.opencode.lagoon.core.ServerKind
 import com.igng.opencode.lagoon.core.ServerProfile
-import com.igng.opencode.lagoon.core.SshHostConfig
 import com.igng.opencode.lagoon.core.profileCredentials
 import com.igng.opencode.lagoon.core.userFacingError
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
-import top.yukonga.miuix.kmp.basic.Card
-import top.yukonga.miuix.kmp.basic.CardDefaults
 import top.yukonga.miuix.kmp.basic.Icon
-import top.yukonga.miuix.kmp.basic.SmallTitle
-import top.yukonga.miuix.kmp.basic.TabRow
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.basic.TextButton
 import top.yukonga.miuix.kmp.extra.SuperBottomSheet
@@ -64,7 +55,7 @@ internal enum class AddDeviceTab(val label: String) {
 }
 
 /**
- * 统一添加入口：三大对等接入通道（OpenCode 直连、DSH 远程中枢、DSH SSH 直连）。
+ * 统一添加入口：三大对等接入通道（OpenCode 直连、DSH 远程中枢、DSH SSH 直连），采用自研澎湃分段胶囊。
  */
 @Composable
 internal fun AddDeviceSheet(
@@ -99,9 +90,9 @@ internal fun AddDeviceSheet(
   }
 
   SuperBottomSheet(title = "", show = true, onDismissRequest = onDismiss) {
-    Column(Modifier.fillMaxWidth().fillMaxHeight(0.94f).background(MiuixTheme.colorScheme.surface)) {
+    Column(Modifier.fillMaxWidth().fillMaxHeight(0.94f).background(HyperTheme.colors.sheetSurface)) {
       Row(
-        Modifier.fillMaxWidth().padding(start = 8.dp, end = 8.dp, top = 4.dp, bottom = 2.dp),
+        Modifier.fillMaxWidth().padding(start = 8.dp, end = 8.dp, top = 4.dp, bottom = 4.dp),
         verticalAlignment = Alignment.CenterVertically
       ) {
         CircleIconButton(
@@ -109,23 +100,25 @@ internal fun AddDeviceSheet(
           "返回",
           onClick = { back() }
         )
-        Spacer(Modifier.width(8.dp))
+        Spacer(Modifier.width(10.dp))
         Text(
           when {
             sshEditor != null -> if (sshEditor!!.isBlank()) "添加 DSH SSH 直连" else "编辑 DSH SSH 直连"
             editing -> "编辑 OpenCode 直连"
             else -> "添加设备"
           },
-          Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis,
-          style = MiuixTheme.textStyles.title4.copy(fontWeight = FontWeight.Medium)
+          Modifier.weight(1f),
+          maxLines = 1,
+          overflow = TextOverflow.Ellipsis,
+          style = MiuixTheme.textStyles.title4.copy(fontWeight = FontWeight.SemiBold)
         )
       }
 
       if (sshEditor == null && !editing) {
-        Box(Modifier.padding(horizontal = 20.dp, vertical = 4.dp)) {
-          TabRow(
+        Box(Modifier.padding(horizontal = 16.dp, vertical = 6.dp)) {
+          HyperSegmentedTabs(
             tabs = AddDeviceTab.entries.map { it.label },
-            selectedTabIndex = AddDeviceTab.entries.indexOf(tab),
+            selectedIndex = AddDeviceTab.entries.indexOf(tab),
             onTabSelected = { tab = AddDeviceTab.entries[it] }
           )
         }
@@ -168,7 +161,7 @@ internal fun AddDeviceSheet(
                       return@launch
                     }
                     var minted: String? = null
-                    val version = controller.testServer(actual, credentials) { minted = it }
+                    controller.testServer(actual, credentials) { minted = it }
                     controller.saveServer(actual, credentials.password, minted ?: credentials.cookie, credentials.username)
                     done("已连接 OpenCode 直连")
                     onDismiss()
@@ -229,47 +222,47 @@ private fun DshRemoteTab(
   val remoteProfiles = state.profiles.filter { it.kind == ServerKind.DSH_REMOTE }
   LazyColumn(
     Modifier.fillMaxSize(),
-    contentPadding = PaddingValues(horizontal = 20.dp, vertical = 8.dp),
+    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
     verticalArrangement = Arrangement.spacedBy(10.dp)
   ) {
     item {
       Text(
         "通过 DSH 远程中枢账号登录，安全接入名下各台电脑；每台托管主机独立保持端到端加密连接。",
-        style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+        style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary)
       )
     }
     item {
-      SmallTitle("DSH 远程中枢账号", insideMargin = PaddingValues(horizontal = 4.dp, vertical = 2.dp))
+      HyperGroupTitle("DSH 远程中枢账号")
       if (catalogAccount == null) {
-        Card(Modifier.fillMaxWidth(), insideMargin = PaddingValues(14.dp)) {
+        HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(14.dp)) {
           Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text(
               "登录一次即可接入中枢名下的多台电脑。每台主机在本地注册独立安全身份，并保持端到端加密连接。",
-              style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+              style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary)
             )
             TextButton(text = "登录 DSH 远程中枢", onClick = onLoginHub, modifier = Modifier.fillMaxWidth())
           }
         }
       } else {
-        Card(Modifier.fillMaxWidth().clickable(onClick = onManageHub), insideMargin = PaddingValues(14.dp)) {
+        HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(14.dp), onClick = onManageHub) {
           Row(verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
               Text(
                 catalogAccount,
-                style = MiuixTheme.textStyles.body1.copy(fontWeight = FontWeight.Medium),
+                style = MiuixTheme.textStyles.body1.copy(fontWeight = FontWeight.SemiBold),
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
               )
               Text(
                 "$catalogOrigin · $hostCount 台托管主机",
-                style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary),
+                style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary),
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
               )
             }
-            Text("管理中枢与主机", style = MiuixTheme.textStyles.body2.copy(color = MiuixTheme.colorScheme.primary))
+            Text("管理中枢与主机", style = MiuixTheme.textStyles.body2.copy(fontWeight = FontWeight.SemiBold, color = HyperTheme.colors.primary))
             Spacer(Modifier.width(4.dp))
-            DropdownChevron(18.dp, MiuixTheme.colorScheme.primary)
+            DropdownChevron(18.dp, HyperTheme.colors.primary)
           }
         }
       }
@@ -277,17 +270,17 @@ private fun DshRemoteTab(
 
     if (remoteProfiles.isNotEmpty()) {
       item {
-        SmallTitle("已接入的主机", insideMargin = PaddingValues(horizontal = 4.dp, vertical = 2.dp))
+        HyperGroupTitle("已接入的主机")
       }
       items(remoteProfiles, key = { it.id }) { profile ->
         val connected = if (profile.id == state.serverId) state.connected else state.allServerSnapshots[profile.id]?.connected == true
-        Card(Modifier.fillMaxWidth().clickable(onClick = onManageHub), insideMargin = PaddingValues(14.dp)) {
+        HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(14.dp), onClick = onManageHub) {
           Row(verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
-              Text(profile.name, style = MiuixTheme.textStyles.body1, maxLines = 1, overflow = TextOverflow.Ellipsis)
+              Text(profile.name, style = MiuixTheme.textStyles.body1.copy(fontWeight = FontWeight.Medium), maxLines = 1, overflow = TextOverflow.Ellipsis)
               Text(
                 "指纹 ${formatFingerprint(profile.remoteHostFingerprint)}",
-                style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary),
+                style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary),
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
               )
@@ -295,7 +288,7 @@ private fun DshRemoteTab(
             if (connected) {
               StatusDot(MiuixColorTokens.Success)
               Spacer(Modifier.width(6.dp))
-              Text("在线", style = MiuixTheme.textStyles.footnote2.copy(color = MiuixColorTokens.Success))
+              Text("在线", style = MiuixTheme.textStyles.footnote2.copy(fontWeight = FontWeight.SemiBold, color = MiuixColorTokens.Success))
             }
           }
         }
@@ -304,25 +297,25 @@ private fun DshRemoteTab(
 
     if (catalogAccount != null) {
       item {
-        Card(Modifier.fillMaxWidth().clickable(onClick = onLoginHub), insideMargin = PaddingValues(14.dp)) {
+        HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(14.dp), onClick = onLoginHub) {
           Row(verticalAlignment = Alignment.CenterVertically) {
-            Icon(MiuixIcons.Add, null, Modifier.size(22.dp), tint = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+            Icon(MiuixIcons.Add, null, Modifier.size(22.dp), tint = HyperTheme.colors.primary)
             Spacer(Modifier.width(10.dp))
             Column(Modifier.weight(1f)) {
-              Text("接入更多中枢主机", style = MiuixTheme.textStyles.body1)
-              Text("在中枢名下的电脑列表中勾选并接入", style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
+              Text("接入更多中枢主机", style = MiuixTheme.textStyles.body1.copy(fontWeight = FontWeight.Medium))
+              Text("在中枢名下的电脑列表中勾选并接入", style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary))
             }
-            DropdownChevron(18.dp, MiuixTheme.colorScheme.onSurfaceVariantSummary)
+            DropdownChevron(18.dp, HyperTheme.colors.textSecondary)
           }
         }
       }
     }
 
     item {
-      Card(Modifier.fillMaxWidth(), insideMargin = PaddingValues(14.dp)) {
+      HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(14.dp)) {
         Text(
           "直连 DSH（地址 + 启动令牌）已下线；原有历史资料可在设备管理中移除。",
-          style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+          style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary)
         )
       }
     }
@@ -337,24 +330,24 @@ private fun DshSshTab(
 ) {
   LazyColumn(
     Modifier.fillMaxSize(),
-    contentPadding = PaddingValues(horizontal = 20.dp, vertical = 8.dp),
+    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
     verticalArrangement = Arrangement.spacedBy(10.dp)
   ) {
     item {
       Text(
         "通过 SSH 登录远端 POSIX 电脑（Linux / macOS / WSL），自动在远端启动并隧道直连 dsh web。",
-        style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+        style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary)
       )
     }
     item {
-      SmallTitle("DSH SSH 主机", insideMargin = PaddingValues(horizontal = 4.dp, vertical = 2.dp))
+      HyperGroupTitle("DSH SSH 主机")
     }
     if (state.sshHosts.isEmpty()) {
       item {
-        Card(Modifier.fillMaxWidth(), insideMargin = PaddingValues(14.dp)) {
+        HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(14.dp)) {
           Text(
             "还没有添加 DSH SSH 主机。添加后会自动通过 SSH 启动远端的 dsh web 并建立加密隧道。",
-            style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+            style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary)
           )
         }
       }
@@ -364,15 +357,15 @@ private fun DshSshTab(
         val connected = profile?.let { p ->
           if (p.id == state.serverId) state.connected else state.allServerSnapshots[p.id]?.connected == true
         } == true
-        Card(Modifier.fillMaxWidth().clickable { onEditSsh(host.id) }, insideMargin = PaddingValues(14.dp)) {
+        HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(14.dp), onClick = { onEditSsh(host.id) }) {
           Row(verticalAlignment = Alignment.CenterVertically) {
-            Icon(MiuixIcons.Link, null, Modifier.size(22.dp), tint = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+            Icon(MiuixIcons.Link, null, Modifier.size(22.dp), tint = HyperTheme.colors.primary)
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
-              Text(host.name, style = MiuixTheme.textStyles.body1, maxLines = 1, overflow = TextOverflow.Ellipsis)
+              Text(host.name, style = MiuixTheme.textStyles.body1.copy(fontWeight = FontWeight.Medium), maxLines = 1, overflow = TextOverflow.Ellipsis)
               Text(
                 host.address,
-                style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary),
+                style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary),
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
               )
@@ -380,35 +373,35 @@ private fun DshSshTab(
             if (connected) {
               StatusDot(MiuixColorTokens.Success)
               Spacer(Modifier.width(6.dp))
-              Text("在线", style = MiuixTheme.textStyles.footnote2.copy(color = MiuixColorTokens.Success))
+              Text("在线", style = MiuixTheme.textStyles.footnote2.copy(fontWeight = FontWeight.SemiBold, color = MiuixColorTokens.Success))
             }
             Spacer(Modifier.width(6.dp))
-            DropdownChevron(18.dp, MiuixTheme.colorScheme.onSurfaceVariantSummary)
+            DropdownChevron(18.dp, HyperTheme.colors.textSecondary)
           }
         }
       }
     }
     item {
-      Card(Modifier.fillMaxWidth().clickable(onClick = onAddSsh), insideMargin = PaddingValues(14.dp)) {
+      HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(14.dp), onClick = onAddSsh) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-          Icon(MiuixIcons.Add, null, Modifier.size(22.dp), tint = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+          Icon(MiuixIcons.Add, null, Modifier.size(22.dp), tint = HyperTheme.colors.primary)
           Spacer(Modifier.width(10.dp))
           Column(Modifier.weight(1f)) {
-            Text("添加 DSH SSH 直连", style = MiuixTheme.textStyles.body1)
+            Text("添加 DSH SSH 直连", style = MiuixTheme.textStyles.body1.copy(fontWeight = FontWeight.Medium))
             Text(
               "不经过第三方服务器，直接通过 SSH 隧道直连",
-              style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+              style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary)
             )
           }
-          DropdownChevron(18.dp, MiuixTheme.colorScheme.onSurfaceVariantSummary)
+          DropdownChevron(18.dp, HyperTheme.colors.textSecondary)
         }
       }
     }
     item {
-      Card(Modifier.fillMaxWidth(), insideMargin = PaddingValues(14.dp)) {
+      HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(14.dp)) {
         Text(
           "直连 DSH（地址 + 启动令牌）已下线；原有历史资料可在设备管理中移除。",
-          style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+          style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary)
         )
       }
     }

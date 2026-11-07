@@ -1,13 +1,13 @@
 package com.igng.opencode.lagoon.ui
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -23,7 +23,7 @@ import top.yukonga.miuix.kmp.basic.TextButton
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 
 /**
- * MIUIX 连续曲率平滑圆角（HyperOS Squircle Shape）
+ * 澎湃 OS 4 连续曲率平滑圆角（HyperOS Continuous Squircle Shape）
  */
 fun miuixSquircleShape(cornerRadius: Dp = 16.dp): Shape = squircles.getOrPut(cornerRadius) {
   RoundedRectangle(cornerRadius = cornerRadius, style = RoundedCornerStyle.Continuous)
@@ -33,28 +33,27 @@ fun miuixSquircleShape(cornerRadius: Dp = 16.dp): Shape = squircles.getOrPut(cor
 private val squircles = java.util.concurrent.ConcurrentHashMap<Dp, Shape>()
 
 /**
- * MIUIX 语义色彩系统：
- * 主色采用小米 HyperOS 官方经典科技蓝 #3482FF，搭配全套层次色阶。
+ * 澎湃 OS 4 语义色彩系统：
+ * 统一绑定至 [HyperTheme.colors] 四级表面色阶与高对比度语义色。
  */
 object MiuixColorTokens {
-  private val dark: Boolean @Composable get() = MiuixTheme.colorScheme.background.luminance() < 0.3f
-  val Primary: Color @Composable get() = MiuixTheme.colorScheme.primary
-  val PrimaryVariant: Color @Composable get() = Primary
-  val PrimarySubtle: Color @Composable get() = Primary.copy(alpha = 0.12f)
-  val Success: Color @Composable get() = if (dark) Color(0xFF91CEAA) else Color(0xFF246D46)
-  val Warning: Color @Composable get() = if (dark) Color(0xFFE4BE86) else Color(0xFF82581F)
-  val Error: Color @Composable get() = if (dark) Color(0xFFE7AEA6) else Color(0xFFA23932)
-  val Info: Color @Composable get() = Primary
-  val SuccessSubtle: Color @Composable get() = Success.copy(alpha = 0.12f)
-  val WarningSubtle: Color @Composable get() = Warning.copy(alpha = 0.12f)
-  val ErrorSubtle: Color @Composable get() = Error.copy(alpha = 0.12f)
-  val NeutralSubtle: Color @Composable get() = MiuixTheme.colorScheme.onSurface.copy(alpha = 0.08f)
-  val NeutralSubtleDark: Color @Composable get() = NeutralSubtle
+  val Primary: Color @Composable get() = HyperTheme.colors.primary
+  val PrimaryVariant: Color @Composable get() = HyperTheme.colors.primary
+  val PrimarySubtle: Color @Composable get() = HyperTheme.colors.primarySubtle
+  val Success: Color @Composable get() = HyperTheme.colors.success
+  val Warning: Color @Composable get() = HyperTheme.colors.warning
+  val Error: Color @Composable get() = HyperTheme.colors.error
+  val Info: Color @Composable get() = HyperTheme.colors.primary
+  val SuccessSubtle: Color @Composable get() = HyperTheme.colors.successSubtle
+  val WarningSubtle: Color @Composable get() = HyperTheme.colors.warningSubtle
+  val ErrorSubtle: Color @Composable get() = HyperTheme.colors.errorSubtle
+  val NeutralSubtle: Color @Composable get() = HyperTheme.colors.container
+  val NeutralSubtleDark: Color @Composable get() = HyperTheme.colors.containerHigh
 }
 
 /**
- * MIUIX 风格状态胶囊 (State Badge / Pill)
- * 采用连续曲率胶囊形态与语义呼吸圆点
+ * 澎湃 OS 4 风格状态胶囊 (State Badge / Pill)
+ * 采用连续曲率胶囊形态、微描边与语义圆点
  */
 @Composable
 fun MiuixStatePill(
@@ -66,7 +65,7 @@ fun MiuixStatePill(
     TaskPhase.COMPLETED -> MiuixColorTokens.Success to MiuixColorTokens.SuccessSubtle
     TaskPhase.WAITING_PERMISSION, TaskPhase.WAITING_QUESTION -> MiuixColorTokens.Warning to MiuixColorTokens.WarningSubtle
     TaskPhase.FAILED, TaskPhase.DISCONNECTED -> MiuixColorTokens.Error to MiuixColorTokens.ErrorSubtle
-    TaskPhase.ABORTED, TaskPhase.IDLE -> MiuixTheme.colorScheme.onSurfaceVariantSummary to MiuixTheme.colorScheme.secondaryContainer
+    TaskPhase.ABORTED, TaskPhase.IDLE -> HyperTheme.colors.textSecondary to HyperTheme.colors.container
     else -> MiuixColorTokens.Primary to MiuixColorTokens.PrimarySubtle
   }
 
@@ -83,10 +82,12 @@ fun MiuixStatePill(
     TaskPhase.DISCONNECTED -> "已断开"
   }
 
+  val pillShape = miuixSquircleShape(10.dp)
   Row(
     modifier = modifier
-      .background(subtleBg, miuixSquircleShape(8.dp))
-      .padding(horizontal = 8.dp, vertical = 4.dp),
+      .background(subtleBg, pillShape)
+      .border(0.5.dp, color.copy(alpha = 0.22f), pillShape)
+      .padding(horizontal = 9.dp, vertical = 4.dp),
     verticalAlignment = Alignment.CenterVertically,
     horizontalArrangement = Arrangement.spacedBy(6.dp)
   ) {
@@ -97,9 +98,11 @@ fun MiuixStatePill(
     )
     Text(
       text = label,
-      style = MiuixTheme.textStyles.footnote2.copy(
-        fontWeight = FontWeight.Medium,
-        color = color
+      style = HyperTheme.tabular(
+        MiuixTheme.textStyles.footnote2.copy(
+          fontWeight = FontWeight.SemiBold,
+          color = color
+        )
       ),
       maxLines = 1,
       overflow = TextOverflow.Ellipsis
@@ -108,7 +111,7 @@ fun MiuixStatePill(
 }
 
 /**
- * MIUIX 规范分节标题 (Section Title)
+ * 澎湃 OS 4 规范分节标题 (Section Title)
  */
 @Composable
 fun MiuixSectionHeader(
@@ -121,23 +124,25 @@ fun MiuixSectionHeader(
   Row(
     modifier = modifier
       .fillMaxWidth()
-      .padding(horizontal = 4.dp, vertical = 6.dp),
+      .padding(horizontal = 6.dp, vertical = 6.dp),
     verticalAlignment = Alignment.CenterVertically
   ) {
     Text(
       text = title,
       style = MiuixTheme.textStyles.headline2.copy(
         fontWeight = FontWeight.Bold,
-        color = MiuixTheme.colorScheme.onSurface
+        color = HyperTheme.colors.textPrimary
       ),
       modifier = Modifier.weight(1f)
     )
     if (count != null) {
       Text(
         text = "$count",
-        style = MiuixTheme.textStyles.footnote1.copy(
-          color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
-          fontWeight = FontWeight.SemiBold
+        style = HyperTheme.tabular(
+          MiuixTheme.textStyles.footnote1.copy(
+            color = HyperTheme.colors.textSecondary,
+            fontWeight = FontWeight.SemiBold
+          )
         ),
         modifier = Modifier.padding(end = 8.dp)
       )

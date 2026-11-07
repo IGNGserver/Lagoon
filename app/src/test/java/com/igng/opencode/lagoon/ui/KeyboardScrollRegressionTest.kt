@@ -83,9 +83,10 @@ class KeyboardScrollRegressionTest {
   }
 
   @Test fun qoderThemeIsScopedToExistingChatNotHomeOrSettings() {
-    assertTrue(source("ChatScreen.kt").contains("QoderChatTheme {"))
+    val chat = source("ChatScreen.kt")
+    assertTrue(chat.contains("HyperLagoonTheme {") || chat.contains("QoderChatTheme {"))
     assertTrue(!source("MainActivity.kt").contains("QoderChatTheme"))
-    assertTrue("输入栏应保留系统导航栏安全距离", source("ChatScreen.kt").contains("navigationBarsPadding()"))
+    assertTrue("输入栏应保留系统导航栏安全距离", chat.contains("navigationBarsPadding()"))
   }
 
   /** 运行中的会话在底部常驻“运行中”指示，且时间每秒刷新。 */

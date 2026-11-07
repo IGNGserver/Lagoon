@@ -117,12 +117,12 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
       if (state.capabilities.deleteSession) add(MenuAction("删除", MiuixIcons.Delete, danger = true) { delete = true })
     })
   )
-  QoderChatTheme {
-    Box(Modifier.fillMaxSize().background(MiuixTheme.colorScheme.surface)) {
+    HyperLagoonTheme {
+    Box(Modifier.fillMaxSize().background(HyperLagoonColors.canvas)) {
       Column(Modifier.fillMaxSize()) {
-        QoderChatTopBar(state.title(session), onBack, subtitle = { SessionSubtitle(state, session) }) {
+        PageTopBar(state.title(session), onBack, subtitle = { SessionSubtitle(state, session) }) {
           Box {
-            QoderCircleButton(QoderGlyph.MORE, "会话操作", { menu = true }, background = Color.Transparent)
+            HyperIconButton(QoderGlyph.MORE, "会话操作", { menu = true }, backgroundColor = HyperTheme.colors.container)
             MenuPopup(menu, { menu = false }, menuSections)
           }
         }
@@ -133,7 +133,7 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
             if (transcriptStatus.state == ResourceState.STALE) "保留上次内容 · 正在后台重试" else (transcriptStatus.error ?: "加载失败"),
             Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 2.dp),
             style = MiuixTheme.textStyles.footnote2,
-            color = if (transcriptStatus.state == ResourceState.STALE) MiuixColorTokens.Warning else MiuixColorTokens.Error
+            color = if (transcriptStatus.state == ResourceState.STALE) HyperTheme.colors.warning else HyperTheme.colors.error
           )
         }
         Conversation(state, controller, Modifier.weight(1f).fillMaxWidth(), ::openFile, { requestModal = it }, onOpenChild,
@@ -154,6 +154,7 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
             if (state.connected && goalSupported) controller.loadGoal()
           }
           if (goalSupported && (state.goal != null || state.connected)) GoalBar(state, controller) { goalDialog = true }
+          HyperPendingActionDock(state, controller)
           ChatComposer(state, controller, interactive, onModal = { composerModal = it }, onServerFile = { sheet = ChatSheet.FILES; controller.listFiles() })
         }
       }
@@ -261,6 +262,93 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
   }
 }
 
+/**
+ * 置顶于输入框上方的「待你拍板」快捷交互底座（HyperOS 4 Action Dock）：
+ * 当当前会话有待审批权限或待回答问题时，常驻吸附于拇指热区，支持一键允许/拒绝而无需翻找长列表。
+ */
+@Composable
+private fun HyperPendingActionDock(state: LagoonState, controller: LagoonController) {
+  val permission = state.visiblePermissions.lastOrNull { it.sessionId == state.sessionId }
+  val question = state.questions.lastOrNull { it.sessionId == state.sessionId }
+  if (permission == null && question == null) return
+  if (permission != null) {
+    val pending = state.pending("permission:${permission.id}")
+    val shape = miuixSquircleShape(18.dp)
+    Row(
+      modifier = Modifier
+        .fillMaxWidth()
+        .padding(horizontal = 12.dp, vertical = 4.dp)
+        .clip(shape)
+        .background(HyperTheme.colors.warningSubtle, shape)
+        .border(0.8.dp, HyperTheme.colors.warning.copy(alpha = 0.35f), shape)
+        .padding(horizontal = 14.dp, vertical = 10.dp),
+      verticalAlignment = Alignment.CenterVertically,
+      horizontalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+      Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        Text(
+          text = "等待操作授权 · ${permission.action.ifBlank { "执行命令" }}",
+          style = MiuixTheme.textStyles.footnote1.copy(
+            fontWeight = FontWeight.SemiBold,
+            color = HyperTheme.colors.warning
+          ),
+          maxLines = 1,
+          overflow = TextOverflow.Ellipsis
+        )
+        Text(
+          text = permission.detail,
+          style = MiuixTheme.textStyles.footnote2.copy(
+            fontFamily = FontFamily.Monospace,
+            color = HyperTheme.colors.textPrimary
+          ),
+          maxLines = 1,
+          overflow = TextOverflow.Ellipsis
+        )
+      }
+      TextButton(
+        text = "拒绝",
+        enabled = !pending,
+        onClick = { controller.replyPermission(permission, "reject") }
+      )
+      TextButton(
+        text = "允许",
+        enabled = !pending,
+        onClick = { controller.replyPermission(permission, "once") },
+        colors = ButtonDefaults.textButtonColorsPrimary()
+      )
+    }
+  } else if (question != null) {
+    val firstTitle = question.questions.firstOrNull()?.title ?: "AI 正在等待你的回答"
+    val shape = miuixSquircleShape(18.dp)
+    Row(
+      modifier = Modifier
+        .fillMaxWidth()
+        .padding(horizontal = 12.dp, vertical = 4.dp)
+        .clip(shape)
+        .background(HyperTheme.colors.primarySubtle, shape)
+        .border(0.8.dp, HyperTheme.colors.primary.copy(alpha = 0.3f), shape)
+        .padding(horizontal = 14.dp, vertical = 10.dp),
+      verticalAlignment = Alignment.CenterVertically
+    ) {
+      Column(Modifier.weight(1f)) {
+        Text(
+          text = "需要你的回答（共 ${question.questions.size} 项）",
+          style = MiuixTheme.textStyles.footnote2.copy(
+            fontWeight = FontWeight.SemiBold,
+            color = HyperTheme.colors.primary
+          )
+        )
+        Text(
+          text = firstTitle,
+          style = MiuixTheme.textStyles.footnote1.copy(color = HyperTheme.colors.textPrimary),
+          maxLines = 1,
+          overflow = TextOverflow.Ellipsis
+        )
+      }
+    }
+  }
+}
+
 /** A quiet entry point above the composer for work that outlives the current reply. */
 @Composable
 private fun SessionActivityChip(activity: SessionActivity, onClick: () -> Unit) {
@@ -269,12 +357,12 @@ private fun SessionActivityChip(activity: SessionActivity, onClick: () -> Unit) 
     if (activity.shells.isNotEmpty()) add("${activity.shells.size} 个命令")
   }
   Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 4.dp)) {
-    Row(Modifier.clip(miuixCapsuleShape()).background(MiuixTheme.colorScheme.secondaryContainer)
+    Row(Modifier.clip(miuixSquircleShape(16.dp)).background(HyperTheme.colors.container)
       .clickable(role = Role.Button, onClick = onClick).padding(horizontal = 12.dp, vertical = 6.dp),
       verticalAlignment = Alignment.CenterVertically) {
-      InfiniteProgressIndicator(color = MiuixTheme.colorScheme.primary, size = 12.dp, strokeWidth = 1.5.dp, orbitingDotSize = 1.5.dp)
+      InfiniteProgressIndicator(color = HyperTheme.colors.primary, size = 12.dp, strokeWidth = 1.5.dp, orbitingDotSize = 1.5.dp)
       Spacer(Modifier.width(6.dp))
-      Text("后台 · ${parts.joinToString(" · ")}", style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
+      Text("后台 · ${parts.joinToString(" · ")}", style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary))
     }
   }
 }
@@ -287,12 +375,12 @@ private fun GoalBar(state: LagoonState, controller: LagoonController, onCreate: 
     TextButton(text = "设定目标", onClick = onCreate, modifier = Modifier.padding(horizontal = 20.dp))
     return
   }
-  Card(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)) {
-    Column(Modifier.padding(horizontal = 12.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+  HyperCard(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp), insidePadding = PaddingValues(12.dp)) {
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
       Row(verticalAlignment = Alignment.CenterVertically) {
-        Text(goal.label, style = MiuixTheme.textStyles.footnote2.copy(color = if (goal.blocked) MiuixColorTokens.Error else MiuixTheme.colorScheme.primary))
+        Text(goal.label, style = MiuixTheme.textStyles.footnote2.copy(color = if (goal.blocked) HyperTheme.colors.error else HyperTheme.colors.primary))
         Spacer(Modifier.width(8.dp))
-        Text("${goal.roundsStarted}/${goal.maxRounds} 轮", style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
+        Text("${goal.roundsStarted}/${goal.maxRounds} 轮", style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary))
         Spacer(Modifier.weight(1f))
         if (goal.active) TextButton(text = "暂停", onClick = { controller.goalAction("pause") })
         if (goal.paused || goal.blocked) TextButton(text = "继续", onClick = { controller.goalAction("resume") })
@@ -300,7 +388,7 @@ private fun GoalBar(state: LagoonState, controller: LagoonController, onCreate: 
         TextButton(text = "清除", onClick = { controller.goalAction("clear") })
       }
       Text(goal.objective, style = MiuixTheme.textStyles.footnote1, maxLines = 2, overflow = TextOverflow.Ellipsis)
-      goal.blockedReason?.let { Text(it, style = MiuixTheme.textStyles.footnote2.copy(color = MiuixColorTokens.Error), maxLines = 2) }
+      goal.blockedReason?.let { Text(it, style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.error), maxLines = 2) }
     }
   }
 }
@@ -328,18 +416,18 @@ private fun ChildSessionBar(state: LagoonState, session: Session, onBack: () -> 
   }
   val elapsed = ((ended ?: now) - started).coerceAtLeast(0)
   Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp)
-    .clip(miuixShape(16.dp)).background(MiuixTheme.colorScheme.secondaryContainer).padding(horizontal = 12.dp, vertical = 8.dp),
+    .clip(miuixSquircleShape(16.dp)).background(HyperTheme.colors.container).padding(horizontal = 12.dp, vertical = 8.dp),
     verticalAlignment = Alignment.CenterVertically) {
     val active = task?.active == true
-    if (active) InfiniteProgressIndicator(color = MiuixTheme.colorScheme.primary, size = 14.dp, strokeWidth = 1.5.dp)
+    if (active) InfiniteProgressIndicator(color = HyperTheme.colors.primary, size = 14.dp, strokeWidth = 1.5.dp)
     else Icon(MiuixIcons.Info, phase, Modifier.size(16.dp),
-      tint = if (phase == "失败") MiuixColorTokens.Error else MiuixTheme.colorScheme.onSurfaceVariantSummary)
+      tint = if (phase == "失败") HyperTheme.colors.error else HyperTheme.colors.textSecondary)
     Spacer(Modifier.width(8.dp))
     Column(Modifier.weight(1f)) {
       Text("$phase · ${durationText(elapsed)}", style = MiuixTheme.textStyles.footnote2.copy(
-        color = if (waiting) MiuixColorTokens.Warning else MiuixTheme.colorScheme.onSurface))
+        color = if (waiting) HyperTheme.colors.warning else HyperTheme.colors.textPrimary))
       Text(listOfNotNull(session.agent, session.model?.label).joinToString(" · ").ifBlank { "子会话" },
-        style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary), maxLines = 1, overflow = TextOverflow.Ellipsis)
+        style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary), maxLines = 1, overflow = TextOverflow.Ellipsis)
     }
     onContinue?.let { TextButton(text = "继续", onClick = it) }
     TextButton(text = "返回父会话", onClick = onBack)
@@ -437,12 +525,12 @@ private fun ShellOutputSheet(state: LagoonState, controller: LagoonController) {
       }
       output.error?.let { Text(it, color = MiuixColorTokens.Error, style = MiuixTheme.textStyles.footnote2) }
       if (output.omitted) Text("仅显示最近 64KB 输出", style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
-      Box(Modifier.weight(1f).fillMaxWidth().padding(top = 8.dp).clip(miuixShape(12.dp)).background(QoderColors.codeColor)) {
+      Box(Modifier.weight(1f).fillMaxWidth().padding(top = 8.dp).clip(miuixSquircleShape(12.dp)).background(HyperTheme.colors.codeSurface)) {
         SelectionContainer {
           Text(output.text.ifBlank { if (output.loading) "正在读取输出…" else "暂无输出" },
             Modifier.fillMaxSize().verticalScroll(scroll).padding(12.dp),
             fontFamily = FontFamily.Monospace, fontSize = 12.sp,
-            color = MiuixTheme.colorScheme.onSurface)
+            color = HyperTheme.colors.textPrimary)
         }
       }
     }
@@ -499,20 +587,22 @@ private fun AnimatedVisibilityScope.QoderActivityOverlay(
   // Not while animating out: that back belongs to the conversation underneath.
   BackHandler(enabled = interactive && transition.targetState == EnterExitState.Visible) { if (latestSelected != null && latestSelected.key != group.key) onBack() else onDismiss() }
   Box(Modifier.fillMaxSize()) {
-    Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.58f))
+    Box(Modifier.fillMaxSize().background(HyperTheme.colors.scrim)
       .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null, onClick = onDismiss))
     Column(Modifier.fillMaxWidth().fillMaxHeight(0.74f).align(Alignment.BottomCenter)
-      .animateEnterExit(enter = slideInVertically(tween(280, easing = CubicBezierEasing(0.2f, 0f, 0f, 1f))) { it / 3 },
-        exit = slideOutVertically(tween(200)) { it / 3 })
-      .clip(androidx.compose.foundation.shape.RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp))
-      .background(QoderColors.sheetColor).pointerInput(Unit) { detectTapGestures { } }.navigationBarsPadding()) {
+      .animateEnterExit(enter = slideInVertically(HyperMotion.sheetOffsetSpring) { it / 2 },
+        exit = slideOutVertically(HyperMotion.sheetOffsetSpring) { it / 2 })
+      .clip(miuixSquircleShape(28.dp))
+      .background(HyperTheme.colors.sheetSurface)
+      .border(0.6.dp, HyperTheme.colors.cardBorder, miuixSquircleShape(28.dp))
+      .pointerInput(Unit) { detectTapGestures { } }.navigationBarsPadding()) {
       QoderSheetHandle()
       if (latestSelected == null) {
         Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 16.dp), verticalAlignment = Alignment.CenterVertically) {
           Spacer(Modifier.width(44.dp))
           Text(latestGroup.title.ifBlank { "操作记录" }, Modifier.weight(1f), textAlign = androidx.compose.ui.text.style.TextAlign.Center,
             style = MiuixTheme.textStyles.title3.copy(fontWeight = FontWeight.Bold))
-          QoderCircleButton(QoderGlyph.CLOSE, "关闭操作列表", onDismiss, background = QoderColors.codeColor, foreground = QoderColors.secondary)
+          HyperIconButton(QoderGlyph.CLOSE, "关闭操作列表", onDismiss, backgroundColor = QoderColors.codeColor, tint = QoderColors.secondary)
         }
         LazyColumn(Modifier.fillMaxWidth().weight(1f).padding(horizontal = 22.dp), state = activityListState, contentPadding = PaddingValues(bottom = 28.dp)) {
           itemsIndexed(sections, key = { _, section -> section.header.key }) { index, section ->
@@ -521,10 +611,10 @@ private fun AnimatedVisibilityScope.QoderActivityOverlay(
         }
       } else {
         Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-          QoderCircleButton(QoderGlyph.BACK, "返回操作列表", if (latestSelected.key == group.key) onDismiss else onBack, background = QoderColors.codeColor, foreground = QoderColors.secondary)
+          HyperIconButton(QoderGlyph.BACK, "返回操作列表", if (latestSelected.key == group.key) onDismiss else onBack, backgroundColor = QoderColors.codeColor, tint = QoderColors.secondary)
           Text(latestSelected.title.ifBlank { "详情" }, Modifier.weight(1f).padding(horizontal = 8.dp), maxLines = 1, overflow = TextOverflow.Ellipsis, textAlign = androidx.compose.ui.text.style.TextAlign.Center,
             style = MiuixTheme.textStyles.title3.copy(fontWeight = FontWeight.Bold))
-          QoderCircleButton(QoderGlyph.CLOSE, "关闭详情", onDismiss, background = QoderColors.codeColor, foreground = QoderColors.secondary)
+          HyperIconButton(QoderGlyph.CLOSE, "关闭详情", onDismiss, backgroundColor = QoderColors.codeColor, tint = QoderColors.secondary)
         }
         key(latestSelected.key) {
           LazyColumn(Modifier.fillMaxWidth().weight(1f).padding(horizontal = 22.dp), contentPadding = PaddingValues(bottom = 32.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
@@ -544,18 +634,6 @@ private fun AnimatedVisibilityScope.QoderActivityOverlay(
         }
       }
     }
-  }
-}
-
-@Composable
-private fun QoderChatTopBar(title: String, onBack: () -> Unit, subtitle: @Composable RowScope.() -> Unit, actions: @Composable RowScope.() -> Unit) {
-  Row(Modifier.fillMaxWidth().statusBarsPadding().heightIn(min = 64.dp).padding(horizontal = 12.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-    QoderCircleButton(QoderGlyph.BACK, "返回上一级", onBack, background = Color.Transparent)
-    Column(Modifier.weight(1f).padding(horizontal = 8.dp)) {
-      Text(title, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MiuixTheme.textStyles.title4.copy(fontWeight = FontWeight.Medium))
-      Row(Modifier.padding(top = 2.dp), verticalAlignment = Alignment.CenterVertically, content = subtitle)
-    }
-    actions()
   }
 }
 
@@ -603,18 +681,18 @@ fun DraftScreen(
       // Where the session will be created: always tappable, even while connecting or offline, so the
       // reader can switch harness without leaving the blank page.
       Row(
-        Modifier.clip(miuixCapsuleShape()).clickable { targetPicker = true }.padding(end = 4.dp),
+        Modifier.clip(miuixSquircleShape(16.dp)).clickable { targetPicker = true }.padding(end = 4.dp),
         verticalAlignment = Alignment.CenterVertically
       ) {
         StatusDot(
           when {
-            state.connected -> MiuixColorTokens.Success
-            state.loading -> MiuixColorTokens.Warning
-            else -> muted
+            state.connected -> HyperTheme.colors.success
+            state.loading -> HyperTheme.colors.warning
+            else -> HyperTheme.colors.textTertiary
           }
         )
         Spacer(Modifier.width(6.dp))
-        Icon(MiuixIcons.Folder, null, Modifier.size(14.dp), tint = muted)
+        Icon(MiuixIcons.Folder, null, Modifier.size(14.dp), tint = HyperTheme.colors.textSecondary)
         Spacer(Modifier.width(4.dp))
         state.server?.let {
           HarnessBadge(it.kind)
@@ -623,7 +701,7 @@ fun DraftScreen(
         Text(
           listOfNotNull(state.server?.name, state.project?.name ?: "选择工作区", connectionHint).joinToString(" · "),
           maxLines = 1, overflow = TextOverflow.Ellipsis,
-          style = MiuixTheme.textStyles.footnote1.copy(color = muted)
+          style = MiuixTheme.textStyles.footnote1.copy(color = HyperTheme.colors.textSecondary)
         )
         DropdownChevron(14.dp, description = "选择服务器与工作区")
       }
@@ -661,13 +739,13 @@ private fun SessionSubtitle(state: LagoonState, session: Session) {
   // 子会话不在根聚合里：优先用该会话自己的实时任务，再退回根聚合 / 未读账本。
   val own = state.livePresentedTasks[session.id]
   val status = if (own != null) state.sessionStatus(session, mapOf(session.id to own)) else state.sessionStatus(session)
-  val muted = MiuixTheme.colorScheme.onSurfaceVariantSummary
+  
   when (status) {
-    SessionStatus.RUNNING -> { InfiniteProgressIndicator(color = MiuixTheme.colorScheme.primary, size = 12.dp, strokeWidth = 1.5.dp, orbitingDotSize = 1.5.dp); Spacer(Modifier.width(6.dp)) }
+    SessionStatus.RUNNING -> { InfiniteProgressIndicator(color = HyperTheme.colors.primary, size = 12.dp, strokeWidth = 1.5.dp, orbitingDotSize = 1.5.dp); Spacer(Modifier.width(6.dp)) }
     SessionStatus.WAITING_PERMISSION, SessionStatus.WAITING_QUESTION, SessionStatus.FAILED ->
-      Text("${status.label} · ", style = MiuixTheme.textStyles.footnote1.copy(color = if (status == SessionStatus.FAILED) MiuixColorTokens.Error else MiuixColorTokens.Warning))
+      Text("${status.label} · ", style = MiuixTheme.textStyles.footnote1.copy(color = if (status == SessionStatus.FAILED) HyperTheme.colors.error else HyperTheme.colors.warning))
     SessionStatus.WAITING_SERVER ->
-      Text("${status.label} · ", style = MiuixTheme.textStyles.footnote1.copy(color = muted))
+      Text("${status.label} · ", style = MiuixTheme.textStyles.footnote1.copy(color = HyperTheme.colors.textSecondary))
     else -> {}
   }
   val profile = session.serverId?.let { id -> state.profiles.firstOrNull { it.id == id } } ?: state.server
@@ -675,7 +753,7 @@ private fun SessionSubtitle(state: LagoonState, session: Session) {
   // 与首页行使用同一套解析，切进会话后工作区名不会变。
   val workspace = resolveSessionWorkspace(session, state.projects, state.workspaceCatalogFor(session))?.name
   Text(listOfNotNull(profile?.name, workspace).joinToString(" · "), maxLines = 1, overflow = TextOverflow.Ellipsis,
-    style = MiuixTheme.textStyles.footnote1.copy(color = muted))
+    style = MiuixTheme.textStyles.footnote1.copy(color = HyperTheme.colors.textSecondary))
 }
 
 /** MIUIX dialog footer: two equal-width buttons, the confirming one in the primary (or error) color. */
@@ -977,9 +1055,10 @@ private fun ChatComposer(
       foreground = if (canSend) MiuixTheme.colorScheme.surface else muted)
   }
   Column(Modifier.fillMaxWidth().navigationBarsPadding().padding(start = 12.dp, end = 12.dp, top = 4.dp, bottom = 8.dp)) {
-    Column(Modifier.fillMaxWidth().clip(miuixShape(if (expanded) 24.dp else 28.dp)).background(QoderColors.inputColor)
+    Column(Modifier.fillMaxWidth().clip(miuixSquircleShape(if (expanded) 24.dp else 28.dp)).background(HyperTheme.colors.cardElevated)
+      .border(0.6.dp, HyperTheme.colors.cardBorder, miuixSquircleShape(if (expanded) 24.dp else 28.dp))
       .animateContentSize().padding(6.dp)) {
-      hint?.let { Text(it, Modifier.padding(start = 12.dp, end = 12.dp, top = 4.dp), color = if (sending) muted else MiuixColorTokens.Warning, style = MiuixTheme.textStyles.footnote2) }
+      hint?.let { Text(it, Modifier.padding(start = 12.dp, end = 12.dp, top = 4.dp), color = if (sending) muted else HyperTheme.colors.warning, style = MiuixTheme.textStyles.footnote2) }
       if (state.attachments.isNotEmpty() || state.references.isNotEmpty()) Box(Modifier.padding(start = 6.dp, end = 6.dp, top = 6.dp)) { AttachmentTray(state, controller) }
       Row(verticalAlignment = Alignment.CenterVertically) {
         if (!expanded) { attach(); AgentSelector(state, controller, enabled = !sending && interactive, iconOnly = true) }
@@ -988,7 +1067,7 @@ private fun ChatComposer(
           if (value.text.isEmpty()) Text("描述你的任务…", color = muted, style = MiuixTheme.textStyles.body1, maxLines = 1)
           BasicTextField(value, { next -> value = next; controller.typeDraft(next.text, state.serverId, state.sessionId) },
             Modifier.fillMaxWidth().onFocusChanged { focused = it.isFocused },
-            textStyle = MiuixTheme.textStyles.body1.copy(color = MiuixTheme.colorScheme.onSurface), cursorBrush = SolidColor(MiuixTheme.colorScheme.primary), maxLines = 6, readOnly = !interactive)
+            textStyle = MiuixTheme.textStyles.body1.copy(color = HyperTheme.colors.textPrimary), cursorBrush = SolidColor(HyperTheme.colors.primary), maxLines = 6, readOnly = !interactive)
         }
         if (!expanded) { sendOrStop(); Spacer(Modifier.width(2.dp)) }
       }
@@ -1032,7 +1111,7 @@ private fun ImageThumb(item: LocalAttachment, onRemove: () -> Unit) {
       BitmapFactory.decodeFile(item.path, BitmapFactory.Options().apply { inSampleSize = (maxOf(bounds.outWidth, bounds.outHeight) / 256).coerceAtLeast(1) })
     }.getOrNull() }
   }
-  Box(Modifier.size(56.dp).clip(miuixShape(12.dp)).background(MiuixTheme.colorScheme.secondaryContainer)) {
+  Box(Modifier.size(56.dp).clip(miuixSquircleShape(12.dp)).background(HyperTheme.colors.container)) {
     bitmap?.let { Image(it.asImageBitmap(), item.name, Modifier.fillMaxSize(), contentScale = ContentScale.Crop) }
     RemoveBadge(Modifier.align(Alignment.TopEnd), onRemove)
   }
@@ -1040,13 +1119,13 @@ private fun ImageThumb(item: LocalAttachment, onRemove: () -> Unit) {
 
 @Composable
 private fun FileChip(name: String, detail: String, onRemove: () -> Unit) {
-  Row(Modifier.height(56.dp).clip(miuixShape(12.dp)).background(MiuixTheme.colorScheme.secondaryContainer).padding(start = 12.dp, end = 4.dp),
+  Row(Modifier.height(56.dp).clip(miuixSquircleShape(12.dp)).background(HyperTheme.colors.container).padding(start = 12.dp, end = 4.dp),
     verticalAlignment = Alignment.CenterVertically) {
-    Icon(MiuixIcons.File, null, Modifier.size(18.dp), tint = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+    Icon(MiuixIcons.File, null, Modifier.size(18.dp), tint = HyperTheme.colors.textSecondary)
     Spacer(Modifier.width(8.dp))
     Column(Modifier.widthIn(max = 160.dp)) {
-      Text(name, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MiuixTheme.textStyles.footnote1.copy(fontWeight = FontWeight.Medium))
-      Text(detail, maxLines = 1, style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
+      Text(name, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MiuixTheme.textStyles.footnote1.copy(fontWeight = FontWeight.Medium, color = HyperTheme.colors.textPrimary))
+      Text(detail, maxLines = 1, style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary))
     }
     RemoveBadge(Modifier, onRemove)
   }
@@ -1055,8 +1134,8 @@ private fun FileChip(name: String, detail: String, onRemove: () -> Unit) {
 @Composable
 private fun RemoveBadge(modifier: Modifier, onRemove: () -> Unit) {
   Box(modifier.size(40.dp).clickable(onClick = onRemove), contentAlignment = Alignment.Center) {
-    Box(Modifier.size(18.dp).clip(miuixCapsuleShape()).background(MiuixTheme.colorScheme.onSurface.copy(alpha = 0.55f)), contentAlignment = Alignment.Center) {
-      Icon(MiuixIcons.Close, "移除", Modifier.size(12.dp), tint = MiuixTheme.colorScheme.surface)
+    Box(Modifier.size(18.dp).clip(miuixSquircleShape(9.dp)).background(HyperTheme.colors.textTertiary), contentAlignment = Alignment.Center) {
+      Icon(MiuixIcons.Close, "移除", Modifier.size(12.dp), tint = HyperTheme.colors.canvas)
     }
   }
 }
