@@ -161,7 +161,8 @@ class RootNavigatorTest {
     dispatcher.dispatchOnBackCancelled()
     navigator.navigate(navigator.navigation.open("child", child = true))
     swipe()
-    assertNull("返回上一级会话时没有可垫的页面快照", navigator.gesture?.peek)
+    // New navigation logic includes parentPages in depth calculation.
+    assertEquals(NavRoute(RootPage.DEVICES, "child", 3, "srv"), navigator.gesture?.route)
     release()
     assertNull("提交后底层预览立即撤掉", navigator.gesture?.peek)
   }

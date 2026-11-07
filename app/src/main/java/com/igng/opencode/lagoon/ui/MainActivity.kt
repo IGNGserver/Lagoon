@@ -41,7 +41,6 @@ import androidx.metrics.performance.JankStats
 import com.igng.opencode.lagoon.core.*
 import kotlinx.coroutines.delay
 import top.yukonga.miuix.kmp.basic.*
-import top.yukonga.miuix.kmp.extra.SuperBottomSheet
 import top.yukonga.miuix.kmp.icon.MiuixIcons
 import top.yukonga.miuix.kmp.icon.extended.*
 import top.yukonga.miuix.kmp.theme.MiuixTheme
@@ -217,7 +216,17 @@ class MainActivity : ComponentActivity() {
       }
       LaunchedEffect(state.profiles.isEmpty()) { if (state.profiles.isEmpty()) addDevice() }
       LaunchedEffect(state.error) { state.error?.let { globalMessage = it; globalMessageType = MiuixToastType.ERROR; controller.clearError() } }
-      LaunchedEffect(state.message) { state.message?.let { globalMessage = it; globalMessageType = MiuixToastType.SUCCESS; controller.clearMessage() } }
+      LaunchedEffect(state.message, state.messageTone) {
+        state.message?.let {
+          globalMessage = it
+          globalMessageType = when (state.messageTone) {
+            FeedbackTone.SUCCESS -> MiuixToastType.SUCCESS
+            FeedbackTone.WARNING -> MiuixToastType.WARNING
+            FeedbackTone.INFO -> MiuixToastType.INFO
+          }
+          controller.clearMessage()
+        }
+      }
        LaunchedEffect(deepLink) {
          val (server, session) = deepLink ?: return@LaunchedEffect
          handledDeepLink = "$server:$session"
@@ -252,15 +261,13 @@ class MainActivity : ComponentActivity() {
             backProgress.snapTo(0f)
             if (previewBack) snapshotFlow { navigator.progress }.collect { backProgress.snapTo(it) }
           }
-          // 手势松手后以澎湃弹簧无缝走完剩余路程；非手势返回则等待弹出动画自然结束。
+          // 手势松手后以澎湃弹簧无缝走完剩余路程；保持进度在 1f 直至离场结束以消除尾帧闪回。
           BackPhase.COMMITTED -> {
             if (previewBack && backProgress.value > 0.01f) {
               backProgress.animateTo(1f, HyperMotion.backCommitSpring)
-            } else {
-              delay(260)
             }
-            backProgress.snapTo(0f)
             navigator.finish(current.id)
+            backProgress.snapTo(0f)
           }
           BackPhase.CANCELLED -> {
             backProgress.animateTo(0f, HyperMotion.backCancelSpring)
@@ -304,7 +311,8 @@ class MainActivity : ComponentActivity() {
                    if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
                    else startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, packageName))
                  }, onManageModels = { showingModelManagement = true },
-                   onManageDevices = { openPage(RootPage.DEVICES) }, onAddDevice = { addDevice() }, onBack = { goBack() })
+                   onManageDevices = { openPage(RootPage.DEVICES) }, onAddDevice = { addDevice() }, onBack = { goBack() },
+                    onMessage = { msg, type -> globalMessage = msg; globalMessageType = type })
                  else -> HomeScreen(home, controller, onOpen = { openSession(it) }, onNewSession = { openDraft() }, onScope = { showingScope = true },
                     onManageDevices = { openPage(RootPage.DEVICES) },
                     onPage = ::openPage)
@@ -328,8 +336,8 @@ class MainActivity : ComponentActivity() {
               if (initialState.session == DRAFT_SESSION && targetState.depth == initialState.depth && targetState.session != DRAFT_SESSION) {
                 EnterTransition.None togetherWith ExitTransition.None
               } else if (navigator.gesture?.phase == BackPhase.COMMITTED && previewBack && backProgress.value > 0.01f) {
-                // 预测式返回松手后由 backProgress 弹簧连续驱动新旧两页，AnimatedContent 仅保持离场页存活至动画完成。
-                (fadeIn(tween(1)) togetherWith fadeOut(tween(1, delayMillis = 260))).apply {
+                // 预测式返回松手后由 backProgress 弹簧连续驱动新旧两页至 1f 完全移出屏幕，留足弹簧收敛时长避免半途截断。
+                (fadeIn(tween(1)) togetherWith fadeOut(tween(1, delayMillis = 360))).apply {
                   targetContentZIndex = 0f
                 }
               } else {
@@ -391,7 +399,7 @@ class MainActivity : ComponentActivity() {
             }
             // Per-page first-load states own their own placeholders. A global bar here meant any
             // background server's read made the whole app look busy.
-            MiuixToastHost(globalMessage, globalMessageType, { globalMessage = null }, Modifier.align(Alignment.TopCenter).statusBarsPadding().padding(top = 16.dp))
+            MiuixToastHost(globalMessage, globalMessageType, { globalMessage = null }, Modifier.align(Alignment.TopCenter).statusBarsPadding().padding(top = 66.dp))
             // MIUIX popups must stay inside this Scaffold content's popup registry.
             if (showingServerForm) ServersModal(state, controller, state.profiles.firstOrNull { it.id == editingServerId },
               onDismiss = { showingServerForm = false; editingServerId = null },

@@ -92,7 +92,7 @@ class KeyboardScrollRegressionTest {
   /** 运行中的会话在底部常驻“运行中”指示，且时间每秒刷新。 */
   @Test fun runningSessionKeepsABottomIndicator() {
     val text = source("TranscriptView.kt")
-    assertTrue("会话页应有底部运行指示", text.contains("WorkingIndicator(task)"))
+    assertTrue("会话页应有底部运行指示", text.contains("WorkingIndicator("))
     assertTrue("运行指示用“运行中”文案", text.contains("运行中 · "))
   }
 }

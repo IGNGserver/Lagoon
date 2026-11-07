@@ -73,7 +73,11 @@ internal class RootNavigator(initial: SessionNavigation = SessionNavigation(), s
   fun start(edge: Int, touchX: Float) {
     direction = backSwipeDirection(edge, touchX, screenWidth)
     progress = 0f
-    gesture = BackGesture(++gestures, route, navigation.back().route.takeIf { it.session == null })
+    val backTarget = navigation.back()
+    val peekRoute = backTarget.route.copy(
+      serverId = backTarget.sessions.lastOrNull()?.takeIf { it != DRAFT_SESSION }?.let { server }
+    )
+    gesture = BackGesture(++gestures, route, peekRoute)
   }
 
   fun move(fraction: Float, edge: Int, touchX: Float) {

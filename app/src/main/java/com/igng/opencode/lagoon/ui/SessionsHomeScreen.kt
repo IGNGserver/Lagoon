@@ -2,6 +2,7 @@ package com.igng.opencode.lagoon.ui
 
 import android.content.Context
 import androidx.activity.compose.BackHandler
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -164,8 +165,11 @@ internal fun HomeScreen(
   renaming?.let { session -> RenameSessionDialog(state, controller, session) { renaming = null } }
   deleting?.let { session ->
     SuperDialog(title = "删除此会话？", show = true, onDismissRequest = { if (!state.pending("delete")) deleting = null }) {
-      Column {
+      Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Text("会话消息将从服务器永久删除。\n${session.displayTitle()}")
+        state.resource("action:delete").takeIf { it.state == ResourceState.ERROR }?.error?.let {
+          HyperInlineNotice(message = it, type = MiuixToastType.ERROR)
+        }
         DialogActions("取消", { deleting = null }, if (state.pending("delete")) "删除中…" else "永久删除", !state.pending("delete"), danger = true) {
           controller.deleteSession(session.id) { deleting = null }
         }
@@ -391,9 +395,15 @@ private fun homeScopeSummary(state: LagoonState): String? {
   fun connected(profile: ServerProfile): Boolean =
     if (!state.multiServerView && profile.id == state.serverId) state.connected
     else state.allServerSnapshots[profile.id]?.connected == true
+  fun errored(profile: ServerProfile): Boolean =
+    !connected(profile) && state.allServerSnapshots[profile.id]?.loading != true &&
+      !state.allServerSnapshots[profile.id]?.error.isNullOrBlank()
   val online = profiles.count(::connected)
-  return if (state.multiServerView) "${online}/${profiles.size} 台在线"
-  else if (online > 0) "已连接" else if (state.loading) "正在连接…" else "未连接"
+  val abnormal = profiles.count(::errored)
+  return if (state.multiServerView) {
+    if (abnormal > 0) "${online}/${profiles.size} 台在线 · $abnormal 台异常"
+    else "${online}/${profiles.size} 台在线"
+  } else if (online > 0) "已连接" else if (state.loading) "正在连接…" else "未连接"
 }
 
 /**
@@ -520,16 +530,14 @@ private fun SessionList(
       state = list,
       contentPadding = PaddingValues(top = 6.dp, bottom = 120.dp)
     ) {
-      state.homeSyncNotice()?.let { notice ->
+      state.homeSyncNotice()?.takeIf { visibleSections.isNotEmpty() }?.let { notice ->
         item(key = "sync") {
-          Text(
-            notice,
-            style = MiuixTheme.textStyles.footnote1,
-            color = MiuixColorTokens.Warning,
-            modifier = Modifier
-              .fillMaxWidth()
-              .clickable(role = Role.Button) { controller.reload() }
-              .padding(horizontal = 20.dp, vertical = 8.dp)
+          HyperInlineNotice(
+            message = notice,
+            type = MiuixToastType.WARNING,
+            action = "重试",
+            onAction = { controller.reload() },
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 4.dp)
           )
         }
       }
@@ -632,6 +640,11 @@ private fun SessionList(
 @Composable
 private fun SectionHeader(title: String, count: Int, collapsed: Boolean, onToggle: () -> Unit) {
   val muted = HyperTheme.colors.textSecondary
+  val angle by animateFloatAsState(
+    targetValue = if (collapsed) 0f else 90f,
+    animationSpec = HyperMotion.controlSpring(),
+    label = "sectionChevronAngle"
+  )
   Row(Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 2.dp), verticalAlignment = Alignment.CenterVertically) {
     Row(
       Modifier
@@ -659,11 +672,10 @@ private fun SectionHeader(title: String, count: Int, collapsed: Boolean, onToggl
         )
       )
       Spacer(Modifier.width(4.dp))
-      Icon(
-        MiuixIcons.ChevronForward,
-        if (collapsed) "展开" else "收起",
-        Modifier.size(14.dp).rotate(if (collapsed) 0f else 90f),
-        tint = muted
+      QoderIcon(
+        glyph = QoderGlyph.CHEVRON,
+        modifier = Modifier.size(14.dp).rotate(angle),
+        color = muted
       )
     }
   }
@@ -713,6 +725,7 @@ internal fun HomeSessionRow(
         .background(HyperTheme.colors.cardElevated, cardShape)
         .border(0.65.dp, borderColor, cardShape)
         .hyperPress(
+          surfaceHighlight = true,
           onClick = onClick,
           onLongClick = {
             val items = actions()
@@ -787,15 +800,17 @@ internal fun HomeSessionRow(
         Spacer(Modifier.width(8.dp))
         BackgroundMarker()
       }
-      if (status == SessionStatus.WAITING_SERVER) {
-        Spacer(Modifier.width(8.dp))
-        StatusPillTag(status.label, HyperTheme.colors.textSecondary, HyperTheme.colors.container)
-      } else if (status == SessionStatus.FAILED) {
-        Spacer(Modifier.width(8.dp))
-        StatusPillTag(status.label, HyperTheme.colors.error, HyperTheme.colors.errorSubtle)
-      } else if (waiting) {
-        Spacer(Modifier.width(8.dp))
-        StatusPillTag(status.label, HyperTheme.colors.warning, HyperTheme.colors.warningSubtle)
+      if (liveDetail.isNullOrBlank()) {
+        if (status == SessionStatus.WAITING_SERVER) {
+          Spacer(Modifier.width(8.dp))
+          StatusPillTag(status.label, HyperTheme.colors.textSecondary, HyperTheme.colors.container)
+        } else if (status == SessionStatus.FAILED) {
+          Spacer(Modifier.width(8.dp))
+          StatusPillTag(status.label, HyperTheme.colors.error, HyperTheme.colors.errorSubtle)
+        } else if (waiting) {
+          Spacer(Modifier.width(8.dp))
+          StatusPillTag(status.label, HyperTheme.colors.warning, HyperTheme.colors.warningSubtle)
+        }
       }
     }
     MenuPopup(menu, { menu = false }, listOf(MenuSection(menuItems)))
@@ -855,8 +870,11 @@ private fun BackgroundMarker() {
 internal fun RenameSessionDialog(state: LagoonState, controller: LagoonController, session: Session, onDismiss: () -> Unit) {
   var title by rememberSaveable(session.id) { mutableStateOf(session.displayTitle()) }
   SuperDialog(title = "重命名会话", show = true, onDismissRequest = { if (!state.pending("rename")) onDismiss() }) {
-    Column {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
       TextField(title, { title = it }, label = "会话名称", modifier = Modifier.fillMaxWidth())
+      state.resource("action:rename").takeIf { it.state == ResourceState.ERROR }?.error?.let {
+        HyperInlineNotice(message = it, type = MiuixToastType.ERROR)
+      }
       DialogActions("取消", onDismiss, if (state.pending("rename")) "保存中…" else "保存", !state.pending("rename") && title.isNotBlank()) {
         controller.rename(title, session.id, onDismiss)
       }

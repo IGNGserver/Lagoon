@@ -30,8 +30,6 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import top.yukonga.miuix.kmp.basic.*
-import top.yukonga.miuix.kmp.extra.SuperBottomSheet
-import top.yukonga.miuix.kmp.extra.SuperSwitch
 import top.yukonga.miuix.kmp.extra.SuperDialog
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 
@@ -137,7 +135,7 @@ internal fun RemoteEnrollSheet(
     }
   }
 
-  SuperBottomSheet(title = "DSH 远程中枢", show = true, onDismissRequest = onDismiss) {
+  HyperBottomSheet(title = "DSH 远程中枢", show = true, onDismissRequest = onDismiss) {
     Column(Modifier.fillMaxWidth().fillMaxHeight(0.88f)) {
       LazyColumn(Modifier.weight(1f).fillMaxWidth(), contentPadding = PaddingValues(horizontal = 20.dp, vertical = 8.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -148,7 +146,7 @@ internal fun RemoteEnrollSheet(
           }
           item { TextField(value = origin, onValueChange = { origin = it; allowHttp = it.startsWith("http://", true); error = null }, label = "中枢服务器地址") }
           if (origin.startsWith("http://", true)) item {
-            SuperSwitch(title = "允许此地址使用 HTTP", summary = "只在你信任的网络中开启", checked = allowHttp, onCheckedChange = { allowHttp = it })
+            HyperSwitchRow(title = "允许此地址使用 HTTP", summary = "只在你信任的网络中开启", checked = allowHttp, onCheckedChange = { allowHttp = it })
           }
           if (providersLoading) item { Text("正在读取登录方式…", style = MiuixTheme.textStyles.footnote2) }
           val browserProviders = providers.filter { it.qrStartUrl != null }
@@ -470,7 +468,7 @@ internal fun RemoteExtensionsDialog(
         style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
       if (busy) Text("正在读取插件…", style = MiuixTheme.textStyles.footnote2)
       bundles.forEach { bundle ->
-        SuperSwitch(
+        HyperSwitchRow(
           title = bundle.name,
           summary = listOfNotNull(bundle.version?.let { "v$it" }, bundle.description, bundle.readOnlyReason).joinToString(" · "),
           checked = bundle.enabled,

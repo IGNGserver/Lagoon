@@ -53,7 +53,6 @@ import kotlinx.coroutines.flow.conflate
 import kotlinx.coroutines.withContext
 import java.io.File
 import top.yukonga.miuix.kmp.basic.*
-import top.yukonga.miuix.kmp.extra.SuperBottomSheet
 import top.yukonga.miuix.kmp.extra.SuperDialog
 import top.yukonga.miuix.kmp.extra.SuperListPopup
 import top.yukonga.miuix.kmp.icon.MiuixIcons
@@ -104,6 +103,9 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
       add(MenuAction("文件", MiuixIcons.Folder) { sheet = ChatSheet.FILES; controller.listFiles() })
       if (state.server?.kind == ServerKind.DSH || state.server?.kind == ServerKind.DSH_REMOTE) {
         add(MenuAction("定时任务", MiuixIcons.Info) { sheet = ChatSheet.SCHEDULES; controller.loadSchedules() })
+        if (state.goal == null) {
+          add(MenuAction("设定长期目标", MiuixIcons.Ok) { goalDialog = true })
+        }
       }
     }),
     MenuSection(buildList {
@@ -122,7 +124,7 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
       Column(Modifier.fillMaxSize()) {
         PageTopBar(state.title(session), onBack, subtitle = { SessionSubtitle(state, session) }) {
           Box {
-            HyperIconButton(QoderGlyph.MORE, "会话操作", { menu = true }, backgroundColor = HyperTheme.colors.container)
+            HyperIconButton(QoderGlyph.MORE, "会话操作", { menu = true }, backgroundColor = Color.Transparent)
             MenuPopup(menu, { menu = false }, menuSections)
           }
         }
@@ -141,19 +143,19 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
             focusManager.clearFocus(); keyboard?.hide()
             activityGroup = it
             activityItem = it.takeIf { row -> row.kind == "tool" }
-          }, onQueuedAction = { queuedAction = it })
+          }, onQueuedAction = { queuedAction = it },
+          activity = activity, onOpenActivity = { sheet = ChatSheet.ACTIVITY })
         if (session.parentId != null) ChildSessionBar(state, session, onBack,
           onContinue = if ((state.server?.kind == ServerKind.DSH || state.server?.kind == ServerKind.DSH_REMOTE) &&
             session.subagentMode == "continuable") {
             { childContinue = true }
           } else null)
         else {
-          if (activity.hasActive) SessionActivityChip(activity) { sheet = ChatSheet.ACTIVITY }
           val goalSupported = state.server?.kind == ServerKind.DSH || state.server?.kind == ServerKind.DSH_REMOTE
           LaunchedEffect(state.sessionId, state.connected, goalSupported) {
             if (state.connected && goalSupported) controller.loadGoal()
           }
-          if (goalSupported && (state.goal != null || state.connected)) GoalBar(state, controller) { goalDialog = true }
+          if (goalSupported && state.goal != null) GoalBar(state, controller)
           HyperPendingActionDock(state, controller)
           ChatComposer(state, controller, interactive, onModal = { composerModal = it }, onServerFile = { sheet = ChatSheet.FILES; controller.listFiles() })
         }
@@ -182,7 +184,7 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
   }
   sheet?.let { which ->
     val resource = when (which) { ChatSheet.CHANGES -> "changes"; ChatSheet.FILES -> "files"; ChatSheet.ACTIVITY -> "children"; ChatSheet.SCHEDULES -> "schedules" }
-    SuperBottomSheet(title = when (which) { ChatSheet.CHANGES -> "代码改动"; ChatSheet.FILES -> "文件"; ChatSheet.ACTIVITY -> "子会话与后台"; ChatSheet.SCHEDULES -> "定时任务" }, show = true, onDismissRequest = { sheet = null }) {
+    HyperBottomSheet(title = when (which) { ChatSheet.CHANGES -> "代码改动"; ChatSheet.FILES -> "文件"; ChatSheet.ACTIVITY -> "子会话与后台"; ChatSheet.SCHEDULES -> "定时任务" }, show = true, onDismissRequest = { sheet = null }) {
       Column(Modifier.fillMaxWidth().fillMaxHeight(0.72f).padding(vertical = 8.dp)) {
         if (which != ChatSheet.FILES && which != ChatSheet.SCHEDULES) {
           ResourceHint(state.resource(resource), "暂无记录",
@@ -192,7 +194,7 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
           // Server lists may repeat an entry; LazyColumn crashes on a duplicate key, so keys never come from data alone.
           ChatSheet.CHANGES -> LazyColumn { itemsIndexed(state.changes, key = { index, change -> "$index:${change.path}" }) { _, change ->
             var expanded by rememberSaveable(change.path) { mutableStateOf(false) }
-            BasicComponent(title = change.path, summary = "+${change.additions} −${change.deletions}", onClick = { expanded = !expanded })
+            HyperActionRow(title = change.path, summary = "+${change.additions} −${change.deletions}", onClick = { expanded = !expanded })
             if (expanded) VirtualText(change.patch.ifBlank { change.after })
           } }
           ChatSheet.FILES -> FilesPanel(state, controller) { path -> controller.addReference(path); sheet = null }
@@ -207,7 +209,7 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
   ShellOutputSheet(state, controller)
   queuedAction?.let { row ->
     val itemId = row.key.removePrefix("user:")
-    SuperBottomSheet(title = "排队消息", show = true, onDismissRequest = { queuedAction = null }) {
+    HyperBottomSheet(title = "排队消息", show = true, onDismissRequest = { queuedAction = null }) {
       Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
         Text(row.text, maxLines = 3, overflow = TextOverflow.Ellipsis, style = MiuixTheme.textStyles.body2)
         TextButton(text = "立即插话", onClick = { controller.updateQueued(itemId, QueueAction.Steer); queuedAction = null }, modifier = Modifier.fillMaxWidth())
@@ -273,17 +275,9 @@ private fun HyperPendingActionDock(state: LagoonState, controller: LagoonControl
   if (permission == null && question == null) return
   if (permission != null) {
     val pending = state.pending("permission:${permission.id}")
-    val shape = miuixSquircleShape(18.dp)
-    Row(
-      modifier = Modifier
-        .fillMaxWidth()
-        .padding(horizontal = 12.dp, vertical = 4.dp)
-        .clip(shape)
-        .background(HyperTheme.colors.warningSubtle, shape)
-        .border(0.8.dp, HyperTheme.colors.warning.copy(alpha = 0.35f), shape)
-        .padding(horizontal = 14.dp, vertical = 10.dp),
-      verticalAlignment = Alignment.CenterVertically,
-      horizontalArrangement = Arrangement.spacedBy(10.dp)
+    HyperPill(
+      modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+      background = HyperTheme.colors.warningSubtle
     ) {
       Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
         Text(
@@ -319,16 +313,9 @@ private fun HyperPendingActionDock(state: LagoonState, controller: LagoonControl
     }
   } else if (question != null) {
     val firstTitle = question.questions.firstOrNull()?.title ?: "AI 正在等待你的回答"
-    val shape = miuixSquircleShape(18.dp)
-    Row(
-      modifier = Modifier
-        .fillMaxWidth()
-        .padding(horizontal = 12.dp, vertical = 4.dp)
-        .clip(shape)
-        .background(HyperTheme.colors.primarySubtle, shape)
-        .border(0.8.dp, HyperTheme.colors.primary.copy(alpha = 0.3f), shape)
-        .padding(horizontal = 14.dp, vertical = 10.dp),
-      verticalAlignment = Alignment.CenterVertically
+    HyperPill(
+      modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+      background = HyperTheme.colors.primarySubtle
     ) {
       Column(Modifier.weight(1f)) {
         Text(
@@ -349,32 +336,12 @@ private fun HyperPendingActionDock(state: LagoonState, controller: LagoonControl
   }
 }
 
-/** A quiet entry point above the composer for work that outlives the current reply. */
-@Composable
-private fun SessionActivityChip(activity: SessionActivity, onClick: () -> Unit) {
-  val parts = buildList {
-    if (activity.activeSubSessions > 0) add("${activity.activeSubSessions} 个子会话")
-    if (activity.shells.isNotEmpty()) add("${activity.shells.size} 个命令")
-  }
-  Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 4.dp)) {
-    Row(Modifier.clip(miuixSquircleShape(16.dp)).background(HyperTheme.colors.container)
-      .clickable(role = Role.Button, onClick = onClick).padding(horizontal = 12.dp, vertical = 6.dp),
-      verticalAlignment = Alignment.CenterVertically) {
-      InfiniteProgressIndicator(color = HyperTheme.colors.primary, size = 12.dp, strokeWidth = 1.5.dp, orbitingDotSize = 1.5.dp)
-      Spacer(Modifier.width(6.dp))
-      Text("后台 · ${parts.joinToString(" · ")}", style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary))
-    }
-  }
-}
+
 
 /** The child-session footer: live status and a way back, with no composer (official subagents are read-only). */
 @Composable
-private fun GoalBar(state: LagoonState, controller: LagoonController, onCreate: () -> Unit) {
-  val goal = state.goal
-  if (goal == null) {
-    TextButton(text = "设定目标", onClick = onCreate, modifier = Modifier.padding(horizontal = 20.dp))
-    return
-  }
+private fun GoalBar(state: LagoonState, controller: LagoonController) {
+  val goal = state.goal ?: return
   HyperCard(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp), insidePadding = PaddingValues(12.dp)) {
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
       Row(verticalAlignment = Alignment.CenterVertically) {
@@ -505,7 +472,7 @@ private fun ShellOutputSheet(state: LagoonState, controller: LagoonController) {
   val output = state.shellOutput ?: return
   val scroll = rememberScrollState()
   LaunchedEffect(output.text) { scroll.animateScrollTo(scroll.maxValue) }
-  SuperBottomSheet(title = output.command.lineSequence().firstOrNull().orEmpty().ifBlank { "后台命令" },
+  HyperBottomSheet(title = output.command.lineSequence().firstOrNull().orEmpty().ifBlank { "后台命令" },
     show = true, onDismissRequest = { controller.closeShellOutput() }) {
     Column(Modifier.fillMaxWidth().fillMaxHeight(0.78f).padding(vertical = 8.dp)) {
       Row(Modifier.fillMaxWidth().padding(horizontal = 4.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -794,12 +761,11 @@ fun MiuixPermissionCard(request: PermissionRequest, controller: LagoonController
 
   val isDangerous = request.action.contains("shell", true) || request.action.contains("write", true) || request.action.contains("delete", true)
 
-  Card(
-    modifier = Modifier.fillMaxWidth(),
-    insideMargin = PaddingValues(16.dp),
-    colors = CardDefaults.defaultColors(
-      color = if (isDangerous) MiuixColorTokens.WarningSubtle else MiuixTheme.colorScheme.surfaceContainer
-    )
+  HyperCard(
+    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+    backgroundColor = if (isDangerous) HyperTheme.colors.warningSubtle else HyperTheme.colors.cardElevated,
+    borderColor = if (isDangerous) HyperTheme.colors.warning.copy(alpha = 0.35f) else HyperTheme.colors.cardBorder,
+    insidePadding = PaddingValues(16.dp)
   ) {
     Row(verticalAlignment = Alignment.CenterVertically) {
       MiuixStatePill(TaskPhase.WAITING_PERMISSION, if (isDangerous) "需确认关键操作" else "等待操作授权")
@@ -807,7 +773,7 @@ fun MiuixPermissionCard(request: PermissionRequest, controller: LagoonController
       Text(
         request.action.ifBlank { "操作" },
         style = MiuixTheme.textStyles.footnote2.copy(
-          color = MiuixTheme.colorScheme.primary,
+          color = HyperTheme.colors.primary,
           fontWeight = FontWeight.Bold
         )
       )
@@ -821,14 +787,14 @@ fun MiuixPermissionCard(request: PermissionRequest, controller: LagoonController
       style = MiuixTheme.textStyles.body2,
       modifier = Modifier
         .fillMaxWidth()
-        .background(MiuixTheme.colorScheme.secondaryContainer, miuixSquircleShape(8.dp))
+        .background(HyperTheme.colors.codeSurface, miuixSquircleShape(8.dp))
         .padding(10.dp)
     )
     Spacer(Modifier.height(12.dp))
     if (request.always.isNotEmpty()) {
       Text(
         text = "选择“始终允许”将在服务器保存规则：" + request.always.joinToString(", "),
-        style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+        style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary)
       )
       Spacer(Modifier.height(10.dp))
     }
@@ -884,10 +850,11 @@ fun MiuixQuestionCard(request: QuestionRequest, controller: LagoonController, pe
   val submitEnabled = !pending && (if (request.form) runCatching { formAnswer(request, answerRows) }.isSuccess
     else answers.indices.all { answers[it].isNotEmpty() || (request.questions[it].custom && custom[it].isNotBlank()) })
 
-  Card(
-    modifier = Modifier.fillMaxWidth(),
-    insideMargin = PaddingValues(16.dp),
-    colors = CardDefaults.defaultColors(color = MiuixTheme.colorScheme.surfaceContainer)
+  HyperCard(
+    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+    backgroundColor = HyperTheme.colors.cardElevated,
+    borderColor = HyperTheme.colors.cardBorder,
+    insidePadding = PaddingValues(16.dp)
   ) {
     MiuixStatePill(TaskPhase.WAITING_QUESTION, "需要你的回答")
     if (visibleIndices.size > 1) {
@@ -1151,7 +1118,7 @@ private fun SchedulesPanel(state: LagoonState, controller: LagoonController) {
   }
   LazyColumn(Modifier.fillMaxWidth()) {
     items(state.schedules, key = { it.id }) { schedule ->
-      BasicComponent(title = schedule.title, summary = "${schedule.detail} · ${schedule.scheduledAt}",
+      HyperActionRow(title = schedule.title, summary = "${schedule.detail} · ${schedule.scheduledAt}",
         onClick = { controller.loadSchedules() })
       Text(schedule.prompt, style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary), maxLines = 2, overflow = TextOverflow.Ellipsis,
         modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp))
@@ -1202,7 +1169,7 @@ private fun FilesPanel(state: LagoonState, controller: LagoonController, onRefer
     } else if (!state.fileBinary || searching) {
       LazyColumn { items(nodes, key = { it.path }) { node ->
         val directory = node.type == "directory"
-        BasicComponent(title = node.path.substringAfterLast('/').ifBlank { node.path }, summary = if (directory) "文件夹" else node.path,
+        HyperActionRow(title = node.path.substringAfterLast('/').ifBlank { node.path }, summary = if (directory) "文件夹" else node.path,
           onClick = { if (directory) controller.listFiles(node.path) else controller.readFile(node.path) })
       } }
     }

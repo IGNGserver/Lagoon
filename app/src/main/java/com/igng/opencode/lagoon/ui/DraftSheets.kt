@@ -29,7 +29,6 @@ import com.igng.opencode.lagoon.core.draftServers
 import com.igng.opencode.lagoon.core.draftWorkspaces
 import com.igng.opencode.lagoon.core.normalizedDirectory
 import top.yukonga.miuix.kmp.basic.Text
-import top.yukonga.miuix.kmp.extra.SuperBottomSheet
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 
 /**
@@ -57,7 +56,7 @@ internal fun DraftDestinationSheet(
   val registered = workspaces.filter { it.registered }
   val serverOnly = workspaces.filterNot { it.registered }
   val muted = HyperTheme.colors.textSecondary
-  SuperBottomSheet(title = "服务器与工作区", show = true, onDismissRequest = onDismiss) {
+  HyperBottomSheet(title = "服务器与工作区", show = true, onDismissRequest = onDismiss) {
     LazyColumn(Modifier.fillMaxWidth().heightIn(max = 680.dp), contentPadding = PaddingValues(bottom = 16.dp)) {
       item { HyperGroupTitle("服务器") }
       items(servers, key = { "server:${it.id}" }) { server ->
@@ -161,7 +160,7 @@ private fun DraftServerRow(server: DraftServer, current: Boolean, onClick: () ->
         overflow = TextOverflow.Ellipsis
       )
     }
-    DropdownChevron(16.dp, muted)
+    ForwardChevron(16.dp, muted)
   }
 }
 
