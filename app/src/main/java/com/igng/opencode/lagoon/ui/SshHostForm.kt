@@ -49,8 +49,6 @@ import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.basic.TextButton
 import top.yukonga.miuix.kmp.basic.TextField
 import top.yukonga.miuix.kmp.extra.SuperDialog
-import top.yukonga.miuix.kmp.extra.SuperDropdown
-import top.yukonga.miuix.kmp.extra.SuperSwitch
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 
 /**
@@ -280,7 +278,7 @@ internal fun SshHostForm(
       }
     }
     item {
-      SuperDropdown(
+      HyperDropdownRow(
         title = "认证方式",
         items = SshAuthMethod.entries.map { it.label },
         selectedIndex = SshAuthMethod.entries.indexOf(auth),
@@ -335,15 +333,15 @@ internal fun SshHostForm(
       TextField(value = workingDirectory, onValueChange = { workingDirectory = it }, label = "远端工作目录（可选，例如 ~/code）", modifier = Modifier.fillMaxWidth())
     }
     item {
-      SuperSwitch(title = "自动连接", summary = "保存后在后台保持这条 SSH 连接", checked = autoConnect, onCheckedChange = { autoConnect = it })
+      HyperSwitchRow(title = "自动连接", summary = "保存后在后台保持这条 SSH 连接", checked = autoConnect, onCheckedChange = { autoConnect = it })
     }
     item {
-      SuperSwitch(title = "接收任务通知", checked = notifications, onCheckedChange = { notifications = it })
+      HyperSwitchRow(title = "接收任务通知", checked = notifications, onCheckedChange = { notifications = it })
     }
     item {
       val groups = state.deviceGroups
       if (groups.isNotEmpty()) {
-        SuperDropdown(
+        HyperDropdownRow(
           title = "加入设备分组",
           items = listOf("不加入分组") + groups.map { it.name },
           selectedIndex = (groups.indexOfFirst { it.id == groupId } + 1).coerceAtLeast(0),

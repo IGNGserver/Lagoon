@@ -19,15 +19,28 @@ internal enum class RootPage(val label: String) {
  * (leave the app). Keeping the transitions pure makes the "侧滑只回上一级、不回桌面" contract
  * verifiable without a device.
  */
-internal data class SessionNavigation(val page: RootPage = RootPage.HOME, val sessions: List<String> = emptyList()) {
-  val canGoBack get() = sessions.isNotEmpty() || page != RootPage.HOME
-  val route get() = NavRoute(page, sessions.lastOrNull(), sessions.size + if (page == RootPage.HOME) 0 else 1)
+internal data class SessionNavigation(
+  val page: RootPage = RootPage.HOME,
+  val sessions: List<String> = emptyList(),
+  val parentPages: List<RootPage> = emptyList()
+) {
+  val canGoBack get() = sessions.isNotEmpty() || parentPages.isNotEmpty() || page != RootPage.HOME
+  val route get() = NavRoute(page, sessions.lastOrNull(), sessions.size + parentPages.size + if (page == RootPage.HOME) 0 else 1)
   fun open(id: String, child: Boolean = false) = copy(sessions = if (child && sessions.isNotEmpty()) sessions.takeWhile { it != id } + id else listOf(id))
   /** Replace the chat stack with an authoritative parent chain (siblings share the same depth). */
   fun openLineage(lineage: List<String>) = copy(sessions = lineage.filter(String::isNotBlank))
-  /** Opening a page from the home ⋯ menu always starts from 会话, never on top of a chat. */
-  fun push(next: RootPage) = SessionNavigation(next)
-  fun back() = if (sessions.isNotEmpty()) copy(sessions = sessions.dropLast(1)) else SessionNavigation()
+  /** Opening a page from the home ⋯ menu starts from 会话; opening DEVICES from SETTINGS remembers SETTINGS on the stack. */
+  fun push(next: RootPage) = when {
+    next == RootPage.HOME -> SessionNavigation()
+    sessions.isEmpty() && page != RootPage.HOME && page != next ->
+      SessionNavigation(next, parentPages = (parentPages + page).filter { it != RootPage.HOME && it != next })
+    else -> SessionNavigation(next)
+  }
+  fun back() = when {
+    sessions.isNotEmpty() -> copy(sessions = sessions.dropLast(1))
+    parentPages.isNotEmpty() -> copy(page = parentPages.last(), parentPages = parentPages.dropLast(1))
+    else -> SessionNavigation()
+  }
 }
 
 /** True when a back navigation leaves the outermost conversation for its originating page. */

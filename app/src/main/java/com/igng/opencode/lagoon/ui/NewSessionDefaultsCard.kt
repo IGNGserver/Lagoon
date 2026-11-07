@@ -16,7 +16,6 @@ import androidx.compose.ui.unit.dp
 import com.igng.opencode.lagoon.core.*
 import top.yukonga.miuix.kmp.basic.HorizontalDivider
 import top.yukonga.miuix.kmp.basic.TextButton
-import top.yukonga.miuix.kmp.extra.SuperBottomSheet
 
 private data class PickerOption(val label: String, val summary: String? = null)
 
@@ -59,6 +58,7 @@ internal fun NewSessionDefaultsCard(state: LagoonState, controller: LagoonContro
         summary = when {
           !connected -> "连接后读取服务器提供的${if (isDsh) "预设" else " Agent"}"
           !agentKnown && state.resource("models").state == ResourceState.LOADING -> "正在读取 Agent 预设…"
+          !agentKnown && state.resource("models").state == ResourceState.ERROR -> "读取预设失败，可点下方重新读取"
           !agentKnown -> "服务器没有提供可用的${if (isDsh) "预设" else " Agent"}"
           staleAgent -> "服务器已不再提供这个预设；新会话会回退到服务器默认"
           else -> "新建会话时预先选中；只保存在这台手机"
@@ -97,6 +97,7 @@ internal fun NewSessionDefaultsCard(state: LagoonState, controller: LagoonContro
         summary = when {
           !connected -> "连接后读取服务器模型目录"
           !catalogKnown && state.resource("models").state == ResourceState.LOADING -> "正在读取模型目录…"
+          !catalogKnown && state.resource("models").state == ResourceState.ERROR -> "读取模型目录失败，可点下方重新读取"
           !catalogKnown -> "服务器没有提供可用模型"
           staleModel -> "服务器已不再提供这个模型；新会话会回退到服务器默认"
           state.newSessionModel == null -> "跟随服务器当前默认模型"
@@ -164,14 +165,14 @@ private fun SettingsPickerRow(
   val selected = options.getOrNull(selectedIndex)?.label ?: options.firstOrNull()?.label.orEmpty()
   HyperRow(
     title = title,
-    summary = "$summary · 当前：$selected",
+    summary = summary,
     value = selected,
     showChevron = true,
     enabled = enabled && options.size > 1,
     onClick = { if (enabled && options.size > 1) open = true }
   )
   if (open) {
-    SuperBottomSheet(title = title, show = true, onDismissRequest = { open = false }) {
+    HyperBottomSheet(title = title, show = true, onDismissRequest = { open = false }) {
       LazyColumn(
         Modifier.fillMaxWidth().heightIn(max = 560.dp),
         contentPadding = PaddingValues(bottom = 16.dp)

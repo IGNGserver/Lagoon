@@ -16,6 +16,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -108,7 +109,7 @@ internal fun DeviceManagementScreen(
                 )
               )
             }
-            DropdownChevron(18.dp, HyperTheme.colors.textSecondary)
+            ForwardChevron(16.dp, HyperTheme.colors.textSecondary)
           }
         }
       }
@@ -150,7 +151,7 @@ internal fun DeviceManagementScreen(
               }
               Text("管理中枢与主机", style = MiuixTheme.textStyles.body2.copy(fontWeight = FontWeight.SemiBold, color = HyperTheme.colors.primary))
               Spacer(Modifier.width(4.dp))
-              DropdownChevron(18.dp, HyperTheme.colors.primary)
+              ForwardChevron(16.dp, HyperTheme.colors.primary)
             }
           }
         }
@@ -202,37 +203,35 @@ internal fun DeviceManagementScreen(
 
         if (opencodeProfiles.isNotEmpty()) {
           item {
-            Text(
-              "OpenCode",
-              Modifier.padding(start = 16.dp, top = 8.dp, bottom = 4.dp),
-              style = MiuixTheme.textStyles.footnote2.copy(fontWeight = FontWeight.SemiBold, color = HyperTheme.colors.textSecondary)
-            )
-          }
-          items(opencodeProfiles, key = { "profile:${it.id}" }) { profile ->
-            ProfileRow(
-              profile, state, groupOf[profile.id],
-              onClick = { onEditProfile(profile) },
-              onToggleEnabled = { enabled -> controller.setProfileEnabled(profile.id, enabled) }
-            )
+            HyperGroupTitle("OpenCode")
+            HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(vertical = 4.dp)) {
+              opencodeProfiles.forEachIndexed { index, profile ->
+                if (index > 0) HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
+                ProfileRow(
+                  profile, state, groupOf[profile.id],
+                  onClick = { onEditProfile(profile) },
+                  onToggleEnabled = { enabled -> controller.setProfileEnabled(profile.id, enabled) }
+                )
+              }
+            }
           }
         }
 
         if (dshProfiles.isNotEmpty()) {
           item {
-            Text(
-              "DeepSeek Harness",
-              Modifier.padding(start = 16.dp, top = 10.dp, bottom = 4.dp),
-              style = MiuixTheme.textStyles.footnote2.copy(fontWeight = FontWeight.SemiBold, color = HyperTheme.colors.textSecondary)
-            )
-          }
-          items(dshProfiles, key = { "profile:${it.id}" }) { profile ->
-            ProfileRow(
-              profile, state, groupOf[profile.id],
-              onClick = {
-                if (profile.sshHostId != null) onEditSshHost(profile.sshHostId) else onEditProfile(profile)
-              },
-              onToggleEnabled = { enabled -> controller.setProfileEnabled(profile.id, enabled) }
-            )
+            HyperGroupTitle("DeepSeek Harness")
+            HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(vertical = 4.dp)) {
+              dshProfiles.forEachIndexed { index, profile ->
+                if (index > 0) HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
+                ProfileRow(
+                  profile, state, groupOf[profile.id],
+                  onClick = {
+                    if (profile.sshHostId != null) onEditSshHost(profile.sshHostId) else onEditProfile(profile)
+                  },
+                  onToggleEnabled = { enabled -> controller.setProfileEnabled(profile.id, enabled) }
+                )
+              }
+            }
           }
         }
       }
@@ -284,7 +283,7 @@ private fun GroupRow(group: DeviceGroup, state: LagoonState, onClick: () -> Unit
         HarnessBadge(it.kind)
         Spacer(Modifier.width(4.dp))
       }
-      DropdownChevron(18.dp, HyperTheme.colors.textSecondary)
+      ForwardChevron(16.dp, HyperTheme.colors.textSecondary)
     }
     if (members.isNotEmpty()) {
       Text(
@@ -306,67 +305,83 @@ private fun ProfileRow(
   onClick: () -> Unit,
   onToggleEnabled: (Boolean) -> Unit
 ) {
+  val snapshot = state.allServerSnapshots[profile.id]
   val connected = profile.enabled &&
-    (if (profile.id == state.serverId) state.connected else state.allServerSnapshots[profile.id]?.connected == true)
+    (if (profile.id == state.serverId) state.connected else snapshot?.connected == true)
+  val loading = profile.enabled &&
+    (if (profile.id == state.serverId) state.loading else snapshot?.loading == true)
+  val error = if (profile.id == state.serverId) state.error ?: state.connection.reason else snapshot?.error
   val endpoint = profile.endpointSummary
   val subtitle = buildString {
     append(endpoint)
     if (groupName != null) append(" · 分组：").append(groupName)
     if (!profile.enabled) append(" · 已禁用")
+    else if (!connected && !loading && !error.isNullOrBlank()) append(" · ").append(error)
   }
   val muted = HyperTheme.colors.textSecondary
-  HyperCard(
-    Modifier.fillMaxWidth().padding(bottom = 6.dp),
-    insidePadding = PaddingValues(horizontal = 14.dp, vertical = 12.dp)
+  Row(
+    Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp),
+    verticalAlignment = Alignment.CenterVertically
   ) {
-    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-      Row(
-        Modifier
-          .weight(1f)
-          .hyperPress(onClick = onClick)
-          .padding(vertical = 2.dp),
-        verticalAlignment = Alignment.CenterVertically
-      ) {
-        Icon(
-          if (profile.sshHostId != null) MiuixIcons.Link else MiuixIcons.GridView,
-          null,
-          Modifier.size(22.dp),
-          tint = if (profile.enabled) HyperTheme.colors.primary else muted.copy(alpha = 0.55f)
-        )
-        Spacer(Modifier.width(12.dp))
-        Column(Modifier.weight(1f)) {
-          Row(verticalAlignment = Alignment.CenterVertically) {
-            Text(
-              profile.name,
-              style = MiuixTheme.textStyles.body1.copy(
-                fontWeight = FontWeight.SemiBold,
-                color = if (profile.enabled) HyperTheme.colors.textPrimary else muted
-              ),
-              maxLines = 1,
-              overflow = TextOverflow.Ellipsis
-            )
-            if (profile.kind == ServerKind.DSH && profile.sshHostId == null) {
-              Spacer(Modifier.width(6.dp))
-              Text("旧版", style = MiuixTheme.textStyles.footnote2.copy(color = MiuixColorTokens.Warning))
-            }
-          }
+    Row(
+      Modifier
+        .weight(1f)
+        .clip(miuixSquircleShape(14.dp))
+        .hyperPress(surfaceHighlight = true, onClick = onClick)
+        .padding(vertical = 4.dp),
+      verticalAlignment = Alignment.CenterVertically
+    ) {
+      Icon(
+        if (profile.sshHostId != null) MiuixIcons.Link else MiuixIcons.GridView,
+        null,
+        Modifier.size(22.dp),
+        tint = if (profile.enabled) HyperTheme.colors.primary else muted.copy(alpha = 0.55f)
+      )
+      Spacer(Modifier.width(12.dp))
+      Column(Modifier.weight(1f)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
           Text(
-            subtitle,
-            style = MiuixTheme.textStyles.footnote2.copy(color = muted),
+            profile.name,
+            style = MiuixTheme.textStyles.body1.copy(
+              fontWeight = FontWeight.SemiBold,
+              color = if (profile.enabled) HyperTheme.colors.textPrimary else muted
+            ),
             maxLines = 1,
             overflow = TextOverflow.Ellipsis
           )
+          if (profile.kind == ServerKind.DSH && profile.sshHostId == null) {
+            Spacer(Modifier.width(6.dp))
+            Text("旧版", style = MiuixTheme.textStyles.footnote2.copy(color = MiuixColorTokens.Warning))
+          }
         }
-        if (connected) {
-          StatusDot(MiuixColorTokens.Success)
-          Spacer(Modifier.width(6.dp))
-          Text("在线", style = MiuixTheme.textStyles.footnote2.copy(fontWeight = FontWeight.SemiBold, color = MiuixColorTokens.Success))
-        }
-        Spacer(Modifier.width(8.dp))
-        DropdownChevron(18.dp, muted)
+        Text(
+          subtitle,
+          style = MiuixTheme.textStyles.footnote2.copy(
+            color = if (profile.enabled && !connected && !loading && !error.isNullOrBlank()) HyperTheme.colors.warning else muted
+          ),
+          maxLines = 2,
+          overflow = TextOverflow.Ellipsis
+        )
+      }
+      if (connected) {
+        StatusDot(MiuixColorTokens.Success)
+        Spacer(Modifier.width(6.dp))
+        Text("在线", style = MiuixTheme.textStyles.footnote2.copy(fontWeight = FontWeight.SemiBold, color = MiuixColorTokens.Success))
+      } else if (loading) {
+        Text("连接中", style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.warning))
+      } else if (profile.enabled) {
+        Text(
+          if (!error.isNullOrBlank()) "异常" else "离线",
+          style = MiuixTheme.textStyles.footnote2.copy(
+            fontWeight = FontWeight.Medium,
+            color = if (!error.isNullOrBlank()) HyperTheme.colors.warning else muted
+          )
+        )
       }
       Spacer(Modifier.width(8.dp))
-      HyperSwitch(checked = profile.enabled, onCheckedChange = onToggleEnabled)
+      ForwardChevron(16.dp, muted)
     }
+    Spacer(Modifier.width(8.dp))
+    HyperSwitch(checked = profile.enabled, onCheckedChange = onToggleEnabled)
   }
 }

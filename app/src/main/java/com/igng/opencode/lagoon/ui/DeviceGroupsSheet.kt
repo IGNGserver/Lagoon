@@ -32,7 +32,6 @@ import top.yukonga.miuix.kmp.basic.Checkbox
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.basic.TextButton
 import top.yukonga.miuix.kmp.basic.TextField
-import top.yukonga.miuix.kmp.extra.SuperBottomSheet
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 
 /**
@@ -60,7 +59,7 @@ internal fun DeviceGroupsSheet(
   val opencodeMembers = state.profiles.filter { it.kind == ServerKind.OPENCODE }
   val dshMembers = state.profiles.filter { it.kind != ServerKind.OPENCODE }
 
-  SuperBottomSheet(
+  HyperBottomSheet(
     title = if (editing != null) "编辑设备组" else "新建设备组",
     show = true,
     onDismissRequest = onDismiss

@@ -39,7 +39,6 @@ import kotlinx.coroutines.launch
 import top.yukonga.miuix.kmp.basic.Icon
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.basic.TextButton
-import top.yukonga.miuix.kmp.extra.SuperBottomSheet
 import top.yukonga.miuix.kmp.extra.SuperDialog
 import top.yukonga.miuix.kmp.icon.MiuixIcons
 import top.yukonga.miuix.kmp.icon.extended.Add
@@ -89,7 +88,7 @@ internal fun AddDeviceSheet(
     }
   }
 
-  SuperBottomSheet(title = "", show = true, onDismissRequest = onDismiss) {
+  HyperBottomSheet(title = "", show = true, onDismissRequest = onDismiss) {
     Column(Modifier.fillMaxWidth().fillMaxHeight(0.94f).background(HyperTheme.colors.sheetSurface)) {
       Row(
         Modifier.fillMaxWidth().padding(start = 8.dp, end = 8.dp, top = 4.dp, bottom = 4.dp),
@@ -262,7 +261,7 @@ private fun DshRemoteTab(
             }
             Text("管理中枢与主机", style = MiuixTheme.textStyles.body2.copy(fontWeight = FontWeight.SemiBold, color = HyperTheme.colors.primary))
             Spacer(Modifier.width(4.dp))
-            DropdownChevron(18.dp, HyperTheme.colors.primary)
+            ForwardChevron(16.dp, HyperTheme.colors.primary)
           }
         }
       }
@@ -305,7 +304,7 @@ private fun DshRemoteTab(
               Text("接入更多中枢主机", style = MiuixTheme.textStyles.body1.copy(fontWeight = FontWeight.Medium))
               Text("在中枢名下的电脑列表中勾选并接入", style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary))
             }
-            DropdownChevron(18.dp, HyperTheme.colors.textSecondary)
+            ForwardChevron(16.dp, HyperTheme.colors.textSecondary)
           }
         }
       }
@@ -376,7 +375,7 @@ private fun DshSshTab(
               Text("在线", style = MiuixTheme.textStyles.footnote2.copy(fontWeight = FontWeight.SemiBold, color = MiuixColorTokens.Success))
             }
             Spacer(Modifier.width(6.dp))
-            DropdownChevron(18.dp, HyperTheme.colors.textSecondary)
+            ForwardChevron(16.dp, HyperTheme.colors.textSecondary)
           }
         }
       }
@@ -393,7 +392,7 @@ private fun DshSshTab(
               style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary)
             )
           }
-          DropdownChevron(18.dp, HyperTheme.colors.textSecondary)
+          ForwardChevron(16.dp, HyperTheme.colors.textSecondary)
         }
       }
     }

@@ -17,6 +17,7 @@ import com.igng.opencode.lagoon.core.TaskPhase
 import com.igng.opencode.lagoon.core.TaskState
 import com.kyant.shapes.RoundedCornerStyle
 import com.kyant.shapes.RoundedRectangle
+import com.kyant.shapes.UnevenRoundedRectangle
 import top.yukonga.miuix.kmp.basic.ButtonDefaults
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.basic.TextButton
@@ -29,8 +30,22 @@ fun miuixSquircleShape(cornerRadius: Dp = 16.dp): Shape = squircles.getOrPut(cor
   RoundedRectangle(cornerRadius = cornerRadius, style = RoundedCornerStyle.Continuous)
 }
 
+/**
+ * 澎湃 OS 4 半屏抽屉顶部连续曲率圆角（底部直角贴合屏幕边缘，消除底角漏黑边）
+ */
+fun miuixTopSquircleShape(cornerRadius: Dp = 28.dp): Shape = topSquircles.getOrPut(cornerRadius) {
+  UnevenRoundedRectangle(
+    topStart = cornerRadius,
+    topEnd = cornerRadius,
+    bottomEnd = 0.dp,
+    bottomStart = 0.dp,
+    style = RoundedCornerStyle.Continuous
+  )
+}
+
 /** One shape per radius: a new instance on every call made each background rebuild its outline. */
 private val squircles = java.util.concurrent.ConcurrentHashMap<Dp, Shape>()
+private val topSquircles = java.util.concurrent.ConcurrentHashMap<Dp, Shape>()
 
 /**
  * 澎湃 OS 4 语义色彩系统：

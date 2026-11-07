@@ -15,7 +15,6 @@ import com.igng.opencode.lagoon.core.*
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 import top.yukonga.miuix.kmp.basic.*
-import top.yukonga.miuix.kmp.extra.SuperBottomSheet
 import top.yukonga.miuix.kmp.extra.SuperDialog
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 
@@ -63,7 +62,7 @@ internal fun RemoteHostsSheet(
     }
   }
 
-  SuperBottomSheet(title = "DSH 远程主机", show = true, onDismissRequest = onDismiss) {
+  HyperBottomSheet(title = "DSH 远程主机", show = true, onDismissRequest = onDismiss) {
     Column(Modifier.fillMaxWidth().fillMaxHeight(0.78f)) {
       LazyColumn(Modifier.weight(1f).fillMaxWidth(), contentPadding = PaddingValues(horizontal = 20.dp, vertical = 8.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -130,7 +129,7 @@ internal fun RemoteHostsSheet(
             }
           }
         }
-        error?.let { text -> item { Text(text, color = MiuixColorTokens.Error, style = MiuixTheme.textStyles.footnote1) } }
+        error?.let { text -> item { HyperInlineNotice(message = text, type = MiuixToastType.ERROR, modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp)) } }
       }
     }
   }

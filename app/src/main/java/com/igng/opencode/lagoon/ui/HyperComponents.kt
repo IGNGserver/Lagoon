@@ -27,8 +27,8 @@ import top.yukonga.miuix.kmp.basic.HorizontalDivider
 import top.yukonga.miuix.kmp.basic.Icon
 import top.yukonga.miuix.kmp.basic.PopupPositionProvider
 import top.yukonga.miuix.kmp.basic.Text
+import top.yukonga.miuix.kmp.extra.SuperBottomSheet
 import top.yukonga.miuix.kmp.icon.MiuixIcons
-import top.yukonga.miuix.kmp.icon.extended.Ok
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 import top.yukonga.miuix.kmp.theme.miuixCapsuleShape
 
@@ -36,6 +36,88 @@ import top.yukonga.miuix.kmp.theme.miuixCapsuleShape
  * 澎湃 OS 4 自研组件底座：
  * 提供具备四级表面色阶、连续曲率圆角（Squircle）、微高光描边与弹簧按压触感的核心组件。
  */
+
+/**
+ * 澎湃 OS 4 连接悬浮岛（HyperConnectionIsland）：
+ * 用于在屏幕顶部显示连接状态、正在运行的任务、透出网络或设备故障，取代原本的简单 Toast。
+ */
+@Composable
+fun HyperConnectionIsland(
+  message: String,
+  modifier: Modifier = Modifier,
+  type: MiuixToastType = MiuixToastType.INFO,
+  onClick: (() -> Unit)? = null
+) {
+  val (color, bgColor) = when (type) {
+    MiuixToastType.ERROR -> Pair(HyperTheme.colors.error, HyperTheme.colors.errorSubtle)
+    MiuixToastType.SUCCESS -> Pair(HyperTheme.colors.success, HyperTheme.colors.successSubtle)
+    MiuixToastType.WARNING -> Pair(HyperTheme.colors.warning, HyperTheme.colors.warningSubtle)
+    else -> Pair(HyperTheme.colors.primary, HyperTheme.colors.primarySubtle)
+  }
+
+  // Simplified version of the island for now.
+  Box(
+    modifier = modifier
+      .clip(miuixSquircleShape(24.dp))
+      .background(bgColor, miuixSquircleShape(24.dp))
+      .border(0.8.dp, color.copy(alpha = 0.35f), miuixSquircleShape(24.dp))
+      .padding(horizontal = 16.dp, vertical = 8.dp)
+      .then(if (onClick != null) Modifier.hyperPress(onClick = onClick) else Modifier),
+    contentAlignment = Alignment.Center
+  ) {
+    Text(
+      text = message,
+      style = MiuixTheme.textStyles.footnote1.copy(color = color, fontWeight = FontWeight.SemiBold)
+    )
+  }
+}
+
+/**
+ * 澎湃 OS 4 行内提示（HyperInlineNotice）：
+ * 用于在页面内透出错误、警告或操作指引，修正旧版松散的报错样式。
+ */
+@Composable
+fun HyperInlineNotice(
+  message: String,
+  modifier: Modifier = Modifier,
+  type: MiuixToastType = MiuixToastType.INFO,
+  action: String? = null,
+  onAction: (() -> Unit)? = null
+) {
+  val (color, bgColor, glyph) = when (type) {
+    MiuixToastType.ERROR -> Triple(HyperTheme.colors.error, HyperTheme.colors.errorSubtle, QoderGlyph.ERROR)
+    MiuixToastType.SUCCESS -> Triple(HyperTheme.colors.success, HyperTheme.colors.successSubtle, QoderGlyph.CHECK)
+    MiuixToastType.WARNING -> Triple(HyperTheme.colors.warning, HyperTheme.colors.warningSubtle, QoderGlyph.WARNING)
+    else -> Triple(HyperTheme.colors.primary, HyperTheme.colors.primarySubtle, QoderGlyph.INFO)
+  }
+
+  Row(
+    modifier = modifier
+      .fillMaxWidth()
+      .clip(miuixSquircleShape(12.dp))
+      .background(bgColor, miuixSquircleShape(12.dp))
+      .padding(12.dp),
+    verticalAlignment = Alignment.CenterVertically,
+    horizontalArrangement = Arrangement.spacedBy(10.dp)
+  ) {
+    QoderIcon(glyph, Modifier.size(18.dp), color = color)
+    Text(
+      text = message,
+      style = MiuixTheme.textStyles.body2.copy(color = color, fontWeight = FontWeight.Medium),
+      modifier = Modifier.weight(1f)
+    )
+    if (action != null && onAction != null) {
+      Text(
+        text = action,
+        style = MiuixTheme.textStyles.body2.copy(color = color, fontWeight = FontWeight.SemiBold),
+        modifier = Modifier
+          .clip(CircleShape)
+          .hyperPress(onClick = onAction)
+          .padding(horizontal = 8.dp, vertical = 4.dp)
+      )
+    }
+  }
+}
 
 /**
  * Level 1 连续曲率分组大卡片岛（Grouped Squircle Island）
@@ -48,6 +130,7 @@ fun HyperCard(
   borderColor: Color = HyperTheme.colors.cardBorder,
   insidePadding: PaddingValues = PaddingValues(16.dp),
   onClick: (() -> Unit)? = null,
+  surfaceHighlight: Boolean = true,
   content: @Composable ColumnScope.() -> Unit
 ) {
   val shape = miuixSquircleShape(cornerRadius)
@@ -56,15 +139,31 @@ fun HyperCard(
       .clip(shape)
       .background(backgroundColor, shape)
       .border(0.6.dp, borderColor, shape)
-      .then(if (onClick != null) Modifier.hyperPress(onClick = onClick) else Modifier)
+      .then(if (onClick != null) Modifier.hyperPress(onClick = onClick, surfaceHighlight = surfaceHighlight) else Modifier)
       .padding(insidePadding),
     content = content
   )
 }
 
 /**
- * 澎湃 OS 4 分组标题（替代松散的灰字小标题）
+ * 澎湃 OS 4 胶囊容器（用于 Dock、状态栏等）
  */
+@Composable
+fun HyperPill(
+  modifier: Modifier = Modifier,
+  background: Color = HyperTheme.colors.cardElevated,
+  content: @Composable RowScope.() -> Unit
+) {
+  Row(
+    modifier = modifier
+      .clip(miuixSquircleShape(16.dp))
+      .background(background)
+      .border(0.6.dp, HyperTheme.colors.cardBorder, miuixSquircleShape(16.dp))
+      .padding(horizontal = 14.dp, vertical = 7.dp),
+    verticalAlignment = Alignment.CenterVertically,
+    content = content
+  )
+}
 @Composable
 fun HyperGroupTitle(
   text: String,
@@ -249,8 +348,27 @@ fun HyperSwitchRow(
 }
 
 /**
- * 自研澎湃 OS 4 下拉选择行（替代 SuperDropdown）
+ * 自研澎湃 OS 4 动作行（替代 BasicComponent / SuperArrow）
  */
+@Composable
+fun HyperActionRow(
+  title: String,
+  modifier: Modifier = Modifier,
+  summary: String? = null,
+  enabled: Boolean = true,
+  onClick: (() -> Unit)? = null,
+  trailing: @Composable (RowScope.() -> Unit)? = null
+) {
+  HyperRow(
+    title = title,
+    summary = summary,
+    modifier = modifier,
+    enabled = enabled,
+    onClick = onClick,
+    showChevron = onClick != null && trailing == null,
+    trailing = trailing
+  )
+}
 @Composable
 fun HyperDropdownRow(
   title: String,
@@ -299,44 +417,60 @@ fun HyperSegmentedTabs(
   onTabSelected: (Int) -> Unit,
   modifier: Modifier = Modifier
 ) {
+  if (tabs.isEmpty()) return
   val containerShape = miuixSquircleShape(16.dp)
-  Row(
+  val pillShape = miuixSquircleShape(12.dp)
+  val safeIndex = selectedIndex.coerceIn(0, tabs.lastIndex)
+
+  BoxWithConstraints(
     modifier = modifier
       .fillMaxWidth()
       .clip(containerShape)
       .background(HyperTheme.colors.container, containerShape)
-      .padding(4.dp),
-    horizontalArrangement = Arrangement.spacedBy(4.dp),
-    verticalAlignment = Alignment.CenterVertically
+      .padding(4.dp)
   ) {
-    tabs.forEachIndexed { index, label ->
-      val selected = index == selectedIndex
-      val pillShape = miuixSquircleShape(12.dp)
-      val bg by animateColorAsState(
-        targetValue = if (selected) HyperTheme.colors.cardElevated else Color.Transparent,
-        animationSpec = HyperMotion.controlSpring(),
-        label = "tabBg"
-      )
-      Box(
-        modifier = Modifier
-          .weight(1f)
-          .heightIn(min = 36.dp)
-          .clip(pillShape)
-          .background(bg, pillShape)
-          .then(if (selected) Modifier.border(0.5.dp, HyperTheme.colors.cardBorder, pillShape) else Modifier)
-          .hyperPress(scaleDown = 0.96f) { onTabSelected(index) }
-          .padding(horizontal = 8.dp, vertical = 6.dp),
-        contentAlignment = Alignment.Center
-      ) {
-        Text(
-          text = label,
-          maxLines = 1,
-          overflow = TextOverflow.Ellipsis,
-          style = MiuixTheme.textStyles.footnote1.copy(
-            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
-            color = if (selected) HyperTheme.colors.textPrimary else HyperTheme.colors.textSecondary
+    val tabWidth = maxWidth / tabs.size
+    val indicatorOffset by animateDpAsState(
+      targetValue = tabWidth * safeIndex,
+      animationSpec = HyperMotion.controlSpring(),
+      label = "tabIndicatorOffset"
+    )
+
+    Box(
+      modifier = Modifier
+        .offset(x = indicatorOffset)
+        .width(tabWidth)
+        .height(36.dp)
+        .clip(pillShape)
+        .background(HyperTheme.colors.cardElevated, pillShape)
+        .border(0.5.dp, HyperTheme.colors.cardBorder, pillShape)
+    )
+
+    Row(
+      modifier = Modifier.fillMaxWidth(),
+      verticalAlignment = Alignment.CenterVertically
+    ) {
+      tabs.forEachIndexed { index, label ->
+        val selected = index == safeIndex
+        Box(
+          modifier = Modifier
+            .weight(1f)
+            .height(36.dp)
+            .clip(pillShape)
+            .hyperPress(scaleDown = 0.96f) { onTabSelected(index) }
+            .padding(horizontal = 8.dp),
+          contentAlignment = Alignment.Center
+        ) {
+          Text(
+            text = label,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            style = MiuixTheme.textStyles.footnote1.copy(
+              fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
+              color = if (selected) HyperTheme.colors.textPrimary else HyperTheme.colors.textSecondary
+            )
           )
-        )
+        }
       }
     }
   }
@@ -370,7 +504,7 @@ fun HyperTopBar(
         glyph = QoderGlyph.BACK,
         description = "返回上一级",
         onClick = onBack,
-        backgroundColor = HyperTheme.colors.container
+        backgroundColor = Color.Transparent
       )
       Spacer(Modifier.width(12.dp))
       Column(Modifier.weight(1f)) {
@@ -403,8 +537,32 @@ fun HyperTopBar(
 }
 
 /**
- * 澎湃 OS 4 圆形图标按钮（带弹簧按压反馈）
+ * 澎湃 OS 4 半屏抽屉底座（HyperBottomSheet）：
+ * 强制统一顶部圆角为 28dp 连续曲率，并配合背景色与入场动效。
  */
+@Composable
+fun HyperBottomSheet(
+  title: String,
+  show: Boolean,
+  onDismissRequest: () -> Unit,
+  modifier: Modifier = Modifier,
+  content: @Composable ColumnScope.() -> Unit
+) {
+  SuperBottomSheet(
+    title = title,
+    show = show,
+    onDismissRequest = onDismissRequest,
+    modifier = modifier.clip(miuixTopSquircleShape(28.dp))
+  ) {
+    Column(
+      modifier = Modifier
+        .fillMaxWidth()
+        .background(HyperTheme.colors.sheetSurface),
+      content = content
+    )
+  }
+}
+
 @Composable
 internal fun HyperIconButton(
   glyph: QoderGlyph,

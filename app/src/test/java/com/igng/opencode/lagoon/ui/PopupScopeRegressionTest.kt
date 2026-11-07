@@ -85,7 +85,7 @@ class PopupScopeRegressionTest {
       modal in open until close
     )
     // 服务器弹层确由 MIUIX 机制渲染，而不是被改成了不受此机制保护的自定义浮层。
-    assertTrue(uiSource("Screens.kt").contains("SuperBottomSheet("))
+    assertTrue(uiSource("HyperComponents.kt").contains("SuperBottomSheet("))
   }
 
   @Test

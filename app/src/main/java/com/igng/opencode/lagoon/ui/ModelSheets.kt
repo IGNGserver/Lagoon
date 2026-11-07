@@ -9,7 +9,6 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.igng.opencode.lagoon.core.*
 import top.yukonga.miuix.kmp.basic.*
-import top.yukonga.miuix.kmp.extra.SuperBottomSheet
 import top.yukonga.miuix.kmp.icon.MiuixIcons
 import top.yukonga.miuix.kmp.icon.extended.ContactsCircle
 import top.yukonga.miuix.kmp.theme.MiuixTheme
@@ -101,7 +100,7 @@ internal fun VariantSelector(state: LagoonState, controller: LagoonController, m
 internal fun ModelManagementSheet(state: LagoonState, controller: LagoonController, onDismiss: () -> Unit) {
   val catalog = state.modelCatalog
   val selectedCount = catalog.count { !state.modelVisibilityConfigured || state.modelOverrides[it.key] == true }
-  SuperBottomSheet(
+  HyperBottomSheet(
     title = "管理模型${state.server?.name?.let { " · $it" }.orEmpty()}",
     show = true,
     onDismissRequest = onDismiss
