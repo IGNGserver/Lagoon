@@ -331,7 +331,7 @@ class MainActivity : ComponentActivity() {
               }
             }
             AnimatedContent(route, transitionSpec = {
-              if (navigator.gesture?.phase == BackPhase.COMMITTED && previewBack && backProgress.value > 0.01f) {
+              if ((navigator.gesture?.phase == BackPhase.COMMITTED || lastGesturePhase == BackPhase.COMMITTED) && previewBack && backProgress.value > 0.01f) {
                 // 预测式返回松手后由 backProgress 弹簧连续驱动新旧两页至 1f 完全移出屏幕，留足弹簧收敛时长避免半途截断。
                 (fadeIn(tween(1)) togetherWith fadeOut(tween(1, delayMillis = 360))).apply {
                   targetContentZIndex = 0f
