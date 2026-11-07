@@ -136,8 +136,8 @@ data class LagoonState(
   /** Wall clock when the open conversation's transcript read began; 0 when it is not loading. */
   val transcriptLoadingSince: Long = 0
 ) {
-  /** Lazily computed per state instance; see [homeProjection]. */
-  internal var homeProjectionCache: LagoonState? = null
+  /** Lazily computed per state instance and offline-TTL epoch; see [homeProjection]. */
+  @Volatile internal var homeProjectionCache: Pair<Int, LagoonState>? = null
   val server: ServerProfile? get() = profiles.firstOrNull { it.id == serverId }
   /** Connections the user has not disabled. Presentation layers must use this, not [profiles]. */
   val enabledProfiles: List<ServerProfile> by lazy(LazyThreadSafetyMode.PUBLICATION) { profiles.filter { it.enabled } }

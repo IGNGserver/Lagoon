@@ -17,9 +17,11 @@ class OfflineCache internal constructor(
   private val decrypt: (String) -> String,
   private val writes: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 ) : CatalogCache {
-  constructor(context: Context) : this(context.getSharedPreferences("offline_cache", Context.MODE_PRIVATE),
-    KeystoreCipher("lagoon-offline-cache", legacyAlias = "opencode-lagoon-offline-cache")::encrypt,
-    KeystoreCipher("lagoon-offline-cache", legacyAlias = "opencode-lagoon-offline-cache")::decrypt)
+  constructor(context: Context) : this(
+    context.getSharedPreferences("offline_cache", Context.MODE_PRIVATE),
+    KeystoreCipher.of("lagoon-offline-cache", legacyAlias = "opencode-lagoon-offline-cache")::encrypt,
+    KeystoreCipher.of("lagoon-offline-cache", legacyAlias = "opencode-lagoon-offline-cache")::decrypt
+  )
   private val pendingLock = Any()
   private val pending = LinkedHashMap<String, () -> String>()
   // Monotonic sequence per key. A write is committed only while it is still the newest intent for
@@ -29,6 +31,8 @@ class OfflineCache internal constructor(
   private val inFlight = mutableSetOf<String>()
   private var sequence = 0L
   private val index = ArrayList<String>()
+  private val entryBytes = HashMap<String, Long>()
+  private var totalBytes = 0L
   private var writer: Job? = null
   /** Cheap change gates: a 10–30s reconcile must not re-encrypt an unchanged catalog/transcript. */
   private val catalogSignatures = HashMap<String, Int>()
@@ -39,25 +43,32 @@ class OfflineCache internal constructor(
     nameSequence[name] = value
     return value
   }
-  private fun touchIndex(name: String) {
+  private fun recordBytes(name: String, bytes: Long) {
+    val previous = entryBytes.put(name, bytes) ?: 0L
+    totalBytes = (totalBytes - previous + bytes).coerceAtLeast(0L)
+  }
+  private fun removeBytes(name: String) {
+    val removed = entryBytes.remove(name) ?: return
+    totalBytes = (totalBytes - removed).coerceAtLeast(0L)
+  }
+  private fun touchIndex(name: String, bytes: Long) {
+    recordBytes(name, bytes)
     index.remove(name)
     index.add(name)
     while (index.isNotEmpty() && (index.size > MAX_ENTRIES || cacheBytes() > MAX_TOTAL_BYTES)) evict(index.first())
     pruneSequences()
     persistIndex()
   }
-  /** Keeps [nameSequence] from growing with every session ever opened. */
-  private fun cacheBytes(): Long = preferences.all.filterKeys { it.startsWith(CATALOG_PREFIX) || it.startsWith(MESSAGES_PREFIX) }
-    .values.sumOf { (it as? String)?.length?.times(2L) ?: 0L }
+  /** O(1) tracked size; avoids copying [SharedPreferences.getAll] on every write while holding [pendingLock]. */
+  private fun cacheBytes(): Long = totalBytes
   private fun pruneSequences() {
     nameSequence.keys.retainAll(index.toSet() + pending.keys + inFlight)
   }
   private fun evict(name: String) {
     index.remove(name)
-    synchronized(pendingLock) {
-      pending.remove(name)
-      nextSequence(name)
-    }
+    removeBytes(name)
+    pending.remove(name)
+    nextSequence(name)
     preferences.edit().remove(name).apply()
   }
   private fun persistIndex() {
@@ -67,13 +78,20 @@ class OfflineCache internal constructor(
     index += runCatching { JSONArray(preferences.getString(INDEX_KEY, "[]")).let { array -> (0 until array.length()).mapNotNull { array.optString(it).takeIf(String::isNotBlank) } } }.getOrDefault(emptyList())
   }
   init {
-    loadIndex()
-    // Keys written before this version (or evicted from the index) are adopted so the bound still
-    // applies to an upgraded install.
-    preferences.all.keys.filter { it.startsWith(CATALOG_PREFIX) || it.startsWith(MESSAGES_PREFIX) }
-      .filterNot(index::contains).forEach { index.add(it) }
-    while (index.isNotEmpty() && (index.size > MAX_ENTRIES || cacheBytes() > MAX_TOTAL_BYTES)) evict(index.first())
-    if (index.isNotEmpty()) persistIndex()
+    synchronized(pendingLock) {
+      loadIndex()
+      val all = preferences.all
+      all.forEach { (key, value) ->
+        if (key.startsWith(CATALOG_PREFIX) || key.startsWith(MESSAGES_PREFIX)) {
+          val bytes = (value as? String)?.length?.times(2L) ?: 0L
+          recordBytes(key, bytes)
+          if (key !in index) index.add(key)
+        }
+      }
+      index.removeAll { it !in entryBytes }
+      while (index.isNotEmpty() && (index.size > MAX_ENTRIES || cacheBytes() > MAX_TOTAL_BYTES)) evict(index.first())
+      if (index.isNotEmpty()) persistIndex()
+    }
   }
   // Serialization and AES-GCM encryption of large transcripts are CPU-bound. Queue them on a
   // dedicated IO scope so refreshing a session never blocks the UI thread. Draining a snapshot of
@@ -101,9 +119,10 @@ class OfflineCache internal constructor(
           synchronized(pendingLock) {
             // Validation and commit share the delete lock. Encryption may finish after a deletion;
             // only the exact still-live write intent can reach preferences.
-            if (nameSequence[name] == captured && encoded.length * 2L <= MAX_ENTRY_BYTES) {
+            val bytes = encoded.length * 2L
+            if (nameSequence[name] == captured && bytes <= MAX_ENTRY_BYTES) {
               preferences.edit().putString(name, encoded).apply()
-              touchIndex(name)
+              touchIndex(name, bytes)
             }
           }
         } catch (cancel: CancellationException) { throw cancel } catch (error: Exception) { Diagnostics.warn("OfflineCache", "缓存写入失败", error) }
@@ -227,9 +246,10 @@ class OfflineCache internal constructor(
     synchronized(pendingLock) {
       catalogSignatures.remove(serverId)
       messageSignatures.keys.removeAll { it.startsWith("$serverId:") }
-      val matches = (index + preferences.all.keys + pending.keys + inFlight + nameSequence.keys).filter { it == "catalog:$serverId" || it.startsWith("messages:$serverId:") }.toSet()
+      val matches = (index + entryBytes.keys + pending.keys + inFlight + nameSequence.keys).filter { it == "catalog:$serverId" || it.startsWith("messages:$serverId:") }.toSet()
       matches.forEach { name ->
         pending.remove(name)
+        removeBytes(name)
         nextSequence(name)
         preferences.edit().remove(name).apply()
       }
@@ -242,10 +262,11 @@ class OfflineCache internal constructor(
   fun deleteTranscripts(serverId: String) {
     synchronized(pendingLock) {
       messageSignatures.keys.removeAll { it.startsWith("$serverId:") }
-      val matches = (index + preferences.all.keys + pending.keys + inFlight + nameSequence.keys).filter { it.startsWith("messages:$serverId:") }.toSet()
+      val matches = (index + entryBytes.keys + pending.keys + inFlight + nameSequence.keys).filter { it.startsWith("messages:$serverId:") }.toSet()
       if (matches.isEmpty()) return
       matches.forEach { name ->
         pending.remove(name)
+        removeBytes(name)
         nextSequence(name)
         preferences.edit().remove(name).apply()
       }
@@ -260,6 +281,7 @@ class OfflineCache internal constructor(
     synchronized(pendingLock) {
       messageSignatures.remove("$serverId:$sessionId")
       pending.remove(name)
+      removeBytes(name)
       nextSequence(name)
       preferences.edit().remove(name).apply()
       index.remove(name)

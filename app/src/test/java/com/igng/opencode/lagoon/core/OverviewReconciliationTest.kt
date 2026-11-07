@@ -186,4 +186,40 @@ class OverviewReconciliationTest {
       assertEquals(0, snapshot.summary.completed)
     }
   }
+
+  @Test fun refreshAllAndAwaitSuspendsUntilBackgroundMonitorCompletesRead() = runBlocking {
+    MockWebServer().use { server ->
+      var requests = 0
+      val base = dispatcher()
+      server.dispatcher = object : Dispatcher() {
+        override fun dispatch(request: RecordedRequest): MockResponse {
+          val path = request.requestUrl!!.encodedPath
+          if (path == "/api/session") {
+            requests++
+            Thread.sleep(150)
+          }
+          return base.dispatch(request)
+        }
+      }
+      val store = ServerStore(memoryPreferences(), memoryPreferences(), { it }, { it })
+      val profile = ServerProfile("a", "A", server.url("/").toString(), allowCleartext = true)
+      store.save(profile, password = "secret")
+      val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+      val snapshots = java.util.concurrent.ConcurrentHashMap<String, ServerOverviewSnapshot>()
+      val overview = AllServersOverview(store, OfflineCache(memoryPreferences(), { it }, { it }), scope, { snapshots[it.serverId] = it })
+      try {
+        overview.start(listOf(profile))
+        // 等待首次读取完成
+        withTimeout(5_000) {
+          while (snapshots["a"]?.connected != true) delay(20)
+        }
+        val before = requests
+        overview.refreshAllAndAwait()
+        assertTrue("refreshAllAndAwait 返回前必须已完成新一轮后台对账读取", requests > before)
+      } finally {
+        overview.stop()
+        scope.cancel()
+      }
+    }
+  }
 }

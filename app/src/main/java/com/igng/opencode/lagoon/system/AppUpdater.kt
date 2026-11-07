@@ -147,14 +147,13 @@ class AppUpdater private constructor(private val context: Context) {
       synchronized(this@AppUpdater) {
       val result = if (fetched is AppUpdateCheck.Failed) fetched else
         cachedBody()?.let { AppReleases.parse(it, currentVersionName(), selectedIncludePrerelease, currentVersionCode()) } ?: fetched
-      val current = _state.value
       when (result) {
-        is AppUpdateCheck.Available -> {
+        is AppUpdateCheck.Available -> _state.update { current ->
           val sameRelease = current.release?.version == result.release.version
           val base = if (sameRelease) current else withoutDownload(current)
           val ready = sameRelease && base.apkPath?.let { File(it).isFile } == true
           val size = base.apkPath?.let { File(it).length() }.takeIf { ready }
-          _state.value = base.copy(
+          base.copy(
             phase = if (ready) AppUpdatePhase.READY else AppUpdatePhase.AVAILABLE,
             release = result.release,
             progress = if (ready) 1f else null,
@@ -165,9 +164,9 @@ class AppUpdater private constructor(private val context: Context) {
             lastCheckedAt = System.currentTimeMillis()
           )
         }
-        is AppUpdateCheck.UpToDate -> {
+        is AppUpdateCheck.UpToDate -> _state.update { current ->
           val base = withoutDownload(current)
-          _state.value = base.copy(
+          base.copy(
             phase = AppUpdatePhase.UP_TO_DATE,
             release = null,
             progress = null,
@@ -178,10 +177,10 @@ class AppUpdater private constructor(private val context: Context) {
             lastCheckedAt = System.currentTimeMillis()
           )
         }
-        is AppUpdateCheck.Failed -> {
+        is AppUpdateCheck.Failed -> _state.update { current ->
           // A previously downloaded APK stays installable; this failure only describes the check.
           val ready = current.apkPath?.let { File(it).isFile } == true
-          _state.value = current.copy(
+          current.copy(
             phase = if (ready) AppUpdatePhase.READY else AppUpdatePhase.FAILED,
             progress = if (ready) 1f else null,
             failure = result.failure,
@@ -403,13 +402,16 @@ class AppUpdater private constructor(private val context: Context) {
     context.getSharedPreferences("ui", Context.MODE_PRIVATE).edit()
       .putString("updateChannel", if (includePrerelease) "preview" else "stable").apply()
     if (downloadJob?.isCompleted == false) cancelDownload()
-    val base = withoutDownload(_state.value)
     val result = cachedBody()?.let { AppReleases.parse(it, currentVersionName(), includePrerelease, currentVersionCode()) }
-    _state.value = base.copy(
-      phase = if (checkJob?.isCompleted == false) AppUpdatePhase.CHECKING else
-        if (result is AppUpdateCheck.Available) AppUpdatePhase.AVAILABLE else AppUpdatePhase.IDLE,
-      release = (result as? AppUpdateCheck.Available)?.release,
-      failure = null, failureDetail = null)
+    _state.update { current ->
+      val base = withoutDownload(current)
+      base.copy(
+        phase = if (checkJob?.isCompleted == false) AppUpdatePhase.CHECKING else
+          if (result is AppUpdateCheck.Available) AppUpdatePhase.AVAILABLE else AppUpdatePhase.IDLE,
+        release = (result as? AppUpdateCheck.Available)?.release,
+        failure = null, failureDetail = null
+      )
+    }
   }
 
   private fun savePolicy() {

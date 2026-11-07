@@ -45,4 +45,24 @@ class OfflineCacheTruncationTest {
     cache.awaitWrites()
     assertEquals("turn:7", cache.messages("s", "sess").single().turnId)
   }
+
+  @Test fun writePathDoesNotScanPreferencesAllOnEveryCommit() = runBlocking {
+    var getAllCalls = 0
+    val delegate = FakeSharedPreferences()
+    val prefs = object : android.content.SharedPreferences by delegate {
+      override fun getAll(): MutableMap<String, *> {
+        getAllCalls++
+        return delegate.all
+      }
+    }
+    val cache = OfflineCache(prefs, { it }, { it })
+    assertEquals("仅在初始化时读取一次存量条目", 1, getAllCalls)
+    repeat(10) { idx ->
+      cache.saveMessages("s", "sess-$idx", listOf(Message("m$idx", "user", idx.toLong(), listOf(MessagePart("p", "text", text = "hello $idx")))))
+    }
+    cache.awaitWrites()
+    cache.deleteMessages("s", "sess-0")
+    cache.deleteTranscripts("s")
+    assertEquals("写入与删除均使用内存字节账本，不再全量拷贝 preferences.all", 1, getAllCalls)
+  }
 }

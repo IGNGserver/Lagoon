@@ -61,32 +61,34 @@ object TranscriptRows {
   }
 
   private const val TURN_CACHE_CAPACITY = 256
-  private val turnRowCache = object : LinkedHashMap<String, Pair<String, List<TranscriptRow>>>(TURN_CACHE_CAPACITY, 0.75f, true) {
-    override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Pair<String, List<TranscriptRow>>>?): Boolean =
+  private val turnRowCache = object : LinkedHashMap<String, List<TranscriptRow>>(TURN_CACHE_CAPACITY, 0.75f, true) {
+    override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, List<TranscriptRow>>?): Boolean =
       size > TURN_CACHE_CAPACITY
   }
 
   /**
-   * 为非展开态的历史 Turn 计算轻量结构签名：
-   * 当流式输出只更新最后一个 Turn 时，历史已完成 Turn 的投影结果直接 O(1) 复用，无需在每帧重复遍历和格式化。
+   * 为非展开态的历史 Turn 计算完整结构与内容签名：
+   * 包含消息/部件不可变数据类的 hashCode（String 哈希在 JVM 上首次计算后缓存为 O(1) 字段读取），
+   * 既避免跨会话相同 turnId（如 DSH 的 `msg_1:1`）互相覆盖，也保证排队消息编辑、工具参数/报错变化立即刷新。
    */
-  private fun turnSignature(turn: Turn, working: Boolean, unverified: Boolean): String {
-    val sb = StringBuilder(128)
-    sb.append(turn.id).append('|').append(working).append('|').append(unverified).append('|')
+  private fun turnCacheKey(turn: Turn, turnKey: String, working: Boolean, unverified: Boolean): String {
+    val sb = StringBuilder(160)
+    sb.append(turnKey).append('|').append(turn.created).append('|').append(working).append('|').append(unverified).append('|')
     turn.user?.let { u ->
-      sb.append("u:").append(u.id).append(':').append(u.queued).append(':').append(u.parts.size).append('|')
+      sb.append("u:").append(u.id).append(':').append(u.created).append(':').append(u.queued)
+        .append(':').append(u.parts.size).append(':').append(u.hashCode()).append('|')
     }
     turn.shell?.let { s ->
-      sb.append("s:").append(s.id).append(':').append(s.parts.size).append('|')
+      sb.append("s:").append(s.id).append(':').append(s.created).append(':')
+        .append(s.parts.size).append(':').append(s.hashCode()).append('|')
     }
     turn.entries.forEach { msg ->
-      sb.append(msg.id).append(':').append(msg.completedAt ?: 0L).append(':')
-        .append(msg.finish.orEmpty()).append(':').append(msg.error?.hashCode() ?: 0).append(':')
-        .append(msg.retry?.hashCode() ?: 0).append(':').append(msg.parts.size)
+      sb.append(msg.id).append(':').append(msg.created).append(':').append(msg.completedAt ?: 0L).append(':')
+        .append(msg.parts.size).append(':').append(msg.hashCode())
       msg.parts.forEach { p ->
         sb.append(',').append(p.id).append(':').append(p.status).append(':')
           .append(p.text.length).append(':').append(p.output.length).append(':')
-          .append(p.patch.length).append(':').append(p.attachments.size)
+          .append(p.patch.length).append(':').append(p.hashCode())
       }
       sb.append(';')
     }
@@ -95,13 +97,13 @@ object TranscriptRows {
 
   private fun cachedTurnRows(turn: Turn, turnKey: String, expanded: Set<String>, working: Boolean, unverified: Boolean): List<TranscriptRow> {
     if (expanded.isNotEmpty()) return turnRows(turn, turnKey, expanded, working, unverified)
-    val sig = turnSignature(turn, working, unverified)
+    val cacheKey = turnCacheKey(turn, turnKey, working, unverified)
     synchronized(turnRowCache) {
-      turnRowCache[turnKey]?.takeIf { it.first == sig }?.let { return it.second }
+      turnRowCache[cacheKey]?.let { return it }
     }
     val built = turnRows(turn, turnKey, expanded, working, unverified)
     synchronized(turnRowCache) {
-      turnRowCache[turnKey] = sig to built
+      turnRowCache[cacheKey] = built
     }
     return built
   }

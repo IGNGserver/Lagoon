@@ -1,9 +1,13 @@
 package com.igng.opencode.lagoon.core.ssh
 
 import com.igng.opencode.lagoon.core.*
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.emitAll
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.isActive
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * A [HarnessClient] for one SSH-backed DSH host. Every call waits for the link to have an
@@ -13,13 +17,16 @@ import kotlinx.coroutines.flow.flow
  */
 internal class SshDshClient(
   private val link: SshHostLink,
-  private val onClose: () -> Unit = {}
+  private val onClose: () -> Unit = { link.close() }
 ) : HarnessClient {
+  private val closedFlag = AtomicBoolean(false)
+
   private suspend fun api(): DshApi = link.awaitClient()
 
+  override val isClosed: Boolean get() = closedFlag.get() || link.isClosed
+
   override fun close() {
-    link.close()
-    onClose()
+    if (closedFlag.compareAndSet(false, true)) onClose()
   }
 
   override fun capabilities(): ApiCapabilities = DshApi.TUNNEL_CAPABILITIES
@@ -202,5 +209,12 @@ internal class SshDshClient(
   override suspend fun searchFiles(directory: String, query: String, session: Session?): List<String> =
     api().searchFiles(directory, query, session)
 
-  override fun events(onOpen: () -> Unit): Flow<ServerEvent> = flow { emitAll(api().events(onOpen)) }
+  override fun events(onOpen: () -> Unit): Flow<ServerEvent> = flow {
+    while (currentCoroutineContext().isActive && !isClosed) {
+      val currentApi = api()
+      emitAll(currentApi.events(onOpen))
+      // Underlying DshApi was closed because the SSH link or remote dsh web restarted; loop to bind the next generation.
+      if (!isClosed) delay(250)
+    }
+  }
 }

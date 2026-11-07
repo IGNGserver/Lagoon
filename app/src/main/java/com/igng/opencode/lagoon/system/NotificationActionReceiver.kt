@@ -7,7 +7,7 @@ import com.igng.opencode.lagoon.core.ApiException
 import com.igng.opencode.lagoon.core.Diagnostics
 import com.igng.opencode.lagoon.core.LagoonController
 import com.igng.opencode.lagoon.core.LiveUpdateStage
-import com.igng.opencode.lagoon.core.createHarnessClient
+import com.igng.opencode.lagoon.core.ServerKind
 import com.igng.opencode.lagoon.core.ServerStore
 import com.igng.opencode.lagoon.core.Session
 import kotlinx.coroutines.CancellationException
@@ -73,26 +73,30 @@ class NotificationActionReceiver : BroadcastReceiver() {
     val profile = store.profiles().firstOrNull { it.id == serverId } ?: return false
     if (!profile.enabled) return false
     if (profileUrl != profile.url) return false
-    val client = if (profile.sshHostId != null) LagoonController.get(context).sshClientForNotification(profile)
-      else createHarnessClient(profile, store.credentials(serverId), callTimeoutSeconds = 8)
+    val controller = LagoonController.get(context)
     return try {
-      when (action) {
-        "abort" -> client.abort(Session(sessionId, directory, "", 0))
-        "reject", "once" -> {
-          val requestId = permissionId ?: error("缺少权限 ID")
-          // Re-read the request from its session so a stale notification can never answer a different one.
-          val pendingRequest = client.sessionPermissions(Session(sessionId, permissionDirectory, "", 0)).firstOrNull { it.id == requestId }
-          if (pendingRequest != null) {
-            try {
-              client.replyPermission(pendingRequest, action)
-            } catch (e: ApiException) {
-              if (e.status != 404) throw e
+      controller.notificationClient(profile, store.credentials(serverId)).use { lease ->
+        val client = lease.client
+        when (action) {
+          "abort" -> client.abort(Session(sessionId, directory, "", 0))
+          "reject", "once" -> {
+            val requestId = permissionId ?: error("缺少权限 ID")
+            // Re-read the request from its session so a stale notification can never answer a different one.
+            val pendingRequest = client.sessionPermissions(Session(sessionId, permissionDirectory, "", 0)).firstOrNull { it.id == requestId }
+            if (pendingRequest != null) {
+              try {
+                client.replyPermission(pendingRequest, action)
+              } catch (e: ApiException) {
+                if (e.status != 404) throw e
+              }
+            } else if (profile.kind == ServerKind.DSH || profile.kind == ServerKind.DSH_REMOTE) {
+              return false
             }
           }
+          else -> return false
         }
-        else -> return false
       }
-      LagoonController.get(context).notificationCompleted(serverId, permissionId)
+      controller.notificationCompleted(serverId, permissionId)
       true
     } catch (cancel: CancellationException) {
       throw cancel

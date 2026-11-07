@@ -49,21 +49,23 @@ internal class ConversationStorePool(private val capacity: Int = 12) {
     val session = state.session ?: return
     val k = key(serverId, sessionId)
     val existing = slots[k]
-    // 当新选中会话尚处于空列表初始加载帧、而槽位中已有消息时，保留已缓存消息直至新消息到达
-    val keepMessages = state.messages.isEmpty() &&
+    // 当新选中会话尚处于空列表初始加载帧、而槽位中已有消息时，保留已缓存消息与会话级附属状态直至新读取到达；
+    // 一旦进入正常就绪/更新帧，则如实记录清空操作（如 goal=null、schedules/changes 变空）。
+    val initialLoading = state.messages.isEmpty() &&
       state.resource("messages").state == ResourceState.LOADING &&
-      existing != null && existing.messages.isNotEmpty()
+      existing != null
+    val keepMessages = initialLoading && existing!!.messages.isNotEmpty()
     slots[k] = ConversationSlot(
       serverId = serverId,
       sessionId = sessionId,
       session = session,
-      projectId = state.projectId ?: existing?.projectId,
+      projectId = state.projectId ?: if (initialLoading) existing?.projectId else null,
       messages = if (keepMessages) existing!!.messages else state.messages,
-      changes = state.changes.ifEmpty { existing?.changes.orEmpty() },
-      goal = state.goal ?: existing?.goal,
-      schedules = state.schedules.ifEmpty { existing?.schedules.orEmpty() },
-      agent = state.agent ?: existing?.agent,
-      model = state.model ?: existing?.model,
+      changes = if (initialLoading && state.changes.isEmpty()) existing!!.changes else state.changes,
+      goal = if (initialLoading && state.goal == null) existing!!.goal else state.goal,
+      schedules = if (initialLoading && state.schedules.isEmpty()) existing!!.schedules else state.schedules,
+      agent = if (initialLoading && state.agent == null) existing!!.agent else state.agent,
+      model = if (initialLoading && state.model == null) existing!!.model else state.model,
       agentChanged = state.agentChanged,
       modelChanged = state.modelChanged,
       draft = state.draft,
@@ -95,11 +97,43 @@ internal class ConversationStorePool(private val capacity: Int = 12) {
       record(base)
       return base
     }
+    // 跨服务器路由转场或手势返回时，先用目标服务器的快照替换服务器级状态，防止把另一台服务器的任务/权限/目录混入当前页。
+    val serverBase = if (base.serverId == serverId) base else {
+      val snapshot = base.allServerSnapshots[serverId]
+      base.copy(
+        serverId = serverId,
+        version = snapshot?.version.orEmpty(),
+        connected = snapshot?.connected == true,
+        cached = snapshot?.cached == true,
+        loading = snapshot?.loading == true,
+        error = snapshot?.error,
+        degraded = snapshot?.degraded == true,
+        streamConnected = snapshot?.streamConnected == true,
+        projects = snapshot?.projects.orEmpty(),
+        workspaceCatalog = snapshot?.workspaceCatalog.orEmpty(),
+        sessions = snapshot?.sessions.orEmpty(),
+        knownParents = snapshot?.parents.orEmpty(),
+        tasks = snapshot?.tasks.orEmpty(),
+        permissions = snapshot?.permissions.orEmpty(),
+        questions = snapshot?.questions.orEmpty(),
+        notices = snapshot?.notices.orEmpty(),
+        backgroundRunning = snapshot?.backgroundRunning.orEmpty(),
+        shells = snapshot?.shells.orEmpty(),
+        summary = snapshot?.summary ?: TaskSummary.EMPTY,
+        autoApprovalFailures = snapshot?.autoApprovalFailures.orEmpty(),
+        lastContactAt = snapshot?.lastReadAt ?: 0L,
+        changes = emptyList(),
+        goal = null,
+        schedules = emptyList(),
+        draft = "",
+        references = emptyList()
+      )
+    }
     val slot = slots[key(serverId, sessionId)]
     if (slot != null) {
-      val mergedSessions = if (base.sessions.any { it.id == slot.sessionId }) base.sessions
-      else base.sessions + slot.session
-      return base.copy(
+      val mergedSessions = if (serverBase.sessions.any { it.id == slot.sessionId }) serverBase.sessions
+      else serverBase.sessions + slot.session
+      return serverBase.copy(
         serverId = serverId,
         sessionId = sessionId,
         projectId = slot.projectId,
@@ -124,16 +158,16 @@ internal class ConversationStorePool(private val capacity: Int = 12) {
       )
     }
     // 回退至 SessionViewCache / TranscriptMemory（如预取会话或父会话）
-    val knownSession = base.sessions.firstOrNull { it.id == sessionId }
-      ?: base.allServerSnapshots[serverId]?.sessions?.firstOrNull { it.id == sessionId }
+    val knownSession = serverBase.sessions.firstOrNull { it.id == sessionId }
+      ?: base.sessions.firstOrNull { it.id == sessionId && (it.serverId == null || it.serverId == serverId) }
     val cachedView = sessionViews?.get(serverId, sessionId)
     val fallbackMessages = cachedView?.messages ?: transcriptMemory?.get(serverId, sessionId).orEmpty()
     val mergedSessions = when {
-      knownSession == null -> emptyList()
-      base.sessions.any { it.id == sessionId } -> base.sessions
-      else -> base.sessions + knownSession
+      knownSession == null -> serverBase.sessions
+      serverBase.sessions.any { it.id == sessionId } -> serverBase.sessions
+      else -> serverBase.sessions + knownSession
     }
-    return base.copy(
+    return serverBase.copy(
       serverId = serverId,
       sessionId = sessionId,
       sessions = mergedSessions,
@@ -141,7 +175,11 @@ internal class ConversationStorePool(private val capacity: Int = 12) {
       messagesCursor = cachedView?.olderCursor,
       loadedOlderMessages = cachedView?.loadedOlder ?: false,
       cacheComplete = cachedView?.cacheComplete ?: true,
-      draft = ""
+      changes = emptyList(),
+      goal = null,
+      schedules = emptyList(),
+      draft = "",
+      references = emptyList()
     )
   }
 

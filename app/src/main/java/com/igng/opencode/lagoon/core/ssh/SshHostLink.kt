@@ -53,6 +53,7 @@ internal class SshHostLink(
   val status: StateFlow<SshLinkStatus> = mutableStatus
 
   @Volatile private var closed = false
+  val isClosed: Boolean get() = closed
   @Volatile private var transport: SshTransport? = null
   @Volatile private var endpoint: RemoteDshEndpoint? = null
   @Volatile private var forwarder: SshForwarder? = null
@@ -106,11 +107,11 @@ internal class SshHostLink(
   }
 
   fun retry() {
-    if (closed) return
-    if (mutableStatus.value.phase == SshLinkPhase.FAILED || mutableStatus.value.phase == SshLinkPhase.IDLE) {
-      attempt = 0
-      ready = CompletableDeferred()
-      synchronized(this) {
+    synchronized(this) {
+      if (closed) return
+      if (mutableStatus.value.phase == SshLinkPhase.FAILED || mutableStatus.value.phase == SshLinkPhase.IDLE) {
+        attempt = 0
+        if (ready.isCompleted) ready = CompletableDeferred()
         if (connectJob?.isActive != true) connectJob = scope.launch(Dispatchers.IO) { connectLoop() }
       }
     }
@@ -122,7 +123,7 @@ internal class SshHostLink(
     val current = transport
     if (mutableStatus.value.isConnected && current != null) {
       scope.launch(Dispatchers.IO) {
-        if (!current.ping(8_000) || current.isClosed) lost(SshFailure(SshFailureKind.DISCONNECTED, "SSH 连接已断开"))
+        if (!current.ping(8_000) || current.isClosed) lost(SshFailure(SshFailureKind.DISCONNECTED, "SSH 连接已断开"), current)
       }
     } else if (mutableStatus.value.phase == SshLinkPhase.FAILED) {
       retry()
@@ -221,7 +222,12 @@ internal class SshHostLink(
         throw SshFailure(SshFailureKind.DISCONNECTED, "SSH 主机已移除", retryable = false)
       }
       api.setContentWatching(contentWatching)
-      client = api
+      val previousClient = synchronized(this) {
+        val old = client
+        client = api
+        old
+      }
+      if (previousClient !== null && previousClient !== api) runCatching { previousClient.close() }
       workspaceCollector?.cancel()
       workspaceCollector = api.workspaceUpdates?.let { updates ->
         scope.launch {
@@ -267,7 +273,7 @@ internal class SshHostLink(
         delay(PING_INTERVAL_MILLIS)
         val active = transport ?: break
         if (active.isClosed || !active.ping(PING_TIMEOUT_MILLIS)) {
-          lost(SshFailure(SshFailureKind.DISCONNECTED, "SSH 连接没有响应，正在重连"))
+          lost(SshFailure(SshFailureKind.DISCONNECTED, "SSH 连接没有响应，正在重连"), active)
           break
         }
         val dsh = endpoint
@@ -275,7 +281,7 @@ internal class SshHostLink(
           // SSH can stay up while the remote dsh web process dies. Probe its loopback port so the
           // bootstrap can restart it and hand out a new token before the next control-plane read.
           if (!active.probeTunnel("127.0.0.1", dsh.port, 8_000)) {
-            lost(SshFailure(SshFailureKind.DSH_START, "远端的 dsh web 已停止，正在重启"))
+            lost(SshFailure(SshFailureKind.DSH_START, "远端的 dsh web 已停止，正在重启"), active)
             break
           }
         }
@@ -283,9 +289,10 @@ internal class SshHostLink(
     }
   }
 
-  private fun lost(failure: SshFailure) {
+  private fun lost(failure: SshFailure, expectedTransport: SshTransport? = null) {
     synchronized(this) {
       if (closed || mutableStatus.value.phase == SshLinkPhase.RECONNECTING || mutableStatus.value.phase == SshLinkPhase.FAILED) return
+      if (expectedTransport != null && transport !== expectedTransport) return
       publish(SshLinkPhase.RECONNECTING, mutableStatus.value.step, failure.message, failure, attempt)
       val pending = ready
       if (!pending.isCompleted) pending.completeExceptionally(failure)

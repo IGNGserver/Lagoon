@@ -94,18 +94,29 @@ internal fun LagoonState.allServerStatuses(now: Long = System.currentTimeMillis(
     snapshot.sessionStatuses(permissionPolicy, now).map { (id, status) -> scopedKey(snapshot.serverId, id) to status }
   }.toMap()
 
-/** A home filter is a projection, not a connection switch. */
-fun LagoonState.homeProjection(): LagoonState {
-  homeProjectionCache?.let { return it }
-  return computeHomeProjection().also { homeProjectionCache = it }
+/** Offline-TTL staleness fingerprint so [homeProjectionCache] invalidates once an offline server expires. */
+private fun LagoonState.offlineStaleFingerprint(now: Long): Int {
+  var hash = if (!connected && lastContactAt > 0 && now - lastContactAt > STALE_CONNECTION_TASK_MILLIS) 1 else 0
+  for ((id, snapshot) in allServerSnapshots) {
+    val stale = !snapshot.connected && snapshot.lastReadAt > 0 && now - snapshot.lastReadAt > STALE_CONNECTION_TASK_MILLIS
+    if (stale) hash = 31 * hash + id.hashCode()
+  }
+  return hash
 }
 
-private fun LagoonState.computeHomeProjection(): LagoonState {
+/** A home filter is a projection, not a connection switch. */
+fun LagoonState.homeProjection(now: Long = System.currentTimeMillis()): LagoonState {
+  val fingerprint = offlineStaleFingerprint(now)
+  homeProjectionCache?.takeIf { it.first == fingerprint }?.let { return it.second }
+  return computeHomeProjection(now).also { homeProjectionCache = fingerprint to it }
+}
+
+private fun LagoonState.computeHomeProjection(now: Long = System.currentTimeMillis()): LagoonState {
   val snapshots = serverSnapshots()
   val enabledIds = enabledProfiles.mapTo(HashSet()) { it.id }
   if (!allServers) {
     val group = homeGroup
-    if (group != null && group.memberIds.any { it in enabledIds }) return groupHomeProjection(snapshots, group)
+    if (group != null && group.memberIds.any { it in enabledIds }) return groupHomeProjection(snapshots, group, now)
     if (group == null) {
       val id = (homeServerId ?: serverId)?.takeIf { it in enabledIds }
         ?: serverId?.takeIf { it in enabledIds }
@@ -124,14 +135,16 @@ private fun LagoonState.computeHomeProjection(): LagoonState {
         cached = snapshot.cached, loading = snapshot.loading, degraded = snapshot.degraded, sessions = snapshot.sessions,
         projects = snapshot.projects, tasks = snapshot.tasks, permissions = snapshot.permissions, questions = snapshot.questions,
         notices = snapshot.notices, knownParents = snapshot.parents, backgroundRunning = snapshot.backgroundRunning,
-        summary = snapshot.displaySummary(permissionPolicy), lastContactAt = snapshot.lastReadAt,
+        summary = snapshot.displaySummary(permissionPolicy, now), lastContactAt = snapshot.lastReadAt,
         autoApprovalFailures = snapshot.autoApprovalFailures, sessionId = null, projectId = null, scopeProjectId = null,
         serverReadPending = serverReadPending, workspaceCatalog = snapshot.workspaceCatalog,
         allServerSnapshots = snapshots)
     }
     // The selected group has no enabled member left: fall through to the aggregate projection.
   }
-  val statuses = allServerStatuses()
+  val statuses = allServerStatuses(now)
+  val mergedSummary = if (snapshots.isEmpty()) TaskSummary.EMPTY
+    else TaskSummary.merge(snapshots.values.filter { it.profile.notifications }.map { it.displaySummary(permissionPolicy, now) })
   return copy(serverId = null, homeGroupId = null, allServers = true,
     homeServerId = homeServerId?.takeIf { it in enabledIds },
     sessionId = null, projectId = null, scopeProjectId = null, workspaceCatalog = emptyList(),
@@ -149,7 +162,7 @@ private fun LagoonState.computeHomeProjection(): LagoonState {
     // `cached` 描述的是“当前对话的消息是否为缓存”，不能拿来给整页的目录数据下结论。聚合页只有在
     // 一台服务器都没连上时才可能整页都是缓存；否则由各设备的 chip 状态点表达。
     cached = snapshots.values.none { it.connected } && snapshots.values.any { it.cached },
-    summary = if (snapshots.isEmpty()) TaskSummary.EMPTY else globalSummary,
+    summary = mergedSummary,
     allServerSnapshots = snapshots, allSessionStatuses = statuses,
     allUnseenSessions = snapshots.values.flatMap { snapshot -> snapshot.notices.filterNot { it.viewed }.map { scopedKey(snapshot.serverId, it.sessionId) } }.toSet())
 }
@@ -160,18 +173,19 @@ private fun LagoonState.computeHomeProjection(): LagoonState {
  */
 private fun LagoonState.groupHomeProjection(
   snapshots: Map<String, ServerOverviewSnapshot>,
-  group: DeviceGroup
+  group: DeviceGroup,
+  now: Long = System.currentTimeMillis()
 ): LagoonState {
   val members = group.memberIds.toSet()
   val scoped = snapshots.filterKeys { it in members }
   val statuses = scoped.values.flatMap { snapshot ->
-    snapshot.sessionStatuses(permissionPolicy).map { (id, status) -> scopedKey(snapshot.serverId, id) to status }
+    snapshot.sessionStatuses(permissionPolicy, now).map { (id, status) -> scopedKey(snapshot.serverId, id) to status }
   }.toMap()
   val active = serverId?.takeIf { id -> id in members && scoped[id]?.connected == true }
     ?: scoped.keys.firstOrNull { id -> scoped[id]?.connected == true }
     ?: serverId?.takeIf { it in members && profiles.any { profile -> profile.id == it && profile.enabled } }
     ?: scoped.keys.firstOrNull()
-  val summary = TaskSummary.merge(scoped.values.filter { it.profile.notifications }.map { it.displaySummary(permissionPolicy) })
+  val summary = TaskSummary.merge(scoped.values.filter { it.profile.notifications }.map { it.displaySummary(permissionPolicy, now) })
   val unseen = scoped.values.flatMap { snapshot ->
     snapshot.notices.filterNot { it.viewed }.map { scopedKey(snapshot.serverId, it.sessionId) }
   }.toSet()
