@@ -118,6 +118,16 @@ class LagoonController private constructor(private val appContext: Context) {
   internal val conversationPool: ConversationStorePool
     get() = conversationPoolStorage ?: ConversationStorePool().also { conversationPoolStorage = it }
 
+  /**
+   * 统一的状态提交入口：所有状态变更（包括流式增量、乐观发送、翻页、草稿、目标、定时任务与改动列表）
+   * 在 CAS 提交后立即同步到 [conversationPool]，避免绕过 [withSummary] 的更新在会话切换时丢失。
+   */
+  private fun updateState(transform: (LagoonState) -> LagoonState) {
+    var committed: LagoonState? = null
+    mutable.update { current -> transform(current).also { committed = it } }
+    committed?.let(conversationPool::record)
+  }
+
   /** 按目标 (serverId, sessionId) 投影独立会话状态，供路由转场与父子会话栈直接读取。 */
   fun conversationState(base: LagoonState, serverId: String?, sessionId: String?): LagoonState =
     conversationPool.project(base, serverId, sessionId, sessionViews, transcriptMemory)
@@ -339,6 +349,7 @@ class LagoonController private constructor(private val appContext: Context) {
   private var draftProjectId: String? = null
   /** 从空白页切换服务器时保留已输入的正文；从首页重新开草稿时从空白开始。 */
   private var draftKeepsComposer = false
+  private var preservedDraftText = ""
   /** An activity is started (ON_START…ON_STOP). The live stream runs only while foreground or monitoring. */
   @Volatile private var foreground = false
   /** [TaskMonitorService] keeps the process alive for running tasks; the stream may then run in background. */
@@ -449,7 +460,7 @@ class LagoonController private constructor(private val appContext: Context) {
   /** A monitor was deliberately stopped: drop its stale tasks/notices from the global island. */
   private fun acceptSnapshotRemoved(id: String) {
     if (allSnapshots.remove(id) == null) return
-    mutable.update { it.copy(allServerSnapshots = allSnapshots.toMap()) }
+    updateState { it.copy(allServerSnapshots = allSnapshots.toMap()) }
   }
 
   /** Rebuilds the home/notification projection after one overview connection changes. */
@@ -459,12 +470,12 @@ class LagoonController private constructor(private val appContext: Context) {
     if (currentProfile == null || !currentProfile.enabled) {
       // A monitor can publish once more while it is being removed. A disabled profile must never
       // reappear in the home/notification projection, even for that frame.
-      if (allSnapshots.remove(snapshot.serverId) != null) mutable.update { it.copy(allServerSnapshots = allSnapshots.toMap()) }
+      if (allSnapshots.remove(snapshot.serverId) != null) updateState { it.copy(allServerSnapshots = allSnapshots.toMap()) }
       return
     }
     val normalized = snapshot.copy(profile = currentProfile)
     val previous = allSnapshots.put(normalized.serverId, normalized)
-    mutable.update { current ->
+    updateState { current ->
       withSummary(current.copy(profiles = profiles, allServerSnapshots = allSnapshots.toMap(),
         streamConnected = if (current.serverId == snapshot.serverId) snapshot.streamConnected else current.streamConnected,
         streamDownSince = if (current.serverId != snapshot.serverId) current.streamDownSince
@@ -475,7 +486,7 @@ class LagoonController private constructor(private val appContext: Context) {
     if (state.value.serverId == snapshot.serverId) {
       val failures = normalized.autoApprovalFailures - previous?.autoApprovalFailures.orEmpty()
       if (failures.isNotEmpty() && !state.value.permissionPolicy.hide) {
-        mutable.update { it.copy(error = "自动处理失败，正在重试；可在对话中手动处理") }
+        updateState { it.copy(error = "自动处理失败，正在重试；可在对话中手动处理") }
         state.value.permissions.filter { it.id in failures }.forEach { notifyAttention(it.sessionId) }
       }
       return
@@ -652,7 +663,7 @@ class LagoonController private constructor(private val appContext: Context) {
     if (serverId == null || serverId != state.value.serverId || state.value.server?.kind != ServerKind.DSH_REMOTE) return null
     return api?.probeRemote()
   }
-  fun clearError() = mutable.update { it.copy(error = null) }
+  fun clearError() = updateState { it.copy(error = null) }
   /**
    * The live stream (re)connected. Events between the last read and the handshake may be lost, so the
    * control plane and the open transcript's tail are re-read — but only those: the catalog paging,
@@ -673,9 +684,9 @@ class LagoonController private constructor(private val appContext: Context) {
         if (token != generation) return@launch
         if (error.isRetryableTransportFailure()) {
           val serverId = state.value.serverId ?: return@launch
-          mutable.update { it.copy(connected = false, error = null) }
+          updateState { it.copy(connected = false, error = null) }
           scheduleReconnect(serverId, token, attempt = 1, reason = "实时同步恢复失败，正在重连")
-        } else mutable.update { it.copy(degraded = true) }
+        } else updateState { it.copy(degraded = true) }
       }
     }
   }
@@ -693,12 +704,12 @@ class LagoonController private constructor(private val appContext: Context) {
     val current = state.value
     val serverId = current.serverId ?: return
     val sessionId = current.sessionId ?: return
-    if (text.isBlank()) { mutable.update { it.copy(error = "附件需要在连接恢复后发送") }; return }
+    if (text.isBlank()) { updateState { it.copy(error = "附件需要在连接恢复后发送") }; return }
     val existing = queuedSends.firstOrNull { it.serverId == serverId && it.sessionId == sessionId }
     val prompt = existing?.copy(text = existing.text + "\n\n" + text)
       ?: QueuedPrompt(serverId, sessionId, text, PENDING_PREFIX + MessageIds.ascending(), System.currentTimeMillis())
     queuedSends.remove(existing); queuedSends += prompt
-    mutable.update { it.copy(messages = it.messages.filterNot { message -> message.id == prompt.messageId } + prompt.row()) }
+    updateState { it.copy(messages = it.messages.filterNot { message -> message.id == prompt.messageId } + prompt.row()) }
     accepted?.invoke()
   }
   /** [messages] plus the conversation's pending prompt row, which no server read or cache paint knows about. */
@@ -712,7 +723,7 @@ class LagoonController private constructor(private val appContext: Context) {
     if (queuedSends.isEmpty() || !current.connected) return
     val prompt = queuedSends.firstOrNull { it.serverId == current.serverId && it.sessionId == current.sessionId } ?: return
     queuedSends.remove(prompt)
-    mutable.update { it.copy(messages = it.messages.filterNot { message -> message.id == prompt.messageId }) }
+    updateState { it.copy(messages = it.messages.filterNot { message -> message.id == prompt.messageId }) }
     deliver(prompt.text, prompt.serverId, prompt.sessionId, accepted = null, onFailed = { restoreDraft(prompt) })
   }
   /** Pending prompts of conversations the user is leaving go back into their drafts, undelivered. */
@@ -721,7 +732,7 @@ class LagoonController private constructor(private val appContext: Context) {
     if (leaving.isEmpty()) return
     queuedSends.removeAll(leaving)
     val ids = leaving.map { it.messageId }.toSet()
-    mutable.update { it.copy(messages = it.messages.filterNot { message -> message.id in ids }) }
+    updateState { it.copy(messages = it.messages.filterNot { message -> message.id in ids }) }
     leaving.forEach(::restoreDraft)
   }
   private fun restoreDraft(prompt: QueuedPrompt) {
@@ -797,6 +808,8 @@ class LagoonController private constructor(private val appContext: Context) {
   /** Drops every stored transcript (the server keeps them); conversations are read again on open. */
   fun clearTranscriptCache(onCleared: () -> Unit = {}) {
     transcriptMemory.clear()
+    sessionViews.clear()
+    conversationPool.clear()
     scope.launch {
       kotlinx.coroutines.withContext(storeDispatcher) {
         attempt { transcripts?.clear() }
@@ -813,7 +826,7 @@ class LagoonController private constructor(private val appContext: Context) {
   private fun retryReason(error: String?): String = error?.takeIf { it.isNotBlank() } ?: "连接失败"
   private fun setStage(token: Int, stage: ConnectStage) {
     if (token != generation) return
-    mutable.update { if (it.connection.stage == stage) it else it.copy(connection = ConnectionStatus(stage, System.currentTimeMillis())) }
+    updateState { if (it.connection.stage == stage) it else it.copy(connection = ConnectionStatus(stage, System.currentTimeMillis())) }
   }
   /** Moves the connecting stages forward; a background refresh of an interactive screen stays READY. */
   private fun advanceStage(token: Int, stage: ConnectStage) {
@@ -826,7 +839,7 @@ class LagoonController private constructor(private val appContext: Context) {
       if (token != generation || state.value.serverId != id || state.value.connected || state.value.sessions.isNotEmpty()) return@launch
       val projects = (cached.first + store.localProjects(id)).distinctBy { normalizedDirectory(it.directory) }.map { it.copy(serverId = id) }
       if (cached.second.isEmpty()) return@launch
-      mutable.update { current -> withSummary(current.copy(sessions = cached.second.map { scoped(id, it) }.sortedWith(sessionActivityOrder),
+      updateState { current -> withSummary(current.copy(sessions = cached.second.map { scoped(id, it) }.sortedWith(sessionActivityOrder),
         projects = current.projects.takeIf { it.isNotEmpty() } ?: projects)) }
       trace(token, ConnectMilestone.CACHE_PAINT)
     }
@@ -857,7 +870,7 @@ class LagoonController private constructor(private val appContext: Context) {
       state.value.messages.persistable().isEmpty() && state.value.resource("messages").state in setOf(ResourceState.LOADING, ResourceState.NOT_LOADED)
     fun show(messages: List<Message>) {
       if (messages.isEmpty() || !stillWaiting()) return
-      mutable.update { withSummary(it.copy(messages = withPending(serverId, sessionId, messages), provisionalMessageIds = messages.mapTo(mutableSetOf()) { message -> message.id })) }
+      updateState { withSummary(it.copy(messages = withPending(serverId, sessionId, messages), provisionalMessageIds = messages.mapTo(mutableSetOf()) { message -> message.id })) }
       openTrace.mark(revision, ConnectMilestone.CACHE_PAINT)
     }
     transcriptMemory.get(serverId, sessionId)?.let { show(it); return }
@@ -869,11 +882,11 @@ class LagoonController private constructor(private val appContext: Context) {
   private fun trace(token: Int, milestone: ConnectMilestone) {
     connectTrace.mark(token.toLong(), milestone)?.let { Diagnostics.info("ConnectTrace", "${milestone.label} ${it}ms") }
   }
-  fun clearMessage() = mutable.update { it.copy(message = null) }
+  fun clearMessage() = updateState { it.copy(message = null) }
 
   fun setPermissionPolicy(policy: PermissionPolicy) {
     store.rememberPermissionPolicy(policy)
-    mutable.update { withSummary(it.copy(permissionPolicy = policy)) }
+    updateState { withSummary(it.copy(permissionPolicy = policy)) }
     state.value.serverId?.let { allOverview.consider(it, state.value.permissions) }
     allOverview.policyChanged()
     state.value.serverSnapshots().values.forEach { snapshot ->
@@ -921,13 +934,13 @@ class LagoonController private constructor(private val appContext: Context) {
     if (!enabled) {
       val group = state.value.homeGroup
       if (group != null) selectGroup(group.id)
-      else if (!state.value.allServers) mutable.update { it.copy(allServers = true, homeGroupId = null) }
+      else if (!state.value.allServers) updateState { it.copy(allServers = true, homeGroupId = null) }
       return
     }
     if (state.value.allServers && state.value.homeGroupId == null) return
     store.rememberAllServers(true)
     saveDeviceGroups(state.value.deviceGroups, null)
-    mutable.update { it.copy(allServers = true, homeGroupId = null, scopeWorkspaceKey = null, scopeProjectId = null) }
+    updateState { it.copy(allServers = true, homeGroupId = null, scopeWorkspaceKey = null, scopeProjectId = null) }
   }
 
   /** Persists a device-group edit and publishes it without touching any server connection. */
@@ -939,10 +952,10 @@ class LagoonController private constructor(private val appContext: Context) {
       throw cancel
     } catch (error: Exception) {
       Diagnostics.warn("LagoonController", "设备分组保存失败", error)
-      mutable.update { it.copy(message = "设备分组保存失败") }
+      updateState { it.copy(message = "设备分组保存失败") }
       return
     }
-    mutable.update {
+    updateState {
       it.copy(
         deviceGroups = clean.groups,
         homeGroupId = clean.selectedGroupId,
@@ -1029,7 +1042,7 @@ class LagoonController private constructor(private val appContext: Context) {
     val group = state.value.deviceGroups.firstOrNull { it.id == id } ?: return
     val members = group.memberIds.mapNotNull { member -> state.value.profiles.firstOrNull { it.id == member && it.enabled } }
     if (members.isEmpty()) {
-      mutable.update { it.copy(message = "这个设备组没有启用的连接") }
+      updateState { it.copy(message = "这个设备组没有启用的连接") }
       return
     }
     val current = state.value.serverId
@@ -1039,7 +1052,7 @@ class LagoonController private constructor(private val appContext: Context) {
       ?: members.first()
     store.rememberAllServers(false)
     saveDeviceGroups(state.value.deviceGroups, id)
-    mutable.update { it.copy(allServers = false, homeGroupId = id, scopeWorkspaceKey = null, scopeProjectId = null) }
+    updateState { it.copy(allServers = false, homeGroupId = id, scopeWorkspaceKey = null, scopeProjectId = null) }
     if (active.id != state.value.serverId || !state.value.connected) {
       connect(active.id, preserveHome = true, groupOverride = id)
     }
@@ -1062,7 +1075,7 @@ class LagoonController private constructor(private val appContext: Context) {
     if (!profile.enabled) cancelProfileNotifications(profile.id)
     val profiles = store.profiles()
     val groups = DeviceGroupState(state.value.deviceGroups, state.value.homeGroupId).sanitized(profiles.map { it.id }.toSet())
-    mutable.update { it.copy(profiles = profiles, deviceGroups = groups.groups, homeGroupId = groups.selectedGroupId) }
+    updateState { it.copy(profiles = profiles, deviceGroups = groups.groups, homeGroupId = groups.selectedGroupId) }
     scheduleBackgroundSync()
     val connectNow = connect && profile.enabled
     allOverview.start(profiles, include = setOfNotNull(if (connectNow) profile.id else state.value.serverId))
@@ -1080,7 +1093,7 @@ class LagoonController private constructor(private val appContext: Context) {
     val profile = store.profiles().firstOrNull { it.id == profileId } ?: return
     if (profile.enabled == enabled) return
     if (!store.setProfileEnabled(profileId, enabled)) {
-      mutable.update { it.copy(message = "无法保存连接状态，请重试") }
+      updateState { it.copy(message = "无法保存连接状态，请重试") }
       return
     }
     val profiles = store.profiles()
@@ -1093,7 +1106,7 @@ class LagoonController private constructor(private val appContext: Context) {
       allSnapshots.remove(profileId)
       val enabledIds = profiles.filter { it.enabled }.mapTo(HashSet()) { it.id }
       val groups = DeviceGroupState(state.value.deviceGroups, currentGroupId).sanitized(profiles.map { it.id }.toSet())
-      mutable.update {
+      updateState {
         it.copy(
           profiles = profiles,
           deviceGroups = groups.groups,
@@ -1133,7 +1146,7 @@ class LagoonController private constructor(private val appContext: Context) {
     lastDisabledActiveId = null
     val groups = DeviceGroupState(state.value.deviceGroups, state.value.homeGroupId)
       .sanitized(profiles.map { it.id }.toSet())
-    mutable.update {
+    updateState {
       it.copy(
         profiles = profiles,
         deviceGroups = groups.groups,
@@ -1171,7 +1184,7 @@ class LagoonController private constructor(private val appContext: Context) {
     stopSingleConnection()
     store.rememberAllServers(true)
     val snapshots = allSnapshots.filterKeys { id -> profiles.any { it.id == id && it.enabled } }
-    mutable.update { latest ->
+    updateState { latest ->
       LagoonState(
         profiles = profiles,
         sshHosts = latest.sshHosts,
@@ -1197,13 +1210,39 @@ class LagoonController private constructor(private val appContext: Context) {
 
   fun sshHostSecrets(hostId: String): SshSecrets = sshHostStore.secrets(hostId)
 
+  internal class NotificationClientLease(val client: HarnessClient, private val owned: Boolean) : AutoCloseable {
+    override fun close() {
+      if (owned) client.close()
+    }
+  }
+
+  /**
+   * 通知栏操作专用客户端租约：
+   * - DSH / DSH_REMOTE / SSH 优先复用 [allOverview] 持有的在线客户端（DSH 审批瀑布绑定在活跃 `$events` 流上，
+   *   且 DSH_REMOTE / SSH 共享单条加密连接）；进程冷启动尚未建立在线客户端时再按完整工厂构造并在用后关闭。
+   * - OpenCode 使用 8 秒超时的独立 REST 客户端并在完成后关闭。
+   */
+  internal fun notificationClient(profile: ServerProfile, credentials: ServerCredentials): NotificationClientLease {
+    if (profile.kind == ServerKind.DSH || profile.kind == ServerKind.DSH_REMOTE || profile.sshHostId != null) {
+      val live = clientFor(profile.id)?.takeUnless { it.isClosed }
+      if (live != null) return NotificationClientLease(live, owned = false)
+      if (profile.sshHostId != null) return NotificationClientLease(sshHostManager.client(profile), owned = false)
+      val remoteBackend = if (profile.kind == ServerKind.DSH_REMOTE) remoteBackendFactory.create(profile, credentials) else null
+      return NotificationClientLease(
+        createHarnessClient(profile, credentials, callTimeoutSeconds = 8, remoteBackend = remoteBackend),
+        owned = true
+      )
+    }
+    return NotificationClientLease(createHarnessClient(profile, credentials, callTimeoutSeconds = 8), owned = true)
+  }
+
   /** A bounded client for notification actions; SSH may need to reconnect first. */
   internal fun sshClientForNotification(profile: ServerProfile): HarnessClient = sshHostManager.client(profile)
 
   fun sshLinkStatus(hostId: String) = sshHostManager.status(hostId)
 
   fun dismissDeviceGroupReset() {
-    if (state.value.deviceGroupReset) mutable.update { it.copy(deviceGroupReset = false) }
+    if (state.value.deviceGroupReset) updateState { it.copy(deviceGroupReset = false) }
   }
 
   suspend fun probeSshHostKey(config: SshHostConfig): PresentedSshHostKey =
@@ -1211,7 +1250,7 @@ class LagoonController private constructor(private val appContext: Context) {
 
   fun pinSshHostKey(hostId: String, key: PresentedSshHostKey) {
     sshHostManager.pinHostKey(hostId, key)
-    mutable.update { it.copy(sshHosts = sshHostStore.load()) }
+    updateState { it.copy(sshHosts = sshHostStore.load()) }
   }
 
   /** Runs the real connect → host key → bootstrap → tunnel → login flow without saving. */
@@ -1273,7 +1312,7 @@ class LagoonController private constructor(private val appContext: Context) {
     val profiles = store.profiles()
     val groups = DeviceGroupState(state.value.deviceGroups, state.value.homeGroupId).sanitized(profiles.map { it.id }.toSet())
     if (!profile.enabled) cancelProfileNotifications(profile.id)
-    mutable.update {
+    updateState {
       it.copy(
         profiles = profiles,
         sshHosts = sshHostStore.load(),
@@ -1298,7 +1337,7 @@ class LagoonController private constructor(private val appContext: Context) {
     }
     sshHostManager.close(hostId)
     runCatching { sshHostStore.delete(hostId) }
-    mutable.update { it.copy(sshHosts = sshHostStore.load()) }
+    updateState { it.copy(sshHosts = sshHostStore.load()) }
   }
 
   fun retrySshHost(hostId: String) = sshHostManager.retry(hostId)
@@ -1339,6 +1378,9 @@ class LagoonController private constructor(private val appContext: Context) {
     }
     allSnapshots.remove(id)
     transcriptMemory.forgetServer(id)
+    sessionViews.forgetServer(id)
+    conversationPool.forgetServer(id)
+    choicesCache.invalidateServer(id)
     store.delete(id)
     removed?.sshHostId?.let { hostId ->
       sshHostManager.close(hostId)
@@ -1355,7 +1397,7 @@ class LagoonController private constructor(private val appContext: Context) {
     val nextSelected = nextGroups.selectedGroupId
     saveDeviceGroups(nextGroups.groups, nextSelected)
     allOverview.start(store.profiles(), include = setOfNotNull(state.value.serverId))
-    mutable.update { it.copy(
+    updateState { it.copy(
       profiles = store.profiles(),
       sshHosts = sshHostStore.load(),
       allServerSnapshots = allSnapshots.toMap(),
@@ -1405,7 +1447,7 @@ class LagoonController private constructor(private val appContext: Context) {
           if (state.value.serverId != serverId) return@collect
           val mapped = projects.map { it.copy(serverId = serverId) }
           if (mapped == state.value.workspaceCatalog) return@collect
-          mutable.update { it.copy(workspaceCatalog = mapped) }
+          updateState { it.copy(workspaceCatalog = mapped) }
           adoptDefaultDraftWorkspace(serverId, mapped)
         }
       } catch (cancel: CancellationException) {
@@ -1421,7 +1463,7 @@ class LagoonController private constructor(private val appContext: Context) {
     if (current.projectId != null) return
     val first = projects.firstOrNull()?.id ?: return
     draftProjectId = first
-    mutable.update { if (it.serverId == serverId && it.projectId == null) it.copy(projectId = first) else it }
+    updateState { if (it.serverId == serverId && it.projectId == null) it.copy(projectId = first) else it }
   }
   private fun observeTransport(serverId: String) {
     transportJob?.cancel()
@@ -1429,7 +1471,7 @@ class LagoonController private constructor(private val appContext: Context) {
       while (isActive) {
         val detail = api?.transportStatus()
         if (state.value.serverId == serverId && state.value.transportDetail != detail) {
-          mutable.update { it.copy(transportDetail = detail) }
+          updateState { it.copy(transportDetail = detail) }
         }
         delay(1_000)
       }
@@ -1440,7 +1482,7 @@ class LagoonController private constructor(private val appContext: Context) {
     val profiles = store.profiles()
     val profile = profiles.firstOrNull { it.id == id && it.enabled }
     if (profile == null) {
-      mutable.update { it.copy(message = if (profiles.any { p -> p.id == id }) "这个连接已禁用，请先在设备管理中启用" else "这个连接已移除") }
+      updateState { it.copy(message = if (profiles.any { p -> p.id == id }) "这个连接已禁用，请先在设备管理中启用" else "这个连接已移除") }
       return
     }
     if (id != lastDisabledActiveId) lastDisabledActiveId = null
@@ -1489,10 +1531,16 @@ class LagoonController private constructor(private val appContext: Context) {
     val draftModel = if (keepDraftSelection) previous.model else defaults.model?.let { model ->
       model.copy(variant = store.modelVariants(id)[modelKey(model)])
     }
+    val liveBlankDraft = when {
+      !draftIntent -> ""
+      keepDraftSelection -> liveDraft(previous)
+      draftKeepsComposer -> preservedDraftText.ifEmpty { liveDraft(previous) }
+      else -> ""
+    }
     store.select(id, rememberedProject, rememberedSession)
     // Drop the pre-ledger “永久已完成” states and read markers; keep runs this device saw as still running.
     store.migrateTaskLedger(id)
-    mutable.update { LagoonState(profiles = profiles, sshHosts = previous.sshHosts,
+    updateState { LagoonState(profiles = profiles, sshHosts = previous.sshHosts,
       deviceGroups = previous.deviceGroups, deviceGroupReset = previous.deviceGroupReset,
       homeGroupId = group?.id,
       serverId = id, loading = true, projectId = rememberedProject, sessionId = rememberedSession,
@@ -1515,23 +1563,22 @@ class LagoonController private constructor(private val appContext: Context) {
       } else configuration.modelChanged,
       newSessionAgent = defaults.agent, newSessionModel = defaults.model,
       draft = when {
-        draftIntent -> if (draftKeepsComposer) previous.draft else ""
-        else -> rememberedSession?.let { store.draft(id, it) }.orEmpty()
+        draftIntent -> liveBlankDraft
+        else -> ""
       },
-      draftRevision = if (draftIntent) previous.draftRevision else 0,
-      references = when {
-        // Files picked on the blank page are kept in pendingAttachments; server file references
-        // belong to the old server and are dropped when the draft moves to another one.
-        draftIntent -> emptyList()
-        else -> rememberedSession?.let { store.references(id, it) }.orEmpty()
-      },
+      draftRevision = if (draftIntent) previous.draftRevision + (if (liveBlankDraft != previous.draft) 1 else 0) else 0,
+      references = emptyList(),
       tasks = snapshot?.tasks ?: TaskReconciliation.restored(store.taskStates(id)), knownParents = store.taskParents(id), notices = store.sessionNotices(id), collapsedSections = store.collapsedSections(id), pinned = store.pinnedSessions(id),
       pendingAttachments = previous.pendingAttachments,
       modelOverrides = store.modelOverrides(id), modelVisibilityConfigured = store.modelVisibilityConfigured(id),
       modelVariants = store.modelVariants(id), recentModels = store.recentModels(id), scopeProjectId = store.scope(id)) }
     if (state.value.sessions.isNotEmpty()) trace(token, ConnectMilestone.CACHE_PAINT)
     else paintCachedCatalog(id, token)
-    rememberedSession?.let { openTrace.begin(selectionRevision, "恢复会话"); showCachedTranscript(id, it, selectionRevision) }
+    rememberedSession?.let {
+      openTrace.begin(selectionRevision, "恢复会话")
+      showCachedTranscript(id, it, selectionRevision)
+      restoreComposerInput(id, it, selectionRevision)
+    }
     allOverview.selectionChanged(previousServer)
     // A broken DSH Remote / SSH profile can fail while the client is being constructed (missing
     // host, blank account). That used to escape connect() on the main thread and close the app;
@@ -1542,7 +1589,7 @@ class LagoonController private constructor(private val appContext: Context) {
       if (error is CancellationException) throw error
       val reason = userFacingError(error, "连接失败")
       connectTrace.fail(token.toLong(), reason)
-      mutable.update { it.copy(loading = false, connected = false, error = reason) }
+      updateState { it.copy(loading = false, connected = false, error = reason) }
       scheduleReconnect(id, token, if (error.isAuthFailure) AUTH_RETRY_ATTEMPT else 0, reason)
       return
     }
@@ -1561,7 +1608,7 @@ class LagoonController private constructor(private val appContext: Context) {
         val reason = userFacingError(error, "连接失败")
         connectTrace.fail(token.toLong(), reason)
         showOffline(id, token, reason)
-        if (token == generation) mutable.update { it.copy(remoteRecovery = remoteFailure(error)?.kind?.recovery()) }
+        if (token == generation) updateState { it.copy(remoteRecovery = remoteFailure(error)?.kind?.recovery()) }
         // A refresh while offline must be able to recover: retry the connection with backoff instead
         // of leaving the user on a stale snapshot with no path back to a live stream (A10).
         // Expired credentials do not heal by retrying quickly; keep probing at the slowest pace.
@@ -1573,7 +1620,7 @@ class LagoonController private constructor(private val appContext: Context) {
   fun openConversation(target: SessionTarget) {
     clearDraftIntent()
     if (store.profiles().none { it.id == target.serverId && it.enabled }) {
-      mutable.update {
+      updateState {
         it.copy(message = if (store.profiles().any { profile -> profile.id == target.serverId }) "这个连接已禁用，请先在设备管理中启用"
           else "这个连接已移除")
       }
@@ -1584,7 +1631,7 @@ class LagoonController private constructor(private val appContext: Context) {
     } else if (state.value.sessions.any { it.id == target.sessionId }) selectSession(target.sessionId)
     else {
       // 先清掉上一个会话的输入：随后的 selectSession 会把它当作"重新选中"而保留，并异步填回本会话的草稿。
-      mutable.update { it.copy(sessionId = target.sessionId, messages = emptyList(), draft = "", references = emptyList(), resources = mapOf("messages" to ResourceStatus(ResourceState.LOADING))) }
+      updateState { it.copy(sessionId = target.sessionId, messages = emptyList(), draft = "", references = emptyList(), resources = mapOf("messages" to ResourceStatus(ResourceState.LOADING))) }
       resolveSession(target.sessionId) { if (state.value.serverId == target.serverId && state.value.sessionId == target.sessionId) selectSession(target.sessionId) }
     }
   }
@@ -1593,7 +1640,7 @@ class LagoonController private constructor(private val appContext: Context) {
     if (store.profiles().none { it.id == id && it.enabled }) return
     val delayMillis = (2_000L shl attempt.coerceAtMost(4)).coerceAtMost(60_000L)
     val now = System.currentTimeMillis()
-    mutable.update { it.copy(connection = ConnectionStatus(ConnectStage.RETRYING, now, now + delayMillis, reason ?: retryReason(it.error))) }
+    updateState { it.copy(connection = ConnectionStatus(ConnectStage.RETRYING, now, now + delayMillis, reason ?: retryReason(it.error))) }
     scope.launch {
       delay(delayMillis)
       if (token == generation && state.value.serverId == id && !state.value.connected) reconnect(id, token, attempt)
@@ -1643,7 +1690,7 @@ class LagoonController private constructor(private val appContext: Context) {
     // The raw reason stays in diagnostics; repeating it on every backoff attempt used to raise a
     // new toast each time the app tried to reconnect.
     Diagnostics.warn("LagoonController", "显示离线缓存：$reason")
-    if (loaded == null) mutable.update { it.copy(loading = false, connected = false, error = null) }
+    if (loaded == null) updateState { it.copy(loading = false, connected = false, error = null) }
     else {
       val (cachedProjects, cachedSessions, catalogComplete) = loaded
       val projects = (cachedProjects + store.localProjects(id))
@@ -1653,13 +1700,13 @@ class LagoonController private constructor(private val appContext: Context) {
       val sessionId = if (draftServerId == id) null
         else store.selectedSession(id)?.takeIf { selected -> sessions.any { it.id == selected && !it.blank } }
       trace(token, ConnectMilestone.CACHE_PAINT)
-      mutable.update { it.copy(loading = false, connected = false, cached = true, error = null,
+      updateState { it.copy(loading = false, connected = false, cached = true, error = null,
         projects = projects, sessions = sessions, projectId = store.selectedProject(id) ?: projects.firstOrNull()?.id,
         sessionId = sessionId, messages = withPending(id, sessionId, emptyList()), catalogComplete = catalogComplete) }
       if (sessionId != null) {
         val (messages, olderCursor) = cachedTranscriptWindow(id, sessionId)
         val messagesComplete = cachedTranscriptComplete(id, sessionId)
-        if (token == generation && state.value.serverId == id && state.value.sessionId == sessionId) mutable.update { withSummary(it.copy(messages = withPending(id, sessionId, messages), cacheComplete = messagesComplete,
+        if (token == generation && state.value.serverId == id && state.value.sessionId == sessionId) updateState { withSummary(it.copy(messages = withPending(id, sessionId, messages), cacheComplete = messagesComplete,
           messagesCursor = olderCursor, resources = mapOf("messages" to ResourceStatus(ResourceState.STALE, "离线缓存")))) }
       }
     }
@@ -1726,7 +1773,7 @@ class LagoonController private constructor(private val appContext: Context) {
     var earlyFollowUp: Job? = null
     var earlySession: Session? = null
     if (!controlOnly) {
-      mutable.update { current -> withSummary(current.copy(version = version, capabilities = capabilities, connected = true, loading = false,
+      updateState { current -> withSummary(current.copy(version = version, capabilities = capabilities, connected = true, loading = false,
         error = null, lastContactAt = System.currentTimeMillis(), workspaceCatalog = workspaceCatalog,
         sessions = (sessions + current.sessions).distinctBy { it.id }.sortedWith(sessionActivityOrder))) }
       if (workspaceCatalog.isNotEmpty()) adoptDefaultDraftWorkspace(serverId, workspaceCatalog)
@@ -1896,12 +1943,24 @@ class LagoonController private constructor(private val appContext: Context) {
 
     deletedSessions.forEach { store.forgetTask(serverId, it) }
     val storedTasks = store.taskStates(serverId)
+    // Pre-decrypt missing session previews off the main thread so a cold start with 100+ sessions
+    // never blocks the UI thread on AndroidKeyStore Binder IPC inside updateState.
+    val candidateSessionIds = (extraSessions.map { it.id } + sessions.map { it.id } + state.value.sessions.map { it.id })
+      .filterNot { it in deletedSessions }
+      .distinct()
+    val knownPreviews = state.value.previews
+    val missingPreviewIds = candidateSessionIds.filterNot(knownPreviews::containsKey)
+    val loadedPreviews = if (missingPreviewIds.isEmpty()) emptyMap() else kotlinx.coroutines.withContext(Dispatchers.IO) {
+      missingPreviewIds.associateWith { id -> store.sessionPreview(serverId, id) }
+    }
+    val draftSessionIds = kotlinx.coroutines.withContext(Dispatchers.IO) { store.draftSessionIds(serverId) }
+    if (token != generation || requestSequence != catalogSequence) return
     var finishedRuns = emptyList<Pair<Session, Long>>()
     // 本次读取前已知的待处理项，用于识别事件流可能漏掉的新权限/表单。
     val priorRequestIds = (state.value.permissions.map { it.id } + state.value.questions.map { it.id }).toSet()
     // 对账期间被权威读取证明已处理的等待项，读取结束后撤掉已发通知（见下方 cancelAttention）。
     var resolvedWaitingIds = emptyList<String>()
-    mutable.update { previous ->
+    updateState { previous ->
       val now = System.currentTimeMillis()
       // shell 合并：本次成功读取的目录以服务端结果为准；读取失败的目录保留旧条目（TTL 防僵死）。
       val keptShells = previous.shells.filter { (_, job) ->
@@ -1971,7 +2030,9 @@ class LagoonController private constructor(private val appContext: Context) {
       val cursors = if (controlOnly && previous.sessionCursors.isNotEmpty()) previous.sessionCursors.takeIf { page.next != null }.orEmpty()
         else listOfNotNull(page.next).associateBy { "" }
       withSummary(previous.copy(version = version, capabilities = capabilities,
-        draftSessions = store.draftSessionIds(serverId), previews = nextSessions.associate { session -> session.id to (previous.previews[session.id] ?: store.sessionPreview(serverId, session.id)) }, connected = true, cached = previous.cached && previous.sessionId != null, loading = false,
+        draftSessions = draftSessionIds,
+        previews = nextSessions.associate { session -> session.id to (previous.previews[session.id] ?: loadedPreviews[session.id] ?: SessionPreview()) },
+        connected = true, cached = previous.cached && previous.sessionId != null, loading = false,
         error = null, degraded = degraded, lastContactAt = System.currentTimeMillis(),
         connection = if (previous.connection.stage == ConnectStage.READY) previous.connection else ConnectionStatus(ConnectStage.READY, System.currentTimeMillis()),
         remoteRecovery = null,
@@ -2033,18 +2094,18 @@ class LagoonController private constructor(private val appContext: Context) {
     val revision = selectionRevision
     val key = operationKey(serverId, session.id, current.projectId, "messages-more")
     if (key in current.pendingOperations) return scope.launch { }
-    mutable.update { it.copy(pendingOperations = it.pendingOperations + key) }
+    updateState { it.copy(pendingOperations = it.pendingOperations + key) }
     return scope.launch {
       try {
         val older = transcriptSync!!.loadOlder(api, serverId, session, cursor)
-        if (state.value.serverId == serverId && selectionRevision == revision && state.value.messagesCursor == cursor) mutable.update {
+        if (state.value.serverId == serverId && selectionRevision == revision && state.value.messagesCursor == cursor) updateState {
           it.copy(messages = (older.messages + it.messages).distinctBy { m -> m.id }, messagesCursor = older.next,
             loadedOlderMessages = true, historyRevision = it.historyRevision + 1)
         }
       } catch (cancel: CancellationException) { throw cancel } catch (error: Exception) {
         Diagnostics.warn("TranscriptSync", "读取本机历史失败", error)
       } finally {
-        mutable.update { it.copy(pendingOperations = it.pendingOperations - key) }
+        updateState { it.copy(pendingOperations = it.pendingOperations - key) }
       }
     }
   }
@@ -2092,10 +2153,10 @@ class LagoonController private constructor(private val appContext: Context) {
           // page off-line and let the normal backoff reconnect; do not toast the library text or
           // leave the user with no path back to a live stream.
           Diagnostics.warn("LagoonController", "刷新时连接中断，保留现有数据并重连", error)
-          mutable.update { state -> state.copy(connected = false, loading = false, error = null) }
+          updateState { state -> state.copy(connected = false, loading = false, error = null) }
           scheduleReconnect(serverId, token, reason = "连接中断，正在重连")
         } else {
-          mutable.update { state -> state.copy(error = reason,
+          updateState { state -> state.copy(error = reason,
             remoteRecovery = remoteFailure(error)?.kind?.recovery()
               ?: if (error.isAuthFailure) RemoteRecoveryKind.LOGIN else state.remoteRecovery,
             connection = if (state.connection.stage == ConnectStage.READY) state.connection
@@ -2155,14 +2216,21 @@ class LagoonController private constructor(private val appContext: Context) {
    * A run this device saw that has since ended becomes an unread result and a completion notification.
    */
   suspend fun backgroundSync() {
-    allOverview.refreshAll()
-    if (foreground || monitoring && stream?.isActive == true) return
-    connecting?.takeIf { it.isActive }?.join()
-    if (state.value.serverId == null || api == null) return
-    if (System.currentTimeMillis() - lastFullRefreshAt < refreshMode.foregroundRefreshMs) return
-    val token = generation
-    attempt { loadAllInternal(token, controlOnly = false, followUp = false, deep = false) }
-      .onFailure { Diagnostics.warn("BackgroundSync", "后台同步失败", it) }
+    if (foreground || monitoring && stream?.isActive == true) {
+      allOverview.refreshAll()
+      return
+    }
+    coroutineScope {
+      val overviewSync = async { allOverview.refreshAllAndAwait() }
+      connecting?.takeIf { it.isActive }?.join()
+      if (state.value.serverId != null && api != null &&
+        System.currentTimeMillis() - lastFullRefreshAt >= refreshMode.foregroundRefreshMs) {
+        val token = generation
+        attempt { loadAllInternal(token, controlOnly = false, followUp = false, deep = false) }
+          .onFailure { Diagnostics.warn("BackgroundSync", "后台同步失败", it) }
+      }
+      overviewSync.await()
+    }
   }
 
   /**
@@ -2202,7 +2270,7 @@ class LagoonController private constructor(private val appContext: Context) {
         if (token != generation || refresh?.isActive == true || !streamAllowed()) continue
         attempt { loadAll(token, controlOnly = true, followUp = false) }.onFailure { error ->
           Diagnostics.warn("LagoonController", "状态同步失败", error)
-          if (token == generation) mutable.update { it.copy(degraded = true) }
+          if (token == generation) updateState { it.copy(degraded = true) }
         }
       }
     }
@@ -2241,7 +2309,7 @@ class LagoonController private constructor(private val appContext: Context) {
           activeAt = before?.activeAt ?: -1L, pendingInput = before?.pendingInput == true)
         val next = after
         val enteringTerminal = next.phase in TERMINAL_PHASES && before?.phase !in TERMINAL_PHASES
-        mutable.update { current -> withSummary(current.copy(tasks = current.tasks + (sessionId to next))) }
+        updateState { current -> withSummary(current.copy(tasks = current.tasks + (sessionId to next))) }
         if (enteringTerminal && sessionId == state.value.sessionId && messageRefresh?.isActive != true) {
           state.value.session?.let { selected -> val token = generation; messageRefresh = scope.launch { delay(refreshMode.messageDebounceMs); loadSession(selected, ancillary = false, token = token) } }
         }
@@ -2254,14 +2322,14 @@ class LagoonController private constructor(private val appContext: Context) {
         val request = props.toPermission(directory)
         if (request.id in resolvedPermissions) return
         waitingEventSeqAt[request.sessionId] = ++waitingEventSeq
-        mutable.update { withSummary(it.copy(permissions = (it.permissions.filterNot { old -> old.id == request.id } + request))) }
+        updateState { withSummary(it.copy(permissions = (it.permissions.filterNot { old -> old.id == request.id } + request))) }
         allOverview?.consider(state.value.serverId ?: return, listOf(request))
         notifyAttention(request.sessionId)
       }
       "form.created" -> {
         val request = props.obj("form").toForm(directory)
         waitingEventSeqAt[request.sessionId] = ++waitingEventSeq
-        mutable.update { withSummary(it.copy(questions = (it.questions.filterNot { old -> old.id == request.id } + request))) }
+        updateState { withSummary(it.copy(questions = (it.questions.filterNot { old -> old.id == request.id } + request))) }
         notifyAttention(request.sessionId)
       }
       "permission.replied" -> {
@@ -2285,7 +2353,7 @@ class LagoonController private constructor(private val appContext: Context) {
         val created = state.value.serverId?.let { server -> scoped(server, info.toSession()) } ?: info.toSession()
         if (created.id.isNotBlank()) {
           state.value.serverId?.let { store.rememberParents(it, listOf(created)) }
-          mutable.update { current ->
+          updateState { current ->
             val prior = current.sessions.firstOrNull { it.id == created.id }
             // blank 是单向的：已经见过它开始轮次，就不能被更旧的 created 事件重新标记为草稿。
             val merged = if (prior != null && !prior.blank) created.copy(blank = false) else created
@@ -2311,7 +2379,7 @@ class LagoonController private constructor(private val appContext: Context) {
           if (event.type == "session.agent.selected") session.copy(agent = props.str("agent").ifBlank { session.agent })
           else session.copy(model = props.obj("model").toModelChoice() ?: session.model)
         }
-        mutable.update { current ->
+        updateState { current ->
           if (sessionId != current.sessionId) current else current.copy(
             agent = if (event.type == "session.agent.selected" && !current.agentChanged) props.str("agent").ifBlank { current.agent } else current.agent,
             model = if (event.type == "session.model.selected" && !current.modelChanged) props.obj("model").toModelChoice() ?: current.model else current.model)
@@ -2322,12 +2390,14 @@ class LagoonController private constructor(private val appContext: Context) {
         waitingEventSeqAt.remove(sessionId)
         state.value.serverId?.let { server ->
           transcriptMemory.forget(server, sessionId)
+          sessionViews.forget(server, sessionId)
+          conversationPool.forget(server, sessionId)
           forgetStoredTranscript(server, sessionId)
           store.forgetSession(server, sessionId)
           attempt { notifications.cancel(server, sessionId) }
         }
         persistedTasks.remove("${state.value.serverId}\u0000$sessionId")
-        mutable.update { withSummary(it.copy(
+        updateState { withSummary(it.copy(
           sessions = it.sessions.filterNot { session -> session.id == sessionId },
           tasks = it.tasks - sessionId,
           knownParents = it.knownParents - sessionId,
@@ -2339,7 +2409,7 @@ class LagoonController private constructor(private val appContext: Context) {
       "project.updated" -> {
         val project = props.toProject()
         val server = state.value.serverId
-        if (project.id.isNotBlank()) mutable.update { current ->
+        if (project.id.isNotBlank()) updateState { current ->
           val updated = current.projects.map {
             if (it.id == project.id) project.copy(sandboxes = project.sandboxes.ifEmpty { it.sandboxes }, serverId = server) else it
           }
@@ -2350,11 +2420,11 @@ class LagoonController private constructor(private val appContext: Context) {
       // 后台 shell 的实时增删：created 带完整 Shell.Info（`metadata.sessionID` 归属会话），
       // exited/deleted 只带 id。后台活动由 withSummary 重新计算，不改变根会话相位。
       "shell.created" -> props.obj("info").toShellJob(event.directory)?.let { job ->
-        mutable.update { withSummary(it.copy(shells = it.shells + (job.id to job))) }
+        updateState { withSummary(it.copy(shells = it.shells + (job.id to job))) }
       }
       "shell.exited", "shell.deleted" -> {
         val shellId = props.str("id")
-        if (shellId.isNotBlank() && mutable.value.shells.containsKey(shellId)) mutable.update { withSummary(it.copy(shells = it.shells - shellId)) }
+        if (shellId.isNotBlank() && mutable.value.shells.containsKey(shellId)) updateState { withSummary(it.copy(shells = it.shells - shellId)) }
       }
       // A run started or ended: official `session.sync` of that one session (outcome, idle, updated).
       "session.execution.started", "session.execution.succeeded", "session.execution.failed", "session.execution.interrupted" -> refreshSession(sessionId)
@@ -2364,7 +2434,7 @@ class LagoonController private constructor(private val appContext: Context) {
     // background tasks are not collapsed into one last-seen boolean.
     val backgroundChild = BackgroundWork.backgroundSubagentId(event.type, props)
     if (sessionId.isNotBlank() && backgroundChild != null) {
-      mutable.update { current ->
+      updateState { current ->
         val previous = current.tasks[backgroundChild]
         val child = if (previous?.active == true || previous?.phase in TaskState.TERMINAL_PHASES) previous!! else TaskState(backgroundChild, TaskPhase.SUBAGENT,
           TaskState.RUNNING_DETAIL, since = event.created.takeIf { it > 0 } ?: System.currentTimeMillis(), activeAt = -1L)
@@ -2378,7 +2448,7 @@ class LagoonController private constructor(private val appContext: Context) {
       if (projected != null && projected.messages !== mutable.value.messages) {
         val before = mutable.value.messages.associateBy { it.id }
         val liveIds = projected.messages.filter { before[it.id] != it }.map { it.id }.toSet()
-        mutable.update { it.copy(messages = projected.messages, provisionalMessageIds = it.provisionalMessageIds - liveIds,
+        updateState { it.copy(messages = projected.messages, provisionalMessageIds = it.provisionalMessageIds - liveIds,
           resources = it.resources + ("messages" to ResourceStatus(ResourceState.READY))) }
       }
        if (projected?.reconcile == true && messageRefresh?.isActive != true) {
@@ -2391,7 +2461,7 @@ class LagoonController private constructor(private val appContext: Context) {
     // Apply this after transcript projection so the completion notice prevents the history-derived
     // fallback above from immediately recreating the child task.
     BackgroundWork.completedSubagentId(event.type, props)?.let { child ->
-      mutable.update { current -> withSummary(current.copy(tasks = current.tasks + (child to
+      updateState { current -> withSummary(current.copy(tasks = current.tasks + (child to
         TaskReducer.terminal(child, when (props.obj("metadata").str("state")) {
           "error" -> "failed"; "cancelled" -> "interrupted"; else -> "succeeded"
         }, current.tasks[child])))) }
@@ -2400,7 +2470,7 @@ class LagoonController private constructor(private val appContext: Context) {
 
   private fun updateSession(id: String, change: (Session) -> Session) {
     if (id.isBlank()) return
-    mutable.update { current -> if (current.sessions.none { it.id == id }) current else current.copy(sessions = current.sessions.map { if (it.id == id) change(it) else it }.sortedWith(sessionActivityOrder)) }
+    updateState { current -> if (current.sessions.none { it.id == id }) current else current.copy(sessions = current.sessions.map { if (it.id == id) change(it) else it }.sortedWith(sessionActivityOrder)) }
   }
 
   /** Re-reads one session's info; an unknown session becomes known (e.g. a run started from another client). */
@@ -2414,7 +2484,7 @@ class LagoonController private constructor(private val appContext: Context) {
       val fresh = scoped(server, freshRaw)
       if (token != generation) return@launch
       state.value.serverId?.let { store.rememberParents(it, listOf(fresh)) }
-      mutable.update { current -> withSummary(current.copy(sessions = (listOf(fresh) + current.sessions).distinctBy { it.id }.sortedWith(sessionActivityOrder),
+      updateState { current -> withSummary(current.copy(sessions = (listOf(fresh) + current.sessions).distinctBy { it.id }.sortedWith(sessionActivityOrder),
         knownParents = current.knownParents + listOfNotNull(fresh.parentId?.let { fresh.id to it }))) }
       // A child whose root is outside the catalog page: resolve the ancestry so its state rolls up.
       fresh.parentId?.takeIf { parent -> state.value.sessions.none { it.id == parent } }?.let(::refreshSession)
@@ -2450,7 +2520,7 @@ class LagoonController private constructor(private val appContext: Context) {
     if (existing.any { it.error || !notice.error }) return
     val viewing = foreground && visibleConversation == (server to session.id)
     val notices = store.rememberNotice(server, notice.copy(viewed = viewing))
-    mutable.update { if (it.serverId == server) withSummary(it.copy(notices = notices)) else it }
+    updateState { if (it.serverId == server) withSummary(it.copy(notices = notices)) else it }
     if (viewing) return
     val profile = state.value.server?.takeIf { it.id == server && it.notifications } ?: return
     val result = TaskState(session.id, if (notice.error) TaskPhase.FAILED else TaskPhase.COMPLETED,
@@ -2462,13 +2532,13 @@ class LagoonController private constructor(private val appContext: Context) {
     val current = state.value; val server = current.serverId ?: return
     val collapsed = if (key in current.collapsedSections) current.collapsedSections - key else current.collapsedSections + key
     store.rememberCollapsedSections(server, collapsed)
-    mutable.update { it.copy(collapsedSections = collapsed) }
+    updateState { it.copy(collapsedSections = collapsed) }
   }
   fun togglePin(sessionId: String) {
     val current = state.value; val server = current.serverId ?: return
     val pinned = if (sessionId in current.pinned) current.pinned - sessionId else current.pinned + sessionId
     store.rememberPinnedSessions(server, pinned)
-    mutable.update { it.copy(pinned = pinned) }
+    updateState { it.copy(pinned = pinned) }
   }
 
   /**
@@ -2538,7 +2608,7 @@ class LagoonController private constructor(private val appContext: Context) {
     while (resolvedPermissions.size > 1000) resolvedPermissions.remove(resolvedPermissions.first())
     waitingEventSeqAt[sessionId] = ++waitingEventSeq
     state.value.serverId?.let { allOverview?.settled(it, requestId) }
-    mutable.update { current ->
+    updateState { current ->
       val pending = current.permissions.filterNot { it.id == requestId }
       val task = current.tasks[sessionId]
       val restored = if (task?.phase == TaskPhase.WAITING_PERMISSION && pending.none { it.sessionId == sessionId })
@@ -2553,7 +2623,7 @@ class LagoonController private constructor(private val appContext: Context) {
     resolvedPermissions += requestId
     while (resolvedPermissions.size > 1000) resolvedPermissions.remove(resolvedPermissions.first())
     waitingEventSeqAt[sessionId] = ++waitingEventSeq
-    mutable.update { current ->
+    updateState { current ->
       val pending = current.questions.filterNot { it.id == requestId }
       val task = current.tasks[sessionId]
       val restored = if (task?.phase == TaskPhase.WAITING_QUESTION && pending.none { it.sessionId == sessionId })
@@ -2577,8 +2647,9 @@ class LagoonController private constructor(private val appContext: Context) {
     val project = mutable.value.projects.firstOrNull { it.id == id } ?: return
     selectionRevision += 1
     visibleConversation = null
-    mutable.update { it.copy(projectId = id, sessionId = null, messages = emptyList(), agent = null, model = null,
+    updateState { it.copy(projectId = id, sessionId = null, messages = emptyList(), agent = null, model = null,
       agentChanged = false, modelChanged = false, draft = "", references = emptyList(), resources = emptyMap(),
+      changes = emptyList(), goal = null, goalLoading = false, schedules = emptyList(), schedulesLoading = false,
       files = emptyList(), searchResults = emptyList(), fileText = null, fileBinary = false, filePreview = null, filePreviewMime = null) }
     store.rememberLocation(id, null)
     val token = generation
@@ -2645,7 +2716,7 @@ class LagoonController private constructor(private val appContext: Context) {
   ) {
     val expectedDirectory = mutable.value.executionDirectory ?: mutable.value.homeDirectory
     if (token != generation || revision != selectionRevision || (expectedDirectory != null && expectedDirectory != directory)) return
-    mutable.update { current ->
+    updateState { current ->
       val agentList = agents.getOrDefault(current.agents)
       val catalog = models.getOrDefault(current.modelCatalog)
       val serverId = current.serverId
@@ -2699,7 +2770,7 @@ class LagoonController private constructor(private val appContext: Context) {
     val client = api ?: return
     val token = generation
     val pageSize = HarnessClient.SHELL_OUTPUT_PAGE
-    mutable.update { current ->
+    updateState { current ->
       if (current.serverId != server) current
       else current.copy(shellOutput = ShellOutputView(job.id, job.command, job.directory, loading = true))
     }
@@ -2712,7 +2783,7 @@ class LagoonController private constructor(private val appContext: Context) {
               text.append(chunk)
               if (text.length > 64 * 1024) text.delete(0, text.length - 64 * 1024)
             }
-            mutable.update { current ->
+            updateState { current ->
               if (current.serverId != server || current.shellOutput?.shellId != job.id) current
               else current.copy(shellOutput = current.shellOutput?.copy(
                 text = text.toString(), loading = !finished,
@@ -2720,18 +2791,18 @@ class LagoonController private constructor(private val appContext: Context) {
                   status = if (running) "running" else "exited", started = job.started)))
             }
           }
-          if (!ok) mutable.update { current ->
+          if (!ok) updateState { current ->
             if (current.shellOutput?.shellId != job.id) current
             else current.copy(shellOutput = current.shellOutput?.copy(loading = false, error = "此主机没有后台任务输出"))
           }
         } catch (cancel: CancellationException) { throw cancel }
         catch (error: Exception) {
-          mutable.update { current ->
+          updateState { current ->
             if (current.shellOutput?.shellId != job.id) current
             else current.copy(shellOutput = current.shellOutput?.copy(loading = false, error = userFacingError(error, "读取后台输出失败")))
           }
         } finally {
-          mutable.update { current ->
+          updateState { current ->
             if (current.shellOutput?.shellId != job.id) current
             else current.copy(shellOutput = current.shellOutput?.copy(loading = false))
           }
@@ -2757,7 +2828,7 @@ class LagoonController private constructor(private val appContext: Context) {
               Diagnostics.warn("ShellOutput", "读取后台输出失败", error); null
             }
           if (head == null) {
-            mutable.update { current ->
+            updateState { current ->
               if (current.shellOutput?.shellId != job.id) current
               else current.copy(shellOutput = current.shellOutput?.copy(loading = false,
                 error = "该服务器不支持查看后台命令输出", snapshot = snapshot))
@@ -2774,7 +2845,7 @@ class LagoonController private constructor(private val appContext: Context) {
           }
         if (page == null) {
           missing = true
-          mutable.update { current ->
+          updateState { current ->
             if (current.shellOutput?.shellId != job.id) current
             else current.copy(shellOutput = current.shellOutput?.copy(loading = false,
               error = "后台命令输出已不可用", snapshot = snapshot))
@@ -2785,7 +2856,7 @@ class LagoonController private constructor(private val appContext: Context) {
         val appended = (previous.text + page.output).takeLast(pageSize)
         cursor = page.cursor
         val caughtUp = page.cursor >= page.size
-        mutable.update { current ->
+        updateState { current ->
           if (current.shellOutput?.shellId != job.id) current
           else current.copy(shellOutput = ShellOutputView(
             shellId = job.id,
@@ -2814,14 +2885,14 @@ class LagoonController private constructor(private val appContext: Context) {
   fun closeShellOutput() {
     shellOutputJob?.cancel()
     shellOutputJob = null
-    if (state.value.shellOutput != null) mutable.update { it.copy(shellOutput = null) }
+    if (state.value.shellOutput != null) updateState { it.copy(shellOutput = null) }
   }
 
   /** Terminate a running background command, like the official activity row's stop action. */
   fun stopShell(job: ShellJob) = scope.launch {
     val client = api ?: return@launch
     attempt { client.removeShell(job.id, job.directory) }.onSuccess {
-      if (state.value.serverId != null) mutable.update { withSummary(it.copy(shells = it.shells - job.id)) }
+      if (state.value.serverId != null) updateState { withSummary(it.copy(shells = it.shells - job.id)) }
     }.onFailure { error -> Diagnostics.warn("ShellOutput", "停止后台命令失败", error) }
   }
 
@@ -2862,6 +2933,7 @@ class LagoonController private constructor(private val appContext: Context) {
     // 同一会话被重新选中（通知/深链）时保留输入框里的最新文字，避免回退尚未落盘（约 350ms 防抖）的输入。
     // 草稿与文件引用要经 Keystore 解密，放到 [restoreComposerInput] 异步填回：点开会话的第一帧不等它。
     val reselected = mutable.value.sessionId == id
+    val slot = if (reselected) null else conversationPool.get(serverId, id)
     val draft = if (reselected) liveDraft(mutable.value) else ""
     val references = if (reselected) mutable.value.references else emptyList()
     visibleConversation = null
@@ -2873,14 +2945,17 @@ class LagoonController private constructor(private val appContext: Context) {
     val messages = cached?.messages ?: withPending(serverId, id, emptyList())
     closeShellOutput()
     familyDiscovery = null
-    mutable.update { withSummary(it.copy(projectId = project?.id, sessionId = id, messages = messages,
+    updateState { withSummary(it.copy(projectId = project?.id, sessionId = id, messages = messages,
       agent = configuration.agent ?: session.agent, model = configuration.model ?: session.model,
       agentChanged = configuration.agentChanged, modelChanged = configuration.modelChanged,
       draft = draft, references = references, loadedOlderMessages = cached?.loadedOlder ?: false,
       messagesCursor = cached?.olderCursor, cacheComplete = cached?.cacheComplete ?: true,
       resources = mapOf("messages" to ResourceStatus(if (cached != null) ResourceState.READY else ResourceState.LOADING)),
       provisionalMessageIds = emptySet(), transcriptLoadingSince = if (offline || cached != null) 0 else System.currentTimeMillis(),
-      changes = emptyList(), files = emptyList(),
+      changes = if (reselected) it.changes else slot?.changes.orEmpty(),
+      goal = if (reselected) it.goal else slot?.goal, goalLoading = false,
+      schedules = if (reselected) it.schedules else slot?.schedules.orEmpty(), schedulesLoading = false,
+      files = emptyList(),
       searchResults = emptyList(), fileText = null, fileBinary = false, filePreview = null, filePreviewMime = null)) }
     store.rememberLocation(project?.id, id)
     transcripts?.protectedSession = serverId to id
@@ -2892,7 +2967,7 @@ class LagoonController private constructor(private val appContext: Context) {
           val (cachedMessages, olderCursor) = cachedTranscriptWindow(serverId, id)
           val complete = storesTranscripts(serverId)
           if (state.value.serverId == serverId && selectionRevision == revision && cachedMessages.isNotEmpty()) openTrace.mark(revision, ConnectMilestone.CACHE_PAINT)
-          if (state.value.serverId == serverId && selectionRevision == revision) mutable.update { it.copy(messages = cachedMessages, cacheComplete = complete, messagesCursor = olderCursor,
+          if (state.value.serverId == serverId && selectionRevision == revision) updateState { it.copy(messages = cachedMessages, cacheComplete = complete, messagesCursor = olderCursor,
             resources = it.resources + ("messages" to ResourceStatus(if (cachedMessages.isEmpty()) ResourceState.ERROR else ResourceState.STALE, "离线缓存"))) }
         }
       }
@@ -2923,7 +2998,7 @@ class LagoonController private constructor(private val appContext: Context) {
     scope.launch {
       val (draft, references) = kotlinx.coroutines.withContext(Dispatchers.IO) { store.draft(serverId, sessionId) to store.references(serverId, sessionId) }
       if (selectionRevision != revision || state.value.serverId != serverId || state.value.sessionId != sessionId) return@launch
-      mutable.update { it.copy(draft = liveDraft(it).ifEmpty { draft }, references = it.references.ifEmpty { references }) }
+      updateState { it.copy(draft = liveDraft(it).ifEmpty { draft }, references = it.references.ifEmpty { references }) }
     }
   }
   private fun scheduleTranscriptRetry(session: Session, token: Int) {
@@ -2946,14 +3021,14 @@ class LagoonController private constructor(private val appContext: Context) {
       // 连接还没建立时也必须说明原因：静默返回会让聊天页永远空白，看起来像“会话没有内容”。
       val reason = state.value.error ?: state.value.connection.reason
         ?: "尚未连接到这台设备，无法读取会话内容"
-      mutable.update { it.copy(resources = it.resources + ("messages" to ResourceStatus(ResourceState.ERROR, reason)),
+      updateState { it.copy(resources = it.resources + ("messages" to ResourceStatus(ResourceState.ERROR, reason)),
         transcriptLoadingSince = 0) }
       return
     }
     val serverId = state.value.serverId ?: return
     val revision = selectionRevision
     val requestSequence = ++messageSequence
-    fun current() = token == generation && revision == selectionRevision && state.value.sessionId == session.id && state.value.executionDirectory == session.directory && requestSequence == messageSequence
+    fun current() = token == generation && revision == selectionRevision && state.value.serverId == serverId && state.value.sessionId == session.id && requestSequence == messageSequence
     // Capture before any HTTP/cache suspension, not after the page returns. Live events replace
     // immutable Message values, letting us protect only the IDs that changed during this read.
     val readStart = state.value.messages.associateBy { it.id }
@@ -2961,7 +3036,7 @@ class LagoonController private constructor(private val appContext: Context) {
       message.id !in snapshot.provisionalMessageIds || readStart[message.id]?.let { message != it } == true
     }
     val showingCache = state.value.provisionalMessageIds.isNotEmpty()
-    if (current() && (state.value.messages.isEmpty() || showingCache)) mutable.update { it.copy(resources = it.resources + ("messages" to ResourceStatus(ResourceState.LOADING)),
+    if (current() && (state.value.messages.isEmpty() || showingCache)) updateState { it.copy(resources = it.resources + ("messages" to ResourceStatus(ResourceState.LOADING)),
       transcriptLoadingSince = it.transcriptLoadingSince.takeIf { since -> since > 0 } ?: System.currentTimeMillis()) }
     // Rows painted from the cache are a placeholder: the read starts from a fresh initial window.
     val initialWindow = (state.value.messages.isEmpty() || showingCache) && !state.value.loadedOlderMessages
@@ -3015,7 +3090,7 @@ class LagoonController private constructor(private val appContext: Context) {
       Diagnostics.warn("LagoonController", "会话消息读取失败", error)
       val retryable = error.isRetryableTransportFailure()
       val fallback = cachedTranscript(serverId, session.id)
-      if (current()) mutable.update {
+      if (current()) updateState {
         val status = if (retryable) ResourceStatus(ResourceState.STALE, "连接中断，正在后台重试")
           else ResourceStatus(if (fallback.isEmpty()) ResourceState.ERROR else ResourceState.STALE, userFacingError(error))
         it.copy(cached = fallback.isNotEmpty(), cacheComplete = false, provisionalMessageIds = emptySet(),
@@ -3048,8 +3123,8 @@ class LagoonController private constructor(private val appContext: Context) {
     // 缓存完整性标志解密+解析缓存体，不能放在主线程的状态提交里。
     val cachedComplete = if (result.isSuccess) true else cachedTranscriptComplete(serverId, session.id)
     if (!current()) return
-    mutable.update {
-      if (!current()) return@update it
+    updateState {
+      if (!current()) return@updateState it
       // Reconcile inside the atomic update too: cache reads and a retried state CAS must not
       // commit the earlier snapshot over a later delta, tool completion, or newly loaded page.
       val committed = withPending(serverId, session.id, mergeTranscript(liveMessages(it), messages, pending, readStart))
@@ -3069,7 +3144,8 @@ class LagoonController private constructor(private val appContext: Context) {
     if (!current()) return
     if (result.isSuccess) {
       val committed = state.value.messages
-      store.rememberPreview(serverId, session.id, committed.sessionPreview())
+      val committedPreview = committed.sessionPreview()
+      kotlinx.coroutines.withContext(Dispatchers.IO) { store.rememberPreview(serverId, session.id, committedPreview) }
       transcriptMemory.put(serverId, session.id, committed.persistable())
       transcriptRetry?.cancel()
       transcriptRetry = null
@@ -3104,13 +3180,13 @@ class LagoonController private constructor(private val appContext: Context) {
     // The descendant tree and diff are independent. The family read is bounded and keeps its
     // frontier across calls, so a wide/deep family is completed over a few opens instead of one
     // unbounded request storm.
-    mutable.update { it.copy(resources = it.resources + listOf("children", "changes").associateWith { ResourceStatus(ResourceState.LOADING) }) }
+    updateState { it.copy(resources = it.resources + listOf("children", "changes").associateWith { ResourceStatus(ResourceState.LOADING) }) }
     val (family, changes) = coroutineScope {
       val changesTask = async { attempt { client.diff(session) } }
       loadFamily(session, client, serverId) to changesTask.await()
     }
     if (token != generation || state.value.serverId != serverId || state.value.sessionId != session.id) return
-    mutable.update { current ->
+    updateState { current ->
       val found = family.sessions.map { scoped(serverId, it) }
       val familyStatus = when {
         family.incompleteRoots.isNotEmpty() -> ResourceStatus(ResourceState.LOADING)
@@ -3139,7 +3215,7 @@ class LagoonController private constructor(private val appContext: Context) {
     if (result.sessions.isNotEmpty()) {
       store.rememberParents(serverId, result.sessions)
       if (state.value.serverId != serverId) return result
-      mutable.update { current ->
+      updateState { current ->
         current.copy(
           knownParents = store.taskParents(serverId),
           sessions = (current.sessions + result.sessions.map { scoped(serverId, it) }).distinctBy { it.id }.sortedWith(sessionActivityOrder)
@@ -3149,7 +3225,7 @@ class LagoonController private constructor(private val appContext: Context) {
     return result
   }
   fun chooseAgent(name: String?) {
-    mutable.update { it.copy(agent = name ?: it.messages.asReversed().firstNotNullOfOrNull { message -> message.agent } ?: it.session?.agent, agentChanged = name != null) }; rememberConfiguration()
+    updateState { it.copy(agent = name ?: it.messages.asReversed().firstNotNullOfOrNull { message -> message.agent } ?: it.session?.agent, agentChanged = name != null) }; rememberConfiguration()
   }
   private fun selectedModel(model: ModelChoice): ModelChoice {
     val server = state.value.serverId ?: return model.copy(variant = null)
@@ -3161,11 +3237,11 @@ class LagoonController private constructor(private val appContext: Context) {
   }
   fun chooseModel(model: ModelChoice?) {
     val next = model?.let(::selectedModel) ?: state.value.messages.asReversed().firstNotNullOfOrNull { it.model } ?: state.value.session?.model
-    mutable.update { it.copy(model = next, modelChanged = model != null) }; rememberConfiguration()
+    updateState { it.copy(model = next, modelChanged = model != null) }; rememberConfiguration()
     val server = state.value.serverId ?: return
     if (model != null) {
       store.rememberRecentModel(server, modelKey(model))
-      mutable.update { it.copy(recentModels = store.recentModels(server)) }
+      updateState { it.copy(recentModels = store.recentModels(server)) }
     }
   }
   /** Selects a server-advertised variant for the current model; null means the server default. */
@@ -3175,7 +3251,7 @@ class LagoonController private constructor(private val appContext: Context) {
     val info = state.value.modelCatalog.firstOrNull { it.key == modelKey(current) } ?: return
     val selected = variant?.takeIf { id -> info.variants.any { it.id == id } }
     store.rememberModelVariant(server, info.key, selected)
-    mutable.update { it.copy(model = info.choice.copy(variant = selected), modelChanged = true, modelVariants = store.modelVariants(server)) }
+    updateState { it.copy(model = info.choice.copy(variant = selected), modelChanged = true, modelVariants = store.modelVariants(server)) }
     rememberConfiguration()
   }
   /** Phone-local default preset for the blank page; null means "follow the server default". */
@@ -3183,7 +3259,7 @@ class LagoonController private constructor(private val appContext: Context) {
     val server = state.value.serverId ?: return
     val clean = name?.takeIf(String::isNotBlank)
     store.rememberNewSessionDefaults(server, store.newSessionDefaults(server).copy(agent = clean))
-    mutable.update { it.copy(newSessionAgent = clean) }
+    updateState { it.copy(newSessionAgent = clean) }
   }
   /** Phone-local default model; the strength stays in [modelVariants], keyed by the model. */
   fun setNewSessionModel(model: ModelChoice?) {
@@ -3193,7 +3269,7 @@ class LagoonController private constructor(private val appContext: Context) {
         ?: candidate.copy(variant = null)
     }
     store.rememberNewSessionDefaults(server, store.newSessionDefaults(server).copy(model = clean))
-    mutable.update { it.copy(newSessionModel = clean) }
+    updateState { it.copy(newSessionModel = clean) }
   }
   /** The default strength for one model, edited from Settings; null means "follow the model". */
   fun setNewSessionVariant(modelKey: String, variant: String?) {
@@ -3201,7 +3277,7 @@ class LagoonController private constructor(private val appContext: Context) {
     val info = state.value.modelCatalog.firstOrNull { it.key == modelKey } ?: return
     val clean = variant?.takeIf { id -> info.variants.any { it.id == id } }
     store.rememberModelVariant(server, modelKey, clean)
-    mutable.update { it.copy(modelVariants = store.modelVariants(server)) }
+    updateState { it.copy(modelVariants = store.modelVariants(server)) }
   }
   /**
    * Loads the agent/model catalog for the Settings page even when no conversation is open.  The
@@ -3226,13 +3302,13 @@ class LagoonController private constructor(private val appContext: Context) {
     else current.modelCatalog.associate { it.key to true }
     val next = baseline + (model.key to visible)
     store.rememberModelOverrides(server, next)
-    mutable.update { it.copy(modelOverrides = next, modelVisibilityConfigured = true) }
+    updateState { it.copy(modelOverrides = next, modelVisibilityConfigured = true) }
   }
   /** Returns to the unconfigured state: every model currently offered by the server is visible. */
   fun resetModelVisibility() {
     val server = state.value.serverId ?: return
     store.clearModelVisibility(server)
-    mutable.update { it.copy(modelOverrides = emptyMap(), modelVisibilityConfigured = false) }
+    updateState { it.copy(modelOverrides = emptyMap(), modelVisibilityConfigured = false) }
   }
   /** Copies picked phone files into the cache off the main thread; each rejection is reported once. */
   fun addLocalAttachments(uris: List<android.net.Uri>) {
@@ -3245,18 +3321,18 @@ class LagoonController private constructor(private val appContext: Context) {
         val pending = state.value.pendingAttachments[key].orEmpty().sumOf { it.size }
         val result = kotlinx.coroutines.withContext(Dispatchers.IO) { attempt { attachmentImporter.import(uri, pending) } }
         result.onSuccess { item ->
-          if (state.value.serverId == server) mutable.update { it.copy(pendingAttachments = it.pendingAttachments + (key to (it.pendingAttachments[key].orEmpty() + item))) }
+          if (state.value.serverId == server) updateState { it.copy(pendingAttachments = it.pendingAttachments + (key to (it.pendingAttachments[key].orEmpty() + item))) }
           else attachmentImporter.discard(listOf(item))
         }.onFailure { errors += it.message ?: "无法添加附件" }
       }
-      if (errors.isNotEmpty() && state.value.serverId == server) mutable.update { it.copy(error = errors.distinct().joinToString("\n")) }
+      if (errors.isNotEmpty() && state.value.serverId == server) updateState { it.copy(error = errors.distinct().joinToString("\n")) }
     }
   }
   fun removeLocalAttachment(id: String) {
     if (state.value.pending("send")) return
     val key = attachmentKey(state.value.sessionId)
     val removed = state.value.pendingAttachments[key].orEmpty().filter { it.id == id }
-    mutable.update { it.copy(pendingAttachments = it.pendingAttachments + (key to it.pendingAttachments[key].orEmpty().filterNot { item -> item.id == id })) }
+    updateState { it.copy(pendingAttachments = it.pendingAttachments + (key to it.pendingAttachments[key].orEmpty().filterNot { item -> item.id == id })) }
     operationScope.launch(Dispatchers.IO) { attachmentImporter.discard(removed) }
   }
   private fun rememberConfiguration() {
@@ -3278,7 +3354,7 @@ class LagoonController private constructor(private val appContext: Context) {
     // session id to persist it under (a synthetic id would leak into draftSessionIds()).
     val session = current.sessionId
     typedDraft = null
-    mutable.update {
+    updateState {
       val draftSessions = if (session == null) it.draftSessions
         else if (text.isBlank()) it.draftSessions - session else it.draftSessions + session
       it.copy(draft = text, draftRevision = it.draftRevision + 1, draftSessions = draftSessions)
@@ -3296,7 +3372,7 @@ class LagoonController private constructor(private val appContext: Context) {
     val session = current.sessionId
     typedDraft = TypedDraft(server, session, text)
     if (session != null && (session in current.draftSessions) == text.isBlank())
-      mutable.update { it.copy(draftSessions = if (text.isBlank()) it.draftSessions - session else it.draftSessions + session) }
+      updateState { it.copy(draftSessions = if (text.isBlank()) it.draftSessions - session else it.draftSessions + session) }
     if (session != null) persistDraft(server, session, text)
   }
   /** The composer text of [server]/[session] as typed, falling back to the last app-side [LagoonState.draft]. */
@@ -3313,9 +3389,9 @@ class LagoonController private constructor(private val appContext: Context) {
   }
   fun addReference(path: String, mime: String = referenceMime(path)) {
     // 发送中的请求已捕获引用快照；此处不再静默忽略，否则文件面板会“点了没反应”。
-    mutable.update { it.copy(references = (it.references + FileReference(path, mime)).distinctBy { ref -> ref.path }) }; rememberReferences()
+    updateState { it.copy(references = (it.references + FileReference(path, mime)).distinctBy { ref -> ref.path }) }; rememberReferences()
   }
-  fun removeReference(path: String) { mutable.update { it.copy(references = it.references.filterNot { ref -> ref.path == path }) }; rememberReferences() }
+  fun removeReference(path: String) { updateState { it.copy(references = it.references.filterNot { ref -> ref.path == path }) }; rememberReferences() }
   private fun rememberReferences() {
     val current = state.value; val server = current.serverId ?: return; val session = current.sessionId ?: return
     operationScope.launch { referenceMutex.withLock { kotlinx.coroutines.withContext(Dispatchers.IO) { attempt { store.rememberReferences(server, session, current.references) } } } }
@@ -3325,13 +3401,13 @@ class LagoonController private constructor(private val appContext: Context) {
     val server = state.value.serverId ?: return
     val scope = projectId?.takeIf { id -> state.value.projects.any { it.id == id } }
     store.rememberScope(server, scope)
-    mutable.update { it.copy(scopeProjectId = scope, scopeWorkspaceKey = null) }
+    updateState { it.copy(scopeProjectId = scope, scopeWorkspaceKey = null) }
     if (scope != null && scope != state.value.projectId) selectProject(scope)
   }
 
   /** Group home filter by merged workspace name; selecting a harness stays a separate action. */
   fun setWorkspaceScope(key: String?) {
-    mutable.update { it.copy(scopeWorkspaceKey = key, scopeProjectId = null) }
+    updateState { it.copy(scopeWorkspaceKey = key, scopeProjectId = null) }
   }
 
   // ---- Device-local projects ----
@@ -3350,7 +3426,7 @@ class LagoonController private constructor(private val appContext: Context) {
   fun removeProject(projectId: String) {
     val server = state.value.serverId ?: return
     val projects = store.removeLocalProject(server, projectId)
-    mutable.update { withSummary(it.copy(projects = projects,
+    updateState { withSummary(it.copy(projects = projects,
       projectId = it.projectId?.takeIf { id -> projects.any { p -> p.id == id } } ?: projects.firstOrNull()?.id,
       scopeProjectId = it.scopeProjectId?.takeIf { id -> projects.any { p -> p.id == id } })) }
   }
@@ -3358,20 +3434,20 @@ class LagoonController private constructor(private val appContext: Context) {
   // ---- Remote directory browser (used to add a project) ----
   fun openDirectoryBrowser(): Job = operationScope.launch {
     val op = attempt { beginOperation(state.value.homeDirectory) }.getOrElse { error ->
-      mutable.update { it.copy(error = userFacingError(error, "无法打开目录"), resources = it.resources + ("browse" to ResourceStatus(ResourceState.ERROR, userFacingError(error)))) }
+      updateState { it.copy(error = userFacingError(error, "无法打开目录"), resources = it.resources + ("browse" to ResourceStatus(ResourceState.ERROR, userFacingError(error)))) }
       return@launch
     }
-    mutable.update { it.copy(browsePath = "", browseEntries = emptyList(), browseSearch = emptyList(), browseShowHidden = false, resources = it.resources + ("browse" to ResourceStatus(ResourceState.LOADING))) }
+    updateState { it.copy(browsePath = "", browseEntries = emptyList(), browseSearch = emptyList(), browseShowHidden = false, resources = it.resources + ("browse" to ResourceStatus(ResourceState.LOADING))) }
     val root = attempt { op.client.projectAt("") }.getOrNull()?.directory?.takeIf(String::isNotBlank)
       ?: state.value.homeDirectory ?: "/"
     loadBrowse(op, root)
   }
   fun browseDirectory(path: String): Job = operationScope.launch {
     val op = attempt { beginOperation(path) }.getOrElse { error ->
-      mutable.update { it.copy(resources = it.resources + ("browse" to ResourceStatus(ResourceState.ERROR, userFacingError(error)))) }
+      updateState { it.copy(resources = it.resources + ("browse" to ResourceStatus(ResourceState.ERROR, userFacingError(error)))) }
       return@launch
     }
-    mutable.update { it.copy(resources = it.resources + ("browse" to ResourceStatus(ResourceState.LOADING)), browseSearch = emptyList()) }
+    updateState { it.copy(resources = it.resources + ("browse" to ResourceStatus(ResourceState.LOADING)), browseSearch = emptyList()) }
     loadBrowse(op, path)
   }
   private suspend fun loadBrowse(op: OperationContext, path: String) {
@@ -3387,11 +3463,11 @@ class LagoonController private constructor(private val appContext: Context) {
     val request = ++searchSequence
     val text = query.trim()
     if (text.length < 2) {
-      mutable.update { it.copy(browseSearch = emptyList(), resources = it.resources + ("browse-search" to ResourceStatus(ResourceState.EMPTY))) }
+      updateState { it.copy(browseSearch = emptyList(), resources = it.resources + ("browse-search" to ResourceStatus(ResourceState.EMPTY))) }
       return operationScope.launch { }
     }
     val path = state.value.browsePath ?: return operationScope.launch { }
-    mutable.update { it.copy(browseSearch = emptyList(), resources = it.resources + ("browse-search" to ResourceStatus(ResourceState.LOADING))) }
+    updateState { it.copy(browseSearch = emptyList(), resources = it.resources + ("browse-search" to ResourceStatus(ResourceState.LOADING))) }
     return operationScope.launch {
       val op = attempt { beginOperation(path) }.getOrElse { return@launch }
       delay(250)
@@ -3404,11 +3480,11 @@ class LagoonController private constructor(private val appContext: Context) {
     }
   }
   fun closeDirectoryBrowser() {
-    mutable.update { it.copy(browsePath = null, browseEntries = emptyList(), browseSearch = emptyList()) }
+    updateState { it.copy(browsePath = null, browseEntries = emptyList(), browseSearch = emptyList()) }
   }
   /** 切换「显示隐藏目录」；仅影响本机列表投影，不重新请求服务器。 */
   fun setBrowseShowHidden(show: Boolean) {
-    mutable.update { it.copy(browseShowHidden = show) }
+    updateState { it.copy(browseShowHidden = show) }
   }
   /**
    * Opens the blank "新会话" page on [serverId], optionally on [projectId].
@@ -3424,9 +3500,11 @@ class LagoonController private constructor(private val appContext: Context) {
   fun enterDraft(serverId: String, projectId: String? = null, keepComposer: Boolean = false) {
     if (store.profiles().none { it.id == serverId && it.enabled }) return
     val current = state.value
+    val keptText = if (keepComposer) liveDraft(current) else ""
     draftServerId = serverId
     draftProjectId = projectId
     draftKeepsComposer = keepComposer
+    preservedDraftText = keptText
     typedDraft = null
     if (current.serverId != serverId) {
       // The overview snapshot carries the device-local project list; fall back to the store for an
@@ -3444,7 +3522,7 @@ class LagoonController private constructor(private val appContext: Context) {
       else current.preferredDraftProject(serverId, projectId)
         ?: current.serverWorkspaceCatalogOn(serverId).firstOrNull()?.copy(serverId = serverId)
     draftProjectId = target?.id
-    applyDraftProject(current, target, fresh = !keepComposer || current.sessionId != null)
+    applyDraftProject(current.copy(draft = keptText), target, fresh = !keepComposer || current.sessionId != null)
   }
 
   /** The reader left the blank page without sending: later loads may restore sessions again. */
@@ -3454,6 +3532,7 @@ class LagoonController private constructor(private val appContext: Context) {
     draftServerId = null
     draftProjectId = null
     draftKeepsComposer = false
+    preservedDraftText = ""
     pendingDraft = null
   }
 
@@ -3471,15 +3550,17 @@ class LagoonController private constructor(private val appContext: Context) {
       current.agents, current.modelCatalog, current.modelVariants) else null
     val agent = if (fresh) defaults?.agent else current.agent
     val model = if (fresh) defaults?.model else current.model
-    mutable.update {
+    updateState {
       withSummary(it.copy(projectId = project?.id, sessionId = null, messages = emptyList(),
         agent = agent, model = model,
         agentChanged = if (fresh) agent != null else it.agentChanged,
         modelChanged = if (fresh) model != null else it.modelChanged,
-        draft = text, references = references, resources = it.resources - "messages",
+        draft = text, draftRevision = it.draftRevision + (if (text != it.draft) 1 else 0),
+        references = references, resources = it.resources - "messages",
         files = emptyList(), searchResults = emptyList(), fileText = null, fileBinary = false,
         filePreview = null, filePreviewMime = null, loadedOlderMessages = false, messagesCursor = null,
-        provisionalMessageIds = emptySet(), transcriptLoadingSince = 0, changes = emptyList()))
+        provisionalMessageIds = emptySet(), transcriptLoadingSince = 0, changes = emptyList(),
+        goal = null, goalLoading = false, schedules = emptyList(), schedulesLoading = false))
     }
     store.rememberLocation(project?.id, null)
     if (project != null) {
@@ -3495,7 +3576,7 @@ class LagoonController private constructor(private val appContext: Context) {
    */
   fun chooseWorkspace(project: Project) {
     val unique = normalizedDirectory(project.directory)
-    val current = state.value
+    val current = state.value.let { it.copy(draft = liveDraft(it)) }
     val existing = current.projects.firstOrNull { normalizedDirectory(it.directory) == unique }
     // Keep the prompt typed on the blank page: changing workspace is not sending or leaving it.
     if (existing != null) {
@@ -3512,7 +3593,7 @@ class LagoonController private constructor(private val appContext: Context) {
     if (knownWorkspace != null) {
       val projects = store.addLocalProject(current.serverId ?: return, knownWorkspace.copy(serverId = current.serverId))
       val next = current.copy(projects = projects)
-      mutable.update { it.copy(projects = projects) }
+      updateState { it.copy(projects = projects) }
       applyDraftProject(next, knownWorkspace, fresh = false)
       return
     }
@@ -3551,7 +3632,7 @@ class LagoonController private constructor(private val appContext: Context) {
       allSnapshots[server] = snapshot.copy(notices = notices,
         summary = snapshot.copy(notices = notices).displaySummary(current.permissionPolicy))
     }
-    mutable.update { latest ->
+    updateState { latest ->
       val next = noticesByServer[latest.serverId]?.let { withSummary(latest.copy(notices = it)) } ?: latest
       next.copy(allServerSnapshots = allSnapshots.toMap(),
         message = "已将 $cleared 个会话标记为已读")
@@ -3567,13 +3648,13 @@ class LagoonController private constructor(private val appContext: Context) {
     val current = state.value
     val targets = current.serverReadTargets()
     if (targets.isEmpty()) {
-      mutable.update { it.copy(message = "没有需要同步的服务端已读") }
+      updateState { it.copy(message = "没有需要同步的服务端已读") }
       return
     }
     val clients = targets.keys.associateWith { server ->
       if (server == current.serverId) api else attempt { allOverview.client(server) }.getOrNull()
     }
-    mutable.update { it.copy(serverReadPending = true) }
+    updateState { it.copy(serverReadPending = true) }
     serverReadJob = operationScope.launch {
       var succeeded = 0
       var failed = 0
@@ -3601,7 +3682,7 @@ class LagoonController private constructor(private val appContext: Context) {
           }
         }
         applyServerRead(acknowledged)
-        mutable.update {
+        updateState {
           it.copy(
             message = when {
               failed == 0 -> "服务端已读已同步 $succeeded 个会话"
@@ -3615,9 +3696,9 @@ class LagoonController private constructor(private val appContext: Context) {
         throw cancel
       } catch (error: Exception) {
         Diagnostics.warn("SessionView", "服务端已读同步失败", error)
-        mutable.update { it.copy(error = "服务端已读同步失败") }
+        updateState { it.copy(error = "服务端已读同步失败") }
       } finally {
-        mutable.update { it.copy(serverReadPending = false) }
+        updateState { it.copy(serverReadPending = false) }
       }
     }
   }
@@ -3637,7 +3718,7 @@ class LagoonController private constructor(private val appContext: Context) {
       allSnapshots[server] = snapshot.copy(sessions = sessions)
     }
     if (updated.isEmpty()) return
-    mutable.update { latest ->
+    updateState { latest ->
       latest.copy(sessions = updated[latest.serverId] ?: latest.sessions,
         allServerSnapshots = allSnapshots.toMap())
     }
@@ -3655,14 +3736,14 @@ class LagoonController private constructor(private val appContext: Context) {
     val unseen = current.notices.unseenFor(session)
     if (unseen.isNotEmpty()) {
       val notices = store.viewNotices(server, session, unseen.map { it.id }.toSet())
-      mutable.update { if (it.serverId == server) withSummary(it.copy(notices = notices)) else it }
+      updateState { if (it.serverId == server) withSummary(it.copy(notices = notices)) else it }
       attempt { notifications.cancel(server, session) }
     }
     val target = current.session ?: return
     val idle = target.idle
     if (idle > 0 && target.viewed < idle && current.capabilities.sessionView != null) {
       val client = api
-      mutable.update { it.copy(sessions = it.sessions.map { item -> if (item.id == session && item.idle == idle) item.copy(viewed = idle) else item }) }
+      updateState { it.copy(sessions = it.sessions.map { item -> if (item.id == session && item.idle == idle) item.copy(viewed = idle) else item }) }
       operationScope.launch {
         attempt { client?.viewSession(target, idle) }.onFailure { Diagnostics.warn("SessionView", "服务端已读同步失败，保留本地已读记录") }
       }
@@ -3690,10 +3771,10 @@ class LagoonController private constructor(private val appContext: Context) {
       requireNotNull(api) { "请先连接服务器" }, selectionRevision, current)
   }
   private fun OperationContext.commit(update: (LagoonState) -> LagoonState) {
-    if (isCurrent(this@LagoonController)) mutable.update(update)
+    if (isCurrent(this@LagoonController)) updateState(update)
   }
   private fun OperationContext.commitConnection(update: (LagoonState) -> LagoonState) {
-    if (connectionCurrent(this@LagoonController)) mutable.update(update)
+    if (connectionCurrent(this@LagoonController)) updateState(update)
   }
   /** DSH workspaces are identified by an opaque id; a session created without it is invisible to
    *  clients that enumerate by workspace. Prefer the catalog entry for the exact directory. */
@@ -3721,15 +3802,15 @@ class LagoonController private constructor(private val appContext: Context) {
     val directory = current.project?.directory
     if (!current.connected) {
       if (directory.isNullOrBlank()) {
-        mutable.update { it.copy(error = "连上服务器并选择工作区后即可发送") }
+        updateState { it.copy(error = "连上服务器并选择工作区后即可发送") }
         return operationScope.launch { }
       }
       pendingDraft = PendingDraft(current.serverId.orEmpty(), current.projectId, directory, title, prompt, agent, model, onStarted)
-      mutable.update { it.copy(message = "已排队：连接后会自动创建会话并发送") }
+      updateState { it.copy(message = "已排队：连接后会自动创建会话并发送") }
       return operationScope.launch { }
     }
     if (directory == null) {
-      mutable.update { it.copy(error = "先选择工作区") }
+      updateState { it.copy(error = "先选择工作区") }
       return operationScope.launch { }
     }
     return startSessionIn(directory, title, prompt, agent, model, onStarted)
@@ -3743,13 +3824,17 @@ class LagoonController private constructor(private val appContext: Context) {
     val session = scoped(op.serverId, op.client.createSession(directory, title, workspaceIdFor(op.snapshot, directory)))
     op.commitConnection { it.copy(sessions = (listOf(session) + it.sessions).distinctBy { s -> s.id }) }
     if (op.isCurrent(this)) {
-      store.rememberDraft(op.serverId, session.id, prompt)
       store.rememberConfiguration(op.serverId, session.id, SessionConfiguration(agent, model, agent != null, model != null))
-      if (draftFiles.isNotEmpty()) mutable.update { it.copy(pendingAttachments = it.pendingAttachments - attachmentKey(null) + (session.id to draftFiles)) }
+      if (draftFiles.isNotEmpty()) updateState { it.copy(pendingAttachments = it.pendingAttachments - attachmentKey(null) + (session.id to draftFiles)) }
       selectSession(session.id)
-      mutable.update { it.copy(agentChanged = agent != null, modelChanged = model != null, draft = prompt, previews = it.previews + (session.id to SessionPreview(SessionContent.EMPTY))) }
+      updateState { it.copy(agentChanged = agent != null, modelChanged = model != null, draft = prompt, draftRevision = it.draftRevision + 1, previews = it.previews + (session.id to SessionPreview(SessionContent.EMPTY))) }
       onStarted?.invoke(session)
-      send(prompt)
+      deliver(prompt, op.serverId, session.id, accepted = null, onFailed = {
+        if (prompt.isNotBlank()) {
+          draftWrites.remove("${op.serverId}:${session.id}")?.cancel()
+          kotlinx.coroutines.withContext(Dispatchers.IO) { attempt { store.rememberDraft(op.serverId, session.id, prompt) } }
+        }
+      })
     }
   }
 
@@ -3768,10 +3853,10 @@ class LagoonController private constructor(private val appContext: Context) {
   fun send(text: String, expectedServer: String? = state.value.serverId, expectedSession: String? = state.value.sessionId, accepted: (() -> Unit)? = null): Job =
     deliver(text, expectedServer, expectedSession, accepted, onFailed = null)
   /** [send] with [onFailed] run when the server refuses the prompt (a held prompt then returns to the draft). */
-  private fun deliver(text: String, expectedServer: String?, expectedSession: String?, accepted: (() -> Unit)?, onFailed: (() -> Unit)?): Job {
+  private fun deliver(text: String, expectedServer: String?, expectedSession: String?, accepted: (() -> Unit)?, onFailed: (suspend () -> Unit)?): Job {
     if (state.value.serverId != expectedServer || state.value.sessionId != expectedSession) {
       // 静默丢弃会让用户以为已经发出；明确提示并要求重试。
-      mutable.update { it.copy(error = "当前会话已切换，消息未发送，请重试") }
+      updateState { it.copy(error = "当前会话已切换，消息未发送，请重试") }
       return operationScope.launch { }
     }
     if (state.value.canQueueSend) {
@@ -3810,12 +3895,13 @@ class LagoonController private constructor(private val appContext: Context) {
       op.commitConnection { current -> withSummary(current.copy(tasks = current.tasks +
         (session.id to PendingInputs.accepted(session.id, current.tasks[session.id], session.idle)))) }
       if (attachments.isNotEmpty()) {
-        mutable.update { it.copy(pendingAttachments = it.pendingAttachments + (attachmentKey(session.id) to it.pendingAttachments[attachmentKey(session.id)].orEmpty().filterNot { item -> item in attachments })) }
+        updateState { it.copy(pendingAttachments = it.pendingAttachments + (attachmentKey(session.id) to it.pendingAttachments[attachmentKey(session.id)].orEmpty().filterNot { item -> item in attachments })) }
         kotlinx.coroutines.withContext(Dispatchers.IO) { attachmentImporter.discard(attachments) }
       }
       store.rememberConfiguration(op.serverId, session.id, SessionConfiguration(op.snapshot.agent, op.snapshot.model))
       referenceMutex.withLock { kotlinx.coroutines.withContext(Dispatchers.IO) { store.rememberReferences(op.serverId, session.id, emptyList()) } }
-      store.rememberPreview(op.serverId, session.id, SessionPreview(SessionContent.CONTENT, text.take(300)))
+      val sentPreview = SessionPreview(SessionContent.CONTENT, text.take(300))
+      kotlinx.coroutines.withContext(Dispatchers.IO) { store.rememberPreview(op.serverId, session.id, sentPreview) }
       if (op.isCurrent(this)) {
         if (liveDraft() == text) updateDraft("")
         accepted?.invoke()
@@ -3825,7 +3911,10 @@ class LagoonController private constructor(private val appContext: Context) {
       op.commit { it.copy(agentChanged = false, modelChanged = false, references = emptyList()) }
     }
     if (op.isCurrent(this)) rememberCurrentSessionView()
-    if (op.connectionCurrent(this) && op.snapshot.server?.notifications == true) TaskMonitorService.start(appContext, op.serverId, session.id)
+    if (foreground && op.connectionCurrent(this) && op.snapshot.server?.notifications == true) {
+      attempt { TaskMonitorService.start(appContext, op.serverId, session.id) }
+        .onFailure { Diagnostics.warn("Monitor", "无法启动任务监控服务", it) }
+    }
     // With the live stream up, the inbox/step events project the turn; otherwise read it back.
     if (op.isCurrent(this) && !state.value.streamConnected) loadSession(session, token = op.token, client = op.client, ancillary = false)
   }
@@ -3855,6 +3944,9 @@ class LagoonController private constructor(private val appContext: Context) {
   fun deleteSession(target: String? = null, onDeleted: (() -> Unit)? = null) = withSession("delete", target) { op, client, session ->
     client.deleteSession(session)
     cache.deleteMessages(op.serverId, session.id)
+    transcriptMemory.forget(op.serverId, session.id)
+    sessionViews.forget(op.serverId, session.id)
+    conversationPool.forget(op.serverId, session.id)
     forgetStoredTranscript(op.serverId, session.id)
     store.forgetSession(op.serverId, session.id)
     if (op.isCurrent(this)) onDeleted?.invoke()
@@ -3919,7 +4011,7 @@ class LagoonController private constructor(private val appContext: Context) {
   }
   fun listFiles(path: String = "."): Job {
     val request = ++fileSequence
-    mutable.update { it.copy(resources = it.resources + ("files" to ResourceStatus(ResourceState.LOADING)), searchResults = emptyList()) }
+    updateState { it.copy(resources = it.resources + ("files" to ResourceStatus(ResourceState.LOADING)), searchResults = emptyList()) }
     ++searchSequence
     return act { op ->
       val directory = op.snapshot.executionDirectory ?: error("先选择项目")
@@ -3934,7 +4026,7 @@ class LagoonController private constructor(private val appContext: Context) {
   }
   fun readFile(path: String): Job {
     val request = ++fileSequence
-    mutable.update { it.copy(resources = it.resources + ("files" to ResourceStatus(ResourceState.LOADING))) }
+    updateState { it.copy(resources = it.resources + ("files" to ResourceStatus(ResourceState.LOADING))) }
     return act { op ->
       val directory = op.snapshot.executionDirectory ?: error("先选择项目")
       val preview = try { op.client.previewFile(directory, path, op.snapshot.session) } catch (error: Exception) {
@@ -3959,10 +4051,10 @@ class LagoonController private constructor(private val appContext: Context) {
   fun searchFiles(query: String): Job {
     val request = ++searchSequence
     if (query.trim().length < 2) {
-      mutable.update { it.copy(searchResults = emptyList(), resources = it.resources + ("search" to ResourceStatus(ResourceState.EMPTY))) }
+      updateState { it.copy(searchResults = emptyList(), resources = it.resources + ("search" to ResourceStatus(ResourceState.EMPTY))) }
       return operationScope.launch { }
     }
-    mutable.update { it.copy(searchResults = emptyList(), resources = it.resources + ("search" to ResourceStatus(ResourceState.LOADING))) }
+    updateState { it.copy(searchResults = emptyList(), resources = it.resources + ("search" to ResourceStatus(ResourceState.LOADING))) }
     return act { op ->
       delay(250)
       if (request != searchSequence) return@act
@@ -3983,16 +4075,16 @@ class LagoonController private constructor(private val appContext: Context) {
     val captured = attempt { beginOperation(directory) }
     val key = action.takeIf { it.isNotBlank() }?.let { operationKey(state.value.serverId, state.value.sessionId, state.value.projectId, it) }
     if (key != null && key in state.value.pendingOperations) return operationScope.launch { }
-    if (key != null) mutable.update { it.copy(pendingOperations = it.pendingOperations + key,
+    if (key != null) updateState { it.copy(pendingOperations = it.pendingOperations + key,
       resources = it.resources + ("action:$action" to ResourceStatus(ResourceState.LOADING))) }
     return operationScope.launch {
       val op = captured.getOrElse { error ->
-        mutable.update { it.copy(error = userFacingError(error), resources = it.resources + ("action:$action" to ResourceStatus(ResourceState.ERROR, userFacingError(error))), pendingOperations = it.pendingOperations - setOfNotNull(key)) }
+        updateState { it.copy(error = userFacingError(error), resources = it.resources + ("action:$action" to ResourceStatus(ResourceState.ERROR, userFacingError(error))), pendingOperations = it.pendingOperations - setOfNotNull(key)) }
         return@launch
       }
       try {
         block(op)
-        if (key != null && op.isCurrent(this@LagoonController)) mutable.update {
+        if (key != null && op.isCurrent(this@LagoonController)) updateState {
           it.copy(resources = it.resources + ("action:$action" to ResourceStatus(ResourceState.READY)))
         }
       } catch (cancel: CancellationException) { throw cancel } catch (error: Exception) {
@@ -4001,7 +4093,7 @@ class LagoonController private constructor(private val appContext: Context) {
           // transient relay drop must not become a global "加载失败" toast.
           val readLike = action.startsWith("open:") || action in setOf("sessions-more", "messages-more", "goal-refresh", "schedules")
           val transient = readLike && error.isRetryableTransportFailure()
-          mutable.update { current ->
+          updateState { current ->
             current.copy(
               error = if (transient) null else userFacingError(error),
               resources = if (key == null || !op.isCurrent(this@LagoonController)) current.resources
@@ -4011,7 +4103,7 @@ class LagoonController private constructor(private val appContext: Context) {
           }
         }
       } finally {
-        if (key != null) mutable.update { it.copy(pendingOperations = it.pendingOperations - key) }
+        if (key != null) updateState { it.copy(pendingOperations = it.pendingOperations - key) }
       }
     }
   }

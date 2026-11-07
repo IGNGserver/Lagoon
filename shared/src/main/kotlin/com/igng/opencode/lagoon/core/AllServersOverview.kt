@@ -1,6 +1,7 @@
 package com.igng.opencode.lagoon.core
 
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.awaitCancellation
@@ -77,6 +78,7 @@ internal class AllServersOverview(
   private val clients = mutableMapOf<String, HarnessClient>()
   private val configurations = mutableMapOf<String, Pair<ServerProfile, ServerCredentials>>()
   private val wakes = mutableMapOf<String, Channel<Unit>>()
+  private val refreshWaiters = mutableMapOf<String, MutableList<CompletableDeferred<Unit>>>()
   private val reconnectHints = mutableMapOf<String, Channel<Unit>>()
   private val approvers = mutableMapOf<String, PermissionAutoApprover>()
   private val snapshots = mutableMapOf<String, ServerOverviewSnapshot>()
@@ -143,6 +145,21 @@ internal class AllServersOverview(
   }
   fun refreshAll() { wakes.values.forEach { it.trySend(Unit) }; reconnectHints.values.forEach { it.trySend(Unit) } }
 
+  /**
+   * Triggers one control-plane refresh on every monitored background server and suspends until each
+   * active monitor completes its pass, so WorkManager does not release its WakeLock mid-flight.
+   */
+  suspend fun refreshAllAndAwait() {
+    val activeIds = jobs.filterValues { it.isActive }.keys.filter { it != selectedServer() }
+    val pending = activeIds.map { id ->
+      CompletableDeferred<Unit>().also { deferred ->
+        refreshWaiters.getOrPut(id) { mutableListOf() }.add(deferred)
+      }
+    }
+    refreshAll()
+    pending.awaitAll()
+  }
+
   /** Stop (`false`) or resume content streams for every client; used when the app leaves the foreground. */
   fun setContentWatching(enabled: Boolean) {
     clients.values.forEach { it.setContentWatching(enabled) }
@@ -183,6 +200,7 @@ internal class AllServersOverview(
   }
   private fun remove(id: String) {
     jobs.remove(id)?.cancel(); wakes.remove(id)?.close(); approvers.remove(id)?.dispose()
+    refreshWaiters.remove(id)?.forEach { it.complete(Unit) }
     reconnectHints.remove(id)?.close()
     clients.remove(id)?.close(); configurations.remove(id); locks.remove(id); snapshots.remove(id)
     handoffs.remove(id)
@@ -260,45 +278,51 @@ internal class AllServersOverview(
     approvers[id] = approver
 
     suspend fun refresh() {
-      if (selectedServer() == id) return
-      handoffs.remove(id)?.let { snapshot = it.copy(streamConnected = snapshot.streamConnected) }
-      // Conflate streaming bursts without issuing a full control-plane read for every token. The
-      // overview read repairs state, so a few seconds of coalescing is enough and keeps several
-      // streaming servers from turning every token into HTTP traffic.
-      val elapsed = now() - lastReadAt
-      if (elapsed < EVENT_READ_COALESCE_MILLIS) delay(EVENT_READ_COALESCE_MILLIS - elapsed)
-      if (selectedServer() == id) return
-      lastReadAt = now()
-      val revision = waitingRevision
-      val next = lock.withLock {
-        val previous = snapshot
-        try {
-          val first = firstReads.remove(id)
-          readInternal(profile, client, previous, light = !first) { revision == waitingRevision }
-        } catch (cancel: CancellationException) {
-          throw cancel
-        } catch (error: Exception) {
-          previous.copy(connected = false, loading = false, cached = previous.cached || cachedCatalog != null,
-            degraded = true, error = userFacingError(error, "连接失败"))
+      val waiters = refreshWaiters.remove(id)?.toList().orEmpty()
+      try {
+        if (selectedServer() == id) return
+        handoffs.remove(id)?.let { snapshot = it.copy(streamConnected = snapshot.streamConnected) }
+        // Conflate streaming bursts without issuing a full control-plane read for every token. The
+        // overview read repairs state, so a few seconds of coalescing is enough and keeps several
+        // streaming servers from turning every token into HTTP traffic.
+        val elapsed = now() - lastReadAt
+        if (waiters.isEmpty() && elapsed < EVENT_READ_COALESCE_MILLIS) delay(EVENT_READ_COALESCE_MILLIS - elapsed)
+        if (selectedServer() == id) return
+        lastReadAt = now()
+        val revision = waitingRevision
+        val next = lock.withLock {
+          val previous = snapshot
+          try {
+            val first = firstReads.remove(id)
+            readInternal(profile, client, previous, light = !first) { revision == waitingRevision }
+          } catch (cancel: CancellationException) {
+            throw cancel
+          } catch (error: Exception) {
+            previous.copy(connected = false, loading = false, cached = previous.cached || cachedCatalog != null,
+              degraded = true, error = userFacingError(error, "连接失败"))
+          }
         }
+        if (selectedServer() == id) return
+        snapshot = if (revision == waitingRevision) next.copy(streamConnected = snapshot.streamConnected, autoApprovalFailures = snapshot.autoApprovalFailures)
+          else next.copy(tasks = snapshot.tasks, notices = snapshot.notices, permissions = snapshot.permissions, questions = snapshot.questions,
+            shells = snapshot.shells, parents = next.parents + snapshot.parents,
+            sessions = (snapshot.sessions + next.sessions).distinctBy { it.id },
+            streamConnected = snapshot.streamConnected, autoApprovalFailures = snapshot.autoApprovalFailures)
+        snapshot = snapshot.copy(permissions = approver.pending(snapshot.permissions))
+        snapshot = reconcileWaiting(snapshot, resolvedSessions, resolvedFormSessions = resolvedFormSessions)
+        store.rememberParents(id, snapshot.sessions)
+        snapshot.tasks.values.forEach { store.rememberTask(id, it, snapshot.parents[it.sessionId]) }
+        store.taskStates(id).values.filter { it.active && it.sessionId !in snapshot.tasks }.forEach {
+          store.rememberTask(id, it.copy(phase = TaskPhase.IDLE, detail = ""), snapshot.parents[it.sessionId])
+        }
+        snapshot.notices.forEach { store.rememberNotice(id, it) }
+        snapshot = snapshot.copy(notices = store.sessionNotices(id))
+        emit(snapshot)
+        consider(id, snapshot.permissions)
+      } finally {
+        waiters.forEach { it.complete(Unit) }
+        refreshWaiters.remove(id)?.forEach { it.complete(Unit) }
       }
-      if (selectedServer() == id) return
-      snapshot = if (revision == waitingRevision) next.copy(streamConnected = snapshot.streamConnected, autoApprovalFailures = snapshot.autoApprovalFailures)
-        else next.copy(tasks = snapshot.tasks, notices = snapshot.notices, permissions = snapshot.permissions, questions = snapshot.questions,
-          shells = snapshot.shells, parents = next.parents + snapshot.parents,
-          sessions = (snapshot.sessions + next.sessions).distinctBy { it.id },
-          streamConnected = snapshot.streamConnected, autoApprovalFailures = snapshot.autoApprovalFailures)
-      snapshot = snapshot.copy(permissions = approver.pending(snapshot.permissions))
-      snapshot = reconcileWaiting(snapshot, resolvedSessions, resolvedFormSessions = resolvedFormSessions)
-      store.rememberParents(id, snapshot.sessions)
-      snapshot.tasks.values.forEach { store.rememberTask(id, it, snapshot.parents[it.sessionId]) }
-      store.taskStates(id).values.filter { it.active && it.sessionId !in snapshot.tasks }.forEach {
-        store.rememberTask(id, it.copy(phase = TaskPhase.IDLE, detail = ""), snapshot.parents[it.sessionId])
-      }
-      snapshot.notices.forEach { store.rememberNotice(id, it) }
-      snapshot = snapshot.copy(notices = store.sessionNotices(id))
-      emit(snapshot)
-      consider(id, snapshot.permissions)
     }
 
     coroutineScope {

@@ -1203,4 +1203,125 @@ class ControllerRegressionTest {
     }
   }
 
+  @Test fun loadSessionStillCommitsWhenExecutionDirectoryDiffersFromSessionDirectory() = runBlocking {
+    MockWebServer().use { server ->
+      server.dispatcher = object : Dispatcher() {
+        override fun dispatch(request: RecordedRequest): MockResponse = when (request.requestUrl!!.encodedPath) {
+          "/api/info" -> MockResponse().setBody("""{"version":"2.0.22"}""")
+          "/api/session/s-moved/message" -> MockResponse().setBody(
+            """{"data":[{"id":"m1","role":"user","type":"user","text":"hello","time":{"created":100}}],"cursor":{}}"""
+          )
+          "/api/session/s-moved/inbox" -> MockResponse().setBody("""{"data":[]}""")
+          else -> MockResponse().setBody("""{"data":[]}""")
+        }
+      }
+      val client = api(server); client.health()
+      // 模拟 openConversation 尚未补读到完整 session（sessions 为空、executionDirectory 回退到 project.directory）
+      // 或 session.moved 在请求途中更新了目录的场景
+      val (controller, state) = controller(client, LagoonState(
+        serverId = "server",
+        connected = true,
+        projects = listOf(Project("p", "/project-root", "Repo")),
+        projectId = "p",
+        sessions = listOf(Session("s-moved", "/project-root/worktree-b", "Moved", 10)),
+        sessionId = "s-moved",
+        resources = mapOf("messages" to ResourceStatus(ResourceState.LOADING)),
+        transcriptLoadingSince = 123L
+      ))
+      readTranscript(controller, client, Session("s-moved", "", "Moved", 10))
+      assertEquals(ResourceState.READY, state.value.resource("messages").state)
+      assertEquals(0L, state.value.transcriptLoadingSince)
+      assertEquals(listOf("m1"), state.value.messages.map { it.id })
+    }
+  }
+
+  @Test fun blankDraftPreservesTypedKeystrokesAcrossWorkspaceAndDraftReentry() {
+    val profileA = ServerProfile("srv-a", "A", "https://a.example")
+    val project1 = Project("p1", "/repo-1", "Repo 1", serverId = "srv-a")
+    val project2 = Project("p2", "/repo-2", "Repo 2", serverId = "srv-a")
+    val store = ServerStore(memoryPreferences(), memoryPreferences(), { it }, { it })
+    store.save(profileA, password = "pw")
+    val (controller, state) = controller(api(MockWebServer()), LagoonState(
+      profiles = listOf(profileA),
+      serverId = "srv-a",
+      connected = true,
+      projects = listOf(project1, project2),
+      projectId = "p1",
+      sessionId = null
+    ))
+    put(controller, "store", store)
+    controller.enterDraft("srv-a", "p1", keepComposer = false)
+    // 用户在空白页打字只走 typeDraft，不改 state.draft
+    controller.typeDraft("这段话切工作区或切设备不能丢", "srv-a", null)
+    assertEquals("", state.value.draft)
+    // 切换工作区与 keepComposer 重新进入空白页后，刚才敲的字必须写进 state.draft 保留
+    controller.chooseWorkspace(project2)
+    assertEquals("这段话切工作区或切设备不能丢", state.value.draft)
+    controller.typeDraft("再加一句", "srv-a", null)
+    controller.enterDraft("srv-a", "p1", keepComposer = true)
+    assertEquals("再加一句", state.value.draft)
+  }
+
+  @Test fun firstSendInNewSessionDoesNotResurrectSentPromptFromAsyncDraftRestore() = runBlocking {
+    MockWebServer().use { server ->
+      server.dispatcher = object : Dispatcher() {
+        override fun dispatch(request: RecordedRequest): MockResponse = when (request.requestUrl!!.encodedPath) {
+          "/api/info" -> MockResponse().setBody("""{"version":"2.0.22"}""")
+          "/api/session" -> MockResponse().setBody("""{"data":{"id":"new-sess","location":{"directory":"/repo"},"title":"新会话","time":{}}}""")
+          "/api/session/new-sess/prompt" -> MockResponse().setResponseCode(204)
+          else -> MockResponse().setBody("""{"data":[]}""")
+        }
+      }
+      val client = api(server); client.health()
+      val store = ServerStore(memoryPreferences(), memoryPreferences(), { it }, { it })
+      val (controller, state) = controller(client, LagoonState(
+        serverId = "server",
+        connected = true,
+        projects = listOf(Project("p", "/repo", "Repo")),
+        projectId = "p"
+      ))
+      put(controller, "store", store)
+      put(controller, "scope", CoroutineScope(SupervisorJob() + Dispatchers.Default))
+      controller.startSession("新会话", "第一条提示词").join()
+      withTimeout(3_000) { while (state.value.pending("create") || state.value.pending("send")) delay(10) }
+      delay(150)
+      assertEquals("new-sess", state.value.sessionId)
+      assertEquals("发送成功后输入框与草稿必须清空，不得被异步草稿恢复写回", "", state.value.draft)
+      assertEquals("", store.draft("server", "new-sess"))
+    }
+  }
+
+  @Test fun streamingEventsAndDeleteSessionSynchronizeConversationStorePool() {
+    val session = Session("s1", "/repo", "Task", 100)
+    val initialMsg = Message("m1", "assistant", 100, listOf(MessagePart("p1", "text", text = "Hello")))
+    val (controller, state) = controller(api(MockWebServer()), LagoonState(
+      serverId = "server",
+      connected = true,
+      sessions = listOf(session),
+      sessionId = "s1",
+      messages = listOf(initialMsg),
+      resources = mapOf("messages" to ResourceStatus(ResourceState.READY))
+    ))
+    val handleEvent = LagoonController::class.java.getDeclaredMethod("handleEvent", ServerEvent::class.java).apply { isAccessible = true }
+    handleEvent.invoke(controller, ServerEvent(
+      id = "evt-delta",
+      directory = "/repo",
+      type = "session.text.delta",
+      properties = org.json.JSONObject().put("sessionID", "s1").put("assistantMessageID", "m1").put("delta", " world"),
+      created = 101
+    ))
+    assertEquals("Hello world", state.value.messages.single().parts.single().text)
+    assertEquals("流式增量必须同步记录到 ConversationStorePool", "Hello world",
+      controller.conversationPool.get("server", "s1")?.messages?.single()?.parts?.single()?.text)
+
+    handleEvent.invoke(controller, ServerEvent(
+      id = "evt-del",
+      directory = "/repo",
+      type = "session.deleted",
+      properties = org.json.JSONObject().put("sessionID", "s1"),
+      created = 102
+    ))
+    assertNull("会话删除事件必须同步驱逐 ConversationStorePool 槽位", controller.conversationPool.get("server", "s1"))
+  }
+
 }

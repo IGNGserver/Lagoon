@@ -85,6 +85,70 @@ class SshHostTest {
     }
   }
 
+  @Test fun bootstrapReusesAndStopsProcessEvenWhenStartTimeFileIsEmpty() {
+    assumeTrue(File("/bin/sh").exists())
+    val root = Files.createTempDirectory("lagoon-ssh-empty-st").toFile()
+    val home = File(root, "home").apply { mkdirs() }
+    val bin = File(root, "bin").apply { mkdirs() }
+    val dsh = File(bin, "dsh").apply {
+      writeText(
+        """
+        #!/bin/sh
+        echo "dsh web: http://127.0.0.1:45679/?token=test-token-2"
+        sleep 60
+        """.trimIndent()
+      )
+      setExecutable(true)
+    }
+    val transport = LocalShellTransport(home, "${bin.absolutePath}:/usr/bin:/bin")
+    val bootstrap = RemoteDshBootstrap(transport, launchCommand = "dsh web", startTimeoutSeconds = 10)
+    try {
+      val first = bootstrap.start()
+      assertEquals(45679, first.port)
+      // 模拟旧版或非 /proc 环境留下 0 字节 web.st：仍应回退到命令行参数校验并正常复用/停止，不泄漏孤儿进程
+      File(home, ".dsh-app-remote/web.st").writeText("")
+      val second = bootstrap.ensureRunning()
+      assertTrue("empty web.st must fall back to ps args check and reuse process", second.reused)
+      assertEquals(first.pid, second.pid)
+    } finally {
+      bootstrap.stop()
+      dsh.delete()
+      root.deleteRecursively()
+    }
+  }
+
+  @Test fun sshHostManagerRefCountsSharedLinkAcrossMultipleClientHandles() {
+    val prefs = com.igng.opencode.lagoon.core.FakeSharedPreferences()
+    val secretPrefs = com.igng.opencode.lagoon.core.FakeSharedPreferences()
+    val store = com.igng.opencode.lagoon.core.SshHostStore(prefs, secretPrefs, { it }, { it })
+    val config = SshHostConfig(
+      id = "ssh-ref", name = "DevBox", host = "127.0.0.1", port = 22, user = "dev",
+      auth = com.igng.opencode.lagoon.core.SshAuthMethod.PASSWORD,
+      hostKeyType = "ssh-ed25519", hostKeyFingerprint = "SHA256:test"
+    )
+    store.save(config, com.igng.opencode.lagoon.core.SshSecrets(password = "pw"))
+    val profile = com.igng.opencode.lagoon.core.ServerProfile(
+      id = "p-ssh", name = "DevBox", url = config.profileUrl(), username = "dev",
+      kind = com.igng.opencode.lagoon.core.ServerKind.DSH, sshHostId = config.id
+    )
+    val manager = SshHostManager(store)
+    try {
+      val monitorClient = manager.client(profile)
+      val tempClient = manager.client(profile)
+      // 关闭临时客户端不得销毁监控仍持有的共享 SshHostLink
+      tempClient.close()
+      assertTrue(tempClient.isClosed)
+      org.junit.Assert.assertFalse("监控持有的客户端不应被临时客户端连带关闭", monitorClient.isClosed)
+      org.junit.Assert.assertNotNull(manager.status(config.id))
+      // 最后一个持有者关闭后才真正回收底层连接
+      monitorClient.close()
+      assertTrue(monitorClient.isClosed)
+      org.junit.Assert.assertNull(manager.status(config.id))
+    } finally {
+      manager.closeAll()
+    }
+  }
+
   private class LocalShellTransport(private val home: File, private val path: String) : SshTransport {
     override val isClosed: Boolean = false
 

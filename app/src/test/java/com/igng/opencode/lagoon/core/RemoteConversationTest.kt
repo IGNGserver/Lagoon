@@ -89,6 +89,70 @@ class RemoteConversationTest {
     }
   }
 
+  /**
+   * 端到端回归：Goal / Schedule / Plugin / Credential 在真实 RemoteGateway + FakeRemoteHost 严格 `{args}` 校验下
+   * 全部使用合法的 Typert RPC 信封，不再因顶层缺少 `args` 报 `gateway/internal`。
+   */
+  @Test fun remoteGoalSchedulePluginAndCredentialCallsCarryStrictArgsEnvelope() = runBlocking {
+    FakeRemoteHost().use { host ->
+      host.call = { endpoint, payload ->
+        val args = payload.getJSONObject("args")
+        when (endpoint) {
+          "goals/get" -> {
+            assertEquals("s-remote", args.getString("agentId"))
+            host.ok(JSONObject().put("id", "g1").put("revision", 2).put("objective", "完成修复").put("phase", "active")
+              .put("maxGoalRounds", 16).put("roundsStarted", 1).put("activation", "armed"))
+          }
+          "goals/create" -> {
+            assertEquals("s-remote", args.getString("agentId"))
+            assertEquals("新目标", args.getJSONObject("request").getString("objective"))
+            host.ok(JSONObject().put("ref", JSONObject().put("id", "g2").put("revision", 1)))
+          }
+          "goals/pause" -> {
+            assertEquals("s-remote", args.getString("agentId"))
+            assertEquals("g1", args.getJSONObject("ref").getString("id"))
+            host.ok(JSONObject())
+          }
+          "schedule/list" -> {
+            assertEquals("s-remote", args.getJSONObject("request").getString("sessionId"))
+            host.ok(JSONArray().put(JSONObject().put("id", "sch-1").put("kind", "every").put("everySeconds", 300).put("title", "轮询")))
+          }
+          "pluginManager/setBundleEnabled" -> {
+            assertEquals("dsh-bundle", args.getString("name"))
+            host.ok(JSONObject())
+          }
+          "pluginManager/setPluginEnabled" -> {
+            assertEquals("plugin-1", args.getString("id"))
+            host.ok(JSONObject())
+          }
+          "credentials/describe" -> {
+            assertEquals("API_KEY", args.getJSONArray("refs").getString(0))
+            host.ok(JSONObject().put("API_KEY", JSONObject().put("configured", true).put("writable", true)))
+          }
+          "credentials/set", "credentials/unset" -> host.ok(JSONObject())
+          else -> host.ok(JSONObject())
+        }
+      }
+      host.start()
+      val (session, backend) = backend(host)
+      try {
+        val goal = backend.client.goal("s-remote")
+        assertEquals("g1", goal?.id)
+        assertTrue(backend.client.createGoal("s-remote", "新目标", 10))
+        assertTrue(backend.client.goalAction("s-remote", "g1", 2, "pause"))
+        assertEquals(1, backend.client.schedules("s-remote").size)
+        assertTrue(backend.client.setPluginBundle("dsh-bundle", true))
+        assertTrue(backend.client.setPluginEntry("plugin-1", false))
+        assertTrue(backend.client.credentialStatus(listOf("API_KEY")).getValue("API_KEY").configured)
+        assertTrue(backend.client.setCredential("API_KEY", "secret"))
+        assertTrue(backend.client.clearCredential("API_KEY"))
+      } finally {
+        backend.close()
+        session.close()
+      }
+    }
+  }
+
   /** 与真机一致：~1.5 MB 的快照会被切成几十个 DSHF 分片，跨 Noise 逐帧送达。 */
   @Test fun loadsLargeSnapshotDeliveredInFragments() = runBlocking {
     val id = "session-${UUID.randomUUID()}"

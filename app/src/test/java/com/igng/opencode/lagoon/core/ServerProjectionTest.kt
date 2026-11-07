@@ -215,4 +215,20 @@ class ServerProjectionTest {
     assertTrue(state.globalSummary.isEmpty)
     assertEquals(listOf("A"), state.silentServersWithTasks())
   }
+
+  @Test fun homeProjectionCacheInvalidatesOnceOfflineTtlExpires() {
+    val t0 = 1_000_000L
+    val session = Session("same", "/repo", "A", 0, serverId = "a")
+    val snapshot = ServerOverviewSnapshot("a", a, connected = false, loading = false,
+      lastReadAt = t0, sessions = listOf(session), tasks = mapOf("same" to TaskState("same", TaskPhase.THINKING)))
+    val state = LagoonState(profiles = listOf(a), allServers = true, allServerSnapshots = mapOf("a" to snapshot))
+
+    val beforeExpiry = state.homeProjection(now = t0 + 1_000L)
+    assertEquals(SessionStatus.RUNNING, beforeExpiry.allSessionStatuses[session.key])
+    assertEquals(1, beforeExpiry.summary.running)
+
+    val afterExpiry = state.homeProjection(now = t0 + STALE_CONNECTION_TASK_MILLIS + 1_000L)
+    assertEquals(SessionStatus.NONE, afterExpiry.allSessionStatuses[session.key])
+    assertEquals(0, afterExpiry.summary.running)
+  }
 }

@@ -308,10 +308,14 @@ internal class TranscriptStore internal constructor(
 
     private fun openBackend(context: Context): Backend {
       val driver = AndroidSqlDriver(context, "transcripts.db")
-      val wrapper = KeystoreCipher("lagoon-transcript-key")
+      val wrapper = KeystoreCipher.of("lagoon-transcript-key")
       fun freshKey(): ByteArray = ByteArray(32).also(SecureRandom()::nextBytes).also { key ->
-        driver.execute("DELETE FROM message"); driver.execute("DELETE FROM sync")
-        driver.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('dek', ?)", arrayOf(wrapper.encrypt(android.util.Base64.encodeToString(key, android.util.Base64.NO_WRAP))))
+        val sealed = wrapper.encrypt(android.util.Base64.encodeToString(key, android.util.Base64.NO_WRAP))
+        driver.transaction {
+          driver.execute("DELETE FROM message")
+          driver.execute("DELETE FROM sync")
+          driver.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('dek', ?)", arrayOf(sealed))
+        }
       }
       SCHEMA.forEach(driver::execute)
       // A data key the Keystore can no longer unwrap (restored backup, cleared credentials) makes every

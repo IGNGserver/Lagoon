@@ -139,13 +139,15 @@ class DshApiTest {
       assertEquals("/api/settings/describe", server.takeRequest().path)
       val mutate = server.takeRequest()
       assertEquals("/api/settings/mutate", mutate.path)
-      val body = JSONObject(mutate.body.readUtf8()).getJSONObject("payload")
+      val body = JSONObject(mutate.body.readUtf8()).getJSONObject("payload").getJSONObject("args")
       assertEquals("llm-pi-ai", body.getString("ns"))
       assertEquals(3, body.getInt("expectedRevision"))
       val op = body.getJSONArray("ops").getJSONObject(0)
       assertEquals("providers", op.getJSONArray("path").getString(0))
       assertEquals("acme", op.getJSONArray("path").getString(1))
-      assertEquals("/api/credentials/set", server.takeRequest().path)
+      val credSet = server.takeRequest()
+      assertEquals("/api/credentials/set", credSet.path)
+      assertEquals("sk-test", JSONObject(credSet.body.readUtf8()).getJSONObject("payload").getJSONObject("args").getString("value"))
     }
   }
 
@@ -160,7 +162,7 @@ class DshApiTest {
       server.takeRequest()
       val request = server.takeRequest()
       assertEquals("/api/schedule/list", request.path)
-      assertEquals("s1", JSONObject(request.body.readUtf8()).getJSONObject("payload").getJSONObject("request").getString("sessionId"))
+      assertEquals("s1", JSONObject(request.body.readUtf8()).getJSONObject("payload").getJSONObject("args").getJSONObject("request").getString("sessionId"))
     }
   }
 
@@ -208,12 +210,18 @@ class DshApiTest {
       assertTrue(client.createGoal("s1", "新目标", 5))
       assertTrue(client.goalAction("s1", "g1", 2, "pause"))
       server.takeRequest() // root
-      assertEquals("/api/goals/get", server.takeRequest().path)
-      assertEquals("/api/goals/create", server.takeRequest().path)
+      val getReq = server.takeRequest()
+      assertEquals("/api/goals/get", getReq.path)
+      assertEquals("s1", JSONObject(getReq.body.readUtf8()).getJSONObject("payload").getJSONObject("args").getString("agentId"))
+      val createReq = server.takeRequest()
+      assertEquals("/api/goals/create", createReq.path)
+      val createArgs = JSONObject(createReq.body.readUtf8()).getJSONObject("payload").getJSONObject("args")
+      assertEquals("s1", createArgs.getString("agentId"))
+      assertEquals("新目标", createArgs.getJSONObject("request").getString("objective"))
       val pause = server.takeRequest()
       assertEquals("/api/goals/pause", pause.path)
       val body = JSONObject(pause.body.readUtf8())
-      assertEquals("s1", body.getJSONObject("payload").getString("agentId"))
+      assertEquals("s1", body.getJSONObject("payload").getJSONObject("args").getString("agentId"))
     }
   }
 
@@ -231,9 +239,13 @@ class DshApiTest {
       assertTrue(client.setCredential("DEEPSEEK_API_KEY", "sk-test"))
       assertTrue(client.clearCredential("DEEPSEEK_API_KEY"))
       server.takeRequest() // root token exchange
-      assertEquals("/api/credentials/describe", server.takeRequest().path)
+      val describe = server.takeRequest()
+      assertEquals("/api/credentials/describe", describe.path)
+      assertEquals("DEEPSEEK_API_KEY", JSONObject(describe.body.readUtf8()).getJSONObject("payload").getJSONObject("args").getJSONArray("refs").getString(0))
       val set = server.takeRequest(); assertEquals("/api/credentials/set", set.path)
-      assertEquals("/api/credentials/unset", server.takeRequest().path)
+      assertEquals("sk-test", JSONObject(set.body.readUtf8()).getJSONObject("payload").getJSONObject("args").getString("value"))
+      val unset = server.takeRequest(); assertEquals("/api/credentials/unset", unset.path)
+      assertEquals("DEEPSEEK_API_KEY", JSONObject(unset.body.readUtf8()).getJSONObject("payload").getJSONObject("args").getString("ref"))
     }
   }
 
@@ -241,11 +253,28 @@ class DshApiTest {
     MockWebServer().use { server ->
       server.enqueue(rootOk())
       server.enqueue(envelope("""[{"name":"dsh-opencode-go","enabled":true,"installed":true,"official":false,"version":"1.0.0","description":"Go"} ]"""))
-      val bundles = api(server).pluginBundles()
+      server.enqueue(envelope("""{}"""))
+      server.enqueue(envelope("""{}"""))
+      val client = api(server)
+      val bundles = client.pluginBundles()
       assertEquals(1, bundles.size)
       assertEquals("dsh-opencode-go", bundles.single().name)
       assertTrue(bundles.single().enabled)
       assertEquals("1.0.0", bundles.single().version)
+      assertTrue(client.setPluginBundle("dsh-opencode-go", false))
+      assertTrue(client.setPluginEntry("entry-1", true))
+      server.takeRequest() // root
+      server.takeRequest() // listBundles
+      val bundleToggle = server.takeRequest()
+      assertEquals("/api/pluginManager/setBundleEnabled", bundleToggle.path)
+      val bundleArgs = JSONObject(bundleToggle.body.readUtf8()).getJSONObject("payload").getJSONObject("args")
+      assertEquals("dsh-opencode-go", bundleArgs.getString("name"))
+      assertFalse(bundleArgs.getBoolean("enabled"))
+      val entryToggle = server.takeRequest()
+      assertEquals("/api/pluginManager/setPluginEnabled", entryToggle.path)
+      val entryArgs = JSONObject(entryToggle.body.readUtf8()).getJSONObject("payload").getJSONObject("args")
+      assertEquals("entry-1", entryArgs.getString("id"))
+      assertTrue(entryArgs.getBoolean("enabled"))
     }
   }
 

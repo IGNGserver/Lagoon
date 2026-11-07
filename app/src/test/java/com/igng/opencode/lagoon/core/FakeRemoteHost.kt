@@ -226,7 +226,12 @@ internal class FakeRemoteHost(
       "harness.transport.describe" -> respond(JSONObject().put("capabilities", JSONArray(capabilities)))
       "harness.remote.call" -> {
         val endpoint = params.getString("endpoint")
-        respond(call(endpoint, params.optJSONObject("payload") ?: JSONObject()))
+        val rpcPayload = params.optJSONObject("payload") ?: JSONObject()
+        if (rpcPayload.length() != 1 || rpcPayload.optJSONObject("args") == null) {
+          respond(fail("gateway/internal", "Remote payload must contain exactly one plain-object args field"))
+        } else {
+          respond(call(endpoint, rpcPayload))
+        }
       }
       "harness.remote.stream.open" -> {
         streamOpens += params

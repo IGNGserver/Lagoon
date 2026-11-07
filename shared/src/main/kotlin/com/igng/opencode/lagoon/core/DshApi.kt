@@ -332,12 +332,12 @@ class DshApi(
     for ((key, value) in fields) if (value != null) out.put(key, value)
   }
 
-  private fun envelope(args: JSONObject): JSONObject = JSONObject().put("args", args)
+  private fun envelope(args: JSONObject): RpcPayload = RpcPayload(JSONObject().put("args", args))
 
   /** 常见的 `{request: …}` 形状。 */
-  private fun requestArgs(request: JSONObject): JSONObject = envelope(argsOf("request" to request))
+  private fun requestArgs(request: JSONObject): RpcPayload = envelope(argsOf("request" to request))
 
-  private fun noArgs(): JSONObject = envelope(JSONObject())
+  private fun noArgs(): RpcPayload = envelope(JSONObject())
 
   /**
    * Runs one blocking OkHttp call on the shared IO dispatcher, but cancels the socket as soon as the
@@ -365,10 +365,11 @@ class DshApi(
     }
 
   /** 一元调用的请求信封是 `{type, rpcId, method, payload}`；响应是 `{type, rpcId, result}`。 */
-  private suspend fun call(endpoint: String, payload: JSONObject = noArgs(), retried: Boolean = false): Any? =
+  private suspend fun call(endpoint: String, payload: RpcPayload = noArgs(), retried: Boolean = false): Any? =
     withContext(Dispatchers.IO) {
+      val wirePayload = payload.json
       remoteBackend?.let { remote ->
-        try { return@withContext remote.call(endpoint, payload) }
+        try { return@withContext remote.call(endpoint, wirePayload) }
         catch (cancel: CancellationException) { throw cancel }
         // Keep typed connection failures intact: the controller uses their kind to offer login,
         // fingerprint or host recovery. Only untyped I/O is collapsed into a transport failure.
@@ -391,7 +392,7 @@ class DshApi(
         .put("type", "client-request")
         .put("rpcId", UUID.randomUUID().toString())
         .put("method", endpoint)
-        .put("payload", payload)
+        .put("payload", wirePayload)
       val request = Request.Builder()
         .url(url)
         .header("Content-Type", "application/json; charset=utf-8")
@@ -441,7 +442,7 @@ class DshApi(
     else -> upstream
   }
 
-  private suspend fun callObject(endpoint: String, payload: JSONObject = noArgs()): JSONObject =
+  private suspend fun callObject(endpoint: String, payload: RpcPayload = noArgs()): JSONObject =
     call(endpoint, payload) as? JSONObject ?: JSONObject()
 
   private fun httpMessage(status: Int): String = when (status) {
@@ -751,11 +752,12 @@ class DshApi(
   /** 打开一条 mux 流：客户端发 `open`，服务端回 `item`/`end`/`error` 帧。 */
   private suspend fun openMux(
     endpoint: String,
-    payload: JSONObject,
+    payload: RpcPayload,
     onItem: (JSONObject) -> Unit,
     onClosed: (Throwable?) -> Unit
   ): WebSocket = withContext(Dispatchers.IO) {
-    remoteBackend?.let { return@withContext it.open(endpoint, payload, onItem, onClosed) }
+    val wirePayload = payload.json
+    remoteBackend?.let { return@withContext it.open(endpoint, wirePayload, onItem, onClosed) }
     val current = cookie()
     val streamId = UUID.randomUUID().toString()
     // OkHttp 的 WebSocket 直接接受 http(s) URL 并发起 Upgrade；HttpUrl 不接受 ws/wss 方案。
@@ -778,7 +780,7 @@ class DshApi(
           .put("type", "open")
           .put("streamId", streamId)
           .put("endpoint", endpoint)
-          .put("payload", payload)
+          .put("payload", wirePayload)
         webSocket.send(open.toString())
       }
 
@@ -816,7 +818,7 @@ class DshApi(
    * 取一条流的首个 `item` 帧（`workspace/follow` 的清单、`session/follow` 的快照、`job/list` 的行）。
    * 失败必须带端点与上游原因抛出：把“读不到”当成空数据会让会话页永远空白且无法排障。
    */
-  private suspend fun fetchFirstFrame(endpoint: String, payload: JSONObject): JSONObject {
+  private suspend fun fetchFirstFrame(endpoint: String, payload: RpcPayload): JSONObject {
     val deferred = CompletableDeferred<JSONObject>()
     val socket = try {
       openMux(endpoint, payload, onItem = { frame ->
@@ -1289,7 +1291,7 @@ class DshApi(
     }
   }
 
-  private fun workspacePayload(): JSONObject =
+  private fun workspacePayload(): RpcPayload =
     if (workspaceArgsStyle == WorkspaceArgsStyle.REQUEST) requestArgs(JSONObject()) else noArgs()
 
   private fun flipWorkspaceStyle() {
@@ -1985,7 +1987,7 @@ class DshApi(
   }
 
   override suspend fun setPluginBundle(name: String, enabled: Boolean): Boolean {
-    call("pluginManager/setBundleEnabled", JSONObject().put("name", name).put("enabled", enabled))
+    call("pluginManager/setBundleEnabled", envelope(argsOf("name" to name, "enabled" to enabled)))
     return true
   }
 
@@ -2008,14 +2010,17 @@ class DshApi(
       .put("models", JSONArray().put(JSONObject().put("id", modelId)))
     val ops = JSONArray().put(JSONObject().put("op", "set")
       .put("path", JSONArray().put("providers").put(route)).put("value", profile))
-    call("settings/mutate", JSONObject().put("ns", "llm-pi-ai").put("ops", ops)
-      .put("expectedRevision", ns.optInt("revision", 0)))
+    call("settings/mutate", envelope(argsOf(
+      "ns" to "llm-pi-ai",
+      "ops" to ops,
+      "expectedRevision" to ns.optInt("revision", 0)
+    )))
     if (apiKey.isNotBlank()) setCredential(apiKeyEnv, apiKey)
     return true
   }
 
   override suspend fun schedules(sessionId: String): List<RemoteSchedule> {
-    val value = call("schedule/list", JSONObject().put("request", JSONObject().put("sessionId", sessionId))) as? JSONArray
+    val value = call("schedule/list", requestArgs(JSONObject().put("sessionId", sessionId))) as? JSONArray
       ?: return emptyList()
     return (0 until value.length()).mapNotNull { index ->
       val item = value.optJSONObject(index) ?: return@mapNotNull null
@@ -2071,7 +2076,7 @@ class DshApi(
   }
 
   override suspend fun goal(sessionId: String): RemoteGoal? {
-    val value = call("goals/get", JSONObject().put("agentId", sessionId)) as? JSONObject ?: return null
+    val value = call("goals/get", envelope(argsOf("agentId" to sessionId))) as? JSONObject ?: return null
     val id = value.optString("id").takeIf { it.isNotBlank() } ?: return null
     val ref = value.optJSONObject("ref")
     val obligation = value.optString("objective")
@@ -2091,20 +2096,22 @@ class DshApi(
   override suspend fun createGoal(sessionId: String, objective: String, maxRounds: Int?): Boolean {
     val request = JSONObject().put("objective", objective)
     if (maxRounds != null) request.put("maxGoalRounds", maxRounds)
-    call("goals/create", JSONObject().put("agentId", sessionId).put("request", request))
+    call("goals/create", envelope(argsOf("agentId" to sessionId, "request" to request)))
     return true
   }
 
   override suspend fun goalAction(sessionId: String, id: String, revision: Int, action: String): Boolean {
     if (action !in setOf("pause", "resume", "complete", "clear")) return false
-    call("goals/$action", JSONObject().put("agentId", sessionId)
-      .put("ref", JSONObject().put("id", id).put("revision", revision)))
+    call("goals/$action", envelope(argsOf(
+      "agentId" to sessionId,
+      "ref" to JSONObject().put("id", id).put("revision", revision)
+    )))
     return true
   }
 
   override suspend fun credentialStatus(refs: List<String>): Map<String, RemoteCredentialStatus> {
     if (refs.isEmpty()) return emptyMap()
-    val body = call("credentials/describe", JSONObject().put("refs", JSONArray(refs))) as? JSONObject ?: return emptyMap()
+    val body = call("credentials/describe", envelope(argsOf("refs" to JSONArray(refs)))) as? JSONObject ?: return emptyMap()
     return body.keys().asSequence().mapNotNull { ref ->
       val item = body.optJSONObject(ref) ?: return@mapNotNull null
       ref to RemoteCredentialStatus(ref, item.optBoolean("configured"), item.optBoolean("writable", true),
@@ -2114,18 +2121,18 @@ class DshApi(
 
   override suspend fun setCredential(ref: String, value: String): Boolean {
     if (ref.isBlank() || value.isBlank()) return false
-    call("credentials/set", JSONObject().put("ref", ref).put("value", value))
+    call("credentials/set", envelope(argsOf("ref" to ref, "value" to value)))
     return true
   }
 
   override suspend fun clearCredential(ref: String): Boolean {
     if (ref.isBlank()) return false
-    call("credentials/unset", JSONObject().put("ref", ref))
+    call("credentials/unset", envelope(argsOf("ref" to ref)))
     return true
   }
 
   override suspend fun setPluginEntry(entryId: String, enabled: Boolean): Boolean {
-    call("pluginManager/setPluginEnabled", JSONObject().put("id", entryId).put("enabled", enabled))
+    call("pluginManager/setPluginEnabled", envelope(argsOf("id" to entryId, "enabled" to enabled)))
     return true
   }
 
@@ -2814,3 +2821,7 @@ class DshApi(
     internal val TUNNEL_CAPABILITIES: ApiCapabilities get() = CAPABILITIES
   }
 }
+
+/** Typert Gateway RPC 载荷只允许 `{args:{…}}` 信封；用类型包装避免新增接口时漏掉 `envelope(...)`。 */
+@JvmInline
+private value class RpcPayload(val json: JSONObject)

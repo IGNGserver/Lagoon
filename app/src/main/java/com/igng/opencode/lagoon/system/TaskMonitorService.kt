@@ -1,11 +1,13 @@
 package com.igng.opencode.lagoon.system
 
+import android.app.Notification
 import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
+import com.igng.opencode.lagoon.core.Diagnostics
 import com.igng.opencode.lagoon.core.LagoonController
 import com.igng.opencode.lagoon.core.LiveUpdateContent
 import com.igng.opencode.lagoon.core.LiveUpdateStage
@@ -47,8 +49,7 @@ class TaskMonitorService : Service() {
     var foregroundId = if (LiveUpdateContent.stageOf(summary) == LiveUpdateStage.ACTIVE)
       TaskNotifications.summaryId(TaskNotifications.ALL_SERVERS_ID)
     else TaskNotifications.backgroundId(TaskNotifications.ALL_SERVERS_ID)
-    if (Build.VERSION.SDK_INT >= 29) startForeground(foregroundId, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
-    else startForeground(foregroundId, notification)
+    if (!tryStartForeground(foregroundId, notification)) return START_NOT_STICKY
     if (monitor == null) {
       controller.setMonitoring(true)
       monitor = scope.launch {
@@ -65,8 +66,7 @@ class TaskMonitorService : Service() {
             if (desired != foregroundId) {
               val next = if (active) notifications.buildSummary(TaskNotifications.ALL_PROFILE, state.globalSummary, state.globalSummaryTarget)
                 else notifications.buildBackgroundSummary(TaskNotifications.ALL_PROFILE, state.globalBackgroundTargets)
-              if (Build.VERSION.SDK_INT >= 29) startForeground(desired, next, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
-              else startForeground(desired, next)
+              if (!tryStartForeground(desired, next)) return@collect
               if (active) notifications.cancelBackground(TaskNotifications.ALL_SERVERS_ID)
               else notifications.cancelSummary(TaskNotifications.ALL_SERVERS_ID)
               foregroundId = desired
@@ -92,6 +92,15 @@ class TaskMonitorService : Service() {
     }
     return START_REDELIVER_INTENT
   }
+  private fun tryStartForeground(id: Int, notification: Notification): Boolean =
+    runCatching {
+      if (Build.VERSION.SDK_INT >= 29) startForeground(id, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+      else startForeground(id, notification)
+    }.onFailure { error ->
+      Diagnostics.warn("Monitor", "前台服务通知启动受限，降级停止后台监控", error)
+      stopSelf()
+    }.isSuccess
+
   override fun onTimeout(startId: Int, fgsType: Int) { stopSelf() }
   override fun onDestroy() {
     settle?.cancel(); monitor?.cancel()

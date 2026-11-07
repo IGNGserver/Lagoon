@@ -5,6 +5,7 @@ import android.content.SharedPreferences
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 
 class ServerStore internal constructor(private val preferences: SharedPreferences, private val secrets: SharedPreferences,
   private val encryptValue: (String) -> String, private val decryptValue: (String) -> String,
@@ -22,10 +23,15 @@ class ServerStore internal constructor(private val preferences: SharedPreference
   internal fun remoteCatalogs(): List<RemoteCatalog> = remoteCatalogStore.load()
   internal fun saveRemoteCatalog(catalog: RemoteCatalog) = remoteCatalogStore.save(catalog)
   internal fun clearRemoteCatalog(origin: String, account: String) = remoteCatalogStore.clear(origin, account)
-  constructor(context: Context) : this(context.getSharedPreferences("servers", Context.MODE_PRIVATE),
+  constructor(context: Context) : this(
+    context.getSharedPreferences("servers", Context.MODE_PRIVATE),
     context.getSharedPreferences("secrets", Context.MODE_PRIVATE),
-    KeystoreCipher("lagoon-server-passwords", legacyAlias = "opencode-lagoon-server-passwords")::encrypt,
-    KeystoreCipher("lagoon-server-passwords", legacyAlias = "opencode-lagoon-server-passwords")::decrypt, context.applicationContext)
+    KeystoreCipher.of("lagoon-server-passwords", legacyAlias = "opencode-lagoon-server-passwords")::encrypt,
+    KeystoreCipher.of("lagoon-server-passwords", legacyAlias = "opencode-lagoon-server-passwords")::decrypt,
+    context.applicationContext
+  )
+
+  private val previewCache = ConcurrentHashMap<String, SessionPreview>()
 
   fun profiles(): List<ServerProfile> = try {
     JSONArray(preferences.getString("profiles", "[]")).objects().map {
@@ -280,13 +286,20 @@ class ServerStore internal constructor(private val preferences: SharedPreference
     editor.remove("selectedProject").putInt("projectCatalogVersion", 2).apply()
   }
 
-  fun sessionPreview(server: String, session: String): SessionPreview = runCatching {
-    val raw = secrets.getString("preview:$server:$session", null)?.let(decryptValue)
-      ?: preferences.getString("preview:$server:$session", "{}").orEmpty()
-    val value = JSONObject(raw)
-    SessionPreview(SessionContent.valueOf(value.str("content").ifBlank { "UNKNOWN" }), value.str("text"))
-  }.getOrDefault(SessionPreview())
+  fun sessionPreview(server: String, session: String): SessionPreview {
+    val cacheKey = "$server\u0000$session"
+    previewCache[cacheKey]?.let { return it }
+    return runCatching {
+      val raw = secrets.getString("preview:$server:$session", null)?.let(decryptValue)
+        ?: preferences.getString("preview:$server:$session", "{}").orEmpty()
+      val value = JSONObject(raw)
+      SessionPreview(SessionContent.valueOf(value.str("content").ifBlank { "UNKNOWN" }), value.str("text"))
+    }.getOrDefault(SessionPreview()).also { previewCache[cacheKey] = it }
+  }
   fun rememberPreview(server: String, session: String, preview: SessionPreview) {
+    val cacheKey = "$server\u0000$session"
+    if (previewCache[cacheKey] == preview) return
+    previewCache[cacheKey] = preview
     runCatching {
       val value = JSONObject().put("content", preview.content.name).put("text", preview.text).toString()
       secrets.edit().putString("preview:$server:$session", encryptValue(value)).apply()
@@ -328,6 +341,7 @@ class ServerStore internal constructor(private val preferences: SharedPreference
   }
   override fun forgetSession(server: String, session: String) {
     forgetTask(server, session)
+    previewCache.remove("$server\u0000$session")
     val editor = preferences.edit()
     listOf("preview", "configuration").forEach { editor.remove("$it:$server:$session") }
     editor.apply()
@@ -461,6 +475,7 @@ class ServerStore internal constructor(private val preferences: SharedPreference
     decryptValue(value)
   } catch (_: Exception) { null }
   fun delete(id: String) {
+    previewCache.keys.removeAll { it.startsWith("$id\u0000") }
     val editor = preferences.edit().putString("profiles", profilesJson(profiles().filterNot { it.id == id }))
       .remove("directories:$id").remove("sessionNotices:$id").remove("collapsedSections:$id").remove("collapsedProjects:$id").remove("pinned:$id").remove("remoteMigration:$id")
       .remove("backgroundRunning:$id")

@@ -236,24 +236,18 @@ private class JschSshTransport(private val session: Session) : SshTransport {
   }
 
   override fun probeTunnel(host: String, port: Int, timeoutMillis: Long): Boolean {
-    val writer = java.io.PipedOutputStream()
-    val input = java.io.PipedInputStream(writer)
     val channel = session.openChannel("direct-tcpip") as ChannelDirectTCPIP
     return try {
       channel.setHost(host)
       channel.setPort(port)
-      channel.setInputStream(input)
+      channel.setInputStream(java.io.ByteArrayInputStream(ByteArray(0)))
       channel.setOutputStream(ByteArrayOutputStream())
       channel.connect(timeoutMillis.toInt().coerceAtLeast(1_000))
-      val deadline = System.currentTimeMillis() + 1_500
-      while (!channel.isConnected && System.currentTimeMillis() < deadline) Thread.sleep(100)
       channel.isConnected
     } catch (_: Exception) {
       false
     } finally {
       runCatching { channel.disconnect() }
-      runCatching { writer.close() }
-      runCatching { input.close() }
     }
   }
 

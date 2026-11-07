@@ -18,8 +18,8 @@ internal class SshHostStore internal constructor(
   constructor(context: Context) : this(
     context.getSharedPreferences("ssh-hosts", Context.MODE_PRIVATE),
     context.getSharedPreferences("ssh-secrets", Context.MODE_PRIVATE),
-    KeystoreCipher("lagoon-ssh-secrets")::encrypt,
-    KeystoreCipher("lagoon-ssh-secrets")::decrypt
+    KeystoreCipher.of("lagoon-ssh-secrets")::encrypt,
+    KeystoreCipher.of("lagoon-ssh-secrets")::decrypt
   )
 
   fun load(): List<SshHostConfig> {

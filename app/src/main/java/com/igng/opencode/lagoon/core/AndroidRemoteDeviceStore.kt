@@ -10,8 +10,11 @@ internal class AndroidRemoteDeviceStore internal constructor(
   private val seal: (String) -> String,
   private val open: (String) -> String
 ) : RemoteDeviceStore {
-  constructor(context: Context) : this(context.getSharedPreferences("remote-device-identities", Context.MODE_PRIVATE),
-    KeystoreCipher("lagoon-remote-device-identities")::encrypt, KeystoreCipher("lagoon-remote-device-identities")::decrypt)
+  constructor(context: Context) : this(
+    context.getSharedPreferences("remote-device-identities", Context.MODE_PRIVATE),
+    KeystoreCipher.of("lagoon-remote-device-identities")::encrypt,
+    KeystoreCipher.of("lagoon-remote-device-identities")::decrypt
+  )
 
   override fun load(slot: String): RemoteDeviceRecord? = synchronized(lock) {
     val sealed = preferences.getString(slot, null) ?: return null
