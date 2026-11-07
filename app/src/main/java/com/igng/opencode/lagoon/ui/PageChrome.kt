@@ -149,31 +149,38 @@ internal fun MenuPopup(show: Boolean, onDismiss: () -> Unit, sections: List<Menu
   val positionProvider = rememberImeAwarePopupPositionProvider(show)
   SuperListPopup(show = show, alignment = alignment, popupPositionProvider = positionProvider, onDismissRequest = onDismiss) {
     ListPopupColumn {
-      visible.forEachIndexed { sectionIndex, section ->
-        if (sectionIndex > 0) HorizontalDivider(Modifier.padding(horizontal = 20.dp, vertical = 4.dp))
-        section.title?.let {
-          Text(it, Modifier.padding(start = 20.dp, end = 20.dp, top = if (sectionIndex == 0) 18.dp else 10.dp, bottom = 2.dp),
-            style = MiuixTheme.textStyles.footnote1.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
-        }
-        section.actions.forEachIndexed { index, action ->
-          // SpinnerItemImpl pads only the first and last rows of a list; map our rows onto that rule.
-          val first = sectionIndex == 0 && index == 0 && section.title == null
-          val last = sectionIndex == visible.lastIndex && index == section.actions.lastIndex
-          val position = if (first) 0 else 1
-          val colors = if (action.danger) SpinnerDefaults.spinnerColors(contentColor = MiuixColorTokens.Error) else SpinnerDefaults.spinnerColors()
-          val tint = when {
-            action.danger -> MiuixColorTokens.Error
-            action.selected -> MiuixTheme.colorScheme.primary
-            else -> MiuixTheme.colorScheme.onSurface
+      // MIUIX 0.8.8's ListPopupColumn derives its height from at most
+      // MAX_ITEMS_FOR_HEIGHT = 8 direct children (ListPopupKt.minIntrinsicHeight), so a
+      // menu with more rows is cut at the 8th row even though it is scrollable. The home
+      // menu put 设置 exactly there. One outer Column makes the whole menu a single
+      // measurable, so the intrinsic height covers every row and tall menus scroll.
+      Column {
+        visible.forEachIndexed { sectionIndex, section ->
+          if (sectionIndex > 0) HorizontalDivider(Modifier.padding(horizontal = 20.dp, vertical = 4.dp))
+          section.title?.let {
+            Text(it, Modifier.padding(start = 20.dp, end = 20.dp, top = if (sectionIndex == 0) 18.dp else 10.dp, bottom = 2.dp),
+              style = MiuixTheme.textStyles.footnote1.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
           }
-          SpinnerItemImpl(
-            entry = SpinnerEntry(icon = action.icon?.let { icon -> { modifier -> Icon(icon, null, modifier, tint = tint) } }, title = action.label),
-            entryCount = if (last) position + 1 else position + 2,
-            isSelected = action.selected,
-            index = position,
-            spinnerColors = colors,
-            onSelectedIndexChange = { onDismiss(); action.onClick() }
-          )
+          section.actions.forEachIndexed { index, action ->
+            // SpinnerItemImpl pads only the first and last rows of a list; map our rows onto that rule.
+            val first = sectionIndex == 0 && index == 0 && section.title == null
+            val last = sectionIndex == visible.lastIndex && index == section.actions.lastIndex
+            val position = if (first) 0 else 1
+            val colors = if (action.danger) SpinnerDefaults.spinnerColors(contentColor = MiuixColorTokens.Error) else SpinnerDefaults.spinnerColors()
+            val tint = when {
+              action.danger -> MiuixColorTokens.Error
+              action.selected -> MiuixTheme.colorScheme.primary
+              else -> MiuixTheme.colorScheme.onSurface
+            }
+            SpinnerItemImpl(
+              entry = SpinnerEntry(icon = action.icon?.let { icon -> { modifier -> Icon(icon, null, modifier, tint = tint) } }, title = action.label),
+              entryCount = if (last) position + 1 else position + 2,
+              isSelected = action.selected,
+              index = position,
+              spinnerColors = colors,
+              onSelectedIndexChange = { onDismiss(); action.onClick() }
+            )
+          }
         }
       }
     }

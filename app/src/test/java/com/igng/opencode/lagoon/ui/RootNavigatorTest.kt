@@ -66,7 +66,7 @@ class RootNavigatorTest {
   }
 
   @Test fun twoBacksInQuickSuccessionEachPopOneLevel() {
-    navigator.navigate(SessionNavigation(RootPage.ARCHIVED).open("parent").open("child", child = true))
+    navigator.navigate(SessionNavigation(RootPage.DEVICES).open("parent").open("child", child = true))
     swipe(); release()
     val first = navigator.gesture!!
     assertEquals(BackPhase.COMMITTED, first.phase)
@@ -81,7 +81,7 @@ class RootNavigatorTest {
     assertEquals(second, navigator.gesture)
     assertEquals(0.3f, navigator.progress)
     release()
-    assertEquals(SessionNavigation(RootPage.ARCHIVED), navigator.navigation)
+    assertEquals(SessionNavigation(RootPage.DEVICES), navigator.navigation)
     swipe(); release()
     assertEquals(SessionNavigation(), navigator.navigation)
     assertEquals(0, systemBacks)
@@ -154,10 +154,10 @@ class RootNavigatorTest {
 
   @Test fun peekShowsTheOriginatingPageOnlyWhenLeavingTheOutermostSession() {
     navigator.server = "srv"
-    navigator.navigate(SessionNavigation(RootPage.ARCHIVED).open("parent"))
+    navigator.navigate(SessionNavigation(RootPage.DEVICES).open("parent"))
     swipe()
-    assertEquals(NavRoute(RootPage.ARCHIVED, "parent", 2, "srv"), navigator.gesture?.route)
-    assertEquals(SessionNavigation(RootPage.ARCHIVED).route, navigator.gesture?.peek)
+    assertEquals(NavRoute(RootPage.DEVICES, "parent", 2, "srv"), navigator.gesture?.route)
+    assertEquals(SessionNavigation(RootPage.DEVICES).route, navigator.gesture?.peek)
     dispatcher.dispatchOnBackCancelled()
     navigator.navigate(navigator.navigation.open("child", child = true))
     swipe()

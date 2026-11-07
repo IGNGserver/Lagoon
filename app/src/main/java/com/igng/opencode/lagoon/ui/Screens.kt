@@ -66,7 +66,7 @@ import java.util.UUID
 
 /* ------------------------------------------------------------------ *
  * 信息架构主线：Server → Project/Directory → Session → Conversation
- * 「会话」是唯一的根页面；设置与已归档从首页 ⋯ 菜单整页推入。
+ * 「会话」是唯一的根页面；设置从首页 ⋯ 菜单整页推入。
  * ------------------------------------------------------------------ */
 
 private class DateFormatterCache {
@@ -544,9 +544,13 @@ fun SettingsScreen(
     mutableStateOf(preview)
   }
   LaunchedEffect(updater) { updater.check(includePrerelease, automatic = true) }
+  LaunchedEffect(state.serverId, state.connected) { controller.loadDefaultCatalog() }
   var installAllowed by remember { mutableStateOf(context.packageManager.canRequestPackageInstalls()) }
   var pendingInstall by rememberSaveable { mutableStateOf(false) }
   var showReleaseNotes by rememberSaveable { mutableStateOf(false) }
+  var hostDialog by rememberSaveable { mutableStateOf<String?>(null) }
+  val hostProfile = state.server
+  LaunchedEffect(hostProfile?.id) { hostDialog = null }
   LaunchedEffect(update.release?.version) { showReleaseNotes = false }
   // 只展示系统标准实时更新的状态；不检测任何厂商通道。检测放到 IO 线程执行。
   var notificationsEnabled by remember { mutableStateOf(true) }
@@ -645,6 +649,37 @@ fun SettingsScreen(
             else -> "未配置过滤 · 显示服务器返回的全部模型"
           },
           onClick = onManageModels
+        )
+      }
+    }
+
+    item {
+      SmallTitle("新会话默认值")
+      NewSessionDefaultsCard(state, controller)
+    }
+
+    if (hostProfile != null && (hostProfile.kind == ServerKind.DSH || hostProfile.kind == ServerKind.DSH_REMOTE)) item {
+      SmallTitle("DSH 主机设置")
+      Card(Modifier.fillMaxWidth()) {
+        SuperArrow(
+          title = "主机模型密钥",
+          summary = "写入 Host 凭据引用；值不会回显",
+          onClick = { hostDialog = "model-key" }
+        )
+        SuperArrow(
+          title = "自定义模型服务商",
+          summary = "写入 Host 的 llm-pi-ai 配置（路由、协议、Base URL、模型）",
+          onClick = { hostDialog = "provider" }
+        )
+        SuperArrow(
+          title = "主机扩展（插件开关）",
+          summary = "只列出 Host 允许远程开关的官方 bundle；安装与配置仍在电脑上",
+          onClick = { hostDialog = "extensions" }
+        )
+        if (hostProfile.kind == ServerKind.DSH_REMOTE) SuperArrow(
+          title = "连接详情",
+          summary = "Relay 路径、主机指纹与加密 RPC 诊断",
+          onClick = { hostDialog = "details" }
         )
       }
     }
@@ -795,6 +830,13 @@ fun SettingsScreen(
   }
 
   val releaseForNotes = update.release
+
+  if (hostProfile != null) when (hostDialog) {
+    "extensions" -> RemoteExtensionsDialog(hostProfile, controller) { hostDialog = null }
+    "model-key" -> RemoteModelKeyDialog(hostProfile, controller) { hostDialog = null }
+    "provider" -> RemoteProviderDialog(hostProfile, controller) { hostDialog = null }
+    "details" -> RemoteConnectionDialog(hostProfile, state, controller) { hostDialog = null }
+  }
 
   if (showReleaseNotes && releaseForNotes != null) {
     SuperBottomSheet(

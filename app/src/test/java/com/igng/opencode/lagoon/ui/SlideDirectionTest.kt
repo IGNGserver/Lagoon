@@ -14,7 +14,7 @@ class SlideDirectionTest {
   }
 
   @Test fun goingBackEntersFromTheLeft() {
-    val child = SessionNavigation(RootPage.ARCHIVED).open("s1").open("c1", true)
+    val child = SessionNavigation(RootPage.DEVICES).open("s1").open("c1", true)
     assertEquals(-1, slideDirection(child.route, child.back().route))
     assertEquals(-1, slideDirection(child.back().route, child.back().back().route))
     assertEquals(-1, slideDirection(SessionNavigation().push(RootPage.SETTINGS).route, home))

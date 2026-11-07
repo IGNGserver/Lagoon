@@ -1473,6 +1473,14 @@ class LagoonController private constructor(private val appContext: Context) {
     closeShellOutput(); familyDiscovery = null
     resolvedPermissions.clear()
     val configuration = rememberedSession?.let { store.configuration(id, it) } ?: SessionConfiguration()
+    val defaults = store.newSessionDefaults(id)
+    // A reconnect to the same blank page keeps the reader's manual preset/model choice; switching
+    // to another server starts from that server's defaults because catalogs differ.
+    val keepDraftSelection = draftIntent && previous.serverId == id && previous.sessionId == null
+    val draftAgent = if (keepDraftSelection) previous.agent else defaults.agent
+    val draftModel = if (keepDraftSelection) previous.model else defaults.model?.let { model ->
+      model.copy(variant = store.modelVariants(id)[modelKey(model)])
+    }
     store.select(id, rememberedProject, rememberedSession)
     // Drop the pre-ledger “永久已完成” states and read markers; keep runs this device saw as still running.
     store.migrateTaskLedger(id)
@@ -1489,7 +1497,15 @@ class LagoonController private constructor(private val appContext: Context) {
       autoApprovalFailures = snapshot?.autoApprovalFailures.orEmpty(), streamConnected = snapshot?.streamConnected == true,
       streamDownSince = if (snapshot?.streamConnected == true) 0 else System.currentTimeMillis(),
       connection = ConnectionStatus(ConnectStage.CONNECTING, System.currentTimeMillis()), remoteRecovery = null,
-      agent = configuration.agent, model = configuration.model, agentChanged = configuration.agentChanged, modelChanged = configuration.modelChanged,
+      agent = if (draftIntent) draftAgent else configuration.agent,
+      model = if (draftIntent) draftModel else configuration.model,
+      agentChanged = if (draftIntent) {
+        if (keepDraftSelection) previous.agentChanged else defaults.agent != null
+      } else configuration.agentChanged,
+      modelChanged = if (draftIntent) {
+        if (keepDraftSelection) previous.modelChanged else defaults.model != null
+      } else configuration.modelChanged,
+      newSessionAgent = defaults.agent, newSessionModel = defaults.model,
       draft = when {
         draftIntent -> if (draftKeepsComposer) previous.draft else ""
         else -> rememberedSession?.let { store.draft(id, it) }.orEmpty()
@@ -2622,12 +2638,25 @@ class LagoonController private constructor(private val appContext: Context) {
     val expectedDirectory = mutable.value.executionDirectory ?: mutable.value.homeDirectory
     if (token != generation || revision != selectionRevision || (expectedDirectory != null && expectedDirectory != directory)) return
     mutable.update { current ->
+      val agentList = agents.getOrDefault(current.agents)
       val catalog = models.getOrDefault(current.modelCatalog)
       val serverId = current.serverId
-      val model = if (serverId == null) current.model else current.model?.let { normalizeModelVariant(serverId, it, catalog) }
-      current.copy(agents = agents.getOrDefault(current.agents), models = catalog.map { it.choice }, modelCatalog = catalog,
-        model = model, modelChanged = current.modelChanged || model?.variant != current.model?.variant,
-        modelVariants = serverId?.let(store::modelVariants) ?: current.modelVariants, commands = commands.getOrDefault(current.commands),
+      val variants = serverId?.let(store::modelVariants) ?: current.modelVariants
+      // A blank page carries the phone's defaults (or the reader's override). Validate that
+      // selection against the catalog before the first send: a removed preset/model must fall
+      // back to the server default rather than fail the prompt with an unknown id.
+      val resolved = if (current.sessionId == null) {
+        resolveDraftDefaults(current.agent, current.model, agentList, catalog, variants)
+      } else null
+      val model = if (resolved != null) resolved.model
+        else if (serverId == null) current.model
+        else current.model?.let { normalizeModelVariant(serverId, it, catalog) }
+      val agent = if (resolved != null) resolved.agent else current.agent
+      current.copy(agents = agentList, models = catalog.map { it.choice }, modelCatalog = catalog,
+        agent = agent, agentChanged = if (resolved != null) agent != null else current.agentChanged,
+        model = model, modelChanged = if (resolved != null) model != null
+          else current.modelChanged || model?.variant != current.model?.variant,
+        modelVariants = variants, commands = commands.getOrDefault(current.commands),
         resources = current.resources + mapOf("agents" to agents.resourceStatus(), "models" to models.resourceStatus(), "commands" to commands.resourceStatus()))
     }
   }
@@ -3140,6 +3169,44 @@ class LagoonController private constructor(private val appContext: Context) {
     mutable.update { it.copy(model = info.choice.copy(variant = selected), modelChanged = true, modelVariants = store.modelVariants(server)) }
     rememberConfiguration()
   }
+  /** Phone-local default preset for the blank page; null means "follow the server default". */
+  fun setNewSessionAgent(name: String?) {
+    val server = state.value.serverId ?: return
+    val clean = name?.takeIf(String::isNotBlank)
+    store.rememberNewSessionDefaults(server, store.newSessionDefaults(server).copy(agent = clean))
+    mutable.update { it.copy(newSessionAgent = clean) }
+  }
+  /** Phone-local default model; the strength stays in [modelVariants], keyed by the model. */
+  fun setNewSessionModel(model: ModelChoice?) {
+    val server = state.value.serverId ?: return
+    val clean = model?.let { candidate ->
+      state.value.modelCatalog.firstOrNull { it.key == modelKey(candidate) }?.choice?.copy(variant = null)
+        ?: candidate.copy(variant = null)
+    }
+    store.rememberNewSessionDefaults(server, store.newSessionDefaults(server).copy(model = clean))
+    mutable.update { it.copy(newSessionModel = clean) }
+  }
+  /** The default strength for one model, edited from Settings; null means "follow the model". */
+  fun setNewSessionVariant(modelKey: String, variant: String?) {
+    val server = state.value.serverId ?: return
+    val info = state.value.modelCatalog.firstOrNull { it.key == modelKey } ?: return
+    val clean = variant?.takeIf { id -> info.variants.any { it.id == id } }
+    store.rememberModelVariant(server, modelKey, clean)
+    mutable.update { it.copy(modelVariants = store.modelVariants(server)) }
+  }
+  /**
+   * Loads the agent/model catalog for the Settings page even when no conversation is open.  The
+   * blank page normally learns it from loadChoices when a workspace is chosen; Settings can be
+   * opened straight from the home list, so it needs its own trigger.
+   */
+  fun loadDefaultCatalog(force: Boolean = false) {
+    val current = state.value
+    if (current.server == null) return
+    if (!force && current.agents.isNotEmpty() && current.modelCatalog.isNotEmpty()) return
+    val directory = current.executionDirectory ?: current.homeDirectory
+    val token = generation
+    scope.launch { loadChoices(directory.orEmpty(), token, force) }
+  }
   /** A switch from the phone's "管理模型" list; it overrides the official default rule for this server. */
   fun setModelVisible(model: ModelInfo, visible: Boolean) {
     val server = state.value.serverId ?: return
@@ -3391,9 +3458,15 @@ class LagoonController private constructor(private val appContext: Context) {
     visibleConversation = null
     val text = if (fresh) "" else current.draft
     val references = if (fresh) emptyList() else current.references
+    val defaults = if (fresh) resolveDraftDefaults(current.newSessionAgent, current.newSessionModel,
+      current.agents, current.modelCatalog, current.modelVariants) else null
+    val agent = if (fresh) defaults?.agent else current.agent
+    val model = if (fresh) defaults?.model else current.model
     mutable.update {
       withSummary(it.copy(projectId = project?.id, sessionId = null, messages = emptyList(),
-        agent = null, model = null, agentChanged = false, modelChanged = false,
+        agent = agent, model = model,
+        agentChanged = if (fresh) agent != null else it.agentChanged,
+        modelChanged = if (fresh) model != null else it.modelChanged,
         draft = text, references = references, resources = it.resources - "messages",
         files = emptyList(), searchResults = emptyList(), fileText = null, fileBinary = false,
         filePreview = null, filePreviewMime = null, loadedOlderMessages = false, messagesCursor = null,
@@ -3781,7 +3854,7 @@ class LagoonController private constructor(private val appContext: Context) {
     op.commitConnection { withSummary(it.copy(sessions = it.sessions.filterNot { s -> s.id == session.id }, tasks = it.tasks - session.id, pinned = it.pinned - session.id)) }
     if (op.connectionCurrent(this)) reload()
   }
-  /** Archives (or restores) [target]; the home list hides archived sessions, 已归档 lists them. */
+  /** Archives (or restores) [target]; archived sessions are hidden from the home list. */
   fun setArchived(target: String, archived: Boolean, onDone: (() -> Unit)? = null) = withSession("archive", target) { op, client, session ->
     client.setArchived(session, archived)
     op.commitConnection { it.copy(sessions = it.sessions.map { item -> if (item.id == session.id) item.copy(archived = archived) else item }) }

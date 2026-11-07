@@ -1,14 +1,13 @@
 package com.igng.opencode.lagoon.ui
 
 /**
- * Pages of the app. There is no tab bar: 会话 is the only root, and 已归档 / 设置 are pushed over it
+ * Pages of the app. There is no tab bar: 会话 is the only root, and 设置 is pushed over it
  * from its ⋯ menu like any other page.
  *
  * 信息架构主线：Server → Project/Directory → Session → Conversation。
  */
 internal enum class RootPage(val label: String) {
   HOME("会话"),
-  ARCHIVED("已归档"),
   DEVICES("设备"),
   SETTINGS("设置")
 }

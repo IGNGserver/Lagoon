@@ -195,22 +195,6 @@ private fun LagoonState.groupHomeProjection(
     allUnseenSessions = unseen)
 }
 
-/**
- * Archived root sessions still counted by the island (active work or unread result) but hidden from
- * the home list by `visibleOnHome`. The home global strip links this count to the archived page.
- */
-internal fun LagoonState.archivedTaskCount(now: Long = System.currentTimeMillis()): Int =
-  homeReadSnapshots().values.sumOf { snapshot ->
-    val archived = snapshot.sessions.filter { it.parentId == null && it.archived }.map { it.id }.toSet()
-    if (archived.isEmpty()) return@sumOf 0
-    val active = SessionActivityRules.rootStates(
-      permissionPolicy.tasks(snapshot.liveTasks(now), snapshot.permissions, snapshot.autoApprovalFailures).filterValues { it.active },
-      snapshot.parents
-    ).keys
-    val unseen = snapshot.notices.filterNot { it.viewed }.map { it.sessionId }
-    (active + unseen).count { it in archived }
-  }
-
 /** Notification-disabled servers that still have work, so the home count can say what the island omits. */
 internal fun LagoonState.silentServersWithTasks(now: Long = System.currentTimeMillis()): List<String> =
   homeReadSnapshots().values.filter { snapshot ->
