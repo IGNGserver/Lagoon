@@ -509,4 +509,21 @@ class OpenCodeApiTest {
     }
   }
 
+  @Test fun malformedEventFramesFailTheStreamForReconciliation() = runBlocking {
+    MockWebServer().use { server ->
+      server.enqueue(MockResponse().setHeader("Content-Type", "text/event-stream").setBody("data: {broken}\n\n"))
+      val failure = kotlinx.coroutines.withTimeout(5_000) {
+        runCatching { api(server).events().collect { } }.exceptionOrNull()
+      }
+      assertTrue("a malformed terminal event must not be silently skipped: $failure", failure is IOException)
+      assertTrue(failure!!.message!!.contains("对账"))
+    }
+  }
+
+  @Test fun eventFramesRejectMissingType() {
+    assertTrue(runCatching { """{"id":"evt_1","data":{}}""".toServerEvent("fallback") }.isFailure)
+    // A legacy envelope without its own id may still use the SSE cursor id.
+    assertEquals("fallback", """{"type":"server.connected","data":{}}""".toServerEvent("fallback").id)
+  }
+
 }

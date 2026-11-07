@@ -172,6 +172,9 @@
 - 时间线由 `turn/step/assistant/tool` 事件折算为控制器认识的 `session.*` 事件；
   实时文本来自 `assistant-stream` 帧（`text-delta`/`reasoning-delta` 折算为
   `session.text.delta` / `session.reasoning.delta`，耐久消息到达时用 `*.ended` 收口）。
+  耐久事件 ID 包含 `session.id + seq + 部件序号`，因为 seq 只在单个会话内唯一；没有耐久 ID 的实时
+  分片使用单调递增发件序号，不能用可能相同的毫秒时间戳去重。只有 `source.kind` 为 `user`（或旧 Host
+  没有 source）的 `user/message` 才进入用户时间线；权威消息按 message id 原地替换同 ID 的本地乐观行。
 - 历史窗口：首屏直接装入 `session/follow` 快照的 turn 窗口（与官方客户端一致：最多 500 条消息、
   至少 50 条 / 2 轮），不再用消息级 `size` 二次截断；`hasMore=true` 时把本页最早 record 的 seq
   作为 `session/page` 的 `beforeSeq`。更早页同样带 `turnWindow{minMessages:min(size,50),minTurns:2}`，
@@ -184,8 +187,10 @@
   其他客户端结算时收到 `cancel` 帧，按本地待办移除并折算为 `permission.replied` / `form.cancelled`。
   `$events` 重连后 Host 会把仍在等待的瀑布按原 eventId 重新投递给新客户端；宽限 3 秒内没有重新投递的本地待办
   视为断线期间已被结算，同样撤回。审批 outcome 只有 `allowed-once` 一种授权，界面不提供「始终允许」。
-- 实时流：mux WebSocket 20 秒 ping；单条 `session/follow` 意外断开时按 2 秒起、最长 60 秒退避重连，
-  重连后的快照把 seq 大于已投影位置的事件补投进时间线。服务端关闭整条连接按异常断开处理，上层重连。
+- 实时流：mux WebSocket 20 秒 ping；`$events` 建连后最多等待 20 秒 ready，超时、帧解析失败、streamId
+  不匹配或缺失 item payload 都关闭该逻辑流并进入退避重连/快照对账，不把“TCP 已连接”误报为“事件流可用”。
+  单条 `session/follow` 意外断开时按 2 秒起、最长 60 秒退避重连，重连后的快照把 seq 大于已投影位置的事件补投进时间线。
+  服务端关闭整条连接按异常断开处理，上层重连。
   客户端按 Host 限制逻辑流：长期 follow 只保留最近活跃的 12 个（当前会话固定），首页只为运行中会话
   开 follow，`job/list` 最多并发 2 条，网关硬上限 32 条（`RemoteGateway.MAX_STREAMS`）。
 - 附件：Lagoon 的附件是 `data:` URI。图片折算为 `{type:"image", mediaType, data, name}`，文本文件内联为带文件名的

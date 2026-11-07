@@ -670,6 +670,63 @@ class ControllerRegressionTest {
       c.fork().join();assertEquals("forked",state.value.sessionId);assertTrue(state.value.sessions.any{it.id=="forked"})
     }
   }
+  @Test fun queuedPromptReturnsToDraftWhenSelectionExpiresBehindSendMutex() = runBlocking {
+    MockWebServer().use { server ->
+      val (controller, state) = controller(api(server), LagoonState(serverId = "server", connected = false,
+        connection = ConnectionStatus(ConnectStage.RETRYING),
+        sessions = listOf(Session("s", "/repo", "S", 0), Session("other", "/repo", "Other", 0)), sessionId = "s"))
+      controller.send("不能丢失的离线消息").join()
+      assertTrue(state.value.messages.any { it.queued })
+      state.value = state.value.copy(connected = true, connection = ConnectionStatus(ConnectStage.READY))
+      val mutex = LagoonController::class.java.getDeclaredField("sendMutex").apply { isAccessible = true }
+        .get(controller) as kotlinx.coroutines.sync.Mutex
+      mutex.lock()
+      LagoonController::class.java.getDeclaredMethod("flushQueuedSends").apply { isAccessible = true }.invoke(controller)
+      // flush has removed the local pending row, but the actual server request is still behind the lock.
+      assertTrue(state.value.messages.none { it.queued })
+      put(controller, "generation", 2)
+      state.value = state.value.copy(sessionId = "other")
+      mutex.unlock()
+      withTimeout(3_000) { while (state.value.pending("send")) delay(10) }
+      val store = LagoonController::class.java.getDeclaredField("store").apply { isAccessible = true }.get(controller) as ServerStore
+      assertEquals("不能丢失的离线消息", store.draft("server", "s"))
+      assertTrue(List(server.requestCount) { server.takeRequest() }.none { it.requestUrl!!.encodedPath.endsWith("/prompt") })
+    }
+  }
+
+  @Test fun duplicateQueuedDeliveryRestoresTheComposerInsteadOfDroppingPrompt() = runBlocking {
+    MockWebServer().use { server ->
+      val (controller, state) = controller(api(server), LagoonState(serverId = "server", connected = false,
+        connection = ConnectionStatus(ConnectStage.RETRYING),
+        sessions = listOf(Session("s", "/repo", "S", 0)), sessionId = "s"))
+      controller.send("重复操作也不能丢草稿").join()
+      assertTrue(state.value.messages.any { it.queued })
+      state.value = state.value.copy(connected = true, connection = ConnectionStatus(ConnectStage.READY),
+        pendingOperations = setOf(operationKey("server", "s", null, "send")))
+      LagoonController::class.java.getDeclaredMethod("flushQueuedSends").apply { isAccessible = true }.invoke(controller)
+      withTimeout(3_000) { while (state.value.draft != "重复操作也不能丢草稿") delay(10) }
+      assertTrue(state.value.messages.none { it.queued })
+      assertEquals(0, server.requestCount)
+    }
+  }
+
+  @Test fun queuedDeliveryWithoutAnOperationClientRestoresTheComposer() = runBlocking {
+    MockWebServer().use { server ->
+      val (controller, state) = controller(api(server), LagoonState(serverId = "server", connected = false,
+        connection = ConnectionStatus(ConnectStage.RETRYING),
+        sessions = listOf(Session("s", "/repo", "S", 0)), sessionId = "s"))
+      controller.send("连接未建立时保留这句话").join()
+      assertTrue(state.value.messages.any { it.queued })
+      state.value = state.value.copy(connected = true, connection = ConnectionStatus(ConnectStage.READY))
+      put(controller, "api", null)
+      LagoonController::class.java.getDeclaredMethod("flushQueuedSends").apply { isAccessible = true }.invoke(controller)
+      withTimeout(3_000) { while (state.value.draft != "连接未建立时保留这句话") delay(10) }
+      assertTrue(state.value.messages.none { it.queued })
+      assertFalse(state.value.pending("send"))
+      assertEquals(0, server.requestCount)
+    }
+  }
+
   @Test fun queuedSendCannotMixServerAndSession() = runBlocking {
     MockWebServer().use { a -> MockWebServer().use { b ->
       a.dispatcher=object:Dispatcher(){override fun dispatch(r:RecordedRequest):MockResponse = when {
