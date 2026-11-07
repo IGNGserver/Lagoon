@@ -43,7 +43,9 @@ data class TranscriptRow(
    */
   val bodyOf: String? = null,
   /** Original authoritative part for the second-level detail sheet. */
-  val source: MessagePart? = null
+  val source: MessagePart? = null,
+  /** Durable part references used to relocate an open group across live/settled projections. */
+  val anchors: List<String> = emptyList()
 )
 
 object TranscriptRows {
@@ -119,10 +121,11 @@ object TranscriptRows {
     val turns = mutableListOf<Turn>()
     val users = mutableSetOf<String>()
     val leading = mutableListOf<Message>()
+    val queued = mutableListOf<Message>()
     var current: Turn? = null
     visible.forEach { message ->
       when (message.role) {
-        "notice" -> {
+        "notice", "relay" -> {
           val turn = current
           if (turn == null) {
             if (message.turnId != null) {
@@ -141,6 +144,10 @@ object TranscriptRows {
         }
         "shell" -> Turn(message.id, message.created, shell = message, turnId = message.turnId).also { turns += it; current = it }
         "user" -> if (users.add(message.id)) {
+          if (message.queued || message.id.startsWith(PENDING_PREFIX)) {
+            queued += message
+            return@forEach
+          }
           val turn = current
           if (turn != null && turn.shell == null && turn.user == null &&
             message.turnId != null && message.turnId == turn.turnId) {
@@ -167,13 +174,14 @@ object TranscriptRows {
       }
     }
     val rows = mutableListOf<TranscriptRow>()
-    leading.forEach { rows += noticeRow(it) }
+    leading.forEach { rows += if (it.role == "relay") relayRow(it) else noticeRow(it) }
     var previousEnd = 0L
     turns.forEachIndexed { index, turn ->
       if (index == 0 || turn.created - previousEnd >= TIME_GAP_MS) rows += TranscriptRow("time:${turn.id}", "time", text = formatTime(turn.created))
       previousEnd = (listOfNotNull(turn.user, turn.shell) + turn.entries).maxOf { it.completedAt ?: it.created }
       rows += cachedTurnRows(turn, "turn:${turn.id}", expanded, working && !unverified && index == turns.lastIndex, unverified)
     }
+    queued.forEach { rows += userRow(it) }
     return rows.withUniqueKeys()
   }
 
@@ -189,6 +197,12 @@ object TranscriptRows {
     val rows = if (children.isEmpty()) first else build(messages, setOf(key) + children, working, revertMessageId, unverified)
     return rows.filter { it.detailOf == key }
   }
+
+  /** Resolves a clicked batch after completion, reconnect or loading its older turn root. */
+  fun resolveGroup(rows: List<TranscriptRow>, original: TranscriptRow): TranscriptRow? =
+    rows.firstOrNull { it.key == original.key } ?: original.anchors.firstNotNullOfOrNull { anchor ->
+      rows.firstOrNull { it.kind == original.kind && anchor in it.anchors }
+    }
 
   /**
    * A part's identity within the transcript. Part ids are not unique on their own: providers may
@@ -215,6 +229,9 @@ object TranscriptRows {
     }
   }
 
+  private fun relayRow(message: Message) = TranscriptRow("relay:${message.id}", "relay", title = message.notice?.label ?: "代理来信",
+    text = message.parts.filter { it.type == "text" }.joinToString("\n") { it.text }, target = message.notice?.target)
+
   private fun noticeRow(message: Message): TranscriptRow {
     val notice = message.notice ?: Notice("")
     val detail = listOf(notice.detail).plus(notice.items).filter(String::isNotBlank).joinToString("、")
@@ -226,17 +243,20 @@ object TranscriptRows {
   private fun Message.interrupted(): Boolean = finish == "aborted" ||
     errorType?.lowercase()?.let { it.contains("abort") || it.contains("interrupt") } == true
 
+  private fun userRow(user: Message): TranscriptRow {
+    val text = user.parts.filter { it.type == "text" }.joinToString("\n") { it.text }.trim()
+    val attachments = (user.parts.filter { it.type == "file" }.map { Attachment(it.path, it.mime, it.title) } + user.parts.flatMap { it.attachments }).distinctBy { it.url }
+    return TranscriptRow("user:${user.id}", "user", text = text, attachments = attachments,
+      meta = listOfNotNull(if (user.id.startsWith(PENDING_PREFIX)) "等待连接后发送" else if (user.queued) "排队中" else null,
+        user.agent, user.model?.label, formatTime(user.created).substringAfter(' '))
+        .filter { it.isNotBlank() }.joinToString(" · "),
+      copyText = text.takeIf { it.isNotBlank() }, status = if (user.queued) "queued" else "")
+  }
+
+
   private fun turnRows(turn: Turn, turnKey: String, expanded: Set<String>, working: Boolean, unverified: Boolean): List<TranscriptRow> {
     val rows = mutableListOf<TranscriptRow>()
-    turn.user?.let { user ->
-      val text = user.parts.filter { it.type == "text" }.joinToString("\n") { it.text }.trim()
-      val attachments = (user.parts.filter { it.type == "file" }.map { Attachment(it.path, it.mime, it.title) } + user.parts.flatMap { it.attachments }).distinctBy { it.url }
-      rows += TranscriptRow("user:${user.id}", "user", text = text, attachments = attachments,
-        meta = listOfNotNull(if (user.id.startsWith(PENDING_PREFIX)) "等待连接后发送" else if (user.queued) "排队中" else null,
-          user.agent, user.model?.label, formatTime(user.created).substringAfter(' '))
-          .filter { it.isNotBlank() }.joinToString(" · "),
-        copyText = text.takeIf { it.isNotBlank() }, status = if (user.queued) "queued" else "")
-    }
+    turn.user?.let { rows += userRow(it) }
     turn.shell?.let { shell ->
       shell.parts.forEachIndexed { index, part -> rows += toolRows(partRef(shell, index, part), part, expanded, unverified) }
     }
@@ -250,28 +270,38 @@ object TranscriptRows {
       message.parts.mapIndexed { index, part -> partRef(message, index, part) to part }
         .filter { (_, part) -> part.isDisplayable && !(part.type == "tool" && (part.tool in HIDDEN_TOOLS || (part.tool == "question" && part.status !in FINISHED_TOOLS))) }
     }
-    // Notices remain official one-line transcript records. They are not model output and should
-    // not inflate the operation counter or become a fake tool row.
-    turn.entries.filter { it.role == "notice" }.forEach { body += noticeRow(it) }
     val lastActivity = entries.indexOfLast { (_, part) -> part.type in setOf("tool", "reasoning") }
     val nonFinal = assistants.filter { it.finish in setOf("tool-calls", "tool_calls") }.map { it.id }.toSet()
     val finalParts = entries.filterIndexed { index, (ref, part) ->
       part.type == "text" && index > lastActivity && nonFinal.none { ref.startsWith("$it/") }
     }
     val finalRefs = finalParts.map { it.first }.toSet()
-    val process = entries.filterNot { it.first in finalRefs }
-    if (working) {
-      // A running turn stays transparent: each process reply is shown inline and every consecutive
-      // batch of operations becomes its own group whose calls remain visible while they execute.
-      // Only finished turns collapse into the「共处理 N 个操作」summary.
-      body += runningTurnRows(process, expanded)
-    } else if (process.isNotEmpty()) {
-      body += toolGroupRows(turnKey, process, expanded, unverified)
+    // Flush around notices: completion events must remain between the steps that produced them,
+    // never hoisted above all assistant work. Final text is only joined within a contiguous segment.
+    val segment = mutableListOf<Pair<String, MessagePart>>()
+    fun flush() {
+      if (segment.isEmpty()) return
+      val process = segment.filterNot { it.first in finalRefs }
+      if (working) body += runningTurnRows(process, expanded)
+      else if (process.isNotEmpty()) body += toolGroupRows(process, expanded, unverified)
+      val answer = segment.filter { it.first in finalRefs }
+      if (answer.isNotEmpty()) body += TranscriptRow("answer:${answer.first().first}", "text",
+        text = answer.joinToString("\n\n") { it.second.text.trim() })
+      segment.clear()
     }
-    if (finalParts.isNotEmpty()) {
-      val text = finalParts.joinToString("\n\n") { it.second.text.trim() }
-      body += TranscriptRow("answer:${finalParts.first().first}", "text", text = text)
+    val visibleRefs = entries.mapTo(hashSetOf()) { it.first }
+    turn.entries.forEach { message ->
+      if (message.role == "notice" || message.role == "relay") {
+        flush()
+        body += if (message.role == "relay") relayRow(message) else noticeRow(message)
+      } else if (message.role == "assistant") {
+        message.parts.forEachIndexed { index, part ->
+          val ref = partRef(message, index, part)
+          if (ref in visibleRefs) segment += ref to part
+        }
+      }
     }
+    flush()
     val compaction = turn.entries.any { it.type == "compaction" }
     var dividerShown = false
     turn.entries.forEach { message ->
@@ -354,8 +384,8 @@ object TranscriptRows {
    * One stable activity group per user turn, including intermediate text in chronological order.
    * Process output is visible in the activity list; tool/reasoning bodies are second-level details.
    */
-  private fun toolGroupRows(turnKey: String, entries: List<Pair<String, MessagePart>>, expanded: Set<String>, unverified: Boolean): List<TranscriptRow> =
-    activityGroupRows("$turnKey:activities", entries, expanded, "共处理 ${entries.count { it.second.type != "text" }} 个操作", unverified)
+  private fun toolGroupRows(entries: List<Pair<String, MessagePart>>, expanded: Set<String>, unverified: Boolean): List<TranscriptRow> =
+    activityGroupRows("activities:${entries.first().first}", entries, expanded, "共处理 ${entries.count { it.second.type != "text" }} 个操作", unverified)
 
   /** A collapsed operation group: a one-line summary, and its calls/bodies only after [expanded]. */
   private fun activityGroupRows(key: String, entries: List<Pair<String, MessagePart>>, expanded: Set<String>, title: String, unverified: Boolean = false): List<TranscriptRow> {
@@ -385,12 +415,12 @@ object TranscriptRows {
       }.joinToString("、", prefix = "含 ")
     } else tools.singleOrNull()?.let { toolInfo(it).second }.orEmpty()
     val row = TranscriptRow(key, "tool-group", title = title, subtitle = preview, meta = summary, status = status,
-      target = tools.singleOrNull()?.takeIf { it.tool in SUBAGENT_TOOLS }?.target)
+      target = tools.singleOrNull()?.takeIf { it.tool in SUBAGENT_TOOLS }?.target, anchors = entries.map { it.first })
     if (key !in expanded) return listOf(row)
     val children = mutableListOf<TranscriptRow>()
     entries.forEachIndexed { position, (ref, part) ->
       val occurrence = entries.take(position).count { it.first == ref }
-      val itemKey = "$key:$ref" + if (occurrence == 0) "" else "~${occurrence + 1}"
+      val itemKey = "part:$ref" + if (occurrence == 0) "" else "~${occurrence + 1}"
       if (part.type == "reasoning") {
         val text = part.text.trim()
         children += TranscriptRow(itemKey, "reasoning", title = "深度思考", status = part.rowStatus(unverified), detailOf = key, source = part)

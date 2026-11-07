@@ -166,6 +166,10 @@
 
 - 项目 = Workspace（`workspace/follow` 首帧 `value.items`）；会话目录取行内 `cwd`。
 - `activeSessions` = 列表行 `running`；后台工作 = `job/list` 的运行作业 + 子会话。
+  每次目录扫描使用当前会话名册，覆盖该目录全部 owner（不再只取最近三个会话），并校验返回的 owner；
+  `job/list` 失败/坏首帧抛错，不缓存成空列表。只有成功完整读取才能删除旧任务；失败保留旧任务为“状态待核实”，
+  不把未核实任务算成正在运行，下一次权威空列表或删除 owner 才清除。
+  直连、Remote、SSH 都由 `jobOutputStream` 能力选择 `job/follow`，不按连接类型分支。
 - `session/list` 里 `blank=true` 是服务端尚未发送任何轮次的草稿：不进入首页、搜索、归档可见性或项目计数，
   也不会为它单独开 `session/follow`。新建会话时优先复用同目录最新的空白会话（DSH Web 同样这么做），
   避免每次新建/首条发送失败都在服务端留下一个“新会话”。
@@ -175,6 +179,13 @@
   耐久事件 ID 包含 `session.id + seq + 部件序号`，因为 seq 只在单个会话内唯一；没有耐久 ID 的实时
   分片使用单调递增发件序号，不能用可能相同的毫秒时间戳去重。只有 `source.kind` 为 `user`（或旧 Host
   没有 source）的 `user/message` 才进入用户时间线；权威消息按 message id 原地替换同 ID 的本地乐观行。
+  `agent-message{form:relay,senderSessionId}` 作为有来源的代理来信（Markdown 正文）显示；
+  `subagent-settled{form:notice,summary,senderSessionId}` 与 `tool-jobs{form:notice,summary}` 只显示运行时摘要，
+  不把模型侧注入指令误显示成用户气泡。通知保留在原始步骤间，不集中提前。
+  工具 `isError/error/meta` 与文件 content 在实时/快照两条路径共享解码，重开不会把失败变成功；
+  多段 text/reasoning 的耐久结果整体校正实时片段，事件属性独立拷贝。
+- 排队输入单独附在时间线尾部，送达前不创建活动轮次；它不会夺走真正执行轮次的运行状态。
+  活动详情按 message/part 引用重新定位，即使运行批次折为完成分组或补齐历史，也能读取同一工具的新正文。
 - 历史窗口：首屏直接装入 `session/follow` 快照的 turn 窗口（与官方客户端一致：最多 500 条消息、
   至少 50 条 / 2 轮），不再用消息级 `size` 二次截断；`hasMore=true` 时把本页最早 record 的 seq
   作为 `session/page` 的 `beforeSeq`。更早页同样带 `turnWindow{minMessages:min(size,50),minTurns:2}`，
@@ -187,6 +198,9 @@
   其他客户端结算时收到 `cancel` 帧，按本地待办移除并折算为 `permission.replied` / `form.cancelled`。
   `$events` 重连后 Host 会把仍在等待的瀑布按原 eventId 重新投递给新客户端；宽限 3 秒内没有重新投递的本地待办
   视为断线期间已被结算，同样撤回。审批 outcome 只有 `allowed-once` 一种授权，界面不提供「始终允许」。
+- 缺口恢复：`session/page` 的 `beforeSeq` 是向前翻页的排他上界。缺口 `(previous,current)` 使用
+  `beforeSeq=current / throughSeq=current-1`，串行补齐后才投影 current；不完整/超大缺口触发快照重读。
+  follow 的 EOF 在已经接收的帧处理完成后才结算，避免丢最后的 tool/result 或 turn/end。
 - 实时流：mux WebSocket 20 秒 ping；`$events` 建连后最多等待 20 秒 ready，超时、帧解析失败、streamId
   不匹配或缺失 item payload 都关闭该逻辑流并进入退避重连/快照对账，不把“TCP 已连接”误报为“事件流可用”。
   单条 `session/follow` 意外断开时按 2 秒起、最长 60 秒退避重连，重连后的快照把 seq 大于已投影位置的事件补投进时间线。

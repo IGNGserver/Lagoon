@@ -68,8 +68,6 @@ class LagoonController private constructor(private val appContext: Context) {
     private const val MAX_SWEEP_DIRECTORIES = 12
     /** 一次控制读最多检查多少个待处理目录的表单。 */
     private const val MAX_FORM_DIRECTORIES = 8
-    /** 目录读取失败时旧 shell 条目的最长保留时间，避免失效条目一直留在后台面板里。 */
-    private const val SHELL_TTL_MILLIS = 5 * 60_000L
   }
   private fun scoped(serverId: String, session: Session): Session = session.copy(serverId = serverId)
 
@@ -1900,6 +1898,7 @@ class LagoonController private constructor(private val appContext: Context) {
     // 运行中的 shell 作业：后台 shell 不是会话，不在 /api/session/active 里，冷启动/断线后只能从
     // `GET /api/shell` 读到。只读有活动或有已知 shell 的目录，不再把所有项目目录都扫一遍。
     val refreshedShellDirectories = mutableSetOf<String>()
+    val failedShellDirectories = mutableSetOf<String>()
     val freshShells = linkedMapOf<String, ShellJob>()
     if (deep) {
       val shellSessions = identities.values.filter { session ->
@@ -1920,6 +1919,7 @@ class LagoonController private constructor(private val appContext: Context) {
           result.getOrDefault(emptyList()).forEach { freshShells[it.id] = it }
         } else {
           directoryHealth.failed(directory)
+          failedShellDirectories += key
           Diagnostics.warn("LagoonController", "shell 列表读取失败：$directory", result.exceptionOrNull())
         }
       }
@@ -1992,12 +1992,7 @@ class LagoonController private constructor(private val appContext: Context) {
     var resolvedWaitingIds = emptyList<String>()
     updateState { previous ->
       val now = System.currentTimeMillis()
-      // shell 合并：本次成功读取的目录以服务端结果为准；读取失败的目录保留旧条目（TTL 防僵死）。
-      val keptShells = previous.shells.filter { (_, job) ->
-        normalizedDirectory(job.directory) !in refreshedShellDirectories && now - job.observedAt < SHELL_TTL_MILLIS
-      }
-      val nextShells = (keptShells + freshShells.mapValues { (_, job) -> job.copy(observedAt = now) })
-        .filterValues { it.sessionId !in deletedSessions }
+      val nextShells = reconcileShellJobs(previous.shells, freshShells, refreshedShellDirectories, deletedSessions, now, failedShellDirectories)
       val previousTasks = (previous.tasks + storedTasks.filter { (id, task) -> previous.tasks[id]?.let { old -> task.since > old.since || (task.finishedAt ?: 0) > (old.finishedAt ?: 0) } ?: true }) - deletedSessions
       val nextSessions = (extraSessions + sessions + previous.sessions.filter {
         // A session this device saw running, or one with an unread result, never silently drops out;
@@ -2800,11 +2795,12 @@ class LagoonController private constructor(private val appContext: Context) {
     val client = api ?: return
     val token = generation
     val pageSize = HarnessClient.SHELL_OUTPUT_PAGE
+    val outputRevision = ++shellOutputRevision
     updateState { current ->
       if (current.serverId != server) current
       else current.copy(shellOutput = ShellOutputView(job.id, job.command, job.directory, loading = true))
     }
-    if (state.value.server?.kind == ServerKind.DSH_REMOTE) {
+    if (client.capabilities().jobOutputStream) {
       shellOutputJob = scope.launch {
         val text = StringBuilder()
         try {
@@ -2814,26 +2810,27 @@ class LagoonController private constructor(private val appContext: Context) {
               if (text.length > 64 * 1024) text.delete(0, text.length - 64 * 1024)
             }
             updateState { current ->
-              if (current.serverId != server || current.shellOutput?.shellId != job.id) current
+              if (token != generation || outputRevision != shellOutputRevision || current.serverId != server || current.shellOutput?.shellId != job.id) current
               else current.copy(shellOutput = current.shellOutput?.copy(
-                text = text.toString(), loading = !finished,
+                text = text.toString(), loading = false,
+                omitted = current.shellOutput?.omitted == true || text.length >= pageSize,
                 snapshot = ShellSnapshot(job.id, job.command, job.directory,
                   status = if (running) "running" else "exited", started = job.started)))
             }
           }
           if (!ok) updateState { current ->
-            if (current.shellOutput?.shellId != job.id) current
+            if (token != generation || outputRevision != shellOutputRevision || current.serverId != server || current.shellOutput?.shellId != job.id) current
             else current.copy(shellOutput = current.shellOutput?.copy(loading = false, error = "此主机没有后台任务输出"))
           }
         } catch (cancel: CancellationException) { throw cancel }
         catch (error: Exception) {
           updateState { current ->
-            if (current.shellOutput?.shellId != job.id) current
+            if (token != generation || outputRevision != shellOutputRevision || current.serverId != server || current.shellOutput?.shellId != job.id) current
             else current.copy(shellOutput = current.shellOutput?.copy(loading = false, error = userFacingError(error, "读取后台输出失败")))
           }
         } finally {
           updateState { current ->
-            if (current.shellOutput?.shellId != job.id) current
+            if (token != generation || outputRevision != shellOutputRevision || current.serverId != server || current.shellOutput?.shellId != job.id) current
             else current.copy(shellOutput = current.shellOutput?.copy(loading = false))
           }
         }
@@ -2859,7 +2856,7 @@ class LagoonController private constructor(private val appContext: Context) {
             }
           if (head == null) {
             updateState { current ->
-              if (current.shellOutput?.shellId != job.id) current
+              if (token != generation || outputRevision != shellOutputRevision || current.serverId != server || current.shellOutput?.shellId != job.id) current
               else current.copy(shellOutput = current.shellOutput?.copy(loading = false,
                 error = "该服务器不支持查看后台命令输出", snapshot = snapshot))
             }
@@ -2876,7 +2873,7 @@ class LagoonController private constructor(private val appContext: Context) {
         if (page == null) {
           missing = true
           updateState { current ->
-            if (current.shellOutput?.shellId != job.id) current
+            if (token != generation || outputRevision != shellOutputRevision || current.serverId != server || current.shellOutput?.shellId != job.id) current
             else current.copy(shellOutput = current.shellOutput?.copy(loading = false,
               error = "后台命令输出已不可用", snapshot = snapshot))
           }
@@ -2887,7 +2884,7 @@ class LagoonController private constructor(private val appContext: Context) {
         cursor = page.cursor
         val caughtUp = page.cursor >= page.size
         updateState { current ->
-          if (current.shellOutput?.shellId != job.id) current
+          if (token != generation || outputRevision != shellOutputRevision || current.serverId != server || current.shellOutput?.shellId != job.id) current
           else current.copy(shellOutput = ShellOutputView(
             shellId = job.id,
             command = previous.command,
@@ -2912,7 +2909,10 @@ class LagoonController private constructor(private val appContext: Context) {
     }
   }
 
+  private var shellOutputRevision = 0L
+
   fun closeShellOutput() {
+    shellOutputRevision++
     shellOutputJob?.cancel()
     shellOutputJob = null
     if (state.value.shellOutput != null) updateState { it.copy(shellOutput = null) }

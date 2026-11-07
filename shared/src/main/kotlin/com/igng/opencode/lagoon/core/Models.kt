@@ -94,7 +94,9 @@ data class Message(val id: String, val role: String, val created: Long, val part
    * live events so one turn's assistant steps never merge into the previous turn when the new turn
    * has no displayable user prompt (goal rounds, automatic continuation, compaction checkpoints).
    */
-  val turnId: String? = null)
+  val turnId: String? = null,
+  /** Durable log order (DSH seq), including same-millisecond inputs. */
+  val sequence: Long? = null)
 
 /** Official `Notice` row: a label, optional detail/items and, for subagent results, the child session. */
 data class Notice(val label: String, val detail: String = "", val items: List<String> = emptyList(), val target: String? = null,
@@ -117,7 +119,9 @@ data class MessagePart(
   /** Child session a subagent tool runs in, when the server reports it. */
   val target: String? = null,
   /** Official background metadata: the tool returned while its child work remains running. */
-  val background: Boolean = false
+  val background: Boolean = false,
+  /** Detached structured tool metadata, retained for protocol diagnostics and future typed adapters. */
+  val metadata: String = ""
 )
 data class PermissionRequest(
   val id: String,
@@ -163,7 +167,9 @@ data class ShellJob(
   val started: Long,
   val directory: String,
   /** 本机观测时间：目录读取失败时用于过期旧条目，避免失效的 shell 一直留在后台面板里。 */
-  val observedAt: Long = System.currentTimeMillis()
+  val observedAt: Long = System.currentTimeMillis(),
+  /** Retained after a failed/incomplete directory read; never a verified running claim. */
+  val uncertain: Boolean = false
 )
 
 enum class TaskPhase { IDLE, THINKING, TOOL, SUBAGENT, TESTING, WAITING_PERMISSION, WAITING_QUESTION, WAITING_SERVER, COMPLETED, FAILED, ABORTED, DISCONNECTED }
@@ -430,12 +436,13 @@ internal fun JSONObject.toAssistantPart(id: String): MessagePart {
     files = diffs.map { it.str("file") }.filter(String::isNotBlank),
     attachments = content.objects().filter { it.str("type") == "file" }.let { JSONArray(it) }.toAttachments(),
     target = (metadata.str("sessionID").ifBlank { inputObject?.str("sessionID").orEmpty() }).takeIf { name in SUBAGENT_TOOLS && it.isNotBlank() },
-    background = background
+    background = background,
+    metadata = metadata.takeIf { it.length() > 0 }?.toString().orEmpty()
   )
 }
 
 internal val SHELL_TOOLS = setOf("shell", "bash", "execute")
-internal val SUBAGENT_TOOLS = setOf("subagent", "task")
+internal val SUBAGENT_TOOLS = setOf("subagent", "subagent_fork", "task")
 
 internal fun JSONObject.toPermission(directory: String): PermissionRequest {
   val resources = arr("resources")

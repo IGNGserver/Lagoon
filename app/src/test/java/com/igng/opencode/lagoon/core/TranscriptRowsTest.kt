@@ -676,4 +676,60 @@ class TranscriptRowsTest {
     assertTrue(details.any { it.kind == "tool-body" })
     assertTrue(details.all { it.detailOf == summary.key })
   }
+  @Test fun noticesStayBetweenTheStepsThatSurroundThem() {
+    val messages = listOf(user("u", t0), assistant("a1", t0 + 1, tool("t1", "bash")),
+      Message("n", "notice", t0 + 2, emptyList(), notice = Notice("子代理完成")),
+      assistant("a2", t0 + 3, tool("t2", "read")),
+      assistant("a3", t0 + 4, part("p", "text", text = "结果")),
+      Message("after", "notice", t0 + 5, emptyList(), notice = Notice("后台完成")))
+    for (working in listOf(true, false)) {
+      val rows = TranscriptRows.build(messages, working = working).filter { it.detailOf == null }
+      assertEquals(listOf("user", "tool-group", "note", "tool-group", "text", "note"),
+        rows.filter { it.kind !in setOf("time", "meta") }.map { it.kind })
+    }
+  }
+
+  @Test fun queuedInputDoesNotStealTheWorkingTurnOrReparentFollowingSteps() {
+    val first = assistant("a1", t0 + 1, tool("t1", "bash", status = "running"), completedAt = null)
+    val queued = user("q", t0 + 2, "下一步").copy(queued = true)
+    val live = TranscriptRows.build(listOf(user("u", t0), first), working = true)
+    val key = live.single { it.kind == "tool-group" }.key
+    val rows = TranscriptRows.build(listOf(user("u", t0), first, queued,
+      assistant("a2", t0 + 3, tool("t2", "read", status = "running"), completedAt = null)), working = true)
+    assertEquals(key, rows.single { it.kind == "tool-group" }.key)
+    assertEquals("调用了 2 次工具", rows.single { it.kind == "tool-group" }.title)
+    assertEquals("user:q", rows.last().key)
+    assertTrue(rows.none { it.kind == "thinking" })
+    assertTrue(TranscriptRows.build(listOf(queued), working = true).none { it.kind == "thinking" })
+  }
+
+  @Test fun openBatchAndSelectedToolResolveAfterFinishDisconnectAndOlderHistory() {
+    val first = assistant("a", t0 + 1, tool("t", "bash", output = "live", status = "running"), completedAt = null)
+    val messages = listOf(user("u", t0), first)
+    val clicked = TranscriptRows.build(messages, working = true).single { it.kind == "tool-group" }
+    val selected = TranscriptRows.details(messages, clicked.key, working = true).single { it.kind == "tool" }
+    val completed = listOf(user("older", t0 - 1), user("u", t0), first.copy(parts = listOf(
+      tool("t", "bash", output = "final")), completedAt = t0 + 4))
+    for (unverified in listOf(false, true)) {
+      val rows = TranscriptRows.build(completed, unverified = unverified)
+      val resolved = requireNotNull(TranscriptRows.resolveGroup(rows, clicked))
+      val details = TranscriptRows.details(completed, resolved.key, unverified = unverified)
+      assertEquals("final", details.single { it.key == selected.key }.source?.output)
+      assertEquals("completed", details.single { it.key == selected.key }.status)
+      assertTrue(details.any { it.bodyOf == selected.key && it.text == "final" })
+    }
+    assertEquals(null, TranscriptRows.resolveGroup(emptyList(), clicked))
+  }
+
+  @Test fun aRelayWakeupHasItsOwnTurnAndIsNotThePreviousUsersAnswer() {
+    val messages = listOf(user("u", t0).copy(turnId = "turn:1"),
+      assistant("a1", t0 + 1, part("p1", "text", text = "first answer")).copy(turnId = "turn:1"),
+      Message("relay", "relay", t0 + 2, listOf(part("r", "text", text = "child report")), notice = Notice("代理来信"), turnId = "turn:2"),
+      assistant("a2", t0 + 3, part("p2", "text", text = "reply to child")).copy(turnId = "turn:2"))
+    val rows = TranscriptRows.build(messages)
+    assertEquals(listOf("first answer", "reply to child"), rows.filter { it.kind == "text" }.map { it.text })
+    assertEquals(2, rows.count { it.kind == "meta" })
+    assertTrue(rows.indexOfFirst { it.kind == "relay" } > rows.indexOfFirst { it.kind == "meta" })
+  }
+
 }

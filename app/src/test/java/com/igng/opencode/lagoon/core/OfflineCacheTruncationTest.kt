@@ -65,4 +65,18 @@ class OfflineCacheTruncationTest {
     cache.deleteTranscripts("s")
     assertEquals("写入与删除均使用内存字节账本，不再全量拷贝 preferences.all", 1, getAllCalls)
   }
+  @Test fun subagentModeModelVariantAndDurableOrderingSurviveRestart() = runBlocking {
+    val cache = cache()
+    val child = Session("c", "/repo", "child", 1, parentId = "p", subagentMode = "continuable",
+      model = ModelChoice("provider", "model", "Model", "high"))
+    cache.saveCatalog("srv", emptyList(), listOf(child))
+    val message = Message("relay", "relay", 1, listOf(MessagePart("p", "text", "child report")),
+      notice = Notice("代理来信", target = "c"), type = "agent-message", turnId = "turn:2", sequence = 10)
+    cache.saveMessages("srv", "p", listOf(message))
+    cache.awaitWrites()
+    assertEquals(child, cache.catalog("srv")!!.second.single())
+    assertEquals(message, cache.messages("srv", "p").single())
+    assertTrue(cache.messages("other", "p").isEmpty())
+  }
+
 }
