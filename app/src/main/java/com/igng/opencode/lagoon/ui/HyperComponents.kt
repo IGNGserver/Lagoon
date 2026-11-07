@@ -628,12 +628,12 @@ fun HyperBottomSheet(
     title = title,
     show = show,
     onDismissRequest = onDismissRequest,
+    backgroundColor = HyperTheme.colors.sheetSurface,
     modifier = modifier.clip(miuixTopSquircleShape(28.dp))
   ) {
     Column(
       modifier = Modifier
-        .fillMaxWidth()
-        .background(HyperTheme.colors.sheetSurface),
+        .fillMaxWidth(),
       content = content
     )
   }

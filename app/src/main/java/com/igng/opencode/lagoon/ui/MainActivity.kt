@@ -237,6 +237,10 @@ class MainActivity : ComponentActivity() {
             navigator.navigate(SessionNavigation()); openSession(SessionTarget(server, session)); deepLink = null
           }
        }
+      var lastGesturePhase by remember { mutableStateOf<BackPhase?>(null) }
+      LaunchedEffect(navigator.gesture?.phase) {
+        navigator.gesture?.phase?.let { lastGesturePhase = it }
+      }
       val backProgress = remember { Animatable(0f) }
       // 手势由 navigator.callback 驱动；这里只按（手势编号, 相位）播放跟手、停留与回弹。
       // 换键即取消上一段，旧手势的收尾既不会改写新手势的进度，也结束不了新手势（finish 校验编号）。
@@ -331,7 +335,7 @@ class MainActivity : ComponentActivity() {
               }
             }
             AnimatedContent(route, transitionSpec = {
-              if (navigator.gesture?.phase == BackPhase.COMMITTED && previewBack && backProgress.value > 0.01f) {
+              if ((navigator.gesture?.phase == BackPhase.COMMITTED || lastGesturePhase == BackPhase.COMMITTED) && previewBack && backProgress.value > 0.01f) {
                 // 预测式返回松手后由 backProgress 弹簧连续驱动新旧两页至 1f 完全移出屏幕，留足弹簧收敛时长避免半途截断。
                 (fadeIn(tween(1)) togetherWith fadeOut(tween(1, delayMillis = 360))).apply {
                   targetContentZIndex = 0f
