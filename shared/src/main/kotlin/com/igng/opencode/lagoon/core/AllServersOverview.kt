@@ -630,9 +630,10 @@ internal class AllServersOverview(
     }.map { it.await() } }
     shellResults.forEach { (directory, result) -> if (result.isSuccess) directoryHealth.succeeded(directory) else directoryHealth.failed(directory) }
     val successfulShellDirs = shellResults.filter { it.second.isSuccess }.map { normalizedDirectory(it.first) }.toSet()
-    val shells = previous.shells.filter { (_, shell) -> normalizedDirectory(shell.directory) !in successfulShellDirs && now() - shell.observedAt < 300_000 }
-      .plus(shellResults.flatMap { it.second.getOrDefault(emptyList()) }.associate { it.id to it.copy(observedAt = now()) })
-      .filterValues { it.sessionId !in deletedSessions }
+    val shells = reconcileShellJobs(previous.shells,
+      shellResults.flatMap { it.second.getOrDefault(emptyList()) }.associateBy { it.id },
+      successfulShellDirs, deletedSessions, now(),
+      shellResults.filter { it.second.isFailure }.map { normalizedDirectory(it.first) }.toSet())
     // A discovered shell can belong to a child absent from the root catalog. Resolve it before
     // deciding which family still has work; otherwise its real root can be falsely completed.
     shells.values.map { it.sessionId }.filterNot(identityMap::containsKey).distinct().take(100).chunked(4).forEach { batch ->

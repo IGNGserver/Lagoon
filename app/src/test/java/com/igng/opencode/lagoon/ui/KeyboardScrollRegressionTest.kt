@@ -78,7 +78,7 @@ class KeyboardScrollRegressionTest {
     assertTrue("操作层必须覆盖输入栏", text.contains("fillMaxHeight(0.74f)"))
     assertTrue("详情需随服务器消息和可信运行态更新", text.contains("rememberUpdatedState(Triple(messages, working to unverified, revertMessageId))") &&
       text.contains("snapshotFlow { source }.conflate()"))
-    assertTrue("二级详情同样不得沿用离线缓存中的转圈状态", text.contains("TranscriptRows.details(messages, group.key, working, revertMessageId, unverified)"))
+    assertTrue("二级详情同样不得沿用离线缓存中的转圈状态", text.contains("TranscriptRows.details(messages, resolved.key, working, revertMessageId, unverified)"))
     assertTrue("工具附件必须显示在二级详情", text.contains("items(latestSelected.attachments"))
   }
 

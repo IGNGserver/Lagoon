@@ -45,7 +45,7 @@ class ControllerRegressionTest {
     private val stores = mutableMapOf<String, SharedPreferences>()
     override fun getSharedPreferences(name: String, mode: Int) = stores.getOrPut(name) { preferences() }
   }
-  private fun controller(api: OpenCodeApi, initial: LagoonState): Pair<LagoonController, MutableStateFlow<LagoonState>> {
+  private fun controller(api: HarnessClient, initial: LagoonState): Pair<LagoonController, MutableStateFlow<LagoonState>> {
     val unsafeClass = Class.forName("sun.misc.Unsafe")
     val unsafe = unsafeClass.getDeclaredField("theUnsafe").apply { isAccessible = true }.get(null)
     val c = unsafeClass.getMethod("allocateInstance", Class::class.java).invoke(unsafe, LagoonController::class.java) as LagoonController
@@ -1379,6 +1379,39 @@ class ControllerRegressionTest {
       created = 102
     ))
     assertNull("会话删除事件必须同步驱逐 ConversationStorePool 槽位", controller.conversationPool.get("server", "s1"))
+  }
+
+  @Test fun jobOutputCapabilityWorksForDirectRemoteAndSshProfiles() {
+    for ((kind, ssh) in listOf(ServerKind.DSH to null, ServerKind.DSH_REMOTE to null, ServerKind.DSH to "ssh-host")) {
+      var called = false
+      val client = Proxy.newProxyInstance(javaClass.classLoader, arrayOf(HarnessClient::class.java)) { _, method, args ->
+        when (method.name) {
+          "capabilities" -> ApiCapabilities(jobOutputStream = true)
+          "followJobOutput" -> {
+            called = true
+            assertEquals("owner", args!![0]); assertEquals("job", args[1])
+            @Suppress("UNCHECKED_CAST")
+            val update = args[2] as (String, Boolean, Boolean) -> Unit
+            update("hello", true, false)
+            update(" world", false, true)
+            true
+          }
+          else -> error("unexpected ${method.name}")
+        }
+      } as HarnessClient
+      val profile = ServerProfile("server", "DSH", "https://fixture", kind = kind, sshHostId = ssh)
+      val (controller, state) = controller(client, LagoonState(serverId = "server", profiles = listOf(profile)))
+      val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
+      put(controller, "scope", scope)
+      try {
+        controller.openShellOutput(ShellJob("job", "owner", "cmd", 1, "/repo"))
+        assertTrue(called)
+        assertEquals("hello world", state.value.shellOutput?.text)
+        assertEquals(false, state.value.shellOutput?.loading)
+        assertEquals(false, state.value.shellOutput?.running)
+        assertNull(state.value.shellOutput?.error)
+      } finally { controller.closeShellOutput(); scope.cancel() }
+    }
   }
 
 }

@@ -436,7 +436,7 @@ private fun ActivityPanel(state: LagoonState, activity: SessionActivity, control
           Column(Modifier.weight(1f)) {
             Text(job.command.lineSequence().firstOrNull().orEmpty().ifBlank { "shell" }, maxLines = 1, overflow = TextOverflow.Ellipsis,
               style = MiuixTheme.textStyles.body2.copy(fontFamily = FontFamily.Monospace))
-            Text("运行中 · ${durationText(now - job.started)}", style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
+            Text(if (job.uncertain) "状态待核实 · 保留上次任务" else "运行中 · ${durationText(now - job.started)}", style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
           }
           ForwardChevron(16.dp, HyperTheme.colors.textSecondary)
         }
@@ -566,9 +566,11 @@ private fun AnimatedVisibilityScope.QoderActivityOverlay(
     snapshotFlow { source }.conflate().collect { (messages, activity, revertMessageId) ->
       val (working, unverified) = activity
       value = withContext(Dispatchers.Default) {
-        val latest = TranscriptRows.build(messages, working = working, revertMessageId = revertMessageId, unverified = unverified).firstOrNull { it.key == group.key }
-          ?: if (unverified && group.status in setOf("running", "pending")) group.copy(status = "unverified") else group
-        latest to TranscriptRows.details(messages, group.key, working, revertMessageId, unverified)
+        val rows = TranscriptRows.build(messages, working = working, revertMessageId = revertMessageId, unverified = unverified)
+        val resolved = TranscriptRows.resolveGroup(rows, group)
+        val latest = resolved ?: group.copy(title = "此操作记录已不可用", status = "unverified")
+        latest to if (resolved == null) emptyList() else
+          TranscriptRows.details(messages, resolved.key, working, revertMessageId, unverified)
       }
       delay(TranscriptScroll.ROWS_THROTTLE_MS * 2)
     }
@@ -578,7 +580,8 @@ private fun AnimatedVisibilityScope.QoderActivityOverlay(
   // Kept outside the list/detail branch: returning from a detail must restore the reader's place.
   val activityListState = rememberLazyListState()
   val latestSelected = selected?.let { item ->
-    val latest = if (item.key == group.key) latestGroup else details.firstOrNull { it.key == item.key } ?: item
+    val latest = if (item.key == group.key) latestGroup else details.firstOrNull { it.key == item.key }
+      ?: item.copy(title = "此操作记录已不可用", status = "unverified", source = null, target = null, attachments = emptyList())
     if (unverified && latest.status in setOf("running", "pending")) latest.copy(status = "unverified") else latest
   }
   // Not while animating out: that back belongs to the conversation underneath.

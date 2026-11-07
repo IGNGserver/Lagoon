@@ -35,8 +35,10 @@ data class SessionActivity(
   val subSessions: List<SubSessionEntry> = emptyList()
 ) {
   val activeSubSessions: Int get() = subSessions.count { it.active }
-  val hasActive: Boolean get() = shells.isNotEmpty() || activeSubSessions > 0
-  val total: Int get() = shells.size + activeSubSessions
+  val activeShells: Int get() = shells.count { !it.uncertain }
+  val uncertainShells: Int get() = shells.count { it.uncertain }
+  val hasActive: Boolean get() = activeShells > 0 || activeSubSessions > 0
+  val total: Int get() = activeShells + activeSubSessions
 }
 
 /**
@@ -76,7 +78,7 @@ object SessionActivityRules {
   fun backgroundRoots(tasks: Map<String, TaskState>, shells: Map<String, ShellJob>, parents: Map<String, String>): Set<String> {
     fun rootRunning(id: String): Boolean = tasks[id]?.active == true
     val roots = linkedSetOf<String>()
-    shells.values.forEach { job ->
+    shells.values.filterNot { it.uncertain }.forEach { job ->
       val root = BackgroundWork.rootOf(job.sessionId, parents)
       if (!rootRunning(root)) roots += root
     }

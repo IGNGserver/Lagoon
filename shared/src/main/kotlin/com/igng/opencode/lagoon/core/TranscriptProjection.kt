@@ -29,8 +29,8 @@ internal fun mergeTranscript(existing: List<Message>, fetched: List<Message>, pe
     if (readStart == null || current == null || current == readStart[message.id]) merged[message.id] = message
   }
   pending.forEach { if (!merged.containsKey(it.id)) merged[it.id] = it }
-  // Stable sort: equal timestamps keep their insertion order (older pages first, then fresh tail).
-  return merged.values.sortedBy { it.created }
+  // DSH exposes durable seq for same-millisecond ties; other harnesses keep stable arrival order.
+  return merged.values.sortedWith(compareBy<Message> { it.created }.thenBy { it.sequence ?: Long.MAX_VALUE })
 }
 
 /**
@@ -114,6 +114,17 @@ object TranscriptProjection {
       JSONObject(fields.toString()).put("id", messageId(event)).put("type", type).put("time", JSONObject().put("created", at)).toMessage()
 
     return when (event.type) {
+      "session.transcript.invalidate" -> Result(messages, reconcile = true)
+      "session.dsh.input" -> {
+        val turn = p.optLong("turn").takeIf { it > 0 }
+        insert(dshInputMessage(p.str("sessionID"), p.optLong("sequence"), at, turn, p.obj("input")))
+      }
+      "session.dsh.assistant" -> editAssistantOrReconcile { message ->
+        val content = JSONArray()
+        p.arr("content").objects().filter { it.str("type") in setOf("text", "reasoning") }.forEach { content.put(it) }
+        val parts = JSONObject().put("id", message.id).put("type", "assistant").put("content", content).toMessage().parts
+        message.copy(parts = parts + message.parts.filter { it.type == "tool" })
+      }
       "session.step.started" -> {
         val existing = messages.indexOfFirst { it.id == assistantId && it.role == "assistant" }
         val agent = p.str("agent").ifBlank { null }
@@ -122,12 +133,13 @@ object TranscriptProjection {
         if (existing >= 0) result(messages.toMutableList().also {
           it[existing] = it[existing].copy(agent = agent ?: it[existing].agent, model = model ?: it[existing].model, retry = null, error = null,
             errorType = null, finish = null, completedAt = null, created = started,
-            turnId = it[existing].turnId ?: turnIdOf(assistantId))
+            turnId = it[existing].turnId ?: turnIdOf(assistantId),
+            sequence = it[existing].sequence ?: p.optLong("sequence").takeIf { seq -> seq > 0 })
         }) else {
           val active = messages.indexOfLast { it.role == "assistant" && it.completedAt == null }
           val closed = if (active < 0) messages else messages.toMutableList().also { it[active] = it[active].copy(retry = null, completedAt = at) }
           result(closed + Message(assistantId, "assistant", started, emptyList(), agent = agent, model = model,
-            type = "assistant", turnId = turnIdOf(assistantId)))
+            type = "assistant", turnId = turnIdOf(assistantId), sequence = p.optLong("sequence").takeIf { it > 0 }))
         }
       }
       "session.step.ended" -> editAssistant { it.copy(completedAt = at, finish = p.str("finish").ifBlank { "stop" }) }
@@ -243,7 +255,11 @@ object TranscriptProjection {
         val id = p.str("messageID")
         if (id.isBlank()) null else {
           val text = p.str("text")
-          val user = JSONObject().put("id", id).put("type", "user").put("text", text)
+          val durable = p.optJSONObject("input")?.let {
+            val turn = p.optLong("turn").takeIf { it > 0 }
+            dshInputMessage(p.str("sessionID"), p.optLong("sequence"), at, turn, it)
+          }
+          val user = durable ?: JSONObject().put("id", id).put("type", "user").put("text", text)
             .put("time", JSONObject().put("created", event.created.takeIf { it > 0 } ?: System.currentTimeMillis()))
             .put("metadata", JSONObject().put("displayText", text)).toMessage()
           val index = messages.indexOfFirst { it.id == id }

@@ -206,7 +206,7 @@ val MessagePart.isDisplayable: Boolean get() = when (type) {
 /** Official visibility: notices and shell turns always render; `hidden` records never do. */
 val Message.isDisplayable: Boolean get() = when (role) {
   "hidden" -> false
-  "notice", "shell" -> true
+  "notice", "relay", "shell" -> true
   else -> error?.isNotBlank() == true || retry != null || parts.any { it.isDisplayable }
 }
 

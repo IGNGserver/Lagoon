@@ -32,7 +32,9 @@ data class ApiCapabilities(
    * Forking is offered on the phone. OpenCode keeps it off (revert covers "go back"); DeepSeek Harness
    * has no message-level revert, so a fork is its way to branch off a session.
    */
-  val fork: Boolean = false
+  val fork: Boolean = false,
+  /** DSH job/follow, independent of direct/SSH/Remote transport. */
+  val jobOutputStream: Boolean = false
 ) {
   fun supports(action: SessionAction) = action in actions
   companion object {

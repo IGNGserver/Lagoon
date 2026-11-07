@@ -344,7 +344,8 @@ class RemoteConversationTest {
             val before = request.getInt("beforeSeq")
             val through = request.getInt("throughSeq")
             val records = JSONArray()
-            for (seq in before..through) records.put(record(seq))
+            // session/page is backwards with an exclusive upper beforeSeq, not a lower bound.
+            for (seq in 5..minOf(through, before - 1)) records.put(record(seq))
             host.ok(JSONObject().put("records", records).put("hasMore", false))
           }
           else -> host.ok(JSONObject())
@@ -370,8 +371,14 @@ class RemoteConversationTest {
         withTimeout(5_000) { while (pageCalls().isEmpty()) delay(20) }
         val request = pageCalls().first()
           .getJSONObject("params").getJSONObject("payload").getJSONObject("args").getJSONObject("request")
-        assertEquals(5, request.getInt("beforeSeq"))
+        assertEquals(9, request.getInt("beforeSeq"))
         assertEquals(8, request.getInt("throughSeq"))
+        withTimeout(5_000) {
+          while (synchronized(received) { received.count { it.type == "session.dsh.assistant" } } < 5) delay(20)
+        }
+        assertEquals((5..9).map { "msg_1:$it" }, synchronized(received) {
+          received.filter { it.type == "session.dsh.assistant" }.map { it.properties.str("assistantMessageID") }
+        })
         collector.cancelAndJoin()
       } finally { backend.close(); session.close() }
     }

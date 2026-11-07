@@ -204,7 +204,7 @@ internal fun Conversation(state: LagoonState, controller: LagoonController, modi
           }
         }
       }
-      if (task?.active == true || activity?.hasActive == true) {
+      if (task?.active == true || activity?.hasActive == true || (activity?.uncertainShells ?: 0) > 0) {
         WorkingIndicator(task, activity, onOpenActivity)
       }
     }
@@ -230,7 +230,8 @@ private fun WorkingIndicator(task: TaskState?, activity: SessionActivity?, onOpe
   val activityParts = buildList {
     if (activity != null) {
       if (activity.activeSubSessions > 0) add("${activity.activeSubSessions} 个子会话")
-      if (activity.shells.isNotEmpty()) add("${activity.shells.size} 个命令")
+      if (activity.activeShells > 0) add("${activity.activeShells} 个命令")
+      if (activity.uncertainShells > 0) add("${activity.uncertainShells} 个任务待核实")
     }
   }
 
@@ -254,7 +255,7 @@ private fun WorkingIndicator(task: TaskState?, activity: SessionActivity?, onOpe
       .padding(horizontal = 14.dp, vertical = 7.dp),
     verticalAlignment = Alignment.CenterVertically
   ) {
-    if (!waiting) {
+    if (!waiting && (running || activity?.hasActive == true)) {
       InfiniteProgressIndicator(color = HyperTheme.colors.primary, size = 14.dp, strokeWidth = 1.5.dp)
       Spacer(Modifier.width(6.dp))
     }
@@ -301,6 +302,12 @@ private fun TranscriptRowView(row: TranscriptRow, onFile: (String) -> Unit, onOp
       Text(row.text, color = MiuixColorTokens.Error, style = MiuixTheme.textStyles.body2)
     }
     "note" -> NoticeRow(row, onOpenChild)
+    "relay" -> Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+      NoticeRow(row.copy(text = ""), onOpenChild)
+      SelectionContainer { Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        parsed(row.key, row.text).forEach { MarkdownBlockView(it, selectable = false) }
+      } }
+    }
     "tool" -> Column {
       GroupRow(row) { onActivityGroup(row) }
       row.target?.let { child -> HyperTextAction(text = "打开子会话", onClick = { onOpenChild(child) }, modifier = Modifier.padding(start = 16.dp)) }

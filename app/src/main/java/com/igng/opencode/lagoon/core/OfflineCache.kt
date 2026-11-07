@@ -149,10 +149,10 @@ class OfflineCache internal constructor(
     write("catalog:$serverId") {
       JSONObject().put("complete", complete && sessions.size <= 300).put("projects", JSONArray().apply { projects.forEach { put(JSONObject().put("id", it.id).put("directory", it.directory).put("name", it.name).put("sandboxes", JSONArray(it.sandboxes))) } })
         .put("sessions", JSONArray().apply { sessions.take(300).forEach { put(JSONObject().put("id", it.id).put("directory", it.directory).put("revertMessageId", it.revertMessageId)
-          .put("title", it.title).put("updated", it.updated).put("parentId", it.parentId)
+          .put("title", it.title).put("updated", it.updated).put("parentId", it.parentId).put("subagentMode", it.subagentMode)
           .put("projectId", it.projectId).put("created", it.created).put("archived", it.archived).put("agent", it.agent)
           .put("viewed", it.viewed).put("idle", it.idle).put("outcome", it.outcome).put("blank", it.blank)
-          .put("model", it.model?.let { model -> JSONObject().put("providerID", model.providerId).put("modelID", model.modelId).put("name", model.label) })) } })
+          .put("model", it.model?.let { model -> JSONObject().put("providerID", model.providerId).put("modelID", model.modelId).put("name", model.label).put("variant", model.variant) })) } })
         .toString()
     }
   }
@@ -163,7 +163,7 @@ class OfflineCache internal constructor(
     data.arr("projects").objects().map { it.toProject() } to
       data.arr("sessions").objects().map { Session(it.str("id"), it.str("directory"), it.str("title"), it.optLong("updated"), it.str("parentId").ifBlank { null }, it.str("projectId").ifBlank { null }, it.optLong("created"), it.optBoolean("archived"),
         it.str("agent").ifBlank { null }, it.obj("model").toModelChoice(), it.optLong("viewed"), it.optLong("idle"), it.str("outcome").ifBlank { null },
-        it.str("revertMessageId").ifBlank { null }, blank = it.optBoolean("blank", false)) }
+        it.str("revertMessageId").ifBlank { null }, blank = it.optBoolean("blank", false), subagentMode = it.str("subagentMode").ifBlank { null }) }
   } catch (cancel: CancellationException) {
     throw cancel
   } catch (error: Exception) {
@@ -180,7 +180,7 @@ class OfflineCache internal constructor(
     }
     write("messages:$serverId:$sessionId") {
       val clipped = messages.size > 100 || messages.any { message -> message.parts.any { part ->
-        part.text.length > 20_000 || part.input.length > 4_000 || part.output.length > 4_000 || part.error.length > 4_000 || part.patch.length > 20_000 ||
+        part.metadata.length > 4_000 || part.text.length > 20_000 || part.input.length > 4_000 || part.output.length > 4_000 || part.error.length > 4_000 || part.patch.length > 20_000 ||
           part.path.startsWith("data:") || part.attachments.any { it.url.startsWith("data:") }
       } }
       // Inline `data:` payloads (screenshots, phone files) are never persisted: they can be megabytes each.
@@ -188,7 +188,7 @@ class OfflineCache internal constructor(
       fun items(list: List<Message>) = JSONArray().apply { list.forEach { message ->
         put(JSONObject().put("id", message.id).put("role", message.role).put("type", message.type).put("created", message.created).put("error", message.error)
           .put("errorType", message.errorType).put("completedAt", message.completedAt).put("finish", message.finish).put("agent", message.agent)
-          .put("retry", message.retry).put("queued", message.queued).put("turnId", message.turnId)
+          .put("retry", message.retry).put("queued", message.queued).put("turnId", message.turnId).put("sequence", message.sequence)
           .put("model", message.model?.let { model -> JSONObject().put("providerID", model.providerId).put("id", model.modelId).put("name", model.label).put("variant", model.variant) })
           .put("notice", message.notice?.let { notice -> JSONObject().put("label", notice.label).put("detail", notice.detail).put("items", JSONArray(notice.items))
             .put("target", notice.target).put("error", notice.error).put("running", notice.running) })
@@ -197,7 +197,7 @@ class OfflineCache internal constructor(
               .put("tool", part.tool).put("title", part.title).put("status", part.status).put("input", part.input.take(4_000))
               .put("output", part.output.take(4_000)).put("path", url(part.path)).put("error", part.error.take(4_000))
               .put("patch", part.patch.take(20_000)).put("files", JSONArray(part.files)).put("mime", part.mime).put("target", part.target)
-              .put("background", part.background)
+              .put("background", part.background).put("metadata", part.metadata.take(4_000))
               .put("attachments", JSONArray().apply { part.attachments.filterNot { it.url.startsWith("data:") }.forEach { put(JSONObject().put("uri", it.url).put("mime", it.mime).put("name", it.name)) } }))
           } }))
       } }
@@ -223,11 +223,11 @@ class OfflineCache internal constructor(
       val role = item.str("role")
       Message(item.str("id"), role, item.optLong("created"), item.arr("parts").objects().map { part ->
         MessagePart(part.str("id"), part.str("type"), part.str("text"), part.str("tool"), part.str("title"), part.str("status"), part.str("input"), part.str("output"), part.str("path"), part.str("error"), part.str("patch"),
-          part.arr("files").strings(), part.str("mime"), part.arr("attachments").toAttachments(), part.str("target").ifBlank { null }, part.optBoolean("background"))
+          part.arr("files").strings(), part.str("mime"), part.arr("attachments").toAttachments(), part.str("target").ifBlank { null }, part.optBoolean("background"), part.str("metadata"))
       }, item.str("error").ifBlank { null }, item.str("agent").ifBlank { null }, item.obj("model").toModelChoice(),
         item.optLong("completedAt").takeIf { it > 0 }, item.str("finish").ifBlank { null }, item.str("errorType").ifBlank { null },
         item.str("retry").ifBlank { null }, notice = notice, queued = item.optBoolean("queued"), type = item.str("type").ifBlank { role },
-        turnId = item.str("turnId").ifBlank { null })
+        turnId = item.str("turnId").ifBlank { null }, sequence = (item.opt("sequence") as? Number)?.toLong())
     }
   } catch (cancel: CancellationException) {
     throw cancel

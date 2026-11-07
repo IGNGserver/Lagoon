@@ -193,6 +193,7 @@ class DshApi(
   private val liveEventSequence = java.util.concurrent.atomic.AtomicLong()
   private fun nextLiveEventId() = liveEventSequence.incrementAndGet()
   /** 实时流里已经建立文本/推理部件的 `sessionId|turn|step` 键与部件种类。 */
+  private val durableTurns = ConcurrentHashMap<String, Long>()
   private val liveParts = ConcurrentHashMap<String, MutableSet<String>>()
   /** 活跃 attempt 的 `attemptId → sessionId|turn|step`（chunk 帧不带 turn/step）。 */
   private val liveAttempts = ConcurrentHashMap<String, String>()
@@ -209,6 +210,7 @@ class DshApi(
     eventChannel?.close()
     followStates.values.toList().forEach(::stopFollowState)
     followStates.clear()
+    durableTurns.clear(); liveParts.clear(); liveAttempts.clear()
     pendingApprovals.clear(); pendingQuestions.clear()
     remoteBackend?.close()
   }
@@ -921,7 +923,7 @@ class DshApi(
    * 把一条 DSH 会话事件翻译成 Lagoon 认识的事件；一次输入可能产出多条（例如 `assistant/message`
    * 里的多个内容块）。不认识的记录（内部事件、log-only 标记）返回空列表。
    */
-  private fun translate(session: Session, event: JSONObject): List<ServerEvent> {
+  internal fun translate(session: Session, event: JSONObject): List<ServerEvent> {
     val type = event.str("type")
     val seq = event.optDouble("seq", 0.0).toLong()
     val time = event.optDouble("time", 0.0).toLong()
@@ -930,9 +932,11 @@ class DshApi(
     fun emit(name: String, properties: JSONObject) {
       // DSH seq 只在单个会话的日志内单调；不同会话可以同时拥有 seq=1。
       // 全局 AllServersOverview 按 ID 去重，因此会话身份必须进入耐久事件 ID。
-      output += ServerEvent(id = "dsh:${session.id}:$seq:${output.size}", directory = session.directory, type = name, properties = properties, created = time)
+      output += ServerEvent(id = "dsh:${session.id}:$seq:${output.size}", directory = session.directory, type = name, properties = JSONObject(properties.toString()), created = time)
     }
-    val base = JSONObject().put("sessionID", session.id)
+    val turn = data.optLong("turn").takeIf { it > 0 } ?: durableTurns[session.id]
+    if (type == "turn/start" && turn != null) durableTurns[session.id] = turn
+    val base = JSONObject().put("sessionID", session.id).put("sequence", seq).putOpt("turn", turn)
     when (type) {
       "turn/start" -> emit("session.execution.started", base.put("at", time))
       "turn/end" -> {
@@ -954,45 +958,27 @@ class DshApi(
       }
       "step/start" -> emit("session.step.started", base
         .put("assistantMessageID", messageId(data))
-        .put("started", time))
+        .put("started", time).putOpt("agent", session.agent).apply {
+          session.model?.let { put("model", JSONObject().put("providerID", it.providerId).put("id", it.modelId).put("name", it.label)) }
+        })
       "step/end" -> emit("session.step.ended", base
         .put("assistantMessageID", messageId(data))
         .put("finish", "stop"))
       "user/message" -> {
-        // Host 也把 runtime/time/goal 等模型上下文写成 user/message。只有明确的用户来源
-        // （以及没有 source 的旧 Host）可以进入用户时间线，其他来源绝不能伪装成手机发送。
         val kind = data.obj("source").str("kind")
-        if (kind.isBlank() || kind == "user") {
-          val id = data.str("id").ifBlank { "user:${session.id}:$seq" }
-          val text = data.arr("content").objects()
-            .mapNotNull { block -> block.str("text").takeIf(String::isNotBlank) }.joinToString("\n")
-          emit("session.user.message", base.put("messageID", id).put("text", text))
-        }
+        if (dshInputMessage(session.id, seq, time, turn, data) == null) return emptyList()
+        // Preserve the legacy user event shape, but pass the durable source to the shared decoder.
+        val name = if (kind.isBlank() || kind == "user") "session.user.message" else "session.dsh.input"
+        emit(name, base.put("messageID", data.str("id").ifBlank { "user:${session.id}:$seq" })
+          .put("text", data.arr("content").contentText()).put("input", data))
       }
       "assistant/message" -> {
         val assistantId = messageId(data)
-        val key = liveKey(session.id, data)
-        // 实时流已经建过部件时只用耐久文本收口，避免同一段文字出现两次。
-        val live = liveParts.remove(key)
-        val message = data.obj("message")
-        for (block in message.arr("content").objects()) {
-          when (block.str("type")) {
-            "reasoning" -> {
-              if (live?.contains("reasoning") != true) {
-                emit("session.reasoning.started", base.put("assistantMessageID", assistantId).put("started", time))
-              }
-              emit("session.reasoning.ended", base.put("assistantMessageID", assistantId).put("text", block.str("text")))
-            }
-            "text" -> {
-              if (live?.contains("text") != true) {
-                emit("session.text.started", base.put("assistantMessageID", assistantId).put("started", time))
-              }
-              emit("session.text.ended", base.put("assistantMessageID", assistantId).put("text", block.str("text")))
-            }
-            // 工具调用由独立的 `tool/call` 记录承载，避免同一调用出现两行。
-            else -> Unit
-          }
-        }
+        liveParts.remove(liveKey(session.id, data))
+        // Replace authoritative text/reasoning as a batch: multiple blocks of one kind and retries
+        // must not overwrite the last live part or duplicate it. Tool heads stay call-id anchored.
+        emit("session.dsh.assistant", base.put("assistantMessageID", assistantId)
+          .put("content", data.obj("message").arr("content")))
       }
       "tool/call" -> {
         val callId = data.str("callId")
@@ -1007,23 +993,12 @@ class DshApi(
         val message = data.obj("message")
         val callId = message.str("toolCallId").ifBlank { data.str("callId") }
         if (callId.isNotBlank()) {
-          val content = message.arr("content")
-          val json = JSONArray()
-          for (block in content.objects()) {
-            if (block.str("type") == "text") json.put(JSONObject().put("type", "text").put("text", block.str("text")))
-          }
-          val properties = base
-            .put("assistantMessageID", messageId(data))
-            .put("id", callId)
-            .put("content", json)
-            .put("metadata", JSONObject())
-          if (message.optBoolean("isError")) {
-            val failure = data.obj("error")
-            val reason = failure.str("reason").ifBlank { failure.str("message") }.ifBlank { "工具执行失败" }
-            emit("session.tool.failed", properties.put("error", JSONObject().put("message", reason)))
-          } else {
-            emit("session.tool.success", properties)
-          }
+          val state = dshToolState(data)
+          val properties = base.put("assistantMessageID", messageId(data)).put("id", callId)
+            .put("content", state.arr("content")).put("metadata", state.obj("metadata"))
+            .put("name", state.obj("metadata").str("tool"))
+          if (state.str("status") == "error") emit("session.tool.failed", properties.put("error", state.obj("error")))
+          else emit("session.tool.success", properties)
         }
       }
       "session/title" -> emit("session.renamed", base.put("title", data.str("title")))
@@ -1549,6 +1524,9 @@ class DshApi(
     existing?.let(::stopFollowState)
     val state = FollowState(session.id)
     state.opening = true
+    state.frameJob = ioScope.launch {
+      for (frame in state.frames) processFollowFrame(session, state, frame)
+    }
     followStates[session.id] = state
     ioScope.launch { openFollow(session, state) }
     state
@@ -1597,6 +1575,8 @@ class DshApi(
     state.error = error.message?.takeIf { it.isNotBlank() } ?: error.javaClass.simpleName
     if (!state.snapshot.isCompleted) state.snapshot.completeExceptionally(error)
     followStates.remove(session.id, state)
+    state.frames.close()
+    state.frameJob?.cancel()
     Diagnostics.warn("DshApi", "会话 follow 未建立：${state.error}")
   }
 
@@ -1616,7 +1596,15 @@ class DshApi(
   }
 
   private fun onFollowFrame(session: Session, state: FollowState, frame: JSONObject) {
+    if (!state.closed) state.frames.trySend(frame)
+  }
+
+  private suspend fun processFollowFrame(session: Session, state: FollowState, frame: JSONObject) {
     if (state.closed) return
+    if (frame.str("type") == "lagoon/follow-closed") {
+      finishFollowClosed(session, state, state.closeCause)
+      return
+    }
     state.lastFrameAt = System.currentTimeMillis()
     val type = frame.str("type")
     if (type != "snapshot" && !state.snapshot.isCompleted) {
@@ -1632,6 +1620,8 @@ class DshApi(
         state.error = null
         state.snapshotAt = System.currentTimeMillis()
         frame.optDouble("cursor", 0.0).toLong().takeIf { it >= 0 }?.let { cursors[session.id] = it }
+        frame.arr("records").objects().lastOrNull { it.obj("event").str("type") == "turn/start" }
+          ?.obj("event")?.obj("data")?.optLong("turn")?.takeIf { it > 0 }?.let { durableTurns[session.id] = it }
         val baseline = lastSeq(session.id)
         if (!state.snapshot.isCompleted) state.snapshot.complete(frame)
         // 重连/重同步：只补投时间线还没有的耐久记录，避免整页重复。
@@ -1654,7 +1644,14 @@ class DshApi(
         val seq = event.optDouble("seq", 0.0).toLong()
         if (seq <= 0 || seq > lastSeq(session.id)) {
           val previous = lastSeq(session.id)
-          if (seq > 0) gapRepairWindow(previous, seq)?.let { repairGap(session, state, it) }
+          if (seq > previous + 1 && previous > 0) {
+            val missing = gapRepairWindow(previous, seq)
+            if (missing == null || !repairGap(session, state, missing)) {
+              state.snapshotAt = 0L
+              emitFollow(state, ServerEvent("dsh:${session.id}:gap:$seq", session.directory, "session.transcript.invalidate",
+                JSONObject().put("sessionID", session.id), System.currentTimeMillis()))
+            }
+          }
           translate(session, event).forEach { emitFollow(state, it) }
           if (seq > 0) advanceSeq(session.id, seq)
         }
@@ -1665,6 +1662,13 @@ class DshApi(
   }
 
   private fun onFollowClosed(session: Session, state: FollowState, cause: Throwable?) {
+    if (state.closed) return
+    state.closeCause = cause
+    // Drain already received frames before handling EOF, including the last tool result/turn end.
+    state.frames.trySend(JSONObject().put("type", "lagoon/follow-closed"))
+  }
+
+  private fun finishFollowClosed(session: Session, state: FollowState, cause: Throwable?) {
     state.opening = false
     state.socket = null
     if (!state.snapshot.isCompleted) {
@@ -1672,6 +1676,8 @@ class DshApi(
     }
     if (state.closed) return
     state.closed = true
+    state.frames.close()
+    state.frameJob?.cancel()
     state.error = cause?.message?.takeIf { it.isNotBlank() } ?: "会话流已关闭"
     followStates.remove(session.id, state)
     val watchedNow = synchronized(watched) { session.id in watched }
@@ -1710,26 +1716,24 @@ class DshApi(
   internal fun gapRepairWindow(previous: Long, seq: Long): LongRange? =
     if (previous > 0 && seq > previous + 1 && seq - previous <= MAX_GAP_REPAIR) (previous + 1) until seq else null
 
-  private fun repairGap(session: Session, state: FollowState, missing: LongRange) {
-    ioScope.launch {
-      try {
-        val request = JSONObject().put("address", address(session.id))
-          .put("throughSeq", missing.last).put("beforeSeq", missing.first).put("maxMessages", GAP_REPAIR_PAGE)
-        val page = callObject("session/page", requestArgs(request))
-        var repaired = 0
-        for (record in page.arr("records").objects()) {
-          val event = record.obj("event")
-          val seq = event.optDouble("seq", 0.0).toLong()
-          if (seq !in missing) continue
-          translate(session, event).forEach { emitFollow(state, it) }
-          repaired++
-        }
-        Diagnostics.info("DshApi", "会话事件缺口补齐 · ${missing.first}..${missing.last} · events=$repaired")
-      } catch (cancel: CancellationException) {
-        throw cancel
-      } catch (error: Exception) {
-        Diagnostics.warn("DshApi", "会话事件缺口补齐失败", error)
+  private suspend fun repairGap(session: Session, state: FollowState, missing: LongRange): Boolean {
+    return try {
+      // beforeSeq is exclusive and pages backwards. The old lower-bound value excluded the gap.
+      val request = JSONObject().put("address", address(session.id))
+        .put("throughSeq", missing.last).put("beforeSeq", missing.last + 1).put("maxMessages", GAP_REPAIR_PAGE)
+      val page = callObject("session/page", requestArgs(request))
+      val events = page.arr("records").objects().map { it.obj("event") }
+        .filter { it.optLong("seq") in missing }.sortedBy { it.optLong("seq") }
+      if (events.map { it.optLong("seq") }.distinct().size.toLong() != missing.last - missing.first + 1) return false
+      for (event in events) {
+        translate(session, event).forEach { emitFollow(state, it) }
+        advanceSeq(session.id, event.optLong("seq"))
       }
+      true
+    } catch (cancel: CancellationException) { throw cancel }
+    catch (error: Exception) {
+      Diagnostics.warn("DshApi", "会话事件缺口补齐失败", error)
+      false
     }
   }
 
@@ -1746,6 +1750,8 @@ class DshApi(
     followStates.remove(state.sessionId, state)
     runCatching { state.socket?.cancel() }
     synchronized(state.pending) { state.pending.clear() }
+    state.frames.close()
+    state.frameJob?.cancel()
     if (!state.snapshot.isCompleted) state.snapshot.completeExceptionally(IOException("会话流已关闭"))
   }
 
@@ -1807,6 +1813,9 @@ class DshApi(
   private class FollowState(val sessionId: String) {
     val snapshot = CompletableDeferred<JSONObject>()
     val pending = ArrayDeque<ServerEvent>()
+    val frames = Channel<JSONObject>(Channel.UNLIMITED)
+    var frameJob: Job? = null
+    @Volatile var closeCause: Throwable? = null
     @Volatile var socket: WebSocket? = null
     @Volatile var opening = false
     @Volatile var closed = false
@@ -1827,17 +1836,14 @@ class DshApi(
    * 注入类 turn root（goal / goal complete / compaction checkpoint）折成一行 notice，既不展示
    * 模型侧原文，也不丢失轮次起点。
    */
-  private fun recordsToMessages(session: Session, records: List<JSONObject>): List<Message> {
-    data class ToolEntry(val id: String, val name: String, val input: JSONObject, var output: String, var done: Boolean)
+  internal fun recordsToMessages(session: Session, records: List<JSONObject>): List<Message> {
+    data class ToolEntry(val id: String, val name: String, val input: JSONObject, var state: JSONObject?)
     data class Step(val turn: Long, val step: Long, var started: Long, var order: Int,
       val blocks: MutableList<JSONObject>, val tools: MutableMap<String, ToolEntry>, var ended: Long)
-    data class UserEntry(val created: Long, val order: Int, val turn: Long?, val data: JSONObject)
-    data class NoticeEntry(val created: Long, val order: Int, val turn: Long?, val id: String,
-      val label: String, val detail: String, val type: String)
 
     val steps = LinkedHashMap<Pair<Long, Long>, Step>()
-    val users = mutableListOf<UserEntry>()
-    val notices = mutableListOf<NoticeEntry>()
+    val inputs = mutableListOf<Triple<Long, Int, Message>>()
+    var lifecycleNotices = emptyList<Message>()
     var currentTurn: Long? = null
     var order = 0
     fun stepOf(data: JSONObject): Step {
@@ -1857,24 +1863,17 @@ class DshApi(
         "turn/start" -> currentTurn = data.optDouble("turn", 0.0).toLong().takeIf { it > 0 }
         "step/start" -> stepOf(data).let { if (it.started == 0L) it.started = time }
         "step/end" -> stepOf(data).ended = time
+        "compaction/start", "compaction/end", "command/done" -> {
+          translate(session, event).forEach { translated ->
+            lifecycleNotices = TranscriptProjection.apply(lifecycleNotices, translated)?.messages ?: lifecycleNotices
+          }
+        }
         // DSH also writes model-facing context (runtime / time snapshots) as user messages; only the
         // user's own prompts (`source.kind` = user, or no source on older hosts) are timeline rows.
         "user/message" -> {
-          val kind = data.obj("source").str("kind")
-          val rawId = data.str("id")
-          when {
-            kind.isBlank() || kind == "user" -> users += UserEntry(time, order, currentTurn, data)
-            kind == "goal" || kind == "tool-goal" || kind == "compact-checkpoint" -> {
-              val text = data.arr("content").objects().mapNotNull { block -> block.str("text").takeIf(String::isNotBlank) }.joinToString("\n")
-              val notice = injectedNotice(kind, text)
-              if (notice != null) {
-                notices += NoticeEntry(time, order, currentTurn, rawId.ifBlank { "notice:$seq" }, notice.first, notice.second, kind)
-              }
-            }
-            // time-context / runtime-context / skill-catalog / agent-instructions are model-facing
-            // context, not timeline rows; keep them out like the official transcript does.
-          }
+          dshInputMessage(session.id, seq, time, currentTurn, data)?.let { inputs += Triple(time, order, it) }
         }
+
         "assistant/message" -> {
           val step = stepOf(data)
           if (step.started == 0L) step.started = time
@@ -1887,17 +1886,14 @@ class DshApi(
           val step = stepOf(data)
           if (step.started == 0L) step.started = time
           val callId = data.str("callId")
-          if (callId.isNotBlank()) step.tools[callId] = ToolEntry(callId, data.str("name"), parseArguments(data.str("arguments")) as? JSONObject ?: JSONObject(), "", false)
+          if (callId.isNotBlank()) step.tools[callId] = ToolEntry(callId, data.str("name"), parseArguments(data.str("arguments")) as? JSONObject ?: JSONObject(), null)
         }
         "tool/result" -> {
           val step = stepOf(data)
           if (step.started == 0L) step.started = time
           val message = data.obj("message")
           val callId = message.str("toolCallId").ifBlank { data.str("callId") }
-          step.tools[callId]?.let { entry ->
-            entry.output = message.arr("content").objects().mapNotNull { block -> block.str("text").takeIf(String::isNotBlank) }.joinToString("\n")
-            entry.done = true
-          }
+          step.tools[callId]?.state = dshToolState(data)
         }
       }
     }
@@ -1905,23 +1901,8 @@ class DshApi(
     // Sort by the event time and use the record position as a tie-breaker: a page can contain a user
     // prompt, an injected goal row and a step at the same millisecond.
     val entries = mutableListOf<Triple<Long, Int, Message>>()
-    for (user in users) {
-      val text = user.data.arr("content").objects().mapNotNull { it.str("text").takeIf(String::isNotBlank) }.joinToString("\n")
-      val id = user.data.str("id").ifBlank { "user:${user.created}" }
-      val json = JSONObject()
-        .put("id", id)
-        .put("type", "user")
-        .put("text", text)
-        .put("time", JSONObject().put("created", user.created))
-        .put("metadata", JSONObject().put("displayText", text))
-      entries += Triple(user.created, user.order,
-        json.toMessage().copy(turnId = user.turn?.let { "turn:$it" }))
-    }
-    for (notice in notices) {
-      entries += Triple(notice.created, notice.order, Message(notice.id, "notice", notice.created, emptyList(),
-        notice = Notice(notice.label, notice.detail), type = notice.type,
-        turnId = notice.turn?.let { "turn:$it" }))
-    }
+    entries += inputs
+    lifecycleNotices.forEach { message -> entries += Triple(message.created, 0, message) }
     for (step in steps.values) {
       val id = "msg_${step.turn}:${step.step}"
       val content = JSONArray()
@@ -1931,13 +1912,8 @@ class DshApi(
         content.put(JSONObject().put("type", kind).put("text", block.str("text")))
       }
       for (tool in step.tools.values) {
-        val state = JSONObject()
-          .put("status", if (tool.done) "completed" else "running")
-          .put("input", tool.input)
-          .put("metadata", JSONObject())
-        if (tool.output.isNotBlank()) {
-          state.put("content", JSONArray().put(JSONObject().put("type", "text").put("text", tool.output)))
-        }
+        val state = tool.state ?: JSONObject().put("status", "running")
+        state.put("input", tool.input)
         content.put(JSONObject().put("type", "tool").put("id", tool.id).put("name", tool.name).put("state", state))
       }
       if (content.length() == 0) continue
@@ -1953,25 +1929,10 @@ class DshApi(
         json.put("model", JSONObject().put("providerID", model.providerId).put("id", model.modelId).put("name", model.label))
       }
       entries += Triple(step.started, step.order,
-        json.toMessage().copy(turnId = "turn:${step.turn}"))
+        json.toMessage().copy(turnId = "turn:${step.turn}", sequence = records.getOrNull(step.order - 1)?.obj("event")?.optLong("seq")))
     }
     entries.sortWith(compareBy<Triple<Long, Int, Message>> { it.first }.thenBy { it.second })
     return entries.map { it.third }
-  }
-
-  /** Turn roots that DSH injects as model-facing user messages; show a compact label, never the prompt. */
-  private fun injectedNotice(kind: String, text: String): Pair<String, String>? = when (kind) {
-    "goal" -> "目标轮次" to goalDetail(text)
-    "tool-goal" -> "目标完成" to goalDetail(text)
-    "compact-checkpoint" -> "上下文已压缩" to ""
-    else -> null
-  }
-
-  private fun goalDetail(text: String): String {
-    val round = Regex("Round:\\s*(\\d+/\\d+)").find(text)?.groupValues?.get(1).orEmpty()
-    val objective = Regex("Objective:\\s*\"([^\"]*)\"").find(text)?.groupValues?.get(1)?.trim().orEmpty()
-    val excerpt = objective.take(160).let { if (objective.length > 160) "$it…" else it }
-    return listOf(round, excerpt).filter(String::isNotBlank).joinToString(" · ")
   }
 
   // ---------------------------------------------------------------- 写操作
@@ -2203,6 +2164,8 @@ class DshApi(
   ): Boolean {
     val closed = CompletableDeferred<Unit>()
     var sawFrame = false
+    var runningState = false
+    var terminalSeen = false
     val socket = try {
       openMux("job/follow", requestArgs(JSONObject().put("sessionId", sessionId).put("jobId", jobId)),
         onItem = { frame ->
@@ -2211,8 +2174,9 @@ class DshApi(
             "opened", "status" -> {
               val job = frame.optJSONObject("job")
               val status = job?.optString("status").orEmpty()
-              val running = status == "running" || status == "stopping"
-              onUpdate("", running, status.isNotBlank() && !running)
+              runningState = status == "running" || status == "stopping"
+              terminalSeen = frame.str("type") == "status" && status.isNotBlank() && !runningState
+              onUpdate("", runningState, terminalSeen)
             }
             "output" -> {
               val chunks = frame.optJSONArray("chunks")
@@ -2222,15 +2186,18 @@ class DshApi(
                   append(chunk.optString("text"))
                 }
               }
-              if (text.isNotEmpty()) onUpdate(text, true, false)
+              if (text.isNotEmpty()) onUpdate(text, runningState, false)
             }
           }
         },
-        onClosed = { closed.complete(Unit) })
+        onClosed = { cause ->
+          if (cause != null) closed.completeExceptionally(cause) else closed.complete(Unit)
+        })
     } catch (cancel: CancellationException) { throw cancel }
     catch (error: Exception) { throw error }
     return try {
       closed.await()
+      if (sawFrame && !terminalSeen) throw IOException("后台任务输出流中断，状态待核实")
       sawFrame
     } finally { runCatching { socket.cancel() } }
   }
@@ -2248,8 +2215,10 @@ class DshApi(
    */
   override suspend fun shells(directory: String): List<ShellJob> = withContext(Dispatchers.IO) {
     val normalized = normalizedDirectory(directory)
-    val sessions = known.values.filter { normalizedDirectory(it.directory) == normalized }
-      .sortedByDescending { it.updated }.take(MAX_JOB_SESSIONS)
+    // Use the current authoritative roster: stale/deleted cached sessions must not poison all jobs
+    // in this directory with a permanent session-not-found error.
+    val sessions = listing().items.mapNotNull(::itemToSession)
+      .filter { normalizedDirectory(it.directory) == normalized }.sortedByDescending { it.updated }
     if (sessions.isEmpty()) return@withContext emptyList()
     val jobs = LinkedHashMap<String, ShellJob>()
     for (session in sessions) {
@@ -2257,7 +2226,7 @@ class DshApi(
         val id = job.str("id")
         val owner = job.str("owner")
         // 无主作业是 Host 全局的，无法归属到目录/会话，跳过。
-        if (id.isBlank() || owner.isBlank() || job.str("status") !in ACTIVE_JOB_STATUSES) continue
+        if (id.isBlank() || owner != session.id || job.str("status") !in ACTIVE_JOB_STATUSES) continue
         jobs[id] = ShellJob(
           id = id,
           sessionId = owner,
@@ -2272,19 +2241,18 @@ class DshApi(
 
   /** `job/list` 是每会话一条流；短 TTL 缓存把同一轮对账里的重复读取收敛掉。 */
   private suspend fun runningJobs(session: Session): List<JSONObject> {
-    jobCache[session.id]?.takeIf { System.currentTimeMillis() - it.first < JOB_CACHE_MILLIS }?.let { return it.second }
-    val jobs = try {
-      oneShotStreams.withPermit {
-        // 等许可期间别的目录可能已经写过缓存；再查一次，避免重复开流。
-        jobCache[session.id]?.takeIf { System.currentTimeMillis() - it.first < JOB_CACHE_MILLIS }?.second
-          ?: fetchFirstFrame("job/list", requestArgs(JSONObject().put("sessionId", session.id))).arr("jobs").objects()
+    jobCache[session.id]?.takeIf { clock() - it.first < JOB_CACHE_MILLIS }?.let { return it.second }
+    // A failed/invalid read is not an authoritative empty list. Propagate it so the caller keeps
+    // last-known jobs and marks the directory stale instead of silently deleting running work.
+    val jobs = oneShotStreams.withPermit {
+      jobCache[session.id]?.takeIf { clock() - it.first < JOB_CACHE_MILLIS }?.second ?: run {
+        val frame = fetchFirstFrame("job/list", requestArgs(JSONObject().put("sessionId", session.id)))
+        if (frame.str("type") != "rows" || frame.optJSONArray("jobs") == null)
+          throw ApiException(502, "后台任务列表格式无效", "stream/jobs-invalid")
+        frame.arr("jobs").objects()
       }
-    } catch (cancel: CancellationException) {
-      throw cancel
-    } catch (_: Exception) {
-      emptyList()
     }
-    jobCache[session.id] = System.currentTimeMillis() to jobs
+    jobCache[session.id] = clock() to jobs
     return jobs
   }
 
@@ -2844,9 +2812,6 @@ class DshApi(
     const val MAX_CHANGE_TURNS = 8
     const val MAX_CHANGED_FILES = 60
 
-    /** 单次 shell 读取最多查询的会话数（`job/list` 是每会话一条流）。 */
-    const val MAX_JOB_SESSIONS = 3
-
     /** 作业清单缓存的有效期：把同一轮对账里的重复读取收敛掉。 */
     const val JOB_CACHE_MILLIS = 20_000L
     val ACTIVE_JOB_STATUSES = setOf("running", "stopping")
@@ -2864,7 +2829,8 @@ class DshApi(
       archive = ArchiveEndpoint(ActionEndpoint("POST", "workspace/archiveSession"), restorable = true),
       documented = false,
       deleteSession = false,
-      fork = true
+      fork = true,
+      jobOutputStream = true
     )
 
     /** Capabilities for a tunneled SSH client created before its DshApi instance exists. */
