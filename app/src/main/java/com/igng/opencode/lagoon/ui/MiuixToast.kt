@@ -12,24 +12,19 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.delay
-import top.yukonga.miuix.kmp.basic.Icon
 import top.yukonga.miuix.kmp.basic.Text
-import top.yukonga.miuix.kmp.icon.MiuixIcons
-import top.yukonga.miuix.kmp.icon.extended.Close
-import top.yukonga.miuix.kmp.icon.extended.Info
-import top.yukonga.miuix.kmp.icon.extended.Ok
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 
 enum class MiuixToastType {
-  INFO, SUCCESS, ERROR
+  INFO, SUCCESS, ERROR, WARNING
 }
 
 /**
- * 澎湃 OS 4 悬浮胶囊轻提示 (HyperOS 4 Floating Island Toast)
+ * 澎湃 OS 4 悬浮胶囊轻提示 (HyperOS 4 Floating Island Toast)：
+ * 区分 INFO / SUCCESS / WARNING / ERROR 四种语义色阶，使用感叹号圆环（QoderGlyph.ERROR）替代误导点击的 × 图标。
  */
 @Composable
 fun MiuixToastHost(
@@ -38,9 +33,9 @@ fun MiuixToastHost(
   onDismiss: () -> Unit,
   modifier: Modifier = Modifier
 ) {
-  LaunchedEffect(message) {
+  LaunchedEffect(message, type) {
     if (message != null) {
-      delay(if (type == MiuixToastType.ERROR) 4_000 else 2_600)
+      delay(if (type == MiuixToastType.ERROR || type == MiuixToastType.WARNING) 3_800 else 2_500)
       onDismiss()
     }
   }
@@ -56,25 +51,29 @@ fun MiuixToastHost(
     modifier = modifier
   ) {
     if (message != null) {
-      val iconVector: ImageVector = when (type) {
-        MiuixToastType.SUCCESS -> MiuixIcons.Ok
-        MiuixToastType.ERROR -> MiuixIcons.Close
-        MiuixToastType.INFO -> MiuixIcons.Info
+      val glyph = when (type) {
+        MiuixToastType.SUCCESS -> QoderGlyph.CHECK
+        MiuixToastType.WARNING -> QoderGlyph.WARNING
+        MiuixToastType.ERROR -> QoderGlyph.ERROR
+        MiuixToastType.INFO -> QoderGlyph.INFO
       }
-      val iconColor: Color = when (type) {
+      val accentColor = when (type) {
         MiuixToastType.SUCCESS -> HyperTheme.colors.success
+        MiuixToastType.WARNING -> HyperTheme.colors.warning
         MiuixToastType.ERROR -> HyperTheme.colors.error
         MiuixToastType.INFO -> HyperTheme.colors.primary
       }
       val shape = miuixSquircleShape(18.dp)
       val bg = HyperTheme.colors.cardElevated
-      val borderColor = if (type == MiuixToastType.ERROR) HyperTheme.colors.error.copy(alpha = 0.35f) else HyperTheme.colors.cardBorder
+      val borderColor = when (type) {
+        MiuixToastType.ERROR -> HyperTheme.colors.error.copy(alpha = 0.35f)
+        MiuixToastType.WARNING -> HyperTheme.colors.warning.copy(alpha = 0.35f)
+        else -> HyperTheme.colors.cardBorder
+      }
 
-      // Not clickable: the toast sits over the page header, and tapping it to dismiss used to eat the
-      // tap meant for the back / ⋯ button underneath for its whole lifetime.
       Row(
         modifier = Modifier
-          .padding(horizontal = 24.dp, vertical = 8.dp)
+          .padding(horizontal = 24.dp, vertical = 6.dp)
           .shadow(12.dp, shape, ambientColor = Color.Black.copy(alpha = 0.18f), spotColor = Color.Black.copy(alpha = 0.18f))
           .clip(shape)
           .background(bg, shape)
@@ -83,11 +82,10 @@ fun MiuixToastHost(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(10.dp)
       ) {
-        Icon(
-          imageVector = iconVector,
-          contentDescription = null,
-          tint = iconColor,
-          modifier = Modifier.size(18.dp)
+        QoderIcon(
+          glyph = glyph,
+          modifier = Modifier.size(18.dp),
+          color = accentColor
         )
         Text(
           text = message,

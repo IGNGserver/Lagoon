@@ -33,7 +33,12 @@ data class ConnectionStatus(
 }
 
 /** One line of connection feedback above the page. */
-data class ConnectionBanner(val text: String, val tone: Tone, val retry: Boolean = false) {
+data class ConnectionBanner(
+  val text: String,
+  val tone: Tone,
+  val retry: Boolean = false,
+  val subtitle: String? = null
+) {
   enum class Tone { PROGRESS, WARNING, ERROR }
 
   companion object {
@@ -43,6 +48,20 @@ data class ConnectionBanner(val text: String, val tone: Tone, val retry: Boolean
     const val SLOW_MILLIS = 8_000L
     /** A live-stream drop shorter than this is a routine reconnect and is not announced. */
     const val STREAM_GRACE_MILLIS = 4_000L
+
+    /**
+     * Filters raw transport status strings so redundant "already connected" or duplicated failure
+     * lines never leak below or inside the connection island.
+     */
+    fun cleanTransportSubtitle(stage: ConnectStage, detail: String?, reason: String? = null): String? {
+      val trimmed = detail?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+      if (stage == ConnectStage.READY || stage == ConnectStage.IDLE) return null
+      if (trimmed.endsWith("已连接") && !trimmed.contains("重连")) return null
+      if (stage == ConnectStage.RETRYING) {
+        if (trimmed.contains("失败") || (reason != null && trimmed.contains(reason))) return null
+      }
+      return trimmed
+    }
 
     /**
      * The banner for the current moment, or null when nothing needs saying. Pure so the copy and the
@@ -55,14 +74,16 @@ data class ConnectionBanner(val text: String, val tone: Tone, val retry: Boolean
       streamConnected: Boolean,
       streamDownSince: Long,
       transcriptSyncing: Boolean = false,
-      transcriptSince: Long = 0
+      transcriptSince: Long = 0,
+      transportDetail: String? = null
     ): ConnectionBanner? {
       val name = serverName?.takeIf { it.isNotBlank() } ?: "服务器"
       val elapsed = (now - status.since).coerceAtLeast(0)
+      val sub = cleanTransportSubtitle(status.stage, transportDetail, status.reason)
       fun progress(text: String, slow: String): ConnectionBanner? = when {
         elapsed < QUIET_MILLIS -> null
-        elapsed >= SLOW_MILLIS -> ConnectionBanner("$slow · 已等待 ${elapsed / 1000} 秒", Tone.WARNING, retry = true)
-        else -> ConnectionBanner(text, Tone.PROGRESS)
+        elapsed >= SLOW_MILLIS -> ConnectionBanner("$slow · 已等待 ${elapsed / 1000} 秒", Tone.WARNING, retry = true, subtitle = sub)
+        else -> ConnectionBanner(text, Tone.PROGRESS, subtitle = sub)
       }
       return when (status.stage) {
         ConnectStage.IDLE -> null
@@ -72,7 +93,7 @@ data class ConnectionBanner(val text: String, val tone: Tone, val retry: Boolean
         ConnectStage.RETRYING -> {
           val seconds = ((status.retryAt - now + 999) / 1000).coerceAtLeast(0)
           val reason = status.reason?.takeIf { it.isNotBlank() } ?: "连接失败"
-          ConnectionBanner(if (status.retryAt > now) "$reason · ${seconds} 秒后重试" else "$reason · 正在重试", Tone.ERROR, retry = true)
+          ConnectionBanner(if (status.retryAt > now) "$reason · ${seconds} 秒后重试" else "$reason · 正在重试", Tone.ERROR, retry = true, subtitle = sub)
         }
         ConnectStage.READY -> when {
           !streamConnected && streamDownSince > 0 && now - streamDownSince >= STREAM_GRACE_MILLIS ->

@@ -63,30 +63,35 @@ internal fun ConnectionStrip(state: LagoonState, controller: LagoonController, m
   val banner = if (state.serverId == null) null else ConnectionBanner.of(
     state.connection, state.server?.name, now, state.streamConnected, state.streamDownSince,
     transcriptSyncing = state.provisionalMessageIds.isNotEmpty() && state.transcriptLoadingSince > 0,
-    transcriptSince = state.transcriptLoadingSince)
-  AnimatedVisibility(banner != null, modifier, enter = fadeIn() + expandVertically(), exit = fadeOut() + shrinkVertically()) {
+    transcriptSince = state.transcriptLoadingSince,
+    transportDetail = state.transportDetail
+  )
+  AnimatedVisibility(
+    visible = banner != null,
+    modifier = modifier,
+    enter = fadeIn(HyperMotion.sheetFloatSpring) + expandVertically(HyperMotion.controlSpring()),
+    exit = fadeOut(HyperMotion.sheetFloatSpring) + shrinkVertically(HyperMotion.controlSpring())
+  ) {
     val shown = banner ?: return@AnimatedVisibility
-    val color = when (shown.tone) {
-      ConnectionBanner.Tone.PROGRESS -> MiuixTheme.colorScheme.onSurfaceVariantSummary
-      ConnectionBanner.Tone.WARNING -> MiuixColorTokens.Warning
-      ConnectionBanner.Tone.ERROR -> MiuixColorTokens.Error
+    val type = when (shown.tone) {
+      ConnectionBanner.Tone.PROGRESS -> MiuixToastType.INFO
+      ConnectionBanner.Tone.WARNING -> MiuixToastType.WARNING
+      ConnectionBanner.Tone.ERROR -> MiuixToastType.ERROR
     }
-    Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 2.dp).semantics { liveRegion = LiveRegionMode.Polite },
-      verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-      if (shown.tone == ConnectionBanner.Tone.PROGRESS) InfiniteProgressIndicator(size = 14.dp, strokeWidth = 2.dp)
-      Text(shown.text, style = MiuixTheme.textStyles.footnote1, color = color, maxLines = 2, modifier = Modifier.weight(1f))
-      val recovery = state.remoteRecovery
-      if (recovery != null) TextButton(text = recovery.label, onClick = { controller.openRemoteRecovery() })
-      else if (shown.retry) TextButton(text = "立即重试", onClick = { controller.retryNow() })
-    }
-  }
-  // Transport-specific substep (SSH: start dsh / tunnel / login; Remote: credentials / handshake).
-  // It is not a network read and only appears while the connection is not READY.
-  val detail = state.transportDetail
-  if (!detail.isNullOrBlank() && (state.connection.stage != com.igng.opencode.lagoon.core.ConnectStage.READY ||
-      detail.contains("重连") || detail.contains("失败"))) {
-    Text(detail, Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 1.dp),
-      style = MiuixTheme.textStyles.footnote2, color = MiuixTheme.colorScheme.onSurfaceVariantSummary, maxLines = 1)
+    val combinedMessage = if (!shown.subtitle.isNullOrBlank()) "${shown.text} · ${shown.subtitle}" else shown.text
+
+    HyperInlineNotice(
+      message = combinedMessage,
+      type = type,
+      action = if (state.remoteRecovery != null) state.remoteRecovery.label else if (shown.retry) "立即重试" else null,
+      onAction = {
+        if (state.remoteRecovery != null) controller.openRemoteRecovery()
+        else if (shown.retry) controller.retryNow()
+      },
+      modifier = Modifier
+        .padding(horizontal = 14.dp, vertical = 4.dp)
+        .semantics { liveRegion = LiveRegionMode.Polite }
+    )
   }
 }
 

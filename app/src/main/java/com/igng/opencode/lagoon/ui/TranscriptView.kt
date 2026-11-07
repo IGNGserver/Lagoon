@@ -43,7 +43,6 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import top.yukonga.miuix.kmp.basic.*
 import top.yukonga.miuix.kmp.icon.MiuixIcons
-import top.yukonga.miuix.kmp.icon.extended.ChevronForward
 import top.yukonga.miuix.kmp.icon.extended.Copy
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 import top.yukonga.miuix.kmp.theme.miuixCapsuleShape
@@ -81,7 +80,8 @@ private fun warmMarkdown(rows: List<TranscriptRow>) {
 
 @Composable
 internal fun Conversation(state: LagoonState, controller: LagoonController, modifier: Modifier = Modifier, onFile: (String) -> Unit, onModal: (Boolean) -> Unit,
-  onOpenChild: (String) -> Unit = {}, onActivityGroup: (TranscriptRow) -> Unit = {}, onQueuedAction: (TranscriptRow) -> Unit = {}) {
+  onOpenChild: (String) -> Unit = {}, onActivityGroup: (TranscriptRow) -> Unit = {}, onQueuedAction: (TranscriptRow) -> Unit = {},
+  activity: SessionActivity? = null, onOpenActivity: () -> Unit = {}) {
   val list = rememberLazyListState()
   val scope = rememberCoroutineScope()
   val unverified = state.livePresentedTasks[state.sessionId]?.active != true || state.cached || !state.connected
@@ -196,35 +196,67 @@ internal fun Conversation(state: LagoonState, controller: LagoonController, modi
             description = if (newContent) "有新消息，回到最新" else "回到底部")
         }
       }
-      if (task?.active == true) WorkingIndicator(task)
+      if (task?.active == true || activity?.hasActive == true) {
+        WorkingIndicator(task, activity, onOpenActivity)
+      }
     }
   }
 }
 
 /**
  * 会话底部常驻的运行指示：只要该会话有任务在跑就一直显示，即使消息本身没有变化；已用时间每秒
- * 刷新，避免用户把静态的「用时」当成“已结束”。
+ * 刷新，避免用户把静态的「用时」当成“已结束”。合并后台活动展示。
  */
 @Composable
-private fun WorkingIndicator(task: TaskState) {
-  val waiting = task.phase in TaskState.WAITING_PHASES
-  var now by remember(task.sessionId, task.since) { mutableStateOf(System.currentTimeMillis()) }
-  LaunchedEffect(task.sessionId, task.since) {
-    while (true) { now = System.currentTimeMillis(); delay(1_000) }
+private fun WorkingIndicator(task: TaskState?, activity: SessionActivity?, onOpenActivity: () -> Unit) {
+  val waiting = task?.phase in TaskState.WAITING_PHASES
+  val running = task?.active == true
+  var now by remember(task?.sessionId, task?.since) { mutableStateOf(System.currentTimeMillis()) }
+  LaunchedEffect(task?.sessionId, task?.since) {
+    if (running) {
+      while (true) { now = System.currentTimeMillis(); delay(1_000) }
+    }
   }
-  val elapsed = ((now - task.since) / 1000).coerceAtLeast(0)
-  Row(Modifier.clip(miuixSquircleShape(16.dp)).background(HyperTheme.colors.cardElevated)
-    .border(0.6.dp, HyperTheme.colors.cardBorder, miuixSquircleShape(16.dp))
-    .padding(horizontal = 14.dp, vertical = 7.dp), verticalAlignment = Alignment.CenterVertically) {
+  val elapsed = if (task != null) ((now - task.since) / 1000).coerceAtLeast(0) else 0L
+
+  val activityParts = buildList {
+    if (activity != null) {
+      if (activity.activeSubSessions > 0) add("${activity.activeSubSessions} 个子会话")
+      if (activity.shells.isNotEmpty()) add("${activity.shells.size} 个命令")
+    }
+  }
+
+  val label = buildList {
+    if (running) {
+      add(if (waiting) "等待你的操作" else "运行中 · ${elapsedText(elapsed)}")
+    }
+    if (activityParts.isNotEmpty()) {
+      add("后台 · ${activityParts.joinToString(" · ")}")
+    }
+  }.joinToString(" | ")
+
+  if (label.isEmpty()) return
+
+  Row(
+    Modifier
+      .clip(miuixSquircleShape(16.dp))
+      .background(HyperTheme.colors.cardElevated)
+      .border(0.6.dp, HyperTheme.colors.cardBorder, miuixSquircleShape(16.dp))
+      .then(if (activityParts.isNotEmpty()) Modifier.hyperPress(scaleDown = 0.96f, onClick = onOpenActivity) else Modifier)
+      .padding(horizontal = 14.dp, vertical = 7.dp),
+    verticalAlignment = Alignment.CenterVertically
+  ) {
     if (!waiting) {
       InfiniteProgressIndicator(color = HyperTheme.colors.primary, size = 14.dp, strokeWidth = 1.5.dp)
       Spacer(Modifier.width(6.dp))
     }
-    Text(if (waiting) "等待你的操作" else "运行中 · ${elapsedText(elapsed)}",
+    Text(
+      text = label,
       style = HyperTheme.tabular(MiuixTheme.textStyles.footnote2.copy(
         fontWeight = FontWeight.SemiBold,
         color = if (waiting) HyperTheme.colors.warning else HyperTheme.colors.primary
-      )))
+      ))
+    )
   }
 }
 
@@ -242,7 +274,7 @@ private fun TranscriptRowView(row: TranscriptRow, onFile: (String) -> Unit, onOp
     "user" -> UserMessageRow(row, onFile, onQueuedAction)
     // One selection container per reply so a long press can select across paragraphs; the turn's final
     // answer is also copyable as a whole from the meta row below it.
-    "text" -> SelectionContainer { Column { parsed(row.key, row.text).forEach { block -> MarkdownBlockView(block, selectable = false) } } }
+    "text" -> SelectionContainer { Column(verticalArrangement = Arrangement.spacedBy(8.dp)) { parsed(row.key, row.text).forEach { block -> MarkdownBlockView(block, selectable = false) } } }
     "meta" -> Row(Modifier.fillMaxWidth().padding(top = 2.dp), verticalAlignment = Alignment.CenterVertically) {
       row.copyText?.let { text ->
         val clipboard = LocalClipboardManager.current
@@ -267,8 +299,8 @@ private fun TranscriptRowView(row: TranscriptRow, onFile: (String) -> Unit, onOp
       QoderSummaryRow(row) { onActivityGroup(row) }
       row.target?.let { child -> TextButton(text = "打开子会话 ›", onClick = { onOpenChild(child) }, modifier = Modifier.padding(start = 16.dp)) }
     }
-    "process-output" -> SelectionContainer { Column(Modifier.fillMaxWidth()) { parsed(row.key, row.text).forEach { block -> MarkdownBlockView(block, selectable = false) } } }
-    "reasoning-body" -> SelectionContainer { Column(Modifier.fillMaxWidth().padding(start = 24.dp)) { parsed(row.key, row.text).forEach { block -> MarkdownBlockView(block, subdued = true, selectable = false) } } }
+    "process-output" -> SelectionContainer { Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) { parsed(row.key, row.text).forEach { block -> MarkdownBlockView(block, selectable = false) } } }
+    "reasoning-body" -> SelectionContainer { Column(Modifier.fillMaxWidth().padding(start = 24.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) { parsed(row.key, row.text).forEach { block -> MarkdownBlockView(block, subdued = true, selectable = false) } } }
     "diff-summary" -> GroupRow(row) { onActivityGroup(row) }
     "context-item" -> Row(Modifier.fillMaxWidth().padding(start = 24.dp, top = 2.dp, bottom = 2.dp), verticalAlignment = Alignment.CenterVertically) {
       Text(row.title, style = MiuixTheme.textStyles.footnote1.copy(fontWeight = FontWeight.Medium))
@@ -404,9 +436,7 @@ internal fun QoderActivityItem(
       Spacer(Modifier.width(12.dp))
       if (isProcess) {
         SelectionContainer(Modifier.weight(1f).padding(top = 7.dp, bottom = 20.dp)) {
-          Column {
-            parsed(header.key, header.text).forEach { block -> MarkdownBlockView(block, selectable = false) }
-          }
+          Column { MarkdownBlockListView(parsed(header.key, header.text), subdued = false) }
         }
       } else if (header.kind == "attachment") {
         Column(Modifier.weight(1f).padding(top = 7.dp, bottom = 20.dp)) {
@@ -467,7 +497,7 @@ internal fun QoderSheetHandle() {
 
 @Composable
 internal fun DetailMarkdown(text: String) {
-  SelectionContainer { Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) { parsed("detail:$text", text).forEach { block -> MarkdownBlockView(block, selectable = false) } } }
+  SelectionContainer { Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) { MarkdownBlockListView(parsed("detail:$text", text), subdued = false) } }
 }
 
 @Composable
@@ -515,7 +545,7 @@ internal fun DetailRowView(row: TranscriptRow) {
       } else Spacer(Modifier.weight(1f))
     }
     "reasoning-body" -> SelectionContainer { Column(Modifier.fillMaxWidth().padding(start = 24.dp)) {
-      parsed(row.key, row.text).forEach { block -> MarkdownBlockView(block, subdued = true, selectable = false) }
+      MarkdownBlockListView(parsed(row.key, row.text), subdued = true)
     } }
     "tool", "tool-group", "diff-summary" -> Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
       ToolStatusDot(row.status)
@@ -664,34 +694,152 @@ private fun annotated(spans: List<MarkdownSpan>): AnnotatedString {
 }
 
 @Composable
+internal fun MarkdownBlockListView(blocks: List<MarkdownBlock>, subdued: Boolean = false) {
+  val base = MiuixTheme.textStyles.body1.copy(
+    color = if (subdued) HyperTheme.colors.textSecondary else HyperTheme.colors.textPrimary,
+    lineHeight = 25.sp, fontSize = if (subdued) 14.sp else 15.5.sp
+  )
+  var index = 0
+  while (index < blocks.size) {
+    val block = blocks[index]
+    if (block.kind == "table-head" || block.kind == "table-row") {
+      val tableBlocks = mutableListOf<MarkdownBlock>()
+      while (index < blocks.size && (blocks[index].kind == "table-head" || blocks[index].kind == "table-row")) {
+        tableBlocks += blocks[index]
+        index++
+      }
+      val tableScroll = rememberScrollState()
+      val tableShape = miuixSquircleShape(12.dp)
+      Column(
+        Modifier
+          .fillMaxWidth()
+          .clip(tableShape)
+          .background(HyperTheme.colors.container, tableShape)
+          .border(0.6.dp, HyperTheme.colors.codeBorder, tableShape)
+          .horizontalScroll(tableScroll)
+      ) {
+        tableBlocks.forEachIndexed { rowIndex, rowBlock ->
+          val isHead = rowBlock.kind == "table-head"
+          if (rowIndex > 0) HorizontalDivider(color = HyperTheme.colors.divider)
+          Row(
+            Modifier
+              .background(if (isHead) HyperTheme.colors.containerHigh.copy(alpha = 0.65f) else Color.Transparent)
+              .padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically
+          ) {
+            rowBlock.cells.forEach { cell ->
+              BasicText(
+                annotated(cell),
+                Modifier.width(168.dp).padding(end = 12.dp),
+                style = base.copy(
+                  fontSize = 14.sp,
+                  lineHeight = 20.sp,
+                  fontWeight = if (isHead) FontWeight.SemiBold else FontWeight.Normal
+                )
+              )
+            }
+          }
+        }
+      }
+    } else {
+      MarkdownBlockView(block, subdued = subdued, selectable = false)
+      index++
+    }
+  }
+}
+
+@Composable
 internal fun MarkdownBlockView(block: MarkdownBlock, subdued: Boolean = false, selectable: Boolean = true) {
   // Nested SelectionContainers would split selection per paragraph; callers wrapping a whole reply pass false.
   val select: @Composable (@Composable () -> Unit) -> Unit = { inner -> if (selectable) SelectionContainer { inner() } else inner() }
   val base = MiuixTheme.textStyles.body1.copy(
-    color = if (subdued) MiuixTheme.colorScheme.onSurfaceVariantSummary else MiuixTheme.colorScheme.onSurface,
-    lineHeight = 26.sp, fontSize = if (subdued) 14.sp else 16.sp
+    color = if (subdued) HyperTheme.colors.textSecondary else HyperTheme.colors.textPrimary,
+    lineHeight = 25.sp, fontSize = if (subdued) 14.sp else 15.5.sp
   )
   val quote = block.prefix.trimStart().startsWith(">")
   val displayPrefix = if (quote) block.prefix.trimStart().trimStart('>').trimStart() else block.prefix
+  val clipboard = LocalClipboardManager.current
   val content: @Composable () -> Unit = {
     when (block.kind) {
-      "rule" -> HorizontalDivider()
-      "code" -> Column(Modifier.fillMaxWidth().background(MiuixTheme.colorScheme.secondaryContainer, miuixSquircleShape(10.dp)).padding(10.dp)) {
-        if (block.prefix.isNotBlank()) Text(block.prefix, modifier = Modifier.padding(bottom = 4.dp), style = MiuixTheme.textStyles.footnote2)
-        select { BasicText(block.text, Modifier.horizontalScroll(rememberScrollState()), style = base.copy(fontFamily = FontFamily.Monospace, fontSize = 13.sp, lineHeight = 20.sp)) }
+      "rule" -> HorizontalDivider(color = HyperTheme.colors.divider)
+      "code" -> Column(
+        Modifier
+          .fillMaxWidth()
+          .background(HyperTheme.colors.codeSurface, miuixSquircleShape(14.dp))
+          .border(0.6.dp, HyperTheme.colors.codeBorder, miuixSquircleShape(14.dp))
+      ) {
+        if (block.prefix.isNotBlank() || block.copyText != null) {
+          Row(
+            Modifier
+              .fillMaxWidth()
+              .background(HyperTheme.colors.container.copy(alpha = 0.5f), miuixTopSquircleShape(14.dp))
+              .padding(horizontal = 12.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically
+          ) {
+            Text(
+              block.prefix.ifBlank { "code" },
+              modifier = Modifier.weight(1f),
+              style = MiuixTheme.textStyles.footnote2.copy(
+                fontFamily = FontFamily.Monospace,
+                fontWeight = FontWeight.Medium,
+                color = HyperTheme.colors.textSecondary
+              )
+            )
+            block.copyText?.let { copyable ->
+              Row(
+                Modifier
+                  .clip(miuixSquircleShape(8.dp))
+                  .hyperPress(scaleDown = 0.94f) { clipboard.setText(AnnotatedString(copyable)) }
+                  .padding(horizontal = 6.dp, vertical = 2.dp),
+                verticalAlignment = Alignment.CenterVertically
+              ) {
+                Icon(MiuixIcons.Copy, "复制代码", Modifier.size(14.dp), tint = HyperTheme.colors.textSecondary)
+                Spacer(Modifier.width(4.dp))
+                Text("复制", style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary))
+              }
+            }
+          }
+          HorizontalDivider(color = HyperTheme.colors.codeBorder)
+        }
+        CodePanel(block.text)
       }
-      "table-head", "table-row" -> Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).background(MiuixTheme.colorScheme.secondaryContainer).padding(8.dp)) {
+      "table-head", "table-row" -> Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).background(HyperTheme.colors.container).padding(8.dp)) {
         block.cells.forEach { cell -> select { BasicText(annotated(cell), Modifier.width(180.dp).padding(end = 12.dp), style = base.copy(fontWeight = if (block.kind == "table-head") FontWeight.SemiBold else FontWeight.Normal)) } }
       }
       else -> {
         val task = taskMarker(block)
-        select { BasicText(buildAnnotatedString { append(displayPrefix); append(task.first); append(annotated(task.second)) },
-          style = if (block.kind == "heading") base.copy(fontSize = when (block.level) { 1 -> 25.sp; 2 -> 21.sp; else -> 18.sp }, fontWeight = FontWeight.SemiBold) else base) }
+        val headingStyle = when (block.level) {
+          1 -> base.copy(fontSize = 22.sp, lineHeight = 30.sp, fontWeight = FontWeight.Bold)
+          2 -> base.copy(fontSize = 19.sp, lineHeight = 26.sp, fontWeight = FontWeight.SemiBold)
+          else -> base.copy(fontSize = 17.sp, lineHeight = 24.sp, fontWeight = FontWeight.SemiBold)
+        }
+        select {
+          BasicText(
+            buildAnnotatedString { append(displayPrefix); append(task.first); append(annotated(task.second)) },
+            style = if (block.kind == "heading") headingStyle else base
+          )
+        }
       }
     }
   }
-  if (quote) Column(Modifier.fillMaxWidth().padding(vertical = 2.dp).background(MiuixTheme.colorScheme.onSurface.copy(alpha = 0.05f), miuixSquircleShape(8.dp)).padding(start = 12.dp, end = 10.dp, top = 6.dp, bottom = 6.dp)) {
-    content()
+  if (quote) {
+    Row(
+      Modifier
+        .fillMaxWidth()
+        .height(IntrinsicSize.Min)
+        .padding(vertical = 2.dp)
+        .background(HyperTheme.colors.container.copy(alpha = 0.55f), miuixSquircleShape(10.dp))
+        .padding(start = 10.dp, end = 12.dp, top = 8.dp, bottom = 8.dp)
+    ) {
+      Box(
+        Modifier
+          .width(3.dp)
+          .fillMaxHeight()
+          .background(HyperTheme.colors.primary, miuixSquircleShape(1.5.dp))
+      )
+      Spacer(Modifier.width(10.dp))
+      Column(Modifier.weight(1f)) { content() }
+    }
   } else content()
 }
 

@@ -1,5 +1,8 @@
 package com.igng.opencode.lagoon.core
 
+/** Semantic tone for global toast feedback so non-error notices/warnings are never painted as green success. */
+enum class FeedbackTone { INFO, SUCCESS, WARNING }
+
 /** Pending operations and phone attachments are keyed by server/session/project. */
 internal fun operationKey(server: String?, session: String?, project: String?, action: String): String {
   val target = when {
@@ -30,6 +33,7 @@ data class LagoonState(
   val streamConnected: Boolean = false,
   /** Non-error feedback (e.g. a share link); kept separate so it is not rendered as a failure. */
   val message: String? = null,
+  val messageTone: FeedbackTone = FeedbackTone.SUCCESS,
   val projects: List<Project> = emptyList(), val projectId: String? = null,
   /**
    * Read-only project/workspace titles of the writable server, used only for row labels. This is

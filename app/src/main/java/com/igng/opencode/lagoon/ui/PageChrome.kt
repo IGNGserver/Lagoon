@@ -32,8 +32,6 @@ import top.yukonga.miuix.kmp.basic.SpinnerEntry
 import top.yukonga.miuix.kmp.basic.SpinnerItemImpl
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.extra.SuperListPopup
-import top.yukonga.miuix.kmp.icon.MiuixIcons
-import top.yukonga.miuix.kmp.icon.extended.ChevronForward
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 
 /** Round 40dp icon button on a filled circle with HyperOS 4 spring press physics, used for back and ⋯ in page headers. */
@@ -59,12 +57,27 @@ internal fun CircleIconButton(icon: ImageVector, description: String, onClick: (
 }
 
 /**
- * The "⌄" after a selector. MIUIX's `ExpandMore` glyph is the expand-to-fullscreen corners, not a
- * chevron, so the down arrow is the forward chevron turned a quarter.
+ * The "›" at the end of a navigation or drill-down row.
+ */
+@Composable
+internal fun ForwardChevron(size: Dp = 16.dp, tint: Color = HyperTheme.colors.textTertiary, description: String? = null) {
+  QoderIcon(
+    glyph = QoderGlyph.CHEVRON,
+    modifier = Modifier.size(size).then(if (description != null) Modifier.semantics { contentDescription = description } else Modifier),
+    color = tint
+  )
+}
+
+/**
+ * The "⌄" after a selector or dropdown trigger.
  */
 @Composable
 internal fun DropdownChevron(size: Dp = 16.dp, tint: Color = HyperTheme.colors.textSecondary, description: String? = null) {
-  Icon(MiuixIcons.ChevronForward, description, Modifier.size(size).rotate(90f), tint = tint)
+  QoderIcon(
+    glyph = QoderGlyph.CHEVRON,
+    modifier = Modifier.size(size).rotate(90f).then(if (description != null) Modifier.semantics { contentDescription = description } else Modifier),
+    color = tint
+  )
 }
 
 /**

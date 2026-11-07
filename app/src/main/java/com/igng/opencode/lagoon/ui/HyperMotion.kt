@@ -13,6 +13,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.composed
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalHapticFeedback
@@ -55,30 +56,49 @@ internal object HyperMotion {
 }
 
 /**
- * 澎湃 OS 4 实体按压阻尼反馈修饰符：
- * 按下时平滑微缩至 [scaleDown]，松手以弹性曲线恢复，可选长按震动反馈。
+ * 澎湃 OS 4 分级实体按压阻尼反馈修饰符：
+ * - 独立胶囊、图标按钮、FAB（[surfaceHighlight] = false）：按下物理弹簧微缩至 [scaleDown]（默认 0.96f）；
+ * - 列表内嵌行与大面积分组卡片（[surfaceHighlight] = true）：采用克制的 0.988f 微缩放，并在绘制阶段平滑过渡至
+ *   [HyperColorPalette.cardPressed] 表面按压高亮色，兼顾澎湃列表触感与防眩晕阅读稳定性。
  */
 @OptIn(ExperimentalFoundationApi::class)
 internal fun Modifier.hyperPress(
   enabled: Boolean = true,
-  scaleDown: Float = 0.968f,
+  scaleDown: Float = 0.96f,
+  surfaceHighlight: Boolean = false,
   role: Role = Role.Button,
   onLongClick: (() -> Unit)? = null,
   onClick: () -> Unit
 ): Modifier = composed {
   val interactionSource = remember { MutableInteractionSource() }
   val pressed by interactionSource.collectIsPressedAsState()
+  val effectiveScaleDown = if (surfaceHighlight && scaleDown == 0.96f) 0.988f else scaleDown
   val scale by animateFloatAsState(
-    targetValue = if (pressed && enabled) scaleDown else 1f,
+    targetValue = if (pressed && enabled) effectiveScaleDown else 1f,
     animationSpec = HyperMotion.pressSpring,
     label = "hyperPressScale"
   )
+  val highlightAlpha by animateFloatAsState(
+    targetValue = if (pressed && enabled && surfaceHighlight) 1f else 0f,
+    animationSpec = HyperMotion.pressSpring,
+    label = "hyperPressHighlight"
+  )
+  val pressedColor = HyperTheme.colors.cardPressed
   val haptics = LocalHapticFeedback.current
   this
     .graphicsLayer {
       scaleX = scale
       scaleY = scale
     }
+    .then(
+      if (surfaceHighlight) {
+        Modifier.drawBehind {
+          if (highlightAlpha > 0.005f) {
+            drawRect(pressedColor.copy(alpha = highlightAlpha))
+          }
+        }
+      } else Modifier
+    )
     .then(
       if (onLongClick != null) {
         Modifier.combinedClickable(

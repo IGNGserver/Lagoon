@@ -49,11 +49,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import top.yukonga.miuix.kmp.basic.*
-import top.yukonga.miuix.kmp.extra.SuperArrow
-import top.yukonga.miuix.kmp.extra.SuperBottomSheet
 import top.yukonga.miuix.kmp.extra.SuperDialog
-import top.yukonga.miuix.kmp.extra.SuperDropdown
-import top.yukonga.miuix.kmp.extra.SuperSwitch
 import top.yukonga.miuix.kmp.icon.MiuixIcons
 import top.yukonga.miuix.kmp.icon.basic.*
 import top.yukonga.miuix.kmp.icon.extended.*
@@ -118,7 +114,7 @@ fun ServersModal(
   var remoteProvider by remember { mutableStateOf(false) }
   val scope = rememberCoroutineScope()
 
-  SuperBottomSheet(
+  HyperBottomSheet(
     title = if (existing == null) "添加设备" else if (existing.kind == ServerKind.DSH_REMOTE) "DSH 远程主机详情" else if (existing.kind == ServerKind.OPENCODE) "编辑 OpenCode 直连" else "编辑设备",
     show = true,
     onDismissRequest = onDismiss
@@ -255,7 +251,7 @@ internal fun MiuixServerForm(
 
   if (harness == ServerKind.DSH_REMOTE) {
     Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-      if (fixedKind == null) SuperDropdown(
+      if (fixedKind == null) HyperDropdownRow(
         title = "服务类型",
         items = ServerKind.entries.map { it.label },
         selectedIndex = ServerKind.entries.indexOf(harness),
@@ -337,7 +333,7 @@ internal fun MiuixServerForm(
     }
 
     if (fixedKind == null) item {
-      SuperDropdown(
+      HyperDropdownRow(
         title = "服务类型",
         items = ServerKind.entries.map { it.label },
         selectedIndex = ServerKind.entries.indexOf(harness),
@@ -391,10 +387,10 @@ internal fun MiuixServerForm(
     }
 
     if (normalizedInput.startsWith("http://", true)) item {
-      SuperSwitch(title = "允许此地址使用 HTTP", summary = "请仅在你信任的网络中开启", checked = allowHttp, onCheckedChange = { allowHttp = it })
+      HyperSwitchRow(title = "允许此地址使用 HTTP", summary = "请仅在你信任的网络中开启", checked = allowHttp, onCheckedChange = { allowHttp = it })
     }
     if (isDsh) item {
-      SuperDropdown(
+      HyperDropdownRow(
         title = "认证方式",
         summary = if (isSecret) "填 Cookie 签名密钥，长期有效，配对不需要看电脑" else "填启动令牌，换到 Cookie 后保存在本机",
         items = DshAuthMode.entries.map { it.label },
@@ -438,7 +434,7 @@ internal fun MiuixServerForm(
     }
 
     item {
-      SuperArrow(
+      HyperActionRow(
         title = "高级与网络设置",
         summary = if (showAdvanced) "收起额外配置" else "连接与通知行为",
         onClick = { showAdvanced = !showAdvanced }
@@ -447,14 +443,14 @@ internal fun MiuixServerForm(
 
     if (showAdvanced) {
       item {
-        SuperSwitch(
+        HyperSwitchRow(
           title = "自动连接此服务器",
           checked = autoConnect,
           onCheckedChange = { autoConnect = it }
         )
       }
       item {
-        SuperSwitch(
+        HyperSwitchRow(
           title = "接收任务完成与等待通知",
           checked = notifications,
           onCheckedChange = { notifications = it }
@@ -530,7 +526,8 @@ fun SettingsScreen(
   onManageModels: () -> Unit,
   onManageDevices: () -> Unit = {},
   onAddDevice: () -> Unit = {},
-  onBack: () -> Unit
+  onBack: () -> Unit,
+  onMessage: (String, MiuixToastType) -> Unit
 ) {
   val context = androidx.compose.ui.platform.LocalContext.current
   val updater = remember(context) { AppUpdater.get(context) }
@@ -577,7 +574,7 @@ fun SettingsScreen(
       }.isSuccess
       if (!opened) {
         pendingInstall = false
-        Toast.makeText(context, "无法打开“安装未知应用”设置，请手动在系统设置中授权", Toast.LENGTH_LONG).show()
+        onMessage("无法打开“安装未知应用”设置，请手动在系统设置中授权", MiuixToastType.ERROR)
       }
       return
     }
@@ -590,7 +587,7 @@ fun SettingsScreen(
       addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
     }
     runCatching { context.startActivity(intent) }.onFailure {
-      Toast.makeText(context, "无法打开系统安装器：${it.message ?: "未知错误"}", Toast.LENGTH_LONG).show()
+      onMessage("无法打开系统安装器：${it.message ?: "未知错误"}", MiuixToastType.ERROR)
     }
   }
   DisposableEffect(lifecycleOwner) {
@@ -875,7 +872,7 @@ fun SettingsScreen(
   }
 
   if (showReleaseNotes && releaseForNotes != null) {
-    SuperBottomSheet(
+    HyperBottomSheet(
       title = "Lagoon ${releaseForNotes.version} 更新说明",
       show = true,
       onDismissRequest = { showReleaseNotes = false }
@@ -911,26 +908,26 @@ private fun UpdateControls(
   val release = update.release
   val failure = update.failure
   if (failure != null && release == null) {
-    BasicComponent(
+    HyperActionRow(
       title = "检查失败",
       summary = failure.userMessage(update.failureDetail),
-      endActions = { TextButton(text = "重试", onClick = onRetryCheck) }
+      trailing = { TextButton(text = "重试", onClick = onRetryCheck) }
     )
     return
   }
   if (release == null) {
     when (update.phase) {
-      AppUpdatePhase.CHECKING -> BasicComponent(
+      AppUpdatePhase.CHECKING -> HyperActionRow(
         title = "检查更新",
         summary = "正在向 GitHub 查询新版本…",
-        endActions = { InfiniteProgressIndicator(size = 16.dp, strokeWidth = 2.dp) }
+        trailing = { InfiniteProgressIndicator(size = 16.dp, strokeWidth = 2.dp) }
       )
-      AppUpdatePhase.UP_TO_DATE -> SuperArrow(
+      AppUpdatePhase.UP_TO_DATE -> HyperActionRow(
         title = "已是最新版本",
         summary = updateChannelsText(update.lastCheckedAt, includePrerelease),
         onClick = onCheck
       )
-      else -> SuperArrow(
+      else -> HyperActionRow(
         title = "检查更新",
         summary = "从 GitHub Releases 检查 Lagoon 新版本",
         onClick = onCheck

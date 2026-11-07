@@ -14,7 +14,6 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.igng.opencode.lagoon.core.*
 import top.yukonga.miuix.kmp.basic.*
-import top.yukonga.miuix.kmp.extra.SuperBottomSheet
 import top.yukonga.miuix.kmp.extra.SuperDialog
 import top.yukonga.miuix.kmp.icon.MiuixIcons
 import top.yukonga.miuix.kmp.icon.extended.Delete
@@ -43,7 +42,7 @@ internal fun HomeScopeSheet(
     if (!state.multiServerView && profile.id == state.serverId) state.connected
     else allSnapshots[profile.id]?.connected == true
   }
-  SuperBottomSheet(title = "选择范围", show = true, onDismissRequest = onDismiss) {
+  HyperBottomSheet(title = "选择范围", show = true, onDismissRequest = onDismiss) {
     LazyColumn(Modifier.fillMaxWidth().heightIn(max = 680.dp), contentPadding = PaddingValues(bottom = 16.dp)) {
       if (!state.allServers) item {
         if (state.homeGroup != null) WorkspaceScopeSection(state, controller, onDismiss)
@@ -139,13 +138,21 @@ private fun ProfileScopeRow(
   selected: Boolean,
   onSelect: () -> Unit
 ) {
+  val snapshot = allSnapshots[profile.id]
   val connected = if (!state.multiServerView && profile.id == state.serverId) state.connected
-  else allSnapshots[profile.id]?.connected == true
+  else snapshot?.connected == true
   val loading = if (!state.multiServerView && profile.id == state.serverId) state.loading
-  else allSnapshots[profile.id]?.loading == true
-  val sessions = if (state.multiServerView) allSnapshots[profile.id]?.sessions.orEmpty() else state.sessions
+  else snapshot?.loading == true
+  val error = if (!state.multiServerView && profile.id == state.serverId) state.error ?: state.connection.reason
+  else snapshot?.error
+  val sessions = if (state.multiServerView) snapshot?.sessions.orEmpty() else state.sessions
   val count = sessions.count { it.visibleOnHome }
-  val status = when { connected -> "已连接"; loading -> "连接中…"; else -> "未连接" }
+  val status = when {
+    connected -> "已连接"
+    loading -> "连接中…"
+    !error.isNullOrBlank() -> "连接异常：$error"
+    else -> "未连接"
+  }
   HyperCard(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 3.dp), insidePadding = PaddingValues(vertical = 2.dp)) {
     ChoiceRow(profile.name, "${profile.connectionTypeLabel} · $status · $count 个会话", selected, onSelect)
   }
@@ -287,7 +294,7 @@ internal fun DirectoryBrowserSheet(state: LagoonState, controller: LagoonControl
   val searching = query.trim().length >= 2
   val entries = remember(state.browseEntries, state.browseShowHidden) { BrowseFilter.entries(state.browseEntries, state.browseShowHidden) }
   val results = remember(state.browseSearch, state.browseShowHidden) { BrowseFilter.results(state.browseSearch, state.browseShowHidden) }
-  SuperBottomSheet(title = "选择服务器目录", show = true, onDismissRequest = { controller.closeDirectoryBrowser() }) {
+  HyperBottomSheet(title = "选择服务器目录", show = true, onDismissRequest = { controller.closeDirectoryBrowser() }) {
     Column(Modifier.fillMaxWidth().heightIn(max = 620.dp)) {
       Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
         crumbs.forEachIndexed { index, (label, target) ->
@@ -303,7 +310,7 @@ internal fun DirectoryBrowserSheet(state: LagoonState, controller: LagoonControl
       TextField(query, { query = it; controller.searchDirectories(it) }, label = "搜索目录或文件", useLabelAsPlaceholder = true, modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp))
       Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
         Text("显示隐藏目录", Modifier.weight(1f), style = MiuixTheme.textStyles.footnote1.copy(color = HyperTheme.colors.textSecondary))
-        Switch(checked = state.browseShowHidden, onCheckedChange = { controller.setBrowseShowHidden(it) })
+        HyperSwitch(checked = state.browseShowHidden, onCheckedChange = { controller.setBrowseShowHidden(it) })
       }
       if (searching) {
         val searchStatus = state.resource("browse-search")
