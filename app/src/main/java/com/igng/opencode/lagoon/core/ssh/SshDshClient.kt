@@ -1,12 +1,14 @@
 package com.igng.opencode.lagoon.core.ssh
 
 import com.igng.opencode.lagoon.core.*
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.emitAll
+import kotlinx.coroutines.flow.channelFlow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -121,7 +123,16 @@ internal class SshDshClient(
   override suspend fun removeShell(id: String, directory: String) = api().removeShell(id, directory)
 
   override suspend fun createSession(directory: String, title: String, workspaceId: String?): Session =
-    api().createSession(directory, title, workspaceId)
+    api().createSession(sessionDirectory(directory), title, workspaceId)
+
+  /** Blank or home-relative requests use the SSH host's working directory; an explicit project path wins. */
+  private fun sessionDirectory(requested: String): String {
+    val preferred = SshShell.absolutePath(link.workingDirectory, link.remoteHome) ?: return requested
+    if (requested.isBlank()) return preferred
+    val home = link.remoteHome?.trimEnd('/')
+    if (home != null && (requested == home || requested == "$home/")) return preferred
+    return requested
+  }
 
   override fun setContentWatching(enabled: Boolean) = link.setContentWatching(enabled)
 
@@ -210,11 +221,34 @@ internal class SshDshClient(
     api().searchFiles(directory, query, session)
 
   override fun events(onOpen: () -> Unit): Flow<ServerEvent> = flow {
+    var seenGeneration = -1L
     while (currentCoroutineContext().isActive && !isClosed) {
-      val currentApi = api()
-      emitAll(currentApi.events(onOpen))
-      // Underlying DshApi was closed because the SSH link or remote dsh web restarted; loop to bind the next generation.
-      if (!isClosed) delay(250)
+      val currentApi = link.awaitClient(sinceGeneration = seenGeneration)
+      seenGeneration = link.generationId
+      // DshApi.events() stays open until its collector is cancelled. Leave this generation as soon
+      // as the link drops CONNECTED or closes this DshApi, then bind whatever generation comes next.
+      channelFlow {
+        val events = launch {
+          currentApi.events(onOpen).collect { send(it) }
+        }
+        val watch = launch {
+          link.status.collect { status ->
+            if (status.phase != SshLinkPhase.CONNECTED || currentApi.isClosed || link.generationId != seenGeneration) {
+              events.cancel()
+            }
+          }
+        }
+        try {
+          events.join()
+        } catch (cancel: CancellationException) {
+          // The watch cancelled this generation on purpose. Only a cancelled collector should escape.
+          if (!currentCoroutineContext().isActive) throw cancel
+        } finally {
+          watch.cancel()
+          events.cancel()
+        }
+      }.collect { emit(it) }
+      if (!isClosed && currentCoroutineContext().isActive) delay(250)
     }
   }
 }

@@ -104,6 +104,49 @@ class SshHostTest {
     }
   }
 
+  @Test fun missingWorkingDirectoryAbortsBeforeLaunch() {
+    assumeTrue(File("/bin/sh").exists())
+    val root = Files.createTempDirectory("lagoon-ssh-nocwd").toFile()
+    val home = File(root, "home").apply { mkdirs() }
+    val bin = File(root, "bin").apply { mkdirs() }
+    val dsh = File(bin, "dsh").apply {
+      writeText("#!/bin/sh\necho should-not-start\n")
+      setExecutable(true)
+    }
+    val transport = LocalShellTransport(home, "${bin.absolutePath}:/usr/bin:/bin")
+    val bootstrap = RemoteDshBootstrap(transport, workingDirectory = "/no/such/dir", startTimeoutSeconds = 5)
+    try {
+      val failure = runCatching { bootstrap.start() }.exceptionOrNull() as? SshFailure
+      assertEquals(SshFailureKind.DSH_START, failure?.kind)
+      assertTrue(failure?.message.orEmpty().contains("/no/such/dir"))
+      assertTrue("dsh must not have been started", !File(home, ".dsh-app-remote/web.pid").exists())
+    } finally {
+      dsh.delete()
+      root.deleteRecursively()
+    }
+  }
+
+  @Test fun quotedLaunchCommandKeepsItsOwnArguments() {
+    val bootstrap = RemoteDshBootstrap(
+      transport = object : SshTransport {
+        override val isClosed = false
+        override fun exec(script: String, timeoutMillis: Long) = error("unused")
+        override fun openTunnel(host: String, port: Int, input: InputStream, output: OutputStream) = error("unused")
+        override fun probeTunnel(host: String, port: Int, timeoutMillis: Long) = false
+        override fun ping(timeoutMillis: Long) = false
+        override fun close() = Unit
+      },
+      launchCommand = "dsh web --foo 'a b'",
+      workingDirectory = "/nope"
+    )
+    val script = bootstrap.startScript()
+    val probe = bootstrap.probeScript()
+    assertTrue(script.contains("LAUNCH=${SshShell.quote("dsh web --foo 'a b' --host 127.0.0.1 --port 0 --no-open")}"))
+    assertTrue(script.contains("eval \"\$1\" >>\"\$D/web.log\" 2>&1 & echo \$! >\"\$D/web.pid\"; wait"))
+    assertTrue(script.contains("cd '/nope' || { printf 'LAGOON nocwd"))
+    assertTrue(probe.contains("pgrep -f '[d]sh web'"))
+  }
+
   @Test fun bootstrapReportsMissingDsh() {
     assumeTrue(File("/bin/sh").exists())
     val root = Files.createTempDirectory("lagoon-ssh-test").toFile()

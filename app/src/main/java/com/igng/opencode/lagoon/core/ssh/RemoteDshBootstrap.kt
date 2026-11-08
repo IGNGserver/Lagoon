@@ -54,6 +54,14 @@ internal class RemoteDshBootstrap(
 
   fun probe(): RemoteDshProbe {
     val result = transport.exec(probeScript(), 20_000)
+    if (result.stdout.contains("LAGOON busy")) {
+      throw SshFailure(
+        SshFailureKind.DSH_START,
+        "这台机器上已经有别的 dsh web 在运行",
+        "Lagoon 不会再启动第二个实例。先在那台电脑上停掉已有的 dsh web，或改用 DSH Remote。",
+        retryable = false
+      )
+    }
     if (looksLikeMissingShell(result)) {
       throw SshFailure(SshFailureKind.NO_SHELL, "远端没有 POSIX shell，无法启动 dsh web", tail(result), retryable = false)
     }
@@ -77,6 +85,7 @@ internal class RemoteDshBootstrap(
   private fun prelude(): String = buildString {
     appendLine("umask 077")
     appendLine("D=\"\$HOME/.dsh-app-remote\"")
+    appendLine("export D")
     appendLine("_st() {")
     appendLine("  if [ -r \"/proc/\$1/stat\" ]; then")
     appendLine("    S=\$(cat \"/proc/\$1/stat\" 2>/dev/null) || return 1")
@@ -126,8 +135,10 @@ internal class RemoteDshBootstrap(
     appendLine("if [ -f \"\$D/web.pid\" ]; then")
     appendLine("  P=\$(cat \"\$D/web.pid\" 2>/dev/null)")
     appendLine("  if [ -n \"\$P\" ] && ours \"\$P\"; then")
+    appendLine("    PARENT=\$(ps -o ppid= -p \"\$P\" 2>/dev/null | tr -d ' ')")
     appendLine("    if command -v pkill >/dev/null 2>&1; then pkill -TERM -P \"\$P\" 2>/dev/null; fi")
     appendLine("    kill \"\$P\" 2>/dev/null")
+    appendLine("    if [ -n \"\$PARENT\" ] && [ \"\$PARENT\" != 1 ]; then kill \"\$PARENT\" 2>/dev/null; fi")
     appendLine("    i=0")
     appendLine("    while kill -0 \"\$P\" 2>/dev/null && [ \"\$i\" -lt 10 ]; do sleep 1; i=\$((i+1)); done")
     appendLine("    kill -9 \"\$P\" 2>/dev/null")
@@ -150,6 +161,16 @@ internal class RemoteDshBootstrap(
     appendLine("    rm -f \"\$D/web.pid\"")
     appendLine("  fi")
     appendLine("fi")
+    // A dsh web this app does not own (a manual `dsh web`, or another profile lock) must not be
+    // joined by a second launch. Report it before start() tries to boot another one.
+    appendLine("_busy=0")
+    appendLine("if [ -f \"\$D/web.pid\" ]; then")
+    appendLine("  _bp=\$(cat \"\$D/web.pid\" 2>/dev/null)")
+    appendLine("  if [ -n \"\$_bp\" ] && ours \"\$_bp\"; then _busy=1; fi")
+    appendLine("fi")
+    appendLine("if [ \"\$_busy\" -eq 0 ] && command -v pgrep >/dev/null 2>&1; then")
+    appendLine("  if pgrep -f '[d]sh web' >/dev/null 2>&1; then printf 'LAGOON busy\\n'; fi")
+    appendLine("fi")
     appendLine("true")
   }
 
@@ -161,16 +182,23 @@ internal class RemoteDshBootstrap(
     append(stopOld())
     append(dshSearch())
     val cwd = workingDirectory?.trim()
-    if (!cwd.isNullOrEmpty()) appendLine("cd ${SshShell.remotePathExpr(cwd)} 2>/dev/null || printf 'LAGOON nocwd\\n'")
+    if (!cwd.isNullOrEmpty()) {
+      appendLine("cd ${SshShell.remotePathExpr(cwd)} || { printf 'LAGOON nocwd\\n'; exit 71; }")
+    }
     appendLine("printf '%s' ${SshShell.quote(command)} > \"\$D/web.cmd\"")
     appendLine(": > \"\$D/web.log\"")
     appendLine("NO_COLOR=1; export NO_COLOR")
     appendLine("N=\"\"; if command -v nohup >/dev/null 2>&1; then N=nohup; fi")
-    appendLine("\$N $command --host 127.0.0.1 --port 0 --no-open </dev/null >>\"\$D/web.log\" 2>&1 &")
-    appendLine("P=\$!")
+    // The wrapper stays alive with `wait`, so the shell does not reap dsh when it exits. web.pid is
+    // still dsh: the wrapper prints the background pid before waiting. Newlines are rejected earlier.
+    val launch = "$command --host 127.0.0.1 --port 0 --no-open"
+    appendLine("LAUNCH=${SshShell.quote(launch)}")
+    appendLine("\$N sh -c 'eval \"\$1\" >>\"\$D/web.log\" 2>&1 & echo \$! >\"\$D/web.pid\"; wait' sh \"\$LAUNCH\" >/dev/null 2>&1 &")
+    appendLine("i=0")
+    appendLine("while [ ! -s \"\$D/web.pid\" ] && [ \$i -lt 20 ]; do sleep 0.1; i=\$((i+1)); done")
+    appendLine("P=\$(cat \"\$D/web.pid\" 2>/dev/null)")
     appendLine("ST=\$(_st \"\$P\" 2>/dev/null)")
     appendLine("if [ -n \"\$ST\" ]; then printf '%s\\n' \"\$ST\" > \"\$D/web.st\"; else rm -f \"\$D/web.st\"; fi")
-    appendLine("printf '%s\\n' \"\$P\" > \"\$D/web.pid\"")
     appendLine("printf 'LAGOON started %s\\n' \"\$P\"")
     appendLine("i=0")
     appendLine("while [ \$i -lt ${startTimeoutSeconds.coerceIn(5, 600)} ]; do")
@@ -218,6 +246,7 @@ internal class RemoteDshBootstrap(
     var pid: Int? = null
     var url: String? = null
     var noDsh = false
+    var noCwd = false
     var exited = false
     var timedOut = false
     val log = ArrayList<String>()
@@ -228,6 +257,7 @@ internal class RemoteDshBootstrap(
         "started" -> pid = value.trim().toIntOrNull()
         "url" -> url = value.trim()
         "nodsh" -> noDsh = true
+        "nocwd" -> noCwd = true
         "exited" -> exited = true
         "timeout" -> timedOut = true
         "log" -> log += value
@@ -236,6 +266,14 @@ internal class RemoteDshBootstrap(
     val parsed = url?.let(::parseLaunchLine)
     if (parsed != null) return RemoteDshEndpoint(parsed.port, parsed.token, pid, home = home, dshPath = dshPath)
     val tail = SshShell.redactTokens(log.filter(String::isNotBlank).joinToString("\n")).trim()
+    if (noCwd) {
+      throw SshFailure(
+        SshFailureKind.DSH_START,
+        "远端工作目录不存在：${workingDirectory?.trim().orEmpty()}",
+        tail,
+        retryable = false
+      )
+    }
     if (noDsh || (exited && looksNotFound(tail))) {
       throw SshFailure(
         SshFailureKind.DSH_NOT_FOUND,

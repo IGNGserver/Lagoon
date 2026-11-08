@@ -22,26 +22,35 @@ internal class SshHostStore internal constructor(
     KeystoreCipher.of("lagoon-ssh-secrets")::decrypt
   )
 
-  fun load(): List<SshHostConfig> {
+  fun load(): List<SshHostConfig> = try {
+    readHosts()
+  } catch (error: IOException) {
+    Diagnostics.warn("SshHostStore", "SSH 主机配置读取失败，界面暂不显示", error)
+    emptyList()
+  }
+
+  /** Throws when the stored document cannot be trusted. Writers must not replace it with a
+   *  one-host list, which would erase every other host. */
+  private fun readHosts(): List<SshHostConfig> {
     val text = preferences.getString(KEY, null) ?: return emptyList()
     return try {
       SshHostCodec.decode(text).distinctBy { it.id }
     } catch (error: Exception) {
-      Diagnostics.warn("SshHostStore", "SSH 主机配置读取失败，已忽略", error)
-      emptyList()
+      throw IOException("SSH 主机配置损坏，已停止写入以免覆盖其余主机", error)
     }
   }
 
   fun save(config: SshHostConfig, secrets: SshSecrets? = null) {
+    val current = readHosts()
     if (secrets != null) saveSecrets(config, secrets)
-    val next = load().filterNot { it.id == config.id } + config
+    val next = current.filterNot { it.id == config.id } + config
     if (!preferences.edit().putString(KEY, SshHostCodec.encode(next)).commit()) {
       throw IOException("SSH 主机保存失败")
     }
   }
 
   fun delete(id: String) {
-    val next = load().filterNot { it.id == id }
+    val next = readHosts().filterNot { it.id == id }
     if (!preferences.edit().putString(KEY, SshHostCodec.encode(next)).commit()) {
       throw IOException("SSH 主机删除失败")
     }

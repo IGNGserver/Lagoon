@@ -570,6 +570,9 @@ class LagoonController private constructor(private val appContext: Context) {
       if (existing != null) return existing.health()
     }
     if (profile.sshHostId != null) {
+      // Saved SSH profiles are tested through testSshHost, which dials the form draft on its own link.
+      // Reaching here means a caller asked to probe the already-saved host; reuse its live client so a
+      // second SSH session does not fight the monitor for the same remote dsh web.
       if (store.profiles().any { it.id == profile.id }) {
         val existing = runCatching { allOverview.client(profile.id) }.getOrNull()
         if (existing != null) return existing.health()
@@ -1327,8 +1330,10 @@ class LagoonController private constructor(private val appContext: Context) {
         homeGroupId = groups.selectedGroupId
       )
     }
-    sshHostManager.close(clean.id)
+    // Drop the monitor's client first. Its close() only releases a refcount, so closing the link
+    // afterwards is what actually tears the old forwarder down; start() below then dials the new config.
     allOverview.invalidate(profile.id)
+    sshHostManager.replace(clean.id)
     scheduleBackgroundSync()
     allOverview.start(profiles, include = setOfNotNull(if (profile.enabled) profile.id else state.value.serverId))
     if (groupId != null) moveProfile(profile.id, groupId)

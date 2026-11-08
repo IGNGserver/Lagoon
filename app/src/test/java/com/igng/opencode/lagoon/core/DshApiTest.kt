@@ -1513,6 +1513,33 @@ class DshApiTest {
     }
   }
 
+  @Test fun tunnelTokenRejectionKeepsTheSavedBrowserCookie() = runBlocking {
+    MockWebServer().use { server ->
+      server.enqueue(MockResponse().setResponseCode(401).setBody("unauthorized"))
+      server.enqueue(envelope("""{"items":[]}"""))
+      val cleared = mutableListOf<String>()
+      val payload = java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(
+        """{"version":1,"issuedAt":1,"expiresAt":${System.currentTimeMillis() + 86_400_000}}""".toByteArray()
+      )
+      val cookie = "dsh-auth-abc=v1.$payload.sig"
+      val client = DshApi(
+        profile(server),
+        ServerCredentials("dsh", "old-token", cookie),
+        hostHeader = "127.0.0.1:45678",
+        onCookie = { cleared += it }
+      )
+      assertEquals("DeepSeek Harness", client.health())
+      assertTrue("a rotated tunnel token must not wipe the saved cookie", cleared.isEmpty())
+      val login = server.takeRequest(2, TimeUnit.SECONDS)
+      assertNotNull(login)
+      assertTrue(login!!.path!!.contains("token=old-token"))
+      val list = server.takeRequest(2, TimeUnit.SECONDS)
+      assertNotNull(list)
+      assertTrue(list!!.getHeader("Cookie").orEmpty().startsWith("dsh-auth-abc=v1."))
+      client.close()
+    }
+  }
+
   @Test fun tunnelHostHeaderIsAppliedToEveryRequest() = runBlocking {
     MockWebServer().use { server ->
       server.enqueue(rootOk())

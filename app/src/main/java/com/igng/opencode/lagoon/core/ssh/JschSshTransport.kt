@@ -37,9 +37,11 @@ internal interface SshTransport : Closeable {
   fun ping(timeoutMillis: Long): Boolean
 }
 
-/** One live direct-tcpip channel. [isOpen] lets the local forwarder prune finished pairs. */
+/** One live direct-tcpip channel. [isOpen] lets the local forwarder prune finished pairs.
+ *  [onClosed] fires when the channel stops, so the local socket does not wait on a poll. */
 internal interface TunnelConnection : Closeable {
   val isOpen: Boolean
+  fun onClosed(listener: () -> Unit) {}
 }
 
 internal interface SshTransportFactory {
@@ -52,7 +54,7 @@ internal interface SshTransportFactory {
 /** JSch-backed transport. JSch is BSD-licensed; the host key is verified by our own TOFU pin. */
 internal class JschSshTransportFactory : SshTransportFactory {
   override fun connect(config: SshHostConfig, secrets: SshSecrets, verifier: SshHostKeyVerifier): SshTransport {
-    val repository = VerifyingHostKeyRepository(verifier)
+    val repository = VerifyingHostKeyRepository(verifier, config.hostKeyType?.trim()?.takeIf { it.isNotEmpty() })
     val session = try {
       openSession(config, secrets, repository)
     } catch (error: Throwable) {
@@ -62,7 +64,7 @@ internal class JschSshTransportFactory : SshTransportFactory {
   }
 
   override fun probeHostKey(config: SshHostConfig): PresentedSshHostKey {
-    val repository = VerifyingHostKeyRepository { false }
+    val repository = VerifyingHostKeyRepository({ false })
     val session = try {
       // The host key is presented before authentication; use a throwaway password auth so a
       // private-key-only config can still be probed without asking for the key again.
@@ -148,7 +150,8 @@ internal class JschSshTransportFactory : SshTransportFactory {
 }
 
 private class VerifyingHostKeyRepository(
-  private val verifier: SshHostKeyVerifier
+  private val verifier: SshHostKeyVerifier,
+  private val expectedType: String? = null
 ) : HostKeyRepository {
   @Volatile var presented: PresentedSshHostKey? = null
   @Volatile var failure: SshFailure? = null
@@ -163,6 +166,18 @@ private class VerifyingHostKeyRepository(
       .encodeToString(MessageDigest.getInstance("SHA-256").digest(key))
     val presented = PresentedSshHostKey(hostKey.type, fingerprint)
     this.presented = presented
+    val pinnedType = expectedType
+    if (pinnedType != null && !pinnedType.equals(hostKey.type, ignoreCase = true)) {
+      val failure = SshFailure(
+        SshFailureKind.HOST_KEY_CHANGED,
+        "主机密钥类型和上次不一致，已拒绝连接",
+        "已记住：$pinnedType\n这次收到：${presented.shortType} ${presented.fingerprint}",
+        retryable = false,
+        presentedKey = presented
+      )
+      this.failure = failure
+      return HostKeyRepository.NOT_INCLUDED
+    }
     return try {
       if (verifier.verify(presented)) HostKeyRepository.OK else HostKeyRepository.NOT_INCLUDED
     } catch (failure: SshFailure) {
@@ -226,8 +241,22 @@ private class JschSshTransport(private val session: Session) : SshTransport {
       channel.setOutputStream(output)
       channel.connect(15_000)
       object : TunnelConnection {
+        private val closedListeners = java.util.concurrent.CopyOnWriteArrayList<() -> Unit>()
+        @Volatile private var notified = false
         override val isOpen: Boolean get() = channel.isConnected
-        override fun close() { runCatching { channel.disconnect() } }
+        override fun onClosed(listener: () -> Unit) {
+          closedListeners += listener
+          if (!isOpen) fireClosed()
+        }
+        override fun close() {
+          runCatching { channel.disconnect() }
+          fireClosed()
+        }
+        private fun fireClosed() {
+          if (notified) return
+          notified = true
+          closedListeners.forEach { runCatching { it() } }
+        }
       }
     } catch (error: Exception) {
       runCatching { channel.disconnect() }
@@ -236,14 +265,19 @@ private class JschSshTransport(private val session: Session) : SshTransport {
   }
 
   override fun probeTunnel(host: String, port: Int, timeoutMillis: Long): Boolean {
+    val request = "GET / HTTP/1.0\r\nHost: $host:$port\r\nConnection: close\r\n\r\n".toByteArray(Charsets.US_ASCII)
+    val captured = ByteArrayOutputStream()
     val channel = session.openChannel("direct-tcpip") as ChannelDirectTCPIP
     return try {
       channel.setHost(host)
       channel.setPort(port)
-      channel.setInputStream(java.io.ByteArrayInputStream(ByteArray(0)))
-      channel.setOutputStream(ByteArrayOutputStream())
+      channel.setInputStream(java.io.ByteArrayInputStream(request))
+      channel.setOutputStream(captured)
       channel.connect(timeoutMillis.toInt().coerceAtLeast(1_000))
-      channel.isConnected
+      val deadline = System.nanoTime() + timeoutMillis.coerceIn(1_000, 30_000) * 1_000_000L
+      while (captured.size() < 12 && System.nanoTime() < deadline) Thread.sleep(25)
+      val head = captured.toString(Charsets.US_ASCII.name())
+      head.startsWith("HTTP/")
     } catch (_: Exception) {
       false
     } finally {
