@@ -285,6 +285,10 @@ internal fun SshHostForm(
     withPinnedKey(config) { pinned -> commit(pinned) }
   }
 
+  // The address can still carry a port when it was typed rather than pasted; the form always
+  // shows and saves the effective value so the hidden 更多选项 field never contradicts it.
+  val effectivePort = SshAddress.parse(address).port?.toString() ?: port.trim()
+
   LazyColumn(
     Modifier.fillMaxWidth().heightIn(max = 720.dp),
     contentPadding = PaddingValues(horizontal = 20.dp, vertical = 8.dp),
@@ -457,7 +461,7 @@ internal fun SshHostForm(
         title = "更多选项",
         summary = if (showMore) "端口、认证方式、启动命令与主机指纹" else moreOptionsSummary(
           auth = auth,
-          port = port,
+          port = effectivePort,
           command = command,
           workingDirectory = workingDirectory,
           name = name,
@@ -479,7 +483,8 @@ internal fun SshHostForm(
       }
       item {
         TextField(
-          value = port,
+          // A hand-typed ":2222" stays in the address field, so show the effective value here.
+          value = effectivePort,
           onValueChange = { typed ->
             port = typed.filter(Char::isDigit)
             // The dedicated field wins: drop a `:port` the address was still carrying.
