@@ -65,26 +65,21 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
 import top.yukonga.miuix.kmp.theme.miuixCapsuleShape
 import top.yukonga.miuix.kmp.theme.miuixShape
 
-private enum class ChatSheet { CHANGES, FILES, SCHEDULES }
-
-internal enum class ConversationPane { TRANSCRIPT, ACTIVITY }
-
-internal fun conversationPaneFromIndex(index: Int): ConversationPane =
-  if (index == ConversationPane.ACTIVITY.ordinal) ConversationPane.ACTIVITY else ConversationPane.TRANSCRIPT
+private enum class ChatSheet { CHANGES, FILES, SCHEDULES, ACTIVITY }
 
 internal fun conversationActivityCount(activity: SessionActivity): Int =
   activity.subSessions.size + activity.shells.size
 
-internal fun conversationPaneLabels(activity: SessionActivity): List<String> = listOf(
-  "主会话",
-  "后台活动（${conversationActivityCount(activity)}）"
-)
+/** The ⋯ entry and the sheet title share one label; the count only shows while there is something to open. */
+internal fun conversationActivityLabel(activity: SessionActivity): String {
+  val count = conversationActivityCount(activity)
+  return if (count > 0) "子会话与后台（$count）" else "子会话与后台"
+}
 
 @Composable
 fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> Unit, onOpenChild: (String) -> Unit, onModal: (Boolean) -> Unit, interactive: Boolean = true) {
   val session = state.session
   var sheet by remember { mutableStateOf<ChatSheet?>(null) }
-  var pane by rememberSaveable(state.serverId, state.sessionId) { mutableStateOf(ConversationPane.TRANSCRIPT) }
   var menu by remember { mutableStateOf(false) }
   var rename by rememberSaveable { mutableStateOf(false) }
   var delete by rememberSaveable { mutableStateOf(false) }
@@ -101,24 +96,17 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
   var goalText by remember(state.serverId, state.sessionId) { mutableStateOf("") }
   val activity = remember(state.sessions, state.presentedTasks, state.shells, state.parents, state.sessionId) { state.sessionActivity() }
   val transcriptList = rememberLazyListState()
-  LaunchedEffect(pane, sheet, state.serverId, state.sessionId) {
-    if (pane == ConversationPane.ACTIVITY || sheet == ChatSheet.CHANGES) controller.loadAncillary()
+  LaunchedEffect(sheet, state.serverId, state.sessionId) {
+    if (sheet == ChatSheet.CHANGES || sheet == ChatSheet.ACTIVITY) controller.loadAncillary()
   }
   val focusManager = LocalFocusManager.current
   val keyboard = LocalSoftwareKeyboardController.current
-  fun showActivityPane() {
+  // 后台活动是半屏抽屉：收起键盘，免得抽屉顶在输入法上；抽屉里的子会话再整页打开。
+  fun showActivitySheet() {
     focusManager.clearFocus()
     keyboard?.hide()
     menu = false
-    sheet = null
-    pane = ConversationPane.ACTIVITY
-  }
-  fun handleChatBack() {
-    if (pane == ConversationPane.ACTIVITY) pane = ConversationPane.TRANSCRIPT else onBack()
-  }
-  BackHandler(enabled = interactive && pane == ConversationPane.ACTIVITY && sheet == null && !menu &&
-    rename == false && delete == false && !composerModal && !requestModal && activityGroup == null && state.shellOutput == null) {
-    pane = ConversationPane.TRANSCRIPT
+    sheet = ChatSheet.ACTIVITY
   }
   val modal = sheet != null || menu || rename || delete || composerModal || requestModal || activityGroup != null || state.shellOutput != null
   DisposableEffect(modal) { onModal(modal); onDispose { onModal(false) } }
@@ -131,7 +119,7 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
   // 分叉与删除按 harness 能力显示（DSH 没有消息级撤销与删除，用分叉与归档代替）。
   val menuSections = listOf(
     MenuSection(buildList {
-      add(MenuAction("子会话与后台（${conversationActivityCount(activity)}）", MiuixIcons.MindMap) { showActivityPane() })
+      add(MenuAction(conversationActivityLabel(activity), MiuixIcons.MindMap) { showActivitySheet() })
       if (state.capabilities.diff) add(MenuAction("改动（${state.changes.size}）", MiuixIcons.Merge) { sheet = ChatSheet.CHANGES })
       add(MenuAction("文件", MiuixIcons.Folder) { sheet = ChatSheet.FILES; controller.listFiles() })
       if (state.server?.kind == ServerKind.DSH || state.server?.kind == ServerKind.DSH_REMOTE) {
@@ -155,7 +143,7 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
   HyperLagoonTheme {
     Box(Modifier.fillMaxSize().background(HyperLagoonColors.canvas)) {
       Column(Modifier.fillMaxSize()) {
-        PageTopBar(state.title(session), ::handleChatBack, subtitle = { SessionSubtitle(state, session) }) {
+        PageTopBar(state.title(session), onBack, subtitle = { SessionSubtitle(state, session) }) {
           Box {
             HyperIconButton(QoderGlyph.MORE, "会话操作", { menu = true }, backgroundColor = Color.Transparent)
             MenuPopup(menu, { menu = false }, menuSections)
@@ -171,27 +159,14 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
             color = if (transcriptStatus.state == ResourceState.STALE) HyperTheme.colors.warning else HyperTheme.colors.error
           )
         }
-        ConversationPaneTabs(
-          pane = pane,
-          activity = activity,
-          onPaneSelected = { selected ->
-            if (selected == ConversationPane.ACTIVITY) showActivityPane() else pane = ConversationPane.TRANSCRIPT
-          },
-          modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp)
-        )
         Box(Modifier.weight(1f).fillMaxWidth()) {
-          when (pane) {
-            ConversationPane.TRANSCRIPT -> Conversation(state, controller, Modifier.fillMaxSize(), ::openFile, { requestModal = it }, onOpenChild,
-              onActivityGroup = {
-                focusManager.clearFocus(); keyboard?.hide()
-                activityGroup = it
-                activityItem = it.takeIf { row -> row.kind == "tool" }
-              }, onQueuedAction = { queuedAction = it },
-              activity = activity, onOpenActivity = ::showActivityPane, listState = transcriptList)
-            ConversationPane.ACTIVITY -> ActivityPanel(state, activity, state.messages.filter { it.isBackgroundActivityMessage }, controller, Modifier.fillMaxSize(),
-              onOpenChild = onOpenChild,
-              onOpenShell = { controller.openShellOutput(it) })
-          }
+          Conversation(state, controller, Modifier.fillMaxSize(), ::openFile, { requestModal = it }, onOpenChild,
+            onActivityGroup = {
+              focusManager.clearFocus(); keyboard?.hide()
+              activityGroup = it
+              activityItem = it.takeIf { row -> row.kind == "tool" }
+            }, onQueuedAction = { queuedAction = it },
+            activity = activity, onOpenActivity = ::showActivitySheet, listState = transcriptList)
         }
         if (session.parentId != null) ChildSessionBar(state, session, onBack,
           onContinue = if ((state.server?.kind == ServerKind.DSH || state.server?.kind == ServerKind.DSH_REMOTE) &&
@@ -231,21 +206,31 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
     }
   }
   sheet?.let { which ->
-    val resource = when (which) { ChatSheet.CHANGES -> "changes"; ChatSheet.FILES -> "files"; ChatSheet.SCHEDULES -> "schedules" }
-    HyperBottomSheet(title = when (which) { ChatSheet.CHANGES -> "代码改动"; ChatSheet.FILES -> "文件"; ChatSheet.SCHEDULES -> "定时任务" }, show = true, onDismissRequest = { sheet = null }) {
+    val title = when (which) {
+      ChatSheet.CHANGES -> "代码改动"
+      ChatSheet.FILES -> "文件"
+      ChatSheet.SCHEDULES -> "定时任务"
+      ChatSheet.ACTIVITY -> conversationActivityLabel(activity)
+    }
+    HyperBottomSheet(title = title, show = true, onDismissRequest = { sheet = null }) {
       Column(Modifier.fillMaxWidth().fillMaxHeight(0.72f).padding(vertical = 8.dp)) {
-        if (which != ChatSheet.FILES && which != ChatSheet.SCHEDULES) {
-          ResourceHint(state.resource(resource), "暂无记录", retry = { if (which == ChatSheet.CHANGES) controller.loadAncillary() else controller.reload() })
-        }
         when (which) {
-          // Server lists may repeat an entry; LazyColumn crashes on a duplicate key, so keys never come from data alone.
-          ChatSheet.CHANGES -> LazyColumn { itemsIndexed(state.changes, key = { index, change -> "$index:${change.path}" }) { _, change ->
-            var expanded by rememberSaveable(change.path) { mutableStateOf(false) }
-            HyperActionRow(title = change.path, summary = "+${change.additions} −${change.deletions}", trailing = { ExpandChevron(expanded) }, onClick = { expanded = !expanded })
-            if (expanded) VirtualText(change.patch.ifBlank { change.after })
-          } }
+          ChatSheet.CHANGES -> {
+            ResourceHint(state.resource("changes"), "暂无记录", retry = { controller.loadAncillary() })
+            // Server lists may repeat an entry; LazyColumn crashes on a duplicate key, so keys never come from data alone.
+            LazyColumn { itemsIndexed(state.changes, key = { index, change -> "$index:${change.path}" }) { _, change ->
+              var expanded by rememberSaveable(change.path) { mutableStateOf(false) }
+              HyperActionRow(title = change.path, summary = "+${change.additions} −${change.deletions}", trailing = { ExpandChevron(expanded) }, onClick = { expanded = !expanded })
+              if (expanded) VirtualText(change.patch.ifBlank { change.after })
+            } }
+          }
           ChatSheet.FILES -> FilesPanel(state, controller) { path -> controller.addReference(path); sheet = null }
           ChatSheet.SCHEDULES -> SchedulesPanel(state, controller)
+          // 子会话整页打开；后台命令有自己的输出抽屉，这一层先收起，不把两个抽屉叠在一起。
+          ChatSheet.ACTIVITY -> ActivityPanel(state, activity, state.messages.filter { it.isBackgroundActivityMessage }, controller,
+            modifier = Modifier.fillMaxWidth().weight(1f).padding(horizontal = 8.dp),
+            onOpenChild = { child -> sheet = null; onOpenChild(child) },
+            onOpenShell = { job -> sheet = null; controller.openShellOutput(job) })
         }
       }
     }
@@ -465,28 +450,7 @@ private fun ChildSessionBar(state: LagoonState, session: Session, onBack: () -> 
   }
 }
 
-@Composable
-private fun ConversationPaneTabs(
-  pane: ConversationPane,
-  activity: SessionActivity,
-  onPaneSelected: (ConversationPane) -> Unit,
-  modifier: Modifier = Modifier
-) {
-  val labels = conversationPaneLabels(activity)
-  HyperSegmentedTabs(
-    tabs = labels,
-    selectedIndex = pane.ordinal,
-    onTabSelected = { onPaneSelected(conversationPaneFromIndex(it)) },
-    modifier = modifier.semantics {
-      contentDescription = "会话内容切换"
-      stateDescription = if (pane == ConversationPane.ACTIVITY) {
-        "已选择后台活动，${conversationActivityCount(activity)} 项"
-      } else "已选择主会话"
-    }
-  )
-}
-
-/** Background commands and the whole child-session family, including finished sessions. */
+/** 「子会话与后台」抽屉的正文：代理消息、后台命令和整棵子会话家族（含历史）。 */
 @Composable
 private fun ActivityPanel(state: LagoonState, activity: SessionActivity, backgroundMessages: List<Message>, controller: LagoonController,
   modifier: Modifier = Modifier, onOpenChild: (String) -> Unit, onOpenShell: (ShellJob) -> Unit) {
