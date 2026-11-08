@@ -990,6 +990,76 @@ class DshApiTest {
     }
   }
 
+  /**
+   * `$events` 只说“不再运行”。follow 没开时，停下来要补读日志尾部的 `turn/end`，
+   * 再补一条带结局的执行事件；读不到结局就不能发，否则会被记成已完成。
+   */
+  @Test fun idleStatusReadsTheTurnEndItDidNotSee() = runBlocking {
+    val server = MockWebServer().also { it.start() }
+    try {
+      server.dispatcher = object : Dispatcher() {
+        override fun dispatch(request: RecordedRequest): MockResponse = when {
+          request.path!!.startsWith("/?token") || request.path == "/" -> rootOk()
+          request.path == "/api/session/list" -> envelope("""{"items":[${sessionRow(running = true)}]}""")
+          request.path == "/api/session/page" -> envelope("""{"records":[${
+            event("turn/end", 9, 20, JSONObject().put("turn", 1).put("reason", JSONObject().put("kind", "completed")))
+          }],"hasMore":false}""")
+          request.path == "/api/remote.mux" -> MockResponse().withWebSocketUpgrade(object : WebSocketListener() {
+            override fun onMessage(webSocket: WebSocket, text: String) {
+              val frame = JSONObject(text)
+              if (frame.optString("type") != "open") return
+              val id = frame.getString("streamId")
+              webSocket.send("""{"type":"item","streamId":"$id","value":{"type":"ready","clientId":"c1","host":{"home":"/home"}}}""")
+              webSocket.send("""{"type":"item","streamId":"$id","value":{"type":"emit","event":"api-session/status","args":["s1",false]}}""")
+            }
+          })
+          else -> MockResponse().setResponseCode(404)
+        }
+      }
+      val client = api(server)
+      client.rootSessionsPage("/repo")
+      val events = withTimeout(20_000) { client.events {}.take(2).toList() }
+      assertEquals("session.status", events[0].type)
+      assertEquals("idle", events[0].properties.getJSONObject("status").getString("type"))
+      assertEquals("session.execution.succeeded", events[1].type)
+      assertEquals("s1", events[1].properties.getString("sessionID"))
+      assertEquals("succeeded", client.session("s1").outcome)
+    } finally {
+      server.shutdown()
+    }
+  }
+
+  /** 日志里没有 `turn/end`（比如进程中途退出）时，只报告空闲，不补一条成功。 */
+  @Test fun idleStatusWithoutATurnEndStaysIdle() = runBlocking {
+    val server = MockWebServer().also { it.start() }
+    try {
+      server.dispatcher = object : Dispatcher() {
+        override fun dispatch(request: RecordedRequest): MockResponse = when {
+          request.path!!.startsWith("/?token") || request.path == "/" -> rootOk()
+          request.path == "/api/session/list" -> envelope("""{"items":[${sessionRow(running = true)}]}""")
+          request.path == "/api/session/page" -> envelope("""{"records":[],"hasMore":false}""")
+          request.path == "/api/remote.mux" -> MockResponse().withWebSocketUpgrade(object : WebSocketListener() {
+            override fun onMessage(webSocket: WebSocket, text: String) {
+              val frame = JSONObject(text)
+              if (frame.optString("type") != "open") return
+              val id = frame.getString("streamId")
+              webSocket.send("""{"type":"item","streamId":"$id","value":{"type":"ready","clientId":"c1","host":{"home":"/home"}}}""")
+              webSocket.send("""{"type":"item","streamId":"$id","value":{"type":"emit","event":"api-session/status","args":["s1",false]}}""")
+            }
+          })
+          else -> MockResponse().setResponseCode(404)
+        }
+      }
+      val client = api(server)
+      client.rootSessionsPage("/repo")
+      val events = withTimeout(20_000) { client.events {}.take(1).toList() }
+      assertEquals(listOf("session.status"), events.map { it.type })
+      assertNull(client.session("s1").outcome)
+    } finally {
+      server.shutdown()
+    }
+  }
+
   @Test fun sessionStatusEventsMapToBusyAndIdle() = runBlocking {
     val server = MockWebServer().also { it.start() }
     try {
