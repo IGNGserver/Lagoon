@@ -196,6 +196,14 @@ internal class SshDshClient(
 
   override suspend fun modelCatalog(directory: String): List<ModelInfo> = api().modelCatalog(directory)
 
+  override suspend fun permissionPresets(directory: String): List<PermissionPresetChoice> = api().permissionPresets(directory)
+
+  override suspend fun setPermission(session: Session, value: String): Boolean = api().setPermission(session, value)
+
+  override suspend fun serverPinnedSessions(): Set<String>? = api().serverPinnedSessions()
+
+  override suspend fun setSessionPinned(session: Session, pinned: Boolean): Boolean = api().setSessionPinned(session, pinned)
+
   override suspend fun sessionPermissions(session: Session): List<PermissionRequest> = api().sessionPermissions(session)
 
   override suspend fun pendingPermissions(directory: String): List<PermissionRequest> = api().pendingPermissions(directory)

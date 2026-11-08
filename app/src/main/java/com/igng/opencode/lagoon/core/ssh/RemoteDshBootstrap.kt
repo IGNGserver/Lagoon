@@ -169,7 +169,9 @@ internal class RemoteDshBootstrap(
     appendLine("  if [ -n \"\$_bp\" ] && ours \"\$_bp\"; then _busy=1; fi")
     appendLine("fi")
     appendLine("if [ \"\$_busy\" -eq 0 ] && command -v pgrep >/dev/null 2>&1; then")
-    appendLine("  if pgrep -f '[d]sh web' >/dev/null 2>&1; then printf 'LAGOON busy\\n'; fi")
+    // 只看当前用户自己的进程：`pgrep -f` 不带 `-u` 会把同一台机器上别人的 dsh web 也算进来，
+    // 在共享主机/跳板机上把「别人开着 dsh web」误报成「本机已有实例」。
+    appendLine("  if pgrep -u \"\$(id -u)\" -f '[d]sh web' >/dev/null 2>&1; then printf 'LAGOON busy\\n'; fi")
     appendLine("fi")
     appendLine("true")
   }
@@ -265,6 +267,19 @@ internal class RemoteDshBootstrap(
     }
     val parsed = url?.let(::parseLaunchLine)
     if (parsed != null) return RemoteDshEndpoint(parsed.port, parsed.token, pid, home = home, dshPath = dshPath)
+    // 有启动链接但解析不出 loopback 端口：远端 profile/启动命令带了 `--public-url` 之类的配置，
+    // 打印的不是 127.0.0.1:<port>。给出可执行的诊断，而不是笼统的「没能启动 dsh web」。
+    if (url != null) {
+      throw SshFailure(
+        SshFailureKind.DSH_START,
+        "远端 dsh web 没有监听 loopback 地址，SSH 隧道无法接入",
+        listOf(
+          "启动行：${SshShell.redactTokens(url)}",
+          "SSH 模式需要一个 http://127.0.0.1:<端口> 形态的启动链接。请检查那台机器的 dsh web profile 是否配置了 publicUrl，或在「启动命令」里去掉 --public-url / --public-host。"
+        ).joinToString("\n"),
+        retryable = false
+      )
+    }
     val tail = SshShell.redactTokens(log.filter(String::isNotBlank).joinToString("\n")).trim()
     if (noCwd) {
       throw SshFailure(

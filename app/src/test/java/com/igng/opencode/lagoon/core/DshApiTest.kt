@@ -177,22 +177,114 @@ class DshApiTest {
     }
   }
 
-  @Test fun filePreviewUsesBase64ReadBytesAndOfficeRender() = runBlocking {
+  /**
+   * 二进制方法的真实响应形状：信封在 `metadata` 分片，`value.data` 是 `null`，字节在独立分片里，
+   * 由顶层 `attachments[{path,codec,part}]` 声明（`workspaceFiles/readBytes`、`officeToPdf/render`）。
+   */
+  private fun binaryEnvelope(value: String, path: List<String>, bytes: ByteArray): MockResponse {
+    val boundary = "----lagoon-binary"
+    val declared = path.joinToString(",") { "\"$it\"" }
+    val metadata = """{"type":"server-response","rpcId":"x","result":{"ok":true,"value":$value},""" +
+      """"attachments":[{"path":[$declared],"codec":"bytes","part":"bytes-0"}]}"""
+    val body = java.io.ByteArrayOutputStream()
+    body.write("--$boundary\r\n".toByteArray())
+    body.write("Content-Disposition: form-data; name=\"bytes-0\"; filename=\"blob\"\r\n".toByteArray())
+    body.write("Content-Type: application/octet-stream\r\n\r\n".toByteArray())
+    body.write(bytes)
+    body.write("\r\n--$boundary\r\n".toByteArray())
+    body.write("Content-Disposition: form-data; name=\"metadata\"\r\n\r\n".toByteArray())
+    body.write(metadata.toByteArray())
+    body.write("\r\n--$boundary--\r\n".toByteArray())
+    return MockResponse().setResponseCode(200)
+      .addHeader("Content-Type", "multipart/form-data; boundary=$boundary")
+      .setBody(okio.Buffer().write(body.toByteArray()))
+  }
+
+  /** 图片预览走官方 Web 的同一条只读路由 `GET /api/file?path=<绝对路径>`。 */
+  @Test fun filePreviewUsesApiFileRouteForImages() = runBlocking {
     MockWebServer().use { server ->
       server.enqueue(rootOk())
-      server.enqueue(envelope("""{"absolutePath":"/repo/a.png","bytes":5,"offset":0,"data":"aGVsbG8=","eof":true}"""))
-      server.enqueue(envelope("""{"data":"JVBERi0="}"""))
+      server.enqueue(MockResponse().setResponseCode(200)
+        .addHeader("Content-Type", "image/png")
+        .setBody(okio.Buffer().write("hello".toByteArray())))
       val client = api(server)
-      val session = Session("s1", "/repo", "T", 1)
-      val image = client.previewFile("/repo", "a.png", session)!!
+      val image = client.previewFile("/repo", "assets/a.png", Session("s1", "/repo", "T", 1))!!
       assertEquals("image/png", image.mime)
       assertArrayEquals("hello".toByteArray(), image.bytes)
-      val pdf = client.previewFile("/repo", "a.docx", session)!!
+      server.takeRequest() // root
+      val request = server.takeRequest()
+      assertTrue(request.path!!.startsWith("/api/file?path="))
+      assertTrue(request.path!!.contains("%2Frepo%2Fassets%2Fa.png"))
+    }
+  }
+
+  /** `/api/file` 不可用时回落 `workspaceFiles/readBytes`，二进制字节窗口必须在 `options.range` 里。 */
+  @Test fun filePreviewFallsBackToReadBytesWithOptionsRange() = runBlocking {
+    MockWebServer().use { server ->
+      server.enqueue(rootOk())
+      server.enqueue(MockResponse().setResponseCode(404))
+      server.enqueue(binaryEnvelope("""{"absolutePath":"/repo/a.png","bytes":5,"offset":0,"data":null,"eof":true}""",
+        listOf("data"), "hello".toByteArray()))
+      val client = api(server)
+      val image = client.previewFile("/repo", "a.png", Session("s1", "/repo", "T", 1))!!
+      assertEquals("image/png", image.mime)
+      assertArrayEquals("hello".toByteArray(), image.bytes)
+      server.takeRequest() // root
+      server.takeRequest() // /api/file 未命中
+      val request = server.takeRequest()
+      assertEquals("/api/workspaceFiles/readBytes", request.path)
+      val args = JSONObject(request.body.readUtf8()).getJSONObject("payload").getJSONObject("args")
+      assertFalse("range 不能在顶层", args.has("range"))
+      assertEquals(0, args.getJSONObject("options").getJSONObject("range").getInt("offset"))
+      assertEquals(8 * 1024 * 1024, args.getJSONObject("options").getJSONObject("range").getInt("length"))
+    }
+  }
+
+  /** Office 预览的 PDF 也是附件传输：`value.data` 为 null，字节来自分片。 */
+  @Test fun officePreviewDecodesBinaryAttachment() = runBlocking {
+    MockWebServer().use { server ->
+      server.enqueue(rootOk())
+      server.enqueue(binaryEnvelope("""{"data":null}""", listOf("data"), "%PDF-".toByteArray()))
+      val pdf = api(server).previewFile("/repo", "a.docx", Session("s1", "/repo", "T", 1))!!
       assertEquals("application/pdf", pdf.mime)
       assertArrayEquals("%PDF-".toByteArray(), pdf.bytes)
       server.takeRequest() // root
-      assertEquals("/api/workspaceFiles/readBytes", server.takeRequest().path)
       assertEquals("/api/officeToPdf/render", server.takeRequest().path)
+    }
+  }
+
+  /** DSH 的 user/message 只存附件引用；图片必须经 `session/attachment` 换成 data URI 才可渲染。 */
+  @Test fun userMessageImageResolvesThroughSessionAttachment() = runBlocking {
+    MockWebServer().use { server ->
+      server.enqueue(rootOk())
+      server.enqueue(envelope("""{"attachment":{"attachmentId":"a1","mediaType":"image/png","bytes":2,"width":1,"height":1},"data":"aGk="}"""))
+      val record = JSONObject().put("type", "event").put("event", JSONObject().put("type", "user/message")
+        .put("seq", 1).put("time", 1000L)
+        .put("data", JSONObject("""{"id":"u1","source":{"kind":"user"},"content":[{"type":"text","text":"看图"},{"type":"image","attachment":{"attachmentId":"a1","mediaType":"image/png","name":"shot.png"}}]}""")))
+      val messages = api(server).recordsToMessages(Session("s1", "/repo", "T", 1), listOf(record))
+      val file = messages.single().parts.single { it.type == "file" }
+      assertEquals("data:image/png;base64,aGk=", file.path)
+      assertEquals("shot.png", file.title)
+      assertEquals("看图", messages.single().parts.first { it.type == "text" }.text)
+    }
+  }
+
+  /** 权限模式：目录读 `permissionPresets/catalog`，切换执行 `/permission <value>` 命令。 */
+  @Test fun permissionPresetsReadCatalogAndSwitchThroughPermissionCommand() = runBlocking {
+    MockWebServer().use { server ->
+      server.enqueue(rootOk())
+      server.enqueue(envelope("""{"options":[{"value":"auto","name":"自动"},{"value":"danger-full-access","name":"完全访问"}]}"""))
+      server.enqueue(envelope("""{"definitionId":"permission","result":{"kind":"ok"}}"""))
+      val client = api(server)
+      assertEquals(listOf("auto", "danger-full-access"), client.permissionPresets("/repo").map { it.value })
+      assertTrue(client.setPermission(Session("s1", "/repo", "T", 1), "auto"))
+      server.takeRequest() // root
+      assertEquals("/api/permissionPresets/catalog", server.takeRequest().path)
+      val switch = server.takeRequest()
+      assertEquals("/api/commands/execute", switch.path)
+      val args = JSONObject(switch.body.readUtf8()).getJSONObject("payload").getJSONObject("args")
+      assertEquals("s1", args.getString("agentId"))
+      assertEquals("/permission auto", args.getString("line"))
     }
   }
 
@@ -1506,16 +1598,22 @@ class DshApiTest {
     }
   }
 
-  @Test fun dataUriAttachmentsBecomeImageAndTextBlocks() = runBlocking {
+  @Test fun dataUriAttachmentsBecomeImageAndFileBlocks() = runBlocking {
     MockWebServer().use { server ->
       server.enqueue(rootOk())
+      server.enqueue(envelope("""{"receiptId":"r-1","file":{"attachmentId":"a-1","name":"note.md","bytes":7}}"""))
       server.enqueue(envelope("""{"accepted":true}"""))
       val png = byteArrayOf(1, 2, 3)
       val image = InlineFile("shot.png", "image/png", AttachmentPolicy.dataUri("image/png", png))
       val note = InlineFile("note.md", "text/markdown", AttachmentPolicy.dataUri("text/markdown", "# 标题".toByteArray()))
       api(server).send(Session("s1", "/repo", "T", 1), "看图", null, null,
         references = listOf(FileReference("src/A.kt")), inline = listOf(image, note))
-      server.takeRequest()
+      server.takeRequest() // root
+      val upload = server.takeRequest()
+      assertEquals("/api/fileUploads/upload", upload.path)
+      val uploadArgs = JSONObject(upload.body.readUtf8()).getJSONObject("payload").getJSONObject("args")
+      assertEquals("s1", uploadArgs.getString("agentId"))
+      assertEquals("note.md", uploadArgs.getJSONObject("request").getString("name"))
       val content = JSONObject(server.takeRequest().body.readUtf8()).getJSONObject("payload").getJSONObject("args")
         .getJSONObject("request").getJSONArray("content")
       assertEquals("看图\n@src/A.kt", content.getJSONObject(0).getString("text"))
@@ -1523,10 +1621,9 @@ class DshApiTest {
       assertEquals("image", imageBlock.getString("type"))
       assertEquals("image/png", imageBlock.getString("mediaType"))
       assertArrayEquals(png, java.util.Base64.getDecoder().decode(imageBlock.getString("data")))
-      val textBlock = content.getJSONObject(2)
-      assertEquals("text", textBlock.getString("type"))
-      assertTrue(textBlock.getString("text").contains("note.md"))
-      assertTrue(textBlock.getString("text").contains("# 标题"))
+      val fileBlock = content.getJSONObject(2)
+      assertEquals("file", fileBlock.getString("type"))
+      assertEquals("r-1", fileBlock.getString("receiptId"))
     }
   }
 
@@ -1803,12 +1900,15 @@ class DshApiTest {
   @Test fun officePreviewSendsRequiredPriorityAndByteOptions() = runBlocking {
     MockWebServer().use { server ->
       server.enqueue(rootOk())
+      // 直连优先走 `GET /api/file`；这台 mock 没有该路由，于是回落到 RPC（本测试要验的就是 RPC 形状）。
+      server.enqueue(MockResponse().setResponseCode(404))
       server.enqueue(envelope("""{"absolutePath":"/repo/a.png","bytes":5,"offset":0,"data":"aGVsbG8=","eof":true}"""))
       server.enqueue(envelope("""{"data":"JVBERi0="}"""))
       val client = api(server)
       client.previewFile("/repo", "a.png", Session("s1", "/repo", "T", 1))
       client.previewFile("/repo", "a.docx", Session("s1", "/repo", "T", 1))
       server.takeRequest() // root
+      server.takeRequest() // /api/file 未命中
       val (imagePath, imagePayload) = record(server)
       assertEquals("/api/workspaceFiles/readBytes", imagePath)
       // 读取窗口在第三个参数 `options.range` 里，不是顶层 `range`。

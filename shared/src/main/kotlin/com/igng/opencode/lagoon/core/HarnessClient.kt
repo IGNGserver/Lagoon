@@ -194,6 +194,21 @@ interface HarnessClient {
 
   suspend fun modelCatalog(directory: String): List<ModelInfo>
 
+  /**
+   * 可选的权限模式目录（DSH：`permissionPresets/catalog`）。空列表＝该 harness 没有这个概念，
+   * 界面不显示选择器。
+   */
+  suspend fun permissionPresets(directory: String): List<PermissionPresetChoice> = emptyList()
+
+  /** 切换一个会话的权限模式（DSH：执行 `/permission <value>`）；不支持的 harness 返回 false。 */
+  suspend fun setPermission(session: Session, value: String): Boolean = false
+
+  /** 服务端记录的置顶会话（DSH：`workspace/follow` 的 `pinnedSessionIds`）；null＝该 harness 没有。 */
+  suspend fun serverPinnedSessions(): Set<String>? = null
+
+  /** 把置顶同步到服务端（DSH：`workspace/pinSession` / `unpinSession`）；不支持返回 false。 */
+  suspend fun setSessionPinned(session: Session, pinned: Boolean): Boolean = false
+
   suspend fun sessionPermissions(session: Session): List<PermissionRequest>
 
   suspend fun pendingPermissions(directory: String): List<PermissionRequest>

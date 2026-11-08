@@ -81,7 +81,9 @@
   - `GET /api/changes.diff?sessionId=<id>&seq=<n>&index=<i>` → 单文件对比
     `{kind:"text", hunks:[{oldStart, oldLines, newStart, newLines, lines[]}], coarse}` 或
     `{kind:"binary"|"oversized"}`；
-  - `GET /api/file?path=<绝对路径>` → 会话媒体读取（图片预览等）。
+  - `GET /api/file?path=<绝对路径>` → 只读的文件字节（官方 chat UI 的图片预览就走这里）。
+    Lagoon 的图片/PDF 预览优先用它：一次 GET 直接拿字节 + `Content-Type`，比二进制 RPC 的
+    multipart 往返少一层解码；Remote 中继只代理 RPC，没有这条路由，那里仍回落 `readBytes`。
   摘要与对比只在该 Host 进程内、该会话存活期间可用；重启后旧轮次没有对比。
 
 ## 用到的命名空间（0.2.x 已核对）
@@ -92,7 +94,10 @@
 | `workspace` | `follow` / `create` / `rename` / `delete` / `archiveSession` / `unarchiveSession` / `pinSession` / `unpinSession` | 工作区（项目）与会话归档/置顶 |
 | `commands` | `list` / `execute` | 斜杠命令（含 `/compact`） |
 | `workspaceFiles` | `stat` / `read` / `readBytes` / `list` / `changes` | 工作区文件浏览（需 `workspaceFileScopeId`） |
-| `job` | `list` / `follow` / `kill` | 后台作业（后台 shell / 长任务） |
+| `job` | `list` / `follow` / `kill` | 后台作业（后台 shell / 长任务）；`kill` 入参 `{sessionId, jobId}` |
+| `session` | `attachment` | `{sessionId, attachmentId}` → `{attachment, data(base64)}`：历史图片/文件的字节 |
+| `fileUploads` | `upload` | `{agentId, request:{data(base64), name?}}` → `{receiptId, file}`，供 prompt 的 `file` 块引用 |
+| `permissionPresets` | `catalog` | 进程级权限目录；**切换没有独立 RPC**，执行 `/permission <preset>` 命令 |
 | `terminal` | — | 交互终端（未接入） |
 | `userQuestions` | 瀑布 + `userQuestions` 投影 | 结构化提问 |
 | `subagent` | — | 子代理（当前用列表行 `parentSessionId` 折算） |
@@ -120,6 +125,11 @@
 - `workspaceFiles/list`：`{workspaceFileScopeId, path}` → `{path, entries:[{name,type,size?}], truncated?}`。
 - `workspaceFiles/read`：`{workspaceFileScopeId, path, range:{offset?,limit?}}` → `{text,…}`；
   二进制以 `workspace-file/not-text` 失败。
+- `workspaceFiles/readBytes`：`{workspaceFileScopeId, path, options:{range:{offset?,length?}, baseFile?}}`。
+  **字节窗口在 `options.range` 里**，顶层 `range` 会被网关以 `gateway/arguments-invalid: missing "options"`
+  拒绝。响应是 `multipart/form-data`：`metadata` 分片是信封、`value.data` 为 `null`，真实字节在
+  `bytes-0` 分片，由顶层 `attachments:[{path:["data"], codec:"bytes", part:"bytes-0"}]` 声明。
+  Lagoon 在 `DshApi.decodeRpcResponse` 里把分片折回 `data` 的 base64，`officeToPdf/render` 同形。
 - `job/list`：`{request:{sessionId}}` 流，首帧 `{type:"rows", jobs:[JobView]}`。
 - `session/follow`：`{request:{address:{kind:"session",sessionId}, assistantStream:true, …}}`。
 
@@ -225,6 +235,19 @@
   `text` 块；都不经 `fileUploads`，也不写进服务器上的项目。
 - 删除会话 = 归档（DSH 没有删除），界面按能力隐藏「删除」、提供「分叉」；回退（revert）在 DSH 里没有对应语义，
   保持不支持；手动压缩走 `/compact` 命令。
+- 附件：图片在 prompt 里是 `{type:"image", mediaType, data}`（Host 会落成附件引用）；**非图片附件**
+  先走 `fileUploads/upload` 换 `receiptId`，再发 `{type:"file", receiptId}`——不再把正文拼进提示词，
+  也就不会因为大文件把上下文撑爆，二进制文件同样能发送（旧实例没有该方法时，文本附件才退回内联）。
+  历史消息里的 `{type:"image"|"file", attachment:{attachmentId}}` 由 `session/attachment` 换成
+  `data:` URI 再渲染；读不到只丢图片、不丢消息。
+- 后台任务：状态与输出走 `job/list` / `job/follow`，终止走一元 `job/kill`（作业归属从 `job/list` 行的
+  `owner` 反查）。旧实现落到空默认实现，界面删掉本地行、远端进程却还在跑。
+- 定时提问：`request.wait.timed === true` 的问答必须由客户端 `userQuestions/attachWait` 认领，否则
+  Host 到点按 `pending` 收掉，用户还在看卡片时模型已经拿到「没人回答」。认领流的结束即这次等待的结算。
+- 权限模式：当前值读 `permissions` 投影（`session/list` / `session/projections`），选项来自
+  `permissionPresets/catalog`，切换执行 `/permission <preset>` 命令——与官方 UI 同一条路径。
+- 置顶：服务端事实是 `workspace/follow` 的 `pinnedSessionIds`（含 `pinned` 增量帧），写入走
+  `workspace/pinSession` / `unpinSession`；本地存储只做离线镜像。
 - 改动列表取最近若干 `workspace/changes` 事件的摘要并按路径合并（最新轮次优先），
   逐文件对比来自 `/api/changes.diff`。
 

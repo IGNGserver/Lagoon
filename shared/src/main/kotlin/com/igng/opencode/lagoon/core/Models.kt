@@ -59,7 +59,12 @@ data class Session(val id: String, val directory: String, val title: String, val
    * 官方客户端只显示当前选中的那一行；Lagoon 有本地草稿页，所以服务端空白行全部隐藏。
    * OpenCode 没有这个状态，恒为 `false`。
    */
-  val blank: Boolean = false) {
+  val blank: Boolean = false,
+  /**
+   * 当前权限模式（DSH 投影 `permissions.currentValue`：预设 key、`auto` 或 `custom`）。
+   * 空串表示该 harness/该会话没有可选的权限目录。
+   */
+  val permission: String = "") {
   /** 排序口径与官方一致：优先 `time.updated`，缺失时退回 `time.created`。 */
   val activityAt: Long get() = updated.takeIf { it > 0 } ?: created
   /** Session ids are only unique within one OpenCode server. */
@@ -171,6 +176,9 @@ data class FileNode(val path: String, val type: String, val absolutePath: String
 data class FileContent(val type: String, val content: String)
 data class ModelChoice(val providerId: String, val modelId: String, val label: String, val variant: String? = null)
 data class AgentChoice(val name: String, val description: String)
+
+/** 一个可选的权限模式：`value` 是回传给服务端的稳定值，`name` 是显示名。 */
+data class PermissionPresetChoice(val value: String, val name: String, val description: String = "")
 data class CommandChoice(val name: String, val description: String)
 
 /**

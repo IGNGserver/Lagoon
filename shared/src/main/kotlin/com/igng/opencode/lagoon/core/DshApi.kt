@@ -174,6 +174,8 @@ class DshApi(
   @Volatile private var catalog: JSONObject? = null
   /** 已归档会话集合（`workspace/follow` 的 baseline 与 `archived` 增量维护）。 */
   private val archivedSessions = ConcurrentHashMap.newKeySet<String>()
+  /** 服务端置顶集合（`workspace/follow` 的 `pinnedSessionIds`，含 `pinned` 增量帧）。 */
+  private val serverPinned = ConcurrentHashMap.newKeySet<String>()
   /** `workspace/follow` 的最新工作区清单；null 表示尚未读取。 */
   @Volatile private var workspaceItems: List<JSONObject>? = null
   private val workspaceLock = Any()
@@ -193,6 +195,11 @@ class DshApi(
   }
   /** 每个会话的作业清单缓存：`job/list` 是每会话一条流，短 TTL 避免对账风暴。 */
   private val jobCache = ConcurrentHashMap<String, Pair<Long, List<JSONObject>>>()
+  /**
+   * `attachmentId` → `data:` URI。DSH 的 user/message 只存附件引用，图片字节要另走
+   * `session/attachment`；同一条消息在快照/实时/翻页里会重复出现，缓存避免重复拉取。
+   */
+  private val attachmentBlobs = ConcurrentHashMap<String, String>()
   /**
    * 一次性读取（当前只有 `job/list`）的并发闸门。首页会按最多 8 个目录并发读作业，
    * 每条 `job/list` 都是一条流；不限流会和 `$events`/`session/follow` 抢预算。
@@ -333,7 +340,9 @@ class DshApi(
       exchange(base.newBuilder().addQueryParameter("token", token).build(), browser = true)?.let { return@withContext it }
     } catch (error: ApiException) {
       if (hostHeader != null && error.status == 401) {
-        throw ApiException(401, "启动令牌已轮换，改用已保存的登录", AUTH_TOKEN_ROTATED)
+        // 远端进程换代：令牌必然轮换。调用方手里可能还有上一张长寿命 Cookie；没有就如实说明，
+        // 而不是让用户去「重新配对」（SSH 模式的凭据是自动管理的）。
+        throw ApiException(401, "远端 dsh web 已重启，正在重新获取启动令牌", AUTH_TOKEN_ROTATED)
       }
       throw error
     }
@@ -470,8 +479,10 @@ class DshApi(
         .header("Cookie", current)
         .post(envelope.toString().toRequestBody(JSON_MEDIA_TYPE))
         .build()
-      val (status, text) = try {
-        runHttpCall(request) { response -> response.code to response.use { it.body?.string().orEmpty() } }
+      val (status, contentType, body) = try {
+        runHttpCall(request) { response ->
+          response.use { Triple(it.code, it.header("Content-Type"), it.body?.bytes() ?: ByteArray(0)) }
+        }
       } catch (error: ApiException) {
         throw error
       } catch (error: IOException) {
@@ -484,9 +495,7 @@ class DshApi(
       }
       if (status == 401) throw ApiException(401, repairMessage(), AUTH_EXPIRED)
       if (status !in 200..299) throw ApiException(status, httpMessage(status), "http/$status")
-      val parsed = try { JSONObject(text) } catch (error: Exception) {
-        throw ApiException(status, "服务器响应不是 JSON，请确认地址指向 DeepSeek Harness 的 Web 实例")
-      }
+      val parsed = decodeRpcResponse(status, contentType, body)
       val result = parsed.optJSONObject("result") ?: throw ApiException(status, "服务器响应缺少 result")
       if (result.optBoolean("ok")) return@withContext result.opt("value")
       val failure = result.optJSONObject("error")
@@ -494,6 +503,65 @@ class DshApi(
       val message = failure?.optString("message").orEmpty()
       throw ApiException(status, friendlyMessage(code, message.ifBlank { "请求失败" }), code.ifBlank { null })
     }
+
+  /**
+   * 一元调用的响应体有两种形状：普通 JSON，以及二进制方法的 `multipart/form-data`。
+   *
+   * `workspaceFiles/readBytes`、`officeToPdf/render` 这类声明了 `codec:"bytes"` 的方法把字节放在
+   * 独立分片里，信封本身在 `metadata` 分片的 `{"type":"server-response",…,"attachments":[…]}`，
+   * `value` 里对应字段是 `null`。这里把分片字节按 `attachments[{path,part}]` 声明的路径折回
+   * base64 字符串，调用方（和远程中继）仍然只看到 JSON。
+   */
+  private fun decodeRpcResponse(status: Int, contentType: String?, body: ByteArray): JSONObject {
+    if (contentType?.trim()?.startsWith("multipart/", ignoreCase = true) == true) {
+      return decodeMultipartEnvelope(contentType, body)
+        ?: throw ApiException(status, "服务器返回了无法解析的二进制响应，请更新 Lagoon 或 dsh")
+    }
+    val text = body.toString(Charsets.UTF_8)
+    return try { JSONObject(text) } catch (error: Exception) {
+      throw ApiException(status, "服务器响应不是 JSON，请确认地址指向 DeepSeek Harness 的 Web 实例")
+    }
+  }
+
+  /**
+   * `multipart/form-data` 信封解码。用 ISO-8859-1 做逐字节映射再切分，二进制分片不会被字符集转换破坏。
+   */
+  private fun decodeMultipartEnvelope(contentType: String, body: ByteArray): JSONObject? {
+    val boundary = Regex("boundary=\"?([^\";]+)\"?").find(contentType)?.groupValues?.get(1)?.trim()
+      ?.takeIf(String::isNotEmpty) ?: return null
+    val raw = body.toString(Charsets.ISO_8859_1)
+    val parts = LinkedHashMap<String, String>()
+    for (chunk in raw.split("--$boundary").drop(1)) {
+      if (chunk.startsWith("--")) break // 结束分界
+      val headerEnd = chunk.indexOf("\r\n\r\n")
+      val headers = if (headerEnd < 0) chunk else chunk.substring(0, headerEnd)
+      val content = if (headerEnd < 0) "" else chunk.substring(headerEnd + 4).removeSuffix("\r\n")
+      val name = Regex("name=\"([^\"]*)\"").find(headers)?.groupValues?.get(1) ?: continue
+      parts[name] = content
+    }
+    val envelope = parts["metadata"]?.let { runCatching { JSONObject(it) }.getOrNull() } ?: return null
+    val attachments = envelope.optJSONArray("attachments") ?: return envelope
+    for (index in 0 until attachments.length()) {
+      val attachment = attachments.optJSONObject(index) ?: continue
+      if (!attachment.optString("codec").equals("bytes", ignoreCase = true)) continue
+      val content = parts[attachment.optString("part")] ?: continue
+      val path = attachment.optJSONArray("path") ?: continue
+      val segments = (0 until path.length()).mapNotNull { path.opt(it) as? String }.filter(String::isNotEmpty)
+      if (segments.isEmpty()) continue
+      putAttachmentBytes(envelope, segments, java.util.Base64.getEncoder().encodeToString(content.toByteArray(Charsets.ISO_8859_1)))
+    }
+    return envelope
+  }
+
+  /** 把分片字节写回 `result.value` 上的声明路径；路径首层不是对象时保持原样（不猜形状）。 */
+  private fun putAttachmentBytes(envelope: JSONObject, segments: List<String>, base64: String) {
+    val root = envelope.optJSONObject("result")?.optJSONObject("value") ?: return
+    var node = root
+    for (segment in segments.dropLast(1)) {
+      node = node.optJSONObject(segment) ?: JSONObject().also { node.put(segment, it) }
+    }
+    node.put(segments.last(), base64)
+  }
 
   /** 已知的 DSH 错误码折算成用户可读文案；未知错误保留服务端原文（便于诊断协议漂移）。 */
   private fun friendlyMessage(code: String, upstream: String): String = when (code) {
@@ -540,6 +608,49 @@ class DshApi(
   }
 
   // ---------------------------------------------------------------- 会话读
+
+  /**
+   * 认证栅栏内的只读文件路由 `GET /api/file?path=<绝对路径>`（官方 Web 预览图片/PDF 用的同一条）。
+   * 成功返回字节与 Content-Type；404/403 表示该路径不可读，返回 null 让调用方回落。
+   */
+  private suspend fun fetchMedia(path: String, maxBytes: Int): FilePreview? = withContext(Dispatchers.IO) {
+    if (remoteBackend != null) return@withContext null
+    val url = base.newBuilder()
+      .addEncodedPathSegment("api")
+      .addEncodedPathSegment("file")
+      .addQueryParameter("path", path)
+      .build()
+    val request = Request.Builder().url(url).header("Cookie", cookie()).get().build()
+    try {
+      runHttpCall(request) { response ->
+        response.use {
+          when {
+            it.code == 413 -> throw ApiException(413, "文件超过预览上限")
+            it.code !in 200..299 -> null
+            else -> {
+              val bytes = it.body?.bytes() ?: return@use null
+              if (bytes.size > maxBytes) throw ApiException(413, "文件超过预览上限")
+              val mime = it.header("Content-Type")?.substringBefore(';')?.trim()?.takeIf(String::isNotBlank)
+              FilePreview(mime ?: "application/octet-stream", bytes)
+            }
+          }
+        }
+      }
+    } catch (error: ApiException) {
+      throw error
+    } catch (error: IOException) {
+      null
+    }
+  }
+
+  /** 工作区相对路径 → `/api/file` 需要的绝对路径；目录未知时返回 null。 */
+  private fun absoluteWorkspacePath(directory: String, path: String): String? {
+    val trimmed = path.trim()
+    if (trimmed.isEmpty()) return null
+    if (trimmed.startsWith("/")) return trimmed
+    val root = normalizedDirectory(directory).ifBlank { return null }
+    return "$root/${trimmed.trimStart('/')}"
+  }
 
   /** `session/list` 的形状：`{items:[{sessionId,updatedAt,running,cwd,parentSessionId,projections,…}]}`。 */
   private data class Listing(val items: List<JSONObject>) {
@@ -603,6 +714,7 @@ class DshApi(
       projectId = directory.ifBlank { null },
       created = previous?.created ?: updated,
       archived = id in archivedSessions || previous?.archived == true,
+      permission = values.obj("permissions").str("currentValue").ifBlank { previous?.permission.orEmpty() },
       agent = values.str("agentPreset").ifBlank { previous?.agent }?.takeIf(String::isNotBlank),
       model = previous?.model,
       viewed = previous?.viewed ?: 0,
@@ -682,6 +794,13 @@ class DshApi(
           workspaceItems = value.arr("items").objects()
           archivedSessions.clear()
           archivedSessions += value.arr("archivedSessionIds").strings()
+          serverPinned.clear()
+          serverPinned += value.arr("pinnedSessionIds").strings()
+        }
+        // 置顶是独立的一帧（锚点与 `archived` 同形）：整值替换，不做增量猜测。
+        "pinned" -> {
+          serverPinned.clear()
+          serverPinned += frame.arr("pinnedSessionIds").strings()
         }
         // `replace` 是"整份过滤后的状态"：主机在某个工作区不再对当前 peer 可见时发它，
         // 而不是发 `remove`（客户端不会复活被删的工作区）。按基线处理，否则列表会留下主机
@@ -996,7 +1115,7 @@ class DshApi(
    * 把一条 DSH 会话事件翻译成 Lagoon 认识的事件；一次输入可能产出多条（例如 `assistant/message`
    * 里的多个内容块）。不认识的记录（内部事件、log-only 标记）返回空列表。
    */
-  internal fun translate(session: Session, event: JSONObject): List<ServerEvent> {
+  internal suspend fun translate(session: Session, event: JSONObject): List<ServerEvent> {
     val type = event.str("type")
     val seq = event.optDouble("seq", 0.0).toLong()
     val time = event.optDouble("time", 0.0).toLong()
@@ -1022,12 +1141,14 @@ class DshApi(
         .put("assistantMessageID", messageId(data))
         .put("finish", "stop"))
       "user/message" -> {
-        val projected = dshInputMessage(session.id, seq, time, turn, data) ?: return emptyList()
+        // 图片/文件在日志里只有附件引用，先把字节换成 data URI 再投影，否则时间线只剩空气泡。
+        val enriched = withAttachmentBlobs(session.id, data)
+        val projected = dshInputMessage(session.id, seq, time, turn, enriched) ?: return emptyList()
         // Keep one source-aware event shape for all DSH inputs; the shared reducer uses the
         // projected role/source and never falls back from a rejected source to p.text.
         val name = if (projected.isHumanInput) "session.user.message" else "session.dsh.input"
         emit(name, base.put("messageID", data.str("id").ifBlank { "user:${session.id}:$seq" })
-          .put("text", data.arr("content").contentText()).put("input", data))
+          .put("text", data.arr("content").contentText()).put("input", enriched))
       }
       "assistant/message" -> {
         val assistantId = messageId(data)
@@ -1270,6 +1391,52 @@ class DshApi(
 
   private fun parseArguments(raw: String): Any =
     if (raw.isBlank()) JSONObject() else runCatching { JSONObject(raw) }.getOrElse { raw }
+
+  /**
+   * 把 `user/message` 里的图片/文件附件换成可渲染的 `data:` URI（`_blobs`）。
+   *
+   * DSH 的 prompt 内容只保留附件引用（`{type:"image", attachment:{attachmentId}}`），字节要用
+   * `session/attachment` 换回来——这是官方 Web 渲染历史图片的同一条接口。读不到（旧实例没有该
+   * 方法、或附件已被清理）时保留引用、放弃字节，绝不让时间线因为一张图片失败。
+   */
+  private suspend fun withAttachmentBlobs(sessionId: String, data: JSONObject): JSONObject {
+    val blocks = data.arr("content").objects().filter { it.str("type") == "image" || it.str("type") == "file" }
+    if (blocks.isEmpty()) return data
+    val blobs = JSONObject()
+    var budget = ATTACHMENT_BUDGET_BYTES
+    for (block in blocks) {
+      val attachment = block.obj("attachment")
+      val attachmentId = attachment.str("attachmentId")
+      if (attachmentId.isBlank()) continue
+      val cached = attachmentBlobs[attachmentId]
+      if (cached != null) {
+        blobs.put(attachmentId, cached)
+        continue
+      }
+      if (budget <= 0) continue
+      val loaded = readAttachment(sessionId, attachmentId, attachment.str("mediaType")) ?: continue
+      budget -= loaded.length
+      if (attachmentBlobs.size >= ATTACHMENT_CACHE_LIMIT) attachmentBlobs.clear()
+      attachmentBlobs[attachmentId] = loaded
+      blobs.put(attachmentId, loaded)
+    }
+    if (blobs.length() == 0) return data
+    return JSONObject(data.toString()).put("_blobs", blobs)
+  }
+
+  /** `session/attachment` → `data:<mediaType>;base64,…`；失败返回 null（只丢图片，不丢消息）。 */
+  private suspend fun readAttachment(sessionId: String, attachmentId: String, mediaType: String): String? = try {
+    val value = callObject("session/attachment", requestArgs(JSONObject()
+      .put("sessionId", sessionId).put("attachmentId", attachmentId)))
+    value.optString("data").takeIf(String::isNotBlank)?.let { encoded ->
+      "data:${mediaType.ifBlank { "application/octet-stream" }};base64,$encoded"
+    }
+  } catch (cancel: CancellationException) {
+    throw cancel
+  } catch (error: Exception) {
+    Diagnostics.warn("DshApi", "附件读取失败", error)
+    null
+  }
 
   // ---------------------------------------------------------------- 事件流
 
@@ -2162,7 +2329,7 @@ class DshApi(
    * 注入类 turn root（goal / goal complete / compaction checkpoint）折成一行 notice，既不展示
    * 模型侧原文，也不丢失轮次起点。
    */
-  internal fun recordsToMessages(session: Session, records: List<JSONObject>): List<Message> {
+  internal suspend fun recordsToMessages(session: Session, records: List<JSONObject>): List<Message> {
     data class ToolEntry(val id: String, val name: String, val input: JSONObject, var state: JSONObject?)
     data class Step(val turn: Long, val step: Long, var started: Long, var order: Int,
       val blocks: MutableList<JSONObject>, val tools: MutableMap<String, ToolEntry>, var ended: Long)
@@ -2197,7 +2364,8 @@ class DshApi(
         // DSH also writes model-facing context (runtime / time snapshots) as user messages; only the
         // user's own prompts (`source.kind` = user, or no source on older hosts) are timeline rows.
         "user/message" -> {
-          dshInputMessage(session.id, seq, time, currentTurn, data)?.let { inputs += Triple(time, order, it) }
+          val enriched = withAttachmentBlobs(session.id, data)
+          dshInputMessage(session.id, seq, time, currentTurn, enriched)?.let { inputs += Triple(time, order, it) }
         }
 
         "assistant/message" -> {
@@ -2428,6 +2596,14 @@ class DshApi(
     val window = if (remoteBackend != null) minOf(budget, REMOTE_READ_WINDOW) else budget
     val office = ext in setOf("doc", "docx", "xls", "xlsx", "ppt", "pptx")
     if (imageMime == null && ext != "pdf" && !office) return@withContext null
+    // 图片与 PDF 走官方 Web 自己的只读路由 `GET /api/file?path=<绝对路径>`：一次 GET 直接拿到字节和
+    // Content-Type，不必把二进制 RPC 的 multipart 信封往返一次。Remote 中继只代理 RPC，没有这条
+    // HTTP 路由，所以只在直连/SSH 隧道下使用；失败仍回落到 RPC。
+    if (!office && remoteBackend == null) {
+      absoluteWorkspacePath(directory, path)?.let { absolute ->
+        fetchMedia(absolute, budget)?.let { return@withContext it }
+      }
+    }
     val scope = fileScope(directory, session)
     val value = try {
       if (office) callObject("officeToPdf/render", envelope(argsOf(
@@ -2641,6 +2817,36 @@ class DshApi(
     jobs.values.toList()
   }
 
+  /**
+   * 终止一个后台作业：一元 `job/kill {sessionId, jobId}`（`job/list` 行里带 `owner`）。
+   *
+   * 旧实现落到 HarnessClient 的空默认实现上，界面把任务从列表里删掉、远端进程却还在跑。
+   * 这里找不到所属会话就直接报错，绝不假装成功。
+   */
+  override suspend fun removeShell(id: String, directory: String): Unit = withContext(Dispatchers.IO) {
+    val sessionId = jobOwner(id, directory) ?: throw ApiException(404, "找不到该后台任务所属的会话，无法终止")
+    call("job/kill", requestArgs(JSONObject().put("sessionId", sessionId).put("jobId", id)))
+    // 清掉缓存，下一次对账读到的是 Host 的真实状态，而不是我们本地删掉的那一行。
+    jobCache.remove(sessionId)
+  }
+
+  /** 先从缓存里找作业归属，再按目录扫描一次；都找不到说明作业已经结算并移出登记表。 */
+  private suspend fun jobOwner(jobId: String, directory: String): String? {
+    for ((sessionId, entry) in jobCache) {
+      if (entry.second.any { it.str("id") == jobId }) return sessionId
+    }
+    val normalized = normalizedDirectory(directory)
+    val sessions = listing().items.mapNotNull(::itemToSession)
+      .filter { normalizedDirectory(it.directory) == normalized }.sortedByDescending { it.updated }
+    for (session in sessions.take(SHELL_OWNER_SCAN_SESSIONS)) {
+      val jobs = try { runningJobs(session) } catch (cancel: CancellationException) { throw cancel } catch (_: Exception) {
+        continue
+      }
+      if (jobs.any { it.str("id") == jobId }) return session.id
+    }
+    return null
+  }
+
   /** `job/list` 是每会话一条流；短 TTL 缓存把同一轮对账里的重复读取收敛掉。 */
   private suspend fun runningJobs(session: Session): List<JSONObject> {
     jobCache[session.id]?.takeIf { clock() - it.first < JOB_CACHE_MILLIS }?.let { return it.second }
@@ -2808,9 +3014,26 @@ class DshApi(
     }.trim()
     if (body.isNotBlank()) content.put(JSONObject().put("type", "text").put("text", body))
     for (file in inline) {
-      if (remote != null && AttachmentPolicy.kind(file.mime.substringBefore(';').trim().lowercase(), file.name) != AttachmentPolicy.Kind.IMAGE) continue
-      val payload = inlineContent(file) ?: continue
-      content.put(payload)
+      val mime = file.mime.substringBefore(';').trim().lowercase()
+      val kind = AttachmentPolicy.kind(mime, file.name)
+      if (kind == AttachmentPolicy.Kind.IMAGE) {
+        inlineContent(file)?.let { content.put(it) }
+        continue
+      }
+      // Remote 中继没有附件回执路由：上面已经折算成 `@路径` 文本。
+      if (remote != null) continue
+      val bytes = readInlineBytes(file) ?: throw ApiException(400, "附件无法读取：${file.name}")
+      // 非图片附件走 `fileUploads/upload` 换 receipt，再以 `{type:"file", receiptId}` 发送：
+      // 这样 Host 保留文件本身（字节、文件名、可读路径），而不是把正文拼进模型上下文。
+      val receipt = try {
+        uploadFileAttachment(session.id, bytes, file.name)
+      } catch (error: ApiException) {
+        // 旧实例/未装附件插件时才退回「文本内联」，二进制文件仍然明确失败。
+        if (kind != AttachmentPolicy.Kind.TEXT || !(error.code.orEmpty().startsWith("gateway/") || error.status == 404)) throw error
+        inlineContent(file)?.let { content.put(it) }
+        continue
+      }
+      content.put(JSONObject().put("type", "file").put("receiptId", receipt))
     }
     if (content.length() == 0) throw ApiException(400, "消息内容为空：附件无法读取或格式不受支持")
     val request = JSONObject()
@@ -2825,9 +3048,19 @@ class DshApi(
     known[session.id] = (known[session.id] ?: session).copy(blank = false)
   }
 
+  /** `fileUploads/upload`：附件字节（base64）换成 Host 的 receipt，供 `session/prompt` 的 file 块引用。 */
+  private suspend fun uploadFileAttachment(agentId: String, bytes: ByteArray, name: String): String {
+    val request = JSONObject().put("data", java.util.Base64.getEncoder().encodeToString(bytes))
+    if (name.isNotBlank()) request.put("name", name)
+    val value = call("fileUploads/upload", envelope(argsOf("agentId" to agentId, "request" to request))) as? JSONObject
+      ?: throw ApiException(502, "服务器没有返回附件回执")
+    return value.optString("receiptId").takeIf(String::isNotBlank)
+      ?: throw ApiException(502, "服务器没有返回附件回执")
+  }
+
   /**
-   * 手机附件（[InlineFile.uri] 是 `data:` URI）折算成 DSH 内容块：图片走多模态 `image` 块，
-   * 文本文件内联成带文件名的 `text` 块（不经 `fileUploads`，也不会写进服务器上的项目）。
+   * 手机附件（[InlineFile.uri] 是 `data:` URI）折算成 DSH 内容块。图片走多模态 `image` 块；
+   * 其余文件由 [uploadFileAttachment] 换成 `file` 块的回执，不再把正文拼进提示词。
    */
   private fun inlineContent(file: InlineFile): JSONObject? {
     val bytes = try { readInlineBytes(file) } catch (error: Exception) {
@@ -2984,6 +3217,45 @@ class DshApi(
       }
     }
     models
+  }
+
+  /**
+   * `permissionPresets/catalog`：进程级权限目录（`{options:[{value,name,description?}]}`）。
+   * 旧实例没有这个方法时当作「无可选权限」，而不是把设置页弄成错误。
+   */
+  override suspend fun permissionPresets(directory: String): List<PermissionPresetChoice> = withContext(Dispatchers.IO) {
+    val value = try {
+      callObject("permissionPresets/catalog")
+    } catch (cancel: CancellationException) {
+      throw cancel
+    } catch (error: ApiException) {
+      if (error.code.orEmpty().startsWith("gateway/") || error.status == 404) return@withContext emptyList()
+      throw error
+    }
+    value.arr("options").objects().mapNotNull { option ->
+      val id = option.str("value").ifBlank { return@mapNotNull null }
+      PermissionPresetChoice(id, option.str("name").ifBlank { id }, option.str("description"))
+    }
+  }
+
+  /**
+   * 切换权限模式。DSH 没有专用的 RPC：官方 UI 同样执行 `/permission <preset>` 命令，
+   * 选项来自 [permissionPresets]；结果写回 `permissions` 投影，这里同步本地缓存。
+   */
+  override suspend fun setPermission(session: Session, value: String): Boolean {
+    if (value.isBlank()) return false
+    executeCommand(session, "/permission $value")
+    known[session.id] = (known[session.id] ?: session).copy(permission = value)
+    return true
+  }
+
+  override suspend fun serverPinnedSessions(): Set<String> = serverPinned.toSet()
+
+  /** 置顶同步：断言式写服务端事实，本地集合跟着更新（`workspace/follow` 之后会再对一次）。 */
+  override suspend fun setSessionPinned(session: Session, pinned: Boolean): Boolean {
+    call(if (pinned) "workspace/pinSession" else "workspace/unpinSession", requestArgs(JSONObject().put("sessionId", session.id)))
+    if (pinned) serverPinned += session.id else serverPinned -= session.id
+    return true
   }
 
   override suspend fun sessionPermissions(session: Session): List<PermissionRequest> =
@@ -3272,8 +3544,15 @@ class DshApi(
     const val MAX_CHANGE_TURNS = 8
     const val MAX_CHANGED_FILES = 60
 
+    /** 一条消息里最多回填多少附件字节（base64 后的长度）；超出的只在时间线里显示文件名。 */
+    const val ATTACHMENT_BUDGET_BYTES = 12 * 1024 * 1024
+    /** 附件 data URI 的在内存缓存条数上限。 */
+    const val ATTACHMENT_CACHE_LIMIT = 64
+
     /** 作业清单缓存的有效期：把同一轮对账里的重复读取收敛掉。 */
     const val JOB_CACHE_MILLIS = 20_000L
+    /** 终止作业时按目录回溯会话的上限：作业归属只可能落在最近活跃的这批会话里。 */
+    const val SHELL_OWNER_SCAN_SESSIONS = 8
     val ACTIVE_JOB_STATUSES = setOf("running", "stopping")
 
     val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
