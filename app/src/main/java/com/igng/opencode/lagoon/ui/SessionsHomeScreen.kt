@@ -30,6 +30,7 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.igng.opencode.lagoon.core.*
 import kotlinx.coroutines.launch
 import top.yukonga.miuix.kmp.basic.*
@@ -663,6 +664,58 @@ private fun BackgroundMarker() {
   val muted = HyperTheme.colors.textSecondary
   Box(Modifier.size(8.dp).clip(CircleShape).background(muted.copy(alpha = 0.42f))) {
     Box(Modifier.fillMaxSize().padding(2.dp).clip(CircleShape).background(HyperTheme.colors.cardElevated))
+  }
+}
+
+/**
+ * 权限模式选择（DSH 的 `permissionPresets/catalog` + `/permission` 命令）。
+ * 只在该实例/会话真的带 `permissions` 投影时入口才可见，避免给没有权限目录的 harness 画空面板。
+ */
+@Composable
+internal fun PermissionDialog(state: LagoonState, controller: LagoonController, session: Session, onDismiss: () -> Unit) {
+  var options by remember(session.id) { mutableStateOf<List<PermissionPresetChoice>?>(null) }
+  val pending = state.pending("permission")
+  LaunchedEffect(session.id) { controller.loadPermissionPresets(session.directory) { options = it } }
+  SuperDialog(title = "权限模式", show = true, onDismissRequest = { if (!pending) onDismiss() }) {
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+      val current = session.permission
+      val list = options
+      if (list == null) {
+        Text("正在读取可选的权限模式…")
+      } else if (list.isEmpty()) {
+        Text("该实例没有提供可选的权限目录")
+      } else {
+        list.forEach { option ->
+          Row(
+            modifier = Modifier.fillMaxWidth()
+              .clickable(enabled = !pending) {
+                controller.setPermission(option.value, session.id) { onDismiss() }
+              }
+              .padding(horizontal = 4.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically
+          ) {
+            if (option.value == current) {
+              Icon(MiuixIcons.Ok, contentDescription = null, tint = MiuixTheme.colorScheme.primary, modifier = Modifier.size(18.dp))
+              Spacer(Modifier.width(8.dp))
+            } else {
+              Spacer(Modifier.width(26.dp))
+            }
+            Column(Modifier.weight(1f)) {
+              Text(option.name, fontWeight = if (option.value == current) FontWeight.SemiBold else FontWeight.Normal)
+              if (option.description.isNotBlank()) {
+                Text(option.description, color = MiuixTheme.colorScheme.onSurfaceVariantActions, fontSize = 12.sp)
+              }
+            }
+          }
+        }
+      }
+      state.resource("action:permission").takeIf { it.state == ResourceState.ERROR }?.error?.let {
+        HyperInlineNotice(message = it, type = MiuixToastType.ERROR)
+      }
+      Row(Modifier.fillMaxWidth().padding(top = 16.dp)) {
+        HyperButton(text = "关闭", variant = HyperButtonVariant.SECONDARY, onClick = onDismiss, modifier = Modifier.fillMaxWidth())
+      }
+    }
   }
 }
 

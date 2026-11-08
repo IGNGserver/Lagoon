@@ -64,6 +64,11 @@ SSH 连接
 - 启动命令经 `sh -c` 执行：包装 shell 把命令行放进后台，把这个后台 pid 写入 `web.pid`，然后 `wait` 陪着它，避免 shell 退出时把 dsh 收掉。输出写入 `web.log`。命令按 POSIX 单引号转义，换行会被拒绝。`nohup` 包在外层。
 - 优先复用本 App 自己启动的实例；PID 不属于当前实例时清理 pid 并重新启动。
 - 探测到别的 `dsh web` 已经在跑时直接失败，不再启动第二个实例去抢同一个 profile。
+  探测只认**当前用户**（`pgrep -u "$(id -u)" -f '[d]sh web'`）：共享主机/跳板机上别人的 `dsh web`
+  不该让这台设备的连接失败。
+- 启动链接必须解析出 `http://127.0.0.1:<端口>`。如果远端 profile 配了 `publicUrl`（打印出来的不是
+  loopback 地址），启动会以「远端 dsh web 没有监听 loopback 地址」失败并给出这行日志：SSH 隧道只能
+  接 loopback，需要在远端去掉 `--public-url` / `publicUrl` 配置。
 - 找不到 `dsh` 时搜索 npm/nvm/volta/bun/pnpm/Homebrew 常见路径；仍找不到则提示
   `npm i -g @deepseek-ai/dsh`。
 - 日志中的 `token=…` 在错误详情里统一替换为 `token=•••`。

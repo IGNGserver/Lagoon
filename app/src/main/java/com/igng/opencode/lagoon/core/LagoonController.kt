@@ -2581,9 +2581,18 @@ class LagoonController private constructor(private val appContext: Context) {
   }
   fun togglePin(sessionId: String) {
     val current = state.value; val server = current.serverId ?: return
-    val pinned = if (sessionId in current.pinned) current.pinned - sessionId else current.pinned + sessionId
+    val pinning = sessionId !in current.pinned
+    val pinned = if (pinning) current.pinned + sessionId else current.pinned - sessionId
     store.rememberPinnedSessions(server, pinned)
     updateState { it.copy(pinned = pinned) }
+    // DSH 的置顶是服务端事实（`workspace/pinSession`）：本地立即生效，再同步给电脑端，
+    // 否则手机上的置顶在 DSH Web 里看不到、桌面上的置顶手机也读不到。
+    val session = current.sessions.firstOrNull { it.id == sessionId } ?: return
+    scope.launch {
+      val client = api ?: return@launch
+      runCatching { client.setSessionPinned(session, pinning) }
+        .onFailure { Diagnostics.warn("Pin", "同步置顶到服务器失败", it) }
+    }
   }
 
   /**
@@ -4039,6 +4048,33 @@ class LagoonController private constructor(private val appContext: Context) {
     op.commitConnection { it.copy(sessions = it.sessions.map { item -> if (item.id == session.id) item.copy(title = title.trim()) else item }) }
     if (op.isCurrent(this)) onRenamed?.invoke()
   }
+  /** 切换会话权限模式；DSH 用 `/permission` 命令实现，其余 harness 不支持时直接报错。 */
+  fun setPermission(value: String, target: String? = null, onDone: (() -> Unit)? = null) =
+    withSession("permission", target) { op, client, session ->
+      check(value.isNotBlank()) { "权限模式不能为空" }
+      if (!client.setPermission(session, value)) throw ApiException(501, "该连接不支持切换权限模式")
+      op.commitConnection { it.copy(sessions = it.sessions.map { item -> if (item.id == session.id) item.copy(permission = value) else item }) }
+      if (op.isCurrent(this)) onDone?.invoke()
+    }
+
+  /** 读取该实例可选的权限目录；失败按空列表处理（只影响这一个选择器，不影响会话）。 */
+  fun loadPermissionPresets(directory: String, onReady: (List<PermissionPresetChoice>) -> Unit) = scope.launch {
+    val client = api
+    if (client == null) {
+      onReady(emptyList())
+      return@launch
+    }
+    val options = try {
+      client.permissionPresets(directory)
+    } catch (cancel: CancellationException) {
+      throw cancel
+    } catch (error: Exception) {
+      Diagnostics.warn("Permission", "读取权限目录失败", error)
+      emptyList()
+    }
+    onReady(options)
+  }
+
   fun deleteSession(target: String? = null, onDeleted: (() -> Unit)? = null) = withSession("delete", target) { op, client, session ->
     client.deleteSession(session)
     cache.deleteMessages(op.serverId, session.id)

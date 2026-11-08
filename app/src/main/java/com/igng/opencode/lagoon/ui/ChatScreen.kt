@@ -82,6 +82,7 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
   var sheet by remember { mutableStateOf<ChatSheet?>(null) }
   var menu by remember { mutableStateOf(false) }
   var rename by rememberSaveable { mutableStateOf(false) }
+  var permission by rememberSaveable { mutableStateOf(false) }
   var delete by rememberSaveable { mutableStateOf(false) }
   var composerModal by remember { mutableStateOf(false) }
   var requestModal by remember { mutableStateOf(false) }
@@ -134,6 +135,8 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
       add(MenuAction(if (session.id in state.pinned) "取消置顶" else "置顶", if (session.id in state.pinned) MiuixIcons.Unpin else MiuixIcons.Pin) { controller.togglePin(session.id) })
       if (state.capabilities.supports(SessionAction.RENAME)) add(MenuAction("重命名", MiuixIcons.Rename) { rename = true })
       if (state.capabilities.fork) add(MenuAction("分叉", MiuixIcons.Copy) { controller.fork() })
+      // 只有服务端真的带权限投影时才显示入口（OpenCode 没有这个语义）。
+      if (session.permission.isNotBlank()) add(MenuAction("权限模式", MiuixIcons.Settings) { permission = true })
       state.capabilities.archive?.let { archive ->
         if (!session.archived) add(MenuAction("归档", ARCHIVE_ICON) { controller.setArchived(session.id, true, onBack) })
         else if (archive.restorable) add(MenuAction("取消归档", UNARCHIVE_ICON) { controller.setArchived(session.id, false) })
@@ -287,6 +290,7 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
     }
   }
   if (rename) RenameSessionDialog(state, controller, session) { rename = false }
+  if (permission) PermissionDialog(state, controller, session) { permission = false }
   if (delete) SuperDialog(title = "删除此会话？", show = true, onDismissRequest = { if (!state.pending("delete")) delete = false }) {
     Column { Text("会话消息将从服务器永久删除。\n${state.title(session)}"); ActionError(state, "delete")
       DialogActions("取消", { delete = false }, if (state.pending("delete")) "删除中…" else "永久删除", !state.pending("delete"), danger = true) { controller.deleteSession { delete = false; onBack() } }

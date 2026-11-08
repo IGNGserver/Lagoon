@@ -144,7 +144,8 @@ class SshHostTest {
     assertTrue(script.contains("LAUNCH=${SshShell.quote("dsh web --foo 'a b' --host 127.0.0.1 --port 0 --no-open")}"))
     assertTrue(script.contains("eval \"\$1\" >>\"\$D/web.log\" 2>&1 & echo \$! >\"\$D/web.pid\"; wait"))
     assertTrue(script.contains("cd '/nope' || { printf 'LAGOON nocwd"))
-    assertTrue(probe.contains("pgrep -f '[d]sh web'"))
+    // 只匹配当前用户的进程：共享主机上别人的 dsh web 不该让本设备连接失败。
+    assertTrue(probe.contains("pgrep -u \"\$(id -u)\" -f '[d]sh web'"))
   }
 
   @Test fun bootstrapReportsMissingDsh() {
