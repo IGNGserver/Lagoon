@@ -1748,6 +1748,7 @@ class DshApi(
     }
     val question = pendingQuestions.remove(eventId)
     if (question != null) {
+      questionCallIds.remove(eventId)
       push(ServerEvent(id = "dsh:question-settled:$eventId", directory = question.directory, type = "form.cancelled",
         properties = JSONObject().put("sessionID", question.sessionId).put("id", eventId), created = now))
     }
@@ -1803,7 +1804,12 @@ class DshApi(
     }
   }
 
-  /** 结算/取消后释放认领，避免一直占着一条逻辑流。 */
+  /**
+   * 结算/取消后释放认领，避免一直占着一条逻辑流。
+   *
+   * 刻意**不**清 `questionCallIds`：结算失败要回落到 `userQuestions/answer`，那条路还需要 callId。
+   * 它由 [settleLocally]（提问真的结束时）和作答成功时清理。
+   */
   private fun releaseQuestionClaim(eventId: String) {
     claimedQuestions.remove(eventId)
     questionClaims.remove(eventId)?.cancel()
@@ -3020,6 +3026,7 @@ class DshApi(
     call("userQuestions/answer", envelope(argsOf(
       "agentId" to request.sessionId, "callId" to callId, "answer" to answer
     )))
+    questionCallIds.remove(request.id)
     releaseQuestionClaim(request.id)
   }
 
