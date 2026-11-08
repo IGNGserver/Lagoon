@@ -164,7 +164,7 @@ internal class RemoteDeviceManager(private val store: RemoteDeviceStore, private
         if (current.transitionAt > 0 && now - current.transitionAt <= TRANSITION_STALE_MILLIS) "正在刷新" else "刷新待重试"
       tokens == null -> "尚未注册"
       tokens.refreshTokenExpiresAt <= now -> "凭据已过期"
-      tokens.accessTokenExpiresAt <= now -> "访问令牌已过期"
+      tokens.accessTokenExpiresAt <= now -> "正在刷新"
       else -> "正常"
     }
     return RemoteCredentialSummary(state, tokens?.accessTokenExpiresAt ?: 0,

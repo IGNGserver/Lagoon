@@ -359,7 +359,8 @@ private fun HyperPendingActionDock(
         verticalArrangement = Arrangement.spacedBy(4.dp)
       ) {
         if (permissions.isNotEmpty()) item { HyperGroupTitle("操作授权") }
-        items(permissions, key = { "permission:${it.id}" }) { request ->
+        val permissionKeys = uniqueListKeys(permissions) { "permission:${it.id}" }
+        itemsIndexed(permissions, key = { index, _ -> permissionKeys[index] }) { _, request ->
           MiuixPermissionCard(
             request = request,
             controller = controller,
@@ -368,7 +369,8 @@ private fun HyperPendingActionDock(
           )
         }
         if (questions.isNotEmpty()) item { HyperGroupTitle("需要回答") }
-        items(questions, key = { "question:${it.id}" }) { request ->
+        val questionKeys = uniqueListKeys(questions) { "question:${it.id}" }
+        itemsIndexed(questions, key = { index, _ -> questionKeys[index] }) { _, request ->
           MiuixQuestionCard(
             request = request,
             controller = controller,
@@ -711,14 +713,19 @@ private fun AnimatedVisibilityScope.QoderActivityOverlay(
           LazyColumn(Modifier.fillMaxWidth().weight(1f).padding(horizontal = 22.dp), contentPadding = PaddingValues(bottom = 32.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
             val bodies = details.filter { it.bodyOf == latestSelected.key }
             // Projected chunks are the sole body source, including reasoning: never repeat source.text.
-            items(bodies, key = { it.key }) { body ->
+            val bodyKeys = uniqueListKeys(bodies) { it.key }
+            itemsIndexed(bodies, key = { index, _ -> bodyKeys[index] }) { _, body ->
               when (body.kind) {
                 "reasoning-body", "process-output" -> DetailMarkdown(body.text)
                 "tool-body" -> DetailCode(body.title, body.text, readContent = latestSelected.source?.tool == "read" && body.title != "文件路径", copyText = body.copyText)
                 else -> DetailRowView(body)
               }
             }
-            items(latestSelected.attachments.distinctBy { it.url }, key = { "attachment:${it.url}" }) { attachment -> AttachmentView(attachment, onFile) }
+            val attachments = latestSelected.attachments.distinctBy { it.url }
+            val attachmentKeys = uniqueListKeys(attachments) { "attachment:${it.url}" }
+            items(attachments.size, key = { attachmentKeys[it] }) { index ->
+              AttachmentView(attachments[index], onFile)
+            }
             if (bodies.isEmpty() && latestSelected.attachments.isEmpty()) item { Text(if (latestSelected.status in setOf("running", "pending")) "等待服务器输出…" else "此操作没有正文", color = QoderColors.secondary) }
             latestSelected.target?.let { child -> item { HyperTextAction(text = "打开子会话", onClick = { onOpenChild(child) }) } }
           }
@@ -1258,7 +1265,8 @@ private fun SchedulesPanel(state: LagoonState, controller: LagoonController) {
     return
   }
   LazyColumn(Modifier.fillMaxWidth()) {
-    items(state.schedules, key = { it.id }) { schedule ->
+    val scheduleKeys = uniqueListKeys(state.schedules) { it.id }
+    itemsIndexed(state.schedules, key = { index, _ -> scheduleKeys[index] }) { _, schedule ->
       HyperActionRow(title = schedule.title, summary = "${schedule.detail} · ${schedule.scheduledAt}",
         onClick = { controller.loadSchedules() })
       Text(schedule.prompt, style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary), maxLines = 2, overflow = TextOverflow.Ellipsis,
@@ -1308,7 +1316,8 @@ private fun FilesPanel(state: LagoonState, controller: LagoonController, onRefer
       HyperButton(text = "引用到消息", onClick = { onReference(state.filePath) })
       VirtualText(state.fileText!!, Modifier.weight(1f), highlight = false)
     } else if (!state.fileBinary || searching) {
-      LazyColumn { items(nodes, key = { it.path }) { node ->
+      val nodeKeys = uniqueListKeys(nodes) { it.path }
+      LazyColumn { itemsIndexed(nodes, key = { index, _ -> nodeKeys[index] }) { _, node ->
         val directory = node.type == "directory"
         HyperActionRow(title = node.path.substringAfterLast('/').ifBlank { node.path }, summary = if (directory) "文件夹" else node.path,
           showChevron = true,

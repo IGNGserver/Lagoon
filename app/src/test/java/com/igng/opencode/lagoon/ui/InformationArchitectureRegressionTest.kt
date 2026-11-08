@@ -30,8 +30,9 @@ class InformationArchitectureRegressionTest {
 
   @Test fun deviceDetailsOwnDefaultsConnectionAndRemoteManagement() {
     val details = uiSource("DeviceManagementScreen.kt")
-    assertTrue(details.contains("NewSessionDefaultsCard(state, controller)"))
+    assertTrue(details.contains("NewSessionDefaultsCard(state, controller, profile.id)"))
     assertTrue(details.contains("onManageModels"))
+    assertFalse(details.contains("selectProfile("))
     assertTrue(details.contains("onEditProfile"))
     assertTrue(details.contains("onManageHub"))
     assertTrue(details.contains("主机扩展"))

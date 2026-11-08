@@ -2,7 +2,7 @@ package com.igng.opencode.lagoon.ui
 
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
@@ -86,7 +86,8 @@ internal fun ModelSelector(state: LagoonState, controller: LagoonController, mod
               controller.chooseModel(null); open = false
             }
           }
-          items(filtered, key = { it.key }) { model ->
+          val modelKeys = uniqueListKeys(filtered) { it.key }
+          itemsIndexed(filtered, key = { index, _ -> modelKeys[index] }) { _, model ->
             ChoiceRow(model.choice.label, model.providerName, state.modelChanged && model.key == currentKey) {
               controller.chooseModel(model.choice); open = false
             }

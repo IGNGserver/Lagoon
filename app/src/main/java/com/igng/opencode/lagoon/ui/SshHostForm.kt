@@ -83,9 +83,6 @@ internal fun SshHostForm(
   var confirmingSecretClear by remember { mutableStateOf<SshSecretField?>(null) }
   var command by rememberSaveable(initial?.id) { mutableStateOf(initial?.launchCommand ?: com.igng.opencode.lagoon.core.DEFAULT_DSH_LAUNCH_COMMAND) }
   var workingDirectory by rememberSaveable(initial?.id) { mutableStateOf(initial?.workingDirectory.orEmpty()) }
-  var autoConnect by rememberSaveable(initial?.id) {
-    mutableStateOf(state.profiles.firstOrNull { initial?.id != null && it.sshHostId == initial.id }?.autoConnect ?: true)
-  }
   var notifications by rememberSaveable(initial?.id) {
     mutableStateOf(state.profiles.firstOrNull { initial?.id != null && it.sshHostId == initial.id }?.notifications ?: true)
   }
@@ -239,7 +236,7 @@ internal fun SshHostForm(
         controller.saveSshHost(
           config = pinned,
           secrets = secrets(),
-          autoConnect = autoConnect,
+          autoConnect = true,
           notifications = notifications,
           groupId = groupId,
           connect = enabled
@@ -393,9 +390,6 @@ internal fun SshHostForm(
       item {
         TextField(value = workingDirectory, onValueChange = { workingDirectory = it }, label = "远端工作目录（可选，例如 ~/code）", modifier = Modifier.fillMaxWidth())
       }
-    }
-    item {
-      HyperSwitchRow(title = "自动连接", summary = "保存后在后台保持这条 SSH 连接", checked = autoConnect, onCheckedChange = { autoConnect = it })
     }
     item {
       HyperSwitchRow(title = "接收任务通知", checked = notifications, onCheckedChange = { notifications = it })

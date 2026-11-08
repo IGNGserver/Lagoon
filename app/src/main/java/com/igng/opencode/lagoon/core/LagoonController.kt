@@ -242,9 +242,9 @@ class LagoonController private constructor(private val appContext: Context) {
   /** Stop background retries after a sign-out; profiles and cached conversations stay local. */
   internal fun markRemoteSignedOut(origin: String, account: String) {
     store.profiles().filter {
-      it.kind == ServerKind.DSH_REMOTE && canonicalRemoteOrigin(it.url) == canonicalRemoteOrigin(origin) && it.username == account
+      it.kind == ServerKind.DSH_REMOTE && canonicalRemoteOrigin(it.url) == canonicalRemoteOrigin(origin) && it.username == account && it.enabled
     }.forEach { profile ->
-      saveServer(profile.copy(autoConnect = false), password = null, cookie = null, credentialUsername = account, connect = false)
+      setProfileEnabled(profile.id, false)
     }
   }
   private fun appVersion(): String = runCatching {
@@ -674,10 +674,12 @@ class LagoonController private constructor(private val appContext: Context) {
     return (client as? RemoteDoctorSource)?.remoteDoctor(appVersion())
   }
 
-  /** Measures one encrypted RPC round trip on the active Remote connection. */
+  /** Measures one encrypted RPC round trip on the requested Remote connection, not only the open chat. */
   internal suspend fun probeRemote(serverId: String? = state.value.serverId): RemoteProbe? {
-    if (serverId == null || serverId != state.value.serverId || state.value.server?.kind != ServerKind.DSH_REMOTE) return null
-    return api?.probeRemote()
+    val id = serverId ?: return null
+    val profile = store.profiles().firstOrNull { it.id == id } ?: return null
+    if (profile.kind != ServerKind.DSH_REMOTE || !profile.enabled) return null
+    return clientFor(id)?.probeRemote()
   }
   fun clearError() = updateState { it.copy(error = null) }
   /**
@@ -1030,20 +1032,6 @@ class LagoonController private constructor(private val appContext: Context) {
     saveDeviceGroups(groups, state.value.homeGroupId?.takeIf { it != id })
   }
 
-  /** Group-level convenience: each member still has its own connection and autoConnect flag. */
-  fun setDeviceAutoConnect(id: String, enabled: Boolean) {
-    val group = state.value.deviceGroups.firstOrNull { it.id == id } ?: return
-    val members = group.memberIds.mapNotNull { member -> store.profiles().firstOrNull { it.id == member } }
-    members.forEach { profile ->
-      if (profile.autoConnect != enabled) {
-        saveServer(profile.copy(autoConnect = enabled), password = null, cookie = null,
-          credentialUsername = profile.username, connect = false)
-      }
-    }
-    allOverview.start(store.profiles(), include = if (enabled) members.mapTo(HashSet()) { it.id }
-      else setOfNotNull(state.value.serverId))
-  }
-
   fun moveProfile(profileId: String, groupId: String?) {
     if (state.value.profiles.none { it.id == profileId }) return
     if (groupId != null && state.value.deviceGroups.none { it.id == groupId }) return
@@ -1103,9 +1091,9 @@ class LagoonController private constructor(private val appContext: Context) {
   /**
    * Enables or disables one saved connection. Disabling stops its monitor/client immediately (an SSH
    * link is closed too), removes it from every home/notification projection, and switches away when
-   * it was the writable server. Re-enabling starts monitoring at once, even when `autoConnect` is
-   * off, so cached conversations return and a live read is scheduled. Credentials, drafts, caches
-   * and the unread ledger are never touched.
+   * it was the writable server. Re-enabling starts monitoring at once so cached conversations
+   * return and a live read is scheduled. Credentials, drafts, caches and the unread ledger are
+   * never touched.
    */
   fun setProfileEnabled(profileId: String, enabled: Boolean) {
     val profile = store.profiles().firstOrNull { it.id == profileId } ?: return
@@ -1175,8 +1163,6 @@ class LagoonController private constructor(private val appContext: Context) {
         messageTone = FeedbackTone.INFO
       )
     }
-    // `include` deliberately overrides autoConnect for this one read so the restored conversations
-    // appear immediately even when the profile was saved with 自动连接 off.
     allOverview.start(profiles, include = setOfNotNull(state.value.serverId, profileId))
     allOverview.refresh(profileId)
     val current = state.value
@@ -3298,36 +3284,36 @@ class LagoonController private constructor(private val appContext: Context) {
     rememberConfiguration()
   }
   /** Phone-local default preset for the blank page; null means "follow the server default". */
-  fun setNewSessionAgent(name: String?) {
-    val server = state.value.serverId ?: return
+  fun setNewSessionAgent(name: String?, serverId: String? = state.value.serverId) {
+    val server = serverId ?: return
     val clean = name?.takeIf(String::isNotBlank)
     store.rememberNewSessionDefaults(server, store.newSessionDefaults(server).copy(agent = clean))
-    updateState { it.copy(newSessionAgent = clean) }
+    if (server == state.value.serverId) updateState { it.copy(newSessionAgent = clean) }
   }
   /** Phone-local default model; the strength stays in [modelVariants], keyed by the model. */
-  fun setNewSessionModel(model: ModelChoice?) {
-    val server = state.value.serverId ?: return
+  fun setNewSessionModel(model: ModelChoice?, serverId: String? = state.value.serverId) {
+    val server = serverId ?: return
     val clean = model?.let { candidate ->
       state.value.modelCatalog.firstOrNull { it.key == modelKey(candidate) }?.choice?.copy(variant = null)
         ?: candidate.copy(variant = null)
     }
     store.rememberNewSessionDefaults(server, store.newSessionDefaults(server).copy(model = clean))
-    updateState { it.copy(newSessionModel = clean) }
+    if (server == state.value.serverId) updateState { it.copy(newSessionModel = clean) }
   }
-  /** The default strength for one model, edited from Settings; null means "follow the model". */
-  fun setNewSessionVariant(modelKey: String, variant: String?) {
-    val server = state.value.serverId ?: return
+  /** The default strength for one model; null means "follow the model". */
+  fun setNewSessionVariant(modelKey: String, variant: String?, serverId: String? = state.value.serverId) {
+    val server = serverId ?: return
     val info = state.value.modelCatalog.firstOrNull { it.key == modelKey } ?: return
     val clean = variant?.takeIf { id -> info.variants.any { it.id == id } }
     store.rememberModelVariant(server, modelKey, clean)
-    updateState { it.copy(modelVariants = store.modelVariants(server)) }
+    if (server == state.value.serverId) updateState { it.copy(modelVariants = store.modelVariants(server)) }
   }
   /**
    * Loads the agent/model catalog for the Settings page even when no conversation is open.  The
    * blank page normally learns it from loadChoices when a workspace is chosen; Settings can be
    * opened straight from the home list, so it needs its own trigger.
    */
-  fun loadDefaultCatalog(force: Boolean = false) {
+  fun loadDefaultCatalog(force: Boolean = false, serverId: String? = state.value.serverId) {
     val current = state.value
     if (current.server == null) return
     if (!force && current.agents.isNotEmpty() && current.modelCatalog.isNotEmpty()) return

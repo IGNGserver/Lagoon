@@ -29,12 +29,23 @@ internal fun pendingRequestCount(permissions: Int, questions: Int): Int =
 /** Stop remains independently visible for the whole running phase, regardless of composer content. */
 internal fun shouldShowGenerationStop(running: Boolean): Boolean = running
 
-internal fun resolveDeviceStatusLabel(enabled: Boolean, online: Boolean, loading: Boolean, hasError: Boolean): String = when {
+/**
+ * One label for a saved device. Hub heartbeats and token expiry are not inputs: those belong in
+ * the detail, not in a second "online" column.
+ */
+internal fun resolveDeviceStatusLabel(
+  enabled: Boolean,
+  connected: Boolean,
+  loading: Boolean,
+  hasError: Boolean,
+  authExpired: Boolean = false
+): String = when {
   !enabled -> "已停用"
-  loading -> "连接中"
-  online -> "在线"
+  loading && !connected -> "连接中"
+  connected -> "已连接"
+  authExpired -> "需要重新登录"
   hasError -> "需检查"
-  else -> "离线"
+  else -> "未连接"
 }
 
 internal fun attachmentCanOpen(url: String): Boolean {
@@ -47,6 +58,16 @@ internal fun attachmentCanOpen(url: String): Boolean {
   if (scheme == null) return true
   if (!scheme.equals("file:", ignoreCase = true)) return false
   return runCatching { !java.net.URI(value).path.isNullOrBlank() }.getOrDefault(false)
+}
+
+/** LazyColumn crashes on a repeated key. Server ids stay visible; the list key gets a suffix. */
+internal fun <T> uniqueListKeys(items: List<T>, key: (T) -> String): List<String> {
+  val seen = HashMap<String, Int>(items.size * 2)
+  return items.map { item ->
+    val raw = key(item).ifBlank { "item" }
+    val count = seen.merge(raw, 1, Int::plus) ?: 1
+    if (count == 1) raw else "$raw~$count"
+  }
 }
 
 internal fun filterModelCatalog(models: List<ModelInfo>, query: String): List<ModelInfo> {

@@ -18,7 +18,9 @@ internal fun LagoonState.serverSnapshots(): Map<String, ServerOverviewSnapshot> 
     else allServerSnapshots.filterKeys { it in enabledIds }
   val id = serverId?.takeIf { it in enabledIds } ?: return visible
   val profile = profiles.firstOrNull { it.id == id } ?: return visible
-  if (!connected && sessions.isEmpty() && tasks.isEmpty()) return visible
+  // The writable connection is authoritative even before its first catalog arrives. Leaving the
+  // background snapshot in place made the device list say 离线 while this server was already up.
+  if (!connected && sessions.isEmpty() && tasks.isEmpty() && !loading && error.isNullOrBlank() && lastContactAt <= 0) return visible
   return visible + (id to ServerOverviewSnapshot(id, profile, version = version, connected = connected,
     canSyncRead = capabilities.sessionView != null,
     cached = cached, loading = loading, lastReadAt = lastContactAt, error = error, degraded = degraded,

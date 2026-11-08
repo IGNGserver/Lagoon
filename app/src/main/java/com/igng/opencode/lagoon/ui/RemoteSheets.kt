@@ -390,25 +390,25 @@ internal fun RemoteConnectionDialog(
   LaunchedEffect(profile.id) { reloadDoctor() }
   SuperDialog(title = "网络与连接", show = true, onDismissRequest = onDismiss) {
     Column(Modifier.fillMaxWidth().padding(top = 8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-      val current = state.serverId == profile.id
+      val snapshot = state.serverSnapshots()[profile.id]
       val rows = buildList {
         add("主机" to profile.name)
         add("连接方式" to "DSH 远程中枢")
         add("地址" to profile.url)
         add("状态" to when {
-          !current -> "未打开"
-          state.connected && state.streamConnected -> "已连接"
-          state.connected -> "已连接 · 实时同步恢复中"
-          state.connection.stage == ConnectStage.RETRYING -> "正在重试"
+          !profile.enabled -> "已停用"
+          snapshot?.connected == true && snapshot.streamConnected -> "已连接"
+          snapshot?.connected == true -> "已连接 · 实时同步恢复中"
+          snapshot?.loading == true -> "连接中"
+          !snapshot?.error.isNullOrBlank() -> snapshot?.error ?: "需检查"
           else -> "未连接"
         })
         add("当前路径" to "Relay 中继")
         add("加密" to "Noise IK · 端到端加密")
-        add("服务版本" to state.version.ifBlank { "未知" })
+        add("服务版本" to (snapshot?.version?.ifBlank { null } ?: "未知"))
         add("主机指纹" to (profile.remoteHostFingerprint?.let { formatFingerprint(it) } ?: "待确认"))
         add("加密 RPC 往返" to (probe?.let { "${it.durationMillis} 毫秒" } ?: "未测量"))
-        add("最近联络" to (if (state.lastContactAt > 0) agoText(state.lastContactAt) else "未知"))
-        add("当前阶段" to (if (state.connection.since > 0) "${agoText(state.connection.since)} · ${state.connection.stage.name}" else "未知"))
+        add("最近联络" to (snapshot?.lastReadAt?.takeIf { it > 0 }?.let { agoText(it) } ?: "未知"))
       }
       val doctorRows = doctor?.diagnosticLines().orEmpty()
         .filterNot { (label, _) -> rows.any { it.first == label } }
@@ -435,7 +435,7 @@ internal fun RemoteConnectionDialog(
         Spacer(Modifier.weight(1f))
         HyperTextAction(text = "关闭", onClick = onDismiss)
       }
-      HyperButton(text = "重新测量", loading = busy, enabled = current, modifier = Modifier.fillMaxWidth(), onClick = {
+      HyperButton(text = "重新测量", loading = busy, enabled = profile.enabled, modifier = Modifier.fillMaxWidth(), onClick = {
         scope.launch {
           busy = true; error = null
           try {

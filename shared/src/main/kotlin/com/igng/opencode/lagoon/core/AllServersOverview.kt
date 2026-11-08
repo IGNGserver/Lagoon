@@ -91,13 +91,12 @@ internal class AllServersOverview(
   private val liveStreams = mutableMapOf<String, Job>()
 
   /**
-   * Ensures one monitor per server that should stay connected: enabled profiles with `autoConnect`
-   * on, plus [include] (the server the user just opened). A disabled profile is never dialled even
-   * when it is selected or explicitly included. The “自动连接此服务器” switch used to be ignored and
-   * every saved server was dialled forever, including permanently unreachable ones.
+   * Ensures one monitor per enabled server. Enabling a device keeps its connection; a disabled
+   * profile is never dialled, even when selected or listed in [include]. The old autoConnect flag
+   * no longer decides whether a saved device is dialled.
    */
   fun start(profiles: List<ServerProfile>, include: Set<String> = emptySet()) {
-    val wanted = profiles.filter { it.enabled && (it.autoConnect || it.id in include) }
+    val wanted = profiles.filter { it.enabled }
     (jobs.keys - wanted.map { it.id }.toSet()).forEach(::remove)
     wanted.forEach { profile ->
       val id = profile.id
@@ -281,14 +280,12 @@ internal class AllServersOverview(
     suspend fun refresh() {
       val waiters = refreshWaiters.remove(id)?.toList().orEmpty()
       try {
-        if (selectedServer() == id) return
         handoffs.remove(id)?.let { snapshot = it.copy(streamConnected = snapshot.streamConnected) }
         // Conflate streaming bursts without issuing a full control-plane read for every token. The
         // overview read repairs state, so a few seconds of coalescing is enough and keeps several
         // streaming servers from turning every token into HTTP traffic.
         val elapsed = now() - lastReadAt
         if (waiters.isEmpty() && elapsed < EVENT_READ_COALESCE_MILLIS) delay(EVENT_READ_COALESCE_MILLIS - elapsed)
-        if (selectedServer() == id) return
         lastReadAt = now()
         val revision = waitingRevision
         val next = lock.withLock {
@@ -303,7 +300,6 @@ internal class AllServersOverview(
               degraded = true, error = userFacingError(error, "连接失败"))
           }
         }
-        if (selectedServer() == id) return
         snapshot = if (revision == waitingRevision) next.copy(streamConnected = snapshot.streamConnected, autoApprovalFailures = snapshot.autoApprovalFailures)
           else next.copy(tasks = snapshot.tasks, notices = snapshot.notices, permissions = snapshot.permissions, questions = snapshot.questions,
             shells = snapshot.shells, parents = next.parents + snapshot.parents,
@@ -662,9 +658,9 @@ internal class AllServersOverview(
     val newlyFinished = if (active == null) emptyList() else sessions.filter {
       it.parentId == null && it.id in wasActive && it.id !in stillActive
     }.map { it to wasActive.getValue(it.id).since }
-    // A view may have selected this server while these HTTP reads were suspended. Its richer
-    // reducer now owns the writes; an older overview read must not invent results or overwrite it.
-    if (selectedServer() == id || !unchanged()) return previous
+    // A newer event invalidated this read. The writable server's conversation reducer still owns
+    // the open transcript; this snapshot is only the device-list connection state.
+    if (!unchanged()) return previous
     deletedSessions.forEach { store.forgetTask(id, it) }
     val notices = (store.sessionNotices(id) + newlyFinished.filterNot { (session, since) -> store.sessionNotices(id).coversRun(session.id, since) }
       .mapNotNull { (session, since) -> session.transitionNotice(since) }).distinctBy { it.id }
