@@ -284,7 +284,7 @@ internal class TranscriptStore internal constructor(
 
   companion object {
     /** Bump whenever [toMessage], [cacheRecord] or [isSettledMessage] change meaning. */
-    const val FORMAT_VERSION = 2
+    const val FORMAT_VERSION = 3
     const val DEFAULT_BUDGET_BYTES = 64L * 1024 * 1024
     /** Sealed rows above this are not stored: Android cursor windows cannot read rows near 2 MB. */
     const val MAX_ROW_BYTES = 1_500_000

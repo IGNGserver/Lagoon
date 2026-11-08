@@ -46,6 +46,27 @@ class OfflineCacheTruncationTest {
     assertEquals("turn:7", cache.messages("s", "sess").single().turnId)
   }
 
+  @Test fun projectedCacheVersionRejectsLegacyRowsButKeepsCatalog() = runBlocking {
+    val preferences = memoryPreferences()
+    preferences.edit()
+      .putString("messages:s:sess", "{\"messages\":[],\"complete\":true}")
+      .putString("catalog:s", "{\"projects\":[],\"sessions\":[]}")
+      .commit()
+    val cache = OfflineCache(preferences, { it }, { it })
+    assertTrue(cache.messages("s", "sess").isEmpty())
+    assertFalse(cache.messagesComplete("s", "sess"))
+    assertTrue(preferences.contains("catalog:s"))
+    assertFalse(preferences.contains("messages:s:sess"))
+  }
+
+  @Test fun projectedCacheRoundTripsSourceKind() = runBlocking {
+    val cache = cache()
+    val message = Message("relay", "relay", 1, listOf(MessagePart("p", "text", "child report")),
+      notice = Notice("代理来信", target = "child"), type = "agent-message", sourceKind = "agent-message")
+    cache.saveMessages("srv", "p", listOf(message))
+    cache.awaitWrites()
+    assertEquals(message, cache.messages("srv", "p").single())
+  }
   @Test fun writePathDoesNotScanPreferencesAllOnEveryCommit() = runBlocking {
     var getAllCalls = 0
     val delegate = FakeSharedPreferences()
@@ -65,6 +86,7 @@ class OfflineCacheTruncationTest {
     cache.deleteTranscripts("s")
     assertEquals("写入与删除均使用内存字节账本，不再全量拷贝 preferences.all", 1, getAllCalls)
   }
+
   @Test fun subagentModeModelVariantAndDurableOrderingSurviveRestart() = runBlocking {
     val cache = cache()
     val child = Session("c", "/repo", "child", 1, parentId = "p", subagentMode = "continuable",

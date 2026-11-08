@@ -98,9 +98,18 @@ data class Message(val id: String, val role: String, val created: Long, val part
   /** Durable log order (DSH seq), including same-millisecond inputs. */
   val sequence: Long? = null,
   /** DSH source.rpcId linking a durable user message back to the client request. */
-  val sourceRequestId: String? = null)
+  val sourceRequestId: String? = null,
+  /** Original harness attribution, when the protocol provides one (for example DSH source.kind). */
+  val sourceKind: String? = null
+)
+/** True only for a user-role message explicitly attributed to a human/legacy user source. */
+val Message.isHumanInput: Boolean
+  get() = role == "user" && (sourceKind.isNullOrBlank() || sourceKind == "user")
 
-/** Official `Notice` row: a label, optional detail/items and, for subagent results, the child session. */
+/** Durable DSH orchestration content belongs to Activity, never the human conversation timeline. */
+val Message.isBackgroundActivityMessage: Boolean
+  get() = role == "relay" || sourceKind in setOf("agent-message", "subagent-settled", "tool-jobs")
+
 data class Notice(val label: String, val detail: String = "", val items: List<String> = emptyList(), val target: String? = null,
   val error: Boolean = false, val running: Boolean = false)
 data class Attachment(val url: String, val mime: String = "", val name: String = "")
@@ -321,7 +330,7 @@ internal fun JSONObject.toMessage(): Message {
       Message(id, "assistant", created, parts, errorText("error").ifBlank { null }, str("agent").ifBlank { null }, obj("model").toModelChoice(),
         longPath("time", "completed").takeIf { it > 0 }, str("finish").ifBlank { null }, error?.str("type")?.ifBlank { null },
         retry?.let { "第 ${it.optInt("attempt")} 次重试：${it.errorText("error")}" }, type = type,
-        turnId = str("turnId").ifBlank { null })
+        turnId = str("turnId").ifBlank { null }, sourceKind = str("sourceKind").ifBlank { null })
     }
     "shell" -> Message(id, "shell", created, listOf(shellPart(id, str("command"), str("status"), opt("exit") as? Number, obj("output").str("output"))
       .copy(target = str("shellID").ifBlank { null })),
@@ -337,15 +346,21 @@ internal fun JSONObject.toInboxMessage(): Message? {
   val created = longPath("time", "created")
   val queued = str("delivery") == "queue"
   return when (str("type")) {
-    "user" -> userMessage(str("id"), created, payload, payload.obj("metadata"), queued,
-      sourceRequestId = payload.obj("source").str("rpcId"))
+    "user" -> {
+      val source = payload.optJSONObject("source")
+      val hasSource = payload.has("source") && payload.opt("source") != JSONObject.NULL
+      val kind = source?.str("kind")?.takeIf(String::isNotBlank)
+      if (hasSource && (source == null || kind != "user")) null
+      else userMessage(str("id"), created, payload, payload.obj("metadata"), queued,
+        sourceRequestId = source?.str("rpcId"), sourceKind = kind)
+    }
     "synthetic" -> noticeMessage(str("id"), created, "synthetic", payload).copy(queued = queued)
     else -> null
   }
 }
 
 private fun userMessage(id: String, created: Long, source: JSONObject, metadata: JSONObject, queued: Boolean,
-  sourceRequestId: String? = null): Message {
+  sourceRequestId: String? = null, sourceKind: String? = null): Message {
   // The official composer records what the user typed in `metadata.displayText`; `text` may carry
   // expanded context (file contents, comments) written for the model.
   val text = metadata.str("displayText").ifBlank { source.str("text") }
@@ -355,7 +370,7 @@ private fun userMessage(id: String, created: Long, source: JSONObject, metadata:
     }
   val agent = metadata.str("agent").ifBlank { null }
   return Message(id, "user", created, parts, agent = agent, model = metadata.obj("model").toModelChoice(), queued = queued, type = "user",
-    sourceRequestId = sourceRequestId?.takeIf(String::isNotBlank))
+    sourceRequestId = sourceRequestId?.takeIf(String::isNotBlank), sourceKind = sourceKind)
 }
 
 private fun shellPart(id: String, command: String, status: String, exit: Number?, output: String): MessagePart {

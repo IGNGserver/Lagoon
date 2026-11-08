@@ -81,8 +81,15 @@ class OfflineCache internal constructor(
     synchronized(pendingLock) {
       loadIndex()
       val all = preferences.all
+      val resetMessages = preferences.getInt(MESSAGE_FORMAT_VERSION_KEY, 0) != PROJECTED_MESSAGES_FORMAT_VERSION
+      if (resetMessages) {
+        val editor = preferences.edit()
+        all.keys.filter { it.startsWith(MESSAGES_PREFIX) }.forEach(editor::remove)
+        editor.putInt(MESSAGE_FORMAT_VERSION_KEY, PROJECTED_MESSAGES_FORMAT_VERSION).commit()
+        index.removeAll { it.startsWith(MESSAGES_PREFIX) }
+      }
       all.forEach { (key, value) ->
-        if (key.startsWith(CATALOG_PREFIX) || key.startsWith(MESSAGES_PREFIX)) {
+        if (key.startsWith(CATALOG_PREFIX) || (!resetMessages && key.startsWith(MESSAGES_PREFIX))) {
           val bytes = (value as? String)?.length?.times(2L) ?: 0L
           recordBytes(key, bytes)
           if (key !in index) index.add(key)
@@ -190,6 +197,7 @@ class OfflineCache internal constructor(
           .put("errorType", message.errorType).put("completedAt", message.completedAt).put("finish", message.finish).put("agent", message.agent)
           .put("retry", message.retry).put("queued", message.queued).put("turnId", message.turnId).put("sequence", message.sequence)
            .put("sourceRequestId", message.sourceRequestId)
+          .put("retry", message.retry).put("queued", message.queued).put("turnId", message.turnId).put("sequence", message.sequence).put("sourceKind", message.sourceKind)
           .put("model", message.model?.let { model -> JSONObject().put("providerID", model.providerId).put("id", model.modelId).put("name", model.label).put("variant", model.variant) })
           .put("notice", message.notice?.let { notice -> JSONObject().put("label", notice.label).put("detail", notice.detail).put("items", JSONArray(notice.items))
             .put("target", notice.target).put("error", notice.error).put("running", notice.running) })
@@ -202,7 +210,7 @@ class OfflineCache internal constructor(
               .put("attachments", JSONArray().apply { part.attachments.filterNot { it.url.startsWith("data:") }.forEach { put(JSONObject().put("uri", it.url).put("mime", it.mime).put("name", it.name)) } }))
           } }))
       } }
-      fun payload(list: List<Message>, flag: Boolean) = JSONObject().put("messages", items(list)).put("complete", flag).toString()
+      fun payload(list: List<Message>, flag: Boolean) = JSONObject().put("version", PROJECTED_MESSAGES_FORMAT_VERSION).put("messages", items(list)).put("complete", flag).toString()
       // 单条缓存有硬上限：超限时保留尽量新的后缀并标记为不完整，而不是整条丢弃、让旧缓存继续
       // 以 complete=true 冒充完整会话。
       var kept = messages.takeLast(100)
@@ -216,29 +224,41 @@ class OfflineCache internal constructor(
     }
   }
   fun messages(serverId: String, sessionId: String): List<Message> {
-    val raw = read("messages:$serverId:$sessionId") ?: return emptyList()
+    val name = "messages:$serverId:$sessionId"
+    val raw = read(name) ?: return emptyList()
     return try {
-    val items = if (raw.trimStart().startsWith("[")) JSONArray(raw) else JSONObject(raw).arr("messages")
-    items.objects().map { item ->
-      val notice = item.optJSONObject("notice")?.let { Notice(it.str("label"), it.str("detail"), it.arr("items").strings(), it.str("target").ifBlank { null }, it.optBoolean("error"), it.optBoolean("running")) }
-      val role = item.str("role")
-      Message(item.str("id"), role, item.optLong("created"), item.arr("parts").objects().map { part ->
-        MessagePart(part.str("id"), part.str("type"), part.str("text"), part.str("tool"), part.str("title"), part.str("status"), part.str("input"), part.str("output"), part.str("path"), part.str("error"), part.str("patch"),
-          part.arr("files").strings(), part.str("mime"), part.arr("attachments").toAttachments(), part.str("target").ifBlank { null }, part.optBoolean("background"), part.str("metadata"))
-      }, item.str("error").ifBlank { null }, item.str("agent").ifBlank { null }, item.obj("model").toModelChoice(),
-        item.optLong("completedAt").takeIf { it > 0 }, item.str("finish").ifBlank { null }, item.str("errorType").ifBlank { null },
-        item.str("retry").ifBlank { null }, notice = notice, queued = item.optBoolean("queued"), type = item.str("type").ifBlank { role },
-        turnId = item.str("turnId").ifBlank { null }, sequence = (item.opt("sequence") as? Number)?.toLong(), sourceRequestId = item.str("sourceRequestId").ifBlank { null })
+      val root = JSONObject(raw)
+      if (root.optInt("version", -1) != PROJECTED_MESSAGES_FORMAT_VERSION) {
+        deleteMessages(serverId, sessionId)
+        return emptyList()
+      }
+      root.arr("messages").objects().map { item ->
+        val notice = item.optJSONObject("notice")?.let { Notice(it.str("label"), it.str("detail"), it.arr("items").strings(), it.str("target").ifBlank { null }, it.optBoolean("error"), it.optBoolean("running")) }
+        val role = item.str("role")
+        Message(item.str("id"), role, item.optLong("created"), item.arr("parts").objects().map { part ->
+          MessagePart(part.str("id"), part.str("type"), part.str("text"), part.str("tool"), part.str("title"), part.str("status"), part.str("input"), part.str("output"), part.str("path"), part.str("error"), part.str("patch"),
+            part.arr("files").strings(), part.str("mime"), part.arr("attachments").toAttachments(), part.str("target").ifBlank { null }, part.optBoolean("background"), part.str("metadata"))
+        }, item.str("error").ifBlank { null }, item.str("agent").ifBlank { null }, item.obj("model").toModelChoice(),
+          item.optLong("completedAt").takeIf { it > 0 }, item.str("finish").ifBlank { null }, item.str("errorType").ifBlank { null },
+          item.str("retry").ifBlank { null }, notice = notice, queued = item.optBoolean("queued"), type = item.str("type").ifBlank { role },
+          turnId = item.str("turnId").ifBlank { null }, sequence = (item.opt("sequence") as? Number)?.toLong(),
+          sourceRequestId = item.str("sourceRequestId").ifBlank { null }, sourceKind = item.str("sourceKind").ifBlank { null })
+      }
+    } catch (cancel: CancellationException) {
+      throw cancel
+    } catch (error: Exception) {
+      Diagnostics.warn("OfflineCache", "messages 解析失败", error)
+      deleteMessages(serverId, sessionId)
+      emptyList()
     }
-  } catch (cancel: CancellationException) {
-    throw cancel
-  } catch (error: Exception) {
-    Diagnostics.warn("OfflineCache", "messages 解析失败", error)
-    emptyList()
-  }
   }
   fun messagesComplete(serverId: String, sessionId: String): Boolean = runCatching {
-    JSONObject(read("messages:$serverId:$sessionId") ?: return false).optBoolean("complete", false)
+    val root = JSONObject(read("messages:$serverId:$sessionId") ?: return false)
+    if (root.optInt("version", -1) != PROJECTED_MESSAGES_FORMAT_VERSION) {
+      deleteMessages(serverId, sessionId)
+      return false
+    }
+    root.optBoolean("complete", false)
   }.getOrDefault(false)
   fun catalogComplete(serverId: String): Boolean = runCatching {
     JSONObject(read("catalog:$serverId") ?: return false).optBoolean("complete", false)
@@ -294,6 +314,8 @@ class OfflineCache internal constructor(
     const val INDEX_KEY = "__index"
     const val CATALOG_PREFIX = "catalog:"
     const val MESSAGES_PREFIX = "messages:"
+    const val MESSAGE_FORMAT_VERSION_KEY = "projectedMessagesFormatVersion"
+    const val PROJECTED_MESSAGES_FORMAT_VERSION = 3
     const val MAX_ENTRIES = 150
     const val MAX_TOTAL_BYTES = 16_000_000L
     const val MAX_ENTRY_BYTES = 2_000_000L

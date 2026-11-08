@@ -12,6 +12,7 @@ import androidx.compose.foundation.*
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.text.BasicText
@@ -85,8 +86,8 @@ private fun warmMarkdown(rows: List<TranscriptRow>) {
 @Composable
 internal fun Conversation(state: LagoonState, controller: LagoonController, modifier: Modifier = Modifier, onFile: (String) -> Unit, onModal: (Boolean) -> Unit,
   onOpenChild: (String) -> Unit = {}, onActivityGroup: (TranscriptRow) -> Unit = {}, onQueuedAction: (TranscriptRow) -> Unit = {},
-  activity: SessionActivity? = null, onOpenActivity: () -> Unit = {}) {
-  val list = rememberLazyListState()
+  activity: SessionActivity? = null, onOpenActivity: () -> Unit = {}, listState: LazyListState? = null) {
+  val list = listState ?: rememberLazyListState()
   val scope = rememberCoroutineScope()
   val unverified = state.livePresentedTasks[state.sessionId]?.active != true || state.cached || !state.connected
   val task = state.livePresentedTasks[state.sessionId]?.takeUnless { unverified }

@@ -117,7 +117,7 @@ object TranscriptRows {
    * changes; authoritative parts, completed calls and errors remain untouched.
    */
   fun build(messages: List<Message>, expanded: Set<String> = emptySet(), working: Boolean = false, revertMessageId: String? = null, unverified: Boolean = false): List<TranscriptRow> {
-    val visible = messages.filter { it.isDisplayable && (revertMessageId == null || it.id < revertMessageId) }
+    val visible = messages.filter { it.isDisplayable && !it.isBackgroundActivityMessage && (revertMessageId == null || it.id < revertMessageId) }
     val turns = mutableListOf<Turn>()
     val users = mutableSetOf<String>()
     val leading = mutableListOf<Message>()
@@ -144,6 +144,7 @@ object TranscriptRows {
         }
         "shell" -> Turn(message.id, message.created, shell = message, turnId = message.turnId).also { turns += it; current = it }
         "user" -> if (users.add(message.id)) {
+          if (!message.isHumanInput) return@forEach
           if (message.queued || message.id.startsWith(PENDING_PREFIX)) {
             queued += message
             return@forEach
