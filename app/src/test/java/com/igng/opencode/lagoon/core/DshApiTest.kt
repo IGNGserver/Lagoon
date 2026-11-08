@@ -1893,7 +1893,7 @@ class DshApiTest {
       "session/prompt", "session/rename", "session/selectModel", "session/updateQueue",
       "settings/describe", "settings/mutate",
       "subagents/interruptByParent", "subagents/prompt",
-      "userQuestions/attachWait",
+      "userQuestions/answer", "userQuestions/attachWait",
       "workspace/archiveSession", "workspace/follow", "workspace/unarchiveSession",
       "workspaceFiles/list", "workspaceFiles/read", "workspaceFiles/readBytes", "workspaceFiles/stat"
     )

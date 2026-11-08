@@ -141,6 +141,8 @@ class DshApi(
   /** 已认领的定时问答：瀑布 eventId → `userQuestions/attachWait` 的逻辑流。 */
   private val questionClaims = ConcurrentHashMap<String, WebSocket>()
   private val claimedQuestions = ConcurrentHashMap.newKeySet<String>()
+  /** 瀑布 eventId → 工具调用 id；瀑布关闭后用它走 `userQuestions/answer`。 */
+  private val questionCallIds = ConcurrentHashMap<String, String>()
   /** 需要实时事件（`session/follow`）的会话，最近打开的放最后。 */
   private val watched = LinkedHashSet<String>()
   /** 当前打开的会话；容量淘汰时优先保留，避免首页刷新把正在阅读的 follow 挤掉。 */
@@ -1679,6 +1681,8 @@ class DshApi(
         // 定时问答（`wait.timed`）只有"某客户端认领"时 Host 才不会自己到点关窗。
         // 不认领的话手机切走再回来，卡片已经被主机取消，且 answered 太晚的 `$events/result` 会被丢弃。
         val wait = request.obj("wait")
+        // 记下 callId：瀑布关闭后（`pending`/`continued`）只能靠它走 `userQuestions/answer` 作答。
+        wait.str("callId").takeIf { it.isNotBlank() }?.let { questionCallIds[eventId] = it }
         if (wait.optBoolean("timed")) claimTimedQuestion(sessionId, eventId, wait.str("callId"))
         val fields = JSONArray()
         for (question in request.arr("questions").objects()) {
@@ -1751,12 +1755,27 @@ class DshApi(
 
   /** 回一条瀑布：`{clientId, eventId, outcome}`，结果值按事件类型自己决定。 */
   private suspend fun settle(eventId: String, value: Any?) {
-    val clientId = eventsClientId ?: throw ApiException(409, "事件流尚未连接，请稍后重试")
+    if (trySettle(eventId, value)) return
+    throw ApiException(409, "事件流尚未连接，请稍后重试")
+  }
+
+  /**
+   * 试回一条瀑布，事件流未连接或这一条已经关闭时返回 false，交给调用方选备用通道。
+   * 审批没有备用通道，问答有（`userQuestions/answer`）。
+   */
+  private suspend fun trySettle(eventId: String, value: Any?): Boolean {
+    val clientId = eventsClientId ?: return false
     val outcome = JSONObject().put("kind", "result")
     if (value != null) outcome.put("value", value)
     val args = JSONObject().put("clientId", clientId).put("eventId", eventId).put("outcome", outcome)
-    try {
+    return try {
       call("\$events/result", envelope(args))
+      true
+    } catch (cancel: CancellationException) {
+      throw cancel
+    } catch (error: Exception) {
+      Diagnostics.info("DshApi", "瀑布结算失败，尝试备用通道：${error.message.orEmpty().take(120)}")
+      false
     } finally {
       releaseQuestionClaim(eventId)
     }
@@ -2991,7 +3010,17 @@ class DshApi(
       if (custom != null) answer.put("custom", custom)
       payload.put(answer)
     }
-    settle(request.id, JSONObject().put("answers", payload))
+    val answer = JSONObject().put("answers", payload)
+    if (trySettle(request.id, answer)) return
+    // 瀑布已经不在等（Host 到点把提问结算成 `pending`/`continued`，或事件流重连过）：
+    // `$events/result` 迟到的答案会被静默丢弃，改用按 `callId` 找回那次提问的
+    // `userQuestions/answer`。
+    val callId = questionCallIds[request.id]
+    if (callId.isNullOrBlank()) throw ApiException(409, "这次提问已经结束，请让 Agent 重新提问")
+    call("userQuestions/answer", envelope(argsOf(
+      "agentId" to request.sessionId, "callId" to callId, "answer" to answer
+    )))
+    releaseQuestionClaim(request.id)
   }
 
   override suspend fun rejectQuestion(request: QuestionRequest) {
