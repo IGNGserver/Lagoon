@@ -339,7 +339,8 @@ internal fun DirectoryBrowserSheet(state: LagoonState, controller: LagoonControl
           itemsIndexed(entries, key = { index, _ -> entryKeys[index] }) { _, node ->
             val directory = node.type == "directory"
             if (directory) HyperRow(title = node.path.trimEnd('/').substringAfterLast('/').ifBlank { node.path }, summary = "文件夹", showChevron = true,
-              onClick = { controller.browseDirectory(childPath(path, node.path)) })
+              // 主机给出的绝对路径优先：契约要求客户端不要自己拼接路径段。
+              onClick = { controller.browseDirectory(node.absolutePath ?: childPath(path, node.path)) })
             else HyperRow(title = node.path.substringAfterLast('/').ifBlank { node.path }, summary = node.path, enabled = false)
           }
         }

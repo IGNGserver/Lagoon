@@ -163,7 +163,11 @@ data class FileChange(
   /** Server-classified change kind (`added` / `deleted` / `modified`); empty when the harness omits it. */
   val status: String = ""
 )
-data class FileNode(val path: String, val type: String)
+/**
+ * 一行文件/目录。[path] 是显示与相对寻址用的名字；[absolutePath] 是 Host 给出的原样路径
+ * （`directoryPicker/list` 的条目自带它，契约要求客户端不要自己拼接路径段）。
+ */
+data class FileNode(val path: String, val type: String, val absolutePath: String? = null)
 data class FileContent(val type: String, val content: String)
 data class ModelChoice(val providerId: String, val modelId: String, val label: String, val variant: String? = null)
 data class AgentChoice(val name: String, val description: String)

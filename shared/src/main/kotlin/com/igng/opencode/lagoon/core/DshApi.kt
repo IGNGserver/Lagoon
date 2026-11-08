@@ -131,6 +131,16 @@ class DshApi(
   private val known = ConcurrentHashMap<String, Session>()
   /** `session/follow` 快照给出的日志切点：`session/page` 的 `throughSeq`。 */
   private val cursors = ConcurrentHashMap<String, Long>()
+  /**
+   * 进程内的目标续跑状态（`armed`/`disarmed`）。投影里刻意没有它（只在进程内），远程模式下
+   * 也不允许 `goals/get`，所以只能从转发事件 `goal/activation-changed` 与 mutation 的返回值里收集。
+   */
+  private val goalActivation = ConcurrentHashMap<String, String>()
+  /** 每个后台任务输出流已读到的字节位移（`job/follow` 的 `from`），断线重连时续读。 */
+  private val jobOffsets = ConcurrentHashMap<String, Long>()
+  /** 已认领的定时问答：瀑布 eventId → `userQuestions/attachWait` 的逻辑流。 */
+  private val questionClaims = ConcurrentHashMap<String, WebSocket>()
+  private val claimedQuestions = ConcurrentHashMap.newKeySet<String>()
   /** 需要实时事件（`session/follow`）的会话，最近打开的放最后。 */
   private val watched = LinkedHashSet<String>()
   /** 当前打开的会话；容量淘汰时优先保留，避免首页刷新把正在阅读的 follow 挤掉。 */
@@ -374,6 +384,22 @@ class DshApi(
   private fun argsOf(vararg fields: Pair<String, Any?>): JSONObject = JSONObject().also { out ->
     for ((key, value) in fields) if (value != null) out.put(key, value)
   }
+
+  /**
+   * Host 只接受 `UTC` 或规范的 IANA `Area/Location`，而且会做
+   * `Intl.DateTimeFormat(...).resolvedOptions().timeZone === value` 的规范化校验；不通过时
+   * 抛在 `agent/pre-step` 里，**整轮失败**（prompt 已经 accepted）。设备报 `GMT`、`GMT+08:00`
+   * 或旧别名（如 `Asia/Calcutta`）时必须整个字段省略，让 Host 退回自己的缺省。
+   */
+  private fun clientTimeZone(): String? = java.util.TimeZone.getDefault().id.takeIf { zone ->
+    zone == "UTC" || Regex("[A-Za-z_]+/[A-Za-z0-9_+-]+(?:/[A-Za-z0-9_+-]+)?").matches(zone)
+  }
+
+  /**
+   * v1 会话代际把 PTC 预设记作 `code`，v3 记作 `ptc`。只做**整值**映射——预设名是主机声明的
+   * 标识符，用子串替换会把 `code-review` 这类名字一起改掉。
+   */
+  private fun normalizeAgentPreset(value: String): String = if (value == "code") "ptc" else value
 
   private fun envelope(args: JSONObject): RpcPayload = RpcPayload(JSONObject().put("args", args))
 
@@ -654,6 +680,17 @@ class DshApi(
           workspaceItems = value.arr("items").objects()
           archivedSessions.clear()
           archivedSessions += value.arr("archivedSessionIds").strings()
+        }
+        // `replace` 是"整份过滤后的状态"：主机在某个工作区不再对当前 peer 可见时发它，
+        // 而不是发 `remove`（客户端不会复活被删的工作区）。按基线处理，否则列表会留下主机
+        // 已经收回的条目。
+        "replace" -> {
+          val value = frame.obj("value")
+          workspaceItems = value.arr("items").objects()
+          if (value.has("archivedSessionIds")) {
+            archivedSessions.clear()
+            archivedSessions += value.arr("archivedSessionIds").strings()
+          }
         }
         "upsert" -> {
           val workspace = frame.obj("workspace")
@@ -1019,7 +1056,51 @@ class DshApi(
           else emit("session.tool.success", properties)
         }
       }
+      // PTC（程序化工具调用）的子调用是**耐久事件**，不是实时增量。v1 代际把它记作
+      // `tool/code-dispatch*`，v3 改名成 `tool/ptc-dispatch*`；两个名字都得认，否则开着 PTC
+      // 的主机上工具卡片整段缺席。
+      "tool/ptc-dispatch-start", "tool/code-dispatch-start" -> {
+        val callId = data.str("subCallId").ifBlank { data.str("callId") }
+        if (callId.isNotBlank()) {
+          val name = data.str("name")
+          emit("session.tool.input.started", base.put("assistantMessageID", messageId(data)).put("id", callId).put("name", name))
+          emit("session.tool.called", base.put("assistantMessageID", messageId(data)).put("id", callId).put("name", name)
+            .put("input", data.opt("arguments") ?: JSONObject()))
+        }
+      }
+      "tool/ptc-dispatch", "tool/code-dispatch" -> {
+        val callId = data.str("subCallId").ifBlank { data.str("callId") }
+        if (callId.isNotBlank()) {
+          val name = data.str("name")
+          val properties = base.put("assistantMessageID", messageId(data)).put("id", callId)
+            .put("content", data.arr("content"))
+            .put("metadata", JSONObject().put("tool", name))
+            .put("name", name)
+          if (data.optBoolean("isError")) emit("session.tool.failed", properties.put("error", data.obj("error")))
+          else emit("session.tool.success", properties)
+        }
+      }
       "session/title" -> emit("session.renamed", base.put("title", data.str("title")))
+      // `agent-preset/selected` 是耐久事件：会话的当前预设以它为准，列表投影只是快照。
+      "agent-preset/selected" -> {
+        val preset = normalizeAgentPreset(data.str("agentPreset"))
+        if (preset.isNotBlank()) {
+          known[session.id]?.let { known[session.id] = it.copy(agent = preset) }
+          emit("session.agent.selected", base.put("agent", preset))
+        }
+      }
+      // `model/selection` 同样是耐久事实；不读它，重启后药丸只能显示本机记得的那个模型。
+      "model/selection" -> {
+        val selection = data.obj("next").takeIf { it.length() > 0 } ?: data.obj("lastUsed")
+        val provider = selection.str("provider")
+        val modelId = selection.str("model")
+        if (provider.isNotBlank() && modelId.isNotBlank()) {
+          known[session.id]?.let {
+            known[session.id] = it.copy(model = ModelChoice(provider, modelId, modelId,
+              selection.str("reasoningEffort").takeIf { effort -> effort.isNotBlank() }))
+          }
+        }
+      }
       // 清单与目标都是整值投影：`todo/write` 每次都是完整替换，`goal/change` 是完整快照。
       "todo/write" -> emit("session.todos.changed", base.put("todos", data.arr("todos")))
       "goal/change" -> emit("session.goal.changed", base)
@@ -1075,17 +1156,8 @@ class DshApi(
         }
       }
       "chunk" -> {
-        val attemptId = frame.str("attemptId")
-        val key = liveAttempts[attemptId] ?: return
-        val chunk = frame.obj("chunk")
-        val kind = when (chunk.str("type")) {
-          "text-delta" -> "text"
-          "reasoning-delta" -> "reasoning"
-          else -> return
-        }
-        val text = chunk.str("text")
-        if (text.isEmpty()) return
-        emitLiveDelta(session, key, kind, text, frame.optDouble("time", 0.0).toLong().takeIf { it > 0 } ?: at, push)
+        val key = liveAttempts[frame.str("attemptId")] ?: return
+        replayLiveChunk(session, key, frame.obj("chunk"), frame.optDouble("time", 0.0).toLong(), push)
       }
       "end" -> {
         val attemptId = frame.str("attemptId")
@@ -1112,6 +1184,49 @@ class DshApi(
     push(ServerEvent(id = "dsh:live:${session.id}:${nextLiveEventId()}:$kind:delta", directory = session.directory,
       type = if (kind == "reasoning") "session.reasoning.delta" else "session.text.delta",
       properties = JSONObject().put("sessionID", session.id).put("assistantMessageID", message).put("delta", text), created = at))
+  }
+
+  /** 一条 `chunk` 帧里的增量（实时帧与开帧基线共用）。 */
+  private fun replayLiveChunk(session: Session, key: String, chunk: JSONObject, time: Long, push: (ServerEvent) -> Unit) {
+    val kind = when (chunk.str("type")) {
+      "text-delta" -> "text"
+      "reasoning-delta" -> "reasoning"
+      else -> return
+    }
+    val text = chunk.str("text")
+    if (text.isEmpty()) return
+    emitLiveDelta(session, key, kind, text, time.takeIf { it > 0 } ?: System.currentTimeMillis(), push)
+  }
+
+  /**
+   * 登记 `session/follow` 开帧里**进行中**的 attempt，并重放它已经产出的增量。
+   *
+   * Host 只在开帧的 `assistantStream.activeAttempt` 里给出正在跑的 attempt，之后不会再补
+   * `start` 帧；不登记的话后续 `chunk` 会因 `liveAttempts[attemptId]` 缺失被整段丢弃。
+   * `stream[]` 是紧凑记录：逐条 `chunk`，或按 `time0/dt/texts` 展开的批量运行。
+   */
+  private fun seedLiveAttempt(session: Session, assistantStream: JSONObject, state: FollowState) {
+    val active = assistantStream.obj("activeAttempt")
+    val attemptId = active.str("attemptId").takeIf { it.isNotBlank() } ?: return
+    val key = liveKey(session.id, active)
+    liveAttempts[attemptId] = key
+    val push: (ServerEvent) -> Unit = { emitFollow(state, it) }
+    for (record in active.arr("stream").objects()) {
+      when (record.str("type")) {
+        "chunk" -> replayLiveChunk(session, key, record.obj("chunk"), record.optDouble("time", 0.0).toLong(), push)
+        "text-chunks", "reasoning-chunks" -> {
+          val kind = if (record.str("type") == "text-chunks") "text" else "reasoning"
+          var at = record.optDouble("time0", 0.0).toLong()
+          val dt = record.arr("dt")
+          record.arr("texts").strings().forEachIndexed { index, text ->
+            if (index > 0) at += dt.optDouble(index - 1, 0.0).toLong()
+            if (text.isNotEmpty()) emitLiveDelta(session, key, kind, text, at.takeIf { it > 0 } ?: System.currentTimeMillis(), push)
+          }
+        }
+        // 工具调用的实时增量不参与时间线；耐久 `tool/call` 会补出完整卡片。
+        else -> Unit
+      }
+    }
   }
 
   /**
@@ -1391,10 +1506,14 @@ class DshApi(
   /**
    * 日志尾部最近的一条 `turn/end`。`session/page` 从日志末尾往前翻，不带 `turnWindow` 时按消息计数，
    * 一轮里的事件远多于两条消息，所以连续翻几页直到看见 `turn/end`。没有它就返回 null。
-   * 切点用本机已知的最大 seq；还没读过日志时用一个足够大的上界，服务端会裁到日志末尾。
+   *
+   * 切点必须是**真实存在**的 seq：Host 的 `session/page` 会校验 `throughSeq <= 日志末尾`，
+   * 超出就报 `gateway/bad-request`（不是"裁到末尾"），所以不能拿一个"足够大的上界"去探。
+   * 还没读过这条日志时先取一次 follow 快照把 `cursor` 学来；学不到就放弃本次补读——宁可不补，
+   * 也不能猜成成功。
    */
   private suspend fun latestTurnEnd(session: Session): JSONObject? {
-    val through = maxOf(cursors[session.id] ?: 0L, lastSeq(session.id)).takeIf { it > 0 } ?: OUTCOME_THROUGH_SEQ
+    val through = knownCursor(session) ?: return null
     var before: Long? = null
     repeat(OUTCOME_PAGE_ATTEMPTS) {
       val request = JSONObject().put("address", address(session.id)).put("throughSeq", through)
@@ -1409,6 +1528,29 @@ class DshApi(
         ?: return null
     }
     return null
+  }
+
+  /**
+   * 一条会话当前已知的日志切点。本机读过就用记住的那个，否则开一条**一次性** follow 只取快照的
+   * `cursor` 再立刻关掉（与 `job/list` 同一种用法，不占长期流预算）；取不到就返回 null。
+   */
+  private suspend fun knownCursor(session: Session): Long? {
+    val remembered = maxOf(cursors[session.id] ?: 0L, lastSeq(session.id))
+    if (remembered > 0) return remembered
+    val snapshot = try {
+      oneShotStreams.withPermit {
+        fetchFirstFrame("session/follow", requestArgs(JSONObject()
+          .put("address", address(session.id))
+          .put("maxMessages", OUTCOME_PAGE_MESSAGES)))
+      }
+    } catch (cancel: CancellationException) {
+      throw cancel
+    } catch (error: Exception) {
+      Diagnostics.warn("DshApi", "读取会话日志切点失败，跳过结局补读", error)
+      return null
+    }
+    if (snapshot.str("type") != "snapshot") return null
+    return snapshot.optDouble("cursor", -1.0).toLong().takeIf { it >= 0 }?.also { cursors[session.id] = it }
   }
 
   private fun flushFollowBuffers(push: (ServerEvent) -> Unit) {
@@ -1493,6 +1635,16 @@ class DshApi(
             properties = JSONObject().put("sessionID", id).put("message", message.ifBlank { "执行失败" }), created = System.currentTimeMillis()))
         }
       }
+      // 目标续跑状态（`armed`/`disarmed`）只存在于进程内，投影刻意不含它，远程也没有 `goals/get`。
+      // 事件 `goal/activation-changed` 是这条事实唯一的远程通道。
+      "goal/activation-changed" -> {
+        val payload = args.optJSONObject(0) ?: return
+        val id = payload.str("sessionId").takeIf { it.isNotBlank() } ?: return
+        val activation = payload.obj("goal").str("activation").takeIf { it.isNotBlank() }
+        if (activation != null) goalActivation[id] = activation else goalActivation.remove(id)
+        push(ServerEvent(id = "dsh:goal:$id:${activation.orEmpty()}", directory = known[id]?.directory.orEmpty(),
+          type = "session.goal.changed", properties = JSONObject().put("sessionID", id), created = System.currentTimeMillis()))
+      }
     }
   }
 
@@ -1524,6 +1676,10 @@ class DshApi(
       }
       "user-questions/request" -> {
         if (eventId.isBlank()) return
+        // 定时问答（`wait.timed`）只有"某客户端认领"时 Host 才不会自己到点关窗。
+        // 不认领的话手机切走再回来，卡片已经被主机取消，且 answered 太晚的 `$events/result` 会被丢弃。
+        val wait = request.obj("wait")
+        if (wait.optBoolean("timed")) claimTimedQuestion(sessionId, eventId, wait.str("callId"))
         val fields = JSONArray()
         for (question in request.arr("questions").objects()) {
           val options = JSONArray()
@@ -1578,6 +1734,7 @@ class DshApi(
   }
 
   private fun settleLocally(eventId: String, push: (ServerEvent) -> Unit) {
+    releaseQuestionClaim(eventId)
     val now = System.currentTimeMillis()
     val permission = pendingApprovals.remove(eventId)
     if (permission != null) {
@@ -1598,7 +1755,39 @@ class DshApi(
     val outcome = JSONObject().put("kind", "result")
     if (value != null) outcome.put("value", value)
     val args = JSONObject().put("clientId", clientId).put("eventId", eventId).put("outcome", outcome)
-    call("\$events/result", envelope(args))
+    try {
+      call("\$events/result", envelope(args))
+    } finally {
+      releaseQuestionClaim(eventId)
+    }
+  }
+
+  /**
+   * 认领一条定时问答：`userQuestions/attachWait` 是一条流，只要它还开着，Host 就认为有客户端在等，
+   * 不会到点自己关窗。认领失败只降级成"被动等待"，不影响作答。
+   */
+  private fun claimTimedQuestion(sessionId: String, eventId: String, callId: String) {
+    if (callId.isBlank() || sessionId.isBlank() || closed) return
+    if (!claimedQuestions.add(eventId)) return
+    ioScope.launch {
+      try {
+        val socket = openMux("userQuestions/attachWait", envelope(argsOf("agentId" to sessionId, "callId" to callId)),
+          onItem = { }, onClosed = { })
+        questionClaims[eventId] = socket
+      } catch (cancel: CancellationException) {
+        claimedQuestions.remove(eventId)
+        throw cancel
+      } catch (error: Exception) {
+        claimedQuestions.remove(eventId)
+        Diagnostics.warn("DshApi", "认领定时问答失败，改为被动等待", error)
+      }
+    }
+  }
+
+  /** 结算/取消后释放认领，避免一直占着一条逻辑流。 */
+  private fun releaseQuestionClaim(eventId: String) {
+    claimedQuestions.remove(eventId)
+    questionClaims.remove(eventId)?.cancel()
   }
 
   /** 拒绝一条瀑布：`{kind:"rejected", error:{name, message}}`。 */
@@ -1743,6 +1932,10 @@ class DshApi(
           }
         }
         val records = frame.arr("records").objects().size
+        // 在生成中途打开会话时，Host 只把进行中的 attempt 放进**开帧**的 `assistantStream`，
+        // 之后不会再补一个 `start`。不从这里登记，后续 `chunk` 会因找不到 attempt 被整段丢弃，
+        // 表现为"手机打开会话看不到正在输出的文本"。
+        seedLiveAttempt(session, frame.obj("assistantStream"), state)
         snapshotStats[session.id] = RemoteSnapshotStats(session.id, records,
           snapshotStats[session.id]?.messages ?: 0, frame.optDouble("cursor", -1.0).toLong(),
           frame.optBoolean("hasMore"), state.snapshotAt)
@@ -2122,8 +2315,25 @@ class DshApi(
   }
 
   override suspend fun setPluginBundle(name: String, enabled: Boolean): Boolean {
-    call("pluginManager/setBundleEnabled", envelope(argsOf("name" to name, "enabled" to enabled)))
+    applyPluginChange(call("pluginManager/setBundleEnabled", envelope(argsOf("name" to name, "enabled" to enabled))), name)
     return true
+  }
+
+  /**
+   * 插件开关返回 `ChangeResult{changed, application, restartReason?, error?}`。`application` 可能是
+   * `failed`/`cancelled`/`restart-required`——把它丢掉，界面上就是"开关拨动后回弹且没有任何提示"。
+   */
+  private fun applyPluginChange(result: Any?, name: String) {
+    val value = result as? JSONObject ?: return
+    val application = value.str("application")
+    val detail = value.obj("error").str("diagnostic").ifBlank { value.obj("error").str("code") }
+    when (application) {
+      "failed" -> throw ApiException(409, detail.ifBlank { "插件 $name 启用状态没有生效" })
+      "cancelled" -> throw ApiException(409, detail.ifBlank { "插件 $name 的变更已取消" })
+      "restart-required" -> Diagnostics.info("DshApi",
+        "插件 $name 需要重启 Host 才生效：${value.str("restartReason").ifBlank { "未给出原因" }}")
+      else -> Unit
+    }
   }
 
   override suspend fun createProviderRoute(
@@ -2135,11 +2345,13 @@ class DshApi(
       modelId.isBlank() || !baseUrl.startsWith("http://") && !baseUrl.startsWith("https://"))
       throw ApiException(400, "模型服务商参数无效")
     val describe = callObject("settings/describe")
+    // `writable` 是 describe 的**根**字段（`required:[writable,hasDocument,namespaces]`），
+    // 命名空间上没有这个字段。读错位置会让只读 Host 的写保护永远不生效。
+    if (!describe.optBoolean("writable", true)) throw ApiException(403, "Host 设置只读")
     val namespaces = describe.optJSONArray("namespaces") ?: throw ApiException(404, "Host 没有设置命名空间")
     val ns = (0 until namespaces.length()).mapNotNull { namespaces.optJSONObject(it) }
       .firstOrNull { it.optString("ns") == "llm-pi-ai" }
       ?: throw ApiException(404, "Host 没有启用 pi-ai 模型适配器")
-    if (!ns.optBoolean("writable", true)) throw ApiException(403, "Host 设置只读")
     val profile = JSONObject().put("displayName", displayName.ifBlank { route })
       .put("api", api).put("baseURL", baseUrl).put("apiKeyEnv", apiKeyEnv)
       .put("models", JSONArray().put(JSONObject().put("id", modelId)))
@@ -2185,15 +2397,24 @@ class DshApi(
       "png" -> "image/png"; "jpg", "jpeg" -> "image/jpeg"; "gif" -> "image/gif"; "webp" -> "image/webp"
       else -> null
     }
-    val max = if (imageMime != null) 8 * 1024 * 1024 else 16 * 1024 * 1024
+    val budget = if (imageMime != null) 8 * 1024 * 1024 else 16 * 1024 * 1024
+    // 远程主机的 `workspaceFiles/readBytes` 单次窗口被夹到 4 MiB（Remote Host 的 MAX_READ_BYTES），
+    // 请求更长只会拿到 `eof=false`。直连没有这个窗口，按预算读即可。
+    val window = if (remoteBackend != null) minOf(budget, REMOTE_READ_WINDOW) else budget
     val office = ext in setOf("doc", "docx", "xls", "xlsx", "ppt", "pptx")
     if (imageMime == null && ext != "pdf" && !office) return@withContext null
     val scope = fileScope(directory, session)
     val value = try {
-      if (office) callObject("officeToPdf/render", envelope(argsOf("workspaceFileScopeId" to scope.id, "path" to path)))
+      if (office) callObject("officeToPdf/render", envelope(argsOf(
+        "workspaceFileScopeId" to scope.id, "path" to path,
+        // `priority` 是必填参数（enum foreground|background），漏传会被网关判为
+        // gateway/arguments-invalid，Office 预览因此整条路径失效。
+        "priority" to "foreground"
+      )))
       else callObject("workspaceFiles/readBytes", envelope(argsOf(
         "workspaceFileScopeId" to scope.id, "path" to path,
-        "range" to JSONObject().put("offset", 0).put("length", max)
+        // 契约里读取窗口是第三个参数 `options.range`，不是顶层 `range`。
+        "options" to JSONObject().put("range", JSONObject().put("offset", 0).put("length", window))
       )))
     } catch (error: ApiException) {
       // Unsupported preview endpoints are a capability gap, not a failed file read.
@@ -2204,13 +2425,27 @@ class DshApi(
     val bytes = try { java.util.Base64.getDecoder().decode(encoded) } catch (_: Exception) {
       throw ApiException(502, "预览数据编码无效")
     }
-    if (bytes.size > max) throw ApiException(413, "文件超过预览上限")
+    if (bytes.size > window) throw ApiException(413, "文件超过 ${window / (1024 * 1024)} MiB 预览上限")
     if (!office && value.has("eof") && !value.optBoolean("eof"))
-      throw ApiException(413, if (ext == "pdf") "PDF 超过 16 MiB 预览上限" else "图片超过 8 MiB 预览上限")
+      throw ApiException(413, "文件超过 ${window / (1024 * 1024)} MiB 预览上限，请改在电脑上查看")
     FilePreview(if (office) "application/pdf" else imageMime ?: "application/pdf", bytes)
   }
 
+  /**
+   * 会话目标。
+   *
+   * 远程白名单里**没有** `goals/get`（只有 clear/complete/create/edit/pause/resume），所以远程模式
+   * 改用 `session/projections` 里 durable 的 `values.goal`，进程内的 `activation` 由转发事件
+   * `goal/activation-changed` 补齐。直连/SSH 仍然读 `goals/get`——它是 activation 的权威来源。
+   */
   override suspend fun goal(sessionId: String): RemoteGoal? {
+    if (remoteBackend != null) {
+      val durable = composerContext(sessionId).goal ?: run {
+        goalActivation.remove(sessionId)
+        return null
+      }
+      return durable.copy(activation = goalActivation[sessionId] ?: durable.activation)
+    }
     val value = call("goals/get", envelope(argsOf("agentId" to sessionId))) as? JSONObject ?: return null
     val id = value.optString("id").takeIf { it.isNotBlank() } ?: return null
     val ref = value.optJSONObject("ref")
@@ -2227,17 +2462,29 @@ class DshApi(
   override suspend fun createGoal(sessionId: String, objective: String, maxRounds: Int?): Boolean {
     val request = JSONObject().put("objective", objective)
     if (maxRounds != null) request.put("maxGoalRounds", maxRounds)
-    call("goals/create", envelope(argsOf("agentId" to sessionId, "request" to request)))
+    val view = call("goals/create", envelope(argsOf("agentId" to sessionId, "request" to request)))
+    commitGoalView(sessionId, view)
     return true
   }
 
   override suspend fun goalAction(sessionId: String, id: String, revision: Int, action: String): Boolean {
     if (action !in setOf("pause", "resume", "complete", "clear")) return false
-    call("goals/$action", envelope(argsOf(
+    val view = call("goals/$action", envelope(argsOf(
       "agentId" to sessionId,
       "ref" to JSONObject().put("id", id).put("revision", revision)
     )))
+    if (action == "clear") goalActivation.remove(sessionId) else commitGoalView(sessionId, view)
     return true
+  }
+
+  /**
+   * 目标的 mutation 会返回权威 `GoalView`（含新的 `revision`）。丢掉它会让本地 `revision` 停在旧值，
+   * 下一次 mutation 就被 Host 以 `GOAL_STALE_REVISION` 拒绝，所以这里把返回的 activation 记下来。
+   */
+  private fun commitGoalView(sessionId: String, view: Any?) {
+    val goal = (view as? JSONObject)?.optJSONObject("goal") ?: view as? JSONObject
+    val activation = goal?.optString("activation")?.takeIf { it.isNotBlank() }
+    if (activation != null) goalActivation[sessionId] = activation else goalActivation.remove(sessionId)
   }
 
   override suspend fun credentialStatus(refs: List<String>): Map<String, RemoteCredentialStatus> {
@@ -2263,7 +2510,7 @@ class DshApi(
   }
 
   override suspend fun setPluginEntry(entryId: String, enabled: Boolean): Boolean {
-    call("pluginManager/setPluginEnabled", envelope(argsOf("id" to entryId, "enabled" to enabled)))
+    applyPluginChange(call("pluginManager/setPluginEnabled", envelope(argsOf("id" to entryId, "enabled" to enabled))), entryId)
     return true
   }
 
@@ -2273,7 +2520,7 @@ class DshApi(
       .put("parentSessionId", parentId).put("childSessionId", childId)
       .put("mode", "continuable").put("delivery", "steer")
       .put("content", JSONArray().put(JSONObject().put("type", "text").put("text", text)))
-      .put("clientTimeZone", java.util.TimeZone.getDefault().id)
+    clientTimeZone()?.let { request.put("clientTimeZone", it) }
     call("subagents/prompt", requestArgs(request))
     return true
   }
@@ -2287,10 +2534,18 @@ class DshApi(
     var sawFrame = false
     var runningState = false
     var terminalSeen = false
+    // `from` 是字节位移：断线重连时从上次读到的位置续读，而不是从任务开头重放。
+    val offsetKey = "$sessionId|$jobId"
+    var lossy = false
+    val request = JSONObject().put("sessionId", sessionId).put("jobId", jobId)
+    jobOffsets[offsetKey]?.let { request.put("from", it) }
     val socket = try {
-      openMux("job/follow", requestArgs(JSONObject().put("sessionId", sessionId).put("jobId", jobId)),
+      openMux("job/follow", requestArgs(request),
         onItem = { frame ->
           sawFrame = true
+          // `next`/`lossy`/`gapBefore` 描述"这段输出是否连续"。忽略它们会让被裁剪的输出看起来完整。
+          frame.optDouble("next", -1.0).toLong().takeIf { it >= 0 }?.let { jobOffsets[offsetKey] = it }
+          if (frame.optBoolean("lossy") || frame.optBoolean("gapBefore")) lossy = true
           when (frame.optString("type")) {
             "opened", "status" -> {
               val job = frame.optJSONObject("job")
@@ -2319,6 +2574,7 @@ class DshApi(
     return try {
       closed.await()
       if (sawFrame && !terminalSeen) throw IOException("后台任务输出流中断，状态待核实")
+      if (lossy && sawFrame) onUpdate("\n…（主机裁剪了早先输出，缺失部分无法回读）", runningState, true)
       sawFrame
     } finally { runCatching { socket.cancel() } }
   }
@@ -2460,6 +2716,17 @@ class DshApi(
   }
 
   override suspend fun abort(session: Session) {
+    val parent = session.parentId?.takeIf { it.isNotBlank() }
+    if (parent != null && parent != session.id) {
+      // 子代理会话只能由**父地址**中断：`session/cancel` 的请求体固定只有 `{sessionId}`，
+      // 装不下父地址，Host 会以 `session/agent-busy` 拒绝。DSH 自己走的也是这条端点。
+      call("subagents/interruptByParent", envelope(argsOf(
+        "childSessionId" to session.id,
+        "parentSessionId" to parent,
+        "mode" to (session.subagentMode?.takeIf { it.isNotBlank() } ?: "continuable")
+      )))
+      return
+    }
     call("session/cancel", requestArgs(JSONObject().put("sessionId", session.id)))
   }
 
@@ -2526,7 +2793,7 @@ class DshApi(
       .put("sessionId", session.id)
       .put("mode", delivery.wire)
       .put("content", content)
-      .put("clientTimeZone", java.util.TimeZone.getDefault().id)
+    clientTimeZone()?.let { request.put("clientTimeZone", it) }
     call("session/prompt", requestArgs(request))
     // prompt 已被接受：本机不再把它当服务端草稿。即使随后的列表/事件仍带旧的 blank，
     // 也由 `itemToSession` 的单调判断保持可见；真正的 turn/start 会由 Host 再确认。
@@ -2576,10 +2843,19 @@ class DshApi(
   /** 会话的 Agent 预设（`agentPresets/select`）；只在轮次边界生效，失败保留当前预设。 */
   private suspend fun selectPreset(session: Session, agent: String?) {
     val wanted = agent?.takeIf(String::isNotBlank) ?: return
-    if (wanted == (known[session.id] ?: session).agent) return
+    val current = known[session.id] ?: session
+    if (wanted == current.agent) return
+    // 契约要求"在会话开始第一轮之前"选择预设；轮次已开始后 Host 会保留原组合（不报错也不通知），
+    // 本地若照旧改名，药丸显示的预设就和主机真正用的工具集不一致。
+    if (!current.blank) {
+      Diagnostics.info("DshApi", "会话已开始首轮，预设不可再切换（${wanted.take(24)}）")
+      return
+    }
     try {
-      call("agentPresets/select", envelope(argsOf("agentId" to session.id, "agentPreset" to wanted)))
-      known[session.id] = (known[session.id] ?: session).copy(agent = wanted)
+      // 返回的是**已提交**的预设标识：可能是主机规范化后的值，也可能与请求不同。
+      val committed = (call("agentPresets/select", envelope(argsOf("agentId" to session.id, "agentPreset" to wanted))) as? String)
+        ?.takeIf { it.isNotBlank() } ?: wanted
+      known[session.id] = current.copy(agent = normalizeAgentPreset(committed))
     } catch (error: CancellationException) {
       throw error
     } catch (error: Exception) {
@@ -2622,8 +2898,14 @@ class DshApi(
       .put("provider", model.providerId)
       .put("model", model.modelId)
     model.variant?.takeIf { it.isNotBlank() }?.let { request.put("reasoningEffort", it) }
-    call("session/selectModel", requestArgs(request))
-    known[session.id] = session.copy(model = model)
+    val result = callObject("session/selectModel", requestArgs(request))
+    // 结果是权威选择 `selected{provider,model,reasoningEffort?}`：Host 可能夹取或丢弃档位，
+    // 用请求值覆盖本地缓存会让药丸一直显示主机没有采用的模型。
+    val selected = result.obj("selected")
+    val provider = selected.str("provider").ifBlank { model.providerId }
+    val modelId = selected.str("model").ifBlank { model.modelId }
+    val effort = selected.str("reasoningEffort").takeIf { it.isNotBlank() }
+    known[session.id] = session.copy(model = ModelChoice(provider, modelId, model.label, effort))
   }
 
   // ---------------------------------------------------------------- 目录 / 模型 / 权限
@@ -2661,12 +2943,16 @@ class DshApi(
       val providerName = group.str("name")
       for (model in group.arr("models").objects()) {
         val modelId = model.str("id").ifBlank { continue }
-        val variants = model.obj("reasoning").arr("efforts").objects().mapNotNull { effort ->
+        val reasoning = model.obj("reasoning")
+        val variants = reasoning.arr("efforts").objects().mapNotNull { effort ->
           val effortId = effort.str("id").ifBlank { return@mapNotNull null }
           ModelVariant(effortId, effort.str("name").ifBlank { effortId })
         }
+        // `efforts` 是**允许的档位枚举**，不是偏好顺序；默认档位在 `reasoning.defaultEffort`。
+        // 拿 `efforts[0]` 当默认值会静默改动成本与质量。
+        val defaultEffort = reasoning.str("defaultEffort").takeIf { it.isNotBlank() }
         models += ModelInfo(
-          choice = ModelChoice(providerId, modelId, model.str("name").ifBlank { modelId }, variants.firstOrNull()?.id),
+          choice = ModelChoice(providerId, modelId, model.str("name").ifBlank { modelId }, defaultEffort),
           providerName = providerName.ifBlank { providerId },
           variants = variants
         )
@@ -2835,15 +3121,21 @@ class DshApi(
 
   /** `directoryPicker/list`：Host 账户可见的一层子目录（官方 Web「选择工作目录」用的同一接口）。 */
   private suspend fun pickerDirectories(directory: String, path: String): List<FileNode> {
-    val relative = path.trim().trim('/').takeUnless { it.isEmpty() || it == "." }
-    val target = when {
-      relative == null -> directory.ifBlank { "/" }
-      directory.isBlank() || directory == "/" -> "/$relative"
-      else -> "${directory.trimEnd('/')}/$relative"
+    // 契约要求客户端**不要**自己拼接路径段：主机给出的 `entry.path` 就是下一层要请求的绝对路径。
+    // 因此在上一层点进来的绝对路径原样使用，只有传相对名时才退回本地拼接。
+    val target = if (path.trim().startsWith("/")) path.trim() else {
+      val relative = path.trim().trim('/').takeUnless { it.isEmpty() || it == "." }
+      when {
+        relative == null -> directory.ifBlank { "/" }
+        directory.isBlank() || directory == "/" -> "/$relative"
+        else -> "${directory.trimEnd('/')}/$relative"
+      }
     }
     val listing = callObject("directoryPicker/list", envelope(argsOf("path" to target)))
     return listing.arr("entries").objects().mapNotNull { entry ->
-      entry.str("name").takeIf(String::isNotBlank)?.let { FileNode(it, "directory") }
+      entry.str("name").takeIf(String::isNotBlank)?.let {
+        FileNode(it, "directory", entry.str("path").takeIf { absolute -> absolute.isNotBlank() })
+      }
     }
   }
 
@@ -2932,8 +3224,11 @@ class DshApi(
     const val STATUS_FALLBACK_MILLIS = 15_000L
     /** 补读结局时每页的消息数；一轮里的非消息事件不计入，所以要连翻几页。 */
     const val OUTCOME_PAGE_MESSAGES = 20
-    /** 还没读过这条日志时的切点：`session/page` 会把它裁到日志末尾。 */
-    const val OUTCOME_THROUGH_SEQ = 9_007_199_254_740_991L
+    /**
+     * 远程主机的 `workspaceFiles/readBytes` 单次读取窗口。Host 侧夹到 4 MiB
+     * （`harness-remote-bridge.ts` 的 `MAX_READ_BYTES`），请求更长只会拿到 `eof=false`。
+     */
+    const val REMOTE_READ_WINDOW = 4 * 1024 * 1024
     /** 往前翻这么多页还看不到 `turn/end` 就放弃，不当作成功。 */
     const val OUTCOME_PAGE_ATTEMPTS = 4
 

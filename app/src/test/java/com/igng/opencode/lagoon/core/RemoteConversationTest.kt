@@ -98,10 +98,14 @@ class RemoteConversationTest {
       host.call = { endpoint, payload ->
         val args = payload.getJSONObject("args")
         when (endpoint) {
-          "goals/get" -> {
-            assertEquals("s-remote", args.getString("agentId"))
-            host.ok(JSONObject().put("id", "g1").put("revision", 2).put("objective", "完成修复").put("phase", "active")
-              .put("maxGoalRounds", 16).put("roundsStarted", 1).put("activation", "armed"))
+          // 远程白名单里没有 `goals/get`：目标以投影为准，activation 走 `goal/activation-changed`。
+          "goals/get" -> throw AssertionError("远程模式不应调用 goals/get（不在 HARNESS_REMOTE_ALLOWLIST 里）")
+          "session/projections" -> {
+            assertEquals("s-remote", args.getJSONObject("request").getString("sessionId"))
+            host.ok(JSONObject().put("values", JSONObject().put("goal", JSONObject()
+              .put("goal", JSONObject().put("id", "g1").put("revision", 2).put("objective", "完成修复")
+                .put("phase", "active").put("maxGoalRounds", 16))
+              .put("roundsStarted", 1).put("createdAt", 1).put("updatedAt", 2))))
           }
           "goals/create" -> {
             assertEquals("s-remote", args.getString("agentId"))

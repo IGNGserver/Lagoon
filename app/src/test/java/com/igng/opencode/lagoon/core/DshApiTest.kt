@@ -1033,6 +1033,10 @@ class DshApiTest {
               val frame = JSONObject(text)
               if (frame.optString("type") != "open") return
               val id = frame.getString("streamId")
+              if (frame.optString("endpoint") == "session/follow") {
+                webSocket.send("""{"type":"item","streamId":"$id","value":{"type":"snapshot","cursor":9,"records":[],"hasMore":false}}""")
+                return
+              }
               webSocket.send("""{"type":"item","streamId":"$id","value":{"type":"ready","clientId":"c1","host":{"home":"/home"}}}""")
               webSocket.send("""{"type":"item","streamId":"$id","value":{"type":"emit","event":"api-session/status","args":["s1",false]}}""")
             }
@@ -1067,6 +1071,10 @@ class DshApiTest {
               val frame = JSONObject(text)
               if (frame.optString("type") != "open") return
               val id = frame.getString("streamId")
+              if (frame.optString("endpoint") == "session/follow") {
+                webSocket.send("""{"type":"item","streamId":"$id","value":{"type":"snapshot","cursor":9,"records":[],"hasMore":false}}""")
+                return
+              }
               webSocket.send("""{"type":"item","streamId":"$id","value":{"type":"ready","clientId":"c1","host":{"home":"/home"}}}""")
               webSocket.send("""{"type":"item","streamId":"$id","value":{"type":"emit","event":"api-session/status","args":["s1",false]}}""")
             }
@@ -1421,13 +1429,25 @@ class DshApiTest {
       server.enqueue(rootOk())
       server.enqueue(envelope("\"plan\""))
       server.enqueue(envelope("""{"accepted":true}"""))
-      api(server).send(Session("s1", "/repo", "T", 1, agent = "standard"), "先规划", "plan", null)
+      // 预设只能在会话开始首轮**之前**切换（Host 对已开始的会话会保留原组合且不报错）。
+      api(server).send(Session("s1", "/repo", "T", 1, agent = "standard", blank = true), "先规划", "plan", null)
       server.takeRequest()
       val select = server.takeRequest()
       assertEquals("/api/agentPresets/select", select.requestUrl!!.encodedPath)
       val args = JSONObject(select.body.readUtf8()).getJSONObject("payload").getJSONObject("args")
       assertEquals("s1", args.getString("agentId"))
       assertEquals("plan", args.getString("agentPreset"))
+      assertEquals("/api/session/prompt", server.takeRequest().requestUrl!!.encodedPath)
+    }
+  }
+
+  /** 已经跑过至少一轮的会话不再发 `agentPresets/select`：那只会让本地药丸和主机真实组合不一致。 */
+  @Test fun startedSessionDoesNotSwitchPreset() = runBlocking {
+    MockWebServer().use { server ->
+      server.enqueue(rootOk())
+      server.enqueue(envelope("""{"accepted":true}"""))
+      api(server).send(Session("s1", "/repo", "T", 1, agent = "standard", blank = false), "先规划", "plan", null)
+      server.takeRequest()
       assertEquals("/api/session/prompt", server.takeRequest().requestUrl!!.encodedPath)
     }
   }
@@ -1714,4 +1734,177 @@ class DshApiTest {
     }
   }
 
+  // ------------------------------------------------------------ 端点契约与 payload 断言
+  //
+  // 这一段守的是**线格式**：只断言"请求打到了哪个路径"抓不到参数名/字段名的漂移，
+  // 而参数名漂移在远程模式下会被网关以 gateway/arguments-invalid 整条拒绝。
+
+  /** 取一次一元调用的 `payload`（`{type,rpcId,method,payload}` 里的那层）。 */
+  private fun record(server: MockWebServer): Pair<String, JSONObject> {
+    val request = server.takeRequest()
+    val body = JSONObject(request.body.readUtf8())
+    return request.path.orEmpty() to body.getJSONObject("payload")
+  }
+
+  @Test fun officePreviewSendsRequiredPriorityAndByteOptions() = runBlocking {
+    MockWebServer().use { server ->
+      server.enqueue(rootOk())
+      server.enqueue(envelope("""{"absolutePath":"/repo/a.png","bytes":5,"offset":0,"data":"aGVsbG8=","eof":true}"""))
+      server.enqueue(envelope("""{"data":"JVBERi0="}"""))
+      val client = api(server)
+      client.previewFile("/repo", "a.png", Session("s1", "/repo", "T", 1))
+      client.previewFile("/repo", "a.docx", Session("s1", "/repo", "T", 1))
+      server.takeRequest() // root
+      val (imagePath, imagePayload) = record(server)
+      assertEquals("/api/workspaceFiles/readBytes", imagePath)
+      // 读取窗口在第三个参数 `options.range` 里，不是顶层 `range`。
+      val args = imagePayload.getJSONObject("args")
+      assertFalse("args 不应再有顶层 range", args.has("range"))
+      assertEquals(0, args.getJSONObject("options").getJSONObject("range").getInt("offset"))
+      val (officePath, officePayload) = record(server)
+      assertEquals("/api/officeToPdf/render", officePath)
+      // `priority` 是必填 enum，漏传会被判 gateway/arguments-invalid。
+      assertEquals("foreground", officePayload.getJSONObject("args").getString("priority"))
+    }
+  }
+
+  @Test fun nonCanonicalTimeZoneIsOmittedFromPrompt() = runBlocking {
+    val original = java.util.TimeZone.getDefault()
+    MockWebServer().use { server ->
+      server.enqueue(rootOk())
+      server.enqueue(envelope("""{}"""))
+      try {
+        // `GMT` 这类缩写被 Host 的 pre-step 校验直接拒绝，整轮会失败。
+        java.util.TimeZone.setDefault(java.util.TimeZone.getTimeZone("GMT"))
+        api(server).send(Session("s1", "/repo", "T", 1), "hi")
+        server.takeRequest() // root
+        val (path, payload) = record(server)
+        assertEquals("/api/session/prompt", path)
+        val args = payload.getJSONObject("args").getJSONObject("request")
+        assertFalse("非规范时区必须整个字段省略", args.has("clientTimeZone"))
+      } finally {
+        java.util.TimeZone.setDefault(original)
+      }
+    }
+  }
+
+  @Test fun canonicalTimeZoneIsSent() = runBlocking {
+    val original = java.util.TimeZone.getDefault()
+    MockWebServer().use { server ->
+      server.enqueue(rootOk())
+      server.enqueue(envelope("""{}"""))
+      try {
+        java.util.TimeZone.setDefault(java.util.TimeZone.getTimeZone("Asia/Shanghai"))
+        api(server).send(Session("s1", "/repo", "T", 1), "hi")
+        server.takeRequest() // root
+        val (_, payload) = record(server)
+        assertEquals("Asia/Shanghai", payload.getJSONObject("args").getJSONObject("request").getString("clientTimeZone"))
+      } finally {
+        java.util.TimeZone.setDefault(original)
+      }
+    }
+  }
+
+  @Test fun abortChildSessionInterruptsByParent() = runBlocking {
+    MockWebServer().use { server ->
+      server.enqueue(rootOk())
+      server.enqueue(envelope("""{"accepted":true}"""))
+      server.enqueue(envelope("""{"accepted":true}"""))
+      val client = api(server)
+      val child = Session("c1", "/repo", "子任务", 1, parentId = "p1", subagentMode = "continuable")
+      client.abort(child)
+      client.abort(Session("r1", "/repo", "根会话", 1))
+      server.takeRequest() // root
+      val (childPath, childPayload) = record(server)
+      // session/cancel 的请求体只有 {sessionId}，装不下父地址；子会话必须走 interruptByParent。
+      assertEquals("/api/subagents/interruptByParent", childPath)
+      val args = childPayload.getJSONObject("args")
+      assertEquals("c1", args.getString("childSessionId"))
+      assertEquals("p1", args.getString("parentSessionId"))
+      assertEquals("continuable", args.getString("mode"))
+      val (rootPath, _) = record(server)
+      assertEquals("/api/session/cancel", rootPath)
+    }
+  }
+
+  @Test fun pluginChangeReportsFailedApplication() = runBlocking {
+    MockWebServer().use { server ->
+      server.enqueue(rootOk())
+      server.enqueue(envelope("""{"changed":false,"application":"failed","error":{"code":"E_BAD","diagnostic":"插件清单损坏"}}"""))
+      val error = runCatching { api(server).setPluginBundle("bundle-a", true) }.exceptionOrNull()
+      assertTrue("failed 必须上报而不是当作成功", error is ApiException)
+      assertTrue(error!!.message.orEmpty().contains("插件清单损坏"))
+      server.takeRequest() // root
+      val (path, payload) = record(server)
+      assertEquals("/api/pluginManager/setBundleEnabled", path)
+      assertEquals("bundle-a", payload.getJSONObject("args").getString("name"))
+      assertTrue(payload.getJSONObject("args").getBoolean("enabled"))
+    }
+  }
+
+  @Test fun modelCatalogUsesDeclaredDefaultEffort() = runBlocking {
+    MockWebServer().use { server ->
+      server.enqueue(rootOk())
+      server.enqueue(envelope("""{"default":{"provider":"p","model":"m"},"routableProviders":["p"],"groups":[
+        {"id":"p","name":"P","models":[{"id":"m","name":"M","reasoning":{"efforts":[{"id":"minimal"},{"id":"medium"}],"defaultEffort":"medium"}}]}]}"""))
+      val model = api(server).modelCatalog("/repo").single()
+      // efforts 是允许的枚举，不是偏好顺序；默认档位取 reasoning.defaultEffort。
+      assertEquals("medium", model.choice.variant)
+      assertEquals(listOf("minimal", "medium"), model.variants.map { it.id })
+    }
+  }
+
+  @Test fun selectModelUsesHostSelectedValue() = runBlocking {
+    MockWebServer().use { server ->
+      server.enqueue(rootOk())
+      server.enqueue(envelope("""{"selected":{"provider":"p","model":"m","reasoningEffort":"low"}}"""))
+      server.enqueue(envelope("""{}"""))
+      val client = api(server)
+      val session = Session("s1", "/repo", "T", 1)
+      client.send(session, "hi", model = ModelChoice("p", "m", "M", "high"))
+      server.takeRequest() // root
+      val (selectPath, selectPayload) = record(server)
+      assertEquals("/api/session/selectModel", selectPath)
+      // 请求带的是用户选的档位……
+      assertEquals("high", selectPayload.getJSONObject("args").getJSONObject("request").getString("reasoningEffort"))
+      val (promptPath, _) = record(server)
+      // ……但 Host 可能夹取或丢弃它，所以随后仍要完成 prompt。
+      assertEquals("/api/session/prompt", promptPath)
+    }
+  }
+
+  @Test fun everyRemoteEndpointDshApiUsesIsAllowlisted() {
+    // DshApi 在远程模式会打到的端点。新增调用时把它加进来，测试就会替你挡住白名单漂移。
+    val used = listOf(
+      "\$events", "\$events/result",
+      "agentPresets/list", "agentPresets/select",
+      "commands/execute", "commands/list",
+      "credentials/describe", "credentials/set", "credentials/unset",
+      "directoryPicker/list", "fileReferences/list",
+      "goals/clear", "goals/complete", "goals/create", "goals/pause", "goals/resume",
+      "job/follow", "job/list",
+      "officeToPdf/render",
+      "permissionPresets/catalog",
+      "pluginManager/listBundles", "pluginManager/listPlugins",
+      "pluginManager/setBundleEnabled", "pluginManager/setPluginEnabled",
+      "schedule/list",
+      "session/cancel", "session/create", "session/follow", "session/fork",
+      "session/list", "session/modelCatalog", "session/page", "session/projections",
+      "session/prompt", "session/rename", "session/selectModel", "session/updateQueue",
+      "settings/describe", "settings/mutate",
+      "subagents/interruptByParent", "subagents/prompt",
+      "userQuestions/attachWait",
+      "workspace/archiveSession", "workspace/follow", "workspace/unarchiveSession",
+      "workspaceFiles/list", "workspaceFiles/read", "workspaceFiles/readBytes", "workspaceFiles/stat"
+    )
+    val missing = used.filterNot { DshEndpointContract.isRemoteEndpoint(it) }
+    assertEquals("这些端点不在远程白名单里，远程模式会被 METHOD_NOT_ALLOWED 拒绝", emptyList<String>(), missing)
+  }
+
+  @Test fun consumedEventsAreForwarded() {
+    // 只在"确实会被转发"的事件上写处理器；反过来，别为不会被转发的事件写死代码。
+    assertTrue(DshEndpointContract.FORWARDED_EVENTS.containsAll(DshEndpointContract.CONSUMED_EVENTS))
+    assertTrue(DshEndpointContract.CONSUMED_EVENTS.contains("goal/activation-changed"))
+    assertTrue(DshEndpointContract.IGNORED_EVENTS.none { it in DshEndpointContract.CONSUMED_EVENTS })
+  }
 }

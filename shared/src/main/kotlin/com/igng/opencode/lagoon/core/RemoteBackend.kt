@@ -33,7 +33,9 @@ class RemoteBackend internal constructor(
 
   internal suspend fun probe(): RemoteProbe {
     val started = System.nanoTime()
-    session.gateway().call("harness.transport.describe", JSONObject())
+    // `harness.transport.describe` 是传输级方法，直接发在加密连接上；它不是网关端点，
+    // 不能包进 `harness.remote.call`（既过不了 `ns/method` 形式校验，也不在远程白名单里）。
+    session.transportCall("harness.transport.describe")
     val elapsed = (System.nanoTime() - started) / 1_000_000
     return RemoteProbe(elapsed)
   }

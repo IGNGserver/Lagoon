@@ -32,8 +32,24 @@ internal class RemoteGateway(private val transferFrames: Boolean = false, privat
   /** 按 endpoint 统计当前流占用，用于定位是 follow、后台作业还是瞬态读取占满了预算。 */
   internal fun streamCounts(): Map<String, Int> = streams.values.groupingBy { it.endpoint }.eachCount()
 
+  /** 已经提示过"不在白名单"的端点；每个端点只提示一次，避免刷日志。 */
+  private val warnedEndpoints = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+  /**
+   * 远程插件只放行 [DshEndpointContract.REMOTE_ALLOWLIST] 里的端点，其余一律
+   * `METHOD_NOT_ALLOWED`。直连能用的端点不一定远程能用，这里提前留一条可定位的日志，
+   * 让"某个功能在远程模式静默失效"变成日志里能看到的名字。
+   */
+  private fun warnIfNotAllowlisted(endpoint: String) {
+    if (DshEndpointContract.isRemoteEndpoint(endpoint)) return
+    if (warnedEndpoints.add(endpoint)) {
+      Diagnostics.warn("RemoteGateway", "端点 $endpoint 不在远程白名单内，Host 会以 METHOD_NOT_ALLOWED 拒绝")
+    }
+  }
+
   suspend fun call(endpoint: String, payload: JSONObject): Any? {
     require(validEndpoint(endpoint))
+    warnIfNotAllowlisted(endpoint)
     val request = JSONObject().put("endpoint", endpoint).put("payload", payload)
     if (endpoint == "\$events/result") {
       val encoded = request.toString().toByteArray(Charsets.UTF_8)
@@ -137,6 +153,7 @@ internal class RemoteGateway(private val transferFrames: Boolean = false, privat
   suspend fun open(endpoint: String, payload: JSONObject): RemoteGatewayStream {
     if (closed) throw IOException("Remote Gateway 已关闭")
     require(validEndpoint(endpoint))
+    warnIfNotAllowlisted(endpoint)
     val id = UUID.randomUUID().toString()
     val stream = StreamState(endpoint, Channel(capacity = 256), Channel(capacity = 256))
     synchronized(streams) {
@@ -282,13 +299,28 @@ internal class RemoteGateway(private val transferFrames: Boolean = false, privat
     /** Host 允许 288 MiB 的分块响应；设备侧仍留出内存余量，超过就明确报错而不是装作“描述无效”。 */
     const val MAX_RESPONSE = 64 * 1024 * 1024
     const val CHUNK = 512 * 1024
+    /**
+     * 只读端点：`RESPONSE_TOO_LARGE` 时允许走一次分块路径（`direct()`）。写端点重放会改变主机状态，
+     * 因此绝不在这里。表里只保留**本应用真正会调用**的端点；不加未使用的名字——它们会让
+     * "换个端点重试"看起来比实际更安全。
+     */
     val READS = setOf(
-      "session/list", "session/page", "session/projections", "session/modelCatalog",
-      "agentPresets/list", "agentPresets/read", "commands/list", "credentials/describe",
-      "directoryPicker/list", "fileReferences/list", "job/list", "llm/listConfigurableProviders",
-      "permissionPresets/catalog", "workspaceFiles/list", "workspaceFiles/stat",
-      "workspaceFiles/read", "workspaceFiles/readBytes", "workspaceFiles/readAll",
-      "workspaceFiles/readRelated"
+      "agentPresets/list",
+      "agentPresets/read",
+      "commands/list",
+      "credentials/describe",
+      "directoryPicker/list",
+      "fileReferences/list",
+      "job/list",
+      "permissionPresets/catalog",
+      "session/list",
+      "session/modelCatalog",
+      "session/page",
+      "session/projections",
+      "workspaceFiles/list",
+      "workspaceFiles/read",
+      "workspaceFiles/readBytes",
+      "workspaceFiles/stat"
     )
   }
 }

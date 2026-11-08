@@ -46,6 +46,14 @@ internal class RemoteSession(
   suspend fun gateway(): RemoteGateway = ensure().gateway
   suspend fun capabilities(): RemoteCapabilities = ensure().capabilities
 
+  /**
+   * 传输级 RPC：`harness.transport.describe` 和能力协商走的是连接上的方法名，
+   * **不是** `harness.remote.call` 的网关端点。走 [gateway] 会被端点白名单和
+   * `ns/method` 形式校验一起拒绝，所以延迟探测必须走这里。
+   */
+  suspend fun transportCall(method: String, params: JSONObject = JSONObject()): Any? =
+    ensure().connection.call(method, params)
+
   private suspend fun ensure(): Active = mutex.withLock {
     if (closed) { publishClosed(); throw IOException("Remote 会话已关闭") }
     active?.takeUnless { it.connection.isClosed }?.let { return@withLock it }
