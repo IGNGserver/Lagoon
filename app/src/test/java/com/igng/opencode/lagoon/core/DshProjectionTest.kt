@@ -91,6 +91,26 @@ class DshProjectionTest {
     } finally { api.close() }
   }
 
+  @Test fun durableUserMessageCarriesRpcIdForOptimisticReconciliation() {
+    val api = client()
+    try {
+      val event = record("user/message", 2, """{"id":"user:server","source":{"kind":"user","rpcId":"req-7"},"content":[{"type":"text","text":"继续"}]}""")
+      val translated = api.translate(session, event.obj("event")).single()
+      val optimistic = Message("req-7", "user", 1, listOf(MessagePart("req-7:text", "text", text = "继续")), sourceRequestId = "req-7")
+      val projected = TranscriptProjection.apply(listOf(optimistic), translated)!!.messages
+      assertEquals(1, projected.size)
+      assertEquals("user:server", projected.single().id)
+      assertEquals("req-7", projected.single().sourceRequestId)
+    } finally { api.close() }
+  }
+
+  @Test fun mergeReplacesOptimisticMessageWhenDurableIdDiffers() {
+    val optimistic = Message("req-7", "user", 1, listOf(MessagePart("req-7:text", "text", text = "继续")), sourceRequestId = "req-7")
+    val durable = Message("user:server", "user", 2, listOf(MessagePart("user:server:text", "text", text = "继续")), sourceRequestId = "req-7")
+    val merged = mergeTranscript(listOf(optimistic), listOf(durable))
+    assertEquals(listOf("user:server"), merged.map { it.id })
+  }
+
   @Test fun sameMillisecondMergeKeepsTheDurableSequenceNotArrivalOrder() {
     val user = Message("u", "user", 1, listOf(MessagePart("p", "text", "question")), sequence = 2)
     val assistant = Message("a", "assistant", 1, listOf(MessagePart("p", "text", "answer")), sequence = 3)

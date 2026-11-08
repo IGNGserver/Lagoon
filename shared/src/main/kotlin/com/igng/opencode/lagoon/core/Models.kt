@@ -96,7 +96,9 @@ data class Message(val id: String, val role: String, val created: Long, val part
    */
   val turnId: String? = null,
   /** Durable log order (DSH seq), including same-millisecond inputs. */
-  val sequence: Long? = null)
+  val sequence: Long? = null,
+  /** DSH source.rpcId linking a durable user message back to the client request. */
+  val sourceRequestId: String? = null)
 
 /** Official `Notice` row: a label, optional detail/items and, for subagent results, the child session. */
 data class Notice(val label: String, val detail: String = "", val items: List<String> = emptyList(), val target: String? = null,
@@ -304,7 +306,8 @@ internal fun JSONObject.toMessage(): Message {
   val id = str("id")
   val created = longPath("time", "created")
   return when (val type = str("type")) {
-    "user" -> userMessage(id, created, this, obj("metadata"), queued = false)
+    "user" -> userMessage(id, created, this, obj("metadata"), queued = false,
+      sourceRequestId = str("sourceRequestId").ifBlank { obj("metadata").str("sourceRequestId") }.ifBlank { obj("source").str("rpcId") })
     "assistant" -> {
       val ordinals = mutableMapOf("text" to 0, "reasoning" to 0)
       val parts = arr("content").objects().map { content ->
@@ -334,13 +337,15 @@ internal fun JSONObject.toInboxMessage(): Message? {
   val created = longPath("time", "created")
   val queued = str("delivery") == "queue"
   return when (str("type")) {
-    "user" -> userMessage(str("id"), created, payload, payload.obj("metadata"), queued)
+    "user" -> userMessage(str("id"), created, payload, payload.obj("metadata"), queued,
+      sourceRequestId = payload.obj("source").str("rpcId"))
     "synthetic" -> noticeMessage(str("id"), created, "synthetic", payload).copy(queued = queued)
     else -> null
   }
 }
 
-private fun userMessage(id: String, created: Long, source: JSONObject, metadata: JSONObject, queued: Boolean): Message {
+private fun userMessage(id: String, created: Long, source: JSONObject, metadata: JSONObject, queued: Boolean,
+  sourceRequestId: String? = null): Message {
   // The official composer records what the user typed in `metadata.displayText`; `text` may carry
   // expanded context (file contents, comments) written for the model.
   val text = metadata.str("displayText").ifBlank { source.str("text") }
@@ -349,7 +354,8 @@ private fun userMessage(id: String, created: Long, source: JSONObject, metadata:
       MessagePart("$id:file:$index", "file", path = attachment.url, title = attachment.name, mime = attachment.mime)
     }
   val agent = metadata.str("agent").ifBlank { null }
-  return Message(id, "user", created, parts, agent = agent, model = metadata.obj("model").toModelChoice(), queued = queued, type = "user")
+  return Message(id, "user", created, parts, agent = agent, model = metadata.obj("model").toModelChoice(), queued = queued, type = "user",
+    sourceRequestId = sourceRequestId?.takeIf(String::isNotBlank))
 }
 
 private fun shellPart(id: String, command: String, status: String, exit: Number?, output: String): MessagePart {

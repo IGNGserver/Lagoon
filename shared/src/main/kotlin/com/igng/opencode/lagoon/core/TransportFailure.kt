@@ -28,7 +28,7 @@ internal fun Throwable.isRetryableTransportFailure(): Boolean =
   generateSequence(this) { it.cause }.any { cause ->
     when (cause) {
       is RemoteFailureException -> cause.retryable &&
-        cause.kind in setOf(RemoteFailureKind.OFFLINE, RemoteFailureKind.NETWORK)
+        cause.kind in setOf(RemoteFailureKind.OFFLINE, RemoteFailureKind.NETWORK, RemoteFailureKind.SLOW_CONSUMER)
       is RemoteRpcException -> true
       is RemoteGatewayException -> cause.code.isTransportCode() || cause.message?.let(TRANSPORT_NOISE::containsMatchIn) == true
       // DshApi wraps a dead gateway in a 502; a direct transport failure uses status 0. Other 5xx
@@ -44,6 +44,6 @@ private fun String?.isTransportCode(): Boolean {
   val value = this?.trim()?.lowercase().orEmpty()
   if (value.isEmpty()) return false
   if (value.startsWith("gateway/")) return false
-  return value in setOf("transport_closed", "rpc_timeout", "connection_failed", "connection_replaced", "stream/closed") ||
+  return value in setOf("transport_closed", "rpc_timeout", "connection_failed", "connection_replaced", "slow_consumer", "stream/closed") ||
     value.contains("rtc") || value.contains("transport")
 }
