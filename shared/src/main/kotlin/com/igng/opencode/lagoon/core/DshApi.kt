@@ -199,6 +199,14 @@ class DshApi(
   private val liveAttempts = ConcurrentHashMap<String, String>()
   /** 每个会话已经投影过的最大事件 seq：消息页与实时流之间按 seq 去重。 */
   private val lastSeqs = ConcurrentHashMap<String, Long>()
+  /**
+   * 本机已经见过的最新一轮结局（`succeeded` / `failed` / `interrupted`）。DSH 的列表只有 `running`，
+   * 没有 OpenCode 的持久 `outcome`；`$events` 的 `api-session/status` 也只给布尔值。结局只写在日志的
+   * `turn/end` 里，所以这里记下本机翻译过或读到过的那一轮，供收尾时补未读结果。
+   */
+  private val outcomes = ConcurrentHashMap<String, String>()
+  /** 正在为一次 idle 收尾补读日志的会话，避免状态事件连发时重复翻页。 */
+  private val outcomeReads = ConcurrentHashMap.newKeySet<String>()
 
   override val isClosed: Boolean get() = closed || remoteBackend?.isClosed == true
 
@@ -211,6 +219,7 @@ class DshApi(
     followStates.values.toList().forEach(::stopFollowState)
     followStates.clear()
     durableTurns.clear(); liveParts.clear(); liveAttempts.clear()
+    outcomes.clear(); outcomeReads.clear()
     pendingApprovals.clear(); pendingQuestions.clear()
     remoteBackend?.close()
   }
@@ -546,7 +555,8 @@ class DshApi(
       model = previous?.model,
       viewed = previous?.viewed ?: 0,
       idle = if (item.optBoolean("running")) 0 else previous?.idle ?: 0,
-      outcome = previous?.outcome,
+      // 列表没有结局字段。保留本机已经从 `turn/end` 读到的那一轮，空闲对账才能把它写成未读结果。
+      outcome = outcomes[id] ?: previous?.outcome,
       revertMessageId = null,
       serverId = previous?.serverId,
       blank = blank
@@ -939,23 +949,7 @@ class DshApi(
     val base = JSONObject().put("sessionID", session.id).put("sequence", seq).putOpt("turn", turn)
     when (type) {
       "turn/start" -> emit("session.execution.started", base.put("at", time))
-      "turn/end" -> {
-        val reason = data.obj("reason")
-        when (reason.str("kind")) {
-          "completed", "forked" -> emit("session.execution.succeeded", base)
-          "aborted", "blocked", "interrupted" -> emit("session.execution.interrupted",
-            base.put("reason", reason.obj("reason").str("kind").ifBlank { "user" }))
-          "max-tokens" -> emit("session.execution.failed", base.put("error", JSONObject()
-            .put("type", "max-tokens")
-            .put("message", "达到输出长度上限")))
-          else -> {
-            val error = reason.obj("error")
-            emit("session.execution.failed", base.put("error", JSONObject()
-              .put("type", error.str("code").ifBlank { reason.str("kind").ifBlank { "error" } })
-              .put("message", error.str("message").ifBlank { "执行失败" })))
-          }
-        }
-      }
+      "turn/end" -> emitTurnEnd(session, base, data, ::emit)
       "step/start" -> emit("session.step.started", base
         .put("assistantMessageID", messageId(data))
         .put("started", time).putOpt("agent", session.agent).apply {
@@ -1091,6 +1085,43 @@ class DshApi(
     push(ServerEvent(id = "dsh:live:${session.id}:${nextLiveEventId()}:$kind:delta", directory = session.directory,
       type = if (kind == "reasoning") "session.reasoning.delta" else "session.text.delta",
       properties = JSONObject().put("sessionID", session.id).put("assistantMessageID", message).put("delta", text), created = at))
+  }
+
+  /**
+   * `turn/end` 是 DSH 唯一带结局的事件。先记下本机见过的这一轮（`succeeded` / `failed` /
+   * `interrupted`），再折算成控制器认识的执行事件。列表和对账都没有这个字段，只能靠这里。
+   */
+  private fun emitTurnEnd(session: Session, base: JSONObject, data: JSONObject, emit: (String, JSONObject) -> Unit) {
+    val reason = data.obj("reason")
+    when (reason.str("kind")) {
+      "completed", "forked" -> {
+        rememberOutcome(session, "succeeded")
+        emit("session.execution.succeeded", base)
+      }
+      "aborted", "blocked", "interrupted" -> {
+        rememberOutcome(session, "interrupted")
+        emit("session.execution.interrupted", base.put("reason", reason.obj("reason").str("kind").ifBlank { "user" }))
+      }
+      "max-tokens" -> {
+        rememberOutcome(session, "failed")
+        emit("session.execution.failed", base.put("error", JSONObject()
+          .put("type", "max-tokens")
+          .put("message", "达到输出长度上限")))
+      }
+      else -> {
+        rememberOutcome(session, "failed")
+        val error = reason.obj("error")
+        emit("session.execution.failed", base.put("error", JSONObject()
+          .put("type", error.str("code").ifBlank { reason.str("kind").ifBlank { "error" } })
+          .put("message", error.str("message").ifBlank { "执行失败" })))
+      }
+    }
+  }
+
+  /** 记下本机见过的最新一轮结局，并写回会话缓存，让随后的列表读取带上它。 */
+  private fun rememberOutcome(session: Session, outcome: String) {
+    outcomes[session.id] = outcome
+    known[session.id]?.let { known[session.id] = it.copy(outcome = outcome) }
   }
 
   private fun parseArguments(raw: String): Any =
@@ -1304,6 +1335,53 @@ class DshApi(
       type = "session.status", properties = JSONObject()
         .put("sessionID", id)
         .put("status", JSONObject().put("type", if (running) "busy" else "idle")), created = now))
+    if (!running) ioScope.launch { publishSettledOutcome(id, push) }
+  }
+
+  /**
+   * `$events` 只报告“不再运行”，不报告这一轮是完成、失败还是中断。follow 在线时 `turn/end`
+   * 已经带了结局；不在线时读日志尾部的最后一条 `turn/end`，翻译成带结局的执行事件。
+   * 读不到、或这一轮已经翻译过，就什么都不补：没有见过结局不能猜成成功。
+   */
+  private suspend fun publishSettledOutcome(id: String, push: (ServerEvent) -> Unit) {
+    if (id.isBlank() || !outcomeReads.add(id)) return
+    try {
+      if (outcomes[id] != null) return
+      val session = known[id] ?: return
+      val event = latestTurnEnd(session) ?: return
+      // follow 可能在这次读取期间自己投递了 turn/end；以先到的为准，不重复发。
+      if (outcomes[id] != null) return
+      translate(session, event).filter { it.type.startsWith("session.execution.") }.forEach(push)
+    } catch (cancel: CancellationException) {
+      throw cancel
+    } catch (error: Exception) {
+      Diagnostics.warn("DshApi", "读取会话结局失败", error)
+    } finally {
+      outcomeReads.remove(id)
+    }
+  }
+
+  /**
+   * 日志尾部最近的一条 `turn/end`。`session/page` 从日志末尾往前翻，不带 `turnWindow` 时按消息计数，
+   * 一轮里的事件远多于两条消息，所以连续翻几页直到看见 `turn/end`。没有它就返回 null。
+   * 切点用本机已知的最大 seq；还没读过日志时用一个足够大的上界，服务端会裁到日志末尾。
+   */
+  private suspend fun latestTurnEnd(session: Session): JSONObject? {
+    val through = maxOf(cursors[session.id] ?: 0L, lastSeq(session.id)).takeIf { it > 0 } ?: OUTCOME_THROUGH_SEQ
+    var before: Long? = null
+    repeat(OUTCOME_PAGE_ATTEMPTS) {
+      val request = JSONObject().put("address", address(session.id)).put("throughSeq", through)
+        .put("maxMessages", OUTCOME_PAGE_MESSAGES)
+      if (before != null) request.put("beforeSeq", before)
+      val page = callObject("session/page", requestArgs(request))
+      val records = page.arr("records").objects()
+      val turnEnd = records.map { it.obj("event") }.lastOrNull { it.str("type") == "turn/end" }
+      if (turnEnd != null) return turnEnd
+      if (!page.optBoolean("hasMore") || records.isEmpty()) return null
+      before = records.mapNotNull { it.obj("event").optDouble("seq", 0.0).toLong().takeIf { seq -> seq > 0 } }.minOrNull()
+        ?: return null
+    }
+    return null
   }
 
   private fun flushFollowBuffers(push: (ServerEvent) -> Unit) {
@@ -1371,6 +1449,9 @@ class DshApi(
           properties = JSONObject()
             .put("sessionID", id)
             .put("status", JSONObject().put("type", if (running) "busy" else "idle")), created = now))
+        // 停下来时日志里才有结局。follow 没开（后台监控、流预算已满）就读不到 turn/end，
+        // 这里补读最后一轮，再补发一条带结局的执行事件，未读账本才有“已完成”。
+        if (!running) ioScope.launch { publishSettledOutcome(id, push) }
       }
       "api-session/activity" -> {
         val id = args.optString(0).takeUnless { it == "null" }.orEmpty()
@@ -2811,6 +2892,12 @@ class DshApi(
     const val WORKSPACE_RETRY_MAX_MILLIS = 60_000L
     /** `$events` 不可用时的状态兜底周期。 */
     const val STATUS_FALLBACK_MILLIS = 15_000L
+    /** 补读结局时每页的消息数；一轮里的非消息事件不计入，所以要连翻几页。 */
+    const val OUTCOME_PAGE_MESSAGES = 20
+    /** 还没读过这条日志时的切点：`session/page` 会把它裁到日志末尾。 */
+    const val OUTCOME_THROUGH_SEQ = 9_007_199_254_740_991L
+    /** 往前翻这么多页还看不到 `turn/end` 就放弃，不当作成功。 */
+    const val OUTCOME_PAGE_ATTEMPTS = 4
 
     /** 单次改动列表最多合并的轮次数与文件数。 */
     const val MAX_CHANGE_TURNS = 8

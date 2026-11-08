@@ -190,6 +190,11 @@
   至少 50 条 / 2 轮），不再用消息级 `size` 二次截断；`hasMore=true` 时把本页最早 record 的 seq
   作为 `session/page` 的 `beforeSeq`。更早页同样带 `turnWindow{minMessages:min(size,50),minTurns:2}`，
   让窗口从 `turn/start` 开始，而不是从一轮中间开始。
+- 结局：DSH 列表只有 `running`，没有 OpenCode 的持久 `outcome`。`turn/end` 是唯一带结局的事件
+  （`completed`/`forked` → 成功，`max-tokens` 与错误 → 失败，`aborted`/`blocked`/`interrupted` → 中断），
+  翻译时记到本机会话缓存。`$events` 的 `api-session/status` 只有布尔值，follow 没开（后台监控、流预算已满）
+  时读不到它，所以会话从运行变为空闲后用 `session/page` 补读日志尾部最近的 `turn/end`，再补发一条
+  `session.execution.*`。读不到结局只报告空闲，不猜成成功；同一轮只补一次。
 - 轮次边界：`turn/start` 折算为 `Message.turnId`（`turn:<n>`），`TranscriptRows` 按它切 turn，
   因此 goal 轮、自动继续、压缩检查点这类没有可显示用户提问的轮次不会并入上一轮。
   `goal` / `tool-goal` / `compact-checkpoint` 注入轮次折成一行 notice（“目标轮次”/“目标完成”/
