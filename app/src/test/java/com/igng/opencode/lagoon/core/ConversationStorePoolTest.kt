@@ -68,7 +68,7 @@ class ConversationStorePoolTest {
     val pool = ConversationStorePool(capacity = 4)
     val session = Session(id = "s1", title = "会话", directory = "/repo", updated = 1_000L)
     val msg = Message(id = "m1", role = "user", created = 1_000L, parts = listOf(MessagePart(id = "p1", type = "text", text = "开始")))
-    val goal = RemoteGoal(id = "g1", revision = 1, objective = "完成优化", phase = "active", maxRounds = 10, roundsStarted = 1, activation = "armed", blockedReason = null)
+    val goal = RemoteGoal(id = "g1", revision = 1, objective = "完成优化", phase = "active", activation = "armed", blockedReason = null)
     val schedule = RemoteSchedule(id = "sch1", kind = "daily", title = "巡检", prompt = "跑巡检", scheduledAt = "2026-11-08T00:00:00Z", detail = "08:00")
     val change = FileChange(path = "a.kt", after = "", additions = 3, deletions = 1)
 

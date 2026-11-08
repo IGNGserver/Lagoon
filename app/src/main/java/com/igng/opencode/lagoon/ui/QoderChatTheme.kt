@@ -40,7 +40,7 @@ internal fun QoderChatTheme(content: @Composable () -> Unit) {
   HyperLagoonTheme(content = content)
 }
 
-internal enum class QoderGlyph { BACK, CLOSE, MORE, THINK, CHECK, ERROR, INFO, CHEVRON, DOWN, PLUS, SEND, STOP, MIC, WARNING, COMPUTER }
+internal enum class QoderGlyph { BACK, CLOSE, MORE, THINK, CHECK, ERROR, INFO, CHEVRON, DOWN, PLUS, SEND, STOP, MIC, WARNING, COMPUTER, GOAL, LIST, RING }
 
 /** Drawn stroke icons, rather than font glyphs whose weight/shape changes with the phone's font. */
 @Composable
@@ -82,6 +82,16 @@ internal fun QoderIcon(glyph: QoderGlyph, modifier: Modifier = Modifier.size(22.
       QoderGlyph.WARNING -> { path(listOf(12f to 2f, 22f to 21f, 2f to 21f), true); line(12f, 8f, 12f, 13.5f); drawCircle(color, 1.1f * u, p(12f, 17f)) }
       QoderGlyph.COMPUTER -> { path(listOf(3f to 4f, 21f to 4f, 21f to 17f, 3f to 17f), true); line(2f, 21f, 22f, 21f) }
       QoderGlyph.MIC -> { drawRoundRect(color, p(9f, 2f), androidx.compose.ui.geometry.Size(6f * u, 12f * u), androidx.compose.ui.geometry.CornerRadius(3f * u), style = Stroke(1.9f * u)); drawArc(color, 0f, 180f, false, p(5f, 6f), androidx.compose.ui.geometry.Size(14f * u, 12f * u), style = Stroke(1.9f * u)); line(12f, 18f, 12f, 22f) }
+      QoderGlyph.GOAL -> {
+        drawCircle(color, 8.5f * u, p(12f, 12f), style = Stroke(2.0f * u))
+        drawCircle(color, 2.2f * u, p(12f, 12f))
+      }
+      QoderGlyph.LIST -> {
+        line(3.5f, 6.5f, 5.5f, 8.5f); line(5.5f, 8.5f, 8.5f, 4.5f); line(11.5f, 6.5f, 20.5f, 6.5f)
+        line(3.5f, 13f, 5.5f, 15f); line(5.5f, 15f, 8.5f, 11f); line(11.5f, 13f, 20.5f, 13f)
+        line(11.5f, 19.5f, 20.5f, 19.5f)
+      }
+      QoderGlyph.RING -> drawCircle(color, 6.5f * u, p(12f, 12f), style = Stroke(1.9f * u))
     }
   }
 }

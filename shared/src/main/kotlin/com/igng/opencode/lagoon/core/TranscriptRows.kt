@@ -52,7 +52,8 @@ object TranscriptRows {
   private const val TIME_GAP_MS = 30 * 60 * 1000L
   private const val MAX_DIFF_FILES = 10
 
-  private val HIDDEN_TOOLS = setOf("todowrite")
+  // 任务清单由输入框上方的小胶囊 + 面板承载，原始工具行（整表 JSON）不再占据时间线。
+  private val HIDDEN_TOOLS = setOf("todowrite", "todo_write")
   private val EDIT_TOOLS = setOf("edit", "write", "patch", "apply_patch")
   private val FINISHED_TOOLS = setOf("completed", "error")
   private val ACTIVE_STATUSES = setOf("running", "pending")
