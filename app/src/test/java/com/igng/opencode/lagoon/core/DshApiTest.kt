@@ -956,6 +956,60 @@ class DshApiTest {
     }
   }
 
+  /**
+   * 在生成中途打开会话：Host 只把进行中的 attempt 放进**开帧**的 `assistantStream`，之后不再补
+   * `start`。基线里的紧凑记录要重放，后续 `chunk` 也要按登记好的 attempt 落位——否则手机看到的是
+   * "会话在跑但一直不出字"。
+   */
+  @Test fun snapshotAssistantStreamBaselineSeedsLiveDeltas() = runBlocking {
+    val server = MockWebServer().also { it.start() }
+    try {
+      server.dispatcher = object : Dispatcher() {
+        override fun dispatch(request: RecordedRequest): MockResponse = when {
+          request.path!!.startsWith("/?token") || request.path == "/" -> rootOk()
+          request.path == "/api/session/list" -> envelope("""{"items":[${sessionRow(running = true)}]}""")
+          request.path == "/api/remote.mux" -> MockResponse().withWebSocketUpgrade(object : WebSocketListener() {
+            override fun onMessage(webSocket: WebSocket, text: String) {
+              val frame = JSONObject(text)
+              if (frame.optString("type") != "open") return
+              val id = frame.getString("streamId")
+              when (frame.getString("endpoint")) {
+                "\$events" -> webSocket.send("""{"type":"item","streamId":"$id","value":{"type":"ready","clientId":"c1","host":{"home":"/home"}}}""")
+                "session/follow" -> {
+                  val baseline = JSONObject()
+                    .put("type", "snapshot")
+                    .put("header", JSONObject().put("version", 4).put("id", "s1").put("createdAt", 1).put("cwd", "/repo"))
+                    .put("cursor", 3).put("hasMore", false).put("records", JSONArray())
+                    .put("assistantStream", JSONObject().put("revision", 5).put("activeAttempt", JSONObject()
+                      .put("attemptId", "a9").put("startedAfterSeq", 3).put("turn", 2).put("step", 1).put("nextIndex", 2)
+                      .put("stream", JSONArray()
+                        .put(JSONObject().put("type", "chunk").put("time", 10)
+                          .put("chunk", JSONObject().put("type", "text-delta").put("index", 0).put("text", "先")))
+                        .put(JSONObject().put("type", "text-chunks").put("time0", 20).put("index", 0)
+                          .put("dt", JSONArray().put(5)).put("texts", JSONArray().put("中").put("后"))))))
+                  webSocket.send(JSONObject().put("type", "item").put("streamId", id).put("value", baseline).toString())
+                  // 基线之后同一条 attempt 的实时增量：没有 start 帧也要能落位。
+                  webSocket.send("""{"type":"item","streamId":"$id","value":{"type":"assistant-stream","frame":{"type":"chunk","attemptId":"a9","revision":5,"index":2,"time":30,"chunk":{"type":"text-delta","index":0,"text":"再"}}}}""")
+                }
+              }
+            }
+          })
+          else -> MockResponse().setResponseCode(404)
+        }
+      }
+      val client = api(server)
+      client.rootSessionsPage("/repo")
+      val events = withTimeout(20_000) { client.events {}.take(6).toList() }
+      assertEquals(listOf("session.step.started", "session.text.started"), events.take(2).map { it.type })
+      // 基线里两条紧凑记录拆成三段增量，之后实时帧继续追加。
+      assertEquals(listOf("先", "中", "后", "再"), events.drop(2).filter { it.type == "session.text.delta" }
+        .map { it.properties.getString("delta") })
+      assertEquals("msg_2:1", events[3].properties.getString("assistantMessageID"))
+    } finally {
+      server.shutdown()
+    }
+  }
+
   @Test fun liveUserMessagesAreSourceGatedAndDurableIdsIncludeSession() = runBlocking {
     val server = MockWebServer().also { it.start() }
     try {
