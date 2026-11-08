@@ -41,7 +41,14 @@ class PersistentConnectionsTest {
     }
   }
 
-  private suspend fun awaitCondition(test: () -> Boolean) = withTimeout(8000) { while (!test()) delay(20) }
+  /**
+   * Every wait here polls a strict condition, so the timeout only bounds patience, never correctness.
+   * A short one used to turn runner load into a false failure: the release job runs the same tasks next
+   * to `assembleRelease` and has repeatedly needed more than 8 s for the first connection or the cache
+   * paint, which blocked two publishes on `anOfflineColdStartNeverTreatsPersistedRunningAsAFreshClaim`.
+   */
+  private suspend fun awaitCondition(test: () -> Boolean) =
+    withTimeout(AWAIT_TIMEOUT_MILLIS) { while (!test()) delay(POLL_INTERVAL_MILLIS) }
 
   @Test fun filterChangesShareClientsAndDoNotDisconnectTheOtherServer() = runBlocking {
     MockWebServer().use { first -> MockWebServer().use { second ->
@@ -361,4 +368,9 @@ class PersistentConnectionsTest {
     }
   }
 
+  private companion object {
+    /** Generous on purpose: CI runners share a core budget with the APK build. */
+    const val AWAIT_TIMEOUT_MILLIS = 25_000L
+    const val POLL_INTERVAL_MILLIS = 20L
+  }
 }

@@ -156,7 +156,9 @@ class DisabledProfileTest {
 
         assertTrue(store.setProfileEnabled("a", true))
         manager.start(store.profiles(), include = setOf("a"))
-        withTimeout(8_000) { while (snapshots["a"]?.connected != true) delay(20) }
+        // Polls a strict condition, so the timeout only bounds patience; 8 s turned runner load into a
+        // false failure in the release job (see PersistentConnectionsTest.awaitCondition).
+        withTimeout(25_000) { while (snapshots["a"]?.connected != true) delay(20) }
         assertTrue(requests.get() > 0)
       } finally {
         manager.stop()
