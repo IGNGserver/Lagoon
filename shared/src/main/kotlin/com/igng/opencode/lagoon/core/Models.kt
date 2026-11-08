@@ -155,10 +155,13 @@ data class QuestionPrompt(
 data class QuestionRequest(val id: String, val sessionId: String, val directory: String, val questions: List<QuestionPrompt>, val form: Boolean = true)
 data class FileChange(
   val path: String,
+  /** Shown when there is no patch to render: a binary/oversized file, or a patch the server truncated. */
   val after: String,
   val additions: Int,
   val deletions: Int,
-  val patch: String = ""
+  val patch: String = "",
+  /** Server-classified change kind (`added` / `deleted` / `modified`); empty when the harness omits it. */
+  val status: String = ""
 )
 data class FileNode(val path: String, val type: String)
 data class FileContent(val type: String, val content: String)
@@ -282,8 +285,13 @@ internal fun JSONObject.toProject(): Project {
 }
 internal fun JSONObject.toSession(): Session {
   val info = sessionInfo()
-  val root = info.obj("location").str("directory").let { path -> info.str("subpath").takeIf { it.isNotBlank() }?.let { "${path.trimEnd('/')}/${it.trim('/')}" } ?: path }
-    .ifBlank { info.str("directory") }
+  /*
+   * `location.directory` is already the session's working directory. `subpath` is that same location
+   * expressed relative to its project root (`path.relative(project.directory, location.directory)`),
+   * so it is a label for grouping — appending it would duplicate the segment and produce a path that
+   * does not exist (a worktree at /repo/wt reporting subpath "wt" became /repo/wt/wt).
+   */
+  val root = info.obj("location").str("directory").ifBlank { info.str("directory") }
   return Session(
     info.str("id"), root,
     info.str("title"), info.longPath("time", "updated"), info.str("parentID").ifBlank { null },
@@ -478,10 +486,17 @@ internal fun JSONObject.toPermission(directory: String): PermissionRequest {
     arr("save").strings(), source.str("messageID"), source.str("id")
   )
 }
-/** `FileDiff.Info` from `GET /api/session/{id}/diff`. */
+/**
+ * `FileDiff.Info` from `GET /api/session/{id}/diff`: `{file, patch, additions, deletions, status, more?}`.
+ * There is no `after` on the wire — the field of that name is a local "cannot render" note, filled here
+ * from the server's own truncation flag instead of from a property that never arrives.
+ */
 internal fun JSONObject.toChange(): FileChange = FileChange(
-  path = str("file").ifBlank { str("path") }, after = str("after"), additions = optInt("additions"), deletions = optInt("deletions"),
-  patch = str("patch")
+  path = str("file").ifBlank { str("path") },
+  after = if (optBoolean("more")) "补丁已截断，仅显示前一部分" else "",
+  additions = optInt("additions"), deletions = optInt("deletions"),
+  patch = str("patch"),
+  status = str("status")
 )
 
 /**

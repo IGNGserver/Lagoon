@@ -390,15 +390,15 @@ class OpenCodeApi(
   override suspend fun hasPendingInput(id: String): Boolean = withContext(Dispatchers.IO) {
     dataArray(obj(sessionPath(id, "/inbox"))).length() > 0
   }
-  /** Sessions whose foreground drain this server currently owns; every other session is idle. */
+  /**
+   * Sessions whose foreground drain this server currently owns; every other session is idle.
+   * The published shape is `{data: {"ses_…": {type: "running"}}}`: the keys are session ids. Reading the
+   * *object* is required — treating `data` as a plain key set would invent a session literally named
+   * `data` on any response we did not expect.
+   */
   override suspend fun activeSessions(): Set<String> {
     val json = withContext(Dispatchers.IO) { jsonObject(request("GET", "api/session/active")) }
-    // 有的实现把运行集合包成数组；不能把 {"data":[...]} 的键名当成会话 id（会造出一个叫 data 的假会话）。
-    json.optJSONObject("data")?.let { return it.keys().asSequence().toSet() }
-    val array = json.optJSONArray("data") ?: json.optJSONArray("sessions")
-    if (array != null) return array.objects().mapNotNull { it.str("id").ifBlank { it.str("sessionID") }.takeIf(String::isNotBlank) }.toSet()
-    if (!json.has("data")) return json.keys().asSequence().toSet()
-    return emptySet()
+    return json.optJSONObject("data")?.keys()?.asSequence()?.toSet().orEmpty()
   }
 
   /**
@@ -431,22 +431,60 @@ class OpenCodeApi(
     val endpoint = capabilities().actions[SessionAction.RENAME] ?: unsupported("服务器未提供重命名")
     request(endpoint.method, endpoint.path(session), body = JSONObject().put("title", title))
   }
-  /** Archive (or, when the instance allows a null `time.archived`, restore) through the documented update body. */
+  /**
+   * `PATCH /api/session/{id}` with a top-level `archived` boolean (OpenCode ≥ 2.1.0): `true` archives,
+   * `false` restores. The server treats a repeat of the current state as a no-op, so there is no
+   * timestamp to send — the read side derives `time.archived` itself.
+   */
   override suspend fun setArchived(session: Session, archived: Boolean, now: Long) {
     val archive = capabilities().archive ?: unsupported("服务器未提供归档")
     if (!archived && !archive.restorable) unsupported("服务器不支持取消归档")
-    request(archive.endpoint.method, archive.endpoint.path(session), body = JSONObject().put("time", JSONObject().put("archived", if (archived) now else JSONObject.NULL)))
+    request(archive.endpoint.method, archive.endpoint.path(session), body = JSONObject().put("archived", archived))
   }
   override suspend fun deleteSession(session: Session) { request("DELETE", sessionPath(session.id)) }
   override suspend fun forkSession(session: Session): Session = dataObject(requestObject("POST", sessionPath(session.id, "/fork"), JSONObject())).toSession()
   override suspend fun abort(session: Session) { request("POST", sessionPath(session.id, "/interrupt")) }
-  override suspend fun compact(session: Session) { request("POST", sessionPath(session.id, "/compact")) }
+  /**
+   * Official compaction admission: a client-minted id makes a repeated tap idempotent, and `steer` runs
+   * the compaction at the next step boundary instead of queueing behind pending prompts.
+   */
+  override suspend fun compact(session: Session) {
+    request("POST", sessionPath(session.id, "/compact"),
+      body = JSONObject().put("id", MessageIds.ascending()).put("delivery", Delivery.STEER.wire))
+  }
   override suspend fun revert(session: Session, messageId: String) {
     request("POST", sessionPath(session.id, "/revert/stage"), body = JSONObject().put("messageID", messageId))
   }
   override suspend fun unrevert(session: Session) {
     val endpoint = capabilities().actions[SessionAction.UNREVERT] ?: unsupported("服务器未提供恢复撤销")
     request(endpoint.method, endpoint.path(session))
+  }
+
+  /**
+   * Queued input control (`session.inbox.update` / `session.inbox.cancel`). OpenCode has no in-place
+   * edit: the official semantic for "edit a queued prompt" is cancel plus re-admit, so the original
+   * attachments are read back first and travel with the replacement.
+   */
+  override suspend fun updateQueue(sessionId: String, itemId: String, action: QueueAction): Boolean {
+    val path = "api/session/${segment(sessionId)}/inbox/${segment(itemId)}"
+    return when (action) {
+      QueueAction.Steer -> { request("PATCH", path, body = JSONObject().put("delivery", Delivery.STEER.wire)); true }
+      QueueAction.Remove -> { request("DELETE", path); true }
+      is QueueAction.Edit -> editQueued(sessionId, itemId, path, action.text)
+    }
+  }
+  private suspend fun editQueued(sessionId: String, itemId: String, path: String, text: String): Boolean {
+    // Read the admitted payload before cancelling it: the files are already resolved on the server and
+    // are the only copy of what the user attached.
+    val previous = withContext(Dispatchers.IO) {
+      dataArray(obj("api/session/${segment(sessionId)}/inbox")).objects().firstOrNull { it.str("id") == itemId }
+        ?.obj("payload")?.optJSONArray("files")
+    }
+    request("DELETE", path)
+    val body = JSONObject().put("id", MessageIds.ascending()).put("text", text).put("delivery", Delivery.QUEUE.wire)
+    if (previous != null && previous.length() > 0) body.put("files", previous)
+    retryOnce { request("POST", sessionPath(sessionId, "/prompt"), body = body) }
+    return true
   }
 
   /**
@@ -461,7 +499,7 @@ class OpenCodeApi(
     files(session, references, inline)?.let { body.put("files", it) }
     val metadata = JSONObject()
     if (!agent.isNullOrBlank()) metadata.put("agent", agent)
-    if (model != null) metadata.put("model", modelRef(model))
+    if (model != null) metadata.put("model", metadataModel(model))
     if (metadata.length() > 0) body.put("metadata", metadata)
     retryOnce { request("POST", sessionPath(session.id, "/prompt"), body = body) }
   }
@@ -478,6 +516,13 @@ class OpenCodeApi(
     if (model != null) request("POST", sessionPath(session.id, "/model"), body = JSONObject().put("model", modelRef(model)))
   }
   private fun modelRef(model: ModelChoice) = JSONObject().put("providerID", model.providerId).put("id", model.modelId)
+    .apply { model.variant?.let { put("variant", it) } }
+  /**
+   * `Model.Ref` on `POST /session/{id}/model` uses `id`, but the official composer records the same
+   * selection in `metadata.model` under `modelID`; writing `id` there leaves the row unreadable to other
+   * clients.
+   */
+  private fun metadataModel(model: ModelChoice) = JSONObject().put("providerID", model.providerId).put("modelID", model.modelId)
     .apply { model.variant?.let { put("variant", it) } }
   private fun files(session: Session, references: List<FileReference>, inline: List<InlineFile>): JSONArray? {
     if (references.isEmpty() && inline.isEmpty()) return null

@@ -267,10 +267,11 @@ class OpenCodeApiTest {
     }
   }
 
-  @Test fun archivingWritesTimeArchivedAndRestoringSendsNull() = runBlocking {
+  /** OpenCode 2.1+ archives through a top-level boolean; restoring sends `false`, never `null`. */
+  @Test fun archivingWritesATopLevelArchivedBooleanAndRestoringSendsFalse() = runBlocking {
     MockWebServer().use { server ->
       server.enqueue(MockResponse().setBody("""{"paths":{"/api/session/{sessionID}":{"patch":{"requestBody":{"content":{"application/json":{"schema":
-        {"type":"object","properties":{"time":{"type":"object","properties":{"archived":{"type":["number","null"]}}}}}}}}}}}}"""))
+        {"type":"object","properties":{"title":{"anyOf":[{"type":"string"},{"type":"null"}]},"archived":{"anyOf":[{"type":"boolean"},{"type":"null"}]}}}}}}}}}}"""))
       repeat(2) { server.enqueue(MockResponse().setResponseCode(204)) }
       val api = api(server)
       api.discoverCapabilities(); server.takeRequest()
@@ -278,9 +279,27 @@ class OpenCodeApiTest {
       api.setArchived(session, true, now = 42)
       val archive = server.takeRequest()
       assertEquals("PATCH", archive.method); assertEquals("/api/session/ses_1", archive.requestUrl?.encodedPath)
-      assertEquals(42L, JSONObject(archive.body.readUtf8()).getJSONObject("time").getLong("archived"))
+      val archived = JSONObject(archive.body.readUtf8())
+      assertEquals(true, archived.getBoolean("archived"))
+      assertFalse("a wall-clock timestamp is not part of the contract", archived.has("time"))
       api.setArchived(session, false)
-      assertTrue(JSONObject(server.takeRequest().body.readUtf8()).getJSONObject("time").isNull("archived"))
+      val restore = JSONObject(server.takeRequest().body.readUtf8())
+      assertEquals(false, restore.getBoolean("archived"))
+      assertFalse(restore.isNull("archived"))
+    }
+  }
+
+  /** Without a readable document the baseline still offers archiving, because every 2.1+ release has it. */
+  @Test fun archivingStaysAvailableWhenTheDocumentCannotBeRead() = runBlocking {
+    MockWebServer().use { server ->
+      server.enqueue(MockResponse().setResponseCode(404))
+      server.enqueue(MockResponse().setResponseCode(204))
+      val api = api(server)
+      api.discoverCapabilities(); server.takeRequest()
+      api.setArchived(Session("ses_1", "/repo", "Old", 0), true)
+      val archive = server.takeRequest()
+      assertEquals("PATCH", archive.method); assertEquals("/api/session/ses_1", archive.requestUrl?.encodedPath)
+      assertEquals(true, JSONObject(archive.body.readUtf8()).getBoolean("archived"))
     }
   }
 
@@ -524,6 +543,99 @@ class OpenCodeApiTest {
     assertTrue(runCatching { """{"id":"evt_1","data":{}}""".toServerEvent("fallback") }.isFailure)
     // A legacy envelope without its own id may still use the SSE cursor id.
     assertEquals("fallback", """{"type":"server.connected","data":{}}""".toServerEvent("fallback").id)
+  }
+
+  @Test fun activeSessionsReadsSessionIdsFromTheDataObject() = runBlocking {
+    MockWebServer().use { server ->
+      server.enqueue(MockResponse().setBody("""{"data":{"ses_a":{"type":"running"},"ses_b":{"type":"running"}}}"""))
+      assertEquals(setOf("ses_a", "ses_b"), api(server).activeSessions())
+    }
+  }
+
+  /** An unexpected shape must yield no sessions, never a session literally named `data`. */
+  @Test fun activeSessionsNeverInventsASessionFromAnEnvelopeKey() = runBlocking {
+    MockWebServer().use { server ->
+      server.enqueue(MockResponse().setBody("""{"data":[]}"""))
+      assertTrue(api(server).activeSessions().isEmpty())
+    }
+  }
+
+  @Test fun compactionAdmitsWithAClientMintedIdAndSteers() = runBlocking {
+    MockWebServer().use { server ->
+      server.enqueue(MockResponse().setResponseCode(200).setBody("""{"data":{"id":"msg_1"}}"""))
+      api(server).compact(Session("ses_1", "/repo", "T", 0))
+      val request = server.takeRequest()
+      assertEquals("POST", request.method); assertEquals("/api/session/ses_1/compact", request.requestUrl?.encodedPath)
+      val body = JSONObject(request.body.readUtf8())
+      assertTrue("重试必须能以同一 id 幂等", body.str("id").startsWith("msg_"))
+      assertEquals("steer", body.str("delivery"))
+    }
+  }
+
+  /**
+   * `metadata.model` is written the way the official composer writes it (`modelID`, not `id`). A queued
+   * prompt is exactly the case that relies on it: the selection is recorded but not applied yet.
+   */
+  @Test fun promptMetadataRecordsTheModelUnderModelID() = runBlocking {
+    MockWebServer().use { server ->
+      server.enqueue(MockResponse().setResponseCode(200).setBody("""{"data":{}}"""))
+      api(server).send(Session("ses_1", "/repo", "T", 0), "hi", agent = "build",
+        model = ModelChoice("anthropic", "claude-x", "Claude X", variant = "high"), delivery = Delivery.QUEUE)
+      val request = server.takeRequest()
+      assertEquals("/api/session/ses_1/prompt", request.requestUrl?.encodedPath)
+      val body = JSONObject(request.body.readUtf8())
+      val model = body.obj("metadata").obj("model")
+      assertEquals("anthropic", model.str("providerID"))
+      assertEquals("claude-x", model.str("modelID"))
+      assertEquals("high", model.str("variant"))
+      assertFalse(model.has("id"))
+      assertEquals("build", body.obj("metadata").str("agent"))
+      assertEquals("queue", body.str("delivery"))
+    }
+  }
+
+  @Test fun steeringAQueuedPromptUsesTheInboxDeliveryRoute() = runBlocking {
+    MockWebServer().use { server ->
+      server.enqueue(MockResponse().setResponseCode(204))
+      assertTrue(api(server).updateQueue("ses_1", "msg_9", QueueAction.Steer))
+      val request = server.takeRequest()
+      assertEquals("PATCH", request.method)
+      assertEquals("/api/session/ses_1/inbox/msg_9", request.requestUrl?.encodedPath)
+      assertEquals("steer", JSONObject(request.body.readUtf8()).str("delivery"))
+    }
+  }
+
+  @Test fun cancellingAQueuedPromptDeletesTheInboxItem() = runBlocking {
+    MockWebServer().use { server ->
+      server.enqueue(MockResponse().setResponseCode(204))
+      assertTrue(api(server).updateQueue("ses_1", "msg_9", QueueAction.Remove))
+      val request = server.takeRequest()
+      assertEquals("DELETE", request.method)
+      assertEquals("/api/session/ses_1/inbox/msg_9", request.requestUrl?.encodedPath)
+    }
+  }
+
+  /**
+   * There is no in-place edit upstream: cancelling and re-admitting is the official semantic, so the
+   * attachments already resolved on the server must travel with the replacement.
+   */
+  @Test fun editingAQueuedPromptCancelsThenReAdmitsWithTheOriginalFiles() = runBlocking {
+    MockWebServer().use { server ->
+      server.enqueue(MockResponse().setBody("""{"data":[{"id":"msg_9","type":"user","delivery":"queue",
+        "time":{"created":1},"payload":{"text":"old","files":[{"uri":"file:///repo/a.png","name":"a.png"}]}}]}"""))
+      server.enqueue(MockResponse().setResponseCode(204))
+      server.enqueue(MockResponse().setResponseCode(200).setBody("""{"data":{}}"""))
+      assertTrue(api(server).updateQueue("ses_1", "msg_9", QueueAction.Edit("new text")))
+      assertEquals("/api/session/ses_1/inbox", server.takeRequest().requestUrl?.encodedPath)
+      val cancel = server.takeRequest()
+      assertEquals("DELETE", cancel.method); assertEquals("/api/session/ses_1/inbox/msg_9", cancel.requestUrl?.encodedPath)
+      val readmit = server.takeRequest()
+      assertEquals("POST", readmit.method); assertEquals("/api/session/ses_1/prompt", readmit.requestUrl?.encodedPath)
+      val body = JSONObject(readmit.body.readUtf8())
+      assertEquals("new text", body.str("text"))
+      assertEquals("queue", body.str("delivery"))
+      assertEquals("file:///repo/a.png", body.arr("files").objects().single().str("uri"))
+    }
   }
 
 }

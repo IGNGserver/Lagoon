@@ -413,11 +413,12 @@ internal class AllServersOverview(
                       })
                     }
                     if (event.type == "session.moved") {
+                      // `subpath` is the moved location relative to the project root, not an extra
+                      // segment: appending it would duplicate the path (see `toSession`).
                       val directory = props.obj("location").str("directory")
-                      val subpath = props.str("subpath")
                       snapshot = snapshot.copy(sessions = snapshot.sessions.map { session ->
                         if (session.id == sessionId) session.copy(
-                          directory = if (subpath.isBlank()) directory else "${directory.trimEnd('/')}/${subpath.trim('/')}",
+                          directory = directory.ifBlank { session.directory },
                           projectId = props.str("projectID").ifBlank { session.projectId })
                         else session
                       })

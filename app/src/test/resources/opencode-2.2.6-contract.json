@@ -1,0 +1,496 @@
+{
+ "openapi": "3.1.0",
+ "info": {
+  "title": "opencode HttpApi contract excerpt",
+  "version": "2.2.6"
+ },
+ "_source": "verbatim from anomalyco/opencode v2.2.6 packages/protocol/openapi.json (responses reduced to status codes)",
+ "paths": {
+  "/api/session/{sessionID}": {
+   "patch": {
+    "operationId": "session.update",
+    "parameters": [
+     {
+      "name": "sessionID",
+      "in": "path",
+      "schema": {
+       "type": "string",
+       "pattern": "^ses"
+      },
+      "required": true
+     }
+    ],
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "properties": {
+         "title": {
+          "anyOf": [
+           {
+            "type": "string"
+           },
+           {
+            "type": "null"
+           }
+          ]
+         },
+         "metadata": {
+          "anyOf": [
+           {
+            "type": "object"
+           },
+           {
+            "type": "null"
+           }
+          ]
+         },
+         "permissions": {
+          "anyOf": [
+           {
+            "type": "array",
+            "items": {
+             "type": "object",
+             "properties": {
+              "action": {
+               "type": "string"
+              },
+              "resource": {
+               "type": "string"
+              },
+              "effect": {
+               "type": "string",
+               "enum": [
+                "allow",
+                "deny",
+                "ask"
+               ]
+              }
+             },
+             "required": [
+              "action",
+              "resource",
+              "effect"
+             ],
+             "additionalProperties": false
+            }
+           },
+           {
+            "type": "null"
+           }
+          ]
+         },
+         "archived": {
+          "anyOf": [
+           {
+            "type": "boolean"
+           },
+           {
+            "type": "null"
+           }
+          ],
+          "description": "Archive the session with true or restore it with false. Repeating the current state is a no-op."
+         }
+        },
+        "additionalProperties": false
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "204": {
+      "description": "(body omitted)"
+     },
+     "400": {
+      "description": "(body omitted)"
+     },
+     "401": {
+      "description": "(body omitted)"
+     },
+     "404": {
+      "description": "(body omitted)"
+     }
+    }
+   },
+   "delete": {
+    "operationId": "session.remove",
+    "parameters": [
+     {
+      "name": "sessionID",
+      "in": "path",
+      "schema": {
+       "type": "string",
+       "pattern": "^ses"
+      },
+      "required": true
+     }
+    ],
+    "responses": {
+     "204": {
+      "description": "(body omitted)"
+     },
+     "400": {
+      "description": "(body omitted)"
+     },
+     "401": {
+      "description": "(body omitted)"
+     },
+     "404": {
+      "description": "(body omitted)"
+     }
+    }
+   }
+  },
+  "/api/session/{sessionID}/revert": {
+   "delete": {
+    "operationId": "session.revert.clear",
+    "parameters": [
+     {
+      "name": "sessionID",
+      "in": "path",
+      "schema": {
+       "type": "string",
+       "pattern": "^ses"
+      },
+      "required": true
+     }
+    ],
+    "responses": {
+     "204": {
+      "description": "(body omitted)"
+     },
+     "400": {
+      "description": "(body omitted)"
+     },
+     "401": {
+      "description": "(body omitted)"
+     },
+     "404": {
+      "description": "(body omitted)"
+     },
+     "409": {
+      "description": "(body omitted)"
+     },
+     "500": {
+      "description": "(body omitted)"
+     }
+    }
+   }
+  },
+  "/api/session/{sessionID}/diff": {
+   "get": {
+    "operationId": "session.diff",
+    "parameters": [
+     {
+      "name": "sessionID",
+      "in": "path",
+      "schema": {
+       "type": "string",
+       "pattern": "^ses"
+      },
+      "required": true
+     },
+     {
+      "name": "from",
+      "in": "query",
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string",
+         "pattern": "^msg_"
+        }
+       ],
+       "description": "User message whose turn to diff. Defaults to the turn of the newest user message."
+      },
+      "required": false
+     },
+     {
+      "name": "to",
+      "in": "query",
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string",
+         "pattern": "^msg_"
+        }
+       ],
+       "description": "Later user message whose turn ends the range. Defaults to the turn of `from` alone."
+      },
+      "required": false
+     },
+     {
+      "name": "context",
+      "in": "query",
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        }
+       ],
+       "description": "Unchanged lines around each hunk. Omit for full-file patches."
+      },
+      "required": false
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "(body omitted)"
+     },
+     "400": {
+      "description": "(body omitted)"
+     },
+     "401": {
+      "description": "(body omitted)"
+     },
+     "404": {
+      "description": "(body omitted)"
+     },
+     "500": {
+      "description": "(body omitted)"
+     }
+    }
+   }
+  },
+  "/api/session/{sessionID}/view": {
+   "post": {
+    "operationId": "session.view",
+    "parameters": [
+     {
+      "name": "sessionID",
+      "in": "path",
+      "schema": {
+       "type": "string",
+       "pattern": "^ses"
+      },
+      "required": true
+     }
+    ],
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "properties": {
+         "idle": {
+          "type": "number"
+         }
+        },
+        "required": [
+         "idle"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "204": {
+      "description": "(body omitted)"
+     },
+     "400": {
+      "description": "(body omitted)"
+     },
+     "401": {
+      "description": "(body omitted)"
+     },
+     "404": {
+      "description": "(body omitted)"
+     }
+    }
+   }
+  },
+  "/api/session/{sessionID}/inbox/{inboxID}": {
+   "patch": {
+    "operationId": "session.inbox.update",
+    "parameters": [
+     {
+      "name": "sessionID",
+      "in": "path",
+      "schema": {
+       "type": "string",
+       "pattern": "^ses"
+      },
+      "required": true
+     },
+     {
+      "name": "inboxID",
+      "in": "path",
+      "schema": {
+       "type": "string",
+       "pattern": "^msg_"
+      },
+      "required": true
+     }
+    ],
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "properties": {
+         "delivery": {
+          "type": "string",
+          "enum": [
+           "steer",
+           "queue"
+          ]
+         }
+        },
+        "required": [
+         "delivery"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "204": {
+      "description": "(body omitted)"
+     },
+     "400": {
+      "description": "(body omitted)"
+     },
+     "401": {
+      "description": "(body omitted)"
+     },
+     "404": {
+      "description": "(body omitted)"
+     },
+     "409": {
+      "description": "(body omitted)"
+     }
+    }
+   },
+   "delete": {
+    "operationId": "session.inbox.cancel",
+    "parameters": [
+     {
+      "name": "sessionID",
+      "in": "path",
+      "schema": {
+       "type": "string",
+       "pattern": "^ses"
+      },
+      "required": true
+     },
+     {
+      "name": "inboxID",
+      "in": "path",
+      "schema": {
+       "type": "string",
+       "pattern": "^msg_"
+      },
+      "required": true
+     }
+    ],
+    "responses": {
+     "204": {
+      "description": "(body omitted)"
+     },
+     "400": {
+      "description": "(body omitted)"
+     },
+     "401": {
+      "description": "(body omitted)"
+     },
+     "404": {
+      "description": "(body omitted)"
+     }
+    }
+   }
+  },
+  "/api/session/{sessionID}/compact": {
+   "post": {
+    "operationId": "session.compact",
+    "parameters": [
+     {
+      "name": "sessionID",
+      "in": "path",
+      "schema": {
+       "type": "string",
+       "pattern": "^ses"
+      },
+      "required": true
+     }
+    ],
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "properties": {
+         "id": {
+          "anyOf": [
+           {
+            "type": "string",
+            "pattern": "^msg_"
+           },
+           {
+            "type": "null"
+           }
+          ]
+         },
+         "delivery": {
+          "anyOf": [
+           {
+            "type": "string",
+            "enum": [
+             "steer",
+             "queue"
+            ]
+           },
+           {
+            "type": "null"
+           }
+          ]
+         }
+        },
+        "additionalProperties": false
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "description": "(body omitted)"
+     },
+     "400": {
+      "description": "(body omitted)"
+     },
+     "401": {
+      "description": "(body omitted)"
+     },
+     "404": {
+      "description": "(body omitted)"
+     },
+     "409": {
+      "description": "(body omitted)"
+     }
+    }
+   }
+  },
+  "/api/session/active": {
+   "get": {
+    "operationId": "session.active",
+    "parameters": [],
+    "responses": {
+     "200": {
+      "description": "(body omitted)"
+     },
+     "400": {
+      "description": "(body omitted)"
+     },
+     "401": {
+      "description": "(body omitted)"
+     }
+    }
+   }
+  }
+ }
+}

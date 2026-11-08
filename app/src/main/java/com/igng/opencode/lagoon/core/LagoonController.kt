@@ -2390,11 +2390,21 @@ class LagoonController private constructor(private val appContext: Context) {
       }
       "session.renamed" -> updateSession(sessionId) { it.copy(title = props.str("title")) }
       "session.moved" -> updateSession(sessionId) { session ->
+        // `location.directory` is the new working directory; `subpath` is that location relative to
+        // the project root, so it must not be appended (see `toSession`).
         val location = props.obj("location").str("directory")
-        val subpath = props.str("subpath")
-        session.copy(directory = if (subpath.isBlank()) location else "${location.trimEnd('/')}/${subpath.trim('/')}", projectId = props.str("projectID").ifBlank { session.projectId })
+        session.copy(directory = location.ifBlank { session.directory }, projectId = props.str("projectID").ifBlank { session.projectId })
       }
       "session.viewed" -> updateSession(sessionId) { it.copy(viewed = maxOf(it.viewed, props.optLong("idle"))) }
+      /*
+       * Archive state can change from another client (the desktop, a TUI). Without these two cases the
+       * phone kept showing a freshly archived session until the next full reconcile, and — since
+       * `/api/session` returns both states — it stayed in the home list as if it were live work.
+       */
+      "session.archived" -> updateSession(sessionId) { it.copy(archived = true) }
+      "session.unarchived" -> updateSession(sessionId) { it.copy(archived = false) }
+      // A fork creates a session this client has never read; re-read the id the event names.
+      "session.forked" -> refreshSession(sessionId)
       "session.revert.staged" -> updateSession(sessionId) { it.copy(revertMessageId = props.obj("revert").str("messageID").ifBlank { null }) }
       "session.revert.cleared", "session.revert.committed" -> updateSession(sessionId) { it.copy(revertMessageId = null) }
       "session.agent.selected", "session.model.selected" -> {

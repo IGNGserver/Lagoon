@@ -5,8 +5,12 @@ import org.json.JSONObject
 /** Session operations whose route changed between OpenCode 2.0.x releases. */
 enum class SessionAction { RENAME, UNREVERT }
 data class ActionEndpoint(val method: String, val path: String)
-/** Session update that accepts `{time: {archived}}`; [restorable] when `archived` may be sent as null to un-archive. */
-data class ArchiveEndpoint(val endpoint: ActionEndpoint, val restorable: Boolean)
+/**
+ * The session update that accepts a top-level `archived` boolean (`PATCH /api/session/{id}`, OpenCode
+ * ≥ 2.1.0). [restorable] is true when the same field accepts `false`, which is how the server restores a
+ * session — never by sending `null`.
+ */
+data class ArchiveEndpoint(val endpoint: ActionEndpoint, val restorable: Boolean = true)
 
 /**
  * Per-instance contract read from the server's `/openapi.json`. Routes that are stable across every
@@ -15,9 +19,8 @@ data class ArchiveEndpoint(val endpoint: ActionEndpoint, val restorable: Boolean
  * - rename: `POST /rename` (2.0.0–2.0.x) → `PATCH /api/session/{id}` with `title`;
  * - unrevert: `POST /revert/clear` → `DELETE /revert`;
  * - diff and view only exist on newer releases;
- * - archiving is not part of the published 2.x contract. It is offered only when the instance documents
- *   `time.archived` on its session update body ([ArchiveEndpoint]); otherwise archived sessions are only
- *   listed, never written.
+ * - archiving was added in 2.1.0 as a top-level `archived` boolean on the session update body. It is
+ *   offered only when the instance documents that field ([ArchiveEndpoint]); 2.0.x has no way to archive.
  */
 data class ApiCapabilities(
   val actions: Map<SessionAction, ActionEndpoint> = emptyMap(),
@@ -44,7 +47,8 @@ data class ApiCapabilities(
         SessionAction.RENAME to ActionEndpoint("PATCH", "api/session/{id}"),
         SessionAction.UNREVERT to ActionEndpoint("DELETE", "api/session/{id}/revert")
       ),
-      diff = true, sessionView = ActionEndpoint("POST", "api/session/{id}/view")
+      diff = true, sessionView = ActionEndpoint("POST", "api/session/{id}/view"),
+      archive = ArchiveEndpoint(ActionEndpoint("PATCH", "api/session/{id}"))
     )
 
     fun fromDocument(document: JSONObject): ApiCapabilities {
@@ -76,17 +80,36 @@ data class ApiCapabilities(
       val actions = mutableMapOf<SessionAction, ActionEndpoint>()
       (endpoint("", "PATCH", setOf("title")) ?: endpoint("/rename", "POST", setOf("title")))?.let { actions[SessionAction.RENAME] = it }
       (endpoint("/revert", "DELETE") ?: endpoint("/revert/clear", "POST"))?.let { actions[SessionAction.UNREVERT] = it }
+      /*
+       * Archiving is a plain boolean on the session update body (`archived: true` archives, `false`
+       * restores). The body may only ever need that one field from us, so any other required sibling
+       * means the instance expects a shape we do not write.
+       */
       val archive = paths.keys().asSequence().firstOrNull { Regex("^/api/session/\\{[^/}]+\\}$").matches(it) && paths.obj(it).has("patch") }?.let { path ->
         val input = body(paths.obj(path).obj("patch"))
         val required = input.arr("required")
-        val raw = schema(input.obj("properties").optJSONObject("time") ?: return@let null).obj("properties").optJSONObject("archived") ?: return@let null
-        if ((0 until required.length()).any { required.optString(it) != "time" }) return@let null
-        val restorable = raw.optBoolean("nullable") || listOf("anyOf", "oneOf").any { key -> raw.arr(key).objects().any { it.optString("type") == "null" } } ||
-          raw.optJSONArray("type")?.let { types -> (0 until types.length()).any { types.optString(it) == "null" } } == true
-        ArchiveEndpoint(ActionEndpoint("PATCH", path.removePrefix("/")), restorable)
+        if ((0 until required.length()).any { required.optString(it) != "archived" }) return@let null
+        val raw = input.obj("properties").optJSONObject("archived") ?: return@let null
+        ArchiveEndpoint(ActionEndpoint("PATCH", path.removePrefix("/")), restorable = acceptsFalse(raw))
       }
       return ApiCapabilities(actions, endpoint("/diff", "GET") != null,
         endpoint("/view", "POST", setOf("idle")), archive, documented = true)
+    }
+
+    /**
+     * Whether a property schema admits `false`, which is how the server restores a session. Unwrapping the
+     * nullable/union branches matters: the published schema is `boolean | null`, never a bare boolean.
+     */
+    private fun acceptsFalse(raw: JSONObject): Boolean {
+      val type = raw.opt("type")
+      val types = when (type) {
+        is String -> listOf(type)
+        is org.json.JSONArray -> (0 until type.length()).map { type.optString(it) }
+        else -> emptyList()
+      }
+      if ("boolean" in types) return true
+      raw.optJSONArray("enum")?.let { values -> return (0 until values.length()).any { values.opt(it) == false } }
+      return listOf("anyOf", "oneOf").any { key -> raw.arr(key).objects().any(::acceptsFalse) }
     }
   }
 }
