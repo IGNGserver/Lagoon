@@ -8,7 +8,7 @@ import java.io.File
  * MIUIX 弹层作用域与密码键盘的源码级结构回归测试。
  *
  * SuperDialog/SuperBottomSheet 只注册进 Miuix Scaffold 内部 provide 的弹层列表，
- * 并只由 Scaffold 自带的 MiuixPopupHost 渲染。MainActivity 一旦把 ServersModal 的
+ * 并只由 Scaffold 自带的 MiuixPopupHost 渲染。MainActivity 一旦把整页编辑器（以及半屏抽屉）的
  * 声明点挪出 Scaffold 内容 lambda，弹层会静默落进无人渲染的默认列表，表现就是
  * “点击添加服务器没有任何反应”（#15 修过一次，#21 重构 Dock 时又移了出去）。
  * JVM 单测无法起 Compose 组合，这里用源码扫描守住这两条已付出过代价的回归线。
@@ -67,8 +67,12 @@ class PopupScopeRegressionTest {
     error("第 $open 行的 '$openChar' 找不到配对闭括号")
   }
 
+  /**
+   * 设备编辑器是路由上的一层，由根 AnimatedContent 渲染——它必须落在 Scaffold 的 content lambda 里，
+   * 否则它内部的 SuperDialog/SuperBottomSheet 注册不到 MiuixPopupHost；MIUIX 半屏抽屉仍走同一作用域。
+   */
   @Test
-  fun serversModalStaysInsideScaffoldContent() {
+  fun deviceEditorAndSheetsStayInsideScaffoldContent() {
     val text = uiSource("MainActivity.kt")
     val scaffold = text.indexOf("Scaffold(")
     assertTrue("MainActivity 已不再使用 MIUIX Scaffold？", scaffold >= 0)
@@ -78,13 +82,15 @@ class PopupScopeRegressionTest {
     val open = text.indexOf('{', marker)
     val close = matchDelimited(text, open)
 
-    val modal = text.indexOf("ServersModal(", open)
+    val editor = text.indexOf("DeviceEditorScreen(", open)
     assertTrue(
-      "ServersModal 被移出 Scaffold 内容作用域：SuperBottomSheet 注册不到 MiuixPopupHost，" +
-        "点击添加服务器将没有任何反应（见 #15/#21 的反复）。请把弹层移回 content lambda 内。",
-      modal in open until close
+      "DeviceEditorScreen 被移出 Scaffold 内容作用域：页面内的 MIUIX 弹层注册不到 MiuixPopupHost，" +
+        "点保存/删除会没有任何反应（见 #15/#21 的反复）。请把整页编辑器放回 content lambda 内。",
+      editor in open until close
     )
-    // 服务器弹层确由 MIUIX 机制渲染，而不是被改成了不受此机制保护的自定义浮层。
+    val sheet = text.indexOf("RemoteEnrollSheet(", open)
+    assertTrue("远程中枢接入抽屉必须同样落在 content lambda 内", sheet in open until close)
+    // 半屏抽屉确由 MIUIX 机制渲染，而不是被改成了不受此机制保护的自定义浮层。
     assertTrue(uiSource("HyperComponents.kt").contains("SuperBottomSheet("))
   }
 

@@ -40,10 +40,28 @@ class InformationArchitectureRegressionTest {
     assertTrue(details.contains("确认删除"))
   }
 
-  @Test fun addDeviceIsAnIndependentFullScreenFlow() {
-    val source = uiSource("AddDeviceSheet.kt")
-    assertTrue(source.contains("BackHandler(onBack = ::back)"))
+  @Test fun deviceEditorIsAnIndependentFullScreenPage() {
+    val source = uiSource("DeviceEditorScreen.kt")
     assertTrue(source.contains("PageTopBar("))
-    assertFalse("添加设备不再应该重新包成底部弹窗", source.contains("HyperBottomSheet("))
+    assertTrue("编辑已有连接与添加设备共用同一整页", source.contains("ProfileEditorPage("))
+    assertTrue("SSH 主机表单也是这一页的一层", source.contains("SshHostForm("))
+    assertFalse("设备编辑器不再是底部弹窗", source.contains("HyperBottomSheet("))
+  }
+
+  /**
+   * 设备子树的每一级都必须是路由上的一层：一旦有人把它写回 `detailId` / `showingAddDevice` 这类
+   * 页面内部状态，进出场就会重新变回硬切——根 AnimatedContent 只认 NavRoute 的变化。
+   */
+  @Test fun everyDevicePageIsARouteNotAPageLocalFlag() {
+    val list = uiSource("DeviceManagementScreen.kt")
+    assertFalse("设备详情不能再用页面内 detailId 切换", list.contains("detailId"))
+    assertTrue("列表只负责选择设备，详情由路由渲染", list.contains("onOpenDevice"))
+    val activity = uiSource("MainActivity.kt")
+    assertFalse("整页编辑器不能再作为根内容之外的布尔浮层", activity.contains("var showingAddDevice"))
+    assertFalse("连接编辑不能再退回半屏抽屉", activity.contains("ServersModal("))
+    assertTrue("整页编辑器是路由的一层", activity.contains("target.editors.isNotEmpty()"))
+    val stack = uiSource("AppBackStack.kt")
+    assertTrue(stack.contains("fun openDevice("))
+    assertTrue(stack.contains("fun openEditor("))
   }
 }

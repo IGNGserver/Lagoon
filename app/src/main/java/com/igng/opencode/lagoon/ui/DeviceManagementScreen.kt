@@ -1,6 +1,5 @@
 package com.igng.opencode.lagoon.ui
 
-import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -8,7 +7,6 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.*
-import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import com.igng.opencode.lagoon.core.*
@@ -19,7 +17,12 @@ import top.yukonga.miuix.kmp.icon.MiuixIcons
 import top.yukonga.miuix.kmp.icon.extended.Add
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 
-/** Device list: identity and health only. Configuration lives in the pushed device detail. */
+/**
+ * Device list: identity and health only. Configuration lives in the pushed device detail.
+ *
+ * 这一页只负责“哪台设备”，不负责“打开哪一页”：详情是路由上的一层（[SessionNavigation.openDevice]），
+ * 由根 AnimatedContent 渲染，所以进入与返回都有与首页进设备页完全相同的整页过渡。
+ */
 @Composable
 internal fun DeviceManagementScreen(
   state: LagoonState,
@@ -27,27 +30,10 @@ internal fun DeviceManagementScreen(
   onBack: () -> Unit,
   onAddDevice: () -> Unit,
   onEditGroup: (String?) -> Unit,
-  onEditProfile: (ServerProfile) -> Unit,
+  onOpenDevice: (String) -> Unit,
   onManageHub: () -> Unit,
   onManageModels: () -> Unit
 ) {
-  var detailId by rememberSaveable { mutableStateOf<String?>(null) }
-  val detail = state.profiles.firstOrNull { it.id == detailId }
-  BackHandler(enabled = detail != null) { detailId = null }
-  LaunchedEffect(detailId, detail) { if (detailId != null && detail == null) detailId = null }
-  if (detail != null) {
-    DeviceDetailScreen(
-      profile = detail,
-      state = state,
-      controller = controller,
-      onBack = { detailId = null },
-      onEditProfile = { onEditProfile(detail) },
-      onManageHub = onManageHub,
-      onManageModels = onManageModels
-    )
-    return
-  }
-
   val online = state.profiles.count { profile -> deviceConnected(profile, state) }
   Column(Modifier.fillMaxSize().background(HyperTheme.colors.canvas)) {
     PageTopBar("设备", onBack, actions = {
@@ -83,7 +69,7 @@ internal fun DeviceManagementScreen(
               summary = profile.endpointSummary + if (profile.enabled) "" else " · 已停用",
               value = deviceStatusLabel(profile, state),
               showChevron = true,
-              onClick = { detailId = profile.id }
+              onClick = { onOpenDevice(profile.id) }
             )
           }
           if (state.profiles.isEmpty()) {
@@ -117,16 +103,26 @@ internal fun DeviceManagementScreen(
   }
 }
 
+/**
+ * 设备详情：设备级配置的唯一入口。它和列表一样是路由上的一层，所以压栈/出栈都走同一套整页过渡，
+ * 侧滑返回时下面垫着的是真实的设备列表。
+ */
 @Composable
-private fun DeviceDetailScreen(
-  profile: ServerProfile,
+internal fun DeviceDetailScreen(
   state: LagoonState,
   controller: LagoonController,
+  deviceId: String,
   onBack: () -> Unit,
-  onEditProfile: () -> Unit,
+  onEditProfile: (ServerProfile) -> Unit,
   onManageHub: () -> Unit,
   onManageModels: () -> Unit
 ) {
+  val profile = state.profiles.firstOrNull { it.id == deviceId }
+  if (profile == null) {
+    // 设备在别处被删掉：这一层已经没有内容，退回列表，而不是把一张空白页留在栈上。
+    LaunchedEffect(deviceId) { onBack() }
+    return
+  }
   var confirmingDelete by remember { mutableStateOf(false) }
   var showDefaults by remember { mutableStateOf(false) }
   var remoteDialog by remember { mutableStateOf<String?>(null) }
@@ -198,7 +194,7 @@ private fun DeviceDetailScreen(
       item {
         HyperGroupTitle("连接设置")
         HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(vertical = 4.dp)) {
-          HyperRow(title = "编辑连接信息", summary = "地址、账号、认证与传输安全", trailing = { DropdownChevron() }, onClick = onEditProfile)
+          HyperRow(title = "编辑连接信息", summary = "地址、账号、认证与传输安全", trailing = { DropdownChevron() }, onClick = { onEditProfile(profile) })
           if (isRemote) {
             HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
             HyperRow(title = "中枢与远程主机", summary = "查看账号、接入其他主机或退出中枢", trailing = { DropdownChevron() }, onClick = onManageHub)

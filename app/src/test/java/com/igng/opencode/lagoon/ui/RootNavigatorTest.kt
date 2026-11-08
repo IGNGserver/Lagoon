@@ -166,4 +166,31 @@ class RootNavigatorTest {
     release()
     assertNull("提交后底层预览立即撤掉", navigator.gesture?.peek)
   }
+
+  /**
+   * 设备详情与编辑器现在是路由上的一层，所以侧滑返回时垫在下面的就是真实的上一级
+   * （详情 → 列表、编辑器 → 详情），而不是一张空白的“设备”页。
+   */
+  @Test fun theBackGesturePreviewsTheRealPageUnderneathADevicePage() {
+    navigator.navigate(SessionNavigation(RootPage.DEVICES).openDevice("dev-1"))
+    swipe()
+    assertEquals("dev-1", navigator.gesture?.route?.device)
+    assertEquals(2, navigator.gesture?.route?.depth)
+    assertEquals(SessionNavigation(RootPage.DEVICES).route, navigator.gesture?.peek)
+    release()
+    assertEquals(SessionNavigation(RootPage.DEVICES), navigator.navigation)
+
+    navigator.navigate(
+      SessionNavigation(RootPage.DEVICES)
+        .openDevice("dev-1")
+        .openEditor(DeviceEditorRoute(profileId = "dev-1"))
+    )
+    swipe()
+    assertEquals("编辑器之下是设备详情", "dev-1", navigator.gesture?.peek?.device)
+    assertEquals("编辑器本身不在预览里", emptyList<DeviceEditorRoute>(), navigator.gesture?.peek?.editors)
+    release()
+    assertEquals("返回一层只退掉编辑器，落回设备详情", emptyList<DeviceEditorRoute>(), navigator.navigation.editors)
+    assertEquals("dev-1", navigator.navigation.device)
+    assertEquals(0, systemBacks)
+  }
 }

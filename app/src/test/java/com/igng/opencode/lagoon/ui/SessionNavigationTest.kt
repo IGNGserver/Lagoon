@@ -2,6 +2,7 @@ package com.igng.opencode.lagoon.ui
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -56,5 +57,59 @@ class SessionNavigationTest {
     assertEquals(1, SessionNavigation().open("s1").route.depth)
     assertEquals(1, SessionNavigation(RootPage.SETTINGS).route.depth)
     assertEquals(3, SessionNavigation(RootPage.DEVICES).open("p").open("c", true).route.depth)
+  }
+
+  /* ---------------- 设备详情与整页编辑器：每一级都是路由上的一层 ---------------- */
+
+  @Test fun deviceDetailIsOneLevelAboveTheDeviceList() {
+    val list = SessionNavigation(RootPage.DEVICES)
+    val detail = list.openDevice("dev-1")
+    assertTrue(detail.canGoBack)
+    assertEquals("dev-1", detail.route.device)
+    assertTrue("详情比列表深一层，过渡方向才能判对", detail.route.depth > list.route.depth)
+    assertEquals(list, detail.back())
+    // 再退一层就是会话首页，下一次返回交给系统。
+    assertEquals(SessionNavigation(), list.back())
+  }
+
+  @Test fun editorIsPushedOverDetailAndPopsOneLevelAtATime() {
+    val detail = SessionNavigation(RootPage.DEVICES).openDevice("dev-1")
+    val profileEditor = detail.openEditor(DeviceEditorRoute(profileId = "dev-1"))
+    val sshEditor = profileEditor.openEditor(DeviceEditorRoute(tab = AddDeviceTab.DSH, sshHostId = ""))
+    assertEquals(2, sshEditor.editors.size)
+    assertEquals("最上层才是屏幕上那一页", "", sshEditor.route.editor?.sshHostId)
+    assertTrue(sshEditor.route.depth > profileEditor.route.depth)
+
+    // 从 SSH 表单返回落回 SSH 设备表单，而不是直接跳回设备详情。
+    assertEquals(profileEditor, sshEditor.back())
+    assertEquals(detail, profileEditor.back())
+    assertEquals(SessionNavigation(RootPage.DEVICES), detail.back())
+  }
+
+  @Test fun editorOpenedWithoutADeviceReturnsToThePageItCameFrom() {
+    val fromHome = SessionNavigation().openEditor(DeviceEditorRoute())
+    assertEquals(RootPage.HOME, fromHome.route.page)
+    assertEquals(SessionNavigation(), fromHome.back())
+    val fromSettings = SessionNavigation(RootPage.SETTINGS).openEditor(DeviceEditorRoute())
+    assertEquals(SessionNavigation(RootPage.SETTINGS), fromSettings.back())
+  }
+
+  @Test fun openingADeviceDropsAnEditorLeftOpenAndAViceVersa() {
+    val stale = SessionNavigation(RootPage.DEVICES).openEditor(DeviceEditorRoute()).openDevice("dev-1")
+    assertTrue("进入设备详情不应该把编辑器叠在下面", stale.editors.isEmpty())
+    val chat = SessionNavigation(RootPage.DEVICES).openDevice("dev-1").open("s1")
+    assertNull("打开会话后设备层不再存在于栈上", chat.device)
+    assertEquals(SessionNavigation(RootPage.DEVICES).open("s1"), chat)
+  }
+
+  @Test fun editorLevelsSurviveARotationThroughTheirEncodedForm() {
+    val editors = listOf(
+      DeviceEditorRoute(tab = AddDeviceTab.DSH),
+      DeviceEditorRoute(tab = AddDeviceTab.DSH, sshHostId = "")
+    )
+    assertEquals(editors, decodeDeviceEditors(encodeDeviceEditors(editors)))
+    val editing = listOf(DeviceEditorRoute(tab = AddDeviceTab.OPENCODE, profileId = "dev-1", sshHostId = "host-1"))
+    assertEquals(editing, decodeDeviceEditors(encodeDeviceEditors(editing)))
+    assertTrue("坏行不能把整页重建弄崩", decodeDeviceEditors(listOf("nonsense")).isEmpty())
   }
 }

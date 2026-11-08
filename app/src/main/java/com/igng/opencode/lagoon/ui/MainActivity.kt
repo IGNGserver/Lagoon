@@ -58,8 +58,10 @@ class MainActivity : ComponentActivity() {
     val controller = LagoonController.get(this)
     navigator = RootNavigator(
       SessionNavigation(
-        savedInstanceState?.getString(KEY_NAV_PAGE)?.let { runCatching { RootPage.valueOf(it) }.getOrNull() } ?: RootPage.HOME,
-        savedInstanceState?.getStringArrayList(KEY_NAV_SESSIONS).orEmpty()
+        page = savedInstanceState?.getString(KEY_NAV_PAGE)?.let { runCatching { RootPage.valueOf(it) }.getOrNull() } ?: RootPage.HOME,
+        sessions = savedInstanceState?.getStringArrayList(KEY_NAV_SESSIONS).orEmpty(),
+        device = savedInstanceState?.getString(KEY_NAV_DEVICE),
+        editors = decodeDeviceEditors(savedInstanceState?.getStringArrayList(KEY_NAV_EDITORS))
       ),
       if (savedInstanceState?.containsKey(KEY_NAV_SERVER) == true) savedInstanceState.getString(KEY_NAV_SERVER) else controller.state.value.serverId
     )
@@ -89,14 +91,10 @@ class MainActivity : ComponentActivity() {
       val dark = themeMode == ThemeMode.DARK || themeMode == ThemeMode.SYSTEM && systemDark
       var previewBack by remember { mutableStateOf(preferences.getBoolean("previewBack", true)) }
       var refreshMode by remember { mutableStateOf(controller.currentRefreshMode()) }
-      // The server sheet edits one profile (null = add a new one); switching happens on the home capsules.
-       // Saveable: rotating or switching the system theme recreates the activity, which closed these sheets.
-       var showingServerForm by rememberSaveable { mutableStateOf(false) }
-       var editingServerId by rememberSaveable { mutableStateOf<String?>(null) }
-       var showingAddDevice by rememberSaveable { mutableStateOf(false) }
-       var addingOpenCodeId by rememberSaveable { mutableStateOf<String?>(null) }
-       var addingSshHostId by rememberSaveable { mutableStateOf<String?>(null) }
-       var showingScope by rememberSaveable { mutableStateOf(false) }
+      // 设备详情与整页编辑器是路由上的一层（见 SessionNavigation.openDevice / openEditor）：以前用
+      // showingAddDevice / detailId 这类布尔量覆盖整页，切换只是同一页里的内容替换，AnimatedContent
+      // 收不到路由变化，设备子树的进退场就全都没有动画。
+      var showingScope by rememberSaveable { mutableStateOf(false) }
        var showingModelManagement by rememberSaveable { mutableStateOf(false) }
        var showingRemoteEnroll by rememberSaveable { mutableStateOf(false) }
        var showingRemoteHosts by rememberSaveable { mutableStateOf(false) }
@@ -124,6 +122,19 @@ class MainActivity : ComponentActivity() {
           else navigator.navigation.open(target.sessionId, child))
         controller.openConversation(target)
       }
+       // 整页编辑器：添加入口、编辑已有连接、SSH 主机表单都是路由上的一层，进出场走同一套页面弹簧。
+       fun openEditor(target: DeviceEditorRoute) {
+         focusManager.clearFocus()
+         navigator.navigate(navigator.navigation.openEditor(target))
+       }
+       fun addDevice(tab: AddDeviceTab = AddDeviceTab.OPENCODE) = openEditor(DeviceEditorRoute(tab = tab))
+       fun editDevice(profile: ServerProfile) = openEditor(
+         DeviceEditorRoute(
+           tab = if (profile.kind == ServerKind.OPENCODE) AddDeviceTab.OPENCODE else AddDeviceTab.DSH,
+           profileId = profile.id,
+           sshHostId = profile.sshHostId
+         )
+       )
        // A blank draft always opens immediately: connecting is the page's job, not a gate on this
        // button. The server is the only mandatory choice; its workspace is picked on the page.
        fun openDraftFor(profile: ServerProfile) {
@@ -145,7 +156,7 @@ class MainActivity : ComponentActivity() {
          val target = state.defaultDraftServer(draftScope)
          if (target == null) {
            when {
-             state.profiles.isEmpty() -> showingAddDevice = true
+             state.profiles.isEmpty() -> addDevice()
              draftScope != null -> { globalMessage = "这个设备组没有启用的连接"; globalMessageType = MiuixToastType.INFO }
              else -> { globalMessage = "所有连接均已禁用，请先在设备管理中启用"; globalMessageType = MiuixToastType.INFO }
            }
@@ -154,22 +165,6 @@ class MainActivity : ComponentActivity() {
          openDraftFor(target.profile)
        }
       fun openPage(page: RootPage) { focusManager.clearFocus(); navigator.navigate(navigator.navigation.push(page)) }
-      fun editServer(profile: ServerProfile?) {
-        showingAddDevice = false; addingOpenCodeId = null; addingSshHostId = null
-        editingServerId = profile?.id; showingServerForm = true
-      }
-      fun editDevice(profile: ServerProfile) {
-        showingServerForm = false; editingServerId = null
-        when {
-          profile.sshHostId != null -> { addingSshHostId = profile.sshHostId; addingOpenCodeId = null; showingAddDevice = true }
-          profile.kind == ServerKind.OPENCODE -> { addingOpenCodeId = profile.id; addingSshHostId = null; showingAddDevice = true }
-          else -> editServer(profile)
-        }
-      }
-      fun addDevice() {
-        showingServerForm = false; editingServerId = null
-        addingOpenCodeId = null; addingSshHostId = null; showingAddDevice = true
-      }
       fun goBack() = navigator.goBack()
       SideEffect {
         navigator.onBack = { from, to ->
@@ -251,8 +246,10 @@ class MainActivity : ComponentActivity() {
       SideEffect {
         navigator.screenWidth = screenWidthPx
         FrameStats.page = when {
+          route.editors.isNotEmpty() -> "设备编辑器"
           route.session == DRAFT_SESSION -> "新会话"
           route.session != null -> "会话"
+          route.device != null -> "设备详情"
           route.page == RootPage.DEVICES -> "设备管理"
           route.page == RootPage.SETTINGS -> "设置"
           else -> "首页"
@@ -297,16 +294,30 @@ class MainActivity : ComponentActivity() {
                 else -> state
               }
               when {
+                // 整页编辑器压在设备列表/详情之上，与其它页一样由根路由驱动，所以进退场自动有动画。
+                target.editors.isNotEmpty() -> DeviceEditorScreen(
+                  state = state, controller = controller, route = target.editors.last(),
+                  onBack = { goBack() },
+                  onEditSsh = { hostId -> openEditor(DeviceEditorRoute(tab = AddDeviceTab.DSH, sshHostId = hostId)) },
+                  onLoginHub = { goBack(); showingRemoteEnroll = true },
+                  onManageHub = { goBack(); showingRemoteHosts = true }
+                )
                 target.session == DRAFT_SESSION -> DraftScreen(state, controller, onBack = { goBack() }, onModal = {}, interactive = active,
                   profileIds = draftScope, onSwitchServer = { profile -> switchDraftServer(profile) })
                  target.session != null -> ChatScreen(displayed, controller, onBack = { goBack() }, onOpenChild = { child ->
                    controller.state.value.serverId?.let { server -> openSession(SessionTarget(server, child), child = true) }
                  }, onModal = {}, interactive = active)
+                 target.page == RootPage.DEVICES && target.device != null -> DeviceDetailScreen(
+                   state = state, controller = controller, deviceId = target.device, onBack = { goBack() },
+                   onEditProfile = { profile -> editDevice(profile) },
+                   onManageHub = { showingRemoteHosts = true },
+                   onManageModels = { showingModelManagement = true }
+                 )
                  target.page == RootPage.DEVICES -> DeviceManagementScreen(
                    state = state, controller = controller, onBack = { goBack() },
                    onAddDevice = { addDevice() },
                    onEditGroup = { groupId -> editingGroupId = groupId; showingDeviceGroups = true },
-                   onEditProfile = { profile -> editDevice(profile) },
+                   onOpenDevice = { id -> navigator.navigate(navigator.navigation.openDevice(id)) },
                    onManageHub = { showingRemoteHosts = true },
                    onManageModels = { showingModelManagement = true }
                  )
@@ -341,22 +352,9 @@ class MainActivity : ComponentActivity() {
                   targetContentZIndex = 0f
                 }
               } else {
-                // 澎湃 OS 4 原生级推入/弹出：全幅弹簧位移 + 底层 -28% 视差与 0.94 缩放（底层不淡出变透）。
-                val direction = slideDirection(initialState, targetState)
-                if (direction > 0) {
-                  (slideInHorizontally(HyperMotion.pageOffsetSpring) { it * direction } togetherWith
-                    (slideOutHorizontally(HyperMotion.pageOffsetSpring) { -it * direction * 28 / 100 } +
-                      scaleOut(HyperMotion.pageFloatSpring, targetScale = 0.94f))).apply {
-                    targetContentZIndex = 2f
-                  }
-                } else {
-                  ((slideInHorizontally(HyperMotion.pageOffsetSpring) { it * direction * 28 / 100 } +
-                    scaleIn(HyperMotion.pageFloatSpring, initialScale = 0.94f)) togetherWith
-                    (slideOutHorizontally(HyperMotion.pageOffsetSpring) { -it * direction } +
-                      scaleOut(HyperMotion.pageFloatSpring, targetScale = 0.95f))).apply {
-                    targetContentZIndex = 0f
-                  }
-                }
+                // 所有整页（含设备详情与整页编辑器）共用 HyperMotion.pageTransform 这一份弹簧规格：
+                // 全幅位移 + 底层 -28% 视差与 0.94 缩放（底层不淡出变透）。
+                pageTransform(slideDirection(initialState, targetState))
               }
             }, contentKey = { target ->
               // Content identity must match the saveable-scope identity. A draft is one page no
@@ -364,8 +362,10 @@ class MainActivity : ComponentActivity() {
               // AnimatedContent keep the old and new draft composed at once, which collides on
               // the shared "draft:<nonce>" saveable key.
               when {
+                target.editors.isNotEmpty() -> "editor:${target.editors.size}:${target.editors.last().key}"
                 target.session == DRAFT_SESSION -> "draft:$draftNonce"
                 target.session != null -> "chat:${target.serverId}:${target.session}"
+                target.device != null -> "device:${target.device}"
                 else -> "page:${target.page}"
               }
             }, label = "navigation") { target ->
@@ -388,6 +388,9 @@ class MainActivity : ComponentActivity() {
               }.then(if (active) Modifier else Modifier.pointerInput(Unit) { awaitPointerEventScope { while (true) { awaitPointerEvent().changes.forEach { it.consume() } } } })
                 .background(HyperTheme.colors.canvas)) {
                 val key = when {
+                  target.editors.isNotEmpty() -> "editor:${target.editors.size}:${target.editors.last().key}"
+                  // 每台设备详情各有一份 saveable 作用域：过渡时新旧两页会同时组合，共用 key 会直接崩。
+                  target.device != null -> "device:${target.device}"
                   // The server is deliberately not part of this key: switching harness from the
                   // blank page must keep the composer text and its saveable state.
                   target.session == DRAFT_SESSION -> "draft:$draftNonce"
@@ -401,13 +404,8 @@ class MainActivity : ComponentActivity() {
             // background server's read made the whole app look busy.
             MiuixToastHost(globalMessage, globalMessageType, { globalMessage = null }, Modifier.align(Alignment.TopCenter).statusBarsPadding().padding(top = 66.dp))
             // MIUIX popups must stay inside this Scaffold content's popup registry.
-            if (showingServerForm) ServersModal(state, controller, state.profiles.firstOrNull { it.id == editingServerId },
-              onDismiss = { showingServerForm = false; editingServerId = null },
-              onRemoteHosts = {
-                val add = editingServerId == null
-                showingServerForm = false; editingServerId = null
-                if (add) showingRemoteEnroll = true else showingRemoteHosts = true
-              })
+            // 整页编辑器不再挂在这里：它是路由上的一层，由上面的 AnimatedContent 渲染并在进退场时有动画；
+            // 它内部的对话框仍然落在这个作用域里（见 PopupScopeRegressionTest）。
              if (showingScope) HomeScopeSheet(
                state = home,
                allSnapshots = state.allServerSnapshots,
@@ -427,15 +425,6 @@ class MainActivity : ComponentActivity() {
              if (showingDeviceGroups) DeviceGroupsSheet(state, controller, editingGroupId, onDismiss = {
                showingDeviceGroups = false; editingGroupId = null
              })
-            if (showingAddDevice) AddDeviceSheet(
-              state = state,
-              controller = controller,
-              existingOpenCode = state.profiles.firstOrNull { it.id == addingOpenCodeId },
-              initialSshHostId = addingSshHostId,
-              onDismiss = { showingAddDevice = false; addingOpenCodeId = null; addingSshHostId = null },
-              onLoginHub = { showingAddDevice = false; addingOpenCodeId = null; addingSshHostId = null; showingRemoteEnroll = true },
-              onManageHub = { showingAddDevice = false; addingOpenCodeId = null; addingSshHostId = null; showingRemoteHosts = true }
-            )
             if (showingModelManagement) ModelManagementSheet(state, controller) { showingModelManagement = false }
             if (showingRemoteHosts) RemoteHostsSheet(controller, onDismiss = { showingRemoteHosts = false }, onEnroll = {
               showingRemoteHosts = false; showingRemoteEnroll = true
@@ -453,7 +442,13 @@ class MainActivity : ComponentActivity() {
   override fun onSaveInstanceState(outState: Bundle) {
     super.onSaveInstanceState(outState)
     handledDeepLink?.let { outState.putString(KEY_HANDLED_DEEP_LINK, it) }
-    navigator.navigation.let { outState.putString(KEY_NAV_PAGE, it.page.name); outState.putStringArrayList(KEY_NAV_SESSIONS, ArrayList(it.sessions)) }
+    navigator.navigation.let {
+      outState.putString(KEY_NAV_PAGE, it.page.name)
+      outState.putStringArrayList(KEY_NAV_SESSIONS, ArrayList(it.sessions))
+      // 设备详情与编辑器也是路由上的一层：旋转回来后仍停在同一页，不退回设备列表。
+      it.device?.let { id -> outState.putString(KEY_NAV_DEVICE, id) }
+      if (it.editors.isNotEmpty()) outState.putStringArrayList(KEY_NAV_EDITORS, encodeDeviceEditors(it.editors))
+    }
     outState.putString(KEY_NAV_SERVER, navigator.server)
   }
   private fun parseDeepLink(intent: Intent?) {
@@ -470,6 +465,8 @@ class MainActivity : ComponentActivity() {
     const val KEY_HANDLED_DEEP_LINK = "handledDeepLink"
     const val KEY_NAV_PAGE = "navPage"
     const val KEY_NAV_SESSIONS = "navSessions"
+    const val KEY_NAV_DEVICE = "navDevice"
+    const val KEY_NAV_EDITORS = "navEditors"
     const val KEY_NAV_SERVER = "navServer"
   }
 }

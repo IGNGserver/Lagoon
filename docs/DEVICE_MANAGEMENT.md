@@ -26,6 +26,19 @@ DSH 的添加入口收进一个分页，原有直连 DSH（地址 + 启动令牌
 - 首页不再有独立的设备条；添加设备只能从「设备管理」或「设置 › 添加设备」进入。
 - 首页标题打开的「选择范围」面板是唯一的设备/分组/项目/工作区入口：全部设备、设备分组、单台连接都在这里；单台设备范围不再出现临时胶囊，回到顶部选「全部设备」即可。
 
+### 1.1 设备子树的每一级都是路由
+
+设备子树的四层「列表 → 详情 → 编辑 → SSH 表单」都记在 `SessionNavigation` 上
+（`device` 与 `editors`，见 `ui/AppBackStack.kt`），由 `MainActivity` 的根 `AnimatedContent`
+统一渲染，动效规格只有 `HyperMotion.pageTransform` 一份：
+
+- 进入：新页整幅从右侧推入，底层退 28% 并缩到 0.94；返回方向相反，底层不变透明。
+- 每一级返回只退一层：SSH 表单 → DSH 段 → 设备详情 → 设备列表 → 会话首页，下一次返回才交给系统。
+- 预测式返回预览垫在下面的是真实的上一级，而不是空白的“设备”页。
+- 不要再用 `detailId` / `showingAddDevice` 这类页面内布尔量切换整页：根过渡只认 `NavRoute` 的变化，
+  那样写回来就又是硬切（`InformationArchitectureRegressionTest` 会拦截）。
+
+
 ## 2. 添加设备页
 
 顶部两个分页：
@@ -108,9 +121,9 @@ DSH 分页不再提供“直连 DSH”的地址/令牌输入。已有旧版直�
 | 分组存储/迁移 | `app/.../core/DeviceGroupStore.kt` |
 | 首页投影/过滤 | `app/.../core/ServerProjection.kt` |
 | 首页范围面板 | `app/.../ui/ProjectSheets.kt`、`app/.../ui/SessionsHomeScreen.kt` |
-| 设备管理页 | `app/.../ui/DeviceManagementScreen.kt` |
+| 设备管理页（列表 + 详情） | `app/.../ui/DeviceManagementScreen.kt` |
 | 分组编辑 | `app/.../ui/DeviceGroupsSheet.kt` |
-| 添加设备页 | `app/.../ui/AddDeviceSheet.kt` |
+| 添加/编辑设备整页 | `app/.../ui/DeviceEditorScreen.kt` |
 | 控制器 | `app/.../core/LagoonController.kt` |
 | 通知/深链入口 | `app/.../system/NotificationActionReceiver.kt`、`app/.../ui/MainActivity.kt` |
 | 页面路由 | `app/.../ui/AppBackStack.kt`、`MainActivity.kt` |
