@@ -60,7 +60,7 @@ class ConversationActivitySheetTest {
 
   @Test fun segmentedTabsRemainForTheDeviceForm() {
     val components = source("HyperComponents.kt")
-    assertTrue("分段胶囊仍由设备表单使用", source("AddDeviceSheet.kt").contains("HyperSegmentedTabs("))
+    assertTrue("分段胶囊仍由设备表单使用", source("DeviceEditorScreen.kt").contains("HyperSegmentedTabs("))
     assertTrue("分段胶囊的选中语义保留", components.contains("role = Role.Tab") && components.contains("this.selected = selected"))
   }
 }
