@@ -57,15 +57,29 @@ class DshProjectionTest {
       val snapshot = api.recordsToMessages(session, records)
       assertEquals(snapshot, live)
       assertEquals(listOf("notice", "relay", "notice", "notice"), snapshot.map { it.role })
+      assertEquals(listOf("tool-jobs", "agent-message", "subagent-settled", "goal"), snapshot.map { it.sourceKind })
+      assertTrue(snapshot.none { it.isHumanInput })
       assertEquals("bash exited 0", snapshot.first().notice?.detail)
       assertEquals("child", snapshot[1].notice?.target)
       assertTrue(snapshot.all { it.turnId == "turn:2" })
       val rows = TranscriptRows.build(snapshot)
-      assertTrue(rows.none { it.kind == "user" || it.text.contains("Read its output") || it.text.contains("runtime closing") })
-      assertTrue(rows.any { it.kind == "relay" && it.text.contains("子代理结果") })
+      assertTrue(rows.none { it.kind == "user" || it.kind == "relay" || it.text.contains("Read its output") || it.text.contains("runtime closing") })
+      assertTrue(snapshot.any { it.role == "relay" && it.parts.any { part -> part.text.contains("子代理结果") } })
     } finally { api.close() }
   }
 
+  @Test fun missingSourceIsLegacyHumanButExplicitUnknownSourceIsNot() {
+    val api = client()
+    try {
+      val legacy = record("user/message", 1, """{"id":"legacy","content":[{"type":"text","text":"human"}]}""")
+      val unknown = record("user/message", 2, """{"id":"unknown","source":{"kind":"runtime-context"},"content":[{"type":"text","text":"private"}]}""")
+      val malformed = record("user/message", 3, """{"id":"malformed","source":{},"content":[{"type":"text","text":"private"}]}""")
+      val messages = listOf(legacy, unknown, malformed).flatMap { api.translate(session, it.obj("event")) }
+        .fold(emptyList<Message>()) { current, event -> TranscriptProjection.apply(current, event)?.messages ?: current }
+      assertEquals(listOf("legacy"), messages.filter { it.isHumanInput }.map { it.id })
+      assertTrue(messages.none { it.id == "unknown" || it.id == "malformed" })
+    } finally { api.close() }
+  }
   @Test fun translatingOneEventDetachesItsMutableProperties() {
     val api = client()
     try {

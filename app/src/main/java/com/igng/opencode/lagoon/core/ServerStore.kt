@@ -10,6 +10,16 @@ import java.util.concurrent.ConcurrentHashMap
 class ServerStore internal constructor(private val preferences: SharedPreferences, private val secrets: SharedPreferences,
   private val encryptValue: (String) -> String, private val decryptValue: (String) -> String,
   private val appContext: Context? = null) : OverviewStore {
+  init {
+    if (preferences.getInt(PREVIEW_FORMAT_VERSION_KEY, 0) != PREVIEW_FORMAT_VERSION) {
+      val plain = preferences.edit()
+      preferences.all.keys.filter { it.startsWith("preview:") }.forEach(plain::remove)
+      plain.putInt(PREVIEW_FORMAT_VERSION_KEY, PREVIEW_FORMAT_VERSION).apply()
+      val encrypted = secrets.edit()
+      secrets.all.keys.filter { it.startsWith("preview:") }.forEach(encrypted::remove)
+      encrypted.apply()
+    }
+  }
   internal val remoteDevices: RemoteDeviceStore by lazy {
     AndroidRemoteDeviceStore(requireNotNull(appContext) { "Remote device storage needs Android Context" })
   }
@@ -48,6 +58,8 @@ class ServerStore internal constructor(private val preferences: SharedPreference
   }
 
   private companion object {
+    const val PREVIEW_FORMAT_VERSION_KEY = "projectedPreviewFormatVersion"
+    const val PREVIEW_FORMAT_VERSION = 3
     val taskLock = Any()
   }
 
@@ -293,6 +305,7 @@ class ServerStore internal constructor(private val preferences: SharedPreference
       val raw = secrets.getString("preview:$server:$session", null)?.let(decryptValue)
         ?: preferences.getString("preview:$server:$session", "{}").orEmpty()
       val value = JSONObject(raw)
+      if (value.optInt("version", -1) != PREVIEW_FORMAT_VERSION) return@runCatching SessionPreview()
       SessionPreview(SessionContent.valueOf(value.str("content").ifBlank { "UNKNOWN" }), value.str("text"))
     }.getOrDefault(SessionPreview()).also { previewCache[cacheKey] = it }
   }
@@ -301,7 +314,7 @@ class ServerStore internal constructor(private val preferences: SharedPreference
     if (previewCache[cacheKey] == preview) return
     previewCache[cacheKey] = preview
     runCatching {
-      val value = JSONObject().put("content", preview.content.name).put("text", preview.text).toString()
+      val value = JSONObject().put("version", PREVIEW_FORMAT_VERSION).put("content", preview.content.name).put("text", preview.text).toString()
       secrets.edit().putString("preview:$server:$session", encryptValue(value)).apply()
       preferences.edit().remove("preview:$server:$session").apply()
     }.onFailure { Diagnostics.warn("ServerStore", "会话摘要缓存暂不可用") }

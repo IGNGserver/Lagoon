@@ -721,6 +721,12 @@ class TranscriptRowsTest {
     assertEquals(null, TranscriptRows.resolveGroup(emptyList(), clicked))
   }
 
+  @Test fun nonHumanUserRoleCannotBecomeAUserBubbleOrPrompt() {
+    val message = Message("agent", "user", t0, listOf(part("p", "text", text = "Background subagent result")), sourceKind = "subagent-settled")
+    val rows = TranscriptRows.build(listOf(message))
+    assertTrue(rows.none { it.kind == "user" })
+    assertEquals(SessionContent.EMPTY, listOf(message).sessionPreview().content)
+  }
   @Test fun aRelayWakeupHasItsOwnTurnAndIsNotThePreviousUsersAnswer() {
     val messages = listOf(user("u", t0).copy(turnId = "turn:1"),
       assistant("a1", t0 + 1, part("p1", "text", text = "first answer")).copy(turnId = "turn:1"),
@@ -729,7 +735,7 @@ class TranscriptRowsTest {
     val rows = TranscriptRows.build(messages)
     assertEquals(listOf("first answer", "reply to child"), rows.filter { it.kind == "text" }.map { it.text })
     assertEquals(2, rows.count { it.kind == "meta" })
-    assertTrue(rows.indexOfFirst { it.kind == "relay" } > rows.indexOfFirst { it.kind == "meta" })
+    assertTrue(rows.none { it.kind == "relay" })
   }
 
 }

@@ -3,42 +3,54 @@ package com.igng.opencode.lagoon.core
 import org.json.JSONArray
 import org.json.JSONObject
 
-/** Shared durable/live decoding. Attribution comes from source, never from model-facing prose. */
+/**
+ * Projects a DSH `user/message` using durable source attribution. DSH uses role=user for every
+ * model-facing input, so source.kind—not the role or prose—is the author identity.
+ */
 internal fun dshInputMessage(sessionId: String, seq: Long, at: Long, turn: Long?, data: JSONObject): Message? {
-  val source = data.obj("source")
-  val kind = source.str("kind")
+  val hasSource = data.has("source") && data.opt("source") != JSONObject.NULL
+  val source = data.optJSONObject("source")
+  // A present but malformed source is never treated as a legacy human message.
+  if (hasSource && source == null) return null
+  val kind = source?.str("kind")?.takeIf(String::isNotBlank)
+  if (hasSource && kind == null) return null
   val id = data.str("id").ifBlank { "user:$sessionId:$seq" }
   val text = data.arr("content").objects().mapNotNull { it.str("text").takeIf(String::isNotBlank) }.joinToString("\n")
   val turnId = turn?.let { "turn:$it" }
-  if (kind.isBlank() || kind == "user") return JSONObject().put("id", id).put("type", "user")
-    .put("text", text).put("metadata", JSONObject().put("displayText", text)).put("sourceRequestId", source.str("rpcId"))
+  if (!hasSource || kind == "user") return JSONObject().put("id", id).put("type", "user")
+    .put("text", text).put("metadata", JSONObject().put("displayText", text)).put("sourceRequestId", source?.str("rpcId"))
     .put("time", JSONObject().put("created", at)).toMessage().copy(turnId = turnId, sequence = seq,
-      sourceRequestId = source.str("rpcId").ifBlank { null })
-  if (kind == "agent-message" && source.str("form") == "relay") return Message(id, "relay", at,
-    listOf(MessagePart("$id:text", "text", text = text)),
-    notice = Notice("代理来信", target = source.str("senderSessionId").takeIf(String::isNotBlank)),
-    type = kind, turnId = turnId, sequence = seq)
-  val label = when (kind) {
+      sourceRequestId = source?.str("rpcId")?.ifBlank { null }, sourceKind = kind)
+  val sourceKind = kind ?: return null
+  if (sourceKind == "agent-message") {
+    if (source.str("form") != "relay" || source.str("senderSessionId").isBlank()) return null
+    return Message(id, "relay", at,
+      listOf(MessagePart("$id:text", "text", text = text)),
+      notice = Notice("代理来信", target = source.str("senderSessionId")),
+      type = sourceKind, turnId = turnId, sequence = seq, sourceKind = sourceKind)
+  }
+  val label = when (sourceKind) {
     "goal" -> "目标轮次"
     "tool-goal" -> "目标完成"
     "compact-checkpoint" -> "上下文已压缩"
-    "subagent-settled" -> "子代理运行结束"
-    "tool-jobs" -> "后台任务通知"
-    else -> if (source.str("form") == "notice") "系统通知" else return null
+    "subagent-settled" -> if (source.str("form") == "notice" && source.str("senderSessionId").isNotBlank()) "子代理运行结束" else return null
+    "tool-jobs" -> if (source.str("form") == "notice") "后台任务通知" else return null
+    else -> return null
   }
-  val detail = when (kind) {
+  val detail = when (sourceKind) {
     "goal", "tool-goal" -> {
       val round = Regex("Round:\\s*(\\d+/\\d+)").find(text)?.groupValues?.get(1).orEmpty()
       val objective = Regex("Objective:\\s*\"([^\"]*)\"").find(text)?.groupValues?.get(1)?.trim().orEmpty()
       listOf(round, objective.take(160) + if (objective.length > 160) "…" else "").filter(String::isNotBlank).joinToString(" · ")
     }
     "compact-checkpoint" -> ""
-    // Do not show the injected instructions (e.g. "Read its output with job_output") as a user prompt.
+    // Never display model-facing injected instructions as a user prompt.
     else -> source.str("summary")
   }
-  return Message(id, "notice", at, emptyList(), notice = Notice(label, detail,
-    target = source.str("senderSessionId").takeIf { kind == "subagent-settled" && it.isNotBlank() }),
-    type = kind, turnId = turnId, sequence = seq)
+  val activityParts = if (sourceKind == "subagent-settled") listOf(MessagePart("$id:text", "text", text = text)) else emptyList()
+  return Message(id, "notice", at, activityParts, notice = Notice(label, detail,
+    target = source.str("senderSessionId").takeIf { sourceKind == "subagent-settled" && it.isNotBlank() }),
+    type = sourceKind, turnId = turnId, sequence = seq, sourceKind = sourceKind)
 }
 
 /** Keep both structured metadata and every rendered content block in both projection paths. */

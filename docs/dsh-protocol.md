@@ -181,7 +181,7 @@
   没有 source）的 `user/message` 才进入用户时间线；权威消息按 message id 原地替换同 ID 的本地乐观行。
   `agent-message{form:relay,senderSessionId}` 作为有来源的代理来信（Markdown 正文）显示；
   `subagent-settled{form:notice,summary,senderSessionId}` 与 `tool-jobs{form:notice,summary}` 只显示运行时摘要，
-  不把模型侧注入指令误显示成用户气泡。通知保留在原始步骤间，不集中提前。
+  不把模型侧注入指令误显示成用户气泡。通知保留在原始步骤间，不集中提前。投影后的会话消息和首页摘要缓存带有格式版本；来源语义升级时旧版本直接丢弃，不按正文猜测或迁移作者。
   工具 `isError/error/meta` 与文件 content 在实时/快照两条路径共享解码，重开不会把失败变成功；
   多段 text/reasoning 的耐久结果整体校正实时片段，事件属性独立拷贝。
 - 排队输入单独附在时间线尾部，送达前不创建活动轮次；它不会夺走真正执行轮次的运行状态。

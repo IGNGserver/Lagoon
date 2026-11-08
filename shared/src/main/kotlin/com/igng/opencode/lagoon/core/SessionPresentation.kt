@@ -191,8 +191,8 @@ fun groupSessions(sessions: List<Session>, projects: List<Project>): List<Sessio
 }
 
 fun List<Message>.sessionPreview(): SessionPreview {
-  val visible = filter { it.isDisplayable && it.role != "notice" }
-  val firstPrompt = visible.firstOrNull { it.role == "user" }?.parts
+  val visible = filter { it.isDisplayable && !it.isBackgroundActivityMessage && it.role != "notice" }
+  val firstPrompt = visible.firstOrNull { it.isHumanInput }?.parts
     ?.firstOrNull { it.type == "text" }?.text.orEmpty()
   return SessionPreview(if (visible.isEmpty()) SessionContent.EMPTY else SessionContent.CONTENT, firstPrompt.take(300))
 }
@@ -203,10 +203,10 @@ val MessagePart.isDisplayable: Boolean get() = when (type) {
   "file" -> path.isNotBlank()
   else -> false
 }
-/** Official visibility: notices and shell turns always render; `hidden` records never do. */
-val Message.isDisplayable: Boolean get() = when (role) {
-  "hidden" -> false
-  "notice", "relay", "shell" -> true
+val Message.isDisplayable: Boolean get() = when {
+  role == "user" && !isHumanInput -> false
+  role == "hidden" -> false
+  role == "notice" || role == "relay" || role == "shell" -> true
   else -> error?.isNotBlank() == true || retry != null || parts.any { it.isDisplayable }
 }
 

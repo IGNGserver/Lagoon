@@ -19,6 +19,7 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.semantics.toggleableState
@@ -534,6 +535,12 @@ fun HyperSegmentedTabs(
             .height(HYPER_TOUCH_TARGET_DP.dp)
             .clip(pillShape)
             .hyperPress(scaleDown = 0.96f) { onTabSelected(index) }
+            .semantics(mergeDescendants = true) {
+              contentDescription = label
+              role = Role.Tab
+              this.selected = selected
+              stateDescription = if (selected) "已选择" else "未选择"
+            }
             .padding(horizontal = 8.dp),
           contentAlignment = Alignment.Center
         ) {

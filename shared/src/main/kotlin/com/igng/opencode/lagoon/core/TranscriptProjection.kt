@@ -278,18 +278,21 @@ object TranscriptProjection {
       "session.user.message" -> {
         val id = p.str("messageID")
         if (id.isBlank()) null else {
-          val text = p.str("text")
-          val durable = p.optJSONObject("input")?.let {
+          val input = p.optJSONObject("input")
+          val user = if (input != null) {
             val turn = p.optLong("turn").takeIf { it > 0 }
-            dshInputMessage(p.str("sessionID"), p.optLong("sequence"), at, turn, it)
+            // DSH sends model-facing agent/job messages through a user-role wire event. If a
+            // source is present, the source-aware projection is authoritative; never fall back to
+            // the legacy p.text shape when it rejects the source.
+            dshInputMessage(p.str("sessionID"), p.optLong("sequence"), at, turn, input) ?: return null
+          } else {
+            JSONObject().put("id", id).put("type", "user").put("text", p.str("text"))
+              .put("time", JSONObject().put("created", event.created.takeIf { it > 0 } ?: System.currentTimeMillis()))
+              .put("metadata", JSONObject().put("displayText", p.str("text"))).toMessage()
           }
-          val user = durable ?: JSONObject().put("id", id).put("type", "user").put("text", text)
-            .put("sourceRequestId", p.obj("source").str("rpcId"))
-            .put("time", JSONObject().put("created", event.created.takeIf { it > 0 } ?: System.currentTimeMillis()))
-            .put("metadata", JSONObject().put("displayText", text)).toMessage().copy(sourceRequestId = p.obj("source").str("rpcId").ifBlank { null })
           val index = messages.indexOfFirst { current ->
-             current.id == id || (user.sourceRequestId?.isNotBlank() == true && current.sourceRequestId == user.sourceRequestId)
-           }
+            current.id == id || (user.sourceRequestId?.isNotBlank() == true && current.sourceRequestId == user.sourceRequestId)
+          }
           if (index >= 0 && messages[index] == user) null
           else if (index >= 0) result(messages.toMutableList().also { it[index] = user })
           else result((messages + user).sortedBy { it.created })

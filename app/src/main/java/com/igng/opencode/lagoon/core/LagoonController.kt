@@ -3935,7 +3935,8 @@ class LagoonController private constructor(private val appContext: Context) {
       val inline = if (attachments.isEmpty()) emptyList() else kotlinx.coroutines.withContext(Dispatchers.IO) { attachments.map(attachmentImporter::inline) }
       val id = MessageIds.ascending()
       if (command == null && text.isNotBlank()) op.commit { it.copy(messages = it.messages + Message(id, "user", System.currentTimeMillis(),
-        listOf(MessagePart("$id:text", "text", text = text)), agent = agent, model = model, type = "user", sourceRequestId = id)) }
+        listOf(MessagePart("$id:text", "text", text = text)), agent = agent, model = model, type = "user", sourceRequestId = id, sourceKind = "user")) }
+
       try {
         admissionStarted = true
         if (command != null) op.client.command(session, command.name, text.substringAfter(' ', ""), agent, model, op.snapshot.references, inline)
@@ -4222,7 +4223,7 @@ private data class PendingDraft(
 
 /** A prompt held while its server is unreachable (see `LagoonController.queuePrompt`). */
 private data class QueuedPrompt(val serverId: String, val sessionId: String, val text: String, val messageId: String, val created: Long) {
-  fun row() = Message(messageId, "user", created, listOf(MessagePart("$messageId:text", "text", text = text)), queued = true, type = "user")
+  fun row() = Message(messageId, "user", created, listOf(MessagePart("$messageId:text", "text", text = text)), queued = true, type = "user", sourceKind = "user")
 }
 
 /** Rows that may be written to the transcript cache: everything except local pending prompts. */

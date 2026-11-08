@@ -965,10 +965,10 @@ class DshApi(
         .put("assistantMessageID", messageId(data))
         .put("finish", "stop"))
       "user/message" -> {
-        val kind = data.obj("source").str("kind")
-        if (dshInputMessage(session.id, seq, time, turn, data) == null) return emptyList()
-        // Preserve the legacy user event shape, but pass the durable source to the shared decoder.
-        val name = if (kind.isBlank() || kind == "user") "session.user.message" else "session.dsh.input"
+        val projected = dshInputMessage(session.id, seq, time, turn, data) ?: return emptyList()
+        // Keep one source-aware event shape for all DSH inputs; the shared reducer uses the
+        // projected role/source and never falls back from a rejected source to p.text.
+        val name = if (projected.isHumanInput) "session.user.message" else "session.dsh.input"
         emit(name, base.put("messageID", data.str("id").ifBlank { "user:${session.id}:$seq" })
           .put("text", data.arr("content").contentText()).put("input", data))
       }
@@ -1956,9 +1956,13 @@ class DshApi(
   private fun inboxMessage(item: JSONObject, queued: Boolean, created: Long): Message? {
     val id = item.str("id")
     if (id.isBlank()) return null
+    val source = item.optJSONObject("source")
+    val hasSource = item.has("source") && item.opt("source") != JSONObject.NULL
+    val kind = source?.str("kind")?.takeIf(String::isNotBlank)
+    if (hasSource && (source == null || kind != "user")) return null
     val text = item.arr("content").objects().mapNotNull { it.str("text").takeIf(String::isNotBlank) }.joinToString("\n")
     val parts = listOfNotNull(text.takeIf(String::isNotBlank)?.let { MessagePart("$id:text", "text", text = it) })
-    return Message(id, "user", created, parts, queued = queued, type = "user")
+    return Message(id, "user", created, parts, queued = queued, type = "user", sourceKind = kind)
   }
 
   override suspend fun updateQueue(sessionId: String, itemId: String, action: QueueAction): Boolean {
