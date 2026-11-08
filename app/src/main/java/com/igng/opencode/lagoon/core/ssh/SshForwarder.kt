@@ -100,14 +100,13 @@ internal class SshForwarder(private val opener: SshTunnelOpener) : Closeable {
   ) {
     @Volatile private var done = false
 
-    /** JSch's direct-tcpip channel pumps both directions itself; poll only its connection state. */
+    /** JSch pumps both directions. Close the local socket as soon as the channel reports closed,
+     *  with a short poll only as a backstop for channels that never fire [TunnelConnection.onClosed]. */
     fun start() {
+      channel.onClosed { close() }
       Thread({
         try {
-          // JSch marks a direct-tcpip channel connected after the channel-open confirmation, which
-          // can lag the connect() return. Do not treat the first few milliseconds as a close.
-          Thread.sleep(3_000)
-          while (!done && channel.isOpen) Thread.sleep(2_000)
+          while (!done && channel.isOpen) Thread.sleep(1_000)
         } catch (_: InterruptedException) {
           Thread.currentThread().interrupt()
         } finally {

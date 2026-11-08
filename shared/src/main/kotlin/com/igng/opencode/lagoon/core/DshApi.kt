@@ -228,9 +228,12 @@ class DshApi(
 
   // ---------------------------------------------------------------- 鉴权
 
-  /** 当前使用的 Cookie；先取落盘的浏览器 Cookie，过期或缺失时才用令牌/密钥换新的。 */
+  /** 当前使用的 Cookie；先取落盘的浏览器 Cookie，过期或缺失时才用令牌/密钥换新的。
+   *  SSH 隧道带了新的启动令牌时不预置 Cookie：先用令牌交换，令牌已轮换再退回这张 Cookie。 */
   @Volatile private var sessionCookie: String? =
-    credentials.cookie.trim().takeIf { DshCookie.isFresh(it, clock()) && (signingSecret == null || DshCookie.isDurable(it)) }
+    credentials.cookie.trim().takeIf {
+      hostHeader == null && DshCookie.isFresh(it, clock()) && (signingSecret == null || DshCookie.isDurable(it))
+    }
   /** 落盘 Cookie 被服务端拒绝过：换新失败时提示「需要重新配对」而不是泛泛的令牌错误。 */
   @Volatile private var cookieRejected = false
   @Volatile private var renewAttemptedAt = 0L
@@ -243,17 +246,26 @@ class DshApi(
       return@withLock current
     }
     sessionCookie = null
-    connect().also(::adopt)
+    try {
+      connect().also(::adopt)
+    } catch (error: ApiException) {
+      // 隧道里的启动令牌在远端 dsh 重启后作废，但浏览器 Cookie 跨进程仍然有效。
+      val saved = credentials.cookie.trim().takeIf { error.code == AUTH_TOKEN_ROTATED && DshCookie.isFresh(it, clock()) }
+      if (saved != null) saved.also(::adopt) else throw error
+    }
   }
 
   private fun repairMessage(): String = if (signingSecret != null) SECRET_REJECTED_MESSAGE else REPAIR_MESSAGE
 
-  /** 采用新 Cookie；浏览器 Cookie 回调落盘，API Peer Cookie 只放内存（dsh 重启即失效）。 */
+  /** 采用新 Cookie；浏览器 Cookie 回调落盘，API Peer Cookie 只放内存（dsh 重启即失效）。
+   *  SSH 隧道每次换代都会拿到新 token，Cookie 只服务于这一代 DshApi，不写入服务器凭据。 */
   private fun adopt(pair: String) {
     sessionCookie = pair
     cookieRejected = false
     // 密钥模式随时能在本机重签，不需要落盘。
-    if (signingSecret == null && DshCookie.isDurable(pair) && pair != credentials.cookie.trim()) runCatching { onCookie(pair) }
+    if (signingSecret == null && DshCookie.isDurable(pair) && pair != credentials.cookie.trim()) {
+      runCatching { onCookie(pair) }
+    }
   }
 
   /**
@@ -262,7 +274,9 @@ class DshApi(
    */
   @Volatile private var plainListener = false
 
-  /** 服务端拒绝了当前 Cookie（401）：丢弃，并把落盘副本一起清掉，避免每次启动都先撞一次 401。 */
+  /** 服务端拒绝了当前 Cookie（401）：丢弃，并把落盘副本一起清掉，避免每次启动都先撞一次 401。
+   *  SSH 隧道的 Cookie 只活在这一代 DshApi 的内存里，远端进程换代时由新 token 重新交换，不能把
+   *  上一张还能用的长寿命 Cookie 从磁盘上抹掉。 */
   private suspend fun rejectCookie(pair: String) = authLock.withLock {
     if (sessionCookie != pair) return@withLock
     sessionCookie = null
@@ -295,12 +309,22 @@ class DshApi(
   /**
    * 换新 Cookie。密钥模式在本机签发；令牌模式先走浏览器式根路径交换（Cookie 跨进程重启有效），
    * 再退回 `/connect` 的 API Peer（0.2.1 线起；Peer 随生命周期连接与进程重启失效）。
+   *
+   * SSH 隧道的令牌每次远端进程重启都会变。根路径用旧令牌换票得到 401 时，不能把它当成「登录已失效」：
+   * 调用方手里可能还有上一张长寿命 Cookie，那张 Cookie 跨 dsh 重启仍然有效。
    */
   private suspend fun connect(): String = withContext(Dispatchers.IO) {
     signingSecret?.let { return@withContext DshCookie.mint(it, base, clock(), secureListener = base.isHttps && !plainListener) }
     if (profile.dshAuth == DshAuthMode.SECRET) throw ApiException(401, "签名密钥格式不正确：应为 43 个字符的 base64url 字符串", AUTH_EXPIRED)
     if (token.isEmpty()) throw ApiException(401, "请填写 DeepSeek Harness 的启动令牌", AUTH_EXPIRED)
-    exchange(base.newBuilder().addQueryParameter("token", token).build(), browser = true)?.let { return@withContext it }
+    try {
+      exchange(base.newBuilder().addQueryParameter("token", token).build(), browser = true)?.let { return@withContext it }
+    } catch (error: ApiException) {
+      if (hostHeader != null && error.status == 401) {
+        throw ApiException(401, "启动令牌已轮换，改用已保存的登录", AUTH_TOKEN_ROTATED)
+      }
+      throw error
+    }
     // 根路径没有交付 Cookie（不是 dsh 的认证首页）：退回 API Peer。令牌被拒（401/403）时同一个令牌
     // 换 /connect 也不会成功，上面已经直接抛出。
     try {
@@ -2869,6 +2893,8 @@ class DshApi(
 
     /** 认证失效的错误码：控制器据此提示重新配对，而不是当成网络抖动。 */
     const val AUTH_EXPIRED = DSH_AUTH_EXPIRED
+    /** 隧道启动令牌已轮换，但上一张浏览器 Cookie 可能还能用。不是登录失效。 */
+    const val AUTH_TOKEN_ROTATED = "auth/token-rotated"
     const val REPAIR_MESSAGE = "登录已失效：dsh 重启后旧令牌作废、Cookie 也已过期或被撤销，请用电脑上新的 dsh web 启动链接重新配对"
     const val SECRET_REJECTED_MESSAGE = "签名密钥被拒绝：密钥不对，或 dsh 的 browser-session 记录已被删除重建，请重新复制 secret"
     const val UNTRUSTED_HOST_MESSAGE = "dsh 拒绝了这个地址（403）：请用 dsh web --host <该 IP> 启动，域名或反向代理需加 --trusted-host"

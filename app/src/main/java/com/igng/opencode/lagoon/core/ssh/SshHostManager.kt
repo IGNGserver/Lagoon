@@ -63,6 +63,16 @@ internal class SshHostManager(
     entry?.link?.close()
   }
 
+  /**
+   * Closes the live link even if a client handle is still counted. Saving a host must not leave the
+   * previous address, key or launch command running because a monitor raced a new `client()` call in
+   * between `invalidate` and `close`.
+   */
+  fun replace(hostId: String) {
+    val entry = synchronized(lock) { links.remove(hostId) }
+    entry?.link?.close()
+  }
+
   fun retry(hostId: String) {
     links[hostId]?.link?.retry()
   }
@@ -98,7 +108,11 @@ internal class SshHostManager(
     kotlinx.coroutines.withContext(Dispatchers.IO) { transportFactory.probeHostKey(config) }
 
   fun pinHostKey(hostId: String, key: PresentedSshHostKey) {
-    runCatching { store.pinHostKey(hostId, key) }
-      .onFailure { Diagnostics.warn("SshHostManager", "主机指纹保存失败", it) }
+    try {
+      store.pinHostKey(hostId, key)
+    } catch (error: Exception) {
+      Diagnostics.warn("SshHostManager", "主机指纹保存失败", error)
+      throw SshFailure(SshFailureKind.OTHER, "主机指纹没有保存成功，请重试", error.message.orEmpty(), retryable = true)
+    }
   }
 }

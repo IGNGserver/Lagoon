@@ -43,6 +43,16 @@ class SshHostStoreTest {
     assertNull(store.load().single().hostKeyFingerprint)
   }
 
+  @Test fun corruptConfigRefusesToOverwriteTheOtherHosts() {
+    val prefs = FakeSharedPreferences()
+    val (store, _) = store(prefs)
+    store.save(host, SshSecrets(password = "pw"))
+    prefs.edit().putString("hosts", "{not-json").commit()
+    val failure = runCatching { store.save(host.copy(id = "ssh-2", name = "另一台")) }.exceptionOrNull()
+    assertTrue(failure is java.io.IOException)
+    assertEquals("{not-json", prefs.getString("hosts", null))
+  }
+
   @Test fun deleteRemovesConfigAndSecrets() {
     val (store, secrets) = store()
     store.save(host, SshSecrets(password = "pw"))

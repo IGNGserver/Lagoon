@@ -56,10 +56,18 @@ internal class SshHostLink(
   val isClosed: Boolean get() = closed
   @Volatile private var transport: SshTransport? = null
   @Volatile private var endpoint: RemoteDshEndpoint? = null
+  /** Browser cookie minted for the current remote dsh. Kept on the link, never in the server
+   *  credential store: a new dsh process invalidates the launch token but this cookie still works. */
+  @Volatile private var rememberedCookie: String = ""
+  val remoteHome: String? get() = endpoint?.home
+  val workingDirectory: String? get() = config.workingDirectory
   @Volatile private var forwarder: SshForwarder? = null
   @Volatile private var client: DshApi? = null
   @Volatile private var contentWatching = false
   @Volatile private var ready = CompletableDeferred<DshApi>()
+  /** Bumped every time the authenticated DshApi is replaced, including a failed exchange. */
+  private val generation = java.util.concurrent.atomic.AtomicLong()
+  val generationId: Long get() = generation.get()
   /** Stable across DSH generations; mirror of the current client's workspace stream. */
   private val workspacePublisher = MutableSharedFlow<List<Project>>(replay = 1, extraBufferCapacity = 1)
   private var workspaceCollector: Job? = null
@@ -67,10 +75,12 @@ internal class SshHostLink(
   @Volatile private var keepAliveJob: Job? = null
   @Volatile private var attempt = 0
 
-  /** Waits until this link has an authenticated DshApi; starts the link on first use. */
-  suspend fun awaitClient(timeoutMillis: Long = 20_000): DshApi {
+  /** Waits until this link has an authenticated DshApi; starts the link on first use.
+   *  [sinceGeneration] waits for a client newer than that generation, so a caller that already holds
+   *  a completed generation is not handed the same instance while a reconnect is in flight. */
+  suspend fun awaitClient(timeoutMillis: Long = 20_000, sinceGeneration: Long = -1): DshApi {
     if (closed) throw SshFailure(SshFailureKind.DISCONNECTED, "SSH 主机已移除", retryable = false)
-    client?.takeIf { mutableStatus.value.isConnected }?.let { return it }
+    client?.takeIf { mutableStatus.value.isConnected && generation.get() > sinceGeneration }?.let { return it }
     val failed = mutableStatus.value
     if (failed.phase == SshLinkPhase.FAILED) {
       val error = failed.error
@@ -79,7 +89,7 @@ internal class SshHostLink(
     }
     start()
     val pending = ready
-    return try {
+    val api = try {
       withTimeout(timeoutMillis) { pending.await() }
     } catch (timeout: TimeoutCancellationException) {
       throw SshFailure(SshFailureKind.UNREACHABLE, "SSH 连接超时，请检查网络和主机状态", retryable = true)
@@ -87,6 +97,10 @@ internal class SshHostLink(
       if (closed) throw SshFailure(SshFailureKind.DISCONNECTED, "SSH 主机已移除", retryable = false)
       throw cancel
     }
+    if (sinceGeneration >= 0 && generation.get() <= sinceGeneration) {
+      return awaitClient(timeoutMillis, sinceGeneration)
+    }
+    return api
   }
 
   /** Keeps the expensive content subscription off for background monitoring. */
@@ -125,7 +139,7 @@ internal class SshHostLink(
       scope.launch(Dispatchers.IO) {
         if (!current.ping(8_000) || current.isClosed) lost(SshFailure(SshFailureKind.DISCONNECTED, "SSH 连接已断开"), current)
       }
-    } else if (mutableStatus.value.phase == SshLinkPhase.FAILED) {
+    } else if (mutableStatus.value.phase == SshLinkPhase.FAILED && mutableStatus.value.error?.retryable != false) {
       retry()
     }
   }
@@ -241,6 +255,7 @@ internal class SshHostLink(
         }
       }
       attempt = 0
+      generation.incrementAndGet()
       publish(SshLinkPhase.CONNECTED, SshLinkStep.CONNECTED, "已连接 · SSH ${config.address}")
       ready.complete(api)
       startKeepAlive()
@@ -263,7 +278,12 @@ internal class SshHostLink(
       remoteHostId = null,
       remoteHostFingerprint = null
     )
-    return DshApi(runtime, ServerCredentials("dsh", endpoint.token), hostHeader = endpoint.authority)
+    return DshApi(
+      runtime,
+      ServerCredentials("dsh", endpoint.token, rememberedCookie),
+      hostHeader = endpoint.authority,
+      onCookie = { value -> rememberedCookie = value }
+    )
   }
 
   private fun startKeepAlive() {
