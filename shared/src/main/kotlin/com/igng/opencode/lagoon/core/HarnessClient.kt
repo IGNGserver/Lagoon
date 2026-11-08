@@ -70,6 +70,13 @@ interface HarnessClient {
 
   suspend fun inbox(id: String): List<Message>
 
+  /**
+   * [inbox] plus the conversation's durable todo list and goal, when the harness projects them.
+   * DSH reads all three from one `session/projections` round trip, so opening a conversation costs
+   * no extra request; other harnesses fall back to [inbox] alone.
+   */
+  suspend fun composerContext(id: String): ComposerContext = ComposerContext(inbox = inbox(id))
+
   /** Edits/removes/steers a still-queued prompt. False when the harness has no queue RPC. */
   suspend fun updateQueue(sessionId: String, itemId: String, action: QueueAction): Boolean = false
 
@@ -251,6 +258,19 @@ interface HarnessClient {
 
 /** One timeline message and, when the protocol has one, its wire JSON exactly as the server sent it. */
 data class MessageRecord(val message: Message, val raw: org.json.JSONObject?)
+
+/**
+ * Durable values the open conversation shows beside its composer.
+ *
+ * [todos] is null when the harness exposes no `todos` projection (an older Host, or another
+ * harness); an empty list means the Host cleared the list. [goal] has no process-local activation:
+ * that only comes from a live `goals/get` read.
+ */
+data class ComposerContext(
+  val inbox: List<Message> = emptyList(),
+  val todos: List<RemoteTodo>? = null,
+  val goal: RemoteGoal? = null
+)
 
 /** 按服务器类型创建对应的客户端。 */
 fun createHarnessClient(

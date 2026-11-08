@@ -1020,6 +1020,9 @@ class DshApi(
         }
       }
       "session/title" -> emit("session.renamed", base.put("title", data.str("title")))
+      // 清单与目标都是整值投影：`todo/write` 每次都是完整替换，`goal/change` 是完整快照。
+      "todo/write" -> emit("session.todos.changed", base.put("todos", data.arr("todos")))
+      "goal/change" -> emit("session.goal.changed", base)
       "compaction/start" -> emit("session.compaction.started", base
         .put("inputID", data.str("compactionId"))
         .put("at", time))
@@ -2042,11 +2045,24 @@ class DshApi(
 
   // ---------------------------------------------------------------- 写操作
 
-  /** 未送达的排队输入来自 `session/projections` 的 `inbox` 投影（`next-turn` 等待当前轮，`next-step` 下一步）。 */
-  override suspend fun inbox(id: String): List<Message> = withContext(Dispatchers.IO) {
-    val value = call("session/projections", requestArgs(JSONObject().put("sessionId", id))) as? JSONObject ?: return@withContext emptyList()
-    val inbox = value.obj("values").obj("inbox")
-    if (inbox.length() == 0) return@withContext emptyList()
+  /**
+   * 会话侧栏一次读取：未送达的排队输入（`inbox` 投影）、当前任务清单（`todos` 投影）与目标
+   * （`goal` 投影）。投影对未加载的会话也可读，因此空闲会话的目标条不会因为 Agent 不在而消失；
+   * 进程内的 `activation` 不在投影里，仍由 [goal] 在 Agent 活跃时补齐。
+   */
+  override suspend fun composerContext(id: String): ComposerContext = withContext(Dispatchers.IO) {
+    val value = call("session/projections", requestArgs(JSONObject().put("sessionId", id))) as? JSONObject
+      ?: return@withContext ComposerContext()
+    val values = value.obj("values")
+    ComposerContext(inbox = inboxMessages(values), todos = values.todoProjection(), goal = values.goalProjection())
+  }
+
+  override suspend fun inbox(id: String): List<Message> = composerContext(id).inbox
+
+  /** `inbox` 投影（`next-turn` 等待当前轮，`next-step` 下一步）折算成排队消息。 */
+  private fun inboxMessages(values: JSONObject): List<Message> {
+    val inbox = values.obj("inbox")
+    if (inbox.length() == 0) return emptyList()
     val now = System.currentTimeMillis()
     val out = mutableListOf<Message>()
     for ((key, queued) in listOf("next-turn" to true, "next-step" to false)) {
@@ -2055,7 +2071,7 @@ class DshApi(
         out += message
       }
     }
-    out
+    return out
   }
 
   private fun inboxMessage(item: JSONObject, queued: Boolean, created: Long): Message? {
@@ -2198,15 +2214,11 @@ class DshApi(
     val value = call("goals/get", envelope(argsOf("agentId" to sessionId))) as? JSONObject ?: return null
     val id = value.optString("id").takeIf { it.isNotBlank() } ?: return null
     val ref = value.optJSONObject("ref")
-    val obligation = value.optString("objective")
-    val phase = value.optString("phase")
     return RemoteGoal(
       id = id,
       revision = ref?.optInt("revision", 0) ?: value.optInt("revision", 0),
-      objective = obligation,
-      phase = phase,
-      maxRounds = value.optInt("maxGoalRounds", 0),
-      roundsStarted = value.optInt("roundsStarted", 0),
+      objective = value.optString("objective"),
+      phase = value.optString("phase"),
       activation = value.optString("activation").takeIf { it.isNotBlank() },
       blockedReason = value.optJSONObject("blockedReason")?.optString("message")?.takeIf { it.isNotBlank() }
     )

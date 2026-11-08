@@ -627,12 +627,19 @@ class LagoonController private constructor(private val appContext: Context) {
   internal suspend fun clearCredential(serverId: String, ref: String): Boolean =
     clientFor(serverId)?.clearCredential(ref) == true
 
+  /**
+   * Reads the goal shown above the composer. `goals/get` is the only source of the process-local
+   * activation ("暂停续跑"), but it fails while the Agent is not live; a failed read keeps the last
+   * durable projection instead of making the goal vanish, and the next successful read replaces it.
+   */
   fun loadGoal() = withSession("goal-refresh") { op, client, session ->
-    val goal = try { client.goal(session.id) } catch (error: Exception) {
+    val fetched = try { Result.success(client.goal(session.id)) } catch (error: Exception) {
       if (error is CancellationException) throw error
-      null
+      Result.failure(error)
     }
-    if (op.isCurrent(this)) op.commit { it.copy(goal = goal) }
+    if (op.isCurrent(this)) op.commit { current ->
+      if (fetched.isFailure) current else current.copy(goal = fetched.getOrNull())
+    }
   }
 
   fun loadSchedules() = withSession("schedules") { op, client, session ->
@@ -2442,8 +2449,20 @@ class LagoonController private constructor(private val appContext: Context) {
         val shellId = props.str("id")
         if (shellId.isNotBlank() && mutable.value.shells.containsKey(shellId)) updateState { withSummary(it.copy(shells = it.shells - shellId)) }
       }
+      // 任务清单是整值投影：每次 `todo_write` 都带来完整列表，事件本身就是最新真值。
+      "session.todos.changed" -> if (sessionId.isNotBlank() && sessionId == mutable.value.sessionId) {
+        val todos = props.arr("todos").toRemoteTodos()
+        updateState { it.copy(todos = todos) }
+      }
+      // 目标阶段/阻塞/完成由 Host 的 goal 快照变化驱动；activation 只能通过 `goals/get` 重读。
+      "session.goal.changed" -> if (sessionId.isNotBlank() && sessionId == mutable.value.sessionId) loadGoal()
       // A run started or ended: official `session.sync` of that one session (outcome, idle, updated).
-      "session.execution.started", "session.execution.succeeded", "session.execution.failed", "session.execution.interrupted" -> refreshSession(sessionId)
+      "session.execution.started", "session.execution.succeeded", "session.execution.failed", "session.execution.interrupted" -> {
+        // `turn/start` 是清单的边界：Host 在同一时刻清空投影，界面跟随，避免上一轮清单冒充本轮。
+        if (event.type == "session.execution.started" && sessionId.isNotBlank() && sessionId == mutable.value.sessionId &&
+          mutable.value.todos.isNotEmpty()) updateState { it.copy(todos = emptyList()) }
+        refreshSession(sessionId)
+      }
     }
     // The parent tool may settle before the child session emits a useful execution event. Official
     // metadata still identifies that child as running; keep every such child separately so sibling
@@ -2665,7 +2684,7 @@ class LagoonController private constructor(private val appContext: Context) {
     visibleConversation = null
     updateState { it.copy(projectId = id, sessionId = null, messages = emptyList(), agent = null, model = null,
       agentChanged = false, modelChanged = false, draft = "", references = emptyList(), resources = emptyMap(),
-      changes = emptyList(), goal = null, goalLoading = false, schedules = emptyList(), schedulesLoading = false,
+      changes = emptyList(), goal = null, todos = emptyList(), goalLoading = false, schedules = emptyList(), schedulesLoading = false,
       files = emptyList(), searchResults = emptyList(), fileText = null, fileBinary = false, filePreview = null, filePreviewMime = null) }
     store.rememberLocation(id, null)
     val token = generation
@@ -2987,7 +3006,8 @@ class LagoonController private constructor(private val appContext: Context) {
       resources = mapOf("messages" to ResourceStatus(if (cached != null) ResourceState.READY else ResourceState.LOADING)),
       provisionalMessageIds = emptySet(), transcriptLoadingSince = if (offline || cached != null) 0 else System.currentTimeMillis(),
       changes = if (reselected) it.changes else slot?.changes.orEmpty(),
-      goal = if (reselected) it.goal else slot?.goal, goalLoading = false,
+      goal = if (reselected) it.goal else slot?.goal,
+      todos = if (reselected) it.todos else slot?.todos.orEmpty(), goalLoading = false,
       schedules = if (reselected) it.schedules else slot?.schedules.orEmpty(), schedulesLoading = false,
       files = emptyList(),
       searchResults = emptyList(), fileText = null, fileBinary = false, filePreview = null, filePreviewMime = null)) }
@@ -3083,17 +3103,18 @@ class LagoonController private constructor(private val appContext: Context) {
     val sync = transcriptSync?.takeIf { client.cacheableTranscripts }
     // Taken before the read: a deletion while it is in flight makes its write a no-op.
     val epoch = sync?.epoch(serverId, session.id) ?: 0L
-    // The newest page of the projected timeline plus admitted-but-undelivered input, like the official
-    // client's message and pending syncs.
-    val (result, pending) = coroutineScope {
+    // The newest page of the projected timeline plus admitted-but-undelivered input, the Host's
+    // todo list and the durable goal projection, like the official client's syncs.
+    val (result, composer) = coroutineScope {
       val page = async { attempt {
         // A cacheable conversation opens from its verified stored run plus only what is new on the server.
         if (sync != null && initialWindow) sync.open(client, serverId, session).also { opened = it; nextCursor = it.olderCursor }.messages
         else client.messageRecords(session.id).let { nextCursor = it.next; records = it.items; reachedStart = it.next == null; it.items.map(MessageRecord::message) }
       } }
-      val inbox = async { attempt { client.inbox(session.id) } }
-      page.await() to inbox.await().getOrDefault(emptyList())
+      val context = async { attempt { client.composerContext(session.id) } }
+      page.await() to context.await().getOrDefault(ComposerContext())
     }
+    val pending = composer.inbox
     if (token != generation) return
     val messages = result.map { first ->
       // Official initial window: keep pulling older pages until the oldest boundary is a whole turn,
@@ -3167,6 +3188,10 @@ class LagoonController private constructor(private val appContext: Context) {
       val latestModel = committed.asReversed().firstNotNullOfOrNull { message -> message.model } ?: session.model
       withSummary(it.copy(messages = committed, cached = result.isFailure, messagesCursor = if (it.loadedOlderMessages) it.messagesCursor else nextCursor, cacheComplete = cachedComplete,
       provisionalMessageIds = emptySet(), transcriptLoadingSince = 0,
+      // 投影里没有清单键 = 这台 Host 不提供该能力，保留上次读到的值；null = Host 已清空。
+      todos = composer.todos ?: it.todos,
+      // 目标只被投影“补充”，从不被它清空：清除/完成由 goals/get 与 goalAction 的权威结果决定。
+      goal = composer.goal?.let { durable -> durable.copy(activation = it.goal?.takeIf { known -> known.id == durable.id }?.activation) } ?: it.goal,
       previews = it.previews + (session.id to preview),
       agent = if (it.agentChanged) it.agent else latestAgent,
       model = if (it.modelChanged) it.model else latestModel?.let { candidate ->
@@ -3599,7 +3624,7 @@ class LagoonController private constructor(private val appContext: Context) {
         files = emptyList(), searchResults = emptyList(), fileText = null, fileBinary = false,
         filePreview = null, filePreviewMime = null, loadedOlderMessages = false, messagesCursor = null,
         provisionalMessageIds = emptySet(), transcriptLoadingSince = 0, changes = emptyList(),
-        goal = null, goalLoading = false, schedules = emptyList(), schedulesLoading = false))
+        goal = null, todos = emptyList(), goalLoading = false, schedules = emptyList(), schedulesLoading = false))
     }
     store.rememberLocation(project?.id, null)
     if (project != null) {

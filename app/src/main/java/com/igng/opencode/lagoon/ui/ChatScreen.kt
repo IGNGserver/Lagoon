@@ -124,7 +124,8 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
       add(MenuAction("文件", MiuixIcons.Folder) { sheet = ChatSheet.FILES; controller.listFiles() })
       if (state.server?.kind == ServerKind.DSH || state.server?.kind == ServerKind.DSH_REMOTE) {
         add(MenuAction("定时任务", MiuixIcons.Info) { sheet = ChatSheet.SCHEDULES; controller.loadSchedules() })
-        if (state.goal == null) {
+        // DSH 允许用新目标替换已完成的目标；进行中/暂停中必须先继续或清除。
+        if (state.goal == null || state.goal.complete) {
           add(MenuAction("设定长期目标", MiuixIcons.Ok) { goalDialog = true })
         }
       }
@@ -178,7 +179,8 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
           LaunchedEffect(state.sessionId, state.connected, goalSupported) {
             if (state.connected && goalSupported) controller.loadGoal()
           }
-          if (goalSupported && state.goal != null) GoalBar(state, controller)
+          // 状态轨只承载 DSH 的会话级目标与 todo 投影；OpenCode 没有这两项，组件自身不占位。
+          if (goalSupported) ConversationStatusRail(state, controller)
           HyperPendingActionDock(state, controller) { requestModal = it }
           ChatComposer(state, controller, interactive, onModal = { composerModal = it }, onServerFile = { sheet = ChatSheet.FILES; controller.listFiles() })
         }
@@ -274,7 +276,7 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
   if (goalDialog) {
     SuperDialog(title = "设定长期目标", show = true, onDismissRequest = { goalDialog = false }) {
       Column(Modifier.padding(top = 8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text("目标是会话级的；达到上限或手动完成前，Host 可能自动续跑。", style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
+        Text("目标是会话级的；完成或清除前，Host 可能自动续跑。之后可在目标面板里暂停、继续或标记完成。", style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
         TextField(value = goalText, onValueChange = { goalText = it }, label = "目标")
         DialogActions("取消", { goalDialog = false }, "创建", goalText.isNotBlank()) {
           val text = goalText.trim()
@@ -370,45 +372,6 @@ private fun HyperPendingActionDock(
 
 
 /** The child-session footer: live status and a way back, with no composer (official subagents are read-only). */
-@Composable
-private fun GoalBar(state: LagoonState, controller: LagoonController) {
-  val goal = state.goal ?: return
-  var menu by remember { mutableStateOf(false) }
-  var confirmClear by remember { mutableStateOf(false) }
-  HyperCard(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp), insidePadding = PaddingValues(12.dp)) {
-    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-      Row(verticalAlignment = Alignment.CenterVertically) {
-        Column(Modifier.weight(1f)) {
-          Text(goal.label, style = MiuixTheme.textStyles.footnote2.copy(color = if (goal.blocked) HyperTheme.colors.error else HyperTheme.colors.primary))
-          Text("${goal.roundsStarted}/${goal.maxRounds} 轮", style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary))
-        }
-        Box {
-          HyperIconButton(QoderGlyph.MORE, "目标操作", { menu = true }, backgroundColor = Color.Transparent)
-          MenuPopup(menu, { menu = false }, listOf(MenuSection(buildList {
-            if (goal.active) add(MenuAction("暂停目标") { controller.goalAction("pause") })
-            if (goal.paused || goal.blocked) add(MenuAction("继续目标") { controller.goalAction("resume") })
-            if (!goal.complete) add(MenuAction("标记完成") { controller.goalAction("complete") })
-            add(MenuAction("清除目标", danger = true) { confirmClear = true })
-          })))
-        }
-      }
-      Text(goal.objective, style = MiuixTheme.textStyles.footnote1)
-      goal.blockedReason?.let { Text(it, style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.error)) }
-    }
-  }
-  if (confirmClear) {
-    SuperDialog(title = "清除长期目标？", show = true, onDismissRequest = { confirmClear = false }) {
-      Column {
-        Text("只会清除当前目标，不会删除会话和消息。")
-        DialogActions("取消", { confirmClear = false }, "确认清除", danger = true) {
-          controller.goalAction("clear")
-          confirmClear = false
-        }
-      }
-    }
-  }
-}
-
 @Composable
 private fun ChildSessionBar(state: LagoonState, session: Session, onBack: () -> Unit, onContinue: (() -> Unit)? = null) {
   val task = state.livePresentedTasks[session.id]
@@ -834,7 +797,7 @@ internal fun DialogActions(cancel: String, onCancel: () -> Unit, confirm: String
 }
 
 @Composable
-private fun ActionError(state: LagoonState, action: String) { state.resource("action:$action").takeIf { it.state == ResourceState.ERROR }?.error?.let { Text(it, color = MiuixColorTokens.Error) } }
+internal fun ActionError(state: LagoonState, action: String) { state.resource("action:$action").takeIf { it.state == ResourceState.ERROR }?.error?.let { Text(it, color = MiuixColorTokens.Error) } }
 
 @Composable
 fun MiuixPermissionCard(request: PermissionRequest, controller: LagoonController, pending: Boolean, onModal: (Boolean) -> Unit = {}) {

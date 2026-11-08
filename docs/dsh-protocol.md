@@ -158,6 +158,10 @@
 投影（`session/list` 行的 `projections.values`、`session/projections`）：
 
 - `inbox`：`{"next-turn":[UserMessage],"next-step":[UserMessage]}`；
+- `todos`：`[{content,status:"pending"|"in_progress"|"completed"}] | null`。`todo/write` 每次写入完整清单，
+  折叠为“最后写入者胜”；`turn/start` 清空、`turn/end` 保留到下一轮开始。键缺失＝该 Host 没有清单能力。
+- `goal`：`{goal:{id,revision,objective,phase,blockedReason?,maxGoalRounds},roundsStarted,createdAt,updatedAt} | null`。
+  没有进程内的 `activation`（“armed”/“disarmed”），它只出现在 `goals/get` 的返回里。
 - `userQuestions`：`{active:[{callId,questions,state}], settled:[…]}`；
 - `agentPreset`、`modelSelection`、`sessionListMetadata{blank,lastPromptAt}`、`permissions` 等。
 - 注意：会话工作目录在列表行的顶层 `cwd`，不是投影字段。
@@ -199,6 +203,11 @@
   因此 goal 轮、自动继续、压缩检查点这类没有可显示用户提问的轮次不会并入上一轮。
   `goal` / `tool-goal` / `compact-checkpoint` 注入轮次折成一行 notice（“目标轮次”/“目标完成”/
   “上下文已压缩”），不展示模型侧原文；`time-context`、runtime context、skill catalog 等继续隐藏。
+- 输入框上方的状态轨：`session/projections` 一次读取 `inbox` + `todos` + `goal`（`composerContext`），
+  `todo/write` 折算为 `session.todos.changed`（整值替换），`goal/change` 折算为 `session.goal.changed`
+  （触发 `goals/get` 重读阶段与 activation）。`turn/start`（`session.execution.started`）同时清空本地清单，
+  与 Host 的投影边界一致；`todos`/`goal` 键缺失时保留上次的值，不把“没有该能力”误判成“已清空”。
+  目标只显示“阶段 + 截断的目标”一行，轮次（`roundsStarted`/`maxGoalRounds`）不再展示。
 - 审批/问答：瀑布事件折算为 `permission.asked` / `form.created`，回应走 `$events/result`；
   其他客户端结算时收到 `cancel` 帧，按本地待办移除并折算为 `permission.replied` / `form.cancelled`。
   `$events` 重连后 Host 会把仍在等待的瀑布按原 eventId 重新投递给新客户端；宽限 3 秒内没有重新投递的本地待办

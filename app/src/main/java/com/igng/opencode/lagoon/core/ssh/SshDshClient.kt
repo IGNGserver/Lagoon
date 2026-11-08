@@ -58,6 +58,8 @@ internal class SshDshClient(
 
   override suspend fun inbox(id: String): List<Message> = api().inbox(id)
 
+  override suspend fun composerContext(id: String): ComposerContext = api().composerContext(id)
+
   override suspend fun updateQueue(sessionId: String, itemId: String, action: QueueAction): Boolean =
     api().updateQueue(sessionId, itemId, action)
 

@@ -130,4 +130,22 @@ class DshProjectionTest {
     val assistant = Message("a", "assistant", 1, listOf(MessagePart("p", "text", "answer")), sequence = 3)
     assertEquals(listOf(user, assistant), mergeTranscript(listOf(assistant), listOf(user, assistant)))
   }
+
+  @Test fun todoWritesAndGoalChangesBecomeConversationStateEvents() {
+    val api = client()
+    try {
+      val todos = api.translate(session, record("todo/write", 9,
+        """{"todos":[{"content":"写测试","status":"completed"},{"content":"改 UI","status":"in_progress"}]}""").obj("event")).single()
+      assertEquals("session.todos.changed", todos.type)
+      assertEquals(session.id, todos.properties.str("sessionID"))
+      assertEquals(listOf("写测试", "改 UI"), todos.properties.arr("todos").toRemoteTodos().map { it.content })
+      // 整值替换：空数组同样是一次权威更新，界面据此隐藏胶囊。
+      val cleared = api.translate(session, record("todo/write", 10, """{"todos":[]}""").obj("event")).single()
+      assertEquals(emptyList<RemoteTodo>(), cleared.properties.arr("todos").toRemoteTodos())
+      val goal = api.translate(session, record("goal/change", 11,
+        """{"kind":"goal/change","operation":"complete","goal":{"id":"g1","revision":2,"objective":"收尾","phase":"complete"}}""").obj("event")).single()
+      assertEquals("session.goal.changed", goal.type)
+      assertEquals(session.id, goal.properties.str("sessionID"))
+    } finally { api.close() }
+  }
 }

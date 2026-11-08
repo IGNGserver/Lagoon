@@ -127,6 +127,11 @@ data class LagoonState(
   /** Set only for a typed Remote failure whose fix needs a UI sheet (login/trust/host). */
   val remoteRecovery: RemoteRecoveryKind? = null,
   val goal: RemoteGoal? = null,
+  /**
+   * The Host's current whole todo list (`todos` projection) for the open conversation. It is
+   * per-turn on the Host: cleared by the next `turn/start`, kept visible after `turn/end`.
+   */
+  val todos: List<RemoteTodo> = emptyList(),
   val goalLoading: Boolean = false,
   val schedules: List<RemoteSchedule> = emptyList(),
   val schedulesLoading: Boolean = false,

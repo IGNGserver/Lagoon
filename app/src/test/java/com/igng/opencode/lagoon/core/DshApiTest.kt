@@ -207,7 +207,7 @@ class DshApiTest {
       assertEquals("g1", goal.id)
       assertEquals(2, goal.revision)
       assertEquals("完成 P4", goal.objective)
-      assertEquals(1, goal.roundsStarted)
+      assertEquals("armed", goal.activation)
       assertTrue(client.createGoal("s1", "新目标", 5))
       assertTrue(client.goalAction("s1", "g1", 2, "pause"))
       server.takeRequest() // root
@@ -722,6 +722,30 @@ class DshApiTest {
       assertTrue(messages[0].queued)
       assertFalse(messages[1].queued)
       assertEquals("排队的问题", messages[0].parts.single().text)
+    }
+  }
+
+  @Test fun composerContextReadsInboxTodosAndDurableGoalInOneProjectionCall() = runBlocking {
+    MockWebServer().use { server ->
+      server.enqueue(rootOk())
+      server.enqueue(envelope(
+        """{"asOfSeq":9,"values":{""" +
+          """"inbox":{"next-turn":[],"next-step":[]},""" +
+          """"todos":[{"content":"写测试","status":"completed"},{"content":"改 UI","status":"in_progress"}],""" +
+          """"goal":{"goal":{"id":"g1","revision":3,"objective":"收尾","phase":"blocked","blockedReason":{"code":"missing","message":"缺少凭据"}},"roundsStarted":2,"createdAt":1,"updatedAt":2}}}"""
+      ))
+      val context = api(server).composerContext("s1")
+      server.takeRequest()
+      val call = server.takeRequest()
+      assertEquals("/api/session/projections", call.requestUrl!!.encodedPath)
+      assertTrue(context.inbox.isEmpty())
+      assertEquals(listOf("completed", "in_progress"), context.todos!!.map { it.status })
+      val goal = context.goal!!
+      assertEquals("g1", goal.id)
+      assertEquals("blocked", goal.phase)
+      assertEquals("缺少凭据", goal.blockedReason)
+      // 投影没有进程内的 activation；界面因此不能把它读成“已暂停续跑”。
+      assertNull(goal.activation)
     }
   }
 

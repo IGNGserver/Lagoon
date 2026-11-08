@@ -152,8 +152,9 @@ class TranscriptRowsTest {
   @Test fun hiddenAndPendingToolsProduceNoRows() {
     val parts = listOf(
       tool("t1", "todowrite", input = """{"todos":[]}"""),
-      tool("t2", "question", status = "running"),
-      tool("t3", "question", status = "completed")
+      tool("t2", "todo_write", input = """{"todos":[{"content":"a","status":"pending"}]}"""),
+      tool("t3", "question", status = "running"),
+      tool("t4", "question", status = "completed")
     )
     val rows = TranscriptRows.build(listOf(user("u1", t0), assistant("a1", t0 + 500, *parts.toTypedArray())))
     assertEquals(1, rows.count { it.kind == "tool-group" })
