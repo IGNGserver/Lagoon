@@ -5,6 +5,7 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -314,7 +315,8 @@ internal fun DirectoryBrowserSheet(state: LagoonState, controller: LagoonControl
           searchStatus.state == ResourceState.LOADING || searchStatus.state == ResourceState.ERROR ->
             ResourceHint(searchStatus, "没有匹配项", retry = { controller.searchDirectories(query) })
           results.isNotEmpty() -> LazyColumn(Modifier.fillMaxWidth()) {
-            items(results, key = { it }) { result ->
+            val resultKeys = uniqueListKeys(results) { it }
+            itemsIndexed(results, key = { index, _ -> resultKeys[index] }) { _, result ->
               val name = result.trimEnd('/').substringAfterLast('/')
               HyperRow(title = name.ifBlank { result }, summary = result, showChevron = true, onClick = { controller.browseDirectory(childPath(path, result)) })
             }
@@ -333,7 +335,8 @@ internal fun DirectoryBrowserSheet(state: LagoonState, controller: LagoonControl
             Text("此目录只有隐藏项，开启「显示隐藏目录」后可见", Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
               style = MiuixTheme.textStyles.footnote1.copy(color = HyperTheme.colors.textSecondary))
           }
-          items(entries, key = { it.path }) { node ->
+          val entryKeys = uniqueListKeys(entries) { it.path }
+          itemsIndexed(entries, key = { index, _ -> entryKeys[index] }) { _, node ->
             val directory = node.type == "directory"
             if (directory) HyperRow(title = node.path.trimEnd('/').substringAfterLast('/').ifBlank { node.path }, summary = "文件夹", showChevron = true,
               onClick = { controller.browseDirectory(childPath(path, node.path)) })

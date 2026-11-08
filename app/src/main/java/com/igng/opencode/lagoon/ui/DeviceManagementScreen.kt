@@ -48,7 +48,7 @@ internal fun DeviceManagementScreen(
     return
   }
 
-  val online = state.profiles.count { profile -> deviceOnline(profile, state) }
+  val online = state.profiles.count { profile -> deviceConnected(profile, state) }
   Column(Modifier.fillMaxSize().background(HyperTheme.colors.canvas)) {
     PageTopBar("设备", onBack, actions = {
       CircleIconButton(MiuixIcons.Add, "添加设备", onAddDevice)
@@ -140,7 +140,7 @@ private fun DeviceDetailScreen(
 
   Column(Modifier.fillMaxSize().background(HyperTheme.colors.canvas)) {
     PageTopBar(profile.name, onBack, subtitle = {
-      StatusDot(if (deviceOnline(profile, state)) HyperTheme.colors.success else HyperTheme.colors.textTertiary)
+      StatusDot(if (deviceConnected(profile, state)) HyperTheme.colors.success else HyperTheme.colors.textTertiary)
       Text(deviceStatusLabel(profile, state), style = MiuixTheme.textStyles.footnote1.copy(color = HyperTheme.colors.textSecondary))
     })
     LazyColumn(
@@ -153,7 +153,7 @@ private fun DeviceDetailScreen(
         HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(vertical = 4.dp)) {
           HyperSwitchRow(
             title = "启用此设备",
-            summary = "停用会断开连接并停止任务通知；不会删除设备、凭据或会话",
+            summary = "启用后保持连接。停用会断开并停止任务通知，不会删除设备、凭据或会话",
             checked = profile.enabled,
             onCheckedChange = { controller.setProfileEnabled(profile.id, it) }
           )
@@ -174,13 +174,6 @@ private fun DeviceDetailScreen(
           )
           HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
           HyperSwitchRow(
-            title = "自动连接",
-            summary = "进入此设备或其设备组时保持连接",
-            checked = profile.autoConnect,
-            onCheckedChange = { savePreference(profile.copy(autoConnect = it)) }
-          )
-          HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
-          HyperSwitchRow(
             title = "任务通知",
             summary = "任务完成或需要你处理时通知",
             checked = profile.notifications,
@@ -189,16 +182,16 @@ private fun DeviceDetailScreen(
           HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
           HyperRow(
             title = "新会话默认值",
-            summary = "将此设备设为当前设备后，配置${if (isDsh) "构建模式与" else " Agent 与"}模型",
+            summary = "只保存在这台手机，不改变当前会话",
             trailing = { DropdownChevron() },
             onClick = { showDefaults = true }
           )
           HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
           HyperRow(
             title = "模型显示",
-            summary = "筛选此设备在会话中展示的模型；不会改变服务器模型",
+            summary = "只筛选这台手机展示的模型，不改变服务器，也不切换当前会话",
             trailing = { DropdownChevron() },
-            onClick = { controller.selectProfile(profile.id); onManageModels() }
+            onClick = onManageModels
           )
         }
       }
@@ -237,12 +230,11 @@ private fun DeviceDetailScreen(
   }
 
   if (showDefaults) {
-    LaunchedEffect(profile.id) { controller.selectProfile(profile.id) }
     HyperBottomSheet(title = "新会话默认值", show = true, onDismissRequest = { showDefaults = false }) {
       Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(16.dp)) {
-        Text("配置 ${profile.name}；此设备已设为当前设备。", style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary))
+        Text("这些选择只用于 ${profile.name} 上新建的会话，不会切换当前连接。", style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary))
         Spacer(Modifier.height(12.dp))
-        NewSessionDefaultsCard(state, controller)
+        NewSessionDefaultsCard(state, controller, profile.id)
       }
     }
   }
@@ -270,16 +262,22 @@ private fun DeviceDetailScreen(
   }
 }
 
-private fun deviceOnline(profile: ServerProfile, state: LagoonState): Boolean =
-  profile.enabled && (if (profile.id == state.serverId) state.connected else state.allServerSnapshots[profile.id]?.connected == true)
+private fun deviceSnapshot(profile: ServerProfile, state: LagoonState): ServerOverviewSnapshot? =
+  state.serverSnapshots()[profile.id]
+
+private fun deviceConnected(profile: ServerProfile, state: LagoonState): Boolean =
+  profile.enabled && deviceSnapshot(profile, state)?.connected == true
 
 private fun deviceStatusLabel(profile: ServerProfile, state: LagoonState): String {
-  val current = profile.id == state.serverId
-  val snapshot = state.allServerSnapshots[profile.id]
+  val snapshot = deviceSnapshot(profile, state)
+  val authExpired = snapshot?.error?.let { message ->
+    message.contains("重新登录") || message.contains("凭据已过期") || message.contains("登录已失效")
+  } == true
   return resolveDeviceStatusLabel(
     enabled = profile.enabled,
-    online = deviceOnline(profile, state),
-    loading = if (current) state.loading else snapshot?.loading == true,
-    hasError = if (current) !state.error.isNullOrBlank() else !snapshot?.error.isNullOrBlank()
+    connected = deviceConnected(profile, state),
+    loading = snapshot?.loading == true,
+    hasError = !snapshot?.error.isNullOrBlank(),
+    authExpired = authExpired
   )
 }

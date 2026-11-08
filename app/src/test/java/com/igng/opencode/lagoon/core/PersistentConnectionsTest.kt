@@ -189,7 +189,7 @@ class PersistentConnectionsTest {
     }
   }
 
-  @Test fun aServerWithAutoConnectOffIsOnlyConnectedWhenExplicitlyIncluded() = runBlocking {
+  @Test fun anEnabledServerStaysMonitoredEvenWhenAutoConnectIsOff() = runBlocking {
     MockWebServer().use { server ->
       val requests = AtomicInteger()
       val base = dispatcher(AtomicInteger())
@@ -207,11 +207,8 @@ class PersistentConnectionsTest {
       val manager = AllServersOverview(store, cache(), scope, { snapshots[it.serverId] = it })
       try {
         manager.start(listOf(profile))
-        delay(300)
-        assertEquals("关闭自动连接的服务器不应被拨号", 0, requests.get())
-        manager.start(listOf(profile), include = setOf("a"))
         awaitCondition { snapshots["a"]?.connected == true }
-        assertTrue(requests.get() > 0)
+        assertTrue("启用的设备应保持连接，自动连接开关不再决定是否拨号", requests.get() > 0)
       } finally { manager.stop(); scope.cancel() }
     }
   }

@@ -39,12 +39,13 @@ class InteractionPoliciesTest {
     assertFalse(shouldShowGenerationStop(running = false))
   }
 
-  @Test fun deviceStatusKeepsLoadingAndErrorForEveryVisibleDevice() {
-    assertEquals("已停用", resolveDeviceStatusLabel(enabled = false, online = false, loading = true, hasError = true))
-    assertEquals("连接中", resolveDeviceStatusLabel(enabled = true, online = false, loading = true, hasError = false))
-    assertEquals("在线", resolveDeviceStatusLabel(enabled = true, online = true, loading = false, hasError = true))
-    assertEquals("需检查", resolveDeviceStatusLabel(enabled = true, online = false, loading = false, hasError = true))
-    assertEquals("离线", resolveDeviceStatusLabel(enabled = true, online = false, loading = false, hasError = false))
+  @Test fun deviceStatusUsesOneConnectionVocabulary() {
+    assertEquals("已停用", resolveDeviceStatusLabel(enabled = false, connected = false, loading = true, hasError = true, authExpired = true))
+    assertEquals("连接中", resolveDeviceStatusLabel(enabled = true, connected = false, loading = true, hasError = false))
+    assertEquals("已连接", resolveDeviceStatusLabel(enabled = true, connected = true, loading = false, hasError = true))
+    assertEquals("需要重新登录", resolveDeviceStatusLabel(enabled = true, connected = false, loading = false, hasError = true, authExpired = true))
+    assertEquals("需检查", resolveDeviceStatusLabel(enabled = true, connected = false, loading = false, hasError = true))
+    assertEquals("未连接", resolveDeviceStatusLabel(enabled = true, connected = false, loading = false, hasError = false))
   }
 
   @Test fun cleartextConsentDoesNotFollowAChangedOrParsedUrl() {
@@ -81,6 +82,12 @@ class InteractionPoliciesTest {
       "intent://scan/#Intent;scheme=zxing;end", "content://provider/1", "mailto:user@example.com",
       "https://", "https://exa mple.com/file", "file:", "file:relative"
     ).forEach { assertFalse("expected rejected: $it", attachmentCanOpen(it)) }
+  }
+
+  @Test fun duplicateServerKeysStayUniqueForLazyLists() {
+    assertEquals(listOf("a", "b"), uniqueListKeys(listOf("a", "b")) { it })
+    assertEquals(listOf("model", "model~2", "model~3"), uniqueListKeys(listOf("model", "model", "model")) { it })
+    assertEquals(listOf("item", "item~2"), uniqueListKeys(listOf("", " ")) { it.trim() })
   }
 
   @Test fun modelSearchTrimsMatchesCaseAndPreservesServerOrder() {

@@ -22,7 +22,7 @@ private data class PickerOption(val label: String, val summary: String? = null)
  * The phone-local defaults for a blank "new session" page, rendered in a HyperOS 4 island card.
  */
 @Composable
-internal fun NewSessionDefaultsCard(state: LagoonState, controller: LagoonController) {
+internal fun NewSessionDefaultsCard(state: LagoonState, controller: LagoonController, serverId: String? = state.serverId) {
   val server = state.server
   val connected = state.connected
   val isDsh = server?.kind == ServerKind.DSH || server?.kind == ServerKind.DSH_REMOTE
@@ -67,8 +67,8 @@ internal fun NewSessionDefaultsCard(state: LagoonState, controller: LagoonContro
         enabled = connected,
         onSelect = { index ->
           when {
-            index <= 0 -> controller.setNewSessionAgent(null)
-            index - 1 < agents.size -> controller.setNewSessionAgent(agents[index - 1].name)
+            index <= 0 -> controller.setNewSessionAgent(null, serverId)
+            index - 1 < agents.size -> controller.setNewSessionAgent(agents[index - 1].name, serverId)
           }
         }
       )
@@ -105,7 +105,7 @@ internal fun NewSessionDefaultsCard(state: LagoonState, controller: LagoonContro
         options = modelOptions,
         selectedIndex = modelIndex,
         enabled = connected && modelChoices.size > 1,
-        onSelect = { index -> controller.setNewSessionModel(modelChoices.getOrNull(index)) }
+        onSelect = { index -> controller.setNewSessionModel(modelChoices.getOrNull(index), serverId) }
       )
       HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
 
@@ -129,7 +129,7 @@ internal fun NewSessionDefaultsCard(state: LagoonState, controller: LagoonContro
         selectedIndex = strengthIndex,
         enabled = connected && strengthKey != null && variants.isNotEmpty(),
         onSelect = { index ->
-          if (strengthKey != null) controller.setNewSessionVariant(strengthKey, variants.getOrNull(index - 1)?.id)
+          if (strengthKey != null) controller.setNewSessionVariant(strengthKey, variants.getOrNull(index - 1)?.id, serverId)
         }
       )
       HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
@@ -143,7 +143,7 @@ internal fun NewSessionDefaultsCard(state: LagoonState, controller: LagoonContro
           text = "重新读取模型目录",
           variant = HyperButtonVariant.SECONDARY,
           loading = state.resource("models").state == ResourceState.LOADING,
-          onClick = { controller.loadDefaultCatalog(force = true) },
+          onClick = { controller.loadDefaultCatalog(force = true, serverId = serverId) },
           modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp)
         )
       }

@@ -48,13 +48,6 @@ internal fun DeviceGroupsSheet(
   var name by rememberSaveable(initialGroupId) { mutableStateOf(editing?.name.orEmpty()) }
   var selected by remember(initialGroupId) { mutableStateOf(editing?.memberIds?.toSet().orEmpty()) }
   var confirmingDelete by remember { mutableStateOf(false) }
-  var connectAll by remember(initialGroupId) {
-    mutableStateOf(
-      editing?.memberIds?.mapNotNull { id -> state.profiles.firstOrNull { it.id == id && it.enabled } }?.let { members ->
-        members.isNotEmpty() && members.all { it.autoConnect }
-      } ?: true
-    )
-  }
   val opencodeMembers = state.profiles.filter { it.kind == ServerKind.OPENCODE }
   val dshMembers = state.profiles.filter { it.kind != ServerKind.OPENCODE }
 
@@ -75,16 +68,6 @@ internal fun DeviceGroupsSheet(
         )
       }
       item { TextField(value = name, onValueChange = { name = it }, label = "分组名称", modifier = Modifier.fillMaxWidth()) }
-      item {
-        HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(vertical = 2.dp)) {
-          HyperSwitchRow(
-            title = "同时连接全部成员",
-            summary = "进入这个分组时保持每个成员的连接；关闭后按需连接",
-            checked = connectAll,
-            onCheckedChange = { connectAll = it }
-          )
-        }
-      }
       if (opencodeMembers.isNotEmpty()) {
         item { HyperGroupTitle("OpenCode") }
         items(opencodeMembers, key = { "oc:${it.id}" }) { profile ->
@@ -107,12 +90,8 @@ internal fun DeviceGroupsSheet(
           enabled = name.isNotBlank() && selected.isNotEmpty(),
           onClick = {
             val ids = selected.toList()
-            val id = if (editing == null) controller.createDevice(name, ids)
-            else {
-              controller.updateDevice(editing.id, name, ids)
-              editing.id
-            }
-            controller.setDeviceAutoConnect(id, connectAll)
+            if (editing == null) controller.createDevice(name, ids)
+            else controller.updateDevice(editing.id, name, ids)
             onDismiss()
           },
           modifier = Modifier.fillMaxWidth()

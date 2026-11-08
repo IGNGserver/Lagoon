@@ -242,7 +242,6 @@ internal fun MiuixServerForm(
   val isSecret = isDsh && dshAuth == DshAuthMode.SECRET
   var username by rememberSaveable(existing?.id) { mutableStateOf(existing?.username ?: "opencode") }
   var password by remember(existing?.id) { mutableStateOf("") }
-  var autoConnect by rememberSaveable(existing?.id) { mutableStateOf(existing?.autoConnect ?: true) }
   var notifications by rememberSaveable(existing?.id) { mutableStateOf(existing?.notifications ?: true) }
   var allowHttp by rememberSaveable(existing?.id) { mutableStateOf(existing?.allowCleartext == true) }
   var showAdvanced by remember { mutableStateOf(existing?.allowCleartext == true) }
@@ -447,13 +446,6 @@ internal fun MiuixServerForm(
     if (showAdvanced) {
       item {
         HyperSwitchRow(
-          title = "自动连接此服务器",
-          checked = autoConnect,
-          onCheckedChange = { autoConnect = it }
-        )
-      }
-      item {
-        HyperSwitchRow(
           title = "接收任务完成与等待通知",
           checked = notifications,
           onCheckedChange = { notifications = it }
@@ -487,7 +479,7 @@ internal fun MiuixServerForm(
              ServerKind.DSH_REMOTE -> remoteAccount.trim()
              else -> username.trim().ifBlank { "opencode" }
            },
-          autoConnect = autoConnect, notifications = notifications,
+          autoConnect = true, notifications = notifications,
           allowCleartext = normalizedUrl.startsWith("http://", true) && allowHttp,
            kind = harness, dshAuth = if (isDsh) dshAuth else DshAuthMode.TOKEN,
            remoteHostId = selectedHost.takeIf { harness == ServerKind.DSH_REMOTE && it.isNotBlank() },
