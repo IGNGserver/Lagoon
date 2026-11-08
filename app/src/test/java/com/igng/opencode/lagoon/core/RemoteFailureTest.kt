@@ -30,6 +30,12 @@ class RemoteFailureTest {
     assertNull(RemoteFailureKind.OFFLINE.recovery())
   }
 
+  @Test fun relayBackpressureKeepsItsUpstreamCodeAndIsRetryable() {
+    val failure = remoteControlFailure(RemoteControlException("SLOW_CONSUMER", "Relay consumer is too slow", true))
+    assertEquals(RemoteFailureKind.SLOW_CONSUMER, failure.kind)
+    assertTrue(failure.retryable)
+    assertEquals(RemoteRecoveryKind.RECONNECT, failure.kind.recovery())
+  }
   @Test fun offlineIsRetryable() {
     val offline = RemoteFailureException(RemoteFailureKind.OFFLINE, "主机现在不在线", retryable = true)
     assertTrue(offline.retryable)

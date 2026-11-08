@@ -21,14 +21,28 @@ import org.json.JSONObject
  */
 internal fun mergeTranscript(existing: List<Message>, fetched: List<Message>, pending: List<Message> = emptyList(),
   readStart: Map<String, Message>? = null): List<Message> {
-  if (existing.isEmpty()) return (fetched + pending).distinctBy { it.id }
-  val merged = LinkedHashMap<String, Message>(existing.size + fetched.size)
+  fun sameMessage(left: Message, right: Message): Boolean =
+    left.id == right.id || (left.sourceRequestId?.isNotBlank() == true && left.sourceRequestId == right.sourceRequestId)
+  val merged = LinkedHashMap<String, Message>(existing.size + fetched.size + pending.size)
   existing.forEach { merged[it.id] = it }
   fetched.forEach { message ->
-    val current = merged[message.id]
-    if (readStart == null || current == null || current == readStart[message.id]) merged[message.id] = message
+    val key = merged.keys.firstOrNull { sameMessage(merged.getValue(it), message) }
+    if (key == null) {
+      merged[message.id] = message
+      return@forEach
+    }
+    val current = merged.getValue(key)
+    val baseline = readStart?.values?.firstOrNull { sameMessage(it, current) }
+    // With a read baseline, only overwrite an entry that was unchanged while the request was in flight.
+    // A missing baseline means the entry is newer/live and must be retained.
+    if (readStart == null || (baseline != null && current == baseline)) {
+      if (key != message.id) merged.remove(key)
+      merged[message.id] = message
+    }
   }
-  pending.forEach { if (!merged.containsKey(it.id)) merged[it.id] = it }
+  pending.forEach { message ->
+    if (merged.keys.none { sameMessage(merged.getValue(it), message) }) merged[message.id] = message
+  }
   // DSH exposes durable seq for same-millisecond ties; other harnesses keep stable arrival order.
   return merged.values.sortedWith(compareBy<Message> { it.created }.thenBy { it.sequence ?: Long.MAX_VALUE })
 }
@@ -110,6 +124,16 @@ object TranscriptProjection {
       if (index < 0) message else message.copy(parts = message.parts.toMutableList().also { it[index] = change(it[index]) })
     }
     fun insert(message: Message?): Result = if (message == null || messages.any { it.id == message.id }) Result(messages) else result(messages + message)
+    fun insertUser(message: Message?): Result {
+      if (message == null) return Result(messages)
+      val index = messages.indexOfFirst { current ->
+        current.id == message.id || (message.sourceRequestId?.isNotBlank() == true && current.sourceRequestId == message.sourceRequestId)
+      }
+      if (index < 0) return result((messages + message).sortedWith(compareBy<Message> { it.created }.thenBy { it.sequence ?: Long.MAX_VALUE }))
+      if (messages[index] == message) return Result(messages)
+      return result(messages.toMutableList().also { it[index] = message })
+    }
+
     fun record(type: String, fields: JSONObject): Message =
       JSONObject(fields.toString()).put("id", messageId(event)).put("type", type).put("time", JSONObject().put("created", at)).toMessage()
 
@@ -117,7 +141,7 @@ object TranscriptProjection {
       "session.transcript.invalidate" -> Result(messages, reconcile = true)
       "session.dsh.input" -> {
         val turn = p.optLong("turn").takeIf { it > 0 }
-        insert(dshInputMessage(p.str("sessionID"), p.optLong("sequence"), at, turn, p.obj("input")))
+        insertUser(dshInputMessage(p.str("sessionID"), p.optLong("sequence"), at, turn, p.obj("input")))
       }
       "session.dsh.assistant" -> editAssistantOrReconcile { message ->
         val content = JSONArray()
@@ -260,9 +284,12 @@ object TranscriptProjection {
             dshInputMessage(p.str("sessionID"), p.optLong("sequence"), at, turn, it)
           }
           val user = durable ?: JSONObject().put("id", id).put("type", "user").put("text", text)
+            .put("sourceRequestId", p.obj("source").str("rpcId"))
             .put("time", JSONObject().put("created", event.created.takeIf { it > 0 } ?: System.currentTimeMillis()))
-            .put("metadata", JSONObject().put("displayText", text)).toMessage()
-          val index = messages.indexOfFirst { it.id == id }
+            .put("metadata", JSONObject().put("displayText", text)).toMessage().copy(sourceRequestId = p.obj("source").str("rpcId").ifBlank { null })
+          val index = messages.indexOfFirst { current ->
+             current.id == id || (user.sourceRequestId?.isNotBlank() == true && current.sourceRequestId == user.sourceRequestId)
+           }
           if (index >= 0 && messages[index] == user) null
           else if (index >= 0) result(messages.toMutableList().also { it[index] = user })
           else result((messages + user).sortedBy { it.created })

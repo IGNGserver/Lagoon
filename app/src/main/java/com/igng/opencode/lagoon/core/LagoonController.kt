@@ -3935,7 +3935,7 @@ class LagoonController private constructor(private val appContext: Context) {
       val inline = if (attachments.isEmpty()) emptyList() else kotlinx.coroutines.withContext(Dispatchers.IO) { attachments.map(attachmentImporter::inline) }
       val id = MessageIds.ascending()
       if (command == null && text.isNotBlank()) op.commit { it.copy(messages = it.messages + Message(id, "user", System.currentTimeMillis(),
-        listOf(MessagePart("$id:text", "text", text = text)), agent = agent, model = model, type = "user")) }
+        listOf(MessagePart("$id:text", "text", text = text)), agent = agent, model = model, type = "user", sourceRequestId = id)) }
       try {
         admissionStarted = true
         if (command != null) op.client.command(session, command.name, text.substringAfter(' ', ""), agent, model, op.snapshot.references, inline)
@@ -3979,8 +3979,14 @@ class LagoonController private constructor(private val appContext: Context) {
       attempt { TaskMonitorService.start(appContext, op.serverId, session.id) }
         .onFailure { Diagnostics.warn("Monitor", "无法启动任务监控服务", it) }
     }
-    // With the live stream up, the inbox/step events project the turn; otherwise read it back.
-    if (op.isCurrent(this) && !state.value.streamConnected) loadSession(session, token = op.token, client = op.client, ancillary = false)
+    // The live stream normally projects the turn. If it is down, reconcile in the background instead of
+    // holding the send operation (and the composer) on a 20-second follow snapshot timeout.
+    if (op.isCurrent(this) && !state.value.streamConnected) {
+      scope.launch {
+        runCatching { loadSession(session, token = op.token, client = op.client, ancillary = false) }
+          .onFailure { error -> Diagnostics.warn("LagoonController", "发送后的会话后台同步失败", error) }
+      }
+    }
   }
   }
   fun promptChild(text: String, onSent: (() -> Unit)? = null) = withSession("child-prompt") { op, client, session ->

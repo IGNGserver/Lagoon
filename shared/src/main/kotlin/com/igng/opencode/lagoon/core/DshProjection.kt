@@ -11,8 +11,9 @@ internal fun dshInputMessage(sessionId: String, seq: Long, at: Long, turn: Long?
   val text = data.arr("content").objects().mapNotNull { it.str("text").takeIf(String::isNotBlank) }.joinToString("\n")
   val turnId = turn?.let { "turn:$it" }
   if (kind.isBlank() || kind == "user") return JSONObject().put("id", id).put("type", "user")
-    .put("text", text).put("metadata", JSONObject().put("displayText", text))
-    .put("time", JSONObject().put("created", at)).toMessage().copy(turnId = turnId, sequence = seq)
+    .put("text", text).put("metadata", JSONObject().put("displayText", text)).put("sourceRequestId", source.str("rpcId"))
+    .put("time", JSONObject().put("created", at)).toMessage().copy(turnId = turnId, sequence = seq,
+      sourceRequestId = source.str("rpcId").ifBlank { null })
   if (kind == "agent-message" && source.str("form") == "relay") return Message(id, "relay", at,
     listOf(MessagePart("$id:text", "text", text = text)),
     notice = Notice("代理来信", target = source.str("senderSessionId").takeIf(String::isNotBlank)),

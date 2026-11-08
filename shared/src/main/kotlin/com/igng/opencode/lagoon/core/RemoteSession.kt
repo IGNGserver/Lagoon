@@ -98,6 +98,8 @@ internal class RemoteSession(
       RemoteConnection.connect(address, device.identity, token, host, key, allowCleartext, clientVersion) {
         (gateway ?: throw IOException("Remote 事件早于能力协商")).event(it)
       }
+    } catch (error: RemoteControlException) {
+      throw remoteControlFailure(error)
     } catch (error: Exception) {
       throw RemoteFailureException(RemoteFailureKind.NETWORK, "没能建立加密中继：${detail(error)}", retryable = true, cause = error)
     }
@@ -136,12 +138,14 @@ internal class RemoteSession(
     if (statusFlow.value.generation != attempt) return
     val failure = error as? RemoteFailureException
       ?: (error as? RemoteServerException)?.let(::remoteServerFailure)
+      ?: (error as? RemoteControlException)?.let(::remoteControlFailure)
     val kind = failure?.kind ?: RemoteFailureKind.NETWORK
     val retryable = failure?.retryable ?: true
     val message = failure?.message?.takeIf { it.isNotBlank() }
       ?: error.message?.takeIf { it.isNotBlank() }
       ?: error.javaClass.simpleName
     val code = (error as? RemoteRpcException)?.code ?: (error as? RemoteGatewayException)?.code
+      ?: (error as? RemoteControlException)?.code
     statusFlow.value = statusFlow.value.copy(phase = if (closed) RemotePhase.CLOSED else RemotePhase.FAILED,
       readyAt = 0, lastError = RemoteFailureSnapshot(kind, message, retryable, code))
   }

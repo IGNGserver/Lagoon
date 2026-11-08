@@ -15,13 +15,14 @@ internal fun RemoteFailureKind.recovery(): RemoteRecoveryKind? = when (this) {
   RemoteFailureKind.TRUST_REQUIRED, RemoteFailureKind.TRUST_CHANGED -> RemoteRecoveryKind.TRUST
   RemoteFailureKind.HOST_NOT_FOUND -> RemoteRecoveryKind.HOST
   RemoteFailureKind.CONNECTION_REPLACED -> RemoteRecoveryKind.RECONNECT
+  RemoteFailureKind.SLOW_CONSUMER -> RemoteRecoveryKind.RECONNECT
   else -> null
 }
 
 /** User-actionable Remote failure. UI may key recovery on [kind], never on a message string. */
 enum class RemoteFailureKind {
   OFFLINE, AUTH_REQUIRED, DEVICE_REVOKED, HOST_NOT_FOUND,
-  TRUST_REQUIRED, TRUST_CHANGED, CONNECTION_REPLACED,
+  TRUST_REQUIRED, TRUST_CHANGED, CONNECTION_REPLACED, SLOW_CONSUMER,
   INCOMPATIBLE, REJECTED, RATE_LIMITED, NETWORK
 }
 
@@ -38,6 +39,7 @@ internal class RemoteFailureException(
       RemoteFailureKind.HOST_NOT_FOUND -> "刷新主机"
       RemoteFailureKind.TRUST_REQUIRED, RemoteFailureKind.TRUST_CHANGED -> "核对指纹"
       RemoteFailureKind.CONNECTION_REPLACED -> "重新连接"
+      RemoteFailureKind.SLOW_CONSUMER -> "降低流量后重连"
       RemoteFailureKind.INCOMPATIBLE -> "查看更新方法"
       RemoteFailureKind.RATE_LIMITED -> "稍后重试"
       RemoteFailureKind.REJECTED -> "查看主机"
@@ -48,7 +50,13 @@ internal class RemoteFailureException(
 internal fun remoteFailure(error: Throwable): RemoteFailureException? =
   generateSequence(error) { it.cause }.filterIsInstance<RemoteFailureException>().firstOrNull()
 
-/** Maps the control-plane REST status/code without guessing from a version string. */
+internal fun remoteControlFailure(error: RemoteControlException): RemoteFailureException = when (error.code) {
+  "CONNECTION_REPLACED" -> RemoteFailureException(RemoteFailureKind.CONNECTION_REPLACED, "另一实例正在使用这台设备身份", retryable = false, cause = error)
+  "SLOW_CONSUMER" -> RemoteFailureException(RemoteFailureKind.SLOW_CONSUMER, "Relay 消费过慢，正在降低流量并重连", retryable = true, cause = error)
+  "TOKEN_EXPIRED", "AUTH_INVALID", "DEVICE_REVOKED" -> RemoteFailureException(RemoteFailureKind.AUTH_REQUIRED, "DSH Remote 凭据已失效，请重新登录", retryable = false, cause = error)
+  else -> RemoteFailureException(RemoteFailureKind.NETWORK, error.message ?: "DSH Remote 连接失败", retryable = error.retryable, cause = error)
+}
+
 internal fun remoteServerFailure(error: RemoteServerException): RemoteFailureException = when {
   error.status == 401 -> RemoteFailureException(RemoteFailureKind.AUTH_REQUIRED, "DSH Remote 登录已失效", retryable = false, cause = error)
   error.status == 403 -> RemoteFailureException(RemoteFailureKind.REJECTED, "主机拒绝了这台手机", retryable = false, cause = error)

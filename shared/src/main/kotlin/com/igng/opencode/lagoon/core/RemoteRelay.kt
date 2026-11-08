@@ -20,6 +20,13 @@ import java.util.Base64
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 
+/** A control-plane rejection whose code is safe to retain in diagnostics and recovery decisions. */
+internal class RemoteControlException(
+  val code: String,
+  message: String,
+  val retryable: Boolean
+) : IOException(message)
+
 /** Relay over the authenticated control socket. Separate relay endpoints are not yet supported. */
 internal class RemoteRelay(
   address: String,
@@ -126,7 +133,8 @@ internal class RemoteRelay(
       } catch (error: Exception) { fail(IOException("Remote 认证失败", error)) }
     }
     override fun onMessage(webSocket: WebSocket, text: String) {
-      try { handle(text) } catch (error: Exception) { fail(IOException("Remote 协议失败", error)) }
+      try { handle(text) } catch (error: RemoteControlException) { fail(error) }
+        catch (error: Exception) { fail(IOException("Remote 协议失败", error)) }
     }
     override fun onMessage(webSocket: WebSocket, bytes: ByteString) { fail(IOException("Remote 不接受二进制控制帧")) }
     override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) { fail(IOException("Remote WebSocket 失败", t)) }
@@ -152,7 +160,11 @@ internal class RemoteRelay(
       val payload = frame.optJSONObject("payload") ?: throw IOException("Remote 帧内容无效")
       when (type) {
         "ping" -> sendFrame("pong", JSONObject().put("nonce", textField(payload, "nonce")), controlLimit)
-        "error", "connect.rejected" -> throw IOException("DSH Hub 拒绝连接")
+        "error", "connect.rejected" -> {
+          val code = (payload.opt("code") as? String)?.takeIf { it.matches(Regex("[A-Z0-9_]{1,80}")) } ?: "REMOTE_REJECTED"
+          val retryable = payload.optBoolean("retryable", code in setOf("CONNECTION_FAILED", "SLOW_CONSUMER"))
+          throw RemoteControlException(code, payload.optString("message").ifBlank { "DSH Hub 拒绝连接" }, retryable)
+        }
         "hello.ack" -> {
           if (state != State.HELLO || payload.opt("protocol") != 1) throw IOException("Remote 握手顺序无效")
           controlLimit = limit(payload, "maxControlFrameBytes", 65536)
