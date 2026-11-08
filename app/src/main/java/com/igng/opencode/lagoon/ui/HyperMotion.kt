@@ -1,5 +1,12 @@
 package com.igng.opencode.lagoon.ui
 
+import androidx.compose.animation.AnimatedContentTransitionScope
+import androidx.compose.animation.ContentTransform
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.togetherWith
 import androidx.compose.animation.core.SpringSpec
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
@@ -53,6 +60,32 @@ internal object HyperMotion {
 
   /** 开关与胶囊指示器滑动弹簧 */
   fun <T> controlSpring(): SpringSpec<T> = spring(dampingRatio = 0.80f, stiffness = 540f)
+}
+
+/**
+ * 整页推入 / 弹出的唯一动效规格（澎湃 OS 4 原生级）：
+ * 新页从右侧整幅推入，旧页同时向反方向退 28% 并缩到 0.94（返回时方向相反、底层不淡出变透）；
+ * 顶层页始终压住底层，避免两页在半透明交界处互相透出。
+ *
+ * 所有整页都是 [NavRoute] 上的一层，所以首页进设备、设备进详情、详情进编辑器、添加入口进 SSH
+ * 表单这四级共用这一份规格——不要另写一份“相似但不相同”的弹簧。
+ */
+internal fun AnimatedContentTransitionScope<NavRoute>.pageTransform(direction: Int): ContentTransform {
+  val spring = HyperMotion.pageOffsetSpring
+  return if (direction > 0) {
+    (slideInHorizontally(spring) { it * direction } togetherWith
+      (slideOutHorizontally(spring) { -it * direction * 28 / 100 } +
+        scaleOut(HyperMotion.pageFloatSpring, targetScale = 0.94f))).apply {
+      targetContentZIndex = 2f
+    }
+  } else {
+    ((slideInHorizontally(spring) { it * direction * 28 / 100 } +
+      scaleIn(HyperMotion.pageFloatSpring, initialScale = 0.94f)) togetherWith
+      (slideOutHorizontally(spring) { -it * direction } +
+        scaleOut(HyperMotion.pageFloatSpring, targetScale = 0.95f))).apply {
+      targetContentZIndex = 0f
+    }
+  }
 }
 
 /**
