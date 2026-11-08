@@ -50,12 +50,12 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
 
 internal enum class AddDeviceTab(val label: String) {
   OPENCODE("OpenCode"),
-  DSH_REMOTE("远程中枢"),
-  DSH_SSH("SSH 主机")
+  DSH("DeepSeek Harness")
 }
 
 /**
- * 统一添加入口：三大对等接入通道（OpenCode 直连、DSH 远程中枢、DSH SSH 直连），采用自研澎湃分段胶囊。
+ * 统一添加入口：先按 harness 分两段（OpenCode / DeepSeek Harness），DSH 段内再分中枢登录与 SSH
+ * 直连两种接入。三种通道仍是同一套 profile 管线，只是不再作为对等的一级页签并列。
  */
 @Composable
 internal fun AddDeviceSheet(
@@ -72,7 +72,7 @@ internal fun AddDeviceSheet(
     mutableStateOf(
       when {
         existingOpenCode != null -> AddDeviceTab.OPENCODE
-        initialSshHostId != null -> AddDeviceTab.DSH_SSH
+        initialSshHostId != null -> AddDeviceTab.DSH
         else -> AddDeviceTab.OPENCODE
       }
     )
@@ -161,18 +161,14 @@ internal fun AddDeviceSheet(
             )
           }
         }
-        tab == AddDeviceTab.DSH_REMOTE -> {
-          DshRemoteTab(
+        else -> {
+          DshTab(
+            state = state,
             catalogAccount = catalog?.account,
             catalogOrigin = catalog?.origin,
             hostCount = catalog?.hosts?.size ?: 0,
             onLoginHub = onLoginHub,
-            onManageHub = onManageHub
-          )
-        }
-        else -> {
-          DshSshTab(
-            state = state,
+            onManageHub = onManageHub,
             onAddSsh = { sshEditor = "" },
             onEditSsh = { sshEditor = it }
           )
@@ -195,57 +191,13 @@ internal fun AddDeviceSheet(
 }
 
 @Composable
-private fun DshRemoteTab(
+private fun DshTab(
+  state: LagoonState,
   catalogAccount: String?,
   catalogOrigin: String?,
   hostCount: Int,
   onLoginHub: () -> Unit,
-  onManageHub: () -> Unit
-) {
-  LazyColumn(
-    Modifier.fillMaxSize(),
-    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
-    verticalArrangement = Arrangement.spacedBy(12.dp)
-  ) {
-    item {
-      Text(
-        "登录 DeepSeek Harness 远程中枢，选择要接入的电脑并核对主机指纹。连接采用端到端加密。",
-        style = MiuixTheme.textStyles.body2.copy(color = HyperTheme.colors.textSecondary)
-      )
-    }
-    if (catalogAccount == null) {
-      item {
-        HyperGroupTitle("中枢账号")
-        HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(16.dp)) {
-          Text("尚未登录。登录后会列出你有权访问的主机，不会自动接入全部主机。",
-            style = MiuixTheme.textStyles.body2.copy(color = HyperTheme.colors.textSecondary))
-          Spacer(Modifier.height(12.dp))
-          HyperButton(text = "登录并选择主机", onClick = onLoginHub, modifier = Modifier.fillMaxWidth())
-        }
-      }
-    } else {
-      item {
-        HyperGroupTitle("中枢账号")
-        HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(vertical = 4.dp)) {
-          HyperRow(
-            title = catalogAccount,
-            summary = "${catalogOrigin.orEmpty()} · $hostCount 台可接入主机",
-            trailing = { DropdownChevron() },
-            onClick = onManageHub
-          )
-        }
-      }
-      item {
-        HyperButton(text = "选择并接入主机", onClick = onLoginHub, modifier = Modifier.fillMaxWidth())
-        HyperTextAction(text = "管理中枢账号与主机", onClick = onManageHub, modifier = Modifier.fillMaxWidth())
-      }
-    }
-  }
-}
-
-@Composable
-private fun DshSshTab(
-  state: LagoonState,
+  onManageHub: () -> Unit,
   onAddSsh: () -> Unit,
   onEditSsh: (String) -> Unit
 ) {
@@ -256,18 +208,51 @@ private fun DshSshTab(
   ) {
     item {
       Text(
-        "通过 SSH 登录远端 POSIX 电脑（Linux / macOS / WSL），自动在远端启动并隧道直连 dsh web。",
+        "DeepSeek Harness 有两种接入：登录远程中枢批量接入电脑，或直接 SSH 直连一台 POSIX 主机。",
         style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary)
       )
     }
-    item {
-      HyperGroupTitle("SSH 主机")
+    item { HyperGroupTitle("远程中枢") }
+    if (catalogAccount == null) {
+      item {
+        HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(16.dp)) {
+          Text(
+            "尚未登录。登录后会列出你有权访问的主机，不会自动接入全部主机。",
+            style = MiuixTheme.textStyles.body2.copy(color = HyperTheme.colors.textSecondary)
+          )
+          Spacer(Modifier.height(12.dp))
+          HyperButton(text = "登录并选择主机", onClick = onLoginHub, modifier = Modifier.fillMaxWidth())
+        }
+      }
+    } else {
+      item {
+        HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(vertical = 4.dp)) {
+          HyperRow(
+            title = catalogAccount,
+            summary = "${catalogOrigin.orEmpty()} · $hostCount 台可接入主机",
+            trailing = { DropdownChevron() },
+            onClick = onManageHub
+          )
+        }
+      }
+      item {
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+          HyperButton(text = "接入更多主机", onClick = onLoginHub, modifier = Modifier.weight(1f))
+          HyperButton(
+            text = "管理中枢",
+            variant = HyperButtonVariant.SECONDARY,
+            onClick = onManageHub,
+            modifier = Modifier.weight(1f)
+          )
+        }
+      }
     }
+    item { HyperGroupTitle("SSH 主机") }
     if (state.sshHosts.isEmpty()) {
       item {
         HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(14.dp)) {
           Text(
-            "还没有添加 DSH SSH 主机。添加后会自动通过 SSH 启动远端的 dsh web 并建立加密隧道。",
+            "还没有 SSH 主机。添加后会自动在远端启动 dsh web 并建立加密隧道。",
             style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary)
           )
         }
@@ -305,6 +290,7 @@ private fun DshSshTab(
     item {
       HyperButton(
         text = "添加 SSH 主机",
+        variant = if (state.sshHosts.isEmpty()) HyperButtonVariant.PRIMARY else HyperButtonVariant.SECONDARY,
         onClick = onAddSsh,
         modifier = Modifier.fillMaxWidth()
       )

@@ -6,17 +6,26 @@ dsh-Go，但实现是 Kotlin/JSch 的独立重写（dsh-Go 是 AGPL-3.0，不直
 
 ## 1. 配置
 
-| 字段 | 说明 |
-|---|---|
-| `name` | 显示名称；留空使用主机地址 |
-| `host` / `port` / `user` | SSH 地址、端口（默认 22）、登录用户 |
-| `auth` | `PASSWORD` 或 `PRIVATE_KEY` |
-| `password` | 密码认证；只保存在加密 SSH 存储 |
-| `privateKey` / `passphrase` | OpenSSH/PEM 私钥；支持导入文件 |
-| `launchCommand` | 远端启动命令，默认 `dsh web`；App 追加 `--host 127.0.0.1 --port 0 --no-open` |
-| `workingDirectory` | 可选；`~` 由远端 shell 展开，同时作为默认会话目录 |
-| `hostKeyType` / `hostKeyFingerprint` | 首次连接确认后固定的主机密钥，SHA-256 `SHA256:…` |
-| `autoConnect` | 保存在 `ServerProfile`；默认开启 |
+第一屏只保留三项：地址、用户名、密码。其余字段收在「更多选项」里，已保存主机的非默认值会自动
+展开该区域，折叠行摘要也会标出 `端口 2222`、`私钥登录` 之类的差异，避免自定义配置被藏住。
+
+| 字段 | 位置 | 说明 |
+|---|---|---|
+| `host` | 第一屏 | SSH 地址；可直接粘贴 `user@host:port` 或整行 `ssh -p 22 user@host`，App 拆分到用户名与端口 |
+| `user` | 第一屏 | 登录用户；地址里带 `user@` 时自动填入 |
+| `password` | 第一屏 | 密码认证；只保存在加密 SSH 存储 |
+| `port` | 更多 | 默认 22；地址里带 `:port` 时自动填入 |
+| `auth` | 更多 | `PASSWORD`（默认）或 `PRIVATE_KEY`；选择私钥后凭据行切换为私钥块 |
+| `privateKey` / `passphrase` | 更多 | OpenSSH/PEM 私钥；支持导入文件与显示/隐藏，私钥密码可选 |
+| `launchCommand` | 更多 | 远端启动命令，默认 `dsh web`；App 追加 `--host 127.0.0.1 --port 0 --no-open` |
+| `workingDirectory` | 更多 | 可选；`~` 由远端 shell 展开，同时作为默认会话目录 |
+| `name` | 更多 | 显示名称；留空使用主机地址 |
+| `hostKeyType` / `hostKeyFingerprint` | 更多 | 首次连接确认后固定的主机密钥，SHA-256 `SHA256:…`；只在此处重置 |
+| `autoConnect` | 不可见 | 保存在 `ServerProfile`；保存时默认开启 |
+| `notifications` / `groupId` / `enabled` | 设备详情 | 设备层偏好；SSH 表单只透传，不再重复提供 |
+
+保存有两个出口：主按钮「连接」先读取并固定主机指纹，再保存并连接；「仅保存，不连接」不访问主机
+（离线也能保存），指纹留到第一次真正连接时确认。
 
 一个 SSH 主机对应一个 `ServerProfile`（`kind = DSH`、`sshHostId != null`）。`url` 是稳定的
 `ssh://user@host:port` 展示身份，不参与 HTTP 凭据 origin；SSH 密码/私钥放在独立的
@@ -39,6 +48,7 @@ SSH 连接
   `ssh-keygen -lf` 结果核对后才固定。
 - 之后指纹变化直接拒绝连接，错误里带“已记住/这次收到”，必须在编辑页显式“重置主机指纹”。
 - 修改 host 或 port 会自动丢弃旧 pin；后台重连不会弹窗，未固定指纹的主机只显示“需要确认”。
+- 用「仅保存，不连接」存下的主机没有 pin，第一次真正连接时才走同一条确认流程。
 
 ### 远端 dsh web
 
@@ -114,7 +124,7 @@ ANDROID_HOME=$HOME/Android/Sdk \
 
 | 文件 | 内容 |
 |---|---|
-| `shared/.../SshHost.kt` | 配置/密钥/状态/错误/指纹/脚本工具 |
+| `shared/.../SshHost.kt` | 配置/密钥/状态/错误/指纹/脚本工具；`SshAddress` 解析 `user@host:port` |
 | `app/.../core/SshHostStore.kt` | 配置 + Keystore 加密密钥 |
 | `app/.../core/ssh/JschSshTransport.kt` | JSch 传输、Host Key、exec、direct-tcpip |
 | `app/.../core/ssh/RemoteDshBootstrap.kt` | probe/start/stop 与日志解析 |
@@ -122,4 +132,4 @@ ANDROID_HOME=$HOME/Android/Sdk \
 | `app/.../core/ssh/SshHostLink.kt` | 状态机、keepalive、重连、DshApi 代次 |
 | `app/.../core/ssh/SshDshClient.kt` | `HarnessClient` 适配 |
 | `app/.../core/ssh/SshHostManager.kt` | 每主机 link 注册表 |
-| `app/.../ui/SshHostForm.kt` | 配置、测试、主机指纹弹窗 |
+| `app/.../ui/SshHostForm.kt` | 三字段表单 + 「更多选项」、仅测试连接、主机指纹弹窗 |

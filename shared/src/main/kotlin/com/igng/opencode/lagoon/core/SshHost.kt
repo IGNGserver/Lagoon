@@ -13,6 +13,73 @@ const val SSH_DEFAULT_PORT = 22
 const val DEFAULT_DSH_LAUNCH_COMMAND = "dsh web"
 const val SSH_STATE_DIR = "\$HOME/.dsh-app-remote"
 
+/** Result of reading one address field, so the form can keep user/port out of the first screen. */
+data class SshAddressParts(val host: String, val user: String? = null, val port: Int? = null)
+
+/**
+ * What the address field accepts. People copy `user@host`, `host:2222` or a whole
+ * `ssh -p 2222 user@host` line out of a terminal or a chat message, so the form splits that instead
+ * of asking everyone for three separate fields. Anything it cannot read stays as the host verbatim.
+ */
+object SshAddress {
+  private val WHITESPACE = Regex("\\s+")
+
+  fun parse(raw: String): SshAddressParts {
+    val text = raw.trim()
+    if (text.isEmpty()) return SshAddressParts("")
+    var rest = text
+    var flagPort: Int? = null
+    if (text.length > 3 && text.startsWith("ssh") && text[3].isWhitespace()) {
+      val tokens = text.split(WHITESPACE).filter(String::isNotEmpty).drop(1)
+      var destination: String? = null
+      var index = 0
+      while (index < tokens.size) {
+        val token = tokens[index]
+        when {
+          (token == "-p" || token == "-P") && index + 1 < tokens.size -> {
+            flagPort = tokens[index + 1].toPortOrNull()
+            index += 2
+          }
+          (token.startsWith("-p") || token.startsWith("-P")) && token.length > 2 -> {
+            flagPort = token.substring(2).toPortOrNull()
+            index += 1
+          }
+          token.startsWith("-") -> index += 1
+          else -> {
+            if (destination == null) destination = token
+            index += 1
+          }
+        }
+      }
+      if (destination == null) return SshAddressParts(text)
+      rest = destination
+    }
+    val at = rest.lastIndexOf('@')
+    val user = if (at > 0) rest.substring(0, at).takeIf(String::isNotBlank) else null
+    val hostPort = if (user != null) rest.substring(at + 1) else rest
+    val split = splitHostPort(hostPort)
+    if (split.first.isBlank()) return SshAddressParts(text)
+    return SshAddressParts(split.first, user, split.second ?: flagPort)
+  }
+
+  private fun splitHostPort(value: String): Pair<String, Int?> {
+    if (value.startsWith("[")) {
+      val close = value.indexOf(']')
+      if (close <= 1) return value to null
+      val tail = value.substring(close + 1)
+      val port = if (tail.startsWith(":")) tail.substring(1).toPortOrNull() else null
+      return value.substring(1, close) to port
+    }
+    val first = value.indexOf(':')
+    // More than one colon without brackets is a bare IPv6 address, never a port.
+    if (first <= 0 || first != value.lastIndexOf(':')) return value to null
+    val port = value.substring(first + 1).toPortOrNull() ?: return value to null
+    return value.substring(0, first) to port
+  }
+
+  private fun String.toPortOrNull(): Int? = trim().toIntOrNull()?.takeIf { it in 1..65535 }
+}
+
 /**
  * A saved SSH host. Behaviour and fields mirror dsh-Go's `SshHostConfig`: address + port + user,
  * password or private key, the remote `dsh web` launch command, an optional working directory and

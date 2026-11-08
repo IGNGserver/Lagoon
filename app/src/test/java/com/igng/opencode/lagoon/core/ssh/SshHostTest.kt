@@ -3,6 +3,7 @@ package com.igng.opencode.lagoon.core.ssh
 import com.igng.opencode.lagoon.core.RemoteExecResult
 import com.igng.opencode.lagoon.core.SshFailure
 import com.igng.opencode.lagoon.core.SshFailureKind
+import com.igng.opencode.lagoon.core.SshAddress
 import com.igng.opencode.lagoon.core.SshHostConfig
 import com.igng.opencode.lagoon.core.SshHostCodec
 import com.igng.opencode.lagoon.core.SshShell
@@ -35,6 +36,39 @@ class SshHostTest {
     assertEquals("\"\$HOME\"/'code lab'", SshShell.remotePathExpr("~/code lab"))
     assertEquals("/home/me/code lab", SshShell.absolutePath("~/code lab", "/home/me"))
     assertEquals("token=•••&a=b", SshShell.redactTokens("http://x/?token=secret&a=b").substringAfter("?"))
+  }
+
+  @Test fun addressFieldSplitsUserPortAndKeepsOddInput() {
+    // The first screen only asks for an address, so pasted ssh forms must land in the right fields.
+    val userAtHost = SshAddress.parse("lvziw@192.168.1.20")
+    assertEquals("192.168.1.20", userAtHost.host)
+    assertEquals("lvziw", userAtHost.user)
+    assertEquals(null, userAtHost.port)
+
+    val hostPort = SshAddress.parse("nas.local:2222")
+    assertEquals("nas.local", hostPort.host)
+    assertEquals(null, hostPort.user)
+    assertEquals(2222, hostPort.port)
+
+    val everything = SshAddress.parse("  me@nas.local:2200  ")
+    assertEquals("nas.local", everything.host)
+    assertEquals("me", everything.user)
+    assertEquals(2200, everything.port)
+
+    val command = SshAddress.parse("ssh -p 2022 me@[fe80::1]")
+    assertEquals("fe80::1", command.host)
+    assertEquals("me", command.user)
+    assertEquals(2022, command.port)
+
+    val bareIpv6 = SshAddress.parse("fe80::1")
+    assertEquals("fe80::1", bareIpv6.host)
+    assertEquals(null, bareIpv6.port)
+
+    // Out-of-range ports and half-typed addresses stay verbatim instead of silently losing the host.
+    assertEquals("host:99999", SshAddress.parse("host:99999").host)
+    assertEquals(null, SshAddress.parse("host:99999").port)
+    assertEquals("me@", SshAddress.parse("me@").host)
+    assertEquals("", SshAddress.parse("   ").host)
   }
 
   @Test fun bootstrapStartsReusesAndStopsManagedDsh() {
