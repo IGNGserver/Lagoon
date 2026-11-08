@@ -193,4 +193,44 @@ class RootNavigatorTest {
     assertEquals("dev-1", navigator.navigation.device)
     assertEquals(0, systemBacks)
   }
+
+  /*
+   * 下面三条守的是"界面能沿着同一个姿态把转场播完"的前提：手势的进度和相位只在 finish 时才清。
+   * 界面用 SeekableTransitionState 驱动两页，松手那一刻读的就是这里的 progress；提前清零（旧实现
+   * 在 commit 里 snapTo(0f)）会让旧页瞬间回到手势前的姿态，也就是用户看到的闪回。
+   */
+
+  @Test fun aCommittedGestureKeepsItsProgressUntilTheExitAnimationFinishes() {
+    navigator.navigate(navigator.navigation.open("s1"))
+    swipe(progress = 0.55f)
+    val gesture = navigator.gesture!!
+    release()
+    assertEquals("栈先落到底，界面据此决定转场目标", SessionNavigation(), navigator.navigation)
+    assertEquals(BackPhase.COMMITTED, navigator.gesture?.phase)
+    assertEquals("离场动画结束前进度不能被清掉", 0.55f, navigator.progress)
+    navigator.finish(gesture.id)
+    assertNull(navigator.gesture)
+    assertEquals(0f, navigator.progress)
+  }
+
+  @Test fun aCancelledGestureKeepsItsProgressForTheSpringBack() {
+    navigator.navigate(navigator.navigation.open("s1"))
+    swipe(progress = 0.4f)
+    val gesture = navigator.gesture!!
+    dispatcher.dispatchOnBackCancelled()
+    assertEquals(BackPhase.CANCELLED, navigator.gesture?.phase)
+    assertEquals("回弹动画结束前进度不能被清掉", 0.4f, navigator.progress)
+    assertEquals("取消不落栈", listOf("s1"), navigator.navigation.sessions)
+    navigator.finish(gesture.id)
+    assertEquals(0f, navigator.progress)
+  }
+
+  @Test fun theGestureTargetIsWhereTheStackLandsOnCommit() {
+    navigator.navigate(SessionNavigation(RootPage.DEVICES).open("s1"))
+    swipe(progress = 0.3f)
+    // 跟手时界面 seek 到这个目标；松手后直接把同一个转场补完到 navigator.route，两者必须同一个值。
+    val target = navigator.gesture?.peek
+    release()
+    assertEquals(target, navigator.route)
+  }
 }
