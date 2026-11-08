@@ -83,11 +83,10 @@ class MainActivity : ComponentActivity() {
     })
     setContent {
       val state by controller.state.collectAsState()
-      // Chat/draft pages do not need the home aggregate; computing it on every streamed token was
-      // pure CPU. Only root/list pages (no session in the stack) use it.
-      val home = if (navigator.navigation.sessions.isEmpty()) state.homeProjection() else state
       // A device group scopes the new-session server list; 全部设备 leaves every enabled profile open.
-      val draftScope = home.homeGroup?.memberIds?.toSet()
+      // 首页的聚合投影不能跟着"当前路由"走：首页在转场里也是一页（离场页、预见式返回的预览页），
+      // 那些帧里栈仍指向会话页。首页统一在组合点取投影，见 [rememberHomePage]。
+      val draftScope = state.homeGroup?.memberIds?.toSet()
       val preferences = remember { getSharedPreferences("ui", MODE_PRIVATE) }
       var themeMode by remember { mutableStateOf(runCatching { ThemeMode.valueOf(preferences.getString("themeMode", "SYSTEM")!!) }.getOrDefault(ThemeMode.SYSTEM)) }
       val systemDark = isSystemInDarkTheme()
@@ -349,7 +348,7 @@ class MainActivity : ComponentActivity() {
                  },
                    onManageDevices = { openPage(RootPage.DEVICES) }, onBack = { goBack() },
                     onMessage = { msg, type -> globalMessage = msg; globalMessageType = type })
-                 else -> HomeScreen(home, controller, onOpen = { openSession(it) }, onNewSession = { openDraft() }, onScope = { showingScope = true },
+                 else -> HomeScreen(rememberHomePage(state), controller, onOpen = { openSession(it) }, onNewSession = { openDraft() }, onScope = { showingScope = true },
                     onManageDevices = { openPage(RootPage.DEVICES) },
                     onPage = ::openPage)
               }
@@ -429,7 +428,7 @@ class MainActivity : ComponentActivity() {
             // 整页编辑器不再挂在这里：它是路由上的一层，由上面的 AnimatedContent 渲染并在进退场时有动画；
             // 它内部的对话框仍然落在这个作用域里（见 PopupScopeRegressionTest）。
              if (showingScope) HomeScopeSheet(
-               state = home,
+               state = rememberHomePage(state),
                allSnapshots = state.allServerSnapshots,
                controller = controller,
                onDismiss = { showingScope = false },
@@ -492,3 +491,18 @@ class MainActivity : ComponentActivity() {
     const val KEY_NAV_SERVER = "navServer"
   }
 }
+
+/**
+ * 首页始终用聚合投影渲染，与"当前路由"无关。
+ *
+ * 首页不只在根路由上出现：打开会话时首页作为离场页仍在画，预见式返回时首页作为预览页、在栈仍
+ * 指向会话页时就已经组合。此前按 `navigator.navigation.sessions.isEmpty()` 决定是否投影，这些帧
+ * 因此拿到原始会话状态——聚合首页（全部设备 / 设备分组）的 [LagoonState.allSessionStatuses] 恒为空，
+ * 行状态（运行中 / 待处理 / 未读点）、未读汇总与状态分组在预览里集体消失，落地那一帧才补回来，
+ * 看起来就是"闪一下状态"。
+ *
+ * [LagoonState.homeProjection] 按 state 实例缓存，且只在首页真正被组合时调用（当前就在首页、
+ * 离场动画、放弃预测式返回的预览），聊天页流式输出期间不会计算，保留 #163 的性能收益。
+ */
+@Composable
+private fun rememberHomePage(state: LagoonState): LagoonState = remember(state) { state.homeProjection() }
