@@ -12,8 +12,11 @@ import androidx.compose.runtime.setValue
 internal enum class BackPhase { ACTIVE, COMMITTED, CANCELLED }
 
 /**
- * 一次根返回手势。[id] 单调递增：旧手势的收尾（提交后的停留、取消后的回弹）只能结束它自己，
- * 不能把紧接着开始的新手势一起清掉。[peek] 是手指移动时垫在下面的上一级页面。
+ * 一次根返回手势。[id] 单调递增：旧手势的收尾（提交后的离场、取消后的回弹）只能结束它自己，
+ * 不能把紧接着开始的新手势一起清掉。
+ *
+ * [peek] 是这次手势要回到的上一级页面：界面在跟手开始时把它设成转场目标，之后只改转场进度；
+ * 松手时栈落到同一页（[commit] → `navigate`），界面再把同一个转场补完，所以提交前后没有任何交接。
  */
 internal data class BackGesture(val id: Int, val route: NavRoute, val peek: NavRoute?, val phase: BackPhase = BackPhase.ACTIVE)
 
@@ -86,9 +89,12 @@ internal class RootNavigator(initial: SessionNavigation = SessionNavigation(), s
     progress = fraction.coerceIn(0f, 1f)
   }
 
-  /** 手势松手或非手势返回（三键导航、实体返回键）：先落栈，离场页由界面层停留片刻后 [finish]。 */
+  /**
+   * 手势松手或非手势返回（三键导航、实体返回键）：先落栈，转场由界面层播完后 [finish]。
+   * [progress] 保留到那时——界面松手后读的就是它，提前清零会让离场页瞬间回到手势前的姿态。
+   */
   fun commit() {
-    // 非手势返回没有 start：顺手结束上一个手势残留的停留/回弹，不能让它挂在新页面上。
+    // 非手势返回没有 start：顺手结束上一个手势残留的离场/回弹，不能让它挂在新页面上。
     gesture = gesture?.takeIf { it.phase == BackPhase.ACTIVE }?.copy(phase = BackPhase.COMMITTED, peek = null)
     goBack()
   }

@@ -12,10 +12,10 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.*
-import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.SeekableTransitionState
+import androidx.compose.animation.core.rememberTransition
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.CubicBezierEasing
-import androidx.compose.animation.core.tween
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -26,6 +26,8 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalFocusManager
@@ -33,6 +35,7 @@ import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.zIndex
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.lifecycle.Lifecycle
@@ -232,16 +235,13 @@ class MainActivity : ComponentActivity() {
             navigator.navigate(SessionNavigation()); openSession(SessionTarget(server, session)); deepLink = null
           }
        }
-      var lastGesturePhase by remember { mutableStateOf<BackPhase?>(null) }
-      LaunchedEffect(navigator.gesture?.phase) {
-        navigator.gesture?.phase?.let { lastGesturePhase = it }
-      }
-      val backProgress = remember { Animatable(0f) }
-      // 手势由 navigator.callback 驱动；这里只按（手势编号, 相位）播放跟手、停留与回弹。
-      // 换键即取消上一段，旧手势的收尾既不会改写新手势的进度，也结束不了新手势（finish 校验编号）。
-      val gesture = navigator.gesture
-      // The real page a back gesture returns to, drawn under the outgoing one while the finger moves.
-      val peekRoute = gesture?.peek?.takeIf { previewBack }
+      // —— 页面转场：只有一条时间轴 ——
+      // 拖动、松手、取消都只改 SeekableTransitionState 的进度（fraction），两页由同一个转场驱动。
+      // 松手那一帧因此不存在"手势轨 → 转场轨"的交接：旧实现正是在那里拆掉 peek、清掉旧页姿态、
+      // 又把目标页作为进入内容排在最后（层级翻转 + 进入首帧透明），于是先闪回手势前的页面再闪到目标页。
+      val transitionState = remember { SeekableTransitionState(navigator.route) }
+      val pageTransition = rememberTransition(transitionState, label = "page")
+      var motion by remember { mutableStateOf(PageMotion.FORWARD) }
       val screenWidthPx = with(density) { LocalConfiguration.current.screenWidthDp.dp.roundToPx() }
       SideEffect {
         navigator.screenWidth = screenWidthPx
@@ -255,24 +255,46 @@ class MainActivity : ComponentActivity() {
           else -> "首页"
         }
       }
-      LaunchedEffect(gesture?.id, gesture?.phase) {
-        val current = gesture ?: return@LaunchedEffect
-        when (current.phase) {
+      // 普通路由变化（点会话、菜单、深链、实体返回键、设置里关掉预览后的侧滑）由这里播；
+      // 预测式返回的转场由下面那条驱动，两个写入者不会抢同一个进度。
+      LaunchedEffect(navigator.route, navigator.gesture?.id) {
+        val target = navigator.route
+        if (motion == PageMotion.GESTURE) return@LaunchedEffect
+        if (transitionState.targetState == target) return@LaunchedEffect
+        motion = pageMotion(transitionState.currentState, target)
+        transitionState.animateTo(target)
+      }
+      // 手势只写进度：跟手期间 seek 到手指位置，松手后把同一段转场用弹簧补完，取消时把进度弹回 0。
+      LaunchedEffect(navigator.gesture?.id, navigator.gesture?.phase) {
+        val gesture = navigator.gesture ?: return@LaunchedEffect
+        when (gesture.phase) {
           BackPhase.ACTIVE -> {
-            backProgress.snapTo(0f)
-            if (previewBack) snapshotFlow { navigator.progress }.collect { backProgress.snapTo(it) }
+            val backTo = gesture.peek ?: return@LaunchedEffect
+            // 上一次收尾还在播：先让它落地，别把它的目标页一起改掉。
+            if (transitionState.currentState != navigator.route) transitionState.snapTo(navigator.route)
+            // 关掉预览时不做跟手，也不留 GESTURE 模式：松手后交给上面那条普通路由转场播返回动画。
+            motion = if (previewBack) PageMotion.GESTURE else PageMotion.BACK
+            if (!previewBack) return@LaunchedEffect
+            transitionState.seekTo(0f, backTo)
+            snapshotFlow { navigator.progress }.collect { transitionState.seekTo(it) }
           }
-          // 手势松手后以澎湃弹簧无缝走完剩余路程；保持进度在 1f 直至离场结束以消除尾帧闪回。
+          // 栈已经在 commit 里落到目标页，这里只把同一段转场从手指进度补到 1，姿态一路连续。
           BackPhase.COMMITTED -> {
-            if (previewBack && backProgress.value > 0.01f) {
-              backProgress.animateTo(1f, HyperMotion.backCommitSpring)
+            if (motion == PageMotion.GESTURE) {
+              // 补上最后一帧手指位置：seek 走帧回调，可能比输入事件慢一帧。
+              transitionState.seekTo(navigator.progress.coerceIn(0f, 1f))
+              transitionState.animateTo(navigator.route, HyperMotion.backCommitSpring)
             }
-            navigator.finish(current.id)
-            backProgress.snapTo(0f)
+            motion = PageMotion.BACK
+            navigator.finish(gesture.id)
           }
           BackPhase.CANCELLED -> {
-            backProgress.animateTo(0f, HyperMotion.backCancelSpring)
-            navigator.finish(current.id)
+            if (motion == PageMotion.GESTURE) {
+              settleFraction(transitionState, 0f, HyperMotion.backCancelSpring)
+              transitionState.snapTo(navigator.route)
+            }
+            motion = PageMotion.BACK
+            navigator.finish(gesture.id)
           }
         }
       }
@@ -332,25 +354,17 @@ class MainActivity : ComponentActivity() {
                     onPage = ::openPage)
               }
             }
-            peekRoute?.let { peek ->
-              Box(Modifier.fillMaxSize().graphicsLayer {
-                val p = backProgress.value.coerceIn(0f, 1f)
-                translationX = -navigator.direction * (1f - p) * size.width * 0.28f
-                val s = 0.94f + 0.06f * p
-                scaleX = s; scaleY = s
-              }.pointerInput(Unit) { awaitPointerEventScope { while (true) { awaitPointerEvent().changes.forEach { it.consume() } } } }) {
-                Page(peek, active = false)
-                Box(Modifier.fillMaxSize().graphicsLayer {
-                  alpha = (1f - backProgress.value.coerceIn(0f, 1f)) * 0.22f
-                }.background(androidx.compose.ui.graphics.Color.Black))
-              }
-            }
-            AnimatedContent(route, transitionSpec = {
-              if ((navigator.gesture?.phase == BackPhase.COMMITTED || lastGesturePhase == BackPhase.COMMITTED) && previewBack && backProgress.value > 0.01f) {
-                // 预测式返回松手后由 backProgress 弹簧连续驱动新旧两页至 1f 完全移出屏幕，留足弹簧收敛时长避免半途截断。
-                (fadeIn(tween(1)) togetherWith fadeOut(tween(1, delayMillis = 360))).apply {
-                  targetContentZIndex = 0f
-                }
+            pageTransition.AnimatedContent(transitionSpec = {
+              if (motion == PageMotion.GESTURE) {
+                // 跟手：进入/退出全部等长线性，进度与手指 1:1；澎湃手感来自松手后作用在进度上的弹簧。
+                ContentTransform(
+                  targetContentEnter = slideInHorizontally(HyperMotion.gestureTrack()) { -it * navigator.direction * 28 / 100 } +
+                    scaleIn(HyperMotion.gestureTrack(), initialScale = 0.94f),
+                  initialContentExit = slideOutHorizontally(HyperMotion.gestureTrack()) { it * navigator.direction } +
+                    scaleOut(HyperMotion.gestureTrack(), targetScale = 0.95f),
+                  // 两页都满屏，尺寸动画只会多一条时间轴，必须关掉才能让进度与手指一一对应。
+                  sizeTransform = null
+                )
               } else {
                 // 所有整页（含设备详情与整页编辑器）共用 HyperMotion.pageTransform 这一份弹簧规格：
                 // 全幅位移 + 底层 -28% 视差与 0.94 缩放（底层不淡出变透）。
@@ -368,25 +382,26 @@ class MainActivity : ComponentActivity() {
                 target.device != null -> "device:${target.device}"
                 else -> "page:${target.page}"
               }
-            }, label = "navigation") { target ->
+            }) { target ->
               val active = target == route
-              val currentGesture = navigator.gesture
-              Box(Modifier.fillMaxSize().graphicsLayer {
-                val p = backProgress.value.coerceIn(0f, 1f)
-                if (target == currentGesture?.route && p > 0f) {
-                  translationX = navigator.direction * p * size.width
-                  val s = 1f - p.coerceAtMost(0.35f) * 0.14f
-                  scaleX = s; scaleY = s
-                  shadowElevation = 24.dp.toPx() * (1f - p * 0.5f)
-                  shape = miuixSquircleShape((28f * p.coerceAtMost(0.4f) / 0.4f).dp)
-                  clip = true
-                } else if (target == route && currentGesture?.phase == BackPhase.COMMITTED && p > 0f) {
-                  translationX = -navigator.direction * (1f - p) * size.width * 0.28f
-                  val s = 0.94f + 0.06f * p
-                  scaleX = s; scaleY = s
-                }
-              }.then(if (active) Modifier else Modifier.pointerInput(Unit) { awaitPointerEventScope { while (true) { awaitPointerEvent().changes.forEach { it.consume() } } } })
-                .background(HyperTheme.colors.canvas)) {
+              // 层级由转场模式决定，不靠 AnimatedContent"目标页最后画"的默认顺序。
+              val front = frontRoute(motion, transitionState.currentState, transitionState.targetState) == target
+              // 跟手时正在离开的那一页：投影与连续曲率圆角跟进度走，位移/缩放交给转场动画，避免叠加。
+              val receding = motion == PageMotion.GESTURE && target == transitionState.currentState
+              Box(
+                Modifier.fillMaxSize()
+                  .zIndex(if (front) 1f else 0f)
+                  .graphicsLayer {
+                    if (receding) {
+                      val p = transitionState.fraction.coerceIn(0f, 1f)
+                      shadowElevation = 24.dp.toPx() * (1f - p * 0.5f)
+                      shape = miuixSquircleShape((28f * p.coerceAtMost(0.4f) / 0.4f).dp)
+                      clip = true
+                    }
+                  }
+                  .then(if (active) Modifier else Modifier.pointerInput(Unit) { awaitPointerEventScope { while (true) { awaitPointerEvent().changes.forEach { it.consume() } } } })
+                  .background(HyperTheme.colors.canvas)
+              ) {
                 val key = when {
                   target.editors.isNotEmpty() -> "editor:${target.editors.size}:${target.editors.last().key}"
                   // 每台设备详情各有一份 saveable 作用域：过渡时新旧两页会同时组合，共用 key 会直接崩。
@@ -398,6 +413,13 @@ class MainActivity : ComponentActivity() {
                   else -> "page:${if (state.allServers) "all" else state.homeServerId}:${target.page}"
                 }
                 holder.SaveableStateProvider(key) { Page(target, active) }
+                if (motion == PageMotion.GESTURE && !front) {
+                  // 底层页随进度被打暗：遮罩与页面同层，松手前后亮度不会跳一下。
+                  Box(Modifier.fillMaxSize().drawWithContent {
+                    drawContent()
+                    drawRect(Color.Black, alpha = (1f - transitionState.fraction.coerceIn(0f, 1f)) * 0.22f)
+                  })
+                }
               }
             }
             // Per-page first-load states own their own placeholders. A global bar here meant any

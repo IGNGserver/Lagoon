@@ -6,10 +6,12 @@ import androidx.compose.animation.scaleIn
 import androidx.compose.animation.scaleOut
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
-import androidx.compose.animation.togetherWith
+import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.SpringSpec
+import androidx.compose.animation.core.TweenSpec
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
@@ -49,6 +51,19 @@ internal object HyperMotion {
   /** 预测式返回取消回弹弹簧 */
   val backCancelSpring: SpringSpec<Float> = spring(dampingRatio = 0.88f, stiffness = 520f)
 
+  /**
+   * 预测式返回的跟手段：进入/退出动画全部用**等长线性** tween。
+   *
+   * SeekableTransitionState 的姿态是"进度 × 这条曲线"，只有线性才能让页面和手指 1:1；
+   * 松手后的澎湃手感由作用在进度上的弹簧（[backCommitSpring] / [backCancelSpring]）给，
+   * 两者相乘仍是弹簧曲线。时长只需彼此一致（决定了转场总时长），不参与观感。
+   */
+  const val gestureTrackMillis: Int = 320
+
+  /** 跟手段动画规格（IntOffset / Float 共用，泛型由调用处的参数类型推断）。 */
+  fun <T> gestureTrack(): TweenSpec<T> =
+    tween(durationMillis = gestureTrackMillis, easing = LinearEasing)
+
   /** 半屏抽屉与浮层弹出弹簧（IntOffset 专用） */
   val sheetOffsetSpring: SpringSpec<IntOffset> = spring(dampingRatio = 0.88f, stiffness = 420f)
 
@@ -72,19 +87,24 @@ internal object HyperMotion {
  */
 internal fun AnimatedContentTransitionScope<NavRoute>.pageTransform(direction: Int): ContentTransform {
   val spring = HyperMotion.pageOffsetSpring
+  // 两页都是满屏：尺寸动画只会往转场里多塞一条时间轴（根转场的进度按总时长归一化），一律关掉。
   return if (direction > 0) {
-    (slideInHorizontally(spring) { it * direction } togetherWith
-      (slideOutHorizontally(spring) { -it * direction * 28 / 100 } +
-        scaleOut(HyperMotion.pageFloatSpring, targetScale = 0.94f))).apply {
-      targetContentZIndex = 2f
-    }
+    ContentTransform(
+      targetContentEnter = slideInHorizontally(spring) { it * direction },
+      initialContentExit = slideOutHorizontally(spring) { -it * direction * 28 / 100 } +
+        scaleOut(HyperMotion.pageFloatSpring, targetScale = 0.94f),
+      targetContentZIndex = 2f,
+      sizeTransform = null
+    )
   } else {
-    ((slideInHorizontally(spring) { it * direction * 28 / 100 } +
-      scaleIn(HyperMotion.pageFloatSpring, initialScale = 0.94f)) togetherWith
-      (slideOutHorizontally(spring) { -it * direction } +
-        scaleOut(HyperMotion.pageFloatSpring, targetScale = 0.95f))).apply {
-      targetContentZIndex = 0f
-    }
+    ContentTransform(
+      targetContentEnter = slideInHorizontally(spring) { it * direction * 28 / 100 } +
+        scaleIn(HyperMotion.pageFloatSpring, initialScale = 0.94f),
+      initialContentExit = slideOutHorizontally(spring) { -it * direction } +
+        scaleOut(HyperMotion.pageFloatSpring, targetScale = 0.95f),
+      targetContentZIndex = 0f,
+      sizeTransform = null
+    )
   }
 }
 
