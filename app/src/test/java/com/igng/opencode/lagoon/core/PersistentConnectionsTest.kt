@@ -258,6 +258,10 @@ class PersistentConnectionsTest {
       store.rememberTask("a", TaskState("s", TaskPhase.THINKING, since = 100))
       val cache = cache()
       cache.saveCatalog("a", emptyList(), listOf(Session("s", "/repo", "Old task", 1, serverId = "a")))
+      // saveCatalog writes through a background coroutine. The monitor reads the offline catalog
+      // exactly once when it starts, so without this join a loaded runner can start the monitor
+      // before the write lands and the cached session never appears in any snapshot.
+      cache.awaitWrites()
       val scope = CoroutineScope(coroutineContext + SupervisorJob())
       val snapshots = ConcurrentHashMap<String, ServerOverviewSnapshot>()
       val manager = AllServersOverview(store, cache, scope, { snapshots[it.serverId] = it })
