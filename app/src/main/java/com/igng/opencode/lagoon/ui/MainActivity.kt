@@ -258,7 +258,23 @@ class MainActivity : ComponentActivity() {
       // 预测式返回的转场由下面那条驱动，两个写入者不会抢同一个进度。
       LaunchedEffect(navigator.route, navigator.gesture?.id) {
         val target = navigator.route
-        if (motion == PageMotion.GESTURE) return@LaunchedEffect
+        val gesture = navigator.gesture
+        // 跟手与终态收尾由下面那条相位 effect 独占转场目标；这里只在没有活手势时收敛。
+        if (gesture?.phase == BackPhase.ACTIVE) return@LaunchedEffect
+        if (motion == PageMotion.GESTURE) {
+          // 终态手势的收尾还在跑：让它继续，别抢同一条时间轴。
+          if (gesture != null) return@LaunchedEffect
+          // 手势已经没了、模式却还停在 GESTURE：上一次收尾被取消过（栈被改写、terminal 事件丢失）。
+          // 必须把同一条转场补到栈顶并交回普通模式，否则此后所有路由变化都会被上面的 GESTURE
+          // 守卫吞掉——页面冻住、左上角返回失效、下一次侧滑直接退出应用。
+          if (transitionState.targetState == target) {
+            transitionState.animateTo(target, HyperMotion.backCommitSpring)
+          } else {
+            transitionState.snapTo(target)
+          }
+          motion = PageMotion.BACK
+          return@LaunchedEffect
+        }
         if (transitionState.targetState == target) return@LaunchedEffect
         motion = pageMotion(transitionState.currentState, target)
         transitionState.animateTo(target)
@@ -292,6 +308,12 @@ class MainActivity : ComponentActivity() {
               settleFraction(transitionState, 0f, HyperMotion.backCancelSpring)
               transitionState.snapTo(navigator.route)
             }
+            motion = PageMotion.BACK
+            navigator.finish(gesture.id)
+          }
+          // 跟手期间栈被自动同步改写：预览的上一页已经不存在，直接落到新栈顶，不做回弹。
+          BackPhase.SUPERSEDED -> {
+            transitionState.snapTo(navigator.route)
             motion = PageMotion.BACK
             navigator.finish(gesture.id)
           }

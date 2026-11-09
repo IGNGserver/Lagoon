@@ -8,8 +8,14 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 
-/** 根返回手势的相位：跟手中 → 已提交（离场页停在手势位置等退场动画）或已取消（回弹）。 */
-internal enum class BackPhase { ACTIVE, COMMITTED, CANCELLED }
+/**
+ * 根返回手势的相位：跟手中 → 已提交（离场页停在手势位置等退场动画）或已取消（回弹）。
+ *
+ * [SUPERSEDED] 是第三种终态：跟手期间栈被自动同步改写（切服务器/切会话），手势预览的上一页
+ * 已经不存在。它和 [CANCELLED] 的区别在松手语义——取消是用户放弃，之后再按返回仍应退一级；
+ * 作废是这次手势本身失效，松手不能再落栈，界面直接落到新栈顶。
+ */
+internal enum class BackPhase { ACTIVE, COMMITTED, CANCELLED, SUPERSEDED }
 
 /**
  * 一次根返回手势。[id] 单调递增：旧手势的收尾（提交后的离场、取消后的回弹）只能结束它自己，
@@ -28,7 +34,7 @@ internal data class BackGesture(val id: Int, val route: NavRoute, val peek: NavR
  * 点开会话的那几百毫秒里主线程可能还没来得及重组。
  *
  * [callback] 在 `setContent` 之前注册，优先级最低：键盘自己先消费返回，MIUIX 弹层、搜索框、活动浮层
- * 的 BackHandler 都注册得更晚、先于它生效；它只在 [SessionNavigation.canGoBack] 时启用。
+ * 的 BackHandler 都注册得更晚、先于它生效；它只在 [SessionNavigation.canGoBack] 或一次返回还在收尾时启用。
  */
 internal class RootNavigator(initial: SessionNavigation = SessionNavigation(), server: String? = null) {
   var navigation by mutableStateOf(initial); private set
@@ -59,10 +65,27 @@ internal class RootNavigator(initial: SessionNavigation = SessionNavigation(), s
     override fun handleOnBackCancelled() = cancel()
   }
 
+  /**
+   * 根回调什么时候向系统登记：栈里还有上一级，**或者**一次返回还在收尾。
+   *
+   * 后半句是必要的防抖。松手后栈可能已经落到根，但页面还在做两三百毫秒的离场动画；这段时间里
+   * 若回调被禁用，系统会立刻撤掉窗口回调，把紧接着的第二次侧滑当成"退出应用"。栈在手势进行中
+   * 被自动同步改写时同理：中途禁用会让这一次手势的 terminal 事件直接丢失。
+   */
+  private fun syncCallback() {
+    callback.isEnabled = navigation.canGoBack || gesture != null
+  }
+
   /** 唯一的栈写入口：栈与根回调的启停一起变，不留"栈已可返回、回调还没启用"的窗口。 */
   fun navigate(next: SessionNavigation) {
+    // 栈在手势底下被改写：预览的上一页已经失效，先把这次手势作废（松手不再落栈），
+    // 界面收到 SUPERSEDED 后会直接落到新栈顶。否则它会拿着一个永远到不了的 peek 收尾。
+    val current = gesture
+    if (current?.phase == BackPhase.ACTIVE && next != navigation) {
+      gesture = current.copy(phase = BackPhase.SUPERSEDED, peek = null)
+    }
     navigation = next
-    callback.isEnabled = next.canGoBack
+    syncCallback()
   }
 
   fun goBack() {
@@ -94,13 +117,31 @@ internal class RootNavigator(initial: SessionNavigation = SessionNavigation(), s
    * [progress] 保留到那时——界面松手后读的就是它，提前清零会让离场页瞬间回到手势前的姿态。
    */
   fun commit() {
-    // 非手势返回没有 start：顺手结束上一个手势残留的离场/回弹，不能让它挂在新页面上。
-    gesture = gesture?.takeIf { it.phase == BackPhase.ACTIVE }?.copy(phase = BackPhase.COMMITTED, peek = null)
-    goBack()
+    val current = gesture
+    if (current == null) {
+      goBack()
+      return
+    }
+    when (current.phase) {
+      BackPhase.ACTIVE -> {
+        gesture = current.copy(phase = BackPhase.COMMITTED, peek = null)
+        goBack()
+      }
+      // 上一次离场/回弹还没播完，这是另一次返回（三键、实体键或迟到的非手势事件）：
+      // 先结束旧收尾让界面离开 GESTURE 模式，再按普通返回落栈。
+      BackPhase.COMMITTED, BackPhase.CANCELLED -> {
+        finish(current.id)
+        goBack()
+      }
+      // 栈改写作废的手势：这次松手属于它，不能再退一级。
+      BackPhase.SUPERSEDED -> Unit
+    }
   }
 
   fun cancel() {
-    gesture = gesture?.takeIf { it.phase == BackPhase.ACTIVE }?.copy(phase = BackPhase.CANCELLED)
+    val current = gesture ?: return
+    if (current.phase != BackPhase.ACTIVE) return
+    gesture = current.copy(phase = BackPhase.CANCELLED)
   }
 
   /** 只结束编号为 [id] 的手势：它的收尾晚于新手势开始时什么都不做。 */
@@ -108,5 +149,6 @@ internal class RootNavigator(initial: SessionNavigation = SessionNavigation(), s
     if (gesture?.id != id) return
     gesture = null
     progress = 0f
+    syncCallback()
   }
 }
