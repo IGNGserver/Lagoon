@@ -38,6 +38,9 @@ class RootNavigatorTest {
   }
   private fun release() = dispatcher.onBackPressed()
 
+  /** 界面在退场/回弹动画播完后会调用 [RootNavigator.finish]；单测里手动模拟这一拍。 */
+  private fun settle() { navigator.gesture?.let { navigator.finish(it.id) } }
+
   @Test fun openingASessionEnablesTheRootCallbackBeforeAnyRecomposition() {
     assertFalse("会话列表根上应交给系统", dispatcher.hasEnabledCallbacks())
     navigator.navigate(navigator.navigation.open("s1"))
@@ -51,7 +54,10 @@ class RootNavigatorTest {
     swipe(); release()
     assertEquals(SessionNavigation(), navigator.navigation)
     assertEquals(0, systemBacks)
-    assertFalse("回到会话列表后，下一次返回才交给系统", dispatcher.hasEnabledCallbacks())
+    // 离场动画还没收尾：第二次侧滑仍由应用接住，不能落到系统退出。
+    assertTrue(dispatcher.hasEnabledCallbacks())
+    settle()
+    assertFalse("收尾结束、回到会话列表根上后，下一次返回才交给系统", dispatcher.hasEnabledCallbacks())
   }
 
   @Test fun backWhileTheKeyboardIsCollapsingStillStaysInTheApp() {
@@ -85,7 +91,9 @@ class RootNavigatorTest {
     swipe(); release()
     assertEquals(SessionNavigation(), navigator.navigation)
     assertEquals(0, systemBacks)
-    // 只有到了会话列表根上，下一次返回才退出应用。
+    // 退场动画播完前回调保持启用：第三次松手落在收尾里，不会交给系统退出。
+    settle()
+    // 只有到了会话列表根上、且收尾结束，下一次返回才退出应用。
     release()
     assertEquals(1, systemBacks)
   }
@@ -232,5 +240,53 @@ class RootNavigatorTest {
     val target = navigator.gesture?.peek
     release()
     assertEquals(target, navigator.route)
+  }
+
+  /*
+   * 下面两条守的是"栈在手势进行中被改写"的竞态：切服务器/切会话的自动同步会在这时 navigate。
+   * 旧实现只改栈、不改手势，回调被同步禁用后系统会撤掉窗口回调；这次手势的 terminal 事件因此
+   * 丢失，motion 永久停在 GESTURE，页面冻住、下一次侧滑直接退出应用。
+   */
+
+  @Test fun aStackRewriteMidGestureSupersedesThePreviewWithoutDisablingTheCallback() {
+    navigator.navigate(navigator.navigation.open("s1"))
+    swipe(progress = 0.4f)
+    // 跟手期间自动同步把栈改写回根。
+    navigator.navigate(SessionNavigation())
+    assertEquals(BackPhase.SUPERSEDED, navigator.gesture?.phase)
+    assertTrue("手势还没收尾，回调不能中途禁用", dispatcher.hasEnabledCallbacks())
+    assertEquals(SessionNavigation(), navigator.navigation)
+  }
+
+  @Test fun aSupersededGestureCannotPopOnRelease() {
+    navigator.navigate(navigator.navigation.open("s1"))
+    swipe(progress = 0.4f)
+    navigator.navigate(SessionNavigation())
+    release()
+    assertEquals("作废手势的松手不能再退一级", SessionNavigation(), navigator.navigation)
+    settle()
+    assertFalse("收尾结束后回到根上，下一次返回才交给系统", dispatcher.hasEnabledCallbacks())
+    assertEquals(0, systemBacks)
+  }
+
+  @Test fun aPlainBackDuringTheExitSettleEndsTheOldGestureAndPopsOnce() {
+    navigator.navigate(SessionNavigation().open("parent").open("child", child = true))
+    swipe(); release()
+    assertEquals(listOf("parent"), navigator.navigation.sessions)
+    // 三键/实体键在离场动画里再按一次：结束旧收尾，再正常落栈。
+    navigator.commit()
+    assertEquals(SessionNavigation(), navigator.navigation)
+    assertNull(navigator.gesture)
+    assertEquals(0f, navigator.progress)
+    assertEquals(0, systemBacks)
+  }
+
+  @Test fun aLateCancelCannotUndoACommittedRelease() {
+    navigator.navigate(navigator.navigation.open("s1"))
+    swipe(); release()
+    navigator.cancel()
+    assertEquals(BackPhase.COMMITTED, navigator.gesture?.phase)
+    assertEquals(SessionNavigation(), navigator.navigation)
+    assertEquals(0, systemBacks)
   }
 }

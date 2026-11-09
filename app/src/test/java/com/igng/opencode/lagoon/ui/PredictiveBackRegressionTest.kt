@@ -38,4 +38,17 @@ class PredictiveBackRegressionTest {
     assertTrue("层级由 frontRoute 统一决定", transition.contains("fun frontRoute("))
     assertTrue("取消回弹由进度自己走帧", transition.contains("fun settleFraction("))
   }
+
+  /**
+   * 手势消失后转场必须能自己走回栈顶。旧实现的 route effect 只认 `motion`，一旦 `motion` 停在
+   * GESTURE 而手势对象已被清掉，之后所有路由变化都会被守卫吞掉：页面冻在离场页、左上角返回无效、
+   * 栈却已经回到根，下一次侧滑直接退出应用。
+   */
+  @Test fun aFinishedGestureCannotLeaveTheStageInGestureMode() {
+    val main = uiSource("MainActivity.kt")
+    assertTrue("跟手才让路，终态收尾仍由相位 effect 接管", main.contains("if (gesture?.phase == BackPhase.ACTIVE) return@LaunchedEffect"))
+    assertTrue("没有活手势时必须把转场收敛回栈顶", main.contains("if (gesture != null) return@LaunchedEffect"))
+    assertTrue("收敛后必须交回普通返回模式", main.contains("motion = PageMotion.BACK"))
+    assertTrue("栈在手势中改写时手势要作废", uiSource("RootNavigator.kt").contains("BackPhase.SUPERSEDED"))
+  }
 }
