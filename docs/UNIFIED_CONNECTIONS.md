@@ -28,7 +28,7 @@
 
 ## 阶段与验收
 
-### 1. 契约和准确性（进行中）
+### 1. 官方契约与运行时准确性（投影/问题已接入，仍在验证）
 
 - 修复 DSH 定时/continued 提问、模型事件、PTC live/history、每轮结局、外部取消归档、命令附件、部分成功创建和 typed stream errors。
 - 修复注册部分失败建档、Hub/account identity scope、目录不完整、SSH auth 错误误判、bootstrap endpoint 校验。
@@ -81,7 +81,8 @@
 - SSH 官方注册只读发现与 PID/version/protected-route 验证；同 source 一个共享 SSH pool，native OpenCode/legacy DSH 独立 runtime links。
 - SSH 表单独立选择、全停用、只读发现、OpenCode 注册路径；删除/禁用 leaf 不再销毁兄弟连接和主机凭据。
 - 独立审查修复 SSE EOF 重订阅、新代次等待递归、半开 SSH entry 淘汰、编辑服务路径回退、无 Harness 测试误启动 DSH。
-- 尚未交付：PTC/Question 运行时接线、图成为统一运行真源、真实桌面 DSH profile 附着、Remote native connector、完整统一 UI、真实设备验收和最终 PR。
+- PTC/Question 已接入运行时和真实 adapter 测试；仍需复核该阶段提交的 teardown/dirty refresh 最后补丁及完整最终日志。
+- 尚未交付：图成为统一运行真源、真实桌面 DSH profile 附着、Remote native connector、完整统一 UI、真实设备验收和最终 PR。
 
 - 工作区已创建且 HEAD 与 origin/main 基线相同。
 - 本机盘可用约 96 GiB（2026-11-09）；构建区 `~/.build`。

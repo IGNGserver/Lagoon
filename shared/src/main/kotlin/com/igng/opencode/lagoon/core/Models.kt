@@ -32,8 +32,12 @@ data class ServerProfile(
   val enabled: Boolean = true,
   /** OpenCode registration locator on an SSH source; null selects the official default file.
    * Never a service generation ID or an ephemeral forwarded URL, and never contains a password. */
-  val sshServicePath: String? = null
-)
+  val sshServicePath: String? = null,
+  /** Ephemeral source/Host gate, applied only to runtime reads; never a saved leaf preference. */
+  val parentEnabled: Boolean = true
+) {
+  val effectiveEnabled: Boolean get() = enabled && parentEnabled
+}
 
 data class Project(val id: String, val directory: String, val name: String, val sandboxes: List<String> = emptyList(),
   /** Source server when this project is shown in the all-servers overview. */

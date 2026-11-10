@@ -16,7 +16,10 @@
 - ConnectionSource → HostBinding → HarnessBinding、严格 codec、credential slot refs、稳定 legacy leaf ID、effectiveEnabled 与 capability/generation/delivery 模型。
 - ConnectionGraphStore journal/backup/future/corrupt protection；Controller 已加载/保存 companion graph。迁移使用严格 ServerStore reader，未知协议/损坏资料禁止覆写。
 - SSH native OpenCode locator 作为 sshServicePath 可持久化，不保存临时 forwarder URL、PID 或进程 generation。
-- **尚未完成**：图成为统一运行路由真源；source/host 开关在全部连接/通知/组合范围实际生效；跨 store 事务验收。
+- source/host/leaf 开关已实际接入：父级 gate 独立持久化，ServerStore.profiles 仅做 runtime overlay，raw reader/writers 不改子项 enabled；新 sibling 即使尚未写入图也继承已停用父级。
+- Overview/Controller 的连接、重连、通知动作、深链、首页/组合/全局摘要均使用 effectiveEnabled；详情页已有三层开关。旧 UI/通知对象不能绕过刚提交的父级 gate；写入主记录成功但 journal cleanup 失败也按磁盘许可收紧运行状态。
+- 损坏/未来版图为 runtime fail-closed，不清空 raw 资料/凭据；graph reader 不自动恢复或迁移。组合全暂停后保留选中的 group ID，不跳转组外连接。
+- **尚未完成**：多服务 manifest 路由取代 legacy leaf factory、跨 store 完整事务验收和真机 UI 验收。
 
 ### 阶段 3：实际原生传输与 mux，已有实质交付
 - OpenCodeApi 的 HTTP/二进制/SSE 已经通过 NativeHttpTransport；public constructors 兼容，close 释放本实例 transport，不关闭共享 dispatcher/pool。
@@ -35,7 +38,8 @@
 - 保存 host route 同步更新 siblings，但不改兄弟 enabled/notifications/drafts/cache。未变 source 只失效目标 binding；source 配置变更才重建全部运行通道。仅保存会把新 leaves 停用，避免偷偷 dial。
 - OpenCode attach-only，从不 install/start/kill；DSH 保留明确选择的旧 managed web bootstrap，普通 close 不杀远端进程。
 - Tests：discovery 13、pool/session ownership 4、真实 socket-backed tunnel adapter 2；另有 graph/store/factory 路由测试。
-- **尚未完成**：真正桌面 DSH profile/runtime 自动发现附着、多 OpenCode channel 列表选择、共享主机重连统一状态。没有真实远端 SSH daemon/Android 真机验收。
+- **DSH Desktop 原生附着为上游 blocker**：本机安装的官方 `@deepseek-ai/dsh@0.2.1-rc.5` CLI 明确拒绝 `--profile desktop`；Electron Desktop 使用 `file://` + IPC，而 Typert web/WS mux 仅由 WebHost 挂载；`/connect` launch token 只存在该 Web process 内存，官方包没有 Desktop profile 注册文件、daemon HTTP 入口或可供 SSH 转发的 IPC bridge。不得通过启动第二个 `dsh web`、猜端口或读写共享 profile state 冒充附着当前 Desktop Agent。正确下一步是先取得官方 Electron Desktop 提供的受支持 Host/SSH attach hook 与身份/lifecycle contract；未取得前，DSH SSH 仅是兼容的新建 WebHost，不宣称 Desktop 运行时复用。
+- 多 OpenCode channel 目前通过用户保存的具体 registration path 逐个建 binding，不自动合并 channel；无真实远端 SSH daemon/Android 真机验收。
 
 ### 阶段 5–7：未交付
 - Remote native connector 仍需固定 upstream overlay + companion package + Android carrier 的构建/端到端测试，不能以 ACP 或插件草案替代原生支持。
@@ -57,5 +61,8 @@
 - 问答审查修复：queued reply 撤回后同客户端可重答、Host cancel 先于 durable pending 的读取竞态、cold idle-session directory 恢复、新投递在旧 submit 期间的认领、关闭时 next RPC 排空、SSH 排空期间新 RPC tunnel、投影读期间 dirty trigger 补读。
 - `runtime-r5-review-2.log`：161 项定向回归全通过。`runtime-r5-final-targeted.log`：PTC/Question+SSH 目标通过；之后加 collector teardown/dirty-read fixtures。
 - `runtime-r5-lifecycle.log`：旧 question test 使用 take(1) 关闭事件监听后继续提交，按新 ownership 语义被拒；已改为在提交期间保留 collector，增加 collector-first teardown 专项测试。
+- `runtime-r5-checkpoint-2.log`：**1108 tests、0 failures、0 errors、6 skipped**；debug assemble 成功，112s；已保存本地提交 `03f4de1`。
+- Hierarchy r5：新增纯 runtime projection、严格主图只读 overlay、Overview/home/通知 effective gate，实际 Controller source/host setter 的前置失败/提交后清理失败/旧页面许可/重开偏好测试。Controller 旧 Unsafe fixture 必须有真实保存 profile，已补齐而不绕开生产许可。
+- `hierarchy-r5-final.log`：106 定向测试通过；`hierarchy-r5-checkpoint.log`：**1134 tests、0 failures、0 errors、6 skipped**；debug assemble 成功，116s，APK 21,612,457 bytes，SHA-256 `15a9019a8d971f11c4d64a1fcb0633ba10aeddcb8ddb974807abad448866c848`。
 - 全部构建在 `/home/lvziw/.build/Lagoon/unified-harness-connections/source`，Gradle/build 输出在 `~/.build`。源码工作树无 app/build、node_modules。
 - `wt audit`：29 repos，0 missing dirs，3 detached、4 merged worktrees 属其他任务；只读报告，无清理。

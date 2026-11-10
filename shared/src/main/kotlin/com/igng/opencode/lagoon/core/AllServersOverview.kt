@@ -91,12 +91,12 @@ internal class AllServersOverview(
   private val liveStreams = mutableMapOf<String, Job>()
 
   /**
-   * Ensures one monitor per enabled server. Enabling a device keeps its connection; a disabled
-   * profile is never dialled, even when selected or listed in [include]. The old autoConnect flag
+   * Ensures one monitor per effectively enabled server. A disabled profile or parent is never
+   * dialled, even when selected or listed in [include]. The old autoConnect flag
    * no longer decides whether a saved device is dialled.
    */
   fun start(profiles: List<ServerProfile>, include: Set<String> = emptySet()) {
-    val wanted = profiles.filter { it.enabled }
+    val wanted = profiles.filter { it.effectiveEnabled }
     (jobs.keys - wanted.map { it.id }.toSet()).forEach(::remove)
     wanted.forEach { profile ->
       val id = profile.id
@@ -122,14 +122,16 @@ internal class AllServersOverview(
   /** Drops a server's monitor and client so the next [start] rebuilds it from changed credentials
    * or an edited SSH host config. */
   fun invalidate(id: String) { remove(id) }
-  fun client(id: String): HarnessClient = clients.getOrPut(id) {
+  fun client(id: String): HarnessClient {
     val (profile, credentials) = configurations[id] ?: error("服务器已移除")
-    check(profile.enabled) { "连接已禁用" }
-    val backend = if (profile.kind == ServerKind.DSH_REMOTE)
-      remoteBackendFactory?.create(profile, credentials) ?: error("DSH Remote storage is not configured") else null
-    backend?.client ?: createHarnessClient(profile, credentials,
-      onCookie = { cookie -> rememberCookie(id, profile, cookie) }, remoteBackend = backend,
-      sshClientFactory = sshClientFactory)
+    check(profile.effectiveEnabled) { "连接已禁用" }
+    return clients.getOrPut(id) {
+      val backend = if (profile.kind == ServerKind.DSH_REMOTE)
+        remoteBackendFactory?.create(profile, credentials) ?: error("DSH Remote storage is not configured") else null
+      backend?.client ?: createHarnessClient(profile, credentials,
+        onCookie = { cookie -> rememberCookie(id, profile, cookie) }, remoteBackend = backend,
+        sshClientFactory = sshClientFactory)
+    }
   }
 
   /**

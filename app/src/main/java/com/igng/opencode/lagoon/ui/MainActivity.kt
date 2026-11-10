@@ -229,7 +229,7 @@ class MainActivity : ComponentActivity() {
          handledDeepLink = "$server:$session"
           val profile = state.profiles.firstOrNull { it.id == server }
           if (profile == null) { globalMessage = "这个设备已移除"; globalMessageType = MiuixToastType.ERROR; deepLink = null }
-          else if (!profile.enabled) { globalMessage = "这个连接已禁用，请先在设备管理中启用"; globalMessageType = MiuixToastType.ERROR; deepLink = null }
+          else if (!profile.effectiveEnabled) { globalMessage = "这个连接已禁用，请先在设备管理中启用"; globalMessageType = MiuixToastType.ERROR; deepLink = null }
           else {
             navigator.navigate(SessionNavigation()); openSession(SessionTarget(server, session)); deepLink = null
           }

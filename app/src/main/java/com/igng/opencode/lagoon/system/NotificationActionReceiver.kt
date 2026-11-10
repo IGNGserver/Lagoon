@@ -71,7 +71,7 @@ class NotificationActionReceiver : BroadcastReceiver() {
   ): Boolean {
     val store = ServerStore(context)
     val profile = store.profiles().firstOrNull { it.id == serverId } ?: return false
-    if (!profile.enabled) return false
+    if (!profile.effectiveEnabled) return false
     if (profileUrl != profile.url) return false
     val controller = LagoonController.get(context)
     return try {

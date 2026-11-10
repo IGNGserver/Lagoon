@@ -111,7 +111,7 @@ internal fun HomeScreen(
         val scopeProfiles = when {
           state.allServers -> state.enabledProfiles
           state.homeGroup != null -> state.enabledProfiles.filter { it.id in state.homeGroup!!.memberIds }
-          else -> listOfNotNull(state.server).filter { it.enabled }
+          else -> listOfNotNull(state.server).filter { it.effectiveEnabled }
         }
         val online = scopeProfiles.count { profile ->
           if (!state.multiServerView && profile.id == state.serverId) state.connected

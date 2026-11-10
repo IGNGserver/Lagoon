@@ -114,6 +114,25 @@ class ConnectionGraphStore internal constructor(
     writeAtomically(encoded, current)
   }
 
+  /** Parent preferences never overwrite child Harness choices or legacy profiles. */
+  @Synchronized
+  fun setSourceEnabled(sourceId: String, enabled: Boolean): ConnectionGraph {
+    val current = requireGraph()
+    require(current.sources.any { it.id == sourceId }) { "接入源已删除，请刷新" }
+    val next = current.copy(sources = current.sources.map { if (it.id == sourceId) it.copy(enabled = enabled) else it })
+    save(next)
+    return next
+  }
+
+  @Synchronized
+  fun setHostEnabled(hostId: String, enabled: Boolean): ConnectionGraph {
+    val current = requireGraph()
+    require(current.hosts.any { it.id == hostId }) { "主机绑定已删除，请刷新" }
+    val next = current.copy(hosts = current.hosts.map { if (it.id == hostId) it.copy(enabled = enabled) else it })
+    save(next)
+    return next
+  }
+
   /** Clears only graph/journal keys. Legacy profiles, credentials, caches and groups are untouched. */
   @Synchronized
   fun clear() {

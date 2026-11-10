@@ -396,7 +396,7 @@ internal fun RemoteConnectionDialog(
         add("连接方式" to "DSH 远程中枢")
         add("地址" to profile.url)
         add("状态" to when {
-          !profile.enabled -> "已停用"
+          !profile.effectiveEnabled -> "已停用"
           snapshot?.connected == true && snapshot.streamConnected -> "已连接"
           snapshot?.connected == true -> "已连接 · 实时同步恢复中"
           snapshot?.loading == true -> "连接中"
@@ -435,7 +435,7 @@ internal fun RemoteConnectionDialog(
         Spacer(Modifier.weight(1f))
         HyperTextAction(text = "关闭", onClick = onDismiss)
       }
-      HyperButton(text = "重新测量", loading = busy, enabled = profile.enabled, modifier = Modifier.fillMaxWidth(), onClick = {
+      HyperButton(text = "重新测量", loading = busy, enabled = profile.effectiveEnabled, modifier = Modifier.fillMaxWidth(), onClick = {
         scope.launch {
           busy = true; error = null
           try {

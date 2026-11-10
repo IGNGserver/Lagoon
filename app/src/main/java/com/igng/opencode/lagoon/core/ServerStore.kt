@@ -9,7 +9,8 @@ import java.util.concurrent.ConcurrentHashMap
 
 class ServerStore internal constructor(private val preferences: SharedPreferences, private val secrets: SharedPreferences,
   private val encryptValue: (String) -> String, private val decryptValue: (String) -> String,
-  private val appContext: Context? = null) : OverviewStore {
+  private val appContext: Context? = null,
+  private val readConnectionGraph: (() -> ConnectionGraph?)? = null) : OverviewStore {
   init {
     if (preferences.getInt(PREVIEW_FORMAT_VERSION_KEY, 0) != PREVIEW_FORMAT_VERSION) {
       val plain = preferences.edit()
@@ -43,14 +44,35 @@ class ServerStore internal constructor(private val preferences: SharedPreference
 
   private val previewCache = ConcurrentHashMap<String, SessionPreview>()
 
-  fun profiles(): List<ServerProfile> = try {
-    readProfiles()
-  } catch (error: Exception) {
-    Diagnostics.warn("ServerStore", "profiles 解析失败，保留原记录并停止资料写入", error)
-    emptyList()
+  /** Runtime view only. Profile writers and graph migration must keep using [readProfiles]. */
+  fun profiles(): List<ServerProfile> {
+    val raw = try {
+      readProfiles()
+    } catch (error: Exception) {
+      Diagnostics.warn("ServerStore", "profiles 解析失败，保留原记录并停止资料写入", error)
+      return emptyList()
+    }
+    val graph = try {
+      if (readConnectionGraph != null) readConnectionGraph.invoke() else readStoredConnectionGraph()
+    } catch (_: Exception) {
+      // A present but unreadable/future graph is not the same as an absent graph. Preserve every
+      // raw leaf and user preference, but fail closed until the parent gates can be read safely.
+      Diagnostics.warn("ServerStore", "connection graph 不可读，保留资料并暂停连接")
+      return ConnectionRuntimeProjection.apply(raw, graph = null, unavailable = true)
+    }
+    return ConnectionRuntimeProjection.apply(raw, graph)
   }
 
-  /** Display may degrade, but writers and migration must never replace an unreadable document. */
+  private fun readStoredConnectionGraph(): ConnectionGraph? {
+    val graphPreferences = appContext?.getSharedPreferences("connection-graph", Context.MODE_PRIVATE) ?: return null
+    if (!graphPreferences.contains("graph")) return null
+    val raw = graphPreferences.getString("graph", null) ?: error("Connection graph is not a string")
+    // Do not call ConnectionGraphStore here: runtime reads must not migrate, recover a journal or
+    // write anything. Only the committed primary document is authoritative for parent gating.
+    return ConnectionGraphCodec.decode(raw)
+  }
+
+  /** Raw leaf preferences only. Writers/migration must never replace an unreadable document. */
   internal fun readProfiles(): List<ServerProfile> {
     try {
       val array = JSONArray(preferences.getString("profiles", "[]"))

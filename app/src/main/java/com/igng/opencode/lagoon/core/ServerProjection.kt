@@ -118,7 +118,8 @@ private fun LagoonState.computeHomeProjection(now: Long = System.currentTimeMill
   val enabledIds = enabledProfiles.mapTo(HashSet()) { it.id }
   if (!allServers) {
     val group = homeGroup
-    if (group != null && group.memberIds.any { it in enabledIds }) return groupHomeProjection(snapshots, group, now)
+    // Parent gates only hide runtime data; they must not discard the saved group selection.
+    if (group != null) return groupHomeProjection(snapshots, group, now)
     if (group == null) {
       val id = (homeServerId ?: serverId)?.takeIf { it in enabledIds }
         ?: serverId?.takeIf { it in enabledIds }
@@ -130,9 +131,11 @@ private fun LagoonState.computeHomeProjection(now: Long = System.currentTimeMill
           connected = false, loading = false, cached = false, summary = TaskSummary.EMPTY, workspaceCatalog = emptyList(),
           allServerSnapshots = snapshots, allSessionStatuses = emptyMap(), allUnseenSessions = emptySet())
       if (id == serverId) return copy(allServers = false, homeServerId = id, allServerSnapshots = snapshots)
-      val snapshot = snapshots[id] ?: return copy(serverId = id, homeServerId = id, sessions = emptyList(), projects = emptyList(), tasks = emptyMap(),
-        permissions = emptyList(), questions = emptyList(), notices = emptyList(), connected = false, loading = true, allServers = false,
-        workspaceCatalog = emptyList(), allServerSnapshots = snapshots)
+      val snapshot = snapshots[id] ?: return copy(serverId = id, homeServerId = id, version = "", sessions = emptyList(), projects = emptyList(), tasks = emptyMap(),
+        permissions = emptyList(), questions = emptyList(), notices = emptyList(), connected = false, streamConnected = false,
+        loading = true, cached = false, degraded = false, lastContactAt = 0, error = null, allServers = false,
+        summary = TaskSummary.EMPTY, knownParents = emptyMap(), backgroundRunning = emptySet(), shells = emptyMap(),
+        autoApprovalFailures = emptySet(), workspaceCatalog = emptyList(), allServerSnapshots = snapshots)
       return copy(serverId = id, homeServerId = id, version = snapshot.version, connected = snapshot.connected, streamConnected = snapshot.streamConnected,
         cached = snapshot.cached, loading = snapshot.loading, degraded = snapshot.degraded, sessions = snapshot.sessions,
         projects = snapshot.projects, tasks = snapshot.tasks, permissions = snapshot.permissions, questions = snapshot.questions,
@@ -142,7 +145,6 @@ private fun LagoonState.computeHomeProjection(now: Long = System.currentTimeMill
         serverReadPending = serverReadPending, workspaceCatalog = snapshot.workspaceCatalog,
         allServerSnapshots = snapshots)
     }
-    // The selected group has no enabled member left: fall through to the aggregate projection.
   }
   val statuses = allServerStatuses(now)
   val mergedSummary = if (snapshots.isEmpty()) TaskSummary.EMPTY
@@ -185,13 +187,13 @@ private fun LagoonState.groupHomeProjection(
   }.toMap()
   val active = serverId?.takeIf { id -> id in members && scoped[id]?.connected == true }
     ?: scoped.keys.firstOrNull { id -> scoped[id]?.connected == true }
-    ?: serverId?.takeIf { it in members && profiles.any { profile -> profile.id == it && profile.enabled } }
+    ?: serverId?.takeIf { it in members && profiles.any { profile -> profile.id == it && profile.effectiveEnabled } }
     ?: scoped.keys.firstOrNull()
   val summary = TaskSummary.merge(scoped.values.filter { it.profile.notifications }.map { it.displaySummary(permissionPolicy, now) })
   val unseen = scoped.values.flatMap { snapshot ->
     snapshot.notices.filterNot { it.viewed }.map { scopedKey(snapshot.serverId, it.sessionId) }
   }.toSet()
-  return copy(serverId = active, homeServerId = active ?: homeServerId?.takeIf { id -> profiles.any { it.id == id && it.enabled } },
+  return copy(serverId = active, homeServerId = active ?: homeServerId?.takeIf { id -> id in members && profiles.any { it.id == id && it.effectiveEnabled } },
     homeGroupId = group.id, allServers = false,
     sessionId = null, projectId = null, scopeProjectId = null,
     sessions = scoped.values.flatMap { it.sessions }.distinctBy { it.key }.sortedWith(sessionActivityOrder),

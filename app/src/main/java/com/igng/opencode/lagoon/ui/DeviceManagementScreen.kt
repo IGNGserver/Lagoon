@@ -66,7 +66,11 @@ internal fun DeviceManagementScreen(
             if (index > 0) HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
             HyperRow(
               title = profile.name,
-              summary = profile.endpointSummary + if (profile.enabled) "" else " · 已停用",
+              summary = profile.endpointSummary + when {
+                !profile.enabled -> " · Harness 已停用"
+                !profile.parentEnabled -> " · 接入源或主机已停用"
+                else -> ""
+              },
               value = deviceStatusLabel(profile, state),
               showChevron = true,
               onClick = { onOpenDevice(profile.id) }
@@ -117,6 +121,7 @@ internal fun DeviceDetailScreen(
   onManageHub: () -> Unit,
   onManageModels: () -> Unit
 ) {
+  val graph by controller.connectionGraph.collectAsState()
   val profile = state.profiles.firstOrNull { it.id == deviceId }
   if (profile == null) {
     // 设备在别处被删掉：这一层已经没有内容，退回列表，而不是把一张空白页留在栈上。
@@ -129,6 +134,9 @@ internal fun DeviceDetailScreen(
   val isRemote = profile.kind == ServerKind.DSH_REMOTE
   val isDsh = profile.kind == ServerKind.DSH || isRemote
   val currentGroup = state.deviceGroups.firstOrNull { profile.id in it.memberIds }
+  val binding = graph?.bindings?.firstOrNull { it.id == profile.id }
+  val parentHost = graph?.hosts?.firstOrNull { it.id == binding?.hostBindingId }
+  val parentSource = graph?.sources?.firstOrNull { it.id == parentHost?.sourceId }
 
   fun savePreference(next: ServerProfile) {
     controller.saveServer(next, password = null, cookie = null, credentialUsername = next.username, connect = false)
@@ -148,8 +156,9 @@ internal fun DeviceDetailScreen(
         HyperGroupTitle("设备状态")
         HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(vertical = 4.dp)) {
           HyperSwitchRow(
-            title = "启用此设备",
-            summary = "启用后保持连接。停用会断开并停止任务通知，不会删除设备、凭据或会话",
+            title = "启用此 Harness",
+            summary = if (profile.parentEnabled) "只控制此 Harness；停用不删除凭据、草稿或会话"
+              else "自身选择已保留，但所属接入源或主机已停用，当前不会连接",
             checked = profile.enabled,
             onCheckedChange = { controller.setProfileEnabled(profile.id, it) }
           )
@@ -157,6 +166,20 @@ internal fun DeviceDetailScreen(
           HyperRow(title = "连接地址", summary = profile.endpointSummary)
           HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
           HyperRow(title = "类型", value = if (profile.sshHostId != null) "SSH 直连" else profile.kind.label)
+        }
+      }
+      if (parentSource != null && parentHost != null) item {
+        HyperGroupTitle("连接层级")
+        HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(vertical = 4.dp)) {
+          HyperSwitchRow(title = "启用接入源", summary = "${parentSource.type.wire} · ${parentSource.name}；影响这个源下所有主机，不改子项选择",
+            checked = parentSource.enabled,
+            onCheckedChange = { controller.setConnectionSourceEnabled(parentSource.id, it) })
+          HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
+          HyperSwitchRow(title = "启用此主机绑定", summary = "${parentHost.name}；影响该绑定下的 Harness，不删除远端任务",
+            checked = parentHost.enabled,
+            onCheckedChange = { controller.setConnectionHostEnabled(parentHost.id, it) })
+          HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
+          HyperRow(title = "实际连接许可", value = if (profile.effectiveEnabled) "允许" else "已暂停")
         }
       }
       item {
@@ -262,7 +285,7 @@ private fun deviceSnapshot(profile: ServerProfile, state: LagoonState): ServerOv
   state.serverSnapshots()[profile.id]
 
 private fun deviceConnected(profile: ServerProfile, state: LagoonState): Boolean =
-  profile.enabled && deviceSnapshot(profile, state)?.connected == true
+  profile.effectiveEnabled && deviceSnapshot(profile, state)?.connected == true
 
 private fun deviceStatusLabel(profile: ServerProfile, state: LagoonState): String {
   val snapshot = deviceSnapshot(profile, state)
@@ -270,7 +293,7 @@ private fun deviceStatusLabel(profile: ServerProfile, state: LagoonState): Strin
     message.contains("重新登录") || message.contains("凭据已过期") || message.contains("登录已失效")
   } == true
   return resolveDeviceStatusLabel(
-    enabled = profile.enabled,
+    enabled = profile.effectiveEnabled,
     connected = deviceConnected(profile, state),
     loading = snapshot?.loading == true,
     hasError = !snapshot?.error.isNullOrBlank(),
