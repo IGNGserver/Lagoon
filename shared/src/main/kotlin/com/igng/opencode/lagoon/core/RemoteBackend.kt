@@ -12,11 +12,18 @@ import java.util.concurrent.atomic.AtomicBoolean
 /** Adapts the existing Typert projection to a single authenticated Remote owner peer. */
 class RemoteBackend internal constructor(
   private val session: RemoteSession,
+  private val nativeProfile: ServerProfile? = null,
   /** 释放共享连接（默认直接关闭会话）；见 [RemoteConnectionRegistry]。 */
   private val release: () -> Unit = { session.close() }
 ) : AutoCloseable {
   private val closed = java.util.concurrent.atomic.AtomicBoolean(false)
-  private val harness = DshApi(
+  private val harness: HarnessClient = if (nativeProfile != null) {
+    require(nativeProfile.kind == ServerKind.OPENCODE && nativeProfile.remoteHostId != null)
+    val serviceId = requireNotNull(nativeProfile.remoteServiceId) { "尚未选择 Host 上的原生服务" }
+    val carrier = LazyNativeHttpTransport(load = { session.nativeServiceTransport(serviceId) }, releaseLease = { close() })
+    OpenCodeApi(nativeProfile.copy(url = RemoteNativeServices.VIRTUAL_BASE_URL, remoteHostId = null,
+      remoteHostFingerprint = null, remoteServiceId = null), ServerCredentials(), transport = carrier)
+  } else DshApi(
     ServerProfile("remote-backend", "DSH Remote", "https://remote.invalid", kind = ServerKind.DSH_REMOTE),
     ServerCredentials("dsh"), remoteBackend = this
   )
@@ -30,6 +37,7 @@ class RemoteBackend internal constructor(
   internal fun credentials(): RemoteCredentialSummary = session.credentials()
   internal fun streamStats(): RemoteStreamStats? = session.streamStats()
   internal suspend fun supportsWorkspaceUpload(): Boolean = session.capabilities().supportsWorkspaceUpload
+  internal suspend fun nativeServiceCatalog(): NativeServiceCatalog? = session.nativeServiceCatalog()
 
   internal suspend fun probe(): RemoteProbe {
     val started = System.nanoTime()
@@ -60,7 +68,9 @@ class RemoteBackend internal constructor(
   }
 
   override fun close() {
-    if (closed.compareAndSet(false, true)) release()
+    if (closed.compareAndSet(false, true)) {
+      try { if (nativeProfile != null) harness.close() } finally { release() }
+    }
   }
 
   private class StreamSocket(

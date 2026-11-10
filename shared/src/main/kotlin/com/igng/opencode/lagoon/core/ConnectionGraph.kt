@@ -269,10 +269,12 @@ object ConnectionGraphCodec {
     .put("autoConnect", profile.autoConnect).put("notifications", profile.notifications).put("allowCleartext", profile.allowCleartext).put("kind", profile.kind.wire)
     .put("dshAuth", profile.dshAuth.wire).putOpt("remoteHostId", profile.remoteHostId).putOpt("remoteHostFingerprint", profile.remoteHostFingerprint)
     .putOpt("sshHostId", profile.sshHostId).put("enabled", profile.enabled).putOpt("sshServicePath", profile.sshServicePath)
+    .putOpt("remoteServiceId", profile.remoteServiceId)
   private fun readProfile(value: JSONObject): ServerProfile = ServerProfile(value.graphString("id"), value.graphString("name"), value.graphString("url"), value.graphString("username"),
     value.graphBoolean("autoConnect"), value.graphBoolean("notifications"), value.graphBoolean("allowCleartext"), MigrationProjection.legacyKind(value.graphString("kind")),
     DshAuthMode.entries.firstOrNull { it.wire == value.graphString("dshAuth") } ?: error("Unknown legacy DSH auth mode"),
-    value.graphOptionalString("remoteHostId"), value.graphOptionalString("remoteHostFingerprint"), value.graphOptionalString("sshHostId"), value.graphBoolean("enabled"), value.graphOptionalString("sshServicePath"))
+    value.graphOptionalString("remoteHostId"), value.graphOptionalString("remoteHostFingerprint"), value.graphOptionalString("sshHostId"), value.graphBoolean("enabled"), value.graphOptionalString("sshServicePath"),
+    parentEnabled = true, remoteServiceId = value.graphOptionalString("remoteServiceId"))
 }
 
 /** Pure/idempotent compatibility projection only. Durable migration/transactions belong to a later store integration. */
@@ -286,7 +288,7 @@ object MigrationProjection {
   }
   fun sourceType(profile: ServerProfile): ConnectionSourceType = when {
     profile.sshHostId != null -> ConnectionSourceType.SSH
-    profile.kind == ServerKind.DSH_REMOTE -> ConnectionSourceType.HUB
+    profile.kind == ServerKind.DSH_REMOTE || profile.remoteHostId != null -> ConnectionSourceType.HUB
     else -> ConnectionSourceType.DIRECT
   }
 
@@ -335,7 +337,7 @@ object MigrationProjection {
           ConnectionSlotRef(ConnectionSlotStore.SSH_SECRETS, "ssh:${profile.sshHostId}:$it") })
         ConnectionSourceType.DIRECT -> ConnectionCredentialRefs(profileSecret = ConnectionSlotRef(ConnectionSlotStore.SERVER_SECRETS, profile.id))
       }
-      HarnessBinding(profile.id, hostId, profile.name, protocol(profile.kind), carrier, enabled = profile.enabled,
+      HarnessBinding(profile.id, hostId, profile.name, protocol(profile.kind), carrier, serviceId = profile.remoteServiceId, enabled = profile.enabled,
         autoConnect = profile.autoConnect, notifications = profile.notifications, credentials = refs, legacyProfile = profile)
     }
     return ConnectionGraph(sources.values.toList(), hosts.values.toList(), bindings, compositions)

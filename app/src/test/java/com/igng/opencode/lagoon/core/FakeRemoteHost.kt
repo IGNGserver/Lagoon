@@ -15,6 +15,8 @@ import java.nio.ByteBuffer
 import java.util.Base64
 import java.util.Collections
 import java.util.UUID
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
@@ -31,7 +33,9 @@ internal class FakeRemoteHost(
   private val capabilities: List<String> = listOf(
     "harness.remote.v3", "harness.remote.transfer.v1", "workspace.upload.v1"
   ),
-  private val strictOfficialContracts: Boolean = false
+  private val strictOfficialContracts: Boolean = false,
+  /** Optional real native connector bridge; DSH calls keep their existing fixture behavior. */
+  private val nativeRpc: ((method: String, params: JSONObject, publish: (String, JSONObject) -> Unit) -> JSONObject)? = null
 ) : AutoCloseable {
   val server = MockWebServer()
   val requests: MutableList<String> = Collections.synchronizedList(mutableListOf())
@@ -40,14 +44,21 @@ internal class FakeRemoteHost(
   val contractViolations: MutableList<String> = Collections.synchronizedList(mutableListOf())
   private val counters = AtomicInteger(0)
   private val fragmentIds = AtomicInteger(0)
-  private var cipher: CipherStatePair? = null
+  private val incomingFragments = RemoteSecureFragments()
+  // One gate covers the Noise sender nonce, fragment order and WebSocket enqueue order, including
+  // callbacks from the stdio reader. Never hold it while waiting for an external RPC response.
+  private val wireGate = Any()
+  private val nativeWorker = nativeRpc?.let {
+    Executors.newSingleThreadExecutor { task -> Thread(task, "fake-remote-native-rpc").apply { isDaemon = true } }
+  }
+  @Volatile private var cipher: CipherStatePair? = null
   /** 为 true 时在 `connect.accepted` 里下发独立 Relay 数据通道，密文随后只走该通道。 */
   var assignRelay: Boolean = false
   var relayTicket: String = "relay-ticket-1234"
   var relayEpoch: Int = 7
-  private var controlSocket: WebSocket? = null
-  private var dataSocket: WebSocket? = null
-  private var dataReady = false
+  @Volatile private var controlSocket: WebSocket? = null
+  @Volatile private var dataSocket: WebSocket? = null
+  @Volatile private var dataReady = false
   private var pendingHandshake: JSONObject? = null
   private var handshakeData: String? = null
 
@@ -91,20 +102,31 @@ internal class FakeRemoteHost(
   private fun send(socket: WebSocket?, type: String, payload: JSONObject) = sendOn(socket, type, payload)
 
   private fun sendOn(socket: WebSocket?, type: String, payload: JSONObject) {
-    socket?.send(JSONObject().put("v", 1).put("id", UUID.randomUUID().toString()).put("type", type)
-      .put("timestamp", System.currentTimeMillis()).put("payload", payload).toString())
+    synchronized(wireGate) {
+      socket?.send(JSONObject().put("v", 1).put("id", UUID.randomUUID().toString()).put("type", type)
+        .put("timestamp", System.currentTimeMillis()).put("payload", payload).toString())
+    }
   }
 
   private fun sendMessage(socket: WebSocket, message: JSONObject) {
-    val pair = cipher ?: return
-    val encoder = Base64.getUrlEncoder().withoutPadding()
-    for (fragment in fragments(message.toString().toByteArray(Charsets.UTF_8))) {
-      val encrypted = ByteArray(fragment.size + 16)
-      val written = pair.sender.encryptWithAd(null, fragment, 0, encrypted, 0, fragment.size)
-      sendOn(if (dataReady) dataSocket else controlSocket, "relay", JSONObject().put("connectionId", connectionId)
-        .put("targetDeviceId", clientDeviceId).put("counter", counters.getAndIncrement())
-        .put("ciphertext", encoder.encodeToString(encrypted.copyOf(written))))
+    synchronized(wireGate) {
+      val pair = cipher ?: return
+      val encoder = Base64.getUrlEncoder().withoutPadding()
+      for (fragment in fragments(message.toString().toByteArray(Charsets.UTF_8))) {
+        val encrypted = ByteArray(fragment.size + 16)
+        val written = pair.sender.encryptWithAd(null, fragment, 0, encrypted, 0, fragment.size)
+        sendOn(if (dataReady) dataSocket else controlSocket ?: socket, "relay", JSONObject().put("connectionId", connectionId)
+          .put("targetDeviceId", clientDeviceId).put("counter", counters.getAndIncrement())
+          .put("ciphertext", encoder.encodeToString(encrypted.copyOf(written))))
+      }
     }
+  }
+
+  /** Safe from a bridge reader/executor thread, including before its open RPC has completed. */
+  fun publishNativeEvent(event: String, data: JSONObject) {
+    require(event.startsWith("harness.services."))
+    val socket = controlSocket ?: return
+    publish(socket, event, data)
   }
 
   private fun publish(socket: WebSocket, event: String, data: JSONObject) {
@@ -149,15 +171,15 @@ internal class FakeRemoteHost(
             val input = Base64.getUrlDecoder().decode(payload.getString("ciphertext"))
             val plaintext = ByteArray(input.size)
             val count = pair.receiver.decryptWithAd(null, input, 0, plaintext, 0, input.size)
-            val message = JSONObject(String(plaintext, 0, count, Charsets.UTF_8))
-            handleMessage(webSocket, message)
+            val assembled = incomingFragments.decode(plaintext.copyOf(count)) ?: return
+            handleMessage(webSocket, JSONObject(String(assembled, Charsets.UTF_8)))
           }
           "ping" -> send(webSocket, "pong", JSONObject().put("nonce", payload.opt("nonce") ?: ""))
           else -> Unit
         }
       } catch (error: Throwable) {
         error.printStackTrace()
-        webSocket.cancel()
+        webSocket.close(1002, "Invalid fixture wire frame")
       }
     }
   }
@@ -185,7 +207,8 @@ internal class FakeRemoteHost(
           val input = Base64.getUrlDecoder().decode(payload.getString("ciphertext"))
           val plaintext = ByteArray(input.size)
           val count = pair.receiver.decryptWithAd(null, input, 0, plaintext, 0, input.size)
-          handleMessage(webSocket, JSONObject(String(plaintext, 0, count, Charsets.UTF_8)))
+          val assembled = incomingFragments.decode(plaintext.copyOf(count)) ?: return
+          handleMessage(webSocket, JSONObject(String(assembled, Charsets.UTF_8)))
         }
         "ping" -> sendOn(webSocket, "pong", payload)
         else -> Unit
@@ -235,7 +258,8 @@ internal class FakeRemoteHost(
       return failure
     }
     when (method) {
-      "harness.transport.describe" -> respond(JSONObject().put("capabilities", JSONArray(capabilities)))
+      "harness.transport.describe" -> respond(JSONObject().put("capabilities", JSONArray(
+        capabilities + if (nativeRpc != null) listOf("harness.services.v1") else emptyList())))
       "harness.remote.call" -> {
         val endpoint = params.getString("endpoint")
         val rpcPayload = params.optJSONObject("payload") ?: JSONObject()
@@ -280,7 +304,21 @@ internal class FakeRemoteHost(
       "harness.remote.stream.close", "harness.remote.transfer.close" ->
         respond(JSONObject().put("closed", true))
       "harness.remote.transfer.open", "harness.remote.transfer.chunk", "harness.remote.transfer.commit" -> respond(JSONObject())
-      else -> respond(JSONObject().put("ok", true))
+      else -> {
+        if (method.startsWith("harness.services.") && nativeRpc != null) {
+          // Blocking stdio is isolated from OkHttp's receiver, so early native event publication
+          // can take the wire gate and so a close/cancel frame cannot deadlock that receiver.
+          nativeWorker!!.execute {
+            try { respond(nativeRpc.invoke(method, params, ::publishNativeEvent)) }
+            catch (error: Exception) {
+              val code = (error as? RemoteRpcException)?.code ?: (error as? NativeRemoteException)?.code ?: "NATIVE_BRIDGE_FAILED"
+              sendMessage(socket, JSONObject().put("v", 1).put("id", id).put("type", "rpc.error")
+                .put("timestamp", System.currentTimeMillis())
+                .put("payload", JSONObject().put("requestId", id).put("code", code).put("message", code)))
+            }
+          }
+        } else respond(JSONObject().put("ok", true))
+      }
     }
   }
 
@@ -315,7 +353,16 @@ internal class FakeRemoteHost(
 
   fun accountEmail(): String = account
 
-  override fun close() { server.shutdown() }
+  override fun close() {
+    nativeWorker?.shutdownNow()
+    try {
+      // MockWebServer's server-side RealWebSocket has no HTTP Call; cancel() dereferences it.
+      // Graceful close plus server shutdown releases both sockets without that client-only path.
+      controlSocket?.close(1001, "Fixture shutdown")
+      dataSocket?.close(1001, "Fixture shutdown")
+      server.shutdown()
+    } finally { nativeWorker?.awaitTermination(3, TimeUnit.SECONDS) }
+  }
 
   private companion object { const val CHUNK = 48 * 1024 }
 }

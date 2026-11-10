@@ -126,7 +126,7 @@ internal class AllServersOverview(
     val (profile, credentials) = configurations[id] ?: error("服务器已移除")
     check(profile.effectiveEnabled) { "连接已禁用" }
     return clients.getOrPut(id) {
-      val backend = if (profile.kind == ServerKind.DSH_REMOTE)
+      val backend = if (profile.kind == ServerKind.DSH_REMOTE || profile.remoteHostId != null)
         remoteBackendFactory?.create(profile, credentials) ?: error("DSH Remote storage is not configured") else null
       backend?.client ?: createHarnessClient(profile, credentials,
         onCookie = { cookie -> rememberCookie(id, profile, cookie) }, remoteBackend = backend,

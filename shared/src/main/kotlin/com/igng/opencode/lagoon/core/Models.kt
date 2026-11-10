@@ -34,8 +34,17 @@ data class ServerProfile(
    * Never a service generation ID or an ephemeral forwarded URL, and never contains a password. */
   val sshServicePath: String? = null,
   /** Ephemeral source/Host gate, applied only to runtime reads; never a saved leaf preference. */
-  val parentEnabled: Boolean = true
+  val parentEnabled: Boolean = true,
+  /** Opaque Host-local native service locator. Generation is negotiated, never persisted as identity. */
+  val remoteServiceId: String? = null
 ) {
+  init {
+    if (remoteServiceId != null) {
+      require(kind == ServerKind.OPENCODE && !remoteHostId.isNullOrBlank() && sshHostId == null) { "原生 Remote 服务必须绑定独立 Host carrier" }
+      require(remoteServiceId.matches(Regex("[A-Za-z0-9][A-Za-z0-9._:-]{0,255}"))) { "原生 Remote 服务标识无效" }
+    }
+    require(kind != ServerKind.OPENCODE || remoteHostId == null || remoteServiceId != null) { "Remote OpenCode 必须指定原生服务" }
+  }
   val effectiveEnabled: Boolean get() = enabled && parentEnabled
 }
 

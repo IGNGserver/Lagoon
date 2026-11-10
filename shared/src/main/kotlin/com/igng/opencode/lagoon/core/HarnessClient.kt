@@ -309,7 +309,10 @@ fun createHarnessClient(
   remoteBackend: RemoteBackend? = null,
   /** App-provided factory for `sshHostId != null`; shared/ has no Android SSH implementation. */
   sshClientFactory: ((ServerProfile, ServerCredentials) -> HarnessClient)? = null
-): HarnessClient = if (profile.sshHostId != null) {
+): HarnessClient = if (profile.remoteHostId != null && profile.kind == ServerKind.OPENCODE) {
+  require(profile.sshHostId == null) { "同一个绑定不能混合 SSH 与 Remote carrier" }
+  (remoteBackend ?: throw IllegalStateException("Host 原生服务 backend 尚未配置")).client
+} else if (profile.sshHostId != null) {
   require(profile.kind != ServerKind.DSH_REMOTE) { "SSH binding 不能使用 Remote carrier" }
   sshClientFactory?.invoke(profile, credentials) ?: throw IllegalStateException("SSH backend 尚未配置")
 } else when (profile.kind) {

@@ -78,6 +78,14 @@
 - 其它修复以针对性回归 + 原有相关套件共同验证；每阶段日志在 `UNIFIED_CONNECTIONS.md` 记录。
 - 当前无 Android 设备连接，不把 JVM/构建视为真机验收。
 
+## 本轮 Remote/层级能力证据
+
+- 固定上游 companion overlay 可构建实际 Router、HostPluginRuntime 与完整插件入口；Host 原生 OpenCode 不依赖 ACP。
+- 原生服务 HTTP/binary/SSE/WebSocket 和上传/下载分片经 Node loopback 测试；Android NativeHttpTransport 经 fake-RPC 单测、实际 Kotlin Noise → Node patched Router/Peer → 原生 fixture 集成验证。
+- 同 Host 两个服务共享加密连接，关一个服务不关兄弟；关闭、慢消费者、旧代次、pending open cancellation 有专项回归。请求超时不自动改路或重发。
+- 三层开关在连接/通知/深链/组合生效；可重叠组合保留同一 leaf 多处引用。原生服务选择不自动启用。
+- 本节不将 fixture 当作官方真实 daemon/公网 Host/真机证据；完整原生能力清单仍需真环境逐项验收。
+
 ## 尚需分阶段落实的关键门槛
 
 1. 第 1 阶段：已发现语义 bug 的回归与修复全部收口。

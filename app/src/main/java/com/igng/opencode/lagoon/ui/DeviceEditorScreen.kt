@@ -6,27 +6,23 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.unit.dp
 import com.igng.opencode.lagoon.core.LagoonController
 import com.igng.opencode.lagoon.core.LagoonState
@@ -39,22 +35,19 @@ import com.igng.opencode.lagoon.core.profileCredentials
 import com.igng.opencode.lagoon.core.userFacingError
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
-import top.yukonga.miuix.kmp.basic.Icon
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.extra.SuperDialog
-import top.yukonga.miuix.kmp.icon.MiuixIcons
-import top.yukonga.miuix.kmp.icon.extended.Link
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 
 /**
  * 设备整页编辑器。三层共用这一页，每一层都是 [DeviceEditorRoute]：
  *
- * - 空的 [DeviceEditorRoute]：添加入口，先按 harness 分两段（OpenCode / DeepSeek Harness）；
+ * - 空的 [DeviceEditorRoute]：按接入源选择 Hub / SSH，高级直连保留 harness 选择提示；
  * - 填了 `profileId`：编辑已有连接，OpenCode 直连、旧版直连 DSH、DSH 远程中枢共用同一个表单；
  * - 填了 `sshHostId`：SSH 主机表单（空串 = 新建）。
  *
  * 因为它由根 `AnimatedContent` 按路由渲染，进入/退出和首页进设备页完全一样；[onBack] 只退一层，
- * 所以从添加入口打开 SSH 表单再返回，落回的是 DSH 段而不是整个设备页。
+ * 所以从添加入口打开 SSH 表单再返回，落回接入源列表而不是整个设备页。
  */
 @Composable
 internal fun DeviceEditorScreen(
@@ -100,7 +93,7 @@ internal fun DeviceEditorScreen(
   }
 }
 
-/** 添加入口：OpenCode 直连表单，或 DSH 段里的中枢登录与 SSH 主机列表。 */
+/** 添加入口：先选择共用接入源；兼容 HTTP 直连表单明确放在高级区。 */
 @Composable
 private fun AddDevicePage(
   state: LagoonState,
@@ -112,60 +105,138 @@ private fun AddDevicePage(
   onManageHub: () -> Unit
 ) {
   val scope = rememberCoroutineScope()
+  // The serialized tab remains a compatibility hint for the advanced form, not a source filter.
   var tab by rememberSaveable { mutableStateOf(initialTab) }
+  var showAdvanced by rememberSaveable { mutableStateOf(false) }
   val catalog = controller.activeRemoteCatalog()
+  val directFormHeight = (LocalConfiguration.current.screenHeightDp * 0.8f).dp.coerceAtLeast(480.dp)
 
   Column(Modifier.fillMaxSize().background(HyperTheme.colors.canvas)) {
     PageTopBar(title = "添加设备", onBack = onBack)
-    Box(Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
-      HyperSegmentedTabs(
-        tabs = AddDeviceTab.entries.map { it.label },
-        selectedIndex = AddDeviceTab.entries.indexOf(tab),
-        onTabSelected = { tab = AddDeviceTab.entries[it] }
-      )
-    }
-    if (tab == AddDeviceTab.OPENCODE) {
-      Box(Modifier.weight(1f).fillMaxWidth()) {
-        MiuixServerForm(
-          existing = null,
-          fixedKind = ServerKind.OPENCODE,
-          onCancel = onBack,
-          onDelete = null,
-          onSave = { profile, password, done ->
-            scope.launch {
-              try {
-                val pair = PairLinkResolver.isPairLink(profile.url)
-                val resolved = if (pair) PairLinkResolver.resolve(profile.url) else null
-                val actual = if (resolved == null) profile
-                else profile.copy(url = resolved.serverUrl, username = resolved.credentials.username)
-                val credentials = resolved?.credentials ?: profileCredentials(
-                  null, actual.url, controller.credentials(profile.id), actual.username, password
-                )
-                var minted: String? = null
-                controller.testServer(actual, credentials) { minted = it }
-                controller.saveServer(actual, credentials.password, minted ?: credentials.cookie, credentials.username)
-                done("已连接 OpenCode 直连")
-                onBack()
-              } catch (cancel: CancellationException) {
-                throw cancel
-              } catch (error: Exception) {
-                done(userFacingError(error, "连接失败"))
-              }
-            }
-          }
+    LazyColumn(
+      Modifier.weight(1f).fillMaxWidth(),
+      contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 48.dp),
+      verticalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+      item {
+        Text(
+          "先选择接入源，再从主机中选择 Harness。Remote Hub 与 SSH 不按 OpenCode / DSH 分开配置；发现服务不会启动或终止进程。",
+          style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary)
         )
       }
-    } else {
-      DshTab(
-        state = state,
-        catalogAccount = catalog?.account,
-        catalogOrigin = catalog?.origin,
-        hostCount = catalog?.hosts?.size ?: 0,
-        onLoginHub = onLoginHub,
-        onManageHub = onManageHub,
-        onAddSsh = { onEditSsh("") },
-        onEditSsh = onEditSsh
-      )
+      item {
+        HyperGroupTitle("Remote Hub · 远程中枢")
+        HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(vertical = 4.dp)) {
+          HyperRow(
+            title = catalog?.account ?: "登录 Remote Hub",
+            summary = if (catalog == null) "登录后逐个选择主机；DSH 可通过 Hub 接入，OpenCode 需 Host 升级并显式启用原生服务"
+              else "${catalog.origin} · ${catalog.hosts.size} 台可接入主机 · DSH；OpenCode 需 Host 升级并显式启用",
+            showChevron = true,
+            onClick = if (catalog == null) onLoginHub else onManageHub
+          )
+        }
+      }
+      item {
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+          HyperButton(
+            text = if (catalog == null) "登录并选择主机" else "接入更多主机",
+            onClick = onLoginHub,
+            modifier = Modifier.weight(1f)
+          )
+          HyperButton(
+            text = "管理中枢",
+            variant = HyperButtonVariant.SECONDARY,
+            onClick = onManageHub,
+            modifier = Modifier.weight(1f)
+          )
+        }
+      }
+      item {
+        HyperGroupTitle("SSH · 主机接入源")
+        HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(vertical = 4.dp)) {
+          HyperRow(
+            title = "添加 SSH 主机",
+            summary = "一份 SSH 配置可接入多个原生 Harness；只读发现后逐个选择",
+            showChevron = true,
+            onClick = { onEditSsh("") }
+          )
+        }
+        Text(
+          "DSH SSH 目前由 WebHost 管理，不支持附着正在运行的 Desktop 进程；OpenCode 只附着已运行的官方服务。",
+          Modifier.padding(horizontal = 6.dp, vertical = 8.dp),
+          style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary)
+        )
+      }
+      if (state.sshHosts.isNotEmpty()) item { HyperGroupTitle("已保存的 SSH 主机") }
+      items(state.sshHosts, key = { "ssh:${it.id}" }) { host ->
+        val profiles = state.profiles.filter { it.sshHostId == host.id }
+        val online = profiles.count { profile ->
+          profile.effectiveEnabled && if (profile.id == state.serverId) state.connected
+            else state.allServerSnapshots[profile.id]?.connected == true
+        }
+        HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(vertical = 4.dp)) {
+          HyperRow(
+            title = host.name,
+            summary = "${host.address} · ${profiles.size} 个 Harness · $online 个在线",
+            showChevron = true,
+            onClick = { onEditSsh(host.id) }
+          )
+        }
+      }
+      item {
+        HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(vertical = 4.dp)) {
+          HyperActionRow(
+            title = "高级 · 兼容 HTTP 直连",
+            summary = "已知服务地址或配对链接时使用，不经过 Hub 或 SSH 发现",
+            trailing = { ExpandChevron(showAdvanced) },
+            onClick = { showAdvanced = !showAdvanced }
+          )
+        }
+      }
+      if (showAdvanced) {
+        item {
+          HyperSegmentedTabs(
+            tabs = AddDeviceTab.entries.map { "${it.label} 直连" },
+            selectedIndex = AddDeviceTab.entries.indexOf(tab),
+            onTabSelected = { tab = AddDeviceTab.entries[it] }
+          )
+        }
+        item {
+          // MiuixServerForm owns a scrolling list; give it a bounded viewport inside this section.
+          Box(Modifier.fillMaxWidth().height(directFormHeight)) {
+            key(tab) {
+              MiuixServerForm(
+                existing = null,
+                fixedKind = if (tab == AddDeviceTab.OPENCODE) ServerKind.OPENCODE else ServerKind.DSH,
+                onCancel = onBack,
+                onDelete = null,
+                onSave = { profile, password, done ->
+                  scope.launch {
+                    try {
+                      val pair = PairLinkResolver.isPairLink(profile.url)
+                      val resolved = if (pair) PairLinkResolver.resolve(profile.url) else null
+                      val actual = if (resolved == null) profile
+                      else profile.copy(url = resolved.serverUrl, username = resolved.credentials.username)
+                      val credentials = resolved?.credentials ?: profileCredentials(
+                        null, actual.url, controller.credentials(profile.id), actual.username, password
+                      )
+                      var minted: String? = null
+                      controller.testServer(actual, credentials) { minted = it }
+                      controller.saveServer(actual, credentials.password, minted ?: credentials.cookie, credentials.username)
+                      done("已连接 ${actual.kind.label} 直连")
+                      onBack()
+                    } catch (cancel: CancellationException) {
+                      throw cancel
+                    } catch (error: Exception) {
+                      done(userFacingError(error, "连接失败"))
+                    }
+                  }
+                }
+              )
+            }
+          }
+        }
+      }
     }
   }
 }
@@ -295,114 +366,6 @@ private fun SshHostPage(
         controller = controller,
         onCancel = onBack,
         onSaved = onBack
-      )
-    }
-  }
-}
-
-@Composable
-private fun DshTab(
-  state: LagoonState,
-  catalogAccount: String?,
-  catalogOrigin: String?,
-  hostCount: Int,
-  onLoginHub: () -> Unit,
-  onManageHub: () -> Unit,
-  onAddSsh: () -> Unit,
-  onEditSsh: (String) -> Unit
-) {
-  LazyColumn(
-    Modifier.fillMaxSize(),
-    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
-    verticalArrangement = Arrangement.spacedBy(10.dp)
-  ) {
-    item {
-      Text(
-        "通过远程中枢或 SSH 接入电脑。一个 SSH 配置可以独立接入 OpenCode 与 DSH；发现服务不会启动或终止进程。",
-        style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary)
-      )
-    }
-    item { HyperGroupTitle("远程中枢") }
-    if (catalogAccount == null) {
-      item {
-        HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(16.dp)) {
-          Text(
-            "尚未登录。登录后会列出你有权访问的主机，不会自动接入全部主机。",
-            style = MiuixTheme.textStyles.body2.copy(color = HyperTheme.colors.textSecondary)
-          )
-          Spacer(Modifier.height(12.dp))
-          HyperButton(text = "登录并选择主机", onClick = onLoginHub, modifier = Modifier.fillMaxWidth())
-        }
-      }
-    } else {
-      item {
-        HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(vertical = 4.dp)) {
-          HyperRow(
-            title = catalogAccount,
-            summary = "${catalogOrigin.orEmpty()} · $hostCount 台可接入主机",
-            trailing = { DropdownChevron() },
-            onClick = onManageHub
-          )
-        }
-      }
-      item {
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-          HyperButton(text = "接入更多主机", onClick = onLoginHub, modifier = Modifier.weight(1f))
-          HyperButton(
-            text = "管理中枢",
-            variant = HyperButtonVariant.SECONDARY,
-            onClick = onManageHub,
-            modifier = Modifier.weight(1f)
-          )
-        }
-      }
-    }
-    item { HyperGroupTitle("SSH 主机") }
-    if (state.sshHosts.isEmpty()) {
-      item {
-        HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(14.dp)) {
-          Text(
-            "还没有 SSH 主机。添加后可只读发现服务，再选择要接入的 Harness；OpenCode 只附着已运行的官方服务。",
-            style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary)
-          )
-        }
-      }
-    } else {
-      items(state.sshHosts, key = { it.id }) { host ->
-        val profile = state.profiles.firstOrNull { it.sshHostId == host.id }
-        val connected = profile?.let { p ->
-          if (p.id == state.serverId) state.connected else state.allServerSnapshots[p.id]?.connected == true
-        } == true
-        HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(14.dp), onClick = { onEditSsh(host.id) }) {
-          Row(verticalAlignment = Alignment.CenterVertically) {
-            Icon(MiuixIcons.Link, null, Modifier.size(22.dp), tint = HyperTheme.colors.primary)
-            Spacer(Modifier.width(12.dp))
-            Column(Modifier.weight(1f)) {
-              Text(host.name, style = MiuixTheme.textStyles.body1.copy(fontWeight = FontWeight.Medium), maxLines = 1, overflow = TextOverflow.Ellipsis)
-              Text(
-                host.address,
-                style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary),
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-              )
-            }
-            if (connected) {
-              StatusDot(MiuixColorTokens.Success)
-              Spacer(Modifier.width(6.dp))
-              Text("在线", style = MiuixTheme.textStyles.footnote2.copy(fontWeight = FontWeight.SemiBold, color = MiuixColorTokens.Success))
-            }
-            Spacer(Modifier.width(6.dp))
-            ForwardChevron(16.dp, HyperTheme.colors.textSecondary)
-          }
-        }
-      }
-    }
-    item {
-      HyperButton(
-        text = "添加 SSH 主机",
-        variant = if (state.sshHosts.isEmpty()) HyperButtonVariant.PRIMARY else HyperButtonVariant.SECONDARY,
-        onClick = onAddSsh,
-        modifier = Modifier.fillMaxWidth()
       )
     }
   }

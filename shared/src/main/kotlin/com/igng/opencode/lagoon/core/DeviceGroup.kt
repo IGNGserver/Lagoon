@@ -10,9 +10,10 @@ import java.util.Locale
  * A user-created device group. It only describes how this installation presents several saved
  * servers; it is never uploaded and does not affect authentication, routing or session identity.
  *
- * A profile belongs to at most one group. Group order is the persistence order; member order is
- * the order chosen in the editor. Ungrouped profiles do not get a home tab: 全部 is the only
- * implicit bucket, so every saved profile remains reachable without becoming top-bar noise.
+ * A profile may belong to several groups, each referencing the same stable profile ID. Group order
+ * is the persistence order; member order is the order chosen in the editor. Ungrouped profiles do
+ * not get a home tab: 全部 is the only implicit bucket, so every saved profile remains reachable
+ * without becoming top-bar noise.
  */
 data class DeviceGroup(
   val id: String,
@@ -40,6 +41,7 @@ val ServerProfile.connectionTypeLabel: String
   get() = when {
     sshHostId != null -> "${if (kind == ServerKind.OPENCODE) "OpenCode" else "DSH"} SSH 直连"
     kind == ServerKind.DSH_REMOTE -> "DSH 远程中枢"
+    remoteHostId != null -> "OpenCode 原生 · Remote"
     kind == ServerKind.OPENCODE -> "OpenCode 直连"
     else -> "旧版直连 DSH"
   }
@@ -49,6 +51,7 @@ val ServerProfile.endpointSummary: String
   get() = when {
     sshHostId != null -> "$connectionTypeLabel · ${url.removePrefix("ssh://")}"
     kind == ServerKind.DSH_REMOTE -> "DSH 远程中枢 · ${remoteHostId?.take(8).orEmpty()}"
+    remoteHostId != null -> "OpenCode 原生 · Remote · ${remoteHostId.take(8)}"
     kind == ServerKind.OPENCODE -> "OpenCode 直连 · $url"
     else -> "旧版直连 DSH · $url"
   }
@@ -63,16 +66,16 @@ data class DeviceGroupState(
   val groups: List<DeviceGroup> = emptyList(),
   val selectedGroupId: String? = null
 ) {
+  /** First containing group in save order; a profile may also belong to later groups. */
   fun groupOf(profileId: String): DeviceGroup? = groups.firstOrNull { profileId in it.memberIds }
 
-  /** Removes duplicate/unknown members, empty groups and duplicate ids without throwing. */
+  /** Removes duplicate/unknown members within each group, empty groups and duplicate group ids. */
   fun sanitized(profileIds: Set<String>): DeviceGroupState {
     val seenGroups = HashSet<String>()
-    val seenProfiles = HashSet<String>()
     val clean = ArrayList<DeviceGroup>(groups.size)
     for (group in groups) {
       if (group.id.isBlank() || group.id.length > 128 || group.name.isBlank() || !seenGroups.add(group.id)) continue
-      val members = group.memberIds.filter { it in profileIds && seenProfiles.add(it) }
+      val members = group.memberIds.filter { it in profileIds }.distinct()
       if (members.isEmpty()) continue
       clean += group.copy(name = group.name.trim().take(128), memberIds = members)
     }
@@ -96,10 +99,9 @@ data class DeviceGroupState(
    */
   fun tabs(profiles: List<ServerProfile>): List<DeviceTab> {
     val byId = profiles.associateBy { it.id }
-    val used = HashSet<String>()
     val result = ArrayList<DeviceTab>(groups.size)
     groups.forEach { group ->
-      val members = group.memberIds.mapNotNull { byId[it] }.filter { used.add(it.id) }
+      val members = group.memberIds.distinct().mapNotNull { byId[it] }
       if (members.isNotEmpty()) result += DeviceTab("group:${group.id}", group.name, group, members)
     }
     return result

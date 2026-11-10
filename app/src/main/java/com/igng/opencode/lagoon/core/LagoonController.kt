@@ -307,7 +307,7 @@ class LagoonController private constructor(private val appContext: Context) {
         RemoteSession(profile.url, profile.allowCleartext, hostId, manager,
           RemotePeerTrust(store.remotePins), account, appVersion())
       }
-      return RemoteBackend(session) { RemoteConnectionRegistry.release(key) }
+      return RemoteBackend(session, profile.takeIf { it.kind == ServerKind.OPENCODE }) { RemoteConnectionRegistry.release(key) }
     }
   }
 
@@ -400,10 +400,38 @@ class LagoonController private constructor(private val appContext: Context) {
 
   internal fun saveRemoteCatalog(catalog: RemoteCatalog) = store.saveRemoteCatalog(catalog)
 
+  /** Read-only discovery on the shared Host connection; never starts a native service or an ACP fallback. */
+  internal suspend fun remoteNativeServices(profileId: String): NativeServiceCatalog? {
+    val profile = store.profiles().firstOrNull { it.id == profileId } ?: error("连接已移除")
+    require(profile.remoteHostId != null) { "此连接不是 Remote Host" }
+    check(profile.parentEnabled) { "所属接入源或主机已停用，请先启用父级" }
+    val backend = remoteBackendFactory.create(profile, store.credentials(profile.id))
+    return try { backend.nativeServiceCatalog() } finally { backend.close() }
+  }
+
+  /** Durable locator identity only. A rediscovery never overwrites an existing leaf's preferences. */
+  internal fun addRemoteNativeService(profileId: String, service: NativeServiceDescriptor, enabled: Boolean = true): ServerProfile {
+    require(service.supported && service.available && "http" in service.capabilities) { "此原生服务当前不受支持或不可用" }
+    require(service.id.matches(Regex("[A-Za-z0-9][A-Za-z0-9._:-]{0,255}"))) { "原生服务标识无效" }
+    val profiles = store.profiles()
+    val parent = profiles.firstOrNull { it.id == profileId && it.remoteHostId != null } ?: error("Remote Host 已移除")
+    val origin = canonicalRemoteOrigin(parent.url)
+    profiles.firstOrNull { it.kind == ServerKind.OPENCODE && it.remoteServiceId == service.id &&
+      it.remoteHostId == parent.remoteHostId && it.username.trim() == parent.username.trim() &&
+      canonicalRemoteOrigin(it.url) == origin }?.let { return it }
+    val locator = org.json.JSONArray(listOf(origin, parent.username.trim(), parent.remoteHostId, service.id)).toString()
+    val profile = ServerProfile(java.util.UUID.nameUUIDFromBytes(locator.toByteArray(Charsets.UTF_8)).toString(),
+      ProfileNames.uniqueDeviceName("${parent.name} · ${service.name}", profiles), origin, username = parent.username,
+      allowCleartext = parent.allowCleartext, kind = ServerKind.OPENCODE, remoteHostId = parent.remoteHostId,
+      remoteHostFingerprint = parent.remoteHostFingerprint, enabled = enabled, remoteServiceId = service.id)
+    saveServer(profile, password = null, credentialUsername = parent.username, connect = false)
+    return store.profiles().first { it.id == profile.id }
+  }
+
   /** Stop background retries after a sign-out; profiles and cached conversations stay local. */
   internal fun markRemoteSignedOut(origin: String, account: String) {
     store.profiles().filter {
-      it.kind == ServerKind.DSH_REMOTE && canonicalRemoteOrigin(it.url) == canonicalRemoteOrigin(origin) && it.username == account && it.effectiveEnabled
+      it.remoteHostId != null && canonicalRemoteOrigin(it.url) == canonicalRemoteOrigin(origin) && it.username == account && it.enabled
     }.forEach { profile ->
       setProfileEnabled(profile.id, false)
     }
@@ -777,7 +805,7 @@ class LagoonController private constructor(private val appContext: Context) {
       } finally { client.close() }
     }
     val client = createHarnessClient(profile, credentials, onCookie = onCookie,
-      remoteBackend = if (profile.kind == ServerKind.DSH_REMOTE) remoteBackendFactory.create(profile, credentials) else null,
+      remoteBackend = if (profile.kind == ServerKind.DSH_REMOTE || profile.remoteHostId != null) remoteBackendFactory.create(profile, credentials) else null,
       sshClientFactory = { p, _ -> sshHostManager.client(p) })
     return try {
       val version = client.health()
@@ -1202,9 +1230,7 @@ class LagoonController private constructor(private val appContext: Context) {
     val label = name.trim().take(128)
     if (label.isBlank() || valid.isEmpty()) return ""
     val id = java.util.UUID.randomUUID().toString()
-    val groups = state.value.deviceGroups.map { group ->
-      group.copy(memberIds = group.memberIds.filterNot { it in valid })
-    }.filter { it.memberIds.isNotEmpty() } + DeviceGroup(
+    val groups = state.value.deviceGroups + DeviceGroup(
       id = id, name = label, memberIds = valid, updatedAt = System.currentTimeMillis()
     )
     saveDeviceGroups(groups, state.value.homeGroupId)
@@ -1217,11 +1243,9 @@ class LagoonController private constructor(private val appContext: Context) {
     val valid = memberIds.filter { profileId -> state.value.profiles.any { it.id == profileId } }.distinct()
     if (label.isBlank() || valid.isEmpty() || state.value.deviceGroups.none { it.id == id }) return
     val groups = state.value.deviceGroups.map { group ->
-      when (group.id) {
-        id -> group.copy(name = label, memberIds = valid, updatedAt = System.currentTimeMillis())
-        else -> group.copy(memberIds = group.memberIds.filterNot { it in valid })
-      }
-    }.filter { it.memberIds.isNotEmpty() }
+      if (group.id == id) group.copy(name = label, memberIds = valid, updatedAt = System.currentTimeMillis())
+      else group
+    }
     saveDeviceGroups(groups, state.value.homeGroupId)
     if (state.value.homeGroupId == id) {
       val active = state.value.serverId?.takeIf { it in valid }
@@ -1450,11 +1474,11 @@ class LagoonController private constructor(private val appContext: Context) {
    */
   internal fun notificationClient(profile: ServerProfile, credentials: ServerCredentials): NotificationClientLease {
     check(store.profiles().any { it.id == profile.id && it.effectiveEnabled }) { "连接或其所属接入源/主机已停用" }
-    if (profile.kind == ServerKind.DSH || profile.kind == ServerKind.DSH_REMOTE || profile.sshHostId != null) {
+    if (profile.kind == ServerKind.DSH || profile.kind == ServerKind.DSH_REMOTE || profile.sshHostId != null || profile.remoteHostId != null) {
       val live = clientFor(profile.id)?.takeUnless { it.isClosed }
       if (live != null) return NotificationClientLease(live, owned = false)
       if (profile.sshHostId != null) return NotificationClientLease(sshHostManager.client(profile), owned = true)
-      val remoteBackend = if (profile.kind == ServerKind.DSH_REMOTE) remoteBackendFactory.create(profile, credentials) else null
+      val remoteBackend = if (profile.kind == ServerKind.DSH_REMOTE || profile.remoteHostId != null) remoteBackendFactory.create(profile, credentials) else null
       return NotificationClientLease(
         createHarnessClient(profile, credentials, callTimeoutSeconds = 8, remoteBackend = remoteBackend),
         owned = true

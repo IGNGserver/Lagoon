@@ -27,7 +27,8 @@ internal class RemoteSession(
   @Volatile private var failedAt = 0L
   @Volatile private var lastFailure: RemoteFailureException? = null
   private val statusFlow = MutableStateFlow(RemoteConnectionStatus(hostId = hostId))
-  private data class Active(val connection: RemoteConnection, val gateway: RemoteGateway, val capabilities: RemoteCapabilities)
+  private data class Active(val connection: RemoteConnection, val gateway: RemoteGateway, val capabilities: RemoteCapabilities,
+    val nativeServices: RemoteNativeServices)
 
   /** Observable connection state; UI and the doctor report read this instead of inferring from data. */
   internal val status: StateFlow<RemoteConnectionStatus> = statusFlow.asStateFlow()
@@ -45,6 +46,22 @@ internal class RemoteSession(
 
   suspend fun gateway(): RemoteGateway = ensure().gateway
   suspend fun capabilities(): RemoteCapabilities = ensure().capabilities
+  internal suspend fun nativeServiceCatalog(): NativeServiceCatalog? {
+    val current = ensure()
+    if (!current.capabilities.hasNativeServices) return null
+    return try { current.nativeServices.describe() }
+    catch (error: NativeServiceUpgradeRequiredException) {
+      throw RemoteFailureException(RemoteFailureKind.INCOMPATIBLE, error.message ?: "Remote Host 需要升级", retryable = false, cause = error)
+    }
+  }
+  internal suspend fun nativeServiceTransport(serviceId: String): NativeHttpTransport {
+    val current = ensure()
+    if (!current.capabilities.hasNativeServices) throw NativeServiceUpgradeRequiredException()
+    val catalog = current.nativeServices.describe()
+    val descriptor = catalog.services.firstOrNull { it.id == serviceId }
+      ?: throw NativeRemoteException("SERVICE_NOT_FOUND", "OpenCode 服务不存在")
+    return current.nativeServices.transport(serviceId, descriptor.generation)
+  }
 
   /**
    * 传输级 RPC：`harness.transport.describe` 和能力协商走的是连接上的方法名，
@@ -57,6 +74,7 @@ internal class RemoteSession(
   private suspend fun ensure(): Active = mutex.withLock {
     if (closed) { publishClosed(); throw IOException("Remote 会话已关闭") }
     active?.takeUnless { it.connection.isClosed }?.let { return@withLock it }
+    active?.nativeServices?.close()
     active?.gateway?.close()
     active = null
     val recent = lastFailure
@@ -101,10 +119,13 @@ internal class RemoteSession(
       else RemoteFailureException(RemoteFailureKind.TRUST_REQUIRED, error.message ?: "尚未确认主机指纹", retryable = false, cause = error)
     }
     var gateway: RemoteGateway? = null
+    var nativeServices: RemoteNativeServices? = null
     statusFlow.value = statusFlow.value.copy(phase = RemotePhase.HANDSHAKING)
     val connection = try {
       RemoteConnection.connect(address, device.identity, token, host, key, allowCleartext, clientVersion) {
-        (gateway ?: throw IOException("Remote 事件早于能力协商")).event(it)
+        if (it.optString("event") == "harness.services.frame") {
+          (nativeServices ?: throw IOException("原生服务事件早于能力协商")).event(it)
+        } else (gateway ?: throw IOException("Remote 事件早于能力协商")).event(it)
       }
     } catch (error: RemoteControlException) {
       throw remoteControlFailure(error)
@@ -119,8 +140,10 @@ internal class RemoteSession(
       }
       val nextGateway = RemoteGateway("harness.remote.stream.transfer.v1" in capabilities.capabilities) { method, params -> connection.call(method, params) }
       gateway = nextGateway
-      Active(connection, nextGateway, capabilities).also { current ->
-        if (closed) { nextGateway.close(); connection.close(); throw IOException("Remote 会话已关闭") }
+      val nextNative = RemoteNativeServices({ method, params -> connection.call(method, params) })
+      nativeServices = nextNative
+      Active(connection, nextGateway, capabilities, nextNative).also { current ->
+        if (closed) { nextNative.close(); nextGateway.close(); connection.close(); throw IOException("Remote 会话已关闭") }
         active = current
         lastFailure = null
         failedAt = 0L
@@ -132,6 +155,7 @@ internal class RemoteSession(
           lastError = null)
         SharedHttp.ioScope.launch {
           connection.awaitClosed()
+          nextNative.close()
           nextGateway.close()
           if (!closed && active?.connection === connection) {
             statusFlow.value = statusFlow.value.copy(phase = RemotePhase.FAILED, readyAt = 0,
@@ -225,6 +249,7 @@ internal class RemoteSession(
   override fun close() {
     closed = true
     publishClosed()
+    active?.nativeServices?.close()
     active?.gateway?.close()
     active?.connection?.close()
     active = null

@@ -53,13 +53,13 @@
 - 官方 OpenCode service registration + authenticated health；真实 DSH profile/进程附着。
 - 启动锁、进程所有权、独立状态命名空间与故障隔离；明确 POSIX/Windows 支持边界。
 
-### 5. Remote native 多 Harness（待开始）
+### 5. Remote native 多 Harness（连接器/原生 carrier/实际 Noise fixture 已实现）
 
 - 可构建交付的 Host native connector，版本化 manifest/serviceId/原生承载。
 - 保持 Hub opaque、现有 Noise 信任边界、同 Host 一条共享通道、多 Host 独立身份兼容。
 - 旧 Host 明确降级；不以 ACP 代替完整原生 OpenCode。
 
-### 6. UI 与自由组合（待开始）
+### 6. UI 与自由组合（源优先层级/重叠组合已接入，真机待验收）
 
 - 添加入口中枢/SSH（直连兼容高级区）；源/Host/服务详情和各级开关。
 - 每台设备多 Harness、组合只引用绑定、范围选择/新会话/通知/深链准确。
@@ -82,7 +82,8 @@
 - SSH 表单独立选择、全停用、只读发现、OpenCode 注册路径；删除/禁用 leaf 不再销毁兄弟连接和主机凭据。
 - 独立审查修复 SSE EOF 重订阅、新代次等待递归、半开 SSH entry 淘汰、编辑服务路径回退、无 Harness 测试误启动 DSH。
 - PTC/Question 已接入运行时和真实 adapter 测试；仍需复核该阶段提交的 teardown/dirty refresh 最后补丁及完整最终日志。
-- 尚未交付：图成为统一运行真源、真实桌面 DSH profile 附着、Remote native connector、完整统一 UI、真实设备验收和最终 PR。
+- Remote native connector 与固定上游完整插件构建、Android 原生 carrier、Host 服务选择和实际 Noise fixture 已接入；管理入口改为源优先并支持重叠组合，最终验证见进度记录。
+- 尚未完成：图成为所有运行场景的唯一真源、真实桌面 DSH profile 附着、完整原生能力真环境矩阵、真实设备交互验收和最终 PR。
 
 - 工作区已创建且 HEAD 与 origin/main 基线相同。
 - 本机盘可用约 96 GiB（2026-11-09）；构建区 `~/.build`。

@@ -8,6 +8,7 @@ internal data class RemoteWorkspaceType(val id: String, val name: String, val ca
 
 internal data class RemoteCapabilities(val capabilities: Set<String>, val workspaceTypes: List<RemoteWorkspaceType>?) {
   val supportsWorkspaceUpload: Boolean get() = "workspace.upload.v1" in capabilities
+  val hasNativeServices: Boolean get() = "harness.services.v1" in capabilities
 
   val sessionFormat: Int? get() = when {
     "harness.remote.v3" in capabilities -> 3
@@ -52,7 +53,7 @@ internal data class RemoteCapabilities(val capabilities: Set<String>, val worksp
         }
       }
       val result = RemoteCapabilities(set, workspaceTypes)
-      if (!v1 && !v3 && listOf(
+      if (!v1 && !v3 && !result.hasNativeServices && listOf(
           "codex" to "codex.appserver.v1", "cursor" to "agent.acp.cursor.v1",
           "antigravity" to "agent.acp.antigravity.v1", "pi" to "agent.acp.pi.v1",
           "opencode" to "agent.acp.opencode.v1", "claude" to "agent.acp.claude.v1",

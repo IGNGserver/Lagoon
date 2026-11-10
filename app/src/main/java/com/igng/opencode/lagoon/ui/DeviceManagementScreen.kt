@@ -34,7 +34,16 @@ internal fun DeviceManagementScreen(
   onManageHub: () -> Unit,
   onManageModels: () -> Unit
 ) {
-  val online = state.profiles.count { profile -> deviceConnected(profile, state) }
+  val graph by controller.connectionGraph.collectAsState()
+  val profilesById = state.profiles.associateBy { it.id }
+  val hostsBySource = graph?.hosts.orEmpty().groupBy { it.sourceId }
+  val bindingsByHost = graph?.bindings.orEmpty().groupBy { it.hostBindingId }
+  val graphProfileIds = graph?.bindings.orEmpty().map { it.id }.toSet()
+  val remainingProfiles = state.profiles.filter { it.id !in graphProfileIds }
+  val unboundSshHosts = state.sshHosts.filter { ssh ->
+    state.profiles.none { it.sshHostId == ssh.id } &&
+      graph?.sources.orEmpty().none { it.sshHostConfigId == ssh.id }
+  }
   Column(Modifier.fillMaxSize().background(HyperTheme.colors.canvas)) {
     PageTopBar("设备", onBack, actions = {
       CircleIconButton(MiuixIcons.Add, "添加设备", onAddDevice)
@@ -46,7 +55,7 @@ internal fun DeviceManagementScreen(
     ) {
       item {
         Text(
-          "${state.profiles.size} 台设备 · $online 台在线",
+          "${state.profiles.size} 个 Harness · ${graph?.hosts?.size ?: 0} 个主机绑定",
           Modifier.padding(horizontal = 6.dp),
           style = MiuixTheme.textStyles.body2.copy(color = HyperTheme.colors.textSecondary)
         )
@@ -60,25 +69,111 @@ internal fun DeviceManagementScreen(
         )
       }
       item {
-        HyperGroupTitle("设备")
+        HyperGroupTitle("接入源管理")
         HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(vertical = 4.dp)) {
-          state.profiles.forEachIndexed { index, profile ->
+          HyperRow(
+            title = "Remote Hub · 远程中枢",
+            summary = "登录或管理账号、主机与原生 DSH / OpenCode 接入",
+            showChevron = true,
+            onClick = onManageHub
+          )
+          HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
+          HyperRow(
+            title = "添加或管理 SSH 接入源",
+            summary = "共用主机配置，再逐个选择原生 Harness",
+            showChevron = true,
+            onClick = onAddDevice
+          )
+        }
+      }
+      if (graph != null) {
+        items(graph?.sources.orEmpty(), key = { "source:${it.id}" }) { source ->
+          val hosts = hostsBySource[source.id].orEmpty()
+          HyperGroupTitle(when (source.type) {
+            ConnectionSourceType.HUB -> "Remote Hub · ${source.name}"
+            ConnectionSourceType.SSH -> "SSH · ${source.name}"
+            ConnectionSourceType.DIRECT -> "兼容直连 · ${source.name}"
+          })
+          HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(vertical = 4.dp)) {
+            HyperSwitchRow(
+              title = "启用接入源",
+              summary = listOfNotNull(source.endpoint, source.account).joinToString(" · ") + "；不改主机与 Harness 自身选择",
+              checked = source.enabled,
+              onCheckedChange = { controller.setConnectionSourceEnabled(source.id, it) }
+            )
+            if (source.type != ConnectionSourceType.DIRECT) {
+              HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
+              HyperRow(
+                title = if (source.type == ConnectionSourceType.HUB) "管理中枢与主机" else "配置 SSH 与发现 Harness",
+                summary = if (source.type == ConnectionSourceType.SSH) "进入添加页，选择已保存的 SSH 主机" else "查看账号或接入更多主机",
+                showChevron = true,
+                onClick = if (source.type == ConnectionSourceType.HUB) onManageHub else onAddDevice
+              )
+            }
+            hosts.forEach { host ->
+              val bindings = bindingsByHost[host.id].orEmpty()
+              HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
+              Column(Modifier.padding(start = 12.dp)) {
+                HyperSwitchRow(
+                  title = "主机 · ${host.name}",
+                  summary = "${bindings.size} 个 Harness · " + if (source.enabled) "只影响此主机绑定" else "接入源已停用，保留此主机自身选择",
+                  checked = host.enabled,
+                  onCheckedChange = { controller.setConnectionHostEnabled(host.id, it) }
+                )
+                Column(Modifier.padding(start = 12.dp)) {
+                  bindings.forEach { binding ->
+                    val profile = profilesById[binding.id]
+                    HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
+                    if (profile != null) {
+                      DeviceHarnessRow(profile, state, onOpenDevice)
+                    } else {
+                      // Graph-only metadata is never used as a new canonical connection route.
+                      HyperRow(title = binding.name, summary = "连接记录暂不可用；未尝试连接", value = "未载入")
+                    }
+                  }
+                  if (bindings.isEmpty()) HyperRow(
+                    title = "尚未选择 Harness",
+                    summary = if (source.type == ConnectionSourceType.HUB) "管理中枢以选择此主机的服务" else "进入接入源配置发现服务",
+                    showChevron = source.type != ConnectionSourceType.DIRECT,
+                    onClick = when (source.type) {
+                      ConnectionSourceType.HUB -> onManageHub
+                      ConnectionSourceType.SSH -> onAddDevice
+                      ConnectionSourceType.DIRECT -> null
+                    }
+                  )
+                }
+              }
+            }
+            if (hosts.isEmpty()) HyperRow(title = "尚未绑定主机", summary = "配置已保留，选择主机后再接入 Harness")
+          }
+        }
+      }
+      if (remainingProfiles.isNotEmpty()) item {
+        HyperGroupTitle(if (graph == null) "Harness · 连接图暂不可用" else "其他已保存的 Harness")
+        HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(vertical = 4.dp)) {
+          remainingProfiles.forEachIndexed { index, profile ->
+            if (index > 0) HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
+            DeviceHarnessRow(profile, state, onOpenDevice)
+          }
+        }
+      }
+      if (unboundSshHosts.isNotEmpty()) item {
+        HyperGroupTitle("SSH · 尚未接入 Harness")
+        HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(vertical = 4.dp)) {
+          unboundSshHosts.forEachIndexed { index, host ->
             if (index > 0) HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
             HyperRow(
-              title = profile.name,
-              summary = profile.endpointSummary + when {
-                !profile.enabled -> " · Harness 已停用"
-                !profile.parentEnabled -> " · 接入源或主机已停用"
-                else -> ""
-              },
-              value = deviceStatusLabel(profile, state),
+              title = host.name,
+              summary = "${host.address} · 已保存配置；进入添加页选择此 SSH 主机",
               showChevron = true,
-              onClick = { onOpenDevice(profile.id) }
+              onClick = onAddDevice
             )
           }
-          if (state.profiles.isEmpty()) {
-            HyperRow(title = "还没有设备", summary = "添加 OpenCode、DeepSeek Harness 中枢或 SSH 主机")
-          }
+        }
+      }
+      if (state.profiles.isEmpty() && graph?.sources.isNullOrEmpty() && unboundSshHosts.isEmpty()) item {
+        HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(vertical = 4.dp)) {
+          HyperRow(title = "还没有接入源", summary = "添加 Remote Hub、SSH 主机，或展开高级 HTTP 直连", showChevron = true, onClick = onAddDevice)
         }
       }
       item {
@@ -130,10 +225,10 @@ internal fun DeviceDetailScreen(
   }
   var confirmingDelete by remember { mutableStateOf(false) }
   var showDefaults by remember { mutableStateOf(false) }
+  var showNative by remember(deviceId) { mutableStateOf(false) }
   var remoteDialog by remember { mutableStateOf<String?>(null) }
   val isRemote = profile.kind == ServerKind.DSH_REMOTE
-  val isDsh = profile.kind == ServerKind.DSH || isRemote
-  val currentGroup = state.deviceGroups.firstOrNull { profile.id in it.memberIds }
+  val memberships = state.deviceGroups.filter { profile.id in it.memberIds }
   val binding = graph?.bindings?.firstOrNull { it.id == profile.id }
   val parentHost = graph?.hosts?.firstOrNull { it.id == binding?.hostBindingId }
   val parentSource = graph?.sources?.firstOrNull { it.id == parentHost?.sourceId }
@@ -165,7 +260,7 @@ internal fun DeviceDetailScreen(
           HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
           HyperRow(title = "连接地址", summary = profile.endpointSummary)
           HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
-          HyperRow(title = "类型", value = if (profile.sshHostId != null) "SSH 直连" else profile.kind.label)
+          HyperRow(title = "类型", value = profile.connectionTypeLabel)
         }
       }
       if (parentSource != null && parentHost != null) item {
@@ -185,12 +280,15 @@ internal fun DeviceDetailScreen(
       item {
         HyperGroupTitle("使用方式")
         HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(vertical = 4.dp)) {
-          HyperDropdownRow(
-            title = "所属设备组",
-            items = listOf("不分组") + state.deviceGroups.map { it.name },
-            selectedIndex = state.deviceGroups.indexOfFirst { it.id == currentGroup?.id }.let { if (it < 0) 0 else it + 1 },
-            onSelectedIndexChange = { index -> controller.moveProfile(profile.id, if (index == 0) null else state.deviceGroups[index - 1].id) }
+          HyperRow(
+            title = "组合成员",
+            summary = if (memberships.isEmpty()) "尚未加入组合；返回设备页管理组合，不改变此 Harness 的接入源"
+              else "已加入 ${memberships.size} 个组合；返回设备页管理成员，不改变接入源"
           )
+          memberships.forEach { group ->
+            HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
+            HyperRow(title = group.name, value = "成员")
+          }
           HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
           HyperSwitchRow(
             title = "任务通知",
@@ -217,7 +315,12 @@ internal fun DeviceDetailScreen(
       item {
         HyperGroupTitle("连接设置")
         HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(vertical = 4.dp)) {
-          HyperRow(title = "编辑连接信息", summary = "地址、账号、认证与传输安全", trailing = { DropdownChevron() }, onClick = { onEditProfile(profile) })
+          if (profile.remoteServiceId == null) HyperRow(title = "编辑连接信息", summary = "地址、账号、认证与传输安全", trailing = { DropdownChevron() }, onClick = { onEditProfile(profile) })
+          else HyperRow(title = "原生服务路由", summary = "Host 管理服务地址与认证；本机只保存服务标识", value = "Remote")
+          if (profile.remoteHostId != null) {
+            HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
+            HyperRow(title = "发现 Host 原生 Harness", summary = "只读发现；逐个选择 OpenCode 原生服务", showChevron = true, onClick = { showNative = true })
+          }
           if (isRemote) {
             HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
             HyperRow(title = "中枢与远程主机", summary = "查看账号、接入其他主机或退出中枢", trailing = { DropdownChevron() }, onClick = onManageHub)
@@ -258,6 +361,8 @@ internal fun DeviceDetailScreen(
     }
   }
 
+  if (showNative) RemoteNativeServicesSheet(controller, profile) { showNative = false }
+
   when (remoteDialog) {
     "connection" -> RemoteConnectionDialog(profile, state, controller) { remoteDialog = null }
     "extensions" -> RemoteExtensionsDialog(profile, controller) { remoteDialog = null }
@@ -279,6 +384,21 @@ internal fun DeviceDetailScreen(
       }
     }
   }
+}
+
+@Composable
+private fun DeviceHarnessRow(profile: ServerProfile, state: LagoonState, onOpenDevice: (String) -> Unit) {
+  HyperRow(
+    title = profile.name,
+    summary = "${profile.kind.label} · ${profile.endpointSummary}" + when {
+      !profile.enabled -> " · Harness 已停用"
+      !profile.parentEnabled -> " · 接入源或主机已停用"
+      else -> ""
+    },
+    value = deviceStatusLabel(profile, state),
+    showChevron = true,
+    onClick = { onOpenDevice(profile.id) }
+  )
 }
 
 private fun deviceSnapshot(profile: ServerProfile, state: LagoonState): ServerOverviewSnapshot? =

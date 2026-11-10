@@ -31,13 +31,14 @@ class DeviceGroupTest {
         DeviceGroup("g1", "A", listOf("p1", "missing", "p1", "p2")),
         DeviceGroup("g1", "duplicate id", listOf("p3")),
         DeviceGroup("g2", "empty", listOf("missing")),
-        DeviceGroup("g3", "  B  ", listOf("p3"))
+        DeviceGroup("g3", "  B  ", listOf("p2", "p3", "p2"))
       ),
       selectedGroupId = "g2"
     )
     val clean = state.sanitized(setOf("p1", "p2", "p3"))
     assertEquals(listOf("g1", "g3"), clean.groups.map { it.id })
     assertEquals(listOf("p1", "p2"), clean.groups[0].memberIds)
+    assertEquals(listOf("p2", "p3"), clean.groups[1].memberIds)
     assertEquals("B", clean.groups[1].name)
     assertNull(clean.selectedGroupId)
   }

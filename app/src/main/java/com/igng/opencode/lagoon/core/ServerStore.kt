@@ -85,7 +85,8 @@ class ServerStore internal constructor(private val preferences: SharedPreference
           if (!item.has("kind")) ServerKind.OPENCODE else MigrationProjection.legacyKind(item.getString("kind")),
           DshAuthMode.fromWire(item.str("dshAuth")), item.str("remoteHostId").takeIf(String::isNotBlank),
           item.str("remoteHostFingerprint").takeIf(String::isNotBlank), item.str("sshHostId").takeIf(String::isNotBlank),
-          item.optBoolean("enabled", true), item.str("sshServicePath").takeIf(String::isNotBlank))
+          item.optBoolean("enabled", true), item.str("sshServicePath").takeIf(String::isNotBlank),
+          parentEnabled = true, remoteServiceId = item.str("remoteServiceId").takeIf(String::isNotBlank))
       }
       check(profiles.distinctBy { it.id }.size == profiles.size) { "连接资料身份重复" }
       return profiles
@@ -504,7 +505,8 @@ class ServerStore internal constructor(private val preferences: SharedPreference
         .put("allowCleartext", item.allowCleartext).put("kind", item.kind.wire).put("dshAuth", item.dshAuth.wire)
         .put("enabled", item.enabled)
         .putOpt("remoteHostId", item.remoteHostId).putOpt("remoteHostFingerprint", item.remoteHostFingerprint)
-        .putOpt("sshHostId", item.sshHostId).putOpt("sshServicePath", item.sshServicePath))
+        .putOpt("sshHostId", item.sshHostId).putOpt("sshServicePath", item.sshServicePath)
+        .putOpt("remoteServiceId", item.remoteServiceId))
     }
   }.toString()
 

@@ -41,10 +41,24 @@
 - **DSH Desktop 原生附着为上游 blocker**：本机安装的官方 `@deepseek-ai/dsh@0.2.1-rc.5` CLI 明确拒绝 `--profile desktop`；Electron Desktop 使用 `file://` + IPC，而 Typert web/WS mux 仅由 WebHost 挂载；`/connect` launch token 只存在该 Web process 内存，官方包没有 Desktop profile 注册文件、daemon HTTP 入口或可供 SSH 转发的 IPC bridge。不得通过启动第二个 `dsh web`、猜端口或读写共享 profile state 冒充附着当前 Desktop Agent。正确下一步是先取得官方 Electron Desktop 提供的受支持 Host/SSH attach hook 与身份/lifecycle contract；未取得前，DSH SSH 仅是兼容的新建 WebHost，不宣称 Desktop 运行时复用。
 - 多 OpenCode channel 目前通过用户保存的具体 registration path 逐个建 binding，不自动合并 channel；无真实远端 SSH daemon/Android 真机验收。
 
-### 阶段 5–7：未交付
-- Remote native connector 仍需固定 upstream overlay + companion package + Android carrier 的构建/端到端测试，不能以 ACP 或插件草案替代原生支持。
-- 全局中枢入口/层级管理/组合交互需统一；目前只有 SSH 接入入口和 leaf 独立开关已扩展。
-- 真实 Host/Hub/SSH/Android 环境验收、完整能力对照、独立审查、凭据扫描、提交/PR 待完成。
+### 阶段 5：Remote native connector 已实现，实际加密互操作已通过定向验证
+- 新增 `host-connector/`：固定上游 SHA-256 校验 overlay，将 NativeServicePeer 放在认证 Noise/信任校验之后的每连接 RpcRouter，完整构建 Router、HostPluginRuntime、插件入口；不是 manifest/stub，也不需要新建 Hub。
+- Host 只读官方 OpenCode registration，先无凭据验证公开 `/api/info` PID/version，再验证受保护 route；凭据仅 Host 内存。只允许 loopback、OpenAPI method/path、header 白名单，禁止重定向、路径穿越和手机任意 URL/凭据。
+- 原生 HTTP/binary/SSE/WS，序号/背压/取消、父连接配额、64 MiB 有界 request/response transfer、上传 commit 一次性消费；未知提交不重发。关闭 pending-open 不复活流；发现替换/入站帧校验回收旧服务代次。
+- Android RemoteNativeServices + LazyNativeHttpTransport 已接入 RemoteSession/RemoteBackend/OpenCodeApi；同 Hub/account/Host 一个 Noise session，不以 ACP 或 DSH Typert 冒充原生 OpenCode。
+- Remote service locator 单独保存为 remoteServiceId，generation 不持久化为身份。新 Host 服务选择页只读发现、默认可停用保存、显式逐个启用；旧 Host 明确升级要求。
+- 验证：Host real loopback 11 tests、patched actual Router/ConnectionController 5 tests；Android carrier 15、lazy admission 7、native binding 7、实际 Kotlin Noise→Node Router/Peer→原生服务 fixture 2（其中 1 互操作、1 旧Host）。大请求实际 Noise 互操作及全量 1173 项回归已通过，具体证据见下方日志记录。
+
+### 阶段 6：统一 UI 与自由组合，源码已接入，验收进行中
+- 添加入口改为 Remote Hub/SSH 接入源优先，兼容 HTTP 直连放高级区；管理页显示 source→Host→Harness 和独立开关。
+- 组合改为稳定 leaf ID 的多对多引用：一个 Harness 可加入多个组合，新建/编辑不再从其他组合偷走成员；显式 MOVE 仍是移动。
+- 详情展示所有组合成员关系，不再用一个下拉框破坏其他组合；原生服务保留准确 carrier 标签和独立操作。
+- 未跑 Android 真机布局、可访问性、预测式返回；当前仅源码与 Compose 编译验收。
+
+### 阶段 7：验证与交付仍进行中
+- 本地 fake Hub/实际 Noise/真实 Node connector 互操作不等于公网 Hub、真实官方 daemon 或 Android 真机验收。
+- DSH Desktop SSH 附着仍缺上游受支持 hook；跨 direct DshApi API-peer 复用及完整功能矩阵未全部验收。没有虚构完成。
+- 本批完整回归/独立复核/凭据模式扫描已通过，准备保存本地 checkpoint；剩余整合及最终 PR 待收口；没有部署、发布或合并。
 
 ## 验证记录
 - `ssh-integration-r4.log`：先修复之前中断留下的 SSH owner 编译错误，ownership/model/legacy store/mux 定向通过。
@@ -64,5 +78,14 @@
 - `runtime-r5-checkpoint-2.log`：**1108 tests、0 failures、0 errors、6 skipped**；debug assemble 成功，112s；已保存本地提交 `03f4de1`。
 - Hierarchy r5：新增纯 runtime projection、严格主图只读 overlay、Overview/home/通知 effective gate，实际 Controller source/host setter 的前置失败/提交后清理失败/旧页面许可/重开偏好测试。Controller 旧 Unsafe fixture 必须有真实保存 profile，已补齐而不绕开生产许可。
 - `hierarchy-r5-final.log`：106 定向测试通过；`hierarchy-r5-checkpoint.log`：**1134 tests、0 failures、0 errors、6 skipped**；debug assemble 成功，116s，APK 21,612,457 bytes，SHA-256 `15a9019a8d971f11c4d64a1fcb0633ba10aeddcb8ddb974807abad448866c848`。
+- Remote native r6：先后修复 Host public info 凭据探测顺序、pending stream 取消前置预留、旧代次入站流回收、上传 commit 一次性消费/finish-close 内存计费；11 项真实 Node peer 测试通过。完整 fixed-upstream Router/Host runtime/plugin 构建成功，actual Router/ConnectionController 5 项通过。
+- `native-android-integration.log`：新测试旧假设失败（协程异常栈恢复会复制异常；异步取消完成需等待；MockWebServer server-side WS 不能使用 client cancel）。保留日志，修正夹具后 `native-android-integration-2.log` 定向通过。
+- `integration-checkpoint-1.log`：1165 tests 中 1 旧 profile scope fixture 缺少 remoteServiceId；`integration-checkpoint-2.log` 同步到组合测试中间快照缺 helper/import，不能作为通过。fixture 已按完整 native locator 更新、组合测试已稳定。
+- `integration-checkpoint-3.log`：1173 tests 中 1 大上传互操作失败；定位 FakeRemoteHost 收到客户端 DSHF 片段却直接当 JSON，加入真实有界解片器（control/data relay 均适用），不缩减上传量。
+- `integration-upload-repaired.log`：实际 Noise + native upload/stream/binding/组合/旧Remote 定向通过。`integration-checkpoint-final.log`：**1173 tests、0 failures、0 errors、6 skipped**（包含实际 Noise cross-language tests 2/2，0 skipped）；`:app:assembleDebug` 成功，112s。APK 21,689,086 bytes，SHA-256 `f932587dc377ad94355aef173de88d364cb8a454830f4939fa2a1b67aa853c3c`。
+- `connector-full-build-4.log`：完整插件 bundle 4,023,665 bytes，SHA-256 `fb0e0c9a9746e6c00fcbe4fed92bb59cb91b2129a1ba4917774ce58a2e94afef`；Host upstream archive SHA-256 与4个关键源文件 SHA 校验，工具依赖已锁定。没有安装或部署到用户 Host。
+- 最终独立 review 发现 metadata route 的 SSE/WS 仍可能带 Basic；已在流入口拒绝 `/api/info`/`openapi.json`、低层公开 info 统一不带认证，负例确认无任何网络请求。`native-host-security-final.log` 11/11、`connector-router-security-final.log` 5/5，`native-security-encrypted-final.log` 最新 Host artifact + Android 真 Noise 回归通过。
+- `connector-full-build-5.log`：最终安全修复插件 bundle 4,023,814 bytes，SHA-256 `1470c8ce20237815a7c5f9c9ec6d35bda47ce4b1442853153f83fb5b610ce0dd`。构建复制上游 MIT LICENSE 到源码副本和输出目录；没有重许可或删除作者声明。
+- 当前 `adb devices -l` 仍为空；真机 UI/通知/返回手势未验收。公网 Hub/真实官方 daemon 未冒充本地 fixture。
 - 全部构建在 `/home/lvziw/.build/Lagoon/unified-harness-connections/source`，Gradle/build 输出在 `~/.build`。源码工作树无 app/build、node_modules。
 - `wt audit`：29 repos，0 missing dirs，3 detached、4 merged worktrees 属其他任务；只读报告，无清理。
