@@ -1,6 +1,6 @@
 # 统一连接机制重构任务跟踪
 
-## 实际交付状态（2026-11-10）
+## 实际交付状态（2026-11-11）
 
 目标仍在进行；没有把组件单测通过等同于七阶段完成。没有部署、发布或合并。
 
@@ -19,7 +19,9 @@
 - source/host/leaf 开关已实际接入：父级 gate 独立持久化，ServerStore.profiles 仅做 runtime overlay，raw reader/writers 不改子项 enabled；新 sibling 即使尚未写入图也继承已停用父级。
 - Overview/Controller 的连接、重连、通知动作、深链、首页/组合/全局摘要均使用 effectiveEnabled；详情页已有三层开关。旧 UI/通知对象不能绕过刚提交的父级 gate；写入主记录成功但 journal cleanup 失败也按磁盘许可收紧运行状态。
 - 损坏/未来版图为 runtime fail-closed，不清空 raw 资料/凭据；graph reader 不自动恢复或迁移。组合全暂停后保留选中的 group ID，不跳转组外连接。
-- **尚未完成**：多服务 manifest 路由取代 legacy leaf factory、跨 store 完整事务验收和真机 UI 验收。
+- r7：ConnectionRouteSnapshot 从 exact binding→Host→source 链生成不含 secret 的不可变执行路由；对照 raw 全量路由元组（完整 Direct base path/认证、SSH config/path/user、Hub account/Host/fingerprint/service），不一致/图缺 binding/损坏/未来版均拒绝，不按新 raw 或旧 graph 静默回退。
+- Overview 的建连及缓存复用、通知租约、Controller 操作/完成提交已接入 runtimeRoute；实际工厂按已准入 carrier→native protocol 分派。raw enabled 和显示偏好不被旧 graph leaf 偏好覆盖；旧同-ID客户端在改路/改认证时回收。Remote account 固定来自准入源，不让 credential username 改变信任 scope。
+- **尚未完成**：跨 store 完整事务/空 source catalog 生命周期、完整原生能力交互矩阵和真机 UI 验收。
 
 ### 阶段 3：实际原生传输与 mux，已有实质交付
 - OpenCodeApi 的 HTTP/二进制/SSE 已经通过 NativeHttpTransport；public constructors 兼容，close 释放本实例 transport，不关闭共享 dispatcher/pool。
@@ -27,7 +29,9 @@
 - Concrete NativeOkHttpTransportTest 16 项；旧的 WS unsupported 测试已替换，不再声称 stock carrier 缺少 WS。
 - DSH direct/SSH PhysicalMuxOwner 一个实例一个 physical socket；保留 idle socket 至 owner close，避免关闭 API-peer lifecycle 后复用失效 cookie；cookie acquisition/socket callback/send 都有 attempt fence。
 - 11 项 mux 回归覆盖 typed errors、cancel-all/reopen、end/reopen、onClosed fan-out、旧代次/旧 401 回调、cookie exchange 期间 close、坏载荷/慢消费者/回调异常隔离。
-- **尚未完成**：跨独立 direct DshApi 实例共用 API-peer owner；真实 API-peer fallback 互操作。RemoteBackend 仍用原独立 encrypted carrier。
+- r7 修复应用 saved direct DSH 诊断另建 physical mux：相同路由/认证借用 Overview owner，未改内容/问答展示，不关闭 borrowed client；编辑 draft 不用旧资料代测，保存后先退役旧 owner 再连接。注意 durable browser cookie 允许多物理 socket，并非必然 409；409 限制是相同 v2 API-peer cookie。
+- Cookie 回调按 owner token+路由+username/password 输入隔离；同URL替换认证后迟到的旧回调不能覆盖新凭据，owner 自身 cookie 轮换仍复用。
+- **尚未完成**：公共库独立 DshApi 实例的全局复用（冷 events 多 collector 仍有 ownership 风险，不以裸 refcount 共享掩盖）；真实官方 API-peer fallback 互操作。RemoteBackend 共用原加密会话。
 
 ### 阶段 4：SSH 多 Harness 已接入，仍非全部完成
 - SshTransportPool 已被 SshHostManager 实际使用：同一 saved source/config/pin/credential revision 复用物理 SSH；每个 binding 有独立 runtime link/forwarder/client/refcount，最后一个引用释放才关连接。
@@ -86,6 +90,10 @@
 - `connector-full-build-4.log`：完整插件 bundle 4,023,665 bytes，SHA-256 `fb0e0c9a9746e6c00fcbe4fed92bb59cb91b2129a1ba4917774ce58a2e94afef`；Host upstream archive SHA-256 与4个关键源文件 SHA 校验，工具依赖已锁定。没有安装或部署到用户 Host。
 - 最终独立 review 发现 metadata route 的 SSE/WS 仍可能带 Basic；已在流入口拒绝 `/api/info`/`openapi.json`、低层公开 info 统一不带认证，负例确认无任何网络请求。`native-host-security-final.log` 11/11、`connector-router-security-final.log` 5/5，`native-security-encrypted-final.log` 最新 Host artifact + Android 真 Noise 回归通过。
 - `connector-full-build-5.log`：最终安全修复插件 bundle 4,023,814 bytes，SHA-256 `1470c8ce20237815a7c5f9c9ec6d35bda47ce4b1442853153f83fb5b610ce0dd`。构建复制上游 MIT LICENSE 到源码副本和输出目录；没有重许可或删除作者声明。
-- 当前 `adb devices -l` 仍为空；真机 UI/通知/返回手势未验收。公网 Hub/真实官方 daemon 未冒充本地 fixture。
+- r7 `route-admission-targeted-2.log`：strict route/diagnostic/父级许可等定向通过；初次 full 暴露 CancellationSafety 要求新 catch 必须重抛取消，以及 Overview 旧测试只换内存 profile、不保存路由的假设，均已修正而非放宽生产准入。
+- r7 独立复核修复 DSH Remote legacy kind alias 的原生协议归一化；addProject/deleteSession 的迟到结果在持久化副作用前校验 route，避免同 leaf ID 换地址后污染项目、草稿/缓存；问答通知取消也按原连接守卫。
+- `route-admission-final.log`：**1203 tests、0 failures、0 errors、6 skipped**，其中 actual Noise 跨语言 2/2，0 skipped；debug assemble 成功，117s。APK 21,697,632 bytes，SHA-256 `1c5c5f445bc52cc04ecd123d5a81848872729d761d0b83f32e98f2ade4119407`。
+- 新增 route admission 11、carrier-first factory 7、saved diagnostic ownership 6、Cookie/auth owner fence 4、迟到持久化副作用 2 项回归。凭据模式扫描无命中（不是完整安全审计）。
+- 本机 `opencode --version` 为 1.18.18，与固定 native v2.2.6 基线不同，没有拿它冒充官方 2.x daemon 真环境验收；本机未发现 sshd。当前 `adb devices -l` 仍为空；真机 UI/通知/返回手势未验收。公网 Hub/真实官方 daemon 未冒充本地 fixture。
 - 全部构建在 `/home/lvziw/.build/Lagoon/unified-harness-connections/source`，Gradle/build 输出在 `~/.build`。源码工作树无 app/build、node_modules。
 - `wt audit`：29 repos，0 missing dirs，3 detached、4 merged worktrees 属其他任务；只读报告，无清理。

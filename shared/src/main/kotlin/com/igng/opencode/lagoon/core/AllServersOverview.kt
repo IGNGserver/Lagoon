@@ -77,6 +77,7 @@ internal class AllServersOverview(
   private val jobs = mutableMapOf<String, Job>()
   private val locks = mutableMapOf<String, Mutex>()
   private val clients = mutableMapOf<String, HarnessClient>()
+  private val ownerTokens = mutableMapOf<String, Any>()
   private val configurations = mutableMapOf<String, Pair<ServerProfile, ServerCredentials>>()
   private val wakes = mutableMapOf<String, Channel<Unit>>()
   private val refreshWaiters = mutableMapOf<String, MutableList<CompletableDeferred<Unit>>>()
@@ -100,6 +101,14 @@ internal class AllServersOverview(
     (jobs.keys - wanted.map { it.id }.toSet()).forEach(::remove)
     wanted.forEach { profile ->
       val id = profile.id
+      try { (store as? ConnectionRouteStore)?.runtimeRoute(profile) }
+      catch (error: Exception) {
+        if (error is CancellationException) throw error
+        remove(id)
+        publish(ServerOverviewSnapshot(id, profile, connected = false, loading = false,
+          error = userFacingError(error, "连接路由尚未提交")))
+        return@forEach
+      }
       val config = profile to store.credentials(id)
       val previous = configurations[id]
       if (jobs[id]?.isActive == true && previous?.second == config.second &&
@@ -109,6 +118,7 @@ internal class AllServersOverview(
       }
       remove(id)
       configurations[id] = config
+      ownerTokens[id] = Any()
       wakes[id] = Channel(Channel.CONFLATED)
       reconnectHints[id] = Channel(Channel.CONFLATED)
       publish(ServerOverviewSnapshot(id, profile, notices = store.sessionNotices(id), loading = selectedServer() != id))
@@ -123,13 +133,24 @@ internal class AllServersOverview(
    * or an edited SSH host config. */
   fun invalidate(id: String) { remove(id) }
   fun client(id: String): HarnessClient {
-    val (profile, credentials) = configurations[id] ?: error("服务器已移除")
-    check(profile.effectiveEnabled) { "连接已禁用" }
+    val (configured, credentials) = configurations[id] ?: error("服务器已移除")
+    val route = try {
+      val admitted = (store as? ConnectionRouteStore)?.runtimeRoute(configured)
+      store.requireCurrentAuthentication(id, credentials)
+      admitted
+    }
+    catch (error: Exception) { if (error is CancellationException) throw error; remove(id); throw error }
+    val profile = route?.executionProfile(configured) ?: store.runtimeProfile(configured)
+    val token = ownerTokens.getOrPut(id) { Any() }
     return clients.getOrPut(id) {
+      if (route != null) return@getOrPut createRoutedHarnessClient(route, profile, credentials,
+        onCookie = { cookie -> rememberCookie(id, profile, credentials, token, cookie) },
+        remoteFactory = remoteBackendFactory?.let { factory -> { p, c -> factory.create(p, c) } },
+        sshFactory = sshClientFactory)
       val backend = if (profile.kind == ServerKind.DSH_REMOTE || profile.remoteHostId != null)
         remoteBackendFactory?.create(profile, credentials) ?: error("DSH Remote storage is not configured") else null
-      backend?.client ?: createHarnessClient(profile, credentials,
-        onCookie = { cookie -> rememberCookie(id, profile, cookie) }, remoteBackend = backend,
+      createHarnessClient(profile, credentials,
+        onCookie = { cookie -> rememberCookie(id, profile, credentials, token, cookie) }, remoteBackend = backend,
         sshClientFactory = sshClientFactory)
     }
   }
@@ -138,11 +159,20 @@ internal class AllServersOverview(
    * DSH 换到的会话 Cookie 落盘，下次启动直接复用（启动令牌在 dsh 重启后就作废了）。同步更新
    * [configurations]，否则下一次 [start] 会把凭据变化误判为资料变更而重建这台服务器的连接。
    */
-  private fun rememberCookie(id: String, profile: ServerProfile, cookie: String) {
+  private fun rememberCookie(id: String, profile: ServerProfile, issuedWith: ServerCredentials, token: Any, cookie: String) {
+    if (ownerTokens[id] !== token) return
+    if (runCatching { store.runtimeProfile(profile) }.isFailure) return
+    val currentCredentials = store.credentials(id)
+    // Owner-generated cookie rotations may change cookie bytes, never the saved auth input.
+    // An old mux's invalidation/renewal must not overwrite credentials replaced at the same URL.
+    if (currentCredentials.username != issuedWith.username || currentCredentials.password != issuedWith.password) return
     store.rememberCookie(id, profile.url, cookie)
     scope.launch {
+      if (ownerTokens[id] !== token) return@launch
       val current = configurations[id] ?: return@launch
-      if (current.first == profile) configurations[id] = profile to store.credentials(id)
+      if (ConnectionRouteAdmission.sameLeafRoute(current.first, profile)) {
+        configurations[id] = current.first to store.credentials(id)
+      }
     }
   }
   fun refreshAll() { wakes.values.forEach { it.trySend(Unit) }; reconnectHints.values.forEach { it.trySend(Unit) } }
@@ -204,6 +234,7 @@ internal class AllServersOverview(
     jobs.remove(id)?.cancel(); wakes.remove(id)?.close(); approvers.remove(id)?.dispose()
     refreshWaiters.remove(id)?.forEach { it.complete(Unit) }
     reconnectHints.remove(id)?.close()
+    ownerTokens.remove(id)
     clients.remove(id)?.close(); configurations.remove(id); locks.remove(id); snapshots.remove(id)
     handoffs.remove(id)
     childDiscoveries.remove(id)

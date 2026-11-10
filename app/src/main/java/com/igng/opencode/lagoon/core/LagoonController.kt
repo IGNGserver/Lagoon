@@ -270,7 +270,7 @@ class LagoonController private constructor(private val appContext: Context) {
         binding.copy(
           enabled = binding.legacyProfile?.enabled ?: binding.enabled,
           discovery = old?.discovery ?: binding.discovery,
-          serviceId = old?.serviceId ?: binding.serviceId
+          serviceId = binding.serviceId
         )
       }
     )
@@ -294,9 +294,10 @@ class LagoonController private constructor(private val appContext: Context) {
 
   private val remoteBackendFactory = object : RemoteBackendFactory {
     override fun create(profile: ServerProfile, credentials: ServerCredentials): RemoteBackend {
+      store.runtimeProfile(profile)
       val hostId = profile.remoteHostId ?: throw IllegalStateException("请先选择并验证 DSH Host")
       val origin = canonicalRemoteOrigin(profile.url)
-      val account = credentials.username.trim()
+      val account = profile.username.trim()
       if (account.isBlank()) throw IllegalStateException("请先登录 DSH Hub 并注册 Remote 设备")
       val manager = RemoteDeviceManager(store.remoteDevices, remoteSlot(profile), origin, account,
         registerer = { descriptor, token -> RemoteServerApi(profile.url, profile.allowCleartext).register(descriptor, token) },
@@ -783,11 +784,18 @@ class LagoonController private constructor(private val appContext: Context) {
   suspend fun testServer(profile: ServerProfile, credentials: ServerCredentials, onCookie: (String) -> Unit = {}): String {
     val saved = store.profiles().firstOrNull { it.id == profile.id }
     check(saved == null || saved.parentEnabled) { "所属接入源或主机已停用，请先启用父级" }
-    // A second Remote connection with the same client identity would replace the live one. Reuse the
-    // persistent monitor's client for any already-saved Remote profile.
-    if (profile.kind == ServerKind.DSH_REMOTE && store.profiles().any { it.id == profile.id }) {
-      val existing = runCatching { allOverview.client(profile.id) }.getOrNull()
-      if (existing != null) return existing.health()
+    // A saved DSH diagnostic must not create another physical mux/$events owner. Browser cookies
+    // permit extra sockets; API-peer cookies may reject a second socket. Borrow the monitor only for
+    // the SAME route and credentials, never silently test old settings from an edited draft.
+    if (saved?.effectiveEnabled == true && (profile.kind != ServerKind.OPENCODE || profile.remoteHostId != null || profile.sshHostId != null)) {
+      check(ConnectionRouteAdmission.sameLeafRoute(saved, profile) && store.credentials(profile.id) == credentials) {
+        "连接信息已修改，请先保存后再测试；不会另建连接或用旧配置代测"
+      }
+      store.runtimeRoute(saved)
+      val existing = allOverview.client(profile.id)
+      val version = existing.health()
+      existing.projects()
+      return version // borrowed owner: never close or alter presentation/content watching
     }
     if (profile.sshHostId != null) {
       // Saved SSH profiles are tested through testSshHost, which dials the form draft on its own link.
@@ -815,13 +823,16 @@ class LagoonController private constructor(private val appContext: Context) {
   }
   fun notifyOverviewAction(serverId: String) = allOverview.refresh(serverId)
 
-  private fun clientFor(serverId: String): HarnessClient? =
-    if (store.profiles().none { it.id == serverId && it.effectiveEnabled }) null
-    else if (serverId == state.value.serverId) {
-      // A monitor rebuild can close the cached client while this screen still holds it. Resolve the
-      // current lease instead of calling into a closed transport.
-      api?.takeUnless { it.isClosed } ?: runCatching { allOverview.client(serverId) }.getOrNull()?.also { api = it }
-    } else runCatching { allOverview.client(serverId) }.getOrNull()
+  private fun clientFor(serverId: String): HarnessClient? {
+    if (store.profiles().none { it.id == serverId && it.effectiveEnabled }) return null
+    if (serverId == state.value.serverId) {
+      val expected = state.value.server ?: return null
+      if (runCatching { store.runtimeRoute(expected) }.isFailure) return null
+      // Resolve through the owner even for cached clients, so its captured route is re-admitted.
+      return runCatching { allOverview.client(serverId) }.getOrNull()?.also { api = it }
+    }
+    return runCatching { allOverview.client(serverId) }.getOrNull()
+  }
 
   internal suspend fun pluginBundles(serverId: String): List<RemotePluginBundle> =
     clientFor(serverId)?.pluginBundles().orEmpty()
@@ -1473,22 +1484,22 @@ class LagoonController private constructor(private val appContext: Context) {
    * - OpenCode 使用 8 秒超时的独立 REST 客户端并在完成后关闭。
    */
   internal fun notificationClient(profile: ServerProfile, credentials: ServerCredentials): NotificationClientLease {
-    check(store.profiles().any { it.id == profile.id && it.effectiveEnabled }) { "连接或其所属接入源/主机已停用" }
+    val route = store.runtimeRoute(profile)
     if (profile.kind == ServerKind.DSH || profile.kind == ServerKind.DSH_REMOTE || profile.sshHostId != null || profile.remoteHostId != null) {
       val live = clientFor(profile.id)?.takeUnless { it.isClosed }
       if (live != null) return NotificationClientLease(live, owned = false)
-      if (profile.sshHostId != null) return NotificationClientLease(sshHostManager.client(profile), owned = true)
-      val remoteBackend = if (profile.kind == ServerKind.DSH_REMOTE || profile.remoteHostId != null) remoteBackendFactory.create(profile, credentials) else null
-      return NotificationClientLease(
-        createHarnessClient(profile, credentials, callTimeoutSeconds = 8, remoteBackend = remoteBackend),
-        owned = true
-      )
+      return NotificationClientLease(createRoutedHarnessClient(route, profile, credentials, callTimeoutSeconds = 8,
+        remoteFactory = remoteBackendFactory::create,
+        sshFactory = { p, _ -> sshHostManager.client(p) }), owned = true)
     }
-    return NotificationClientLease(createHarnessClient(profile, credentials, callTimeoutSeconds = 8), owned = true)
+    return NotificationClientLease(createRoutedHarnessClient(route, profile, credentials, callTimeoutSeconds = 8), owned = true)
   }
 
   /** A bounded client for notification actions; SSH may need to reconnect first. */
-  internal fun sshClientForNotification(profile: ServerProfile): HarnessClient = sshHostManager.client(profile)
+  internal fun sshClientForNotification(profile: ServerProfile): HarnessClient {
+    val admitted = store.runtimeRoute(profile).executionProfile(profile)
+    return sshHostManager.client(admitted)
+  }
 
   fun sshLinkStatus(hostId: String) = sshHostManager.status(hostId)
 
@@ -3798,6 +3809,7 @@ class LagoonController private constructor(private val appContext: Context) {
   /** Resolve [directory] on the server and register the canonical project on this device. */
   fun addProject(directory: String): Job = act("project-add", directory) { op ->
     val project = op.client.projectAt(directory) ?: error("服务器没有解析出这个目录对应的项目")
+    if (!op.isCurrent(this)) return@act
     val existing = state.value.projects.firstOrNull { normalizedDirectory(it.directory) == normalizedDirectory(project.directory) }
     val resolved = (existing ?: project).copy(sandboxes = project.sandboxes.ifEmpty { existing?.sandboxes.orEmpty() }, serverId = op.serverId)
     val projects = store.addLocalProject(op.serverId, resolved)
@@ -4161,17 +4173,24 @@ class LagoonController private constructor(private val appContext: Context) {
    * switched server/project cannot write its result into the new context (A02).
    */
   private data class OperationContext(val token: Int, val serverId: String, val client: HarnessClient,
-    val revision: Long, val snapshot: LagoonState) {
-    fun connectionCurrent(c: LagoonController) = token == c.generation && c.state.value.serverId == serverId && c.api === client
+    val revision: Long, val snapshot: LagoonState, val route: ConnectionRouteSnapshot? = null) {
+    fun connectionCurrent(c: LagoonController) = token == c.generation && c.state.value.serverId == serverId && c.api === client && !client.isClosed &&
+      (route == null || runCatching {
+        val current = c.store.profiles().firstOrNull { it.id == serverId } ?: return@runCatching false
+        c.store.runtimeRoute(current) == route
+      }.getOrDefault(false))
     fun isCurrent(c: LagoonController) = connectionCurrent(c) && revision == c.selectionRevision &&
       c.state.value.projectId == snapshot.projectId && c.state.value.sessionId == snapshot.sessionId && c.state.value.executionDirectory == snapshot.executionDirectory
   }
   private fun beginOperation(targetDirectory: String? = null): OperationContext {
     val current = state.value
     check(current.connected && current.server?.effectiveEnabled != false) { "数据尚未同步或连接已停用，请重新连接后操作" }
-    check(store.profiles().any { it.id == current.serverId && it.effectiveEnabled }) { "连接或其所属接入源/主机已停用" }
+    val saved = store.profiles().firstOrNull { it.id == current.serverId } ?: error("连接资料已移除")
+    val route = store.runtimeRoute(current.server ?: saved)
+    val client = requireNotNull(api) { "请先连接服务器" }
+    check(!client.isClosed) { "连接路由已更新，请重新连接后操作" }
     return OperationContext(generation, current.serverId ?: error("请先连接服务器"),
-      requireNotNull(api) { "请先连接服务器" }, selectionRevision, current)
+      client, selectionRevision, current, route)
   }
   private fun OperationContext.commit(update: (LagoonState) -> LagoonState) {
     if (isCurrent(this@LagoonController)) updateState(update)
@@ -4395,6 +4414,7 @@ class LagoonController private constructor(private val appContext: Context) {
 
   fun deleteSession(target: String? = null, onDeleted: (() -> Unit)? = null) = withSession("delete", target) { op, client, session ->
     client.deleteSession(session)
+    if (!op.connectionCurrent(this)) return@withSession
     cache.deleteMessages(op.serverId, session.id)
     transcriptMemory.forget(op.serverId, session.id)
     sessionViews.forget(op.serverId, session.id)
@@ -4452,14 +4472,18 @@ class LagoonController private constructor(private val appContext: Context) {
   fun replyQuestion(request: QuestionRequest, answers: List<List<String>>) = act("question:${request.id}", request.directory) { op ->
     check(op.snapshot.questions.any { it.id == request.id && it.sessionId == request.sessionId && it.questions == request.questions }) { "问题已变化，请刷新" }
     op.client.replyQuestion(request, answers)
-    if (op.connectionCurrent(this)) questionResolved(request.sessionId, request.id)
-    cancelAttention(request.sessionId)
+    if (op.connectionCurrent(this)) {
+      questionResolved(request.sessionId, request.id)
+      cancelAttention(request.sessionId)
+    }
   }
   fun rejectQuestion(request: QuestionRequest) = act("question:${request.id}", request.directory) { op ->
     check(op.snapshot.questions.any { it.id == request.id && it.sessionId == request.sessionId && it.questions == request.questions }) { "问题已变化，请刷新" }
     op.client.rejectQuestion(request)
-    if (op.connectionCurrent(this)) questionResolved(request.sessionId, request.id)
-    cancelAttention(request.sessionId)
+    if (op.connectionCurrent(this)) {
+      questionResolved(request.sessionId, request.id)
+      cancelAttention(request.sessionId)
+    }
   }
   fun listFiles(path: String = "."): Job {
     val request = ++fileSequence

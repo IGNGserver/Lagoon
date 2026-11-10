@@ -1418,6 +1418,76 @@ class ControllerRegressionTest {
     } finally { operationScope.cancel() }
   }
 
+  @Test fun delayedProjectLookupCannotPersistIntoAReplacementRouteOrChangeItsLocation() = runBlocking {
+    val entered = CompletableDeferred<Unit>()
+    val release = CompletableDeferred<Unit>()
+    val client = Proxy.newProxyInstance(javaClass.classLoader, arrayOf(HarnessClient::class.java)) { _, method, args ->
+      when (method.name) {
+        "isClosed" -> false
+        "projectAt" -> {
+          @Suppress("UNCHECKED_CAST") val continuation = args!!.last() as Continuation<Project?>
+          entered.complete(Unit)
+          launch { release.await(); continuation.resume(Project("old-result", "/old", "Old route")) }
+          COROUTINE_SUSPENDED
+        }
+        else -> error("unexpected ${method.name}")
+      }
+    } as HarnessClient
+    val profile = ServerProfile("server", "Server", "https://old.example")
+    val (controller, state) = controller(client, LagoonState(profiles = listOf(profile), serverId = profile.id,
+      connected = true, projectId = "new-project"))
+    val store = LagoonController::class.java.getDeclaredField("store").apply { isAccessible = true }.get(controller) as ServerStore
+    store.select(profile.id, "new-project", "new-session")
+    val job = controller.addProject("/old")
+    entered.await()
+    val replacement = profile.copy(url = "https://replacement.example")
+    store.save(replacement, null)
+    state.value = state.value.copy(profiles = listOf(replacement)) // same ID and controller generation
+    release.complete(Unit)
+    job.join()
+    assertTrue(store.localProjects(profile.id).isEmpty())
+    assertEquals("new-project", store.selectedProject(profile.id))
+    assertEquals("new-session", store.selectedSession(profile.id))
+    assertEquals("new-project", state.value.projectId)
+    assertNull(state.value.error)
+  }
+
+  @Test fun delayedSessionDeleteCannotEraseReplacementRoutesDraftAndCaches() = runBlocking {
+    val entered = CompletableDeferred<Unit>()
+    val release = CompletableDeferred<Unit>()
+    val client = Proxy.newProxyInstance(javaClass.classLoader, arrayOf(HarnessClient::class.java)) { _, method, args ->
+      when (method.name) {
+        "isClosed" -> false
+        "deleteSession" -> {
+          @Suppress("UNCHECKED_CAST") val continuation = args!!.last() as Continuation<Unit>
+          entered.complete(Unit)
+          launch { release.await(); continuation.resume(Unit) }
+          COROUTINE_SUSPENDED
+        }
+        else -> error("unexpected ${method.name}")
+      }
+    } as HarnessClient
+    val profile = ServerProfile("server", "Server", "https://old.example")
+    val session = Session("same-session", "/new", "Replacement data", 1)
+    val (controller, state) = controller(client, LagoonState(profiles = listOf(profile), serverId = profile.id,
+      connected = true, sessions = listOf(session), sessionId = session.id, pinned = setOf(session.id)))
+    val store = LagoonController::class.java.getDeclaredField("store").apply { isAccessible = true }.get(controller) as ServerStore
+    store.rememberDraft(profile.id, session.id, "unsent replacement draft")
+    store.rememberPinnedSessions(profile.id, setOf(session.id))
+    val job = controller.deleteSession()
+    entered.await()
+    val replacement = profile.copy(url = "https://replacement.example")
+    store.save(replacement, null)
+    state.value = state.value.copy(profiles = listOf(replacement))
+    release.complete(Unit)
+    job.join()
+    assertEquals("unsent replacement draft", store.draft(profile.id, session.id))
+    assertEquals(setOf(session.id), store.pinnedSessions(profile.id))
+    assertEquals(session.id, state.value.sessionId)
+    assertEquals(listOf(session), state.value.sessions)
+    assertNull(state.value.error)
+  }
+
   @Test fun jobOutputCapabilityWorksForDirectRemoteAndSshProfiles() {
     for ((kind, ssh) in listOf(ServerKind.DSH to null, ServerKind.DSH_REMOTE to null, ServerKind.DSH to "ssh-host")) {
       var called = false

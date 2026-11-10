@@ -10,7 +10,7 @@ import java.util.concurrent.ConcurrentHashMap
 class ServerStore internal constructor(private val preferences: SharedPreferences, private val secrets: SharedPreferences,
   private val encryptValue: (String) -> String, private val decryptValue: (String) -> String,
   private val appContext: Context? = null,
-  private val readConnectionGraph: (() -> ConnectionGraph?)? = null) : OverviewStore {
+  private val readConnectionGraph: (() -> ConnectionGraph?)? = null) : OverviewStore, ConnectionRouteStore {
   init {
     if (preferences.getInt(PREVIEW_FORMAT_VERSION_KEY, 0) != PREVIEW_FORMAT_VERSION) {
       val plain = preferences.edit()
@@ -61,6 +61,24 @@ class ServerStore internal constructor(private val preferences: SharedPreference
       return ConnectionRuntimeProjection.apply(raw, graph = null, unavailable = true)
     }
     return ConnectionRuntimeProjection.apply(raw, graph)
+  }
+
+  /** Execution admission is stricter than the display overlay; it never migrates or writes. */
+  override fun runtimeProfile(expected: ServerProfile): ServerProfile {
+    val (current, route) = admitExpectedRoute(expected)
+    return route.executionProfile(current).copy(parentEnabled = true)
+  }
+
+  override fun runtimeRoute(expected: ServerProfile): ConnectionRouteSnapshot = admitExpectedRoute(expected).second
+
+  private fun admitExpectedRoute(expected: ServerProfile): Pair<ServerProfile, ConnectionRouteSnapshot> {
+    check(expected.effectiveEnabled) { "连接或其所属接入源/主机已停用" }
+    val current = readProfiles().singleOrNull { it.id == expected.id } ?: error("连接资料已移除")
+    if (!ConnectionRouteAdmission.sameLeafRoute(current, expected)) {
+      throw StaleConnectionRouteException("连接路由已变化，旧页面或客户端不能继续操作，请重新连接")
+    }
+    val graph = if (readConnectionGraph != null) readConnectionGraph.invoke() else readStoredConnectionGraph()
+    return current to ConnectionRouteAdmission.requireCurrent(current, graph)
   }
 
   private fun readStoredConnectionGraph(): ConnectionGraph? {
@@ -400,6 +418,13 @@ class ServerStore internal constructor(private val preferences: SharedPreference
   }
 
   fun deviceId(): String = preferences.getString("deviceId", null) ?: UUID.randomUUID().toString().also { preferences.edit().putString("deviceId", it).apply() }
+
+  override fun requireCurrentAuthentication(id: String, captured: ServerCredentials) {
+    val current = credentials(id)
+    check(current.username == captured.username && current.password == captured.password) {
+      "连接认证已变化，请重新连接后操作"
+    }
+  }
 
   override fun credentials(id: String): ServerCredentials {
     val profile = profiles().firstOrNull { it.id == id }

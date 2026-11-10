@@ -38,6 +38,7 @@ internal class SshHostManager(
     val hostId = profile.sshHostId ?: throw SshFailure(SshFailureKind.OTHER, "不是 SSH 主机资料", retryable = false)
     val config = store.load().firstOrNull { it.id == hostId }
       ?: throw SshFailure(SshFailureKind.OTHER, "SSH 主机配置已删除", retryable = false)
+    require(profile.url == config.profileUrl() && profile.username == config.user) { "SSH 保存配置已变化，请重新保存绑定路由" }
     val entry = synchronized(lock) {
       val current = links[profile.id]?.takeUnless { it.link.isClosed }
       val active = current ?: SharedLink(hostId,

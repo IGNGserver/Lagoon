@@ -35,11 +35,11 @@
 - 补官方契约 fixture 与针对性回归。物理 mux 所有权由第 3 阶段重构。
 - 验收：针对性单测真实通过；明确已支持版本和未跑真机边界。
 
-### 2. 新连接域与迁移（模型/存储已落地，统一路由未完成）
+### 2. 新连接域与迁移（持久化/父级许可/执行路由已接入，真实环境验收未完）
 
 - ConnectionSource → HostBinding → HarnessBinding、观测目录与本机选择分离。
 - 幂等/中断可恢复/版本化迁移与确切 credential slot refs；保留 ID、disabled、分组/草稿等。
-- 原有资料通过兼容投影运行，unknown 协议不默认为 OpenCode。
+- 原有资料通过兼容投影保留；实际执行按 exact 图链准入快照分派 carrier/native 协议。raw/图不一致时拒绝执行，不自动改路，unknown 协议不默认为 OpenCode。
 
 ### 3. 传输和生命周期（HTTP/SSE/WS 和实例级 mux 已落地，跨实例验收未完成）
 
@@ -83,7 +83,8 @@
 - 独立审查修复 SSE EOF 重订阅、新代次等待递归、半开 SSH entry 淘汰、编辑服务路径回退、无 Harness 测试误启动 DSH。
 - PTC/Question 已接入运行时和真实 adapter 测试；仍需复核该阶段提交的 teardown/dirty refresh 最后补丁及完整最终日志。
 - Remote native connector 与固定上游完整插件构建、Android 原生 carrier、Host 服务选择和实际 Noise fixture 已接入；管理入口改为源优先并支持重叠组合，最终验证见进度记录。
-- 尚未完成：图成为所有运行场景的唯一真源、真实桌面 DSH profile 附着、完整原生能力真环境矩阵、真实设备交互验收和最终 PR。
+- r7 exact 图路由快照已接入 Overview/缓存复用/通知/操作与异步提交，carrier-first factory 不再按 raw 字段直接分派；raw/图不一致时拒绝执行。saved direct DSH 诊断借用 owner，Cookie 迟到回调隔离。
+- 尚未完成：空 source/Host catalog 生命周期、真实桌面 DSH profile 附着、公共库跨实例 events owner 复用、完整原生能力真环境矩阵、真实设备交互验收和最终 PR。
 
 - 工作区已创建且 HEAD 与 origin/main 基线相同。
 - 本机盘可用约 96 GiB（2026-11-09）；构建区 `~/.build`。

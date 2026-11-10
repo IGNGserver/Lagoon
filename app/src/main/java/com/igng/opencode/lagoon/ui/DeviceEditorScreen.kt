@@ -24,6 +24,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.unit.dp
+import com.igng.opencode.lagoon.core.ConnectionRouteAdmission
 import com.igng.opencode.lagoon.core.LagoonController
 import com.igng.opencode.lagoon.core.LagoonState
 import com.igng.opencode.lagoon.core.PairLinkResolver
@@ -310,6 +311,16 @@ private fun ProfileEditorPage(
                 // new settings without testing; enabling it later performs the first connection.
                 controller.saveServer(actualProfile, credentials.password, null, credentials.username, connect = false)
                 done("已保存 $label（连接已禁用，未连接）")
+                onBack()
+                return@launch
+              }
+              if (previous != null && actualProfile.kind == ServerKind.DSH && actualProfile.sshHostId == null &&
+                (!ConnectionRouteAdmission.sameLeafRoute(previous, actualProfile) || controller.credentials(profile.id) != credentials)) {
+                // This action is explicitly Save. Commit the changed route first so the owner can
+                // retire its old mux before constructing a replacement; a diagnostic alone cannot
+                // safely probe a competing API-peer cookie beside the live monitor.
+                controller.saveServer(actualProfile, credentials.password, credentials.cookie, credentials.username, connect = true)
+                done("已保存 $label，正在使用新配置重新连接；原连接不会被并行测试")
                 onBack()
                 return@launch
               }
