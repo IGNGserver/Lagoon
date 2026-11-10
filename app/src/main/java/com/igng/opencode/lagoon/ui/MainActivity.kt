@@ -474,7 +474,10 @@ class MainActivity : ComponentActivity() {
             })
             if (showingRemoteEnroll) RemoteEnrollSheet(controller, onDismiss = { showingRemoteEnroll = false }, onDone = { added ->
               showingRemoteEnroll = false
-              if (added > 0) { globalMessage = "已接入 $added 台远程主机"; globalMessageType = MiuixToastType.SUCCESS }
+              if (added > 0) {
+                 globalMessage = "已保存 $added 台远程主机，请逐个选择 Harness"; globalMessageType = MiuixToastType.SUCCESS
+                 showingRemoteHosts = true
+               }
             })
           }
         }

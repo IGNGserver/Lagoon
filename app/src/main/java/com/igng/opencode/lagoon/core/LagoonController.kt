@@ -258,14 +258,11 @@ class LagoonController private constructor(private val appContext: Context) {
           ?.let { profile.id to it }
       }.toMap(),
       compositions = compositions)
-    if (existing == null) return projected
-    val oldSources = existing.sources.associateBy { it.id }
-    val oldHosts = existing.hosts.associateBy { it.id }
+    val catalogued = ConnectionCatalogProjection.merge(projected, existing, sshHostStore.load(), store.remoteCatalogs())
+    if (existing == null) return catalogued
     val oldBindings = existing.bindings.associateBy { it.id }
-    return projected.copy(
-      sources = projected.sources.map { source -> oldSources[source.id]?.let { source.copy(enabled = it.enabled) } ?: source },
-      hosts = projected.hosts.map { host -> oldHosts[host.id]?.let { host.copy(enabled = it.enabled) } ?: host },
-      bindings = projected.bindings.map { binding ->
+    return catalogued.copy(
+      bindings = catalogued.bindings.map { binding ->
         val old = oldBindings[binding.id]
         binding.copy(
           enabled = binding.legacyProfile?.enabled ?: binding.enabled,
@@ -293,8 +290,23 @@ class LagoonController private constructor(private val appContext: Context) {
   }
 
   private val remoteBackendFactory = object : RemoteBackendFactory {
-    override fun create(profile: ServerProfile, credentials: ServerCredentials): RemoteBackend {
-      store.runtimeProfile(profile)
+    override fun create(profile: ServerProfile, credentials: ServerCredentials): RemoteBackend = acquireRemoteBackend(profile, requireLeaf = true)
+  }
+
+  private fun acquireRemoteBackend(profile: ServerProfile, requireLeaf: Boolean): RemoteBackend {
+      check(remoteCatalog(profile.url, profile.username)?.signedOut != true) { "中枢账号已退出登录，请重新登录" }
+      if (requireLeaf) store.runtimeProfile(profile) else {
+        val host = requireNotNull(profile.remoteHostId) { "尚未选择主机" }
+        val source = MigrationProjection.hubSourceId(profile.url, profile.username)
+        val (savedSource, savedHost) = store.requireParentRoute(source, MigrationProjection.hostId(source, host))
+        check(savedSource.type == ConnectionSourceType.HUB && savedSource.endpoint == canonicalRemoteOrigin(profile.url) &&
+          savedSource.account == profile.username.trim() && savedSource.allowCleartext == profile.allowCleartext &&
+          savedHost.externalHostId == host && savedHost.fingerprint == profile.remoteHostFingerprint) { "Host 路由与连接图不一致，请刷新后重新确认" }
+        val catalog = remoteCatalog(profile.url, profile.username)
+        val saved = store.readProfiles().firstOrNull { it.id == profile.id }
+        check(catalog?.hosts?.any { it.hostId == host && it.fingerprint == profile.remoteHostFingerprint } == true ||
+          saved?.let { ConnectionRouteAdmission.sameLeafRoute(it, profile) } == true) { "主机目录已变化或账号已移除，请刷新并重新登录" }
+      }
       val hostId = profile.remoteHostId ?: throw IllegalStateException("请先选择并验证 DSH Host")
       val origin = canonicalRemoteOrigin(profile.url)
       val account = profile.username.trim()
@@ -309,7 +321,6 @@ class LagoonController private constructor(private val appContext: Context) {
           RemotePeerTrust(store.remotePins), account, appVersion())
       }
       return RemoteBackend(session, profile.takeIf { it.kind == ServerKind.OPENCODE }) { RemoteConnectionRegistry.release(key) }
-    }
   }
 
   private fun remoteSlot(profileId: String) = "profile-${profileId.replace(Regex("[^A-Za-z0-9_-]"), "_")}"
@@ -345,6 +356,16 @@ class LagoonController private constructor(private val appContext: Context) {
     RemoteAccountManager(address, allowCleartext, "Lagoon · ${android.os.Build.MODEL.ifBlank { "Android" }}",
       "android", appVersion(), store.remoteDevices, store.remotePins, store.remoteCatalogStore)
 
+  internal fun explicitlyRemoveRemoteSource(origin: String, account: String) {
+    val canonical = canonicalRemoteOrigin(origin)
+    require(store.profiles().none { it.remoteHostId != null && it.username == account && canonicalRemoteOrigin(it.url) == canonical }) {
+      "请先单独移除该来源下的 Harness"
+    }
+    store.clearRemoteCatalog(canonical, account)
+    persistConnectionGraph()
+    updateState { it.copy(profiles = store.profiles()) }
+  }
+
   internal fun remoteCatalogs(): List<RemoteCatalog> = store.remoteCatalogs()
 
   /** One active Hub account: the most recently saved catalog. Older catalogs stay for cleanup. */
@@ -353,53 +374,55 @@ class LagoonController private constructor(private val appContext: Context) {
   internal fun remoteCatalog(origin: String, account: String): RemoteCatalog? =
     store.remoteCatalogs().firstOrNull { it.origin == canonicalRemoteOrigin(origin) && it.account == account }
 
-  /**
-   * Creates one ServerProfile per selected Host. Existing profiles for the same origin/host are
-   * reused, so adding a Host twice does not duplicate it in the home chips.
-   */
-  internal fun addRemoteProfiles(catalog: RemoteCatalog, selected: List<RemoteHostMeta>): List<ServerProfile> {
-    require(!catalog.requiresCleartextConsent) {
-      "HTTP 明文连接未获授权，请重新登录并明确允许"
-    }
-    if (catalog.hosts.isEmpty()) return emptyList()
-    val origin = catalog.origin.trimEnd('/')
-    val existing = store.profiles()
-    val created = mutableListOf<ServerProfile>()
-    for (host in selected) {
-      val current = existing.firstOrNull { it.matchesRemoteHost(catalog.origin, catalog.account, host.hostId) }
-      if (current != null) {
-        // Reuse the saved profile; only an auto-generated " (N)" suffix may be dropped.
-        val repaired = ProfileNames.adoptHostName(current, host.name, store.profiles())
-        if (repaired != null) {
-          runCatching { store.rename(repaired.id, repaired.name) }
-            .onFailure { Diagnostics.warn("ServerStore", "无法修复设备名称 ${repaired.id}", it) }
-        }
-        continue
-      }
-      val name = ProfileNames.uniqueDeviceName(host.name, store.profiles())
-      val profile = ServerProfile(
-        id = java.util.UUID.randomUUID().toString(),
-        name = name,
-        url = origin,
-        username = catalog.account,
-        autoConnect = true,
-        notifications = true,
-        allowCleartext = catalog.allowCleartext,
-        kind = ServerKind.DSH_REMOTE,
-        remoteHostId = host.hostId,
-        remoteHostFingerprint = host.fingerprint
-      )
-      saveServer(profile, password = null, cookie = null, credentialUsername = catalog.account, connect = false)
-      created += profile
-    }
+  internal fun saveRemoteCatalog(catalog: RemoteCatalog) {
     store.saveRemoteCatalog(catalog)
-    val firstOnline = created.firstOrNull { host -> catalog.hosts.firstOrNull { it.hostId == host.remoteHostId }?.online == true }
-      ?: created.firstOrNull()
-    if (firstOnline != null) connect(firstOnline.id, preserveHome = state.value.allServers)
-    return created
+    persistConnectionGraph()
   }
 
-  internal fun saveRemoteCatalog(catalog: RemoteCatalog) = store.saveRemoteCatalog(catalog)
+  /** Enrollment saves authenticated source/Host metadata only, without creating/dialing a Harness. */
+  internal fun saveRemoteHosts(catalog: RemoteCatalog) = saveRemoteCatalog(catalog)
+
+  internal fun remoteCatalogProfile(catalog: RemoteCatalog, host: RemoteHostMeta): ServerProfile {
+    val current = remoteCatalog(catalog.origin, catalog.account)?.takeUnless { it.signedOut } ?: error("中枢账号已退出登录，请重新登录")
+    val observed = current.hosts.singleOrNull { it.hostId == host.hostId && it.fingerprint == host.fingerprint }
+      ?: error("主机目录已变化，请刷新")
+    val origin = canonicalRemoteOrigin(current.origin)
+    val id = java.util.UUID.nameUUIDFromBytes(org.json.JSONArray(listOf(origin, current.account, observed.hostId)).toString().toByteArray()).toString()
+    return ServerProfile(id, observed.name, origin, current.account, allowCleartext = current.allowCleartext,
+      kind = ServerKind.DSH_REMOTE, remoteHostId = observed.hostId, remoteHostFingerprint = observed.fingerprint)
+  }
+
+  internal suspend fun remoteNativeServices(catalog: RemoteCatalog, host: RemoteHostMeta): NativeServiceCatalog? {
+    val parent = remoteCatalogProfile(catalog, host)
+    val backend = acquireRemoteBackend(parent, requireLeaf = false)
+    return try { backend.nativeServiceCatalog() } finally { backend.close() }
+  }
+
+  internal fun addRemoteNativeService(catalog: RemoteCatalog, host: RemoteHostMeta, service: NativeServiceDescriptor, enabled: Boolean): ServerProfile =
+    saveRemoteNativeService(remoteCatalogProfile(catalog, host), service, enabled)
+
+  internal suspend fun remoteHostServices(catalog: RemoteCatalog, host: RemoteHostMeta): RemoteHostServices {
+    val backend = acquireRemoteBackend(remoteCatalogProfile(catalog, host), requireLeaf = false)
+    return try { backend.hostServices() } finally { backend.close() }
+  }
+
+  internal suspend fun remoteHostServices(profileId: String): RemoteHostServices {
+    val profile = store.profiles().firstOrNull { it.id == profileId } ?: error("连接已移除")
+    val backend = acquireRemoteBackend(profile, requireLeaf = false)
+    return try { backend.hostServices() } finally { backend.close() }
+  }
+
+  internal fun addRemoteDshService(parent: ServerProfile, enabled: Boolean): ServerProfile {
+    val host = requireNotNull(parent.remoteHostId) { "尚未选择 Host" }
+    val origin = canonicalRemoteOrigin(parent.url)
+    store.profiles().firstOrNull { it.remoteServiceId == null && it.kind in setOf(ServerKind.DSH, ServerKind.DSH_REMOTE) &&
+      it.remoteHostId == host && it.username.trim() == parent.username.trim() && canonicalRemoteOrigin(it.url) == origin }?.let { return it }
+    val catalog = remoteCatalog(origin, parent.username)?.takeUnless { it.signedOut } ?: error("中枢账号已退出登录")
+    val observed = catalog.hosts.singleOrNull { it.hostId == host && it.fingerprint == parent.remoteHostFingerprint } ?: error("Host 目录已变化")
+    val profile = remoteCatalogProfile(catalog, observed).copy(enabled = enabled)
+    saveServer(profile, null, credentialUsername = profile.username, connect = false)
+    return store.profiles().first { it.id == profile.id }
+  }
 
   /** Read-only discovery on the shared Host connection; never starts a native service or an ACP fallback. */
   internal suspend fun remoteNativeServices(profileId: String): NativeServiceCatalog? {
@@ -416,6 +439,13 @@ class LagoonController private constructor(private val appContext: Context) {
     require(service.id.matches(Regex("[A-Za-z0-9][A-Za-z0-9._:-]{0,255}"))) { "原生服务标识无效" }
     val profiles = store.profiles()
     val parent = profiles.firstOrNull { it.id == profileId && it.remoteHostId != null } ?: error("Remote Host 已移除")
+    return saveRemoteNativeService(parent, service, enabled)
+  }
+
+  private fun saveRemoteNativeService(parent: ServerProfile, service: NativeServiceDescriptor, enabled: Boolean): ServerProfile {
+    require(service.supported && service.available && "http" in service.capabilities) { "此原生服务当前不可用" }
+    require(service.id.matches(Regex("[A-Za-z0-9][A-Za-z0-9._:-]{0,255}"))) { "原生服务标识无效" }
+    val profiles = store.profiles()
     val origin = canonicalRemoteOrigin(parent.url)
     profiles.firstOrNull { it.kind == ServerKind.OPENCODE && it.remoteServiceId == service.id &&
       it.remoteHostId == parent.remoteHostId && it.username.trim() == parent.username.trim() &&
@@ -431,11 +461,14 @@ class LagoonController private constructor(private val appContext: Context) {
 
   /** Stop background retries after a sign-out; profiles and cached conversations stay local. */
   internal fun markRemoteSignedOut(origin: String, account: String) {
-    store.profiles().filter {
-      it.remoteHostId != null && canonicalRemoteOrigin(it.url) == canonicalRemoteOrigin(origin) && it.username == account && it.enabled
-    }.forEach { profile ->
-      setProfileEnabled(profile.id, false)
+    val normalizedOrigin = canonicalRemoteOrigin(origin)
+    store.remoteCatalogs().firstOrNull { it.origin == normalizedOrigin && it.account == account }?.let { saved ->
+      // Source sign-out never rewrites child choices. Retain metadata even with zero leaves.
+      store.saveRemoteCatalog(saved.copy(signedOut = true, hosts = saved.hosts.map { it.copy(online = false) },
+        updatedAt = System.currentTimeMillis()))
     }
+    persistConnectionGraph() // signed-out catalog projects a denied source before credential revocation
+    applyCurrentGraphRuntimeGates()
   }
   private fun appVersion(): String = runCatching {
     appContext.packageManager.getPackageInfo(appContext.packageName, 0).versionName
@@ -1519,6 +1552,10 @@ class LagoonController private constructor(private val appContext: Context) {
   suspend fun discoverSshHarnesses(config: SshHostConfig, secrets: SshSecrets, path: String? = null): SshHarnessDiscoveryResult {
     val clean = cleanSshConfig(config)
     validateSshSecrets(clean, secrets)
+    if (sshHostStore.load().any { it.id == clean.id }) {
+      val source = MigrationProjection.sshSourceId(clean.id)
+      store.requireParentRoute(source, MigrationProjection.hostId(source, clean.id))
+    }
     return sshHostManager.discover(clean, secrets, path)
   }
 
@@ -1532,8 +1569,10 @@ class LagoonController private constructor(private val appContext: Context) {
   ): String {
     val clean = cleanSshConfig(config)
     validateSshSecrets(clean, secrets)
-    val parent = store.profiles().firstOrNull { it.sshHostId == clean.id }
-    check(parent?.parentEnabled != false) { "所属接入源或主机已停用，不能测试 Harness" }
+    if (sshHostStore.load().any { it.id == clean.id }) {
+      val source = MigrationProjection.sshSourceId(clean.id)
+      store.requireParentRoute(source, MigrationProjection.hostId(source, clean.id))
+    }
     val link = sshHostManager.testLink(clean, secrets, onStatus, harnessKind, registrationPath)
     return try {
       val client = link.awaitHarness()
@@ -1649,12 +1688,11 @@ class LagoonController private constructor(private val appContext: Context) {
 
   fun deleteSshHost(hostId: String) {
     val profiles = store.profiles().filter { it.sshHostId == hostId }
-    if (profiles.isNotEmpty()) {
-      profiles.forEach { deleteServer(it.id) }
-      return
-    }
+    profiles.forEach { deleteServer(it.id) }
     sshHostManager.close(hostId)
     runCatching { sshHostStore.delete(hostId) }
+      .onFailure { showNotice(userFacingError(it, "删除 SSH 接入源失败"), FeedbackTone.WARNING); return }
+    persistConnectionGraph()
     updateState { it.copy(sshHosts = sshHostStore.load()) }
   }
 
@@ -1700,14 +1738,10 @@ class LagoonController private constructor(private val appContext: Context) {
     conversationPool.forgetServer(id)
     choicesCache.invalidateServer(id)
     store.delete(id)
-    removed?.sshHostId?.let { hostId ->
+    removed?.sshHostId?.let {
+      // Removing even the last Harness is NOT removing its source. Only explicit deleteSshHost
+      // may remove shared host configuration/credentials; the empty source remains manageable.
       sshHostManager.closeBinding(id)
-      // A Harness leaf is not the SSH source. Its siblings retain configuration and transport.
-      if (store.profiles().none { it.sshHostId == hostId }) {
-        sshHostManager.close(hostId)
-        runCatching { sshHostStore.delete(hostId) }
-          .onFailure { Diagnostics.warn("LagoonController", "SSH 主机删除失败", it) }
-      }
     }
     cache.delete(id)
     if (transcripts != null) scope.launch(storeDispatcher) { attempt { transcripts.deleteServer(id) } }

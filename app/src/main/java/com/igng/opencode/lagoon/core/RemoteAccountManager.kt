@@ -52,6 +52,7 @@ internal class RemoteAccountManager(
   /** Restores account metadata only; refresh still requires the saved per-device credential. */
   fun resume(catalog: RemoteCatalog) {
     require(canonicalRemoteOrigin(catalog.origin) == origin) { "中枢地址不匹配" }
+    require(!catalog.signedOut) { "中枢账号已退出登录" }
     account = catalog.account
     provider = catalog.provider
   }
@@ -74,6 +75,7 @@ internal class RemoteAccountManager(
   suspend fun refresh(): RemoteCatalog {
     val current = catalogs.load().firstOrNull { it.origin == origin && it.account == account }
       ?: throw IOException("请先登录 DSH Remote")
+    check(!current.signedOut) { "中枢账号已退出登录，请重新登录" }
     val token = deviceToken(current) ?: throw IOException("DSH Remote 登录已失效，请重新登录")
     val hosts = loadHosts(token, current.account)
     val updated = current.copy(hosts = hosts, updatedAt = System.currentTimeMillis())
@@ -123,7 +125,12 @@ internal class RemoteAccountManager(
   }
 
   suspend fun signOut(catalog: RemoteCatalog) {
+    require(canonicalRemoteOrigin(catalog.origin) == origin) { "中枢地址不匹配" }
     val name = catalog.account
+    // Commit local sign-out before any network work. Cancellation/unknown revoke delivery must not
+    // drop metadata or permit a new discovery using a half-signed-out source after process restart.
+    catalogs.save(catalog.copy(signedOut = true, hosts = catalog.hosts.map { it.copy(online = false) },
+      updatedAt = System.currentTimeMillis()))
     for (host in catalog.hosts) {
       val slot = deviceSlot(host.hostId, catalog.account)
       val record = runCatching { devices.load(slot) }.getOrNull() ?: continue
@@ -136,7 +143,6 @@ internal class RemoteAccountManager(
       if (token != null) try { api.revokeSelf(token) } catch (cancel: kotlinx.coroutines.CancellationException) { throw cancel } catch (_: Exception) { }
       runCatching { devices.delete(slot) }
     }
-    catalogs.clear(origin, name)
     accountToken = null
     account = null
     candidates = emptyList()

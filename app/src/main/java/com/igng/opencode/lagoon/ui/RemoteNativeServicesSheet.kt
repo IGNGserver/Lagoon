@@ -18,25 +18,36 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
 internal fun RemoteNativeServicesSheet(
   controller: LagoonController,
   profile: ServerProfile,
+  sourceCatalog: RemoteCatalog? = null,
+  sourceHost: RemoteHostMeta? = null,
   onDismiss: () -> Unit
 ) {
-  key(controller, profile.id, profile.url, profile.username, profile.remoteHostId) {
+  key(controller, profile.id, profile.url, profile.username, profile.remoteHostId, sourceCatalog?.signedOut) {
     val state by controller.state.collectAsState()
     var catalog by remember { mutableStateOf<NativeServiceCatalog?>(null) }
     var busy by remember { mutableStateOf(true) }
     var unsupported by remember { mutableStateOf(false) }
+    var dshAvailable by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     var refresh by remember { mutableIntStateOf(0) }
     val savedProfiles = state.profiles.filter { it.matchesNativeServiceHost(profile) }
+    val savedDsh = state.profiles.firstOrNull { it.remoteServiceId == null && it.kind in setOf(ServerKind.DSH, ServerKind.DSH_REMOTE) &&
+      it.remoteHostId == profile.remoteHostId && it.username.trim() == profile.username.trim() &&
+      runCatching { canonicalRemoteOrigin(it.url) == canonicalRemoteOrigin(profile.url) }.getOrDefault(false) }
 
     LaunchedEffect(refresh) {
       busy = true
       error = null
       unsupported = false
+      dshAvailable = false
       // A failed refresh must not leave an old descriptor selectable.
       catalog = null
       try {
-        catalog = controller.remoteNativeServices(profile.id)
+        check(sourceCatalog?.signedOut != true) { "中枢账号已退出登录，请重新登录后再发现 Harness" }
+        val services = if (sourceCatalog != null && sourceHost != null) controller.remoteHostServices(sourceCatalog, sourceHost)
+          else controller.remoteHostServices(profile.id)
+        catalog = services.native
+        dshAvailable = services.dshAvailable
         unsupported = catalog == null
       } catch (cancel: CancellationException) { throw cancel }
       catch (failure: Exception) { error = userFacingError(failure, "读取 Host 原生服务失败") }
@@ -47,7 +58,8 @@ internal fun RemoteNativeServicesSheet(
       if (busy || !service.supported || !service.available || "http" !in service.capabilities) return
       error = null
       try {
-        val saved = controller.addRemoteNativeService(profile.id, service, enabled = enabled)
+        val saved = if (sourceCatalog != null && sourceHost != null) controller.addRemoteNativeService(sourceCatalog, sourceHost, service, enabled)
+          else controller.addRemoteNativeService(profile.id, service, enabled = enabled)
         // A concurrent save may have reused an existing disabled leaf; enabling is still explicit.
         if (enabled && !saved.enabled) controller.setProfileEnabled(saved.id, true)
       } catch (cancel: CancellationException) { throw cancel }
@@ -89,6 +101,28 @@ internal fun RemoteNativeServicesSheet(
         }
         error?.let { message ->
           item { HyperInlineNotice(message = message, type = MiuixToastType.ERROR) }
+        }
+        item {
+          HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(vertical = 4.dp)) {
+            HyperRow(title = "DeepSeek Harness · 原生 Typert", summary = "与 OpenCode 独立选择；只使用 Host 声明的 DSH 能力",
+              value = if (dshAvailable) "可用" else if (busy) "检测中" else "未声明")
+            val existingDsh = savedDsh
+            if (existingDsh != null) HyperSwitchRow(title = "启用 DSH Harness", checked = existingDsh.enabled,
+              enabled = !busy && (dshAvailable || existingDsh.enabled),
+              summary = "停用只改此 Harness，不会删除主机、其他服务或远端任务",
+              onCheckedChange = { setEnabled(existingDsh, it) })
+            else Row(Modifier.fillMaxWidth().padding(12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+              fun saveDsh(enabled: Boolean) {
+                try { controller.addRemoteDshService(profile, enabled) }
+                catch (cancel: CancellationException) { throw cancel }
+                catch (failure: Exception) { error = userFacingError(failure, "保存 DSH 连接失败") }
+              }
+              HyperButton(text = "加入（停用）", enabled = !busy && dshAvailable, modifier = Modifier.weight(1f),
+                variant = HyperButtonVariant.SECONDARY, onClick = { saveDsh(false) })
+              HyperButton(text = "加入并启用", enabled = !busy && dshAvailable, modifier = Modifier.weight(1f),
+                onClick = { saveDsh(true) })
+            }
+          }
         }
         if (unsupported) item {
           HyperInlineNotice(

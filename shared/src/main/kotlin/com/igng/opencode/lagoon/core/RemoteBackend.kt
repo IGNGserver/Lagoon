@@ -38,6 +38,10 @@ class RemoteBackend internal constructor(
   internal fun streamStats(): RemoteStreamStats? = session.streamStats()
   internal suspend fun supportsWorkspaceUpload(): Boolean = session.capabilities().supportsWorkspaceUpload
   internal suspend fun nativeServiceCatalog(): NativeServiceCatalog? = session.nativeServiceCatalog()
+  internal suspend fun hostServices(): RemoteHostServices = RemoteHostServices(
+    dshAvailable = session.capabilities().sessionFormat != null,
+    native = session.nativeServiceCatalog()
+  )
 
   internal suspend fun probe(): RemoteProbe {
     val started = System.nanoTime()

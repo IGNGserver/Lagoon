@@ -27,12 +27,17 @@ internal data class RemoteCatalog(
   val deviceLabel: String,
   val hosts: List<RemoteHostMeta>,
   val updatedAt: Long,
-  val allowCleartext: Boolean = false
+  val allowCleartext: Boolean = false,
+  /** Source/Host metadata remains available for local hierarchy when account credentials are signed out. */
+  val signedOut: Boolean = false
 ) {
   val key: String get() = "$origin\u0000$account"
   val requiresCleartextConsent: Boolean
     get() = origin.trim().startsWith("http://", ignoreCase = true) && !allowCleartext
 }
+
+/** Authenticated protocol readiness, not guessed from Host name or advertised app version. */
+internal data class RemoteHostServices(val dshAvailable: Boolean, val native: NativeServiceCatalog?)
 
 /** One local record per origin+account. Implementations must replace atomically. */
 internal interface RemoteCatalogStore {
@@ -46,7 +51,7 @@ internal object RemoteCatalogCodec {
     .put("version", 1).put("origin", catalog.origin).put("account", catalog.account)
     .put("provider", catalog.provider ?: JSONObject.NULL).put("deviceLabel", catalog.deviceLabel)
     .put("updatedAt", catalog.updatedAt)
-    .put("allowCleartext", catalog.allowCleartext)
+    .put("allowCleartext", catalog.allowCleartext).put("signedOut", catalog.signedOut)
     .put("hosts", JSONArray().apply {
       catalog.hosts.forEach { host ->
         put(JSONObject().put("hostId", host.hostId).put("name", host.name).put("platform", host.platform)
@@ -89,7 +94,7 @@ internal object RemoteCatalogCodec {
         )
       }
       if (hosts.distinctBy { it.hostId }.size != hosts.size) throw IOException("Remote 主机目录重复")
-      return RemoteCatalog(origin, account, provider, label, hosts, updated, json.optBoolean("allowCleartext", false))
+      return RemoteCatalog(origin, account, provider, label, hosts, updated, json.optBoolean("allowCleartext", false), json.optBoolean("signedOut", false))
     } catch (error: IOException) { throw error }
     catch (error: Exception) { throw IOException("Remote 主机目录损坏", error) }
   }

@@ -47,7 +47,8 @@ private fun openLoginUrl(context: android.content.Context, url: String): Boolean
 
 /**
  * DSH Remote account onboarding: browser/QR or email login, Host selection, explicit fingerprint
- * confirmation, then one ServerProfile per selected Host. The account token stays in this screen.
+ * confirmation, then source/Host metadata only. Harness selection is independent; no auto-dial.
+ * The account token stays in this screen.
  */
 @Composable
 internal fun RemoteEnrollSheet(
@@ -278,10 +279,11 @@ internal fun RemoteEnrollSheet(
                 busy = true; error = null
                 try {
                   val enrollment = manager!!.enroll(chosen, chosen.associate { it.hostId to it.meta.fingerprint!! })
-                  val added = controller.addRemoteProfiles(enrollment.catalog, chosen.filter { it.hostId in enrollment.registered }.map { it.meta })
-                  resultText = if (enrollment.failures.isEmpty()) "已接入 ${added.size} 台远程主机"
-                    else "已接入 ${added.size} 台；${enrollment.failures.size} 台失败：${enrollment.failures.values.first()}"
-                  onDone(added.size)
+                  controller.saveRemoteHosts(enrollment.catalog)
+                  val registered = enrollment.registered.size
+                  resultText = if (enrollment.failures.isEmpty()) "已保存 $registered 台主机；请在主机中逐个选择 Harness，尚未自动连接"
+                    else "已保存 $registered 台；${enrollment.failures.size} 台失败：${enrollment.failures.values.first()}"
+                  onDone(registered)
                 } catch (cancel: CancellationException) { throw cancel }
                 catch (e: Exception) { error = userFacingError(e, "接入远程主机失败") }
                 finally { busy = false }

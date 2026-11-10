@@ -81,6 +81,16 @@ class ServerStore internal constructor(private val preferences: SharedPreference
     return current to ConnectionRouteAdmission.requireCurrent(current, graph)
   }
 
+  /** Saved sources may exist without leaves; discovery still obeys their committed parent gates. */
+  internal fun requireParentRoute(sourceId: String, hostId: String): Pair<ConnectionSource, HostBinding> {
+    val graph = (if (readConnectionGraph != null) readConnectionGraph.invoke() else readStoredConnectionGraph())
+      ?: error("接入源尚未保存到连接图，请重新保存后发现服务")
+    val source = graph.sources.singleOrNull { it.id == sourceId } ?: error("接入源已移除")
+    val host = graph.hosts.singleOrNull { it.id == hostId && it.sourceId == sourceId } ?: error("主机绑定已移除")
+    check(source.enabled && host.enabled) { "接入源或主机已停用，请先启用父级" }
+    return source to host
+  }
+
   private fun readStoredConnectionGraph(): ConnectionGraph? {
     val graphPreferences = appContext?.getSharedPreferences("connection-graph", Context.MODE_PRIVATE) ?: return null
     if (!graphPreferences.contains("graph")) return null

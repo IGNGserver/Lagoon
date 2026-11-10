@@ -21,7 +21,10 @@
 - 损坏/未来版图为 runtime fail-closed，不清空 raw 资料/凭据；graph reader 不自动恢复或迁移。组合全暂停后保留选中的 group ID，不跳转组外连接。
 - r7：ConnectionRouteSnapshot 从 exact binding→Host→source 链生成不含 secret 的不可变执行路由；对照 raw 全量路由元组（完整 Direct base path/认证、SSH config/path/user、Hub account/Host/fingerprint/service），不一致/图缺 binding/损坏/未来版均拒绝，不按新 raw 或旧 graph 静默回退。
 - Overview 的建连及缓存复用、通知租约、Controller 操作/完成提交已接入 runtimeRoute；实际工厂按已准入 carrier→native protocol 分派。raw enabled 和显示偏好不被旧 graph leaf 偏好覆盖；旧同-ID客户端在改路/改认证时回收。Remote account 固定来自准入源，不让 credential username 改变信任 scope。
-- **尚未完成**：跨 store 完整事务/空 source catalog 生命周期、完整原生能力交互矩阵和真机 UI 验收。
+- r8：ConnectionCatalogProjection 合并独立 SSH 配置和 Hub 账号/主机目录，无 Harness 时也保留 source/Host；不创建假 leaf。删除最后一个 SSH Harness 不再删除主机配置/共享凭据，只有显式删除接入源才移除。
+- Hub 登记只保存确认的主机，不默认创建 DSH 或自动连接；DSH/OpenCode 在同一主机服务页独立选择。无子 Harness 的只读发现仍读取 committed graph 父级许可，错误/缺图不自动修复。
+- 退出登录保留 signedOut 目录及原父级/子项偏好，撤销凭据前先持久化本地状态并暂停源；重新登录不偷偷开启父级。signedOut 的发现与后台新连接明确拒绝。
+- **尚未完成**：完整跨 store 故障注入矩阵、完整原生能力交互矩阵和真机 UI 验收。
 
 ### 阶段 3：实际原生传输与 mux，已有实质交付
 - OpenCodeApi 的 HTTP/二进制/SSE 已经通过 NativeHttpTransport；public constructors 兼容，close 释放本实例 transport，不关闭共享 dispatcher/pool。
@@ -95,5 +98,7 @@
 - `route-admission-final.log`：**1203 tests、0 failures、0 errors、6 skipped**，其中 actual Noise 跨语言 2/2，0 skipped；debug assemble 成功，117s。APK 21,697,632 bytes，SHA-256 `1c5c5f445bc52cc04ecd123d5a81848872729d761d0b83f32e98f2ade4119407`。
 - 新增 route admission 11、carrier-first factory 7、saved diagnostic ownership 6、Cookie/auth owner fence 4、迟到持久化副作用 2 项回归。凭据模式扫描无命中（不是完整安全审计）。
 - 本机 `opencode --version` 为 1.18.18，与固定 native v2.2.6 基线不同，没有拿它冒充官方 2.x daemon 真环境验收；本机未发现 sshd。当前 `adb devices -l` 仍为空；真机 UI/通知/返回手势未验收。公网 Hub/真实官方 daemon 未冒充本地 fixture。
+- r8 `source-lifecycle-first.log`、`source-lifecycle-independent.log`：空 source catalog、SSH 删除边界及父级许可定向通过；`source-lifecycle-signedout.log` 首轮一项失败是夹具 Long.MAX_VALUE 超出协议安全时间戳，修正为合法未来值，不放宽生产校验。
+- `source-lifecycle-full.log`：**1225 tests、0 failures、0 errors、6 skipped**，actual Noise 跨语言 2/2 运行通过；debug assemble 成功，123s。APK 21,713,748 bytes，SHA-256 `931ecbd9ea5261733f156164176bdbc03bb8f94adeeda5c9d5d4975e11cd77d8`。新测 CatalogProjection 8、真实 SSH Controller 删除 3、parent-only admission 6、signout/relogin 4、catalog signedOut codec 1。
 - 全部构建在 `/home/lvziw/.build/Lagoon/unified-harness-connections/source`，Gradle/build 输出在 `~/.build`。源码工作树无 app/build、node_modules。
 - `wt audit`：29 repos，0 missing dirs，3 detached、4 merged worktrees 属其他任务；只读报告，无清理。

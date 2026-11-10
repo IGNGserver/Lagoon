@@ -358,6 +358,10 @@ object MigrationProjection {
       autoConnect = binding.autoConnect, notifications = binding.notifications)
   }
 
+  internal fun sshSourceId(configId: String): String = stableId("source-ssh", configId)
+  internal fun hubSourceId(origin: String, account: String): String = stableId("source-hub", canonicalRemoteOrigin(origin), account.trim())
+  internal fun hostId(sourceId: String, externalId: String): String = stableId("host", sourceId, externalId)
+
   private fun stableId(namespace: String, vararg parts: String): String {
     val input = parts.joinToString("") { "${it.length}:$it" }.toByteArray(Charsets.UTF_8)
     return "$namespace-${MessageDigest.getInstance("SHA-256").digest(input).joinToString("") { "%02x".format(it) }}"
