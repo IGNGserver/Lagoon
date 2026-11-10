@@ -27,7 +27,7 @@ async function fixture(t, options = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'lagoon-native-'));
   const path = join(dir, 'service.json'), password = 'private-registration-secret';
   const requests = [], sockets = new Set(), streams = new Set(), peers = [];
-  let mutations = 0, infoPid = 7251;
+  let mutations = 0, infoPid = process.pid;
   const large = Buffer.alloc(CHUNK + 23, 0x61);
   const paths = {
     '/api/project': { get: {} }, '/api/echo': { post: {}, patch: {}, delete: {} },
@@ -37,7 +37,18 @@ async function fixture(t, options = {}) {
   };
   const server = http.createServer(async (req, res) => {
     requests.push({ path: req.url, method: req.method, headers: req.headers });
-    if (req.url === '/api/info') { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ pid: infoPid, version: '2.0.0' })); return; }
+    if (req.url === '/api/info') {
+      if (options.dripInfo && requests.length > 1) {
+        res.writeHead(401, { 'content-length': CHUNK }); res.write('x');
+        const interval = setInterval(() => res.write('x'), 100);
+        res.once('close', () => clearInterval(interval)); return;
+      }
+      if (options.dripInfo && requests.length === 1) { res.setHeader('content-length', 0); res.writeHead(401).end(); return; }
+      if (options.protectedInfo && req.headers.authorization !== `Basic ${encode(`opencode:${password}`)}`) {
+        res.setHeader('content-length', 0); res.writeHead(401).end(); return;
+      }
+      res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ pid: infoPid, version: '2.0.0' })); return;
+    }
     if (req.headers.authorization !== `Basic ${encode(`opencode:${password}`)}`) { res.writeHead(401).end(); return; }
     if (req.url === '/api/project') { res.end('[]'); return; }
     if (req.url === '/openapi.json') { res.end(JSON.stringify({ openapi: '3.1.0', paths })); return; }
@@ -120,6 +131,40 @@ test('real authenticated HTTP methods and binary, stable path identity, safe err
   await assert.rejects(call(peer, s, '/api/echo', { method: 'POST', body: 'not base64' }), error => {
     assert.ok(!error.message.includes('not base64')); return errorCode('INVALID_PARAMS')(error);
   });
+});
+
+test('protected identity authenticates only on the same socket owned by the registered PID', { timeout: 10_000, skip: process.platform !== 'linux' }, async t => {
+  const f = await fixture(t, { protectedInfo: true, realPid: true }), { value: peer } = f.peer();
+  const s = await service(peer);
+  assert.ok(f.requests.some(r => r.path === '/api/info' && !r.headers.authorization));
+  assert.ok(f.requests.some(r => r.path === '/api/info' && r.headers.authorization));
+  const result = await call(peer, s, '/api/echo', { method: 'POST', body: encode('once') });
+  assert.equal(result.status, 200); assert.equal(Buffer.from(result.body, 'base64').toString(), 'once');
+  assert.equal(f.mutations, 1);
+  await openStream(peer, s, 'owned-events', 'sse', '/api/event');
+  await peer.call(`${prefix}stream.close`, { streamId: 'owned-events' });
+});
+
+for (const protectedInfo of [true, false]) test(`stale PID cannot receive credentials even with ${protectedInfo ? 'protected' : 'spoofed public'} identity`, { timeout: 10_000, skip: process.platform !== 'linux' }, async t => {
+  const f = await fixture(t, { protectedInfo }), { value: peer } = f.peer();
+  f.infoPid = 1; // Attacker copies the stale registration's PID/version into its public response.
+  await writeFile(f.path, JSON.stringify({ ...f.registration, pid: 1 }));
+  const result = await peer.describe();
+  assert.equal(result.completeness, 'partial'); assert.equal(result.services[0].available, false);
+  assert.deepEqual(result.issues, [{ code: 'IDENTITY_UNVERIFIED' }]);
+  assert.ok(f.requests.length > 0);
+  assert.ok(f.requests.every(r => r.path === '/api/info' && r.headers.authorization === undefined));
+  assert.equal(f.mutations, 0);
+});
+
+test('slow anonymous activation has an absolute proof deadline without credential disclosure', { timeout: 8_000, skip: process.platform !== 'linux' }, async t => {
+  const f = await fixture(t, { dripInfo: true }), { value: peer } = f.peer();
+  const started = Date.now(), result = await peer.describe();
+  assert.ok(Date.now() - started < 7_000);
+  assert.equal(result.services[0].available, false);
+  assert.deepEqual(result.issues, [{ code: 'IDENTITY_UNVERIFIED' }]);
+  assert.ok(f.requests.every(r => r.path === '/api/info' && r.headers.authorization === undefined));
+  assert.equal(f.mutations, 0);
 });
 
 test('PID/version mismatch unavailable; generation changes invalidate call, transfer and stream', { timeout: 10_000 }, async t => {

@@ -251,7 +251,14 @@ private class JschSshTransport(private val session: Session) : SshTransport {
       channel.setPort(port)
       channel.setInputStream(input)
       channel.setOutputStream(output)
+      // JSch DirectTCPIP.connect starts a worker when an input stream is set; it returns BEFORE
+      // SSH_MSG_CHANNEL_OPEN_CONFIRMATION. Do not expose that opening state as a closed tunnel.
+      val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(15)
       channel.connect(15_000)
+      while (!channel.isConnected && !channel.isClosed && session.isConnected && System.nanoTime() < deadline) {
+        Thread.sleep(10)
+      }
+      if (!channel.isConnected) throw SshFailure(SshFailureKind.TUNNEL, "SSH 隧道未能完成打开确认")
       object : TunnelConnection {
         private val closedListeners = java.util.concurrent.CopyOnWriteArrayList<() -> Unit>()
         @Volatile private var notified = false

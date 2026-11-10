@@ -116,13 +116,17 @@ class RemoteNativeConversationTest {
 
   private fun accessToken() = UUID.randomUUID().toString() + UUID.randomUUID().toString()
 
-  private fun startNode(): RunningNode {
+  private fun startNode(official: Boolean = false): RunningNode {
     val script = File(System.getenv("LAGOON_NATIVE_STDIO_HOST")!!).canonicalFile
     require(script.isFile) { "LAGOON_NATIVE_STDIO_HOST must name the staged stdio-host.mjs" }
     val router = System.getenv("LAGOON_PATCHED_ROUTER")
     require(!router.isNullOrBlank() && File(router).isFile) { "Actual patched-router.mjs is required for native integration" }
     val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    val process = ProcessBuilder("node", script.absolutePath, router).directory(script.parentFile).start()
+    val builder = ProcessBuilder("node", script.absolutePath, router).directory(script.parentFile)
+    if (official) builder.environment()["LAGOON_STDIO_OFFICIAL_REGISTRATION"] =
+      requireNotNull(System.getenv("LAGOON_OFFICIAL_OPENCODE_REGISTRATION"))
+    else builder.environment().remove("LAGOON_STDIO_OFFICIAL_REGISTRATION")
+    val process = builder.start()
     val rpc = StdioRpc(process, scope)
     return RunningNode(process, scope, rpc)
   }
@@ -240,6 +244,40 @@ class RemoteNativeConversationTest {
               }
             }
           }
+        } finally { session.close() }
+      }
+    }
+  }
+
+  @Test fun officialServiceReadsAndEventsCrossActualPatchedRouterAndNoise() = runBlocking {
+    assumeTrue("Set official registration, staged stdio Host and patched Router to enable live encrypted acceptance",
+      !System.getenv("LAGOON_OFFICIAL_OPENCODE_REGISTRATION").isNullOrBlank() &&
+        !System.getenv("LAGOON_NATIVE_STDIO_HOST").isNullOrBlank())
+    startNode(official = true).use { node ->
+      assertTrue(withTimeout(TIMEOUT_MILLIS) { node.rpc.ready.await() }.getBoolean("router"))
+      FakeRemoteHost(nativeRpc = { method, params, _ -> runBlocking(Dispatchers.IO) { node.rpc.call(method, params) } }).use { host ->
+        node.rpc.publish = host::publishNativeEvent
+        host.start()
+        val session = session(host)
+        try {
+          val catalog = requireNotNull(withTimeout(TIMEOUT_MILLIS) { session.nativeServiceCatalog() })
+          assertEquals(DiscoveryCompleteness.COMPLETE, catalog.completeness)
+          val descriptor = catalog.services.single()
+          assertTrue(descriptor.available)
+          val profile = ServerProfile("official-noise", "Official encrypted service", RemoteNativeServices.VIRTUAL_BASE_URL,
+            kind = ServerKind.OPENCODE, remoteHostId = host.hostId, remoteServiceId = descriptor.id)
+          RemoteBackend(session, profile, release = {}).use { backend ->
+            assertEquals("2.2.6", withTimeout(TIMEOUT_MILLIS) { backend.client.health() })
+            assertTrue(withTimeout(TIMEOUT_MILLIS) { backend.client.discoverCapabilities() }.documented)
+            assertTrue(withTimeout(TIMEOUT_MILLIS) { backend.client.projects() }.all { it.id.isNotBlank() })
+            assertTrue(withTimeout(TIMEOUT_MILLIS) { backend.client.rootSessionsPage(size = 10) }.items.isEmpty())
+            val opened = CompletableDeferred<Unit>()
+            val collector = launch(Dispatchers.IO) { backend.client.events { opened.complete(Unit) }.collect {} }
+            try { withTimeout(TIMEOUT_MILLIS) { opened.await() } } finally { collector.cancel(); collector.join() }
+            assertEquals("2.2.6", withTimeout(TIMEOUT_MILLIS) { backend.client.health() })
+          }
+          assertEquals(1, session.status.value.generation)
+          assertEquals(1, synchronized(host.requests) { host.requests.count { it == "GET /ws/v1/connect" } })
         } finally { session.close() }
       }
     }

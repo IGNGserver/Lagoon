@@ -148,7 +148,9 @@ try {
   server.listen(0, '127.0.0.1'); await once(server, 'listening');
   registration = { url: `http://127.0.0.1:${server.address().port}`, pid: process.pid, version: '2.2.6', id: 'stdio-fixture', password: secret };
   await writeFile(registrationPath, JSON.stringify(registration), { mode: 0o600 });
-  peer = new NativeServicePeer({ registrationPaths: [registrationPath], publish: (event, data) => output({ type: 'event', event, data }) });
+  // Opt-in actual-daemon read-only acceptance never rewrites or removes the caller's registration.
+  const official = process.env.LAGOON_STDIO_OFFICIAL_REGISTRATION;
+  peer = new NativeServicePeer({ registrationPaths: [official || registrationPath], publish: (event, data) => output({ type: 'event', event, data }) });
   if (configuredRouter) {
     const logger = { info() {}, warn() {}, debug() {}, error() {} };
     router = new module.RpcRouter(128, logger, undefined, undefined, () => [], undefined, undefined, undefined, undefined, undefined, undefined, peer);

@@ -1,5 +1,6 @@
 import http from 'node:http';
-import { open, constants } from 'node:fs/promises';
+import { open, constants, readdir, readlink } from 'node:fs/promises';
+import net from 'node:net';
 import { createHash, randomUUID } from 'node:crypto';
 import { isAbsolute, join, resolve } from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
@@ -13,7 +14,7 @@ const MESSAGES = {
   REGISTRATION_UNREADABLE: 'Registration cannot be read', REGISTRATION_INVALID: 'Registration is invalid',
   REGISTRATION_TOO_LARGE: 'Registration is too large', SERVICE_UNAVAILABLE: 'Native service is unavailable',
   SERVICE_MISMATCH: 'Native service identity does not match registration', STALE_SERVICE: 'Native service registration changed',
-  AUTH_FAILED: 'Native service authentication failed', ROUTE_DENIED: 'Native service route is not allowed',
+  AUTH_FAILED: 'Native service authentication failed', IDENTITY_UNVERIFIED: 'Native service socket ownership cannot be verified', ROUTE_DENIED: 'Native service route is not allowed',
   REDIRECT_DENIED: 'Native service redirects are not allowed', RESPONSE_TOO_LARGE: 'Native service response exceeds limit',
   RESOURCE_LIMIT: 'Native service resource limit reached', NOT_FOUND: 'Native service handle not found',
   PEER_CLOSED: 'Native service connection is closed', STREAM_FAILED: 'Native service stream failed',
@@ -76,6 +77,106 @@ async function registration(path) {
     fail(error?.code === 'ENOENT' ? 'REGISTRATION_MISSING' : error?.code === 'EACCES' ? 'REGISTRATION_UNREADABLE' : 'REGISTRATION_INVALID');
   } finally { await file?.close().catch(() => {}); }
 }
+async function boundedProcFile(path, max = 4 * 1024 * 1024) {
+  const file = await open(path, constants.O_RDONLY);
+  try {
+    const bytes = Buffer.alloc(max + 1); let size = 0;
+    while (size < bytes.length) {
+      const part = await file.read(bytes, size, bytes.length - size, null);
+      if (!part.bytesRead) break; size += part.bytesRead;
+    }
+    if (size > max) fail('IDENTITY_UNVERIFIED');
+    return bytes.subarray(0, size).toString('utf8');
+  } finally { await file.close(); }
+}
+
+/** Prove the registration PID owns the server end of THIS connected TCP socket before any secret
+ * is written. Binding the authenticated request to this socket prevents port-reuse races between a
+ * listener check and the next connection. Unsupported OS/permissions fail closed, never trust DNS. */
+async function verifySocketOwner(r, socket) {
+  try {
+    if (process.platform !== 'linux' || !socket.localPort || socket.remotePort !== r.port) fail('IDENTITY_UNVERIFIED');
+    const directory = `/proc/${r.pid}/fd`, files = await readdir(directory);
+    if (files.length > 4096) fail('IDENTITY_UNVERIFIED');
+    const inodes = new Set();
+    for (const file of files) {
+      const target = await readlink(`${directory}/${file}`).catch(() => '');
+      const match = /^socket:\[(\d+)\]$/.exec(target); if (match) inodes.add(match[1]);
+    }
+    const loopback = r.hostname === '::1' ? '00000000000000000000000001000000' : '0100007F';
+    const table = await boundedProcFile(r.hostname === '::1' ? '/proc/net/tcp6' : '/proc/net/tcp');
+    for (const line of table.split('\n').slice(1)) {
+      const fields = line.trim().split(/\s+/); if (fields.length < 10 || fields[3] !== '01') continue;
+      const [serverAddress, serverPort] = fields[1].split(':'), [clientAddress, clientPort] = fields[2].split(':');
+      if (serverAddress === loopback && clientAddress === loopback && parseInt(serverPort, 16) === r.port &&
+        parseInt(clientPort, 16) === socket.localPort && inodes.has(fields[9])) return;
+    }
+    fail('IDENTITY_UNVERIFIED');
+  } catch (error) { if (error instanceof NativeServiceError) throw error; fail('IDENTITY_UNVERIFIED'); }
+}
+
+function activateSocket(r, socket) {
+  // Some official listeners use deferred accept: no server-side inode exists until data arrives.
+  // One bounded anonymous identity request activates it on this same socket without any secret.
+  return new Promise((resolveActive, reject) => {
+    let bytes = Buffer.alloc(0), total;
+    const cleanup = () => { socket.off('data', data); socket.off('error', error); socket.off('close', closed); socket.off('timeout', timedOut); socket.setTimeout(0); };
+    const error = () => { cleanup(); reject(new NativeServiceError('IDENTITY_UNVERIFIED')); };
+    const closed = () => error();
+    const timedOut = () => error();
+    const data = chunk => {
+      bytes = Buffer.concat([bytes, chunk]);
+      if (bytes.length > CHUNK + 16 * 1024) return error();
+      const end = bytes.indexOf('\r\n\r\n');
+      if (end < 0) { if (bytes.length > 16 * 1024) error(); return; }
+      if (end > 16 * 1024) return error();
+      if (total === undefined) {
+        const header = bytes.subarray(0, end).toString('ascii'), lines = header.split('\r\n');
+        if (!/^HTTP\/1\.[01] (200|401|403)(?: |$)/.test(lines.shift())) return error();
+        const lengths = lines.filter(line => /^content-length:/i.test(line));
+        if (lengths.length !== 1 || lines.some(line => /^(?:transfer-encoding:|connection:\s*close)/i.test(line))) return error();
+        const length = lengths[0].slice(lengths[0].indexOf(':') + 1).trim();
+        if (!/^\d+$/.test(length) || Number(length) > CHUNK) return error();
+        total = end + 4 + Number(length);
+      }
+      if (bytes.length > total) return error();
+      if (bytes.length === total) { socket.pause(); cleanup(); resolveActive(); }
+    };
+    socket.on('data', data); socket.once('error', error); socket.once('close', closed); socket.once('timeout', timedOut);
+    socket.setTimeout(5_000);
+    const host = r.hostname === '::1' ? '[::1]' : r.hostname;
+    socket.write(`GET /api/info HTTP/1.1\r\nHost: ${host}:${r.port}\r\nConnection: keep-alive\r\nAccept: application/json\r\n\r\n`);
+  });
+}
+
+function ownershipAgent(r, signal) {
+  const agent = new http.Agent({ keepAlive: false, maxSockets: 1 });
+  agent.createConnection = (_options, callback) => {
+    const socket = net.createConnection({ host: r.hostname, port: r.port });
+    let delivered = false;
+    const finish = (error) => {
+      if (delivered) return; delivered = true;
+      signal.removeEventListener('abort', abort);
+      clearTimeout(deadline);
+      if (error) socket.destroy();
+      callback(error, error ? undefined : socket);
+      if (!error) socket.resume(); // HTTP/WebSocket parser is attached by the Agent callback first.
+    };
+    const abort = () => finish(new NativeServiceError('PEER_CLOSED'));
+    // Wall-clock cap covers TCP connect, anonymous activation, and /proc proof, including slow drip.
+    const deadline = setTimeout(() => finish(new NativeServiceError('IDENTITY_UNVERIFIED')), 5_000);
+    signal.addEventListener('abort', abort, { once: true });
+    socket.once('error', () => finish(new NativeServiceError('SERVICE_UNAVAILABLE')));
+    socket.once('connect', () => {
+      activateSocket(r, socket).then(() => verifySocketOwner(r, socket)).then(() => finish(null), finish);
+    });
+    if (signal.aborted) abort();
+    // Do not return the unverified socket: Agent would send the HTTP headers immediately.
+    return undefined;
+  };
+  return agent;
+}
+
 function requestHeaders(input = {}) {
   if (!object(input)) fail('INVALID_PARAMS');
   const out = {};
@@ -144,14 +245,16 @@ export class NativeServicePeer {
   #reserve(n) { if (this.#bytes + n > TOTAL) fail('RESOURCE_LIMIT'); this.#bytes += n; }
   #dropTransfer(id) { const t = this.#transfers.get(id); if (t) { this.#bytes -= t.bytes.length; t.bytes.fill(0); this.#transfers.delete(id); } }
   #dropIncoming(id) { const t = this.#incoming.get(id); if (t) { this.#bytes -= t.bytes.length; t.bytes.fill(0); this.#incoming.delete(id); } }
-  #headers(r, input, path) { return { ...input, ...(r.password === undefined || path.split('?')[0] === '/api/info' ? {} : { authorization: `Basic ${Buffer.from(`opencode:${r.password}`).toString('base64')}` }) }; }
+  #headers(r, input, path) { return { ...input, ...(r.password === undefined || path.split('?')[0] === '/api/info' && !r.ownershipRequired ? {} : { authorization: `Basic ${Buffer.from(`opencode:${r.password}`).toString('base64')}` }) }; }
   #request(r, method, path, headers, body, controller, authenticate = true, onBodyQueued, onRequestStarted) {
     return new Promise((resolveRequest, reject) => {
       const requestHeaders = authenticate ? this.#headers(r, headers, path) : headers;
-      const req = http.request({ hostname: r.hostname, port: r.port, method, path, headers: { ...requestHeaders, ...(body === undefined ? {} : { 'content-length': Buffer.byteLength(body) }) }, signal: controller.signal, agent: false }, res => {
+      const agent = requestHeaders.authorization ? ownershipAgent(r, controller.signal) : false;
+      const req = http.request({ hostname: r.hostname, port: r.port, method, path, headers: { ...requestHeaders, ...(body === undefined ? {} : { 'content-length': Buffer.byteLength(body) }) }, signal: controller.signal, agent }, res => {
         if (res.statusCode >= 300 && res.statusCode < 400) { res.destroy(); reject(new NativeServiceError('REDIRECT_DENIED')); }
         else resolveRequest(res);
       });
+      if (agent) req.once('close', () => agent.destroy());
       req.setTimeout(15_000, () => req.destroy(new NativeServiceError('SERVICE_UNAVAILABLE')));
       req.on('error', error => reject(error instanceof NativeServiceError ? error : new NativeServiceError(this.#closed ? 'PEER_CLOSED' : 'SERVICE_UNAVAILABLE')));
       // An early response is not proof the socket released its request buffer.
@@ -176,8 +279,16 @@ export class NativeServicePeer {
     const c = this.#controller();
     try {
       // This public identity request must not disclose a stale registration's password.
-      const infoResponse = await this.#request(r, 'GET', '/api/info', {}, undefined, c, false);
-      const info = await this.#read(infoResponse, CHUNK);
+      let infoResponse = await this.#request(r, 'GET', '/api/info', {}, undefined, c, false);
+      let info = await this.#read(infoResponse, CHUNK);
+      if (infoResponse.statusCode === 401 || infoResponse.statusCode === 403) {
+        if (r.password === undefined) fail('AUTH_FAILED');
+        // Official 2.2.6's outer auth middleware protects even /api/info. Authenticate only on a
+        // socket proved to belong to the registered PID; never replay business mutations.
+        r.ownershipRequired = true;
+        infoResponse = await this.#request(r, 'GET', '/api/info', {}, undefined, c, true);
+        info = await this.#read(infoResponse, CHUNK);
+      }
       let parsed; try { parsed = JSON.parse(info.bytes.toString('utf8')); } catch { fail('SERVICE_MISMATCH'); }
       if (infoResponse.statusCode !== 200 || !object(parsed) || parsed.pid !== r.pid || typeof parsed.version !== 'string' || !parsed.version.trim() || (r.version !== undefined && parsed.version !== r.version)) fail('SERVICE_MISMATCH');
       const projects = await this.#request(r, 'GET', '/api/project', {}, undefined, c);
@@ -200,7 +311,7 @@ export class NativeServicePeer {
         r = await registration(path); this.#assertOpen();
         let routes, available = true;
         try { routes = await this.#probe(r); } catch (error) { available = false; issues.push({ code: error instanceof NativeServiceError ? error.code : 'SERVICE_UNAVAILABLE' }); }
-        this.#assertOpen(); this.#services.set(id, { path, generation: r.generation, routes, available });
+        this.#assertOpen(); this.#services.set(id, { path, generation: r.generation, routes, available, ownershipRequired: r.ownershipRequired === true });
         this.#retireObsolete(id);
         services.push({ id, name: 'OpenCode', protocol: 'opencode-native', generation: r.generation, available, capabilities: available ? ['http', 'binary', 'sse', 'websocket'] : [] });
       } catch (error) { this.#services.delete(id); this.#retireObsolete(id); if (this.#closed) fail('PEER_CLOSED'); issues.push({ code: error instanceof NativeServiceError ? error.code : 'REGISTRATION_INVALID' }); }
@@ -216,6 +327,7 @@ export class NativeServicePeer {
     this.#assertOpen();
     if (r.generation !== params.generation || service.generation !== params.generation) fail('STALE_SERVICE');
     if (!service.available) fail('SERVICE_UNAVAILABLE');
+    r.ownershipRequired = service.ownershipRequired;
     const path = routePath(params.path);
     if (!(method === 'GET' && ['/api/info', '/openapi.json', '/api/event'].includes(path)) && !service.routes.some(([m, re]) => m === method && re.test(path))) fail('ROUTE_DENIED');
     return r;
@@ -264,7 +376,7 @@ export class NativeServicePeer {
     if (!options.slotReserved && this.#transfers.size + this.#incoming.size + this.#pendingTransfers >= 4) fail('RESOURCE_LIMIT');
     const c = this.#controller(); if (!options.slotReserved) this.#pendingTransfers++; let held = 0;
     try {
-      const res = await this.#request(r, p.method, p.path, headers, body, c, p.path.split('?')[0] !== '/api/info', options.onBodyQueued, options.onRequestStarted);
+      const res = await this.#request(r, p.method, p.path, headers, body, c, p.path.split('?')[0] !== '/api/info' || r.ownershipRequired, options.onBodyQueued, options.onRequestStarted);
       const read = await this.#read(res, p.maxResponseBytes, true); held = read.held;
       this.#assertOpen();
       if ((await registration(r.path)).generation !== r.generation) fail('STALE_SERVICE');
@@ -428,7 +540,8 @@ export class NativeServicePeer {
   #websocket(s, p, r, headers) {
     return new Promise((resolveOpen, reject) => {
       const host = r.hostname === '::1' ? '[::1]' : r.hostname;
-      const ws = new WebSocket(`ws://${host}:${r.port}${p.path}`, { headers: this.#headers(r, headers, p.path), followRedirects: false, maxPayload: CHUNK, handshakeTimeout: 15_000, perMessageDeflate: false });
+      const agent = r.password !== undefined ? ownershipAgent(r, s.controller.signal) : undefined;
+      const ws = new WebSocket(`ws://${host}:${r.port}${p.path}`, { headers: this.#headers(r, headers, p.path), agent, followRedirects: false, maxPayload: CHUNK, handshakeTimeout: 15_000, perMessageDeflate: false });
       s.ws = ws;
       const abort = () => { ws.terminate(); reject(new NativeServiceError(this.#closed ? 'PEER_CLOSED' : 'STREAM_FAILED')); };
       s.controller.signal.addEventListener('abort', abort, { once: true });
@@ -436,7 +549,7 @@ export class NativeServicePeer {
       ws.on('message', (data, binary) => { this.#frame(s, binary ? 'bytes' : 'text', { data: binary ? data.toString('base64') : data.toString('utf8') }).catch(() => {}); });
       ws.on('error', () => { reject(new NativeServiceError('STREAM_FAILED')); this.#finish(s, 'STREAM_FAILED'); });
       ws.on('unexpected-response', (_req, res) => { const code = res.statusCode >= 300 && res.statusCode < 400 ? 'REDIRECT_DENIED' : 'STREAM_FAILED'; res.destroy(); reject(new NativeServiceError(code)); this.#finish(s, code); });
-      ws.on('close', (code, reason) => { s.controller.signal.removeEventListener('abort', abort); this.#finish(s, undefined, { code, reason: reason.toString('utf8') }); });
+      ws.on('close', (code, reason) => { agent?.destroy(); s.controller.signal.removeEventListener('abort', abort); this.#finish(s, undefined, { code, reason: reason.toString('utf8') }); });
     });
   }
   async #send(p) {

@@ -31,7 +31,11 @@
 
 ## 信任与路由
 
-Host 从本机官方 OpenCode registration 读取 URL/Basic password，验证 loopback root HTTP、正整数PID、版本、受保护路由认证和 `/api/info` PID/version。服务 locator 使用本地 registration path 的 hash（不是跨机器身份声明）；generation 由 registration tuple 派生，变更时旧请求 STALE_SERVICE，不重试。
+Host 从本机官方 OpenCode registration 读取 URL/Basic password，验证 loopback root HTTP、正整数PID、版本、受保护路由认证和 `/api/info` PID/version。真实 v2.2.6 发布二进制的外层认证会保护 `/api/info`，不能仅按 OpenAPI 的 security=[] 当作公开端点。
+
+任何携凭据 HTTP/WS 都先在新 TCP socket 上发送有界匿名身份请求（激活 deferred accept），再用 Linux `/proc/<pid>/fd` 的 socket inode 和 `/proc/net/tcp[6]` 已建立四元组确认登记 PID 拥有该 socket 的服务端；只有证明成功才在**同一条 socket**发送认证。公开 200 可伪造 PID/version，也不得绕过此证明。匿名响应必须有唯一有界 Content-Length、不能重定向/关闭连接/夹带额外字节；从连接到归属证明总计 5s 墙钟超时。校验失败不发送凭据，不自动重发业务写操作。
+
+当前 OS 归属实现仅 Linux；macOS/Windows 或 `/proc` 权限/命名空间不能证明时返回 `IDENTITY_UNVERIFIED`，不能降级为信任 loopback 或注册文本。服务 locator 使用本地 registration path 的 hash（不是跨机器身份声明）；generation 由 registration tuple 派生，变更时旧请求 STALE_SERVICE，不重试。
 
 URL/端口/Authorization/Cookie 不能由 Remote 请求提供；响应剔除 Set-Cookie 等敏感 headers。仅相对 OpenCode 路由和 Host 读取的 OpenAPI method/path 匹配；显式允许 `/api/info`、`/openapi.json`、`/api/event`。禁止绝对URL、authority、userinfo、fragment、遍历、反斜杠、未列出 method/path、重定向。服务 ID 非手机 URL。
 
@@ -41,6 +45,8 @@ URL/端口/Authorization/Cookie 不能由 Remote 请求提供；响应剔除 Set
 
 Host companion 和 SHA 校验的固定上游 Router/HostPluginRuntime overlay、Android HTTP/SSE/WS/分片 carrier、同 Host 共享 Noise 会话和服务选择 UI 已有实现。构建、测试入口见 [Host 连接器说明](<../host-connector/README.md>)。
 
-本地跨语言集成实际经过 Kotlin Noise/Relay → patched upstream RpcRouter → NativeServicePeer → 受保护 loopback OpenCode fixture，验证会话列表/改名/SSE/2 MiB 上传与大响应分片/兄弟关闭隔离；不等同于公网 Hub、真实 OpenCode daemon 或 Android 真机验收。旧 Host 没有声明能力时不发送原生调用，显示升级要求，不走 ACP。
+本地跨语言 fixture 集成实际经过 Kotlin Noise/Relay → patched upstream RpcRouter → NativeServicePeer，验证会话列表/改名/SSE/2 MiB 上传与大响应分片/兄弟关闭隔离。另有 opt-in 测试实际连到校验后的官方 OpenCode v2.2.6 daemon：Android 原生直连、真实 JSch/sshd 原生附着，以及 Kotlin Noise → actual Router/Peer → 同一官方 daemon 的目录/能力/事件读取均通过；没有发送模型 prompt。Fake Hub/Host relay + 真实 Noise/Router 不等于公网 Hub/生产 Host，JVM 也不等于 Android 真机。
+
+官方 DSH 0.2.1-rc.5 另以全新隔离 WebHost 验证 session/list、workspace/follow、$events 就绪/取消/关闭；不声称附着现有 Desktop。旧 Host 没有声明原生能力时不发送原生调用，显示升级要求，不走 ACP。
 
 服务 ID 是 Host 本地注册路径的稳定 locator；不声称物理机器全局身份、跨路径服务合并或 DSH Desktop 附着。Host 插件必须由用户显式构建/安装/启用；本任务没有部署。

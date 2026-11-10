@@ -84,7 +84,8 @@
 - 原生服务 HTTP/binary/SSE/WebSocket 和上传/下载分片经 Node loopback 测试；Android NativeHttpTransport 经 fake-RPC 单测、实际 Kotlin Noise → Node patched Router/Peer → 原生 fixture 集成验证。
 - 同 Host 两个服务共享加密连接，关一个服务不关兄弟；关闭、慢消费者、旧代次、pending open cancellation 有专项回归。请求超时不自动改路或重发。
 - 三层开关在连接/通知/深链/组合生效；可重叠组合保留同一 leaf 多处引用。原生服务选择不自动启用。
-- 本节不将 fixture 当作官方真实 daemon/公网 Host/真机证据；完整原生能力清单仍需真环境逐项验收。
+- r8 已取得额外真实服务证据：校验官方 v2.2.6 release 二进制的原生直连读取/SSE、真实 JSch→隔离 sshd 的两 binding 共享/关闭隔离、Kotlin Noise→actual Router/Peer→同一官方 daemon 的目录/能力/事件；另有官方 DSH rc.5 全新 WebHost 的 list/workspace/$events。未发模型 prompt、未使用用户现有资料。
+- Host Basic 仅在 Linux 内核证明登记 PID 持有确切对端 socket 后发送；macOS/Windows 暂不支持该证据路径，明确不可用。不将这些 JVM/loopback/fake relay 证据冒充公网 Hub、生产 Host、DSH Desktop 附着或 Android 真机；完整原生能力清单仍需逐项验收。
 
 ## 尚需分阶段落实的关键门槛
 

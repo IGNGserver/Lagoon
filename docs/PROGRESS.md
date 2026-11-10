@@ -46,11 +46,13 @@
 - OpenCode attach-only，从不 install/start/kill；DSH 保留明确选择的旧 managed web bootstrap，普通 close 不杀远端进程。
 - Tests：discovery 13、pool/session ownership 4、真实 socket-backed tunnel adapter 2；另有 graph/store/factory 路由测试。
 - **DSH Desktop 原生附着为上游 blocker**：本机安装的官方 `@deepseek-ai/dsh@0.2.1-rc.5` CLI 明确拒绝 `--profile desktop`；Electron Desktop 使用 `file://` + IPC，而 Typert web/WS mux 仅由 WebHost 挂载；`/connect` launch token 只存在该 Web process 内存，官方包没有 Desktop profile 注册文件、daemon HTTP 入口或可供 SSH 转发的 IPC bridge。不得通过启动第二个 `dsh web`、猜端口或读写共享 profile state 冒充附着当前 Desktop Agent。正确下一步是先取得官方 Electron Desktop 提供的受支持 Host/SSH attach hook 与身份/lifecycle contract；未取得前，DSH SSH 仅是兼容的新建 WebHost，不宣称 Desktop 运行时复用。
-- 多 OpenCode channel 目前通过用户保存的具体 registration path 逐个建 binding，不自动合并 channel；无真实远端 SSH daemon/Android 真机验收。
+- 多 OpenCode channel 目前通过用户保存的具体 registration path 逐个建 binding，不自动合并 channel。r8 已在隔离 loopback 真 sshd + 官方 OpenCode v2.2.6 验证两 bindings 共享物理 JSch、原生读取/SSE、关闭一个不影响另一个；不是公网 SSH 或 Android 真机验收。
+- 真 SSH 验收暴露并修复 JSch 0.2.25 DirectTCPIP.connect 在已设 input 时异步返回：必须等待 open confirmation 后才向 forwarder 暴露 isOpen，否则 opening 被当 closed，截断 HTTP。保留 opt-in 实际 SSH 回归。
 
 ### 阶段 5：Remote native connector 已实现，实际加密互操作已通过定向验证
 - 新增 `host-connector/`：固定上游 SHA-256 校验 overlay，将 NativeServicePeer 放在认证 Noise/信任校验之后的每连接 RpcRouter，完整构建 Router、HostPluginRuntime、插件入口；不是 manifest/stub，也不需要新建 Hub。
-- Host 只读官方 OpenCode registration，先无凭据验证公开 `/api/info` PID/version，再验证受保护 route；凭据仅 Host 内存。只允许 loopback、OpenAPI method/path、header 白名单，禁止重定向、路径穿越和手机任意 URL/凭据。
+- Host 只读官方 OpenCode registration；先匿名 `/api/info`，但真实 v2.2.6 发布二进制即使 OpenAPI 声明 security=[] 也受外层认证保护。每个携凭据 HTTP/WS socket 均先进行有界匿名激活，再校验 Linux `/proc/<pid>/fd` inode + 已建立连接四元组，确认登记 PID 持有对端后在同一 socket 发送认证，公开 200 也不绕过归属证明。
+- 连接/匿名激活/归属验证总计 5s 墙钟上限；不重放业务 mutation。不支持/无权限取得内核归属证据时 `IDENTITY_UNVERIFIED` fail-closed（当前 macOS/Windows 原生 Host 不可用，不能假称支持）。凭据仅 Host 内存；只允许 loopback、OpenAPI method/path、header 白名单，禁止重定向、遍历和手机任意 URL/凭据。
 - 原生 HTTP/binary/SSE/WS，序号/背压/取消、父连接配额、64 MiB 有界 request/response transfer、上传 commit 一次性消费；未知提交不重发。关闭 pending-open 不复活流；发现替换/入站帧校验回收旧服务代次。
 - Android RemoteNativeServices + LazyNativeHttpTransport 已接入 RemoteSession/RemoteBackend/OpenCodeApi；同 Hub/account/Host 一个 Noise session，不以 ACP 或 DSH Typert 冒充原生 OpenCode。
 - Remote service locator 单独保存为 remoteServiceId，generation 不持久化为身份。新 Host 服务选择页只读发现、默认可停用保存、显式逐个启用；旧 Host 明确升级要求。
@@ -97,8 +99,14 @@
 - r7 独立复核修复 DSH Remote legacy kind alias 的原生协议归一化；addProject/deleteSession 的迟到结果在持久化副作用前校验 route，避免同 leaf ID 换地址后污染项目、草稿/缓存；问答通知取消也按原连接守卫。
 - `route-admission-final.log`：**1203 tests、0 failures、0 errors、6 skipped**，其中 actual Noise 跨语言 2/2，0 skipped；debug assemble 成功，117s。APK 21,697,632 bytes，SHA-256 `1c5c5f445bc52cc04ecd123d5a81848872729d761d0b83f32e98f2ade4119407`。
 - 新增 route admission 11、carrier-first factory 7、saved diagnostic ownership 6、Cookie/auth owner fence 4、迟到持久化副作用 2 项回归。凭据模式扫描无命中（不是完整安全审计）。
-- 本机 `opencode --version` 为 1.18.18，与固定 native v2.2.6 基线不同，没有拿它冒充官方 2.x daemon 真环境验收；本机未发现 sshd。当前 `adb devices -l` 仍为空；真机 UI/通知/返回手势未验收。公网 Hub/真实官方 daemon 未冒充本地 fixture。
+- 早期环境检查仅发现 PATH 中 OpenCode 1.18.18、未发现 sshd，未拿它冒充 v2.2.6。r8 后续从官方 GitHub release 下载固定 v2.2.6 并校验 SHA-256；明确绝对路径找到 `/usr/sbin/sshd`，在隔离 HOME/随机 loopback 端口启动独立测试实例，不替换全局工具或用户服务。Android 真机/公网 Hub 仍未验收。
 - r8 `source-lifecycle-first.log`、`source-lifecycle-independent.log`：空 source catalog、SSH 删除边界及父级许可定向通过；`source-lifecycle-signedout.log` 首轮一项失败是夹具 Long.MAX_VALUE 超出协议安全时间戳，修正为合法未来值，不放宽生产校验。
 - `source-lifecycle-full.log`：**1225 tests、0 failures、0 errors、6 skipped**，actual Noise 跨语言 2/2 运行通过；debug assemble 成功，123s。APK 21,713,748 bytes，SHA-256 `931ecbd9ea5261733f156164176bdbc03bb8f94adeeda5c9d5d4975e11cd77d8`。新测 CatalogProjection 8、真实 SSH Controller 删除 3、parent-only admission 6、signout/relogin 4、catalog signedOut codec 1。
+- r8 真实官方验收：GitHub OpenCode v2.2.6 Linux x64 baseline 压缩包 121,793,402 bytes，官方 SHA256SUMS 校验为 `08bb21d6326ce740d91cce7ebe88a6536933f6e1e30353b91a06b01f25da306c`；全新 HOME/XDG/随机 loopback 端口，未替换系统工具，未发模型 prompt。
+- 官方 /api/info 的外层认证与 OpenAPI security=[] 有差异；初版探测误判，已用同 socket Linux PID/inode/tuple 归属证明修复。审查再修复伪造公开200可绕过认证探测、slow-drip 占用验证槽：所有凭据 socket 统一校验，整体5s截止。`official-native-host-final.log` 16/16（15 peer regression +1真实daemon）；`official-upstream-router.log` actual Router/ConnectionController 5/5。
+- `official-daemon-acceptance.log` 官方 OpenCode 与隔离官方 DSH rc.5 直连只读通过；`official-ssh-noise-acceptance.log` SSH 首轮失败，发现 JSch 异步通道误关闭，不当作环境问题。修复后 `official-ssh-confirmed-acceptance.log` 所有真实 SSH/DSH/Direct/Noise +相关回归通过；RemoteNativeConversationTest 3/3 包含实际 Router→官方daemon，未跳过。
+- `official-connector-full-build.log` 完整固定上游插件 bundle 4,029,731 bytes，SHA-256 `4b8a2d59ebfc75163a06b7b32f058fed649aa346b6ccd67b55bb4ef62ba6ee71`。未安装到用户 Host 或部署。
+- `official-acceptance-full.log`：**1229 tests、0 failures、0 errors、6 skipped**；三个 opt-in 官方 Direct/DSH/SSH 测试及实际 Noise3项均运行无跳过；Debug assemble 成功113s。APK 21,713,748 bytes，SHA-256 `e1f52694152156d36e0762b602430938e859fa7b810b92c9ab34341e8b6cac78`。测试后停止仅本任务拥有的三个临时 daemon。
+- 源码复核仍发现待补功能：DSH 设置管理被 Remote carrier UI 条件隐藏、原生 OpenCode revert/restore 无操作入口、OpenCode fork 能力未从文档发现；不因 read/event 验收通过就声称完整功能完成。
 - 全部构建在 `/home/lvziw/.build/Lagoon/unified-harness-connections/source`，Gradle/build 输出在 `~/.build`。源码工作树无 app/build、node_modules。
 - `wt audit`：29 repos，0 missing dirs，3 detached、4 merged worktrees 属其他任务；只读报告，无清理。

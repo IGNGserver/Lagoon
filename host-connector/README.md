@@ -72,6 +72,21 @@ This validates the patched router/connection seam, not a physical Android-to-
 production-Host end-to-end connection. [Peer-focused tests](<test/native-services.test.mjs>)
 cover additional registration, allowlist, expiry and resource-limit cases.
 
+## Real official-service acceptance (explicit opt-in)
+
+[The official-service test](<test/official-service.mjs>) reads a caller-owned, isolated OpenCode **2.2.6** registration. It never starts/stops a daemon, sends a model prompt, or writes its registration. Run against a scratch copy with the locked tooling dependencies available:
+
+```sh
+LAGOON_OFFICIAL_OPENCODE_REGISTRATION=/absolute/private/scratch/state/opencode/service.json \
+  node --test test/official-service.mjs
+```
+
+The actual release binary protects `/api/info` despite the OpenAPI public declaration. Before **every** credential-bearing HTTP/WebSocket request, the connector proves the registered PID owns the server side of that exact established TCP socket using Linux `/proc` inode/tuple evidence, then authenticates on the same socket. A bounded anonymous HTTP activation handles deferred-accept listeners. Connection/activation/proof have a five-second absolute deadline; no business mutation is retried. Public identity JSON alone is never sufficient evidence.
+
+**Platform limit:** this ownership proof currently supports Linux only. Other OSes, restricted `/proc`, mismatched PID, malformed/closing/oversized anonymous responses and unsupported framing fail closed with `IDENTITY_UNVERIFIED`; they do not silently send the registration password. macOS/Windows native Host support is not claimed.
+
+Android JVM opt-ins are `LAGOON_OFFICIAL_OPENCODE_REGISTRATION`, `LAGOON_OFFICIAL_DSH_CONNECTION` (private JSON `{url,token}` for a fresh standalone official DSH WebHost), and `LAGOON_OFFICIAL_SSH_CONNECTION` (scratch-confined pinned SSH descriptor). Unset variables skip only those explicit live tests; provided invalid configurations fail. With the staged stdio Host and actual patched Router enabled, the encrypted native test also targets the official daemon. These tests do not replace public-Hub, production-Host, Desktop-attachment or Android-device acceptance.
+
 ## Local Host opt-in
 
 Set these on the Host process that loads the patched plugin:
