@@ -160,7 +160,10 @@ data class QuestionPrompt(
   val custom: Boolean = false,
   val field: String = ""
 )
-data class QuestionRequest(val id: String, val sessionId: String, val directory: String, val questions: List<QuestionPrompt>, val form: Boolean = true)
+data class QuestionPresentation(val remainingMs: Long? = null, val countdownRunning: Boolean = false,
+  val held: Boolean = false, val continued: Boolean = false)
+data class QuestionRequest(val id: String, val sessionId: String, val directory: String, val questions: List<QuestionPrompt>,
+  val form: Boolean = true, val presentation: QuestionPresentation? = null)
 data class FileChange(
   val path: String,
   /** Shown when there is no patch to render: a binary/oversized file, or a patch the server truncated. */

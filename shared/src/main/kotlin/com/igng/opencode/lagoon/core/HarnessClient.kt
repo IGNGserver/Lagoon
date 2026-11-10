@@ -30,6 +30,9 @@ interface HarnessClient {
   /** Releases transport-owned sockets and cryptographic state; safe to call more than once. */
   fun close() = Unit
 
+  /** A carrier owner may wait for bounded business-ownership handoffs before destroying its tunnel. */
+  suspend fun awaitClosed() = Unit
+
   /** True after [close] or after the shared Remote session was released. */
   val isClosed: Boolean get() = false
 
@@ -215,11 +218,20 @@ interface HarnessClient {
 
   suspend fun forms(directory: String): List<QuestionRequest>
 
+  /** Durable continued questions can remain answerable while their session is idle. */
+  val recoverableQuestions: Boolean get() = false
+
   suspend fun replyPermission(request: PermissionRequest, reply: String)
 
   suspend fun replyQuestion(request: QuestionRequest, answers: List<List<String>>)
 
   suspend fun rejectQuestion(request: QuestionRequest)
+
+  /** Presentation ownership is separate from monitoring; only the visible foreground reader may claim a timed question. */
+  fun questionPresentation(sessionId: String?, foreground: Boolean) {}
+  fun questionFocus(id: String, focused: Boolean) {}
+  fun questionEngage(id: String) {}
+  fun questionTakeTime(id: String) {}
 
   suspend fun children(session: Session): List<Session>
 

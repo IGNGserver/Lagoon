@@ -1618,6 +1618,7 @@ class LagoonController private constructor(private val appContext: Context) {
     }
   }
   private fun stopSingleConnection() {
+    api?.questionPresentation(null, false)
     stream?.cancel()
     refresh?.cancel()
     eventRefresh?.cancel()
@@ -1801,6 +1802,7 @@ class LagoonController private constructor(private val appContext: Context) {
       return
     }
     api?.setContentWatching(true)
+    synchronizeQuestionPresentation()
     observeWorkspaceEvents(id)
     observeTransport(id)
     connecting = scope.launch {
@@ -1874,6 +1876,7 @@ class LagoonController private constructor(private val appContext: Context) {
       return
     }
     api?.setContentWatching(true)
+    synchronizeQuestionPresentation()
     observeWorkspaceEvents(id)
     observeTransport(id)
     try {
@@ -2047,7 +2050,8 @@ class LagoonController private constructor(private val appContext: Context) {
       .distinct().mapNotNull { identities[it] }.take(MAX_REQUEST_SESSIONS)
     val skippedPermissionSessions = waitingCandidates.filter { directoryHealth.isDown(it.directory) }.map { it.id }.toSet()
     val readableCandidates = waitingCandidates.filterNot { it.id in skippedPermissionSessions }
-    val formDirectories = readableCandidates.map { it.directory }.filter(String::isNotBlank).distinctBy(::normalizedDirectory)
+    val recoveryDirectories = if (client.recoverableQuestions) identities.values.map { it.directory } else emptyList()
+    val formDirectories = (readableCandidates.map { it.directory } + recoveryDirectories).filter(String::isNotBlank).distinctBy(::normalizedDirectory)
       .filterNot { directoryHealth.isDown(it) }.take(MAX_FORM_DIRECTORIES)
     val pendingReads = CoroutineScope(currentCoroutineContext()).async {
       coroutineScope {
@@ -2382,6 +2386,7 @@ class LagoonController private constructor(private val appContext: Context) {
   /** The app came to the foreground: re-read the server unless that just happened, and resume live events. */
   fun onForeground() {
     foreground = true
+    synchronizeQuestionPresentation()
     backgroundStop?.cancel()
     // After a long pause the OS may have frozen or silently dropped the sockets; reconnect rather than
     // trust a stream that only looks open.
@@ -2404,6 +2409,7 @@ class LagoonController private constructor(private val appContext: Context) {
   /** The app left the foreground: process-level connections keep running, the fallback reconcile pauses. */
   fun onBackground() {
     foreground = false
+    synchronizeQuestionPresentation()
     backgroundedAt = System.currentTimeMillis()
     // Control events still drive notifications; transcript/workspace follows are only useful while
     // the reader is on screen. onForeground restores the selected server's content subscription.
@@ -2532,11 +2538,11 @@ class LagoonController private constructor(private val appContext: Context) {
         allOverview?.consider(state.value.serverId ?: return, listOf(request))
         notifyAttention(request.sessionId)
       }
-      "form.created" -> {
+      "form.created", "form.updated" -> {
         val request = props.obj("form").toForm(directory)
-        waitingEventSeqAt[request.sessionId] = ++waitingEventSeq
+        if (event.type == "form.created") waitingEventSeqAt[request.sessionId] = ++waitingEventSeq
         updateState { withSummary(it.copy(questions = (it.questions.filterNot { old -> old.id == request.id } + request))) }
-        notifyAttention(request.sessionId)
+        if (event.type == "form.created") notifyAttention(request.sessionId)
       }
       "permission.replied" -> {
         val requestId = props.str("requestID").ifBlank { props.str("id") }
@@ -3876,8 +3882,19 @@ class LagoonController private constructor(private val appContext: Context) {
   fun conversationVisible(server: String, session: String, visible: Boolean) {
     if (visible) visibleConversation = server to session
     else if (visibleConversation == (server to session)) visibleConversation = null
+    synchronizeQuestionPresentation()
     acknowledgeVisible()
   }
+
+  private fun synchronizeQuestionPresentation() {
+    val selected = state.value.serverId
+    val visible = visibleConversation?.takeIf { it.first == selected }
+    api?.questionPresentation(visible?.second, foreground && visible != null)
+  }
+  fun questionFocus(request: QuestionRequest, focused: Boolean) { api?.questionFocus(request.id, focused) }
+  fun questionEngage(request: QuestionRequest) { api?.questionEngage(request.id) }
+  fun questionTakeTime(request: QuestionRequest) { api?.questionTakeTime(request.id) }
+
   /**
    * 首页「全部已读」：把当前首页范围内的本机结果账本全部标为已读，并撤下对应的结果通知。
    *
@@ -4323,13 +4340,13 @@ class LagoonController private constructor(private val appContext: Context) {
     }
   }
   fun replyQuestion(request: QuestionRequest, answers: List<List<String>>) = act("question:${request.id}", request.directory) { op ->
-    check(request in op.snapshot.questions) { "问题已变化，请刷新" }
+    check(op.snapshot.questions.any { it.id == request.id && it.sessionId == request.sessionId && it.questions == request.questions }) { "问题已变化，请刷新" }
     op.client.replyQuestion(request, answers)
     if (op.connectionCurrent(this)) questionResolved(request.sessionId, request.id)
     cancelAttention(request.sessionId)
   }
   fun rejectQuestion(request: QuestionRequest) = act("question:${request.id}", request.directory) { op ->
-    check(request in op.snapshot.questions) { "问题已变化，请刷新" }
+    check(op.snapshot.questions.any { it.id == request.id && it.sessionId == request.sessionId && it.questions == request.questions }) { "问题已变化，请刷新" }
     op.client.rejectQuestion(request)
     if (op.connectionCurrent(this)) questionResolved(request.sessionId, request.id)
     cancelAttention(request.sessionId)

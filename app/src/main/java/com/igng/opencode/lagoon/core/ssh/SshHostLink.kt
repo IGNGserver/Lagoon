@@ -68,8 +68,13 @@ internal class SshHostLink(
   val remoteHome: String? get() = endpoint?.home
   val workingDirectory: String? get() = config.workingDirectory
   @Volatile private var forwarder: SshForwarder? = null
+  /** Closing DSH drains unanswered waterfalls; retain that exact generation for new RPC sockets. */
+  @Volatile private var drainingTransport: SshTransport? = null
+  @Volatile private var drainingEndpoint: RemoteDshEndpoint? = null
   @Volatile private var client: HarnessClient? = null
   @Volatile private var contentWatching = false
+  @Volatile private var visibleQuestionSession: String? = null
+  @Volatile private var questionForeground = false
   @Volatile private var ready = CompletableDeferred<HarnessClient>()
   /** Bumped every time the authenticated DshApi is replaced, including a failed exchange. */
   private val generation = java.util.concurrent.atomic.AtomicLong()
@@ -132,6 +137,15 @@ internal class SshHostLink(
     contentWatching = enabled
     client?.setContentWatching(enabled)
   }
+
+  fun questionPresentation(sessionId: String?, foreground: Boolean) {
+    visibleQuestionSession = sessionId
+    questionForeground = foreground
+    client?.questionPresentation(sessionId, foreground)
+  }
+  fun questionFocus(id: String, focused: Boolean) { client?.questionFocus(id, focused) }
+  fun questionEngage(id: String) { client?.questionEngage(id) }
+  fun questionTakeTime(id: String) { client?.questionTakeTime(id) }
 
   /** Stable across reconnects: the current DSH generation's workspace titles. */
   val workspaceUpdates: Flow<List<Project>> get() = workspacePublisher.asSharedFlow()
@@ -249,8 +263,10 @@ internal class SshHostLink(
       endpoint = nextEndpoint
       if (forwarder == null) {
         forwarder = SshForwarder { input, output ->
-          val activeTransport = transport ?: throw SshFailure(SshFailureKind.DISCONNECTED, "SSH 连接已断开")
-          val activeEndpoint = endpoint ?: throw SshFailure(SshFailureKind.DISCONNECTED, "dsh web 尚未就绪")
+          val activeTransport = (if (closed) drainingTransport else transport)
+            ?: throw SshFailure(SshFailureKind.DISCONNECTED, "SSH 连接已断开")
+          val activeEndpoint = (if (closed) drainingEndpoint else endpoint)
+            ?: throw SshFailure(SshFailureKind.DISCONNECTED, "dsh web 尚未就绪")
           activeTransport.openTunnel("127.0.0.1", activeEndpoint.port, input, output)
         }
       }
@@ -268,6 +284,7 @@ internal class SshHostLink(
         throw SshFailure(SshFailureKind.DISCONNECTED, "SSH 主机已移除", retryable = false)
       }
       api.setContentWatching(contentWatching)
+      api.questionPresentation(visibleQuestionSession, questionForeground)
       val previousClient = synchronized(this) {
         val old = client
         client = api
@@ -442,6 +459,10 @@ internal class SshHostLink(
 
   override fun close() {
     if (closed) return
+    if (client is DshApi) {
+      drainingTransport = transport
+      drainingEndpoint = endpoint
+    }
     closed = true
     connectJob?.cancel()
     keepAliveJob?.cancel()
@@ -449,14 +470,31 @@ internal class SshHostLink(
     workspaceCollector = null
     val pending = ready
     if (!pending.isCompleted) pending.completeExceptionally(SshFailure(SshFailureKind.DISCONNECTED, "SSH 主机已关闭", retryable = false))
-    runCatching { client?.close() }
+    val closingClient = client
+    val closingTransport = transport
+    val closingForwarder = forwarder
+    if (closingClient is DshApi) {
+      drainingTransport = closingTransport
+      drainingEndpoint = endpoint
+    }
     client = null
-    runCatching { transport?.close() }
     transport = null
     endpoint = null
     openCodeEndpoint = null
-    runCatching { forwarder?.close() }
     forwarder = null
+    runCatching { closingClient?.close() }
+    if (closingClient is DshApi) SharedHttp.ioScope.launch {
+      // attachWait/legacy waterfall handoffs need the SSH tunnel until the API's bounded drain ends.
+      try { closingClient.awaitClosed() } finally {
+        runCatching { closingForwarder?.close() }
+        runCatching { closingTransport?.close() }
+        drainingTransport = null
+        drainingEndpoint = null
+      }
+    } else {
+      runCatching { closingForwarder?.close() }
+      runCatching { closingTransport?.close() }
+    }
     publish(SshLinkPhase.IDLE, SshLinkStep.CONNECT, "")
   }
 

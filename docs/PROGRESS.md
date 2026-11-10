@@ -7,7 +7,10 @@
 ### 阶段 1：官方契约与准确性，部分完成
 - 固定 OpenCode v2.2.6、DSH 0.2.1-rc.5 / 0.2.2-rc.1 fixtures 与提取脚本，真实 Noise/Relay 测试使用官方 schema 正反例。
 - 已接入：DSH model/projection、执行结果 epoch/seq、archive authoritative set、workspace attach partial success、command attachments、typed errors、响应预算；Remote identity scope、分页、不完整目录、损坏存储保护、SSH URL/auth 错误。
-- **尚未接入运行时**：PTC identity projection 与 QuestionRegistry。它们的纯 helper 测试不能作为实际 UI 完成证据。
+- PTC 已接入 DshApi 实时 translate、snapshot/page 历史投影和 TranscriptProjection；rootCallId/parentCallId/subCallId 锚定真实 assistant message，跨页保留祖先，按 durable seq/工具插入顺序归约，普通 native 工具不依赖 PTC 缓存容量。
+- 提问已接入 DshQuestionCoordinator、DshApi、Controller 前后台/可见会话与 Compose 卡片：前台认领/首帧 remainingMs、焦点暂停、编辑保持、慢慢回答、ASK_TIMED_OUT、后台 next handoff、continued 投影/inbox 恢复与排队隐藏。提交失败只读对账，不自动改路或重放。
+- PTC adapter tests 12；Question coordinator 17；Question actual DshApi gateway integration 9。重要 race 覆盖包括同 client queued-reply discard 再答、旧提交与新 event redelivery 并发、cancel 先于 durable continued、directory cold recovery、collector-cancel-first graceful next drain。
+- 当前 integration targeted tests 全通过；最新全量见 `runtime-r5-checkpoint-2.log`。尚无 Android 真机 UI 交互证据。
 
 ### 阶段 2：连接图与安全迁移，部分完成
 - ConnectionSource → HostBinding → HarnessBinding、严格 codec、credential slot refs、稳定 legacy leaf ID、effectiveEnabled 与 capability/generation/delivery 模型。
@@ -49,6 +52,10 @@
 - `ssh-r4-verified.log`：1067 tests、0 failures、0 errors、6 skipped；`:app:assembleDebug` 成功。
 - 独立审查发现 SSE EOF 代次等待、半开池连接复用、注册路径选择回退、无选择测试启动 DSH 四个问题，均已修复并只读复核。增加原连接两次 SSE EOF、新代次超时、半开连接替换测试。
 - `checkpoint-r4.log`：当前 checkpoint 源码 **1070 tests、0 failures、0 errors、6 skipped**；`:app:assembleDebug` 成功，111s。APK 21,556,934 bytes，SHA-256 `4db87ea62e61b121f01c2c7ac9330d9b1cd5e593c688f0074d0403c640bb84c6`。
-- 改动范围 93 files；`git diff --check` 通过；源文件常见 token/private-key pattern 扫描无命中（不等同于完整安全审计）。准备本地阶段提交，不推送/部署/发版；最终 PR 仍待目标完成。
+- 基础批次 93 files 已保存本地提交 `e1ceb83`；`git diff --check` 通过；常见 token/private-key pattern 扫描无命中（不等同于完整安全审计）。未推送/部署/发版；最终 PR 仍待目标完成。
+- Runtime r5：先后修复新增测试的 Kotlin import/JSON 括号/inner fixture、PTC native 缓存 admission、缓存祖先回放、混合工具排序与 lifetime saturation；保留原失败日志，不把其解释为环境失败。
+- 问答审查修复：queued reply 撤回后同客户端可重答、Host cancel 先于 durable pending 的读取竞态、cold idle-session directory 恢复、新投递在旧 submit 期间的认领、关闭时 next RPC 排空、SSH 排空期间新 RPC tunnel、投影读期间 dirty trigger 补读。
+- `runtime-r5-review-2.log`：161 项定向回归全通过。`runtime-r5-final-targeted.log`：PTC/Question+SSH 目标通过；之后加 collector teardown/dirty-read fixtures。
+- `runtime-r5-lifecycle.log`：旧 question test 使用 take(1) 关闭事件监听后继续提交，按新 ownership 语义被拒；已改为在提交期间保留 collector，增加 collector-first teardown 专项测试。
 - 全部构建在 `/home/lvziw/.build/Lagoon/unified-harness-connections/source`，Gradle/build 输出在 `~/.build`。源码工作树无 app/build、node_modules。
 - `wt audit`：29 repos，0 missing dirs，3 detached、4 merged worktrees 属其他任务；只读报告，无清理。

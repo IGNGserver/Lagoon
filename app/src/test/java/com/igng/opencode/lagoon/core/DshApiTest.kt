@@ -1,6 +1,8 @@
 package com.igng.opencode.lagoon.core
 
 import kotlinx.coroutines.flow.take
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.async
 import kotlinx.coroutines.launch
@@ -20,6 +22,7 @@ import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -620,11 +623,15 @@ class DshApiTest {
         }
       }
       val client = api(server)
-      val event = withTimeout(20_000) { client.events {}.take(1).toList() }.single()
+      client.questionPresentation("s1", true)
+      val received = Channel<ServerEvent>(Channel.UNLIMITED)
+      val eventJob = launch { client.events {}.collect { received.send(it) } }
+      val event = withTimeout(20_000) { received.receive() }
       assertEquals("form.created", event.type)
       // 控制器从 properties.form 读表单。
       val form = event.properties.getJSONObject("form")
-      assertEquals("wf-q1", form.getString("id"))
+      assertTrue(form.getString("id").startsWith("dsh:question-event:"))
+      assertNotEquals("wf-q1", form.getString("id"))
       assertEquals("s1", form.getString("sessionID"))
       val field = form.getJSONArray("fields").getJSONObject(0)
       assertEquals("q1", field.getString("key"))
@@ -645,6 +652,10 @@ class DshApiTest {
       assertEquals("q1", answer.getString("id"))
       assertEquals("A", answer.getJSONArray("selected").getString(0))
       assertFalse(answer.has("custom"))
+      client.close()
+      eventJob.cancel()
+      received.close()
+      Unit
     } finally {
       server.shutdown()
     }

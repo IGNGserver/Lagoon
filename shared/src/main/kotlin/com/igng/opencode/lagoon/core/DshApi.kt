@@ -139,11 +139,37 @@ class DshApi(
   private val goalActivation = ConcurrentHashMap<String, String>()
   /** 每个后台任务输出流已读到的字节位移（`job/follow` 的 `from`），断线重连时续读。 */
   private val jobOffsets = ConcurrentHashMap<String, Long>()
-  /** 已认领的定时问答：瀑布 eventId → `userQuestions/attachWait` 的逻辑流。 */
-  private val questionClaims = ConcurrentHashMap<String, WebSocket>()
-  private val claimedQuestions = ConcurrentHashMap.newKeySet<String>()
-  /** 瀑布 eventId → 工具调用 id；瀑布关闭后用它走 `userQuestions/answer`。 */
-  private val questionCallIds = ConcurrentHashMap<String, String>()
+  /** A waterfall belongs to the exact $events client that delivered it. */
+  private data class QuestionDelivery(val clientId: String, val wireEventId: String, val sessionId: String, val callId: String?)
+  private val questionEventClients = ConcurrentHashMap<String, QuestionDelivery>()
+  private val closing = java.util.concurrent.atomic.AtomicBoolean(false)
+  private val shutdown = CompletableDeferred<Unit>()
+  private fun questionDeliveryId(clientId: String, eventId: String) = "${clientId.length}:$clientId:${eventId.length}:$eventId"
+  @Volatile private var questionSession: String? = null
+  @Volatile private var questionForeground = false
+  private val questionRefreshes = ConcurrentHashMap<String, Job>()
+  private val dirtyQuestionRefreshes = ConcurrentHashMap.newKeySet<String>()
+  private val questionCoordinatorDelegate = lazy {
+    DshQuestionCoordinator(ioScope, clock,
+      openClaim = { session, _, callId, remaining, ended ->
+        val socket = openMux("userQuestions/attachWait", envelope(argsOf("agentId" to session, "callId" to callId)),
+          onItem = { item ->
+            val value = item.opt("remainingMs") as? Number ?: throw IOException("提问认领缺少 remainingMs")
+            require(value.toDouble().isFinite() && value.toDouble() >= 0 && value.toDouble() <= Long.MAX_VALUE.toDouble())
+            remaining(value.toLong())
+          }, onClosed = { ended() })
+        java.io.Closeable { socket.cancel() }
+      },
+      settle = { eventId, outcome -> settleQuestionOutcome(eventId, outcome) },
+      answer = { session, callId, answer ->
+        val accepted = call("userQuestions/answer", envelope(argsOf("agentId" to session, "callId" to callId, "answer" to answer)))
+        if (accepted != true) throw ApiException(409, "提问已经结束，请刷新后确认")
+      },
+      refresh = { session -> refreshQuestionProjection(session) },
+      publish = { snapshots -> publishQuestionSnapshots(snapshots) },
+      onError = { error -> Diagnostics.warn("DshApi", "提问状态更新失败", error) })
+  }
+  private val questionCoordinator: DshQuestionCoordinator get() = questionCoordinatorDelegate.value
   /** 需要实时事件（`session/follow`）的会话，最近打开的放最后。 */
   private val watched = LinkedHashSet<String>()
   /** 当前打开的会话；容量淘汰时优先保留，避免首页刷新把正在阅读的 follow 挤掉。 */
@@ -224,29 +250,63 @@ class DshApi(
   /** Execution-scoped outcomes: old history/late reads cannot overwrite a newer running turn. */
   private val executions = DshExecutionTracker()
   private val outcomeReads = ConcurrentHashMap<String, Long>()
+  /** PTC ancestry survives page/snapshot boundaries; session eviction bounds retained tool data. */
+  private val ptcProjections = LinkedHashMap<String, DshPtcProjection>()
+  private fun ptcProjection(sessionId: String): DshPtcProjection = synchronized(ptcProjections) {
+    ptcProjections.remove(sessionId)?.also { ptcProjections[sessionId] = it } ?: DshPtcProjection().also {
+      ptcProjections[sessionId] = it
+      while (ptcProjections.size > WATCH_LIMIT) {
+        val victim = ptcProjections.keys.firstOrNull { id -> id != sessionId && id != activeSessionId } ?: break
+        ptcProjections.remove(victim)
+      }
+    }
+  }
 
-  override val isClosed: Boolean get() = closed || remoteBackend?.isClosed == true
+  override val isClosed: Boolean get() = closing.get() || closed || remoteBackend?.isClosed == true
 
   override fun capabilities(): ApiCapabilities = if (remoteBackend == null) CAPABILITIES else CAPABILITIES.copy(diff = false)
 
   override fun close() {
+    if (closed || !closing.compareAndSet(false, true)) return
+    if (questionCoordinatorDelegate.isInitialized()) {
+      questionCoordinator.close()
+      if (!questionCoordinator.hasPendingSettlements()) { closeTransportAfterQuestions(); return }
+      // Keep the physical carrier alive until ownership handoffs are delivered. Local channel close
+      // alone does not settle an unowned Host waterfall. Bound teardown so a dead socket cannot
+      // retain this client indefinitely.
+      ioScope.launch {
+        try {
+          val drained = kotlinx.coroutines.withTimeoutOrNull(2_000) { questionCoordinator.awaitSettlements(); true } == true
+          if (!drained) {
+            Diagnostics.warn("DshApi", "提问交还请求未在关闭期限内确认，结果未知；释放认领且不重放")
+            questionCoordinator.abortSettlements()
+          }
+        } finally { closeTransportAfterQuestions() }
+      }
+      return
+    }
+    closeTransportAfterQuestions()
+  }
+
+  private fun closeTransportAfterQuestions() {
+    if (closed) return
     closed = true
     activeSessionId = null
     eventChannel?.close()
     followStates.values.toList().forEach(::stopFollowState)
     followStates.clear()
     durableTurns.clear(); liveParts.clear(); liveAttempts.clear()
+    synchronized(ptcProjections) { ptcProjections.clear() }
     executions.clear(); outcomeReads.clear()
     pendingApprovals.clear(); pendingQuestions.clear()
-    // attachWait is a claim, not a fire-and-forget request. Closing the client must release every
-    // claim socket so the Host can settle timed questions instead of retaining a dead UI claimant.
-    questionClaims.values.toList().forEach { runCatching { it.cancel() } }
-    questionClaims.clear()
-    claimedQuestions.clear()
-    questionCallIds.clear()
-    muxOwner.close()
-    remoteBackend?.close()
+    questionEventClients.clear()
+    try {
+      muxOwner.close()
+      remoteBackend?.close()
+    } finally { shutdown.complete(Unit) }
   }
+
+  override suspend fun awaitClosed() { shutdown.await() }
 
   override suspend fun discoverCapabilities(): ApiCapabilities = capabilities()
 
@@ -992,10 +1052,20 @@ class DshApi(
     payload: RpcPayload,
     onItem: (JSONObject) -> Unit,
     onClosed: (Throwable?) -> Unit
-  ): WebSocket = withContext(Dispatchers.IO) {
-    val wirePayload = payload.json
-    remoteBackend?.let { return@withContext it.open(endpoint, wirePayload, onItem, onClosed) }
-    muxOwner.open(endpoint, wirePayload, onItem, onClosed)
+  ): WebSocket {
+    var acquired: WebSocket? = null
+    try {
+      return withContext(Dispatchers.IO) {
+        val wirePayload = payload.json
+        (remoteBackend?.open(endpoint, wirePayload, onItem, onClosed)
+          ?: muxOwner.open(endpoint, wirePayload, onItem, onClosed)).also { acquired = it }
+      }
+    } catch (error: Throwable) {
+      // withContext has prompt cancellation on the return dispatcher: a freshly opened resource
+      // may never reach its caller. Keep ownership here until that handoff actually succeeds.
+      acquired?.cancel()
+      throw error
+    }
   }
 
   /** Test seam for exercising physical API-Peer ownership without starting the full event loops. */
@@ -1417,12 +1487,15 @@ class DshApi(
           .put("content", data.obj("message").arr("content")))
       }
       "tool/call" -> {
+        val projection = ptcProjection(session.id)
+        synchronized(projection) { projection.indexRoots(listOf(event)) }
         val callId = data.str("callId")
-        val name = data.str("name")
-        if (callId.isNotBlank()) {
+        val assistantId = nativeToolMessageId(data)
+        // The bounded PTC ancestry cache must never limit native tool cards.
+        if (callId.isNotBlank() && assistantId != null) {
           val input = parseArguments(data.str("arguments"))
-          emit("session.tool.input.started", base.put("assistantMessageID", messageId(data)).put("id", callId).put("name", name))
-          emit("session.tool.called", base.put("assistantMessageID", messageId(data)).put("id", callId).put("name", name).put("input", input))
+          emit("session.tool.input.started", base.put("assistantMessageID", assistantId).put("id", callId).put("name", data.str("name")))
+          emit("session.tool.called", base.put("assistantMessageID", assistantId).put("id", callId).put("name", data.str("name")).put("input", input))
         }
       }
       "tool/result" -> {
@@ -1440,25 +1513,19 @@ class DshApi(
       // PTC（程序化工具调用）的子调用是**耐久事件**，不是实时增量。v1 代际把它记作
       // `tool/code-dispatch*`，v3 改名成 `tool/ptc-dispatch*`；两个名字都得认，否则开着 PTC
       // 的主机上工具卡片整段缺席。
-      "tool/ptc-dispatch-start", "tool/code-dispatch-start" -> {
-        val callId = data.str("subCallId").ifBlank { data.str("callId") }
-        if (callId.isNotBlank()) {
-          val name = data.str("name")
-          emit("session.tool.input.started", base.put("assistantMessageID", messageId(data)).put("id", callId).put("name", name))
-          emit("session.tool.called", base.put("assistantMessageID", messageId(data)).put("id", callId).put("name", name)
-            .put("input", data.opt("arguments") ?: JSONObject()))
-        }
-      }
+      "tool/ptc-dispatch-start", "tool/code-dispatch-start",
       "tool/ptc-dispatch", "tool/code-dispatch" -> {
-        val callId = data.str("subCallId").ifBlank { data.str("callId") }
-        if (callId.isNotBlank()) {
-          val name = data.str("name")
-          val properties = base.put("assistantMessageID", messageId(data)).put("id", callId)
-            .put("content", data.arr("content"))
-            .put("metadata", JSONObject().put("tool", name))
-            .put("name", name)
-          if (data.optBoolean("isError")) emit("session.tool.failed", properties.put("error", data.obj("error")))
-          else emit("session.tool.success", properties)
+        val projection = ptcProjection(session.id)
+        val child = synchronized(projection) { projection.process(type, data, seq, time) }
+        if (child != null) {
+          val properties = child.properties().put("sessionID", session.id).put("sequence", seq)
+          // Child payloads have no turn/step; ancestry is anchored by the native root call.
+          if (child.kind == DshPtcEvent.Kind.START) {
+            emit("session.tool.input.started", properties)
+            emit("session.tool.called", properties)
+          } else {
+            emit(if (child.state.isError) "session.tool.failed" else "session.tool.success", properties)
+          }
         }
       }
       "session/title" -> emit("session.renamed", base.put("title", data.str("title")))
@@ -1512,6 +1579,15 @@ class DshApi(
 
   /** `msg_<turn>:<step>`：同一步的 `step/start`、`assistant/message`、`tool/call` 共用一个消息 id。 */
   private fun messageId(data: JSONObject): String = "msg_${data.optDouble("turn", 0.0).toLong()}:${data.optDouble("step", 0.0).toLong()}"
+
+  private fun nativeToolMessageId(data: JSONObject): String? {
+    listOf("assistantMessageID", "assistantMessageId", "messageID", "messageId").forEach { key ->
+      (data.opt(key) as? String)?.takeIf(String::isNotBlank)?.let { return it }
+    }
+    val turn = data.optLong("turn").takeIf { it > 0 } ?: return null
+    val step = data.optLong("step").takeIf { it > 0 } ?: return null
+    return "msg_$turn:$step"
+  }
 
   private fun liveKey(sessionId: String, data: JSONObject): String =
     "$sessionId|${data.optDouble("turn", 0.0).toLong()}|${data.optDouble("step", 0.0).toLong()}"
@@ -1716,7 +1792,9 @@ class DshApi(
     // follow 可能先于事件流建立：把快照之后、事件流挂上之前到达的增量补送，避免“打开会话的头几秒丢了”。
     flushFollowBuffers(push)
 
-    val eventsJob = launch { runEventsLoop(push, onOpen) { closed } }
+    // The business waterfall outlives its UI collector long enough to hand ownership back. A
+    // collector cancellation must not cancel the gateway client before its queued `next` RPC.
+    val eventsJob = ioScope.launch { runEventsLoop(push, onOpen) { closed } }
     val statusJob = launch { runStatusFallback(push) { closed } }
 
     val pump = launch {
@@ -1749,7 +1827,13 @@ class DshApi(
 
     awaitClose {
       closed = true
-      eventsJob.cancel()
+      if (questionCoordinatorDelegate.isInitialized()) questionCoordinator.presentation(null, false)
+      if (questionCoordinatorDelegate.isInitialized() && questionCoordinator.hasPendingSettlements()) {
+        ioScope.launch {
+          try { kotlinx.coroutines.withTimeoutOrNull(2_000) { questionCoordinator.awaitSettlements() } }
+          finally { eventsJob.cancel() }
+        }
+      } else eventsJob.cancel()
       statusJob.cancel()
       contentWatcher.cancel()
       contentJob?.cancel()
@@ -1777,7 +1861,14 @@ class DshApi(
           eventsLastFrameAt = System.currentTimeMillis()
           when (frame.str("type")) {
             "ready" -> {
-              eventsClientId = frame.str("clientId")
+              val nextClientId = frame.str("clientId")
+              for ((deliveryId, delivery) in questionEventClients.toMap()) {
+                if (delivery.clientId != nextClientId) {
+                  if (questionCoordinatorDelegate.isInitialized()) questionCoordinator.cancelled(deliveryId)
+                  questionEventClients.remove(deliveryId, delivery)
+                }
+              }
+              eventsClientId = nextClientId
               eventsReady = true
               wasReady = true
               readySignal.complete(Unit)
@@ -2081,6 +2172,7 @@ class DshApi(
   }
 
   private fun handleWaterfall(frame: JSONObject, push: (ServerEvent) -> Unit) {
+    if (closing.get()) return
     val name = frame.str("event")
     val eventId = frame.str("eventId")
     if (eventId.isNotBlank()) redelivered += eventId
@@ -2107,39 +2199,14 @@ class DshApi(
           properties = properties, created = System.currentTimeMillis()))
       }
       "user-questions/request" -> {
-        if (eventId.isBlank()) return
-        // 定时问答（`wait.timed`）只有"某客户端认领"时 Host 才不会自己到点关窗。
-        // 不认领的话手机切走再回来，卡片已经被主机取消，且 answered 太晚的 `$events/result` 会被丢弃。
-        val wait = request.obj("wait")
-        // 记下 callId：瀑布关闭后（`pending`/`continued`）只能靠它走 `userQuestions/answer` 作答。
-        wait.str("callId").takeIf { it.isNotBlank() }?.let { questionCallIds[eventId] = it }
-        if (wait.optBoolean("timed")) claimTimedQuestion(sessionId, eventId, wait.str("callId"))
-        val fields = JSONArray()
-        for (question in request.arr("questions").objects()) {
-          val options = JSONArray()
-          for (option in question.arr("options").objects()) {
-            val label = option.str("label")
-            // DSH 没有独立的选项 value：答案按 label 回显，表单身份也只能取 label。
-            options.put(JSONObject()
-              .put("label", label)
-              .put("description", option.str("description"))
-              .put("value", label))
-          }
-          fields.put(JSONObject()
-            .put("key", question.str("id"))
-            .put("title", question.str("question"))
-            .put("description", question.str("detail"))
-            .put("type", if (question.optBoolean("multiSelect")) "multiselect" else "select")
-            .put("options", options)
-            .put("custom", true))
-        }
-        // 控制器从 `properties.form` 读表单；id 用瀑布事件 id，回答时按它结算。
-        val form = JSONObject().put("id", eventId).put("sessionID", sessionId).put("fields", fields)
-        val properties = JSONObject().put("form", form)
-        val parsed = try { form.toForm(directory) } catch (error: Exception) { null }
-        if (parsed != null) pendingQuestions[eventId] = parsed
-        push(ServerEvent(id = "dsh:question:$eventId", directory = directory, type = "form.created",
-          properties = properties, created = System.currentTimeMillis()))
+        if (eventId.isBlank() || sessionId.isBlank()) return
+        val clientId = eventsClientId ?: return
+        val deliveryId = questionDeliveryId(clientId, eventId)
+        if (questionEventClients.size >= 1024 && !questionEventClients.containsKey(deliveryId))
+          throw IOException("提问事件超过客户端预算")
+        questionEventClients[deliveryId] = QuestionDelivery(clientId, eventId, sessionId,
+          request.optJSONObject("wait")?.optString("callId")?.takeIf { it.isNotBlank() })
+        questionCoordinator.receive(sessionId, deliveryId, request)
       }
     }
   }
@@ -2151,7 +2218,7 @@ class DshApi(
   private fun reconcileAfterReady(push: (ServerEvent) -> Unit) {
     val generation = readyGeneration.incrementAndGet()
     redelivered.clear()
-    val stale = pendingApprovals.keys.toSet() + pendingQuestions.keys.toSet()
+    val stale = pendingApprovals.keys.toSet() + questionEventClients.values.map { it.wireEventId }.toSet()
     if (stale.isEmpty()) return
     ioScope.launch {
       kotlinx.coroutines.delay(REDELIVERY_GRACE_MILLIS)
@@ -2168,7 +2235,14 @@ class DshApi(
   }
 
   private fun settleLocally(eventId: String, push: (ServerEvent) -> Unit) {
-    releaseQuestionClaim(eventId)
+    val deliveryId = eventsClientId?.let { questionDeliveryId(it, eventId) }
+    val delivery = deliveryId?.let { questionEventClients.remove(it) }
+    if (deliveryId != null && questionCoordinatorDelegate.isInitialized()) questionCoordinator.cancelled(deliveryId)
+    if (delivery != null && !closed) ioScope.launch {
+      try { reconcileCancelledQuestion(delivery) }
+      catch (cancel: CancellationException) { throw cancel }
+      catch (error: Exception) { Diagnostics.warn("DshApi", "提问取消后的投影对账失败", error) }
+    }
     val now = System.currentTimeMillis()
     val permission = pendingApprovals.remove(eventId)
     if (permission != null) {
@@ -2176,12 +2250,7 @@ class DshApi(
         properties = JSONObject().put("sessionID", permission.sessionId).put("id", eventId), created = now))
       return
     }
-    val question = pendingQuestions.remove(eventId)
-    if (question != null) {
-      questionCallIds.remove(eventId)
-      push(ServerEvent(id = "dsh:question-settled:$eventId", directory = question.directory, type = "form.cancelled",
-        properties = JSONObject().put("sessionID", question.sessionId).put("id", eventId), created = now))
-    }
+
   }
 
   /** 回一条瀑布：`{clientId, eventId, outcome}`，结果值按事件类型自己决定。 */
@@ -2207,43 +2276,97 @@ class DshApi(
     } catch (error: Exception) {
       Diagnostics.info("DshApi", "瀑布结算失败，尝试备用通道：${error.message.orEmpty().take(120)}")
       false
+    }
+  }
+
+  private suspend fun settleQuestionOutcome(eventId: String, outcome: JSONObject) {
+    val delivery = questionEventClients[eventId] ?: throw ApiException(409, "提问事件通道已变化，请刷新后确认")
+    try {
+      call("\$events/result", envelope(JSONObject().put("clientId", delivery.clientId)
+        .put("eventId", delivery.wireEventId).put("outcome", outcome)))
     } finally {
-      releaseQuestionClaim(eventId)
+      questionEventClients.remove(eventId, delivery)
     }
   }
 
-  /**
-   * 认领一条定时问答：`userQuestions/attachWait` 是一条流，只要它还开着，Host 就认为有客户端在等，
-   * 不会到点自己关窗。认领失败只降级成"被动等待"，不影响作答。
-   */
-  private fun claimTimedQuestion(sessionId: String, eventId: String, callId: String) {
-    if (callId.isBlank() || sessionId.isBlank() || closed) return
-    if (!claimedQuestions.add(eventId)) return
-    ioScope.launch {
-      try {
-        val socket = openMux("userQuestions/attachWait", envelope(argsOf("agentId" to sessionId, "callId" to callId)),
-          onItem = { }, onClosed = { })
-        questionClaims[eventId] = socket
-      } catch (cancel: CancellationException) {
-        claimedQuestions.remove(eventId)
-        throw cancel
-      } catch (error: Exception) {
-        claimedQuestions.remove(eventId)
-        Diagnostics.warn("DshApi", "认领定时问答失败，改为被动等待", error)
+  private suspend fun refreshQuestionProjection(sessionId: String) {
+    val result = call("session/projections", requestArgs(JSONObject().put("sessionId", sessionId))) as? JSONObject
+      ?: throw IOException("提问投影不是对象")
+    questionCoordinator.reconcile(sessionId, result.obj("values"))
+  }
+
+  private fun refreshQuestionsAfterDurableEvent(sessionId: String, event: JSONObject) {
+    if (!questionCoordinatorDelegate.isInitialized() || closing.get()) return
+    if (event.str("type") !in setOf("tool/result", "user/message", "turn/end", "session/inbox")) return
+    synchronized(questionRefreshes) {
+      if (questionRefreshes[sessionId]?.isActive == true) {
+        dirtyQuestionRefreshes += sessionId
+        return
       }
+      val job = ioScope.launch(start = kotlinx.coroutines.CoroutineStart.LAZY) {
+        var attempts = 0
+        do {
+          dirtyQuestionRefreshes.remove(sessionId)
+          try { refreshQuestionProjection(sessionId) }
+          catch (cancel: CancellationException) { throw cancel }
+          catch (error: Exception) { Diagnostics.warn("DshApi", "提问耐久事件对账失败", error) }
+          attempts++
+        } while (!closed && !closing.get() && dirtyQuestionRefreshes.contains(sessionId) && attempts < 8)
+      }
+      questionRefreshes[sessionId] = job
+      job.invokeOnCompletion {
+        val again = synchronized(questionRefreshes) {
+          val removed = questionRefreshes.remove(sessionId, job)
+          removed && !closed && !closing.get() && dirtyQuestionRefreshes.remove(sessionId)
+        }
+        if (again) refreshQuestionsAfterDurableEvent(sessionId, JSONObject().put("type", "tool/result"))
+      }
+      job.start()
     }
   }
 
-  /**
-   * 结算/取消后释放认领，避免一直占着一条逻辑流。
-   *
-   * 刻意**不**清 `questionCallIds`：结算失败要回落到 `userQuestions/answer`，那条路还需要 callId。
-   * 它由 [settleLocally]（提问真的结束时）和作答成功时清理。
-   */
-  private fun releaseQuestionClaim(eventId: String) {
-    claimedQuestions.remove(eventId)
-    questionClaims.remove(eventId)?.cancel()
+  private suspend fun reconcileCancelledQuestion(delivery: QuestionDelivery) {
+    // Gateway cancellation precedes the durable pending tool result. Retry READS only while that
+    // exact call is still open; never replay a settlement/answer mutation.
+    for (attempt in 0..4) {
+      if (closed || closing.get()) return
+      if (attempt > 0) delay(100L shl (attempt - 1))
+      refreshQuestionProjection(delivery.sessionId)
+      val state = delivery.callId?.let { questionCoordinator.snapshotForCall(delivery.sessionId, it) }
+      if (state?.state != "open" || state.eventId != null) return
+    }
   }
+
+  private fun publishQuestionSnapshots(snapshots: List<DshQuestionRegistry.Snapshot>) {
+    val next = snapshots.map { snapshot -> snapshot.toQuestionForm(known[snapshot.sessionId]?.directory.orEmpty()).copy(
+      presentation = QuestionPresentation(snapshot.remainingMs?.let { remaining ->
+        (remaining.coerceAtMost(Long.MAX_VALUE - 999) + 999) / 1000 * 1000
+      }, snapshot.countdownRunning, snapshot.held, snapshot.state == "continued")) }.associateBy { it.id }
+    val previous = pendingQuestions.toMap()
+    pendingQuestions.keys.removeAll { it !in next }
+    pendingQuestions.putAll(next)
+    for ((id, request) in previous) if (id !in next) eventChannel?.trySend(ServerEvent(
+      id = "dsh:question-removed:${nextLiveEventId()}", directory = request.directory, type = "form.cancelled",
+      properties = JSONObject().put("sessionID", request.sessionId).put("id", id), created = clock()))
+    for ((id, request) in next) if (request != previous[id]) {
+      val form = JSONObject().put("id", id).put("sessionID", request.sessionId)
+        .put("fields", JSONArray().apply { request.questions.forEach { put(JSONObject(it.field)) } })
+      request.presentation?.let { state -> form.put("questionPresentation", JSONObject()
+        .putOpt("remainingMs", state.remainingMs).put("countdownRunning", state.countdownRunning)
+        .put("held", state.held).put("continued", state.continued)) }
+      eventChannel?.trySend(ServerEvent(id = "dsh:question-change:${nextLiveEventId()}", directory = request.directory,
+        type = if (id in previous) "form.updated" else "form.created", properties = JSONObject().put("form", form), created = clock()))
+    }
+  }
+
+  override fun questionPresentation(sessionId: String?, foreground: Boolean) {
+    questionSession = sessionId
+    questionForeground = foreground
+    if (!isClosed) questionCoordinator.presentation(sessionId, foreground)
+  }
+  override fun questionFocus(id: String, focused: Boolean) = questionCoordinator.focus(id, focused)
+  override fun questionEngage(id: String) = questionCoordinator.engage(id)
+  override fun questionTakeTime(id: String) = questionCoordinator.takeTime(id)
 
   /** 拒绝一条瀑布：`{kind:"rejected", error:{name, message}}`。 */
   private suspend fun reject(eventId: String, message: String) {
@@ -2375,6 +2498,14 @@ class DshApi(
         frame.arr("records").objects().lastOrNull { it.obj("event").str("type") == "turn/start" }
           ?.obj("event")?.obj("data")?.optLong("turn")?.takeIf { it > 0 }?.let { durableTurns[session.id] = it }
         val baseline = lastSeq(session.id)
+        val projection = ptcProjection(session.id)
+        synchronized(projection) {
+          val records = frame.arr("records").objects()
+          projection.indexRoots(records)
+          // Seed already-covered ancestors before newer children arrive, even without a message read.
+          records.filter { baseline == 0L || it.obj("event").optLong("seq") <= baseline }
+            .forEach { projection.process(it) }
+        }
         if (!state.snapshot.isCompleted) state.snapshot.complete(frame)
         // 重连/重同步：只补投时间线还没有的耐久记录，避免整页重复。
         if (baseline > 0) {
@@ -2409,6 +2540,7 @@ class DshApi(
             }
           }
           translate(session, event).forEach { emitFollow(state, it) }
+          refreshQuestionsAfterDurableEvent(session.id, event)
           if (seq > 0) advanceSeq(session.id, seq)
         }
       }
@@ -2499,6 +2631,9 @@ class DshApi(
 
   private fun stopFollow(id: String) {
     followStates[id]?.let(::stopFollowState)
+    if (id != activeSessionId && !synchronized(watched) { id in watched }) {
+      synchronized(ptcProjections) { ptcProjections.remove(id) }
+    }
   }
 
   private fun stopFollowState(state: FollowState) {
@@ -2593,11 +2728,19 @@ class DshApi(
    * 模型侧原文，也不丢失轮次起点。
    */
   internal suspend fun recordsToMessages(session: Session, records: List<JSONObject>): List<Message> {
-    data class ToolEntry(val id: String, val name: String, val input: JSONObject, var state: JSONObject?)
-    data class Step(val turn: Long, val step: Long, var started: Long, var order: Int,
-      val blocks: MutableList<JSONObject>, val tools: MutableMap<String, ToolEntry>, var ended: Long)
+    // Durable seq is authoritative even if a reconstructed/stitched window arrives out of order.
+    val orderedRecords = records.withIndex().sortedWith(compareBy<IndexedValue<JSONObject>> {
+      it.value.obj("event").optLong("seq").takeIf { seq -> seq > 0 } ?: Long.MAX_VALUE
+    }.thenBy { it.index }).map { it.value }
+    data class ToolEntry(val id: String, val name: String, val input: Any, var state: JSONObject?)
+    data class Step(val id: String, val turn: Long?, var started: Long, var order: Int,
+      val blocks: MutableList<JSONObject>, val tools: MutableMap<String, ToolEntry>, var ended: Long,
+      val toolOrder: MutableSet<String> = LinkedHashSet())
 
-    val steps = LinkedHashMap<Pair<Long, Long>, Step>()
+    val sessionPtc = ptcProjection(session.id)
+    val ptc = synchronized(sessionPtc) { sessionPtc.replayFor(orderedRecords) }
+    val ptcParts = LinkedHashMap<String, LinkedHashMap<String, MessagePart>>()
+    val steps = LinkedHashMap<String, Step>()
     val inputs = mutableListOf<Triple<Long, Int, Message>>()
     var lifecycleNotices = emptyList<Message>()
     var currentTurn: Long? = null
@@ -2605,10 +2748,11 @@ class DshApi(
     fun stepOf(data: JSONObject): Step {
       val turn = data.optDouble("turn", 0.0).toLong()
       val number = data.optDouble("step", 0.0).toLong()
-      return steps.getOrPut(turn to number) { Step(turn, number, 0, order, mutableListOf(), mutableMapOf(), 0) }
+      val id = "msg_$turn:$number"
+      return steps.getOrPut(id) { Step(id, turn, 0, order, mutableListOf(), mutableMapOf(), 0) }
     }
 
-    for (record in records) {
+    for (record in orderedRecords) {
       order++
       val event = record.obj("event")
       val type = event.str("type")
@@ -2640,10 +2784,26 @@ class DshApi(
           }
         }
         "tool/call" -> {
-          val step = stepOf(data)
+          val callId = data.str("callId").takeIf(String::isNotBlank) ?: continue
+          val assistantId = nativeToolMessageId(data) ?: continue
+          val step = steps.getOrPut(assistantId) {
+            Step(assistantId, data.optLong("turn").takeIf { it > 0 }, 0, order, mutableListOf(), mutableMapOf(), 0)
+          }
           if (step.started == 0L) step.started = time
-          val callId = data.str("callId")
-          if (callId.isNotBlank()) step.tools[callId] = ToolEntry(callId, data.str("name"), parseArguments(data.str("arguments")) as? JSONObject ?: JSONObject(), null)
+          step.tools[callId] = ToolEntry(callId, data.str("name"), parseArguments(data.str("arguments")), null)
+          step.toolOrder += callId
+        }
+        "tool/ptc-dispatch-start", "tool/code-dispatch-start",
+        "tool/ptc-dispatch", "tool/code-dispatch" -> {
+          val child = ptc.process(type, data, seq, time) ?: continue
+          synchronized(sessionPtc) { sessionPtc.process(type, data, seq, time) }
+          val root = ptc.indexedRoots()[child.rootCallId] ?: continue
+          val step = steps.getOrPut(child.assistantMessageId) {
+            Step(child.assistantMessageId, root.turn, time, order, mutableListOf(), mutableMapOf(), 0)
+          }
+          if (step.started == 0L) step.started = time
+          ptcParts.getOrPut(step.id) { LinkedHashMap() }[child.subCallId] = child.state.messagePart()
+          step.toolOrder += child.subCallId
         }
         "tool/result" -> {
           val step = stepOf(data)
@@ -2661,7 +2821,7 @@ class DshApi(
     entries += inputs
     lifecycleNotices.forEach { message -> entries += Triple(message.created, 0, message) }
     for (step in steps.values) {
-      val id = "msg_${step.turn}:${step.step}"
+      val id = step.id
       val content = JSONArray()
       for (block in step.blocks) {
         val kind = block.str("type")
@@ -2673,7 +2833,8 @@ class DshApi(
         state.put("input", tool.input)
         content.put(JSONObject().put("type", "tool").put("id", tool.id).put("name", tool.name).put("state", state))
       }
-      if (content.length() == 0) continue
+      val children = ptcParts[id]?.values.orEmpty()
+      if (content.length() == 0 && children.isEmpty()) continue
       val json = JSONObject()
         .put("id", id)
         .put("type", "assistant")
@@ -2685,8 +2846,12 @@ class DshApi(
       if (model != null) {
         json.put("model", JSONObject().put("providerID", model.providerId).put("id", model.modelId).put("name", model.label))
       }
+      val message = json.toMessage()
+      val nativeParts = message.parts.filter { it.type == "tool" }.associateBy { it.id }
+      val orderedTools = step.toolOrder.mapNotNull { toolId -> nativeParts[toolId] ?: ptcParts[id]?.get(toolId) }
       entries += Triple(step.started, step.order,
-        json.toMessage().copy(turnId = "turn:${step.turn}", sequence = records.getOrNull(step.order - 1)?.obj("event")?.optLong("seq")))
+        message.copy(parts = message.parts.filterNot { it.type == "tool" } + orderedTools, turnId = step.turn?.let { "turn:$it" },
+          sequence = orderedRecords.getOrNull(step.order - 1)?.obj("event")?.optLong("seq")))
     }
     entries.sortWith(compareBy<Triple<Long, Int, Message>> { it.first }.thenBy { it.second })
     return entries.map { it.third }
@@ -2703,6 +2868,7 @@ class DshApi(
     val value = call("session/projections", requestArgs(JSONObject().put("sessionId", id))) as? JSONObject
       ?: return@withContext ComposerContext()
     val values = value.obj("values")
+    questionCoordinator.reconcile(id, values)
     ComposerContext(inbox = inboxMessages(values), todos = values.todoProjection(), goal = values.goalProjection())
   }
 
@@ -3553,7 +3719,21 @@ class DshApi(
   override suspend fun pendingPermissions(directory: String): List<PermissionRequest> =
     pendingApprovals.values.toList()
 
-  override suspend fun forms(directory: String): List<QuestionRequest> = pendingQuestions.values.toList()
+  override val recoverableQuestions: Boolean get() = true
+
+  override suspend fun forms(directory: String): List<QuestionRequest> {
+    val listed = if (known.isEmpty() && questionSession == null && directory.isNotBlank())
+      listing().items.mapNotNull(::itemToSession) else emptyList()
+    val matching = (known.values + listed).distinctBy { it.id }.filter { !it.archived && !it.blank &&
+      (directory.isBlank() || normalizedDirectory(it.directory) == normalizedDirectory(directory)) }
+    val sessions = (matching.map { it.id } + listOfNotNull(questionSession)).distinct()
+    // A partial scan is never an authoritative empty directory. The overview retains its last
+    // question snapshot on this explicit error instead of silently losing unscanned requests.
+    if (sessions.size > 256) throw ApiException(409, "目录中的会话过多，提问对账未完成，请打开目标会话")
+    if (directory.isNotBlank() && sessions.isEmpty()) return emptyList()
+    for (id in sessions) refreshQuestionProjection(id)
+    return pendingQuestions.values.filter { directory.isBlank() || normalizedDirectory(it.directory) == normalizedDirectory(directory) }
+  }
 
   override suspend fun replyPermission(request: PermissionRequest, reply: String) {
     pendingApprovals.remove(request.id)
@@ -3565,36 +3745,20 @@ class DshApi(
   }
 
   override suspend fun replyQuestion(request: QuestionRequest, answers: List<List<String>>) {
-    pendingQuestions.remove(request.id)
+    require(answers.size == request.questions.size) { "提问字段已变化，请刷新" }
     val payload = JSONArray()
     request.questions.forEachIndexed { index, prompt ->
-      val row = answers.getOrNull(index).orEmpty().filter(String::isNotBlank)
-      // `field` 是 OpenCode 形状的表单字段 JSON，问题 id 存在 `key` 里。
+      val row = answers[index].filter(String::isNotBlank)
       val questionId = runCatching { JSONObject(prompt.field).str("key") }.getOrNull()?.takeIf(String::isNotBlank)
         ?: prompt.field.ifBlank { prompt.title }
       val (selected, custom) = row.splitAnswer(prompt.options)
-      val answer = JSONObject().put("id", questionId).put("selected", JSONArray(selected))
-      if (custom != null) answer.put("custom", custom)
-      payload.put(answer)
+      payload.put(JSONObject().put("id", questionId).put("selected", JSONArray(selected))
+        .apply { if (custom != null) put("custom", custom) })
     }
-    val answer = JSONObject().put("answers", payload)
-    if (trySettle(request.id, answer)) return
-    // 瀑布已经不在等（Host 到点把提问结算成 `pending`/`continued`，或事件流重连过）：
-    // `$events/result` 迟到的答案会被静默丢弃，改用按 `callId` 找回那次提问的
-    // `userQuestions/answer`。
-    val callId = questionCallIds[request.id]
-    if (callId.isNullOrBlank()) throw ApiException(409, "这次提问已经结束，请让 Agent 重新提问")
-    call("userQuestions/answer", envelope(argsOf(
-      "agentId" to request.sessionId, "callId" to callId, "answer" to answer
-    )))
-    questionCallIds.remove(request.id)
-    releaseQuestionClaim(request.id)
+    questionCoordinator.answer(request.id, JSONObject().put("answers", payload))
   }
 
-  override suspend fun rejectQuestion(request: QuestionRequest) {
-    pendingQuestions.remove(request.id)
-    reject(request.id, "用户取消了回答")
-  }
+  override suspend fun rejectQuestion(request: QuestionRequest) = questionCoordinator.dismiss(request.id)
 
   override suspend fun children(session: Session): List<Session> = withContext(Dispatchers.IO) {
     listing().items.mapNotNull { itemToSession(it) }.filter { it.parentId == session.id && !it.blank }

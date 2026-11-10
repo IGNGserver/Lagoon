@@ -383,7 +383,7 @@ internal class AllServersOverview(
                     while (resolvedSessions.size > 1000) resolvedSessions.remove(resolvedSessions.first())
                     approver.settled(requestId)
                     snapshot = snapshot.copy(permissions = snapshot.permissions.filterNot { it.id == requestId })
-                  } else if (event.type == "form.created") {
+                  } else if (event.type == "form.created" || event.type == "form.updated") {
                     waitingRevision++
                     val form = props.obj("form").toForm(event.directory)
                     snapshot = snapshot.copy(questions = snapshot.questions.filterNot { it.id == form.id } + form)
@@ -577,7 +577,8 @@ internal class AllServersOverview(
       batch.map { directory -> async { directory to attempt { client.pendingPermissions(directory) } } }.awaitAll()
     } }
     sweepPermissionResults.forEach { (directory, result) -> if (result.isSuccess) directoryHealth.succeeded(directory) else directoryHealth.failed(directory) }
-    val formDirectories = (readableSessions.map { it.directory } + previous.questions.map { it.directory } +
+    val recoveryDirectories = if (client.recoverableQuestions) identityMap.values.map { it.directory } else emptyList()
+    val formDirectories = (readableSessions.map { it.directory } + previous.questions.map { it.directory } + recoveryDirectories +
       previous.tasks.values.filter { it.phase == TaskPhase.WAITING_QUESTION }.mapNotNull { identityMap[it.sessionId]?.directory })
       .filter(String::isNotBlank).distinctBy(::normalizedDirectory).filterNot { directoryHealth.isDown(it) }
     val formResults = formDirectories.chunked(4).flatMap { batch -> coroutineScope {

@@ -215,6 +215,7 @@ internal class SshDshClient(
 
   override suspend fun pendingPermissions(directory: String): List<PermissionRequest> = api().pendingPermissions(directory)
 
+  override val recoverableQuestions: Boolean get() = !link.isOpenCode
   override suspend fun forms(directory: String): List<QuestionRequest> = api().forms(directory)
 
   override suspend fun replyPermission(request: PermissionRequest, reply: String) = api().replyPermission(request, reply)
@@ -223,6 +224,11 @@ internal class SshDshClient(
     api().replyQuestion(request, answers)
 
   override suspend fun rejectQuestion(request: QuestionRequest) = api().rejectQuestion(request)
+
+  override fun questionPresentation(sessionId: String?, foreground: Boolean) = link.questionPresentation(sessionId, foreground)
+  override fun questionFocus(id: String, focused: Boolean) = link.questionFocus(id, focused)
+  override fun questionEngage(id: String) = link.questionEngage(id)
+  override fun questionTakeTime(id: String) = link.questionTakeTime(id)
 
   override suspend fun children(session: Session): List<Session> = api().children(session)
 

@@ -877,6 +877,7 @@ fun MiuixPermissionCard(request: PermissionRequest, controller: LagoonController
 
 @Composable
 fun MiuixQuestionCard(request: QuestionRequest, controller: LagoonController, pending: Boolean) {
+  DisposableEffect(request.id) { onDispose { controller.questionFocus(request, false) } }
   val answerSaver = remember(request.id) { Saver<List<List<String>>, String>(save = { rows -> org.json.JSONArray().apply { rows.forEach { put(org.json.JSONArray(it)) } }.toString() }, restore = { json ->
     val rows = org.json.JSONArray(json); (0 until rows.length()).map { i -> val row = rows.getJSONArray(i); (0 until row.length()).map { row.optString(it) } }
   }) }
@@ -923,6 +924,20 @@ fun MiuixQuestionCard(request: QuestionRequest, controller: LagoonController, pe
     insidePadding = PaddingValues(16.dp)
   ) {
     MiuixStatePill(TaskPhase.WAITING_QUESTION, "需要你的回答")
+    request.presentation?.let { status ->
+      val remaining = status.remainingMs?.let { (it.coerceAtLeast(0) + 999) / 1000 }
+      val label = when {
+        status.continued -> "工作已继续，你仍然可以回答"
+        status.held -> "等待你回答"
+        remaining != null && status.countdownRunning -> "$remaining 秒后继续工作"
+        remaining != null -> "已暂停 · 剩余 $remaining 秒"
+        else -> null
+      }
+      if (label != null) Text(label, style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary))
+      if (!status.continued && !status.held && remaining != null) {
+        HyperTextAction(text = "慢慢回答", enabled = !pending, onClick = { controller.questionTakeTime(request) })
+      }
+    }
     if (visibleIndices.size > 1) {
       Spacer(Modifier.height(10.dp))
       Text("第 ${currentPage + 1}/${visibleIndices.size} 项", style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
@@ -949,6 +964,7 @@ fun MiuixQuestionCard(request: QuestionRequest, controller: LagoonController, pe
             modifier = Modifier
               .fillMaxWidth()
               .clickable {
+                controller.questionEngage(request)
                 answers = answers.toMutableList().also { list ->
                   list[index] = if (question.multiple) {
                     if (option.value in list[index]) list[index] - option.value else list[index] + option.value
@@ -979,10 +995,13 @@ fun MiuixQuestionCard(request: QuestionRequest, controller: LagoonController, pe
           Spacer(Modifier.height(6.dp))
           TextField(
             value = custom[index],
-            onValueChange = { value: String -> custom = custom.toMutableList().also { it[index] = value } },
+            onValueChange = { value: String ->
+              controller.questionEngage(request)
+              custom = custom.toMutableList().also { it[index] = value }
+            },
             useLabelAsPlaceholder = true,
             label = "输入自定义回答…",
-            modifier = Modifier.fillMaxWidth()
+            modifier = Modifier.fillMaxWidth().onFocusChanged { controller.questionFocus(request, it.isFocused) }
           )
         }
       }

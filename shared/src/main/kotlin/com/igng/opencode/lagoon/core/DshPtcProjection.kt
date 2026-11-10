@@ -22,6 +22,24 @@ internal class DshPtcProjection(
 
   private var rootIndex = DshPtcRootIndex(emptyMap())
   private val nodes = LinkedHashMap<String, DshPtcToolState>()
+  /** Cached edges can anchor a page before their outcomes replay, without suppressing its starts. */
+  private data class Edge(val rootCallId: String, val parentCallId: String, val depth: Int)
+  private val ancestry = LinkedHashMap<String, Edge>()
+  private fun edge(id: String): Edge? = nodes[id]?.let { Edge(it.rootCallId, it.parentCallId, it.depth) } ?: ancestry[id]
+  private fun forgetTree(rootCallId: String) {
+    nodes.entries.removeAll { it.value.rootCallId == rootCallId }
+    ancestry.entries.removeAll { it.value.rootCallId == rootCallId }
+  }
+  private fun makeRoom(rootCallId: String, subCallId: String): Boolean {
+    if (subCallId in nodes || subCallId in ancestry) return true
+    while ((nodes.keys + ancestry.keys).toSet().size >= maxEntries) {
+      val victim = nodes.values.firstOrNull { it.rootCallId != rootCallId }?.rootCallId
+        ?: ancestry.values.firstOrNull { it.rootCallId != rootCallId }?.rootCallId ?: return false
+      forgetTree(victim)
+      rootIndex = DshPtcRootIndex(rootIndex.roots.filterKeys { it != victim })
+    }
+    return true
+  }
 
   /** Add root `tool/call` locations found in a complete history/snapshot pre-pass. */
   fun indexRoots(records: List<JSONObject>): DshPtcRootIndex {
@@ -32,7 +50,11 @@ internal class DshPtcProjection(
       val data = event.data
       val callId = nonBlank(data, "callId") ?: continue
       val assistantMessageId = explicitAssistantMessageId(data) ?: assistantMessageId(data) ?: continue
-      if (merged.size >= maxEntries && callId !in merged) break
+      if (merged.size >= maxEntries && callId !in merged) {
+        val oldest = merged.keys.first()
+        merged.remove(oldest)
+        forgetTree(oldest)
+      }
       // A durable call id is immutable.  Keeping the first location makes a repeated snapshot
       // and a live replay produce the same projection rather than whichever arrived last.
       if (callId !in merged) {
@@ -53,6 +75,22 @@ internal class DshPtcProjection(
 
   /** The current root index, useful when a live reducer receives one event at a time. */
   fun indexedRoots(): DshPtcRootIndex = rootIndex
+
+  /** A page replays its own outcomes, retaining only roots/ancestors from other loaded windows. */
+  fun replayFor(records: List<JSONObject>): DshPtcProjection {
+    indexRoots(records)
+    val replayedIds = records.mapNotNull { record ->
+      unpack(record)?.data?.let { nonBlank(it, "subCallId") }
+    }.toSet()
+    return DshPtcProjection(maxDepth, maxEntries).also { replay ->
+      replay.rootIndex = rootIndex
+      replay.ancestry.putAll(ancestry)
+      nodes.forEach { (id, node) ->
+        if (id in replayedIds) replay.ancestry[id] = Edge(node.rootCallId, node.parentCallId, node.depth)
+        else replay.nodes[id] = node.copyForRead()
+      }
+    }
+  }
 
   /**
    * Process a durable event record.  Both the `/session/follow` record shape
@@ -80,7 +118,6 @@ internal class DshPtcProjection(
     val existing = nodes[subCallId]
     val depth = edgeDepth(rootCallId, parentCallId, subCallId, existing) ?: return null
     if (existing != null && kind == DshPtcEvent.Kind.START) return null
-    if (existing == null && nodes.size >= maxEntries) return null
 
     val argumentsPresent = data.has("arguments")
     if (kind == DshPtcEvent.Kind.START && !argumentsPresent) return null
@@ -93,9 +130,13 @@ internal class DshPtcProjection(
       // an empty successful result, which would hide a broken host payload.
       data.optJSONArray("content")?.let(::copyJsonArray) ?: return null
     } else JSONArray()
+    if (!makeRoom(rootCallId, subCallId)) return null
     val isError = if (kind == DshPtcEvent.Kind.RESULT) data.optBoolean("isError") else false
-    val error = if (kind == DshPtcEvent.Kind.RESULT) errorObject(data.opt("error")) else null
+    val error = if (kind == DshPtcEvent.Kind.RESULT) errorObject(data.opt("error"))?.apply {
+      if (optString("message").isBlank()) put("message", optString("reason").ifBlank { content.contentText() }.ifBlank { "工具执行失败" })
+    } else null
     val metadata = metadata(root, rootCallId, parentCallId, subCallId, name, data.opt("meta"))
+    error?.let { metadata.put("error", JSONObject(it.toString())) }
     val next = DshPtcToolState(
       rootCallId = rootCallId,
       parentCallId = parentCallId,
@@ -115,6 +156,7 @@ internal class DshPtcProjection(
     // A result can legally be observed before its start in a snapshot.  It is still accepted when
     // its parent is known, matching the official UI reducer.  A later start is a duplicate and is
     // intentionally ignored rather than replacing the settled result.
+    ancestry.remove(subCallId)
     if (existing == null || kind == DshPtcEvent.Kind.RESULT) nodes[subCallId] = next
     return DshPtcEvent(kind = kind, state = next.copyForRead(), sequence = seq, time = time)
   }
@@ -132,15 +174,15 @@ internal class DshPtcProjection(
 
   private fun edgeDepth(rootCallId: String, parentCallId: String, subCallId: String,
     existing: DshPtcToolState?): Int? {
-    if (existing != null) {
-      // IDs are globally opaque in the official protocol.  Reusing one under another root or
-      // parent would make the tree ambiguous, so reject it instead of silently moving the node.
-      if (existing.rootCallId != rootCallId || existing.parentCallId != parentCallId) return null
-      return existing.depth
+    val known = existing?.let { Edge(it.rootCallId, it.parentCallId, it.depth) } ?: ancestry[subCallId]
+    if (known != null) {
+      // A cached edge validates identity without treating its old outcome as a replayed start.
+      if (known.rootCallId != rootCallId || known.parentCallId != parentCallId) return null
+      return known.depth
     }
 
     if (parentCallId == rootCallId) return 1.takeIf { it <= maxDepth }
-    val parent = nodes[parentCallId] ?: return null
+    val parent = edge(parentCallId) ?: return null
     if (parent.rootCallId != rootCallId) return null
 
     var cursor: String? = parentCallId
@@ -148,7 +190,7 @@ internal class DshPtcProjection(
     val visited = HashSet<String>()
     while (cursor != null) {
       if (!visited.add(cursor) || cursor == subCallId) return null
-      cursor = nodes[cursor]?.parentCallId?.takeUnless { it == rootCallId }
+      cursor = edge(cursor)?.parentCallId?.takeUnless { it == rootCallId }
     }
     return depth.takeIf { it <= maxDepth }
   }
