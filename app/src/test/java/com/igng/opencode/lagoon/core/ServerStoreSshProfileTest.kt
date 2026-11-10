@@ -20,6 +20,26 @@ class ServerStoreSshProfileTest {
     assertNull(secrets.values["ssh-profile"])
   }
 
+  @Test fun sshNativeOpenCodeLocatorAndSiblingPreferencesSurviveRouteChange() {
+    val prefs = FakeSharedPreferences()
+    val secrets = FakeSharedPreferences()
+    val store = ServerStore(prefs, secrets, { "enc:$it" }, { it.removePrefix("enc:") })
+    val dsh = ServerProfile("dsh", "DSH", "ssh://old@host:22", "old", kind = ServerKind.DSH,
+      sshHostId = "same-host", enabled = false, notifications = false)
+    val openCode = dsh.copy(id = "opencode", name = "OpenCode", kind = ServerKind.OPENCODE,
+      enabled = true, sshServicePath = "/home/user/.local/state/opencode/service-preview.json")
+    store.save(dsh, null); store.save(openCode, null)
+    assertEquals(openCode, store.profiles().first { it.id == "opencode" })
+    store.updateSshSourceRoute("same-host", "ssh://next@new:2222", "next")
+    val changed = store.profiles()
+    assertEquals(listOf("dsh", "opencode"), changed.map { it.id })
+    assertEquals(dsh.copy(url = "ssh://next@new:2222", username = "next"), changed[0])
+    assertEquals(openCode.copy(url = "ssh://next@new:2222", username = "next"), changed[1])
+    assertEquals(emptyMap<String, Any?>(), secrets.values.filterValues { it != null })
+    store.setProfileEnabled("opencode", false)
+    assertEquals(openCode.sshServicePath, store.profiles().last().sshServicePath)
+  }
+
   @Test fun deletingOneProfileKeepsAnotherSshHostId() {
     val store = ServerStore(FakeSharedPreferences(), FakeSharedPreferences(), { "enc:$it" }, { it.removePrefix("enc:") })
     val first = ServerProfile("a", "A", "ssh://me@a:22", "me", kind = ServerKind.DSH, sshHostId = "ssh-a")

@@ -44,17 +44,32 @@ class ServerStore internal constructor(private val preferences: SharedPreference
   private val previewCache = ConcurrentHashMap<String, SessionPreview>()
 
   fun profiles(): List<ServerProfile> = try {
-    JSONArray(preferences.getString("profiles", "[]")).objects().map {
-      val id = it.str("id")
-      ServerProfile(id, it.str("name"), it.str("url"), it.str("username"),
-        it.optBoolean("autoConnect", true), it.optBoolean("notifications", true), it.optBoolean("allowCleartext", false),
-        ServerKind.fromWire(it.str("kind")), DshAuthMode.fromWire(it.str("dshAuth")), it.str("remoteHostId").takeIf(String::isNotBlank),
-        it.str("remoteHostFingerprint").takeIf(String::isNotBlank), it.str("sshHostId").takeIf(String::isNotBlank),
-        it.optBoolean("enabled", true))
-    }
+    readProfiles()
   } catch (error: Exception) {
-    Diagnostics.warn("ServerStore", "profiles 解析失败，已忽略全部服务器资料", error)
+    Diagnostics.warn("ServerStore", "profiles 解析失败，保留原记录并停止资料写入", error)
     emptyList()
+  }
+
+  /** Display may degrade, but writers and migration must never replace an unreadable document. */
+  internal fun readProfiles(): List<ServerProfile> {
+    try {
+      val array = JSONArray(preferences.getString("profiles", "[]"))
+      check(array.length() <= 5000) { "连接资料超过上限" }
+      val profiles = (0 until array.length()).map { index ->
+        val item = array.getJSONObject(index)
+        val id = item.getString("id").also { check(it.isNotBlank() && it.length <= 512 && '\u0000' !in it) }
+        ServerProfile(id, item.str("name"), item.str("url"), item.str("username"),
+          item.optBoolean("autoConnect", true), item.optBoolean("notifications", true), item.optBoolean("allowCleartext", false),
+          if (!item.has("kind")) ServerKind.OPENCODE else MigrationProjection.legacyKind(item.getString("kind")),
+          DshAuthMode.fromWire(item.str("dshAuth")), item.str("remoteHostId").takeIf(String::isNotBlank),
+          item.str("remoteHostFingerprint").takeIf(String::isNotBlank), item.str("sshHostId").takeIf(String::isNotBlank),
+          item.optBoolean("enabled", true), item.str("sshServicePath").takeIf(String::isNotBlank))
+      }
+      check(profiles.distinctBy { it.id }.size == profiles.size) { "连接资料身份重复" }
+      return profiles
+    } catch (error: Exception) {
+      throw java.io.IOException("连接资料损坏，已停止写入以保护原记录", error)
+    }
   }
 
   private companion object {
@@ -409,7 +424,8 @@ class ServerStore internal constructor(private val preferences: SharedPreference
   }
 
   fun save(profile: ServerProfile, password: String?, cookie: String? = null, credentialUsername: String? = null) {
-    val previousProfile = profiles().firstOrNull { it.id == profile.id }
+    val currentProfiles = readProfiles()
+    val previousProfile = currentProfiles.firstOrNull { it.id == profile.id }
     val previousCredentials = credentials(profile.id)
     val next = profileCredentials(previousProfile?.url, profile.url, previousCredentials,
       credentialUsername ?: profile.username, password, cookie)
@@ -419,7 +435,7 @@ class ServerStore internal constructor(private val preferences: SharedPreference
     // a synthetic `ssh://…` identity that must never be parsed as an HTTP credential origin.
     val encoded = if (profile.sshHostId != null || (next.password.isEmpty() && next.cookie.isEmpty())) null else encryptValue(JSONObject()
       .put("origin", credentialOrigin(profile.url)).put("username", next.username).put("password", next.password).put("cookie", next.cookie).toString())
-    val updated = profiles().filterNot { it.id == profile.id } + profile
+    val updated = currentProfiles.filterNot { it.id == profile.id } + profile
     val json = profilesJson(updated)
     check(secrets.edit().putString(profile.id, encoded).commit()) { "无法保存凭据，请重试" }
     val migration = DshRemoteMigration.plan(profile)
@@ -434,7 +450,7 @@ class ServerStore internal constructor(private val preferences: SharedPreference
    * untouched, so a naming repair can never invalidate a login.
    */
   fun rename(id: String, name: String) {
-    val updated = profiles().map { if (it.id == id) it.copy(name = name) else it }
+    val updated = readProfiles().map { if (it.id == id) it.copy(name = name) else it }
     check(preferences.edit().putString("profiles", profilesJson(updated)).commit()) { "无法保存服务器资料，请重试" }
   }
 
@@ -443,11 +459,19 @@ class ServerStore internal constructor(private val preferences: SharedPreference
    * unread ledger. A no-op when the profile is already in the requested state.
    */
   fun setProfileEnabled(id: String, enabled: Boolean): Boolean {
-    val current = profiles()
+    val current = readProfiles()
     val profile = current.firstOrNull { it.id == id } ?: return false
     if (profile.enabled == enabled) return true
     val updated = current.map { if (it.id == id) it.copy(enabled = enabled) else it }
     return preferences.edit().putString("profiles", profilesJson(updated)).commit()
+  }
+
+  /** Updates display routes for all leaves of one saved source without rewriting child preferences or credentials. */
+  fun updateSshSourceRoute(hostId: String, url: String, username: String) {
+    val updated = readProfiles().map { profile ->
+      if (profile.sshHostId == hostId) profile.copy(url = url, username = username) else profile
+    }
+    check(preferences.edit().putString("profiles", profilesJson(updated)).commit()) { "无法保存 SSH source 路由" }
   }
 
   private fun profilesJson(profiles: List<ServerProfile>): String = JSONArray().apply {
@@ -458,7 +482,7 @@ class ServerStore internal constructor(private val preferences: SharedPreference
         .put("allowCleartext", item.allowCleartext).put("kind", item.kind.wire).put("dshAuth", item.dshAuth.wire)
         .put("enabled", item.enabled)
         .putOpt("remoteHostId", item.remoteHostId).putOpt("remoteHostFingerprint", item.remoteHostFingerprint)
-        .putOpt("sshHostId", item.sshHostId))
+        .putOpt("sshHostId", item.sshHostId).putOpt("sshServicePath", item.sshServicePath))
     }
   }.toString()
 
@@ -488,8 +512,9 @@ class ServerStore internal constructor(private val preferences: SharedPreference
     decryptValue(value)
   } catch (_: Exception) { null }
   fun delete(id: String) {
+    val remaining = readProfiles().filterNot { it.id == id }
     previewCache.keys.removeAll { it.startsWith("$id\u0000") }
-    val editor = preferences.edit().putString("profiles", profilesJson(profiles().filterNot { it.id == id }))
+    val editor = preferences.edit().putString("profiles", profilesJson(remaining))
       .remove("directories:$id").remove("sessionNotices:$id").remove("collapsedSections:$id").remove("collapsedProjects:$id").remove("pinned:$id").remove("remoteMigration:$id")
       .remove("backgroundRunning:$id")
       .remove("modelVisibility:$id").remove("modelVisibilityConfigured:$id").remove("modelVariants:$id").remove("recentModels:$id").remove("scope:$id")

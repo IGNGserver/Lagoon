@@ -30,12 +30,14 @@ internal class FakeRemoteHost(
   private val framesBeforeOpenResponse: Boolean = true,
   private val capabilities: List<String> = listOf(
     "harness.remote.v3", "harness.remote.transfer.v1", "workspace.upload.v1"
-  )
+  ),
+  private val strictOfficialContracts: Boolean = false
 ) : AutoCloseable {
   val server = MockWebServer()
   val requests: MutableList<String> = Collections.synchronizedList(mutableListOf())
   val streamOpens: MutableList<JSONObject> = Collections.synchronizedList(mutableListOf())
   val rpcCalls: MutableList<JSONObject> = Collections.synchronizedList(mutableListOf())
+  val contractViolations: MutableList<String> = Collections.synchronizedList(mutableListOf())
   private val counters = AtomicInteger(0)
   private val fragmentIds = AtomicInteger(0)
   private var cipher: CipherStatePair? = null
@@ -222,12 +224,25 @@ internal class FakeRemoteHost(
         .put("timestamp", System.currentTimeMillis())
         .put("payload", JSONObject().put("requestId", id).put("result", result)))
     }
+    fun contractFailure(endpoint: String, rpcPayload: JSONObject): String? {
+      if (!strictOfficialContracts) return null
+      val failure = runCatching {
+        check(DshEndpointContract.isRemoteEndpoint(endpoint)) { "Endpoint is not allowlisted: $endpoint" }
+        check(rpcPayload.length() == 1 && rpcPayload.optJSONObject("args") != null) { "Invalid args envelope" }
+        if (OfficialDshContract.has(endpoint)) OfficialDshContract.assertArgs(endpoint, rpcPayload.getJSONObject("args"))
+      }.exceptionOrNull()?.message
+      if (failure != null) contractViolations += failure
+      return failure
+    }
     when (method) {
       "harness.transport.describe" -> respond(JSONObject().put("capabilities", JSONArray(capabilities)))
       "harness.remote.call" -> {
         val endpoint = params.getString("endpoint")
         val rpcPayload = params.optJSONObject("payload") ?: JSONObject()
-        if (rpcPayload.length() != 1 || rpcPayload.optJSONObject("args") == null) {
+        val invalid = contractFailure(endpoint, rpcPayload)
+        if (invalid != null) {
+          respond(fail("gateway/arguments-invalid", invalid))
+        } else if (rpcPayload.length() != 1 || rpcPayload.optJSONObject("args") == null) {
           respond(fail("gateway/internal", "Remote payload must contain exactly one plain-object args field"))
         } else {
           respond(call(endpoint, rpcPayload))
@@ -237,6 +252,12 @@ internal class FakeRemoteHost(
         streamOpens += params
         val streamId = params.getString("streamId")
         val endpoint = params.getString("endpoint")
+        contractFailure(endpoint, params.optJSONObject("payload") ?: JSONObject())?.let { reason ->
+          sendMessage(socket, JSONObject().put("v", 1).put("id", id).put("type", "rpc.error")
+            .put("timestamp", System.currentTimeMillis())
+            .put("payload", JSONObject().put("requestId", id).put("code", "gateway/arguments-invalid").put("message", reason)))
+          return
+        }
         streamOpenError(endpoint, params.optJSONObject("payload") ?: JSONObject())?.let { code ->
           sendMessage(socket, JSONObject().put("v", 1).put("id", id).put("type", "rpc.error")
             .put("timestamp", System.currentTimeMillis())

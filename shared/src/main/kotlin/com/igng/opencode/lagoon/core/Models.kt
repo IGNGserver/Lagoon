@@ -29,7 +29,10 @@ data class ServerProfile(
    * projected into the home/notification surfaces, even when it is selected or explicitly included.
    * Credentials, drafts, caches and the unread ledger stay on disk so re-enabling can resume.
    */
-  val enabled: Boolean = true
+  val enabled: Boolean = true,
+  /** OpenCode registration locator on an SSH source; null selects the official default file.
+   * Never a service generation ID or an ephemeral forwarded URL, and never contains a password. */
+  val sshServicePath: String? = null
 )
 
 data class Project(val id: String, val directory: String, val name: String, val sandboxes: List<String> = emptyList(),

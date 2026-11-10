@@ -23,7 +23,10 @@ internal class SshDshClient(
 ) : HarnessClient {
   private val closedFlag = AtomicBoolean(false)
 
-  private suspend fun api(): DshApi = link.awaitClient()
+  private suspend fun api(): HarnessClient {
+    check(!isClosed) { "SSH binding 已关闭" }
+    return link.awaitHarness()
+  }
 
   override val isClosed: Boolean get() = closedFlag.get() || link.isClosed
 
@@ -31,7 +34,9 @@ internal class SshDshClient(
     if (closedFlag.compareAndSet(false, true)) onClose()
   }
 
-  override fun capabilities(): ApiCapabilities = DshApi.TUNNEL_CAPABILITIES
+  override fun capabilities(): ApiCapabilities = link.capabilities()
+
+  override val cacheableTranscripts: Boolean get() = link.isOpenCode
 
   override suspend fun discoverCapabilities(): ApiCapabilities = api().discoverCapabilities()
 
@@ -124,11 +129,13 @@ internal class SshDshClient(
 
   override suspend fun removeShell(id: String, directory: String) = api().removeShell(id, directory)
 
+
   override suspend fun createSession(directory: String, title: String, workspaceId: String?): Session =
     api().createSession(sessionDirectory(directory), title, workspaceId)
 
   /** Blank or home-relative requests use the SSH host's working directory; an explicit project path wins. */
   private fun sessionDirectory(requested: String): String {
+    if (link.isOpenCode) return requested
     val preferred = SshShell.absolutePath(link.workingDirectory, link.remoteHome) ?: return requested
     if (requested.isBlank()) return preferred
     val home = link.remoteHome?.trimEnd('/')
@@ -150,7 +157,7 @@ internal class SshDshClient(
     return listOf(phase, status.detail.takeIf(String::isNotBlank)).joinToString(" · ")
   }
 
-  override val workspaceUpdates: Flow<List<Project>>? get() = link.workspaceUpdates
+  override val workspaceUpdates: Flow<List<Project>>? get() = if (link.isOpenCode) null else link.workspaceUpdates
 
   override suspend fun renameSession(session: Session, title: String) = api().renameSession(session, title)
 
@@ -233,7 +240,7 @@ internal class SshDshClient(
   override fun events(onOpen: () -> Unit): Flow<ServerEvent> = flow {
     var seenGeneration = -1L
     while (currentCoroutineContext().isActive && !isClosed) {
-      val currentApi = link.awaitClient(sinceGeneration = seenGeneration)
+      val currentApi = link.awaitHarness(sinceGeneration = seenGeneration)
       seenGeneration = link.generationId
       // DshApi.events() stays open until its collector is cancelled. Leave this generation as soon
       // as the link drops CONNECTED or closes this DshApi, then bind whatever generation comes next.
@@ -258,6 +265,10 @@ internal class SshDshClient(
           events.cancel()
         }
       }.collect { emit(it) }
+      // Normal SSE EOF does not mean the SSH/runtime generation was replaced. Reopen the event
+      // stream on the same still-live API rather than waiting forever for a new SSH connection.
+      if (link.status.value.isConnected && !currentApi.isClosed && link.generationId == seenGeneration)
+        seenGeneration = -1L
       if (!isClosed && currentCoroutineContext().isActive) delay(250)
     }
   }

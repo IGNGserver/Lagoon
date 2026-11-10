@@ -540,7 +540,7 @@ private fun ShellOutputSheet(state: LagoonState, controller: LagoonController) {
           snapshot.exit != null -> "已结束 · 退出码 ${snapshot.exit}"
           else -> "已结束"
         }, Modifier.weight(1f), style = MiuixTheme.textStyles.footnote1.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
-        if (snapshot?.running == true && state.server?.kind != ServerKind.DSH_REMOTE) state.shells[output.shellId]?.let { job ->
+        if (snapshot?.running == true && state.capabilities.stopShell) state.shells[output.shellId]?.let { job ->
           HyperTextAction(text = "停止", danger = true, onClick = { stopCandidate = job })
         }
       }

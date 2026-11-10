@@ -5,28 +5,15 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.Credentials
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
-import okhttp3.Response
-import okhttp3.ResponseBody
-import okhttp3.sse.EventSource
-import okhttp3.sse.EventSourceListener
-import okhttp3.sse.EventSources
 import org.json.JSONArray
 import org.json.JSONException
 import org.json.JSONObject
 import java.io.IOException
 import java.security.SecureRandom
-import java.util.concurrent.TimeUnit
-import kotlin.coroutines.resume
-import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeoutOrNull
 
 data class ServerCredentials(
@@ -39,7 +26,12 @@ data class ApiPage<T>(val items: List<T>, val next: String? = null)
 
 /** One `/api/event` frame: `type`, its `data` as [properties], the event `location` and `created` time. */
 data class ServerEvent(val id: String = "", val directory: String, val type: String, val properties: JSONObject, val created: Long = 0)
-class ApiException(val status: Int, message: String, val code: String? = null) : IOException(message)
+class ApiException(
+  val status: Int,
+  message: String,
+  val code: String? = null,
+  val details: JSONObject? = null
+) : IOException(message)
 
 /** How a new prompt is delivered while the session is busy (official `Session.Inbox.Delivery`). */
 enum class Delivery(val wire: String) { STEER("steer"), QUEUE("queue") }
@@ -49,53 +41,34 @@ enum class Delivery(val wire: String) { STEER("steer"), QUEUE("queue") }
  * response envelopes follow the published contract; operations whose route differs between 2.0.x
  * releases are resolved from the server's own `/openapi.json` (see [ApiCapabilities]).
  */
-class OpenCodeApi(
+class OpenCodeApi internal constructor(
   private val profile: ServerProfile,
   private val credentials: ServerCredentials,
-  /** Whole-call deadline. Background callers (e.g. notification actions) pass a small value to stay
-   *  inside the short lifetime Android grants a BroadcastReceiver; foreground callers keep the default. */
   callTimeoutSeconds: Long = 60,
-  /** Silence after which the live event stream counts as dead; see [SharedHttp.STREAM_IDLE_SECONDS]. */
-  streamIdleSeconds: Long = SharedHttp.STREAM_IDLE_SECONDS
+  streamIdleSeconds: Long = SharedHttp.STREAM_IDLE_SECONDS,
+  /** Optional carrier for SSH/Remote native services; omitted callers keep the stock OkHttp carrier. */
+  transport: NativeHttpTransport?
 ) : HarnessClient {
-  constructor(profile: ServerProfile, password: String) : this(profile, ServerCredentials(profile.username, password))
+  constructor(
+    profile: ServerProfile,
+    credentials: ServerCredentials,
+    callTimeoutSeconds: Long = 60,
+    streamIdleSeconds: Long = SharedHttp.STREAM_IDLE_SECONDS
+  ) : this(profile, credentials, callTimeoutSeconds, streamIdleSeconds, null)
+
+  constructor(profile: ServerProfile, password: String) : this(profile, ServerCredentials(profile.username, password), 60, SharedHttp.STREAM_IDLE_SECONDS, null)
 
   private val base: HttpUrl = requireNotNull(profile.url.trimEnd('/').toHttpUrlOrNull()) { "服务器地址无效" }
-  private val origin = HttpOrigin.of(base)
-  private val client = OkHttpClient.Builder()
-    .connectTimeout(SharedHttp.CONNECT_TIMEOUT_SECONDS, TimeUnit.SECONDS)
-    .readTimeout(25, TimeUnit.SECONDS)
-    .callTimeout(callTimeoutSeconds, TimeUnit.SECONDS)
-    .connectionPool(SharedHttp.connectionPool)
-    .dispatcher(SharedHttp.dispatcher)
-    // Never let OkHttp's default redirect policy replay an authenticated request to a different
-    // scheme/host/port: a trusted server (or its proxy) could otherwise reflect the Authorization
-    // header or the raw Cookie onto a downgraded or unrelated origin before we ever check the final
-    // URL.
-    .followRedirects(false)
-    .followSslRedirects(false)
-    .addInterceptor { chain ->
-      // Defence in depth: even if the redirect policy is ever changed, no authenticated request can
-      // leave the configured origin.
-      val request = chain.request()
-      if (HttpOrigin.of(request.url) != origin) throw IOException("拒绝向非授权地址发送凭据")
-      chain.proceed(request)
+  private val nativeEndpoint = NativeHttpEndpoint(base.toString())
+  private val nativeTransport: NativeHttpTransport = transport ?: NativeOkHttpTransport(nativeEndpoint, callTimeoutSeconds, streamIdleSeconds)
+  @Volatile private var closed = false
+  override val isClosed: Boolean get() = closed
+  override fun close() {
+    if (!closed) {
+      closed = true
+      nativeTransport.close()
     }
-    .addInterceptor(HttpMetrics.interceptor)
-    .build()
-  private val streamClient = client.newBuilder()
-    // Long-lived streams would pin the in-flight counter; only request/response calls are measured.
-    .apply { interceptors().remove(HttpMetrics.interceptor) }
-    .dispatcher(SharedHttp.streamDispatcher)
-    // Not unbounded: a half-open socket (Wi-Fi/cellular switch, NAT expiry) otherwise looks connected
-    // forever. Any bytes (events, heartbeats, SSE comments) reset the timer; a stream silent this long
-    // is reconnected. Even on a server that sends no heartbeat that only costs one control-plane
-    // re-read per idle period, which the reconcile loop does anyway.
-    .readTimeout(streamIdleSeconds, TimeUnit.SECONDS)
-    .callTimeout(0, TimeUnit.MILLISECONDS)
-    .build()
-  /** Dedicated scope for blocking HTTP work so a cancelled caller never waits on the socket. */
-  private val ioScope = SharedHttp.ioScope
+  }
   @Volatile private var version: String? = null
   @Volatile private var discoveredCapabilities: ApiCapabilities? = null
   /** Row-label titles only; the server's project list is never imported into the local registry. */
@@ -115,29 +88,23 @@ class OpenCodeApi(
   init {
     require(base.scheme == "https" || base.scheme == "http" && profile.allowCleartext) { "HTTP 明文连接未获授权，请在服务器资料中明确开启" }
     require(base.username.isEmpty() && base.password.isEmpty() && base.query == null && base.fragment == null) { "请使用不含凭据或参数的服务器地址" }
+    require(nativeTransport.endpoint.origin == NativeHttpOrigin.from(java.net.URI(base.toString()))) { "原生传输必须使用配置的固定 origin" }
   }
 
-  private fun url(path: String, query: Map<String, String> = emptyMap()): HttpUrl {
-    // The path is already percent-encoded segment-by-segment (see [segment]/[encodedPath]); using the
-    // encoded variant avoids OkHttp re-encoding '%' and producing e.g. '%2520' for ids containing spaces.
-    val builder = base.newBuilder().addEncodedPathSegments(path.trimStart('/'))
-    query.forEach { (key, value) -> builder.addQueryParameter(key, value) }
-    return builder.build()
-  }
-
-  private fun requestBuilder(path: String, query: Map<String, String>): Request.Builder {
-    val builder = Request.Builder().url(url(path, query)).header("Accept", "application/json")
+  private fun requestHeaders(accept: String = "application/json"): Map<String, String> = buildMap {
+    put("Accept", accept)
     if (credentials.password.isNotEmpty()) {
-      builder.header("Authorization", Credentials.basic(credentials.username.ifBlank { profile.username.ifBlank { "opencode" } }, credentials.password))
+      put("Authorization", Credentials.basic(credentials.username.ifBlank { profile.username.ifBlank { "opencode" } }, credentials.password))
     }
-    if (credentials.cookie.isNotBlank()) builder.header("Cookie", credentials.cookie)
-    return builder
+    if (credentials.cookie.isNotBlank()) put("Cookie", credentials.cookie)
   }
 
-  /** Every request this client builds targets [origin]; the redirect policy forbids OkHttp from
-   *  moving an authenticated request elsewhere, so the credentials can only ever reach [origin]. */
-  private fun requireOrigin(request: Request) {
-    require(HttpOrigin.of(request.url) == origin) { "拒绝向非授权地址发送凭据" }
+  private fun requestPath(path: String, query: Map<String, String>): String {
+    val encoded = path.trimStart('/').split('/').joinToString("/") { it }
+    if (query.isEmpty()) return encoded
+    return encoded + "?" + query.entries.joinToString("&") { (key, value) ->
+      "${java.net.URLEncoder.encode(key, "UTF-8").replace("+", "%20") }=${java.net.URLEncoder.encode(value, "UTF-8").replace("+", "%20") }"
+    }
   }
 
   private fun httpErrorMessage(status: Int, body: String): String {
@@ -161,59 +128,40 @@ class OpenCodeApi(
   }
 
   private suspend fun request(method: String, path: String, query: Map<String, String> = emptyMap(), body: JSONObject? = null): String {
-    val mediaType = "application/json; charset=utf-8".toMediaType()
-    return runCall(requestBuilder(path, query).method(method, if (method == "GET" || method == "DELETE" && body == null) null else (body?.toString() ?: "{}").toRequestBody(mediaType)).build()) { response ->
-      val responseBody = response.body?.readText(MAX_RESPONSE_CHARS).orEmpty()
-      if (!response.isSuccessful) throw ApiException(response.code, httpErrorMessage(response.code, responseBody))
-      responseBody
+    val normalizedMethod = requireNativeHttpMethod(method)
+    val requestBody = if (normalizedMethod == "GET" || normalizedMethod == "DELETE" && body == null) null
+      else (body?.toString() ?: "{}").toByteArray(Charsets.UTF_8)
+    val headers = requestHeaders().toMutableMap().apply {
+      if (requestBody != null) put("Content-Type", "application/json; charset=utf-8")
     }
+    val response = nativeTransport.request(
+      normalizedMethod,
+      requestPath(path, query),
+      headers,
+      requestBody,
+      maxResponseBytes = MAX_RESPONSE_CHARS.toLong()
+    )
+    val responseBody = response.body.toString(Charsets.UTF_8)
+    if (response.statusCode !in 200..299) {
+      throw ApiException(response.statusCode, httpErrorMessage(response.statusCode, responseBody))
+    }
+    return responseBody
   }
 
-  private suspend fun requestBytes(path: String, query: Map<String, String> = emptyMap()): Pair<ByteArray, String> =
-    runCall(requestBuilder(path, query).get().build()) { response ->
-      val responseBody = response.body ?: error("服务器返回空响应")
-      if (!response.isSuccessful) {
-        val body = responseBody.readText(MAX_RESPONSE_CHARS)
-        throw ApiException(response.code, httpErrorMessage(response.code, body))
-      }
-      responseBody.bytes(MAX_FILE_BYTES) to (response.header("Content-Type") ?: "application/octet-stream")
+  private suspend fun requestBytes(path: String, query: Map<String, String> = emptyMap()): Pair<ByteArray, String> {
+    val response = nativeTransport.request(
+      "GET",
+      requestPath(path, query),
+      requestHeaders(),
+      maxResponseBytes = MAX_FILE_BYTES
+    )
+    if (response.statusCode !in 200..299) {
+      val body = response.body.toString(Charsets.UTF_8)
+      throw ApiException(response.statusCode, httpErrorMessage(response.statusCode, body))
     }
-
-  /**
-   * Runs the blocking call and its body read on a background worker, but cancels the underlying
-   * socket the moment the caller's coroutine is cancelled. Cancellation must not wait for the server
-   * to answer a request the user already navigated away from (A15): the coroutine returns
-   * immediately while [call] is aborted and the abandoned worker unwinds on its own.
-   */
-  private suspend fun <T> runCall(request: Request, read: (Response) -> T): T {
-    requireOrigin(request)
-    return suspendCancellableCoroutine { continuation ->
-      val call = client.newCall(request)
-      val worker = ioScope.launch {
-        try {
-          continuation.resume(call.execute().use(read))
-        } catch (error: Throwable) {
-          continuation.resumeWith(Result.failure(error))
-        }
-      }
-      continuation.invokeOnCancellation {
-        call.cancel()
-        worker.cancel()
-      }
-    }
-  }
-
-  private fun ResponseBody.readText(limit: Int): String {
-    val source = source()
-    return if (source.request(limit.toLong())) {
-      throw IOException("服务器响应过大（超过 $limit 字节），已拒绝读取")
-    } else source.readString(contentType()?.charset(Charsets.UTF_8) ?: Charsets.UTF_8)
-  }
-
-  private fun ResponseBody.bytes(limit: Long): ByteArray {
-    val source = source()
-    if (source.request(limit + 1)) throw IOException("文件过大（超过 $limit 字节），已拒绝下载")
-    return bytes()
+    return response.body.requireNativeHttpResponseBudget(MAX_FILE_BYTES) to response.headers.entries
+      .firstOrNull { it.key.equals("Content-Type", ignoreCase = true) }?.value.orEmpty()
+      .ifBlank { "application/octet-stream" }
   }
 
   // Parsing runs on the IO dispatcher: JSONObject/JSONArray construction of a large transcript is
@@ -594,36 +542,31 @@ class OpenCodeApi(
 
   /** `GET /api/event`: volatile by contract, so a dropped stream is recovered by reconnect + reconciliation. */
   override fun events(onOpen: () -> Unit): Flow<ServerEvent> = callbackFlow {
-    val request = requestBuilder("api/event", emptyMap()).header("Accept", "text/event-stream").build()
-    requireOrigin(request)
-    val source: EventSource = EventSources.createFactory(streamClient).newEventSource(request, object : EventSourceListener() {
-      override fun onOpen(eventSource: EventSource, response: Response) { onOpen() }
-      override fun onEvent(eventSource: EventSource, id: String?, type: String?, data: String) {
-        try {
-          val event = data.toServerEvent(id.orEmpty())
-          // A full/closed buffer must not silently drop an event: the dropped event could be the very
-          // permission or terminal state the UI is waiting for. Surface it as a stream failure so the
-          // controller reconnects and runs a full reconciliation instead of trusting a partial view.
-          val delivered = trySend(event)
-          if (delivered.isFailure) {
-            Diagnostics.warn("SSE", "事件积压，触发重新同步", delivered.exceptionOrNull())
-            close(IOException("SSE 事件积压，已触发全量对账"))
+    val stream = nativeTransport.openEventStream(
+      requestPath("api/event", emptyMap()),
+      requestHeaders("text/event-stream"),
+      callback = object : NativeHttpEventStreamCallback {
+        override fun onOpen() { onOpen() }
+        override fun onEvent(frame: NativeHttpEvent) {
+          try {
+            val event = frame.data.toServerEvent(frame.id.orEmpty())
+            val delivered = trySend(event)
+            if (delivered.isFailure) {
+              Diagnostics.warn("SSE", "事件积压，触发重新同步", delivered.exceptionOrNull())
+              close(IOException("SSE 事件积压，已触发全量对账"))
+            }
+          } catch (cancel: CancellationException) {
+            throw cancel
+          } catch (error: Exception) {
+            Diagnostics.warn("SSE", "事件无法解析，触发重新同步", error)
+            close(IOException("SSE 事件无法解析，已触发全量对账", error))
           }
-        } catch (cancel: kotlinx.coroutines.CancellationException) {
-          throw cancel
-        } catch (error: Exception) {
-          // A malformed frame may be the only terminal/permission event. Keep the failure explicit so
-          // the caller reconnects and performs an authoritative reconciliation instead of trusting a gap.
-          Diagnostics.warn("SSE", "事件无法解析，触发重新同步", error)
-          close(IOException("SSE 事件无法解析，已触发全量对账", error))
         }
+        override fun onFailure(error: Throwable) { close(error) }
+        override fun onClosed() { close() }
       }
-      override fun onFailure(eventSource: EventSource, t: Throwable?, response: Response?) {
-        close(t ?: IOException("SSE 已断开：HTTP ${response?.code ?: 0}"))
-      }
-      override fun onClosed(eventSource: EventSource) { close() }
-    })
-    awaitClose { source.cancel() }
+    )
+    awaitClose { stream.cancel() }
   }
 
   private suspend fun requestObject(method: String, path: String, body: JSONObject): JSONObject = withContext(Dispatchers.IO) { jsonObject(request(method, path, body = body)) }

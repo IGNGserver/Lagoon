@@ -51,6 +51,14 @@ class ApiCapabilitiesTest {
       {"anyOf":[{"type":"null"},{"type":"object","properties":{"title":{"type":"string"}}}]}}}}}}}}""")
     assertTrue(ApiCapabilities.fromDocument(doc).supports(SessionAction.RENAME))
   }
+  @Test fun shellTerminationDependsOnTheDocumentedDeleteRouteNotTransportKind() {
+    val present = ApiCapabilities.fromDocument(JSONObject("""{"paths":{"/api/shell/{shellID}":{"delete":{}}}}"""))
+    val absent = ApiCapabilities.fromDocument(JSONObject("""{"paths":{"/api/shell/{shellID}":{"get":{}}}}"""))
+    assertTrue(present.stopShell)
+    assertFalse(absent.stopShell)
+    assertTrue(ApiCapabilities.BASELINE.stopShell)
+  }
+
   @Test fun aDocumentWithoutPathsMeansTheCurrentContract() {
     assertEquals(ApiCapabilities.BASELINE, ApiCapabilities.fromDocument(JSONObject("{}")))
   }

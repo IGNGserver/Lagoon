@@ -58,7 +58,8 @@ internal fun remoteControlFailure(error: RemoteControlException): RemoteFailureE
 }
 
 internal fun remoteServerFailure(error: RemoteServerException): RemoteFailureException = when {
-  error.status == 401 -> RemoteFailureException(RemoteFailureKind.AUTH_REQUIRED, "DSH Remote 登录已失效", retryable = false, cause = error)
+  error.isCredentialRejected -> RemoteFailureException(RemoteFailureKind.AUTH_REQUIRED, "DSH Remote 登录已失效", retryable = false, cause = error)
+  error.status == 401 || (error.status == 403 && error.code == null) -> RemoteFailureException(RemoteFailureKind.NETWORK, "DSH Remote 授权服务暂时不可用，已保留凭据", retryable = true, cause = error)
   error.status == 403 -> RemoteFailureException(RemoteFailureKind.REJECTED, "主机拒绝了这台手机", retryable = false, cause = error)
   error.status == 404 -> RemoteFailureException(RemoteFailureKind.HOST_NOT_FOUND, "账号下找不到这台主机", retryable = false, cause = error)
   error.status == 429 -> RemoteFailureException(RemoteFailureKind.RATE_LIMITED, "请求过于频繁，请稍后重试", retryable = true, cause = error)

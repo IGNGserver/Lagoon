@@ -1,5 +1,9 @@
 package com.igng.opencode.lagoon.core.ssh
 
+import com.igng.opencode.lagoon.core.*
+import okhttp3.Credentials
+import org.json.JSONObject
+import java.util.concurrent.atomic.AtomicBoolean
 import com.igng.opencode.lagoon.core.Diagnostics
 import com.igng.opencode.lagoon.core.DshApi
 import com.igng.opencode.lagoon.core.DshAuthMode
@@ -26,6 +30,7 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -56,15 +61,16 @@ internal class SshHostLink(
   val isClosed: Boolean get() = closed
   @Volatile private var transport: SshTransport? = null
   @Volatile private var endpoint: RemoteDshEndpoint? = null
+  @Volatile private var openCodeEndpoint: OpenCodeSshRegistration? = null
   /** Browser cookie minted for the current remote dsh. Kept on the link, never in the server
    *  credential store: a new dsh process invalidates the launch token but this cookie still works. */
   @Volatile private var rememberedCookie: String = ""
   val remoteHome: String? get() = endpoint?.home
   val workingDirectory: String? get() = config.workingDirectory
   @Volatile private var forwarder: SshForwarder? = null
-  @Volatile private var client: DshApi? = null
+  @Volatile private var client: HarnessClient? = null
   @Volatile private var contentWatching = false
-  @Volatile private var ready = CompletableDeferred<DshApi>()
+  @Volatile private var ready = CompletableDeferred<HarnessClient>()
   /** Bumped every time the authenticated DshApi is replaced, including a failed exchange. */
   private val generation = java.util.concurrent.atomic.AtomicLong()
   val generationId: Long get() = generation.get()
@@ -78,9 +84,13 @@ internal class SshHostLink(
   /** Waits until this link has an authenticated DshApi; starts the link on first use.
    *  [sinceGeneration] waits for a client newer than that generation, so a caller that already holds
    *  a completed generation is not handed the same instance while a reconnect is in flight. */
-  suspend fun awaitClient(timeoutMillis: Long = 20_000, sinceGeneration: Long = -1): DshApi {
+  suspend fun awaitClient(timeoutMillis: Long = 20_000, sinceGeneration: Long = -1): DshApi =
+    awaitHarness(timeoutMillis, sinceGeneration) as? DshApi
+      ?: throw SshFailure(SshFailureKind.OTHER, "此 SSH binding 不是 DSH", retryable = false)
+
+  suspend fun awaitHarness(timeoutMillis: Long = 20_000, sinceGeneration: Long = -1): HarnessClient {
     if (closed) throw SshFailure(SshFailureKind.DISCONNECTED, "SSH 主机已移除", retryable = false)
-    client?.takeIf { mutableStatus.value.isConnected && generation.get() > sinceGeneration }?.let { return it }
+    client?.takeIf { !it.isClosed && mutableStatus.value.isConnected && generation.get() > sinceGeneration }?.let { return it }
     val failed = mutableStatus.value
     if (failed.phase == SshLinkPhase.FAILED) {
       val error = failed.error
@@ -88,19 +98,33 @@ internal class SshHostLink(
       retry()
     }
     start()
-    val pending = ready
-    val api = try {
-      withTimeout(timeoutMillis) { pending.await() }
+    return try {
+      withTimeout(timeoutMillis) {
+        while (true) {
+          if (closed) throw SshFailure(SshFailureKind.DISCONNECTED, "SSH 主机已移除", retryable = false)
+          val pending = ready
+          val api = pending.await()
+          if (generation.get() > sinceGeneration && !api.isClosed && mutableStatus.value.isConnected) return@withTimeout api
+          if (api.isClosed && mutableStatus.value.isConnected) {
+            lost(SshFailure(SshFailureKind.DISCONNECTED, "Harness 客户端已关闭，正在重新附着"), transport)
+            continue
+          }
+          // A completed ready from the previous generation must not recurse or spin. Await an
+          // actual state transition under the original deadline before reading the new gate.
+          mutableStatus.first { closed || ready !== pending || generation.get() > sinceGeneration ||
+            it.phase == SshLinkPhase.FAILED }
+          val failure = mutableStatus.value.error
+          if (mutableStatus.value.phase == SshLinkPhase.FAILED && failure != null) throw failure
+        }
+        @Suppress("UNREACHABLE_CODE")
+        error("unreachable")
+      }
     } catch (timeout: TimeoutCancellationException) {
       throw SshFailure(SshFailureKind.UNREACHABLE, "SSH 连接超时，请检查网络和主机状态", retryable = true)
     } catch (cancel: CancellationException) {
       if (closed) throw SshFailure(SshFailureKind.DISCONNECTED, "SSH 主机已移除", retryable = false)
       throw cancel
     }
-    if (sinceGeneration >= 0 && generation.get() <= sinceGeneration) {
-      return awaitClient(timeoutMillis, sinceGeneration)
-    }
-    return api
   }
 
   /** Keeps the expensive content subscription off for background monitoring. */
@@ -111,6 +135,10 @@ internal class SshHostLink(
 
   /** Stable across reconnects: the current DSH generation's workspace titles. */
   val workspaceUpdates: Flow<List<Project>> get() = workspacePublisher.asSharedFlow()
+
+  val isOpenCode: Boolean get() = profile.kind == ServerKind.OPENCODE
+  fun capabilities(): ApiCapabilities = client?.capabilities()
+    ?: if (profile.kind == ServerKind.OPENCODE) ApiCapabilities.BASELINE else DshApi.TUNNEL_CAPABILITIES
 
   /** Starts connecting in the background; safe to call repeatedly. */
   fun start() {
@@ -202,6 +230,10 @@ internal class SshHostLink(
     }
     transport = nextTransport
     try {
+      if (profile.kind == ServerKind.OPENCODE) {
+        attachOpenCode(nextTransport)
+        return
+      }
       publish(SshLinkPhase.CONNECTING, SshLinkStep.START_DSH, "正在检查远端的 dsh web", attempt = attempt)
       val bootstrap = RemoteDshBootstrap(nextTransport, config.launchCommand, config.workingDirectory)
       val nextEndpoint = withContext(Dispatchers.IO) {
@@ -266,6 +298,53 @@ internal class SshHostLink(
     }
   }
 
+  /** Attach-only OpenCode: registration discovery never launches or terminates a process. */
+  private suspend fun attachOpenCode(nextTransport: SshTransport) {
+    publish(SshLinkPhase.CONNECTING, SshLinkStep.TUNNEL, "正在读取 OpenCode 服务注册", attempt = attempt)
+    val registration = withContext(Dispatchers.IO) {
+      SshHarnessProbe(nextTransport).openCodeRegistration(profile.sshServicePath)
+    }
+    forwarder?.close()
+    val local = SshForwarder { input, output ->
+      val active = transport ?: throw SshFailure(SshFailureKind.DISCONNECTED, "SSH 连接已断开")
+      active.openTunnel(registration.host, registration.port, input, output)
+    }
+    forwarder = local
+    openCodeEndpoint = registration
+    val runtime = profile.copy(url = "http://127.0.0.1:${local.port}", username = "opencode",
+      allowCleartext = true, sshHostId = null, remoteHostId = null, remoteHostFingerprint = null)
+    val native = NativeOkHttpTransport(NativeHttpEndpoint(runtime.url))
+    val api = OpenCodeApi(runtime, ServerCredentials("opencode", registration.password.orEmpty()), transport = native)
+    try {
+      withTimeout(45_000) {
+        val headers = registration.password?.let { mapOf("Authorization" to Credentials.basic("opencode", it)) }.orEmpty()
+        val response = native.request("GET", "api/info", headers)
+        val info = runCatching { JSONObject(response.body.toString(Charsets.UTF_8)) }.getOrNull()
+        val status = registration.validateInfo(response.statusCode, info)
+        if (response.statusCode == 503) throw SshFailure(SshFailureKind.UNRESPONSIVE, "OpenCode 服务正在启动或停止")
+        if (response.statusCode in setOf(401, 403)) throw SshFailure(SshFailureKind.LOGIN, "OpenCode 服务认证失败", retryable = false)
+        if (status.compatible != DiscoveryValue.YES || status.listening != DiscoveryValue.YES)
+          throw SshFailure(SshFailureKind.OTHER, "OpenCode 注册与运行进程不匹配，请重新发现服务", retryable = false)
+        // /api/info can be public. Verify a protected native route before declaring auth ready.
+        api.projects()
+        api.discoverCapabilities()
+      }
+      if (closed) throw SshFailure(SshFailureKind.DISCONNECTED, "SSH binding 已关闭", retryable = false)
+      val previous = synchronized(this) { client.also { client = api } }
+      previous?.close()
+      generation.incrementAndGet()
+      attempt = 0
+      publish(SshLinkPhase.CONNECTED, SshLinkStep.CONNECTED, "OpenCode 已连接 · SSH ${config.address}")
+      ready.complete(api)
+      startKeepAlive()
+    } catch (error: Throwable) {
+      api.close()
+      if (error is ApiException && error.status in setOf(401, 403))
+        throw SshFailure(SshFailureKind.LOGIN, "OpenCode 服务认证失败，请重新发现注册文件", retryable = false)
+      throw error
+    }
+  }
+
   private fun createClient(endpoint: RemoteDshEndpoint): DshApi {
     val local = forwarder ?: throw SshFailure(SshFailureKind.TUNNEL, "本地隧道尚未建立")
     val runtime = profile.copy(
@@ -296,6 +375,11 @@ internal class SshHostLink(
           lost(SshFailure(SshFailureKind.DISCONNECTED, "SSH 连接没有响应，正在重连"), active)
           break
         }
+        val openCode = openCodeEndpoint
+        if (openCode != null && !active.probeTunnel(openCode.host, openCode.port, 8_000)) {
+          lost(SshFailure(SshFailureKind.DISCONNECTED, "OpenCode 服务已停止，正在重新发现"), active)
+          break
+        }
         val dsh = endpoint
         if (dsh != null) {
           // SSH can stay up while the remote dsh web process dies. Probe its loopback port so the
@@ -323,6 +407,7 @@ internal class SshHostLink(
       runCatching { transport?.close() }
       transport = null
       endpoint = null
+      openCodeEndpoint = null
       forwarder?.dropConnections()
       if (connectJob?.isActive != true) connectJob = scope.launch(Dispatchers.IO) { connectLoop() }
     }
@@ -338,6 +423,7 @@ internal class SshHostLink(
     runCatching { transport?.close() }
     transport = null
     endpoint = null
+    openCodeEndpoint = null
     runCatching { forwarder?.close() }
     forwarder = null
   }
@@ -368,6 +454,7 @@ internal class SshHostLink(
     runCatching { transport?.close() }
     transport = null
     endpoint = null
+    openCodeEndpoint = null
     runCatching { forwarder?.close() }
     forwarder = null
     publish(SshLinkPhase.IDLE, SshLinkStep.CONNECT, "")

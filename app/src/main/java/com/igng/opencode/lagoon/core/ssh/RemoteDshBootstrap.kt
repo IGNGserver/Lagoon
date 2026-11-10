@@ -327,14 +327,19 @@ internal class RemoteDshBootstrap(
     Regex("command not found|not found|No such file or directory|can't open|ENOENT", RegexOption.IGNORE_CASE)
       .containsMatchIn(log)
 
-  private companion object {
-    fun parseLaunchLine(line: String): RemoteDshEndpoint? {
-      val match = Regex("https?://[^\\s]*[?&]token=([^\\s&]+)").find(line) ?: return null
-      val token = match.groupValues[1]
-      val urlText = match.value.substringBefore("?token=").substringBefore("&token=")
+  internal companion object {
+    internal fun parseLaunchLine(line: String): RemoteDshEndpoint? {
+      val rawUrl = Regex("https?://[^\\s]+").find(line)?.value ?: return null
       return try {
-        val uri = URI(urlText)
-        val port = if (uri.port > 0) uri.port else return null
+        val uri = URI(rawUrl)
+        if (!uri.scheme.equals("http", ignoreCase = true)) return null
+        if (uri.userInfo != null || (uri.host != "127.0.0.1" && !uri.host.equals("localhost", ignoreCase = true))) return null
+        if (uri.path != "/" || uri.fragment != null) return null
+        val query = uri.rawQuery ?: return null
+        if (!query.matches(Regex("token=[A-Za-z0-9._~-]+"))) return null
+        val token = query.removePrefix("token=")
+        val port = uri.port
+        if (port !in 1..65535) return null
         RemoteDshEndpoint(port, token)
       } catch (_: Exception) {
         null

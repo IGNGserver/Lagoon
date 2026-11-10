@@ -1,0 +1,695 @@
+{
+  "version": 1,
+  "upstream": {
+    "repository": "https://github.com/deepseek-ai/deepseek-harness",
+    "tag": "dsh-v0.2.2-rc.1",
+    "commit": "66491b05e3f05ad35bcdd4f6cd7ed26041d9e3db",
+    "version": "0.2.2-rc.1"
+  },
+  "sources": [
+    {
+      "package": "@deepseek-ai/dsh-api-session-controller",
+      "version": "0.2.2-rc.1",
+      "generatedFile": "lib/typert.host.js",
+      "sha256": "f379a3a521f34078b9e540025ceeb4ab8727ef0116e8f36f6f031e6d47478aed"
+    }
+  ],
+  "methods": {
+    "session/attachment": {
+      "sourcePackage": "@deepseek-ai/dsh-api-session-controller",
+      "sourceLocation": {
+        "file": "packages/api/session-controller/src/index.ts",
+        "line": 497,
+        "column": 3
+      },
+      "args": {
+        "type": "object",
+        "properties": {
+          "request": {
+            "type": "object",
+            "properties": {
+              "sessionId": {
+                "type": "string",
+                "description": "Gateway permission scope only; neither Session existence nor its image references are checked."
+              },
+              "attachment": {
+                "type": "object",
+                "properties": {
+                  "attachmentId": {
+                    "type": "string",
+                    "description": "Opaque storage identifier; never a filesystem path or bearer URL."
+                  },
+                  "mediaType": {
+                    "type": "string",
+                    "enum": [
+                      "image/png",
+                      "image/jpeg",
+                      "image/webp",
+                      "image/gif"
+                    ],
+                    "description": "Media type verified from the stored bytes."
+                  },
+                  "bytes": {
+                    "type": "number",
+                    "description": "Exact encoded byte length."
+                  },
+                  "width": {
+                    "type": "number",
+                    "description": "Intrinsic encoded width in pixels."
+                  },
+                  "height": {
+                    "type": "number",
+                    "description": "Intrinsic encoded height in pixels."
+                  },
+                  "name": {
+                    "type": "string",
+                    "description": "Optional display name stripped of local path information."
+                  },
+                  "originalDimensions": {
+                    "type": "object",
+                    "properties": {
+                      "width": {
+                        "type": "number"
+                      },
+                      "height": {
+                        "type": "number"
+                      }
+                    },
+                    "required": [
+                      "width",
+                      "height"
+                    ],
+                    "additionalProperties": false,
+                    "description": "Input dimensions after applying EXIF orientation and before normalization scaling. Present only when normalization reduced the image."
+                  }
+                },
+                "required": [
+                  "attachmentId",
+                  "mediaType",
+                  "bytes",
+                  "width",
+                  "height"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "sessionId",
+              "attachment"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "request"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "session/create": {
+      "sourcePackage": "@deepseek-ai/dsh-api-session-controller",
+      "sourceLocation": {
+        "file": "packages/api/session-controller/src/index.ts",
+        "line": 304,
+        "column": 3
+      },
+      "args": {
+        "type": "object",
+        "properties": {
+          "request": {
+            "type": "object",
+            "properties": {
+              "workspaceId": {
+                "type": "string",
+                "description": "Workspace the Session joins; exclusive with `cwd`."
+              },
+              "cwd": {
+                "type": "string",
+                "description": "Directory the Session owns when no Workspace is named."
+              },
+              "sessionId": {
+                "type": "string",
+                "description": "Blank Session to reuse while it is reusable, or the identity of a new Session when none is stored under it."
+              },
+              "agentPreset": {
+                "type": "string",
+                "description": "Preset the Session runs, replacing a reused Session's recorded preset; the configured default when omitted."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "request"
+        ],
+        "additionalProperties": false
+      },
+      "result": {
+        "type": "object",
+        "properties": {
+          "sessionId": {
+            "type": "string",
+            "description": "The created or reused Session, which may differ from the requested `sessionId`."
+          },
+          "agentPreset": {
+            "type": "string",
+            "description": "Preset the Session runs, when the deployment composes a preset roster."
+          }
+        },
+        "required": [
+          "sessionId"
+        ],
+        "additionalProperties": true
+      }
+    },
+    "session/follow": {
+      "sourcePackage": "@deepseek-ai/dsh-api-session-controller",
+      "sourceLocation": {
+        "file": "packages/api/session-controller/src/index.ts",
+        "line": 607,
+        "column": 3
+      },
+      "args": {
+        "type": "object",
+        "properties": {
+          "request": {
+            "type": "object",
+            "properties": {
+              "address": {
+                "oneOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "kind": {
+                        "type": "string",
+                        "const": "session"
+                      },
+                      "sessionId": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "sessionId"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "kind": {
+                        "type": "string",
+                        "const": "subagent"
+                      },
+                      "parentSessionId": {
+                        "type": "string"
+                      },
+                      "childSessionId": {
+                        "type": "string"
+                      },
+                      "mode": {
+                        "type": "string",
+                        "enum": [
+                          "one-shot",
+                          "continuable",
+                          "unknown"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "parentSessionId",
+                      "childSessionId",
+                      "mode"
+                    ],
+                    "additionalProperties": false
+                  }
+                ]
+              },
+              "activate": {
+                "type": "boolean",
+                "description": "Request background activation; omission leaves the read passive."
+              },
+              "assistantStream": {
+                "type": "boolean",
+                "const": true,
+                "description": "Include process-local assistant presentation frames for the Web client."
+              },
+              "maxMessages": {
+                "type": "number"
+              },
+              "turnWindow": {
+                "type": "object",
+                "properties": {
+                  "minMessages": {
+                    "type": "number",
+                    "description": "Minimum append-origin user/assistant messages; must not exceed maxMessages."
+                  },
+                  "minTurns": {
+                    "type": "number",
+                    "description": "Minimum Turn starts crossed, including the partial Turn at beforeSeq."
+                  }
+                },
+                "required": [
+                  "minMessages",
+                  "minTurns"
+                ],
+                "additionalProperties": false,
+                "description": "Stop at a Turn start after both minima, unless maxMessages or history exhaustion wins."
+              }
+            },
+            "required": [
+              "address"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "request"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "session/page": {
+      "sourcePackage": "@deepseek-ai/dsh-api-session-controller",
+      "sourceLocation": {
+        "file": "packages/api/session-controller/src/index.ts",
+        "line": 529,
+        "column": 3
+      },
+      "args": {
+        "type": "object",
+        "properties": {
+          "request": {
+            "type": "object",
+            "properties": {
+              "address": {
+                "oneOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "kind": {
+                        "type": "string",
+                        "const": "session"
+                      },
+                      "sessionId": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "sessionId"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "kind": {
+                        "type": "string",
+                        "const": "subagent"
+                      },
+                      "parentSessionId": {
+                        "type": "string"
+                      },
+                      "childSessionId": {
+                        "type": "string"
+                      },
+                      "mode": {
+                        "type": "string",
+                        "enum": [
+                          "one-shot",
+                          "continuable",
+                          "unknown"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "parentSessionId",
+                      "childSessionId",
+                      "mode"
+                    ],
+                    "additionalProperties": false
+                  }
+                ]
+              },
+              "throughSeq": {
+                "type": "number",
+                "description": "Inclusive log cut; omission selects the observed log end. A follow opening reports the cut it covered so a caller can pin the same point."
+              },
+              "beforeSeq": {
+                "type": "number"
+              },
+              "maxMessages": {
+                "type": "number"
+              },
+              "turnWindow": {
+                "type": "object",
+                "properties": {
+                  "minMessages": {
+                    "type": "number",
+                    "description": "Minimum append-origin user/assistant messages; must not exceed maxMessages."
+                  },
+                  "minTurns": {
+                    "type": "number",
+                    "description": "Minimum Turn starts crossed, including the partial Turn at beforeSeq."
+                  }
+                },
+                "required": [
+                  "minMessages",
+                  "minTurns"
+                ],
+                "additionalProperties": false,
+                "description": "Stop at a Turn start after both minima, unless maxMessages or history exhaustion wins."
+              }
+            },
+            "required": [
+              "address"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "request"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "session/prompt": {
+      "sourcePackage": "@deepseek-ai/dsh-api-session-controller",
+      "sourceLocation": {
+        "file": "packages/api/session-controller/src/index.ts",
+        "line": 465,
+        "column": 9
+      },
+      "args": {
+        "type": "object",
+        "properties": {
+          "request": {
+            "type": "object",
+            "properties": {
+              "requestId": {
+                "type": "string",
+                "description": "Client-minted identity persisted on the exact accepted user message."
+              },
+              "sessionId": {
+                "type": "string"
+              },
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "queue",
+                  "steer"
+                ]
+              },
+              "content": {
+                "type": "array",
+                "items": {
+                  "oneOf": [
+                    {
+                      "type": "object",
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "text"
+                        },
+                        "text": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "type",
+                        "text"
+                      ],
+                      "additionalProperties": false
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "image"
+                        },
+                        "mediaType": {
+                          "type": "string",
+                          "enum": [
+                            "image/png",
+                            "image/jpeg",
+                            "image/webp",
+                            "image/gif"
+                          ]
+                        },
+                        "data": {
+                          "type": "string"
+                        },
+                        "name": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "type",
+                        "mediaType",
+                        "data"
+                      ],
+                      "additionalProperties": false
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "file"
+                        },
+                        "receiptId": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "type",
+                        "receiptId"
+                      ],
+                      "additionalProperties": false
+                    }
+                  ]
+                },
+                "description": "At least one non-whitespace text part or attachment."
+              },
+              "clientTimeZone": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "requestId",
+              "sessionId",
+              "mode",
+              "content"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "request"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "session/projections": {
+      "sourcePackage": "@deepseek-ai/dsh-api-session-controller",
+      "sourceLocation": {
+        "file": "packages/api/session-controller/src/index.ts",
+        "line": 618,
+        "column": 3
+      },
+      "args": {
+        "type": "object",
+        "properties": {
+          "request": {
+            "type": "object",
+            "properties": {
+              "sessionId": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "sessionId"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "request"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "session/selectModel": {
+      "sourcePackage": "@deepseek-ai/dsh-api-session-controller",
+      "sourceLocation": {
+        "file": "packages/api/session-controller/src/index.ts",
+        "line": 314,
+        "column": 3
+      },
+      "args": {
+        "type": "object",
+        "properties": {
+          "request": {
+            "type": "object",
+            "properties": {
+              "sessionId": {
+                "type": "string"
+              },
+              "provider": {
+                "type": "string"
+              },
+              "model": {
+                "type": "string"
+              },
+              "reasoningEffort": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "sessionId",
+              "provider",
+              "model"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "request"
+        ],
+        "additionalProperties": false
+      },
+      "result": {
+        "type": "object",
+        "properties": {
+          "selected": {
+            "type": "object",
+            "properties": {
+              "provider": {
+                "type": "string"
+              },
+              "model": {
+                "type": "string"
+              },
+              "reasoningEffort": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "provider",
+              "model"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "required": [
+          "selected"
+        ],
+        "additionalProperties": true
+      }
+    },
+    "session/updateQueue": {
+      "sourcePackage": "@deepseek-ai/dsh-api-session-controller",
+      "sourceLocation": {
+        "file": "packages/api/session-controller/src/index.ts",
+        "line": 507,
+        "column": 3
+      },
+      "args": {
+        "type": "object",
+        "properties": {
+          "request": {
+            "type": "object",
+            "properties": {
+              "sessionId": {
+                "type": "string"
+              },
+              "itemId": {
+                "type": "string"
+              },
+              "action": {
+                "oneOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "kind": {
+                        "type": "string",
+                        "const": "edit"
+                      },
+                      "content": {
+                        "type": "array",
+                        "items": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string",
+                              "const": "text"
+                            },
+                            "text": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "type",
+                            "text"
+                          ],
+                          "additionalProperties": false
+                        },
+                        "description": "Non-empty text-only replacement content."
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "content"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "kind": {
+                        "type": "string",
+                        "const": "remove"
+                      }
+                    },
+                    "required": [
+                      "kind"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "kind": {
+                        "type": "string",
+                        "const": "steer"
+                      }
+                    },
+                    "required": [
+                      "kind"
+                    ],
+                    "additionalProperties": false
+                  }
+                ]
+              }
+            },
+            "required": [
+              "sessionId",
+              "itemId",
+              "action"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "request"
+        ],
+        "additionalProperties": false
+      }
+    }
+  }
+}

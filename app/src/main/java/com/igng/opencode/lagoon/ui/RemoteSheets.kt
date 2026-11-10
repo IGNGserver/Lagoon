@@ -278,7 +278,7 @@ internal fun RemoteEnrollSheet(
                 busy = true; error = null
                 try {
                   val enrollment = manager!!.enroll(chosen, chosen.associate { it.hostId to it.meta.fingerprint!! })
-                  val added = controller.addRemoteProfiles(enrollment.catalog, chosen.map { it.meta })
+                  val added = controller.addRemoteProfiles(enrollment.catalog, chosen.filter { it.hostId in enrollment.registered }.map { it.meta })
                   resultText = if (enrollment.failures.isEmpty()) "已接入 ${added.size} 台远程主机"
                     else "已接入 ${added.size} 台；${enrollment.failures.size} 台失败：${enrollment.failures.values.first()}"
                   onDone(added.size)

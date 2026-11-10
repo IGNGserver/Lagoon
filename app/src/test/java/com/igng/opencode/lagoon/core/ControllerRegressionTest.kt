@@ -1381,6 +1381,39 @@ class ControllerRegressionTest {
     assertNull("会话删除事件必须同步驱逐 ConversationStorePool 槽位", controller.conversationPool.get("server", "s1"))
   }
 
+  @Test fun stoppingBackgroundJobCannotMutateAnotherServersSameNamedJob() = runBlocking {
+    val entered = CompletableDeferred<Unit>()
+    val release = CompletableDeferred<Unit>()
+    val client = Proxy.newProxyInstance(javaClass.classLoader, arrayOf(HarnessClient::class.java)) { _, method, args ->
+      when (method.name) {
+        "capabilities" -> ApiCapabilities(stopShell = true)
+        "removeShell" -> {
+          @Suppress("UNCHECKED_CAST")
+          val continuation = args!!.last() as Continuation<Unit>
+          entered.complete(Unit)
+          launch { release.await(); continuation.resume(Unit) }
+          COROUTINE_SUSPENDED
+        }
+        else -> error("unexpected ${method.name}")
+      }
+    } as HarnessClient
+    val original = ShellJob("job", "owner", "first", 1, "/first")
+    val other = original.copy(command = "second", directory = "/second")
+    val (controller, state) = controller(client, LagoonState(serverId = "first", shells = mapOf("job" to original)))
+    val operationScope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
+    put(controller, "scope", operationScope)
+    try {
+      val stopping = controller.stopShell(original)
+      entered.await()
+      put(controller, "generation", 2)
+      state.value = LagoonState(serverId = "second", shells = mapOf("job" to other))
+      release.complete(Unit)
+      stopping.join()
+      assertEquals(other, state.value.shells["job"])
+      assertNull(state.value.error)
+    } finally { operationScope.cancel() }
+  }
+
   @Test fun jobOutputCapabilityWorksForDirectRemoteAndSshProfiles() {
     for ((kind, ssh) in listOf(ServerKind.DSH to null, ServerKind.DSH_REMOTE to null, ServerKind.DSH to "ssh-host")) {
       var called = false

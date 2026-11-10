@@ -121,6 +121,7 @@ class DshApi(
     .build()
 
   private val ioScope = SharedHttp.ioScope
+  private val muxOwner = PhysicalMuxOwner()
 
   init {
     require(base.scheme == "https" || base.scheme == "http" && profile.allowCleartext) { "HTTP 明文连接未获授权，请在服务器资料中明确开启" }
@@ -174,6 +175,7 @@ class DshApi(
   @Volatile private var catalog: JSONObject? = null
   /** 已归档会话集合（`workspace/follow` 的 baseline 与 `archived` 增量维护）。 */
   private val archivedSessions = ConcurrentHashMap.newKeySet<String>()
+  @Volatile private var archiveBaselineKnown = false
   /** 服务端置顶集合（`workspace/follow` 的 `pinnedSessionIds`，含 `pinned` 增量帧）。 */
   private val serverPinned = ConcurrentHashMap.newKeySet<String>()
   /** `workspace/follow` 的最新工作区清单；null 表示尚未读取。 */
@@ -200,6 +202,7 @@ class DshApi(
    * `session/attachment`；同一条消息在快照/实时/翻页里会重复出现，缓存避免重复拉取。
    */
   private val attachmentBlobs = ConcurrentHashMap<String, String>()
+  @Volatile private var fullAttachmentReference: Boolean? = null
   /**
    * 一次性读取（当前只有 `job/list`）的并发闸门。首页会按最多 8 个目录并发读作业，
    * 每条 `job/list` 都是一条流；不限流会和 `$events`/`session/follow` 抢预算。
@@ -218,14 +221,9 @@ class DshApi(
   private val liveAttempts = ConcurrentHashMap<String, String>()
   /** 每个会话已经投影过的最大事件 seq：消息页与实时流之间按 seq 去重。 */
   private val lastSeqs = ConcurrentHashMap<String, Long>()
-  /**
-   * 本机已经见过的最新一轮结局（`succeeded` / `failed` / `interrupted`）。DSH 的列表只有 `running`，
-   * 没有 OpenCode 的持久 `outcome`；`$events` 的 `api-session/status` 也只给布尔值。结局只写在日志的
-   * `turn/end` 里，所以这里记下本机翻译过或读到过的那一轮，供收尾时补未读结果。
-   */
-  private val outcomes = ConcurrentHashMap<String, String>()
-  /** 正在为一次 idle 收尾补读日志的会话，避免状态事件连发时重复翻页。 */
-  private val outcomeReads = ConcurrentHashMap.newKeySet<String>()
+  /** Execution-scoped outcomes: old history/late reads cannot overwrite a newer running turn. */
+  private val executions = DshExecutionTracker()
+  private val outcomeReads = ConcurrentHashMap<String, Long>()
 
   override val isClosed: Boolean get() = closed || remoteBackend?.isClosed == true
 
@@ -238,8 +236,15 @@ class DshApi(
     followStates.values.toList().forEach(::stopFollowState)
     followStates.clear()
     durableTurns.clear(); liveParts.clear(); liveAttempts.clear()
-    outcomes.clear(); outcomeReads.clear()
+    executions.clear(); outcomeReads.clear()
     pendingApprovals.clear(); pendingQuestions.clear()
+    // attachWait is a claim, not a fire-and-forget request. Closing the client must release every
+    // claim socket so the Host can settle timed questions instead of retaining a dead UI claimant.
+    questionClaims.values.toList().forEach { runCatching { it.cancel() } }
+    questionClaims.clear()
+    claimedQuestions.clear()
+    questionCallIds.clear()
+    muxOwner.close()
     remoteBackend?.close()
   }
 
@@ -455,7 +460,7 @@ class DshApi(
         // fingerprint or host recovery. Only untyped I/O is collapsed into a transport failure.
         catch (error: RemoteFailureException) { throw error }
         catch (error: RemoteServerException) { throw remoteServerFailure(error) }
-        catch (error: RemoteGatewayException) { throw ApiException(502, friendlyMessage(error.code, error.message.orEmpty()), error.code) }
+        catch (error: RemoteGatewayException) { throw ApiException(502, friendlyMessage(error.code, error.message.orEmpty()), error.code, error.details) }
         // The transport died, or its pending RPC could not finish. This is not a Host contract
         // rejection: name it as a connection problem (and keep the upstream code) so the controller
         // can reconnect instead of toasting “transfer closed” / WebSocket internals.
@@ -481,7 +486,12 @@ class DshApi(
         .build()
       val (status, contentType, body) = try {
         runHttpCall(request) { response ->
-          response.use { Triple(it.code, it.header("Content-Type"), it.body?.bytes() ?: ByteArray(0)) }
+          response.use {
+            val body = it.body
+            if (body != null && (body.contentLength() > MAX_RPC_RESPONSE_BYTES || body.source().request(MAX_RPC_RESPONSE_BYTES + 1)))
+              throw ApiException(413, "DSH 响应超过本机读取上限", "response/too-large")
+            Triple(it.code, it.header("Content-Type"), body?.bytes() ?: ByteArray(0))
+          }
         }
       } catch (error: ApiException) {
         throw error
@@ -493,15 +503,15 @@ class DshApi(
         rejectCookie(current)
         return@withContext call(endpoint, payload, retried = true)
       }
-      if (status == 401) throw ApiException(401, repairMessage(), AUTH_EXPIRED)
-      if (status !in 200..299) throw ApiException(status, httpMessage(status), "http/$status")
+      if (status == 401) throw ApiException(401, repairMessage(), AUTH_EXPIRED, JSONObject().put("status", status))
+      if (status !in 200..299) throw ApiException(status, httpMessage(status), "http/$status", JSONObject().put("status", status))
       val parsed = decodeRpcResponse(status, contentType, body)
       val result = parsed.optJSONObject("result") ?: throw ApiException(status, "服务器响应缺少 result")
       if (result.optBoolean("ok")) return@withContext result.opt("value")
       val failure = result.optJSONObject("error")
       val code = failure?.optString("code").orEmpty()
       val message = failure?.optString("message").orEmpty()
-      throw ApiException(status, friendlyMessage(code, message.ifBlank { "请求失败" }), code.ifBlank { null })
+      throw ApiException(status, friendlyMessage(code, message.ifBlank { "请求失败" }), code.ifBlank { null }, failure?.optJSONObject("details"))
     }
 
   /**
@@ -628,8 +638,10 @@ class DshApi(
             it.code == 413 -> throw ApiException(413, "文件超过预览上限")
             it.code !in 200..299 -> null
             else -> {
-              val bytes = it.body?.bytes() ?: return@use null
-              if (bytes.size > maxBytes) throw ApiException(413, "文件超过预览上限")
+              val body = it.body ?: return@use null
+              if (body.contentLength() > maxBytes || body.source().request(maxBytes.toLong() + 1))
+                throw ApiException(413, "文件超过预览上限")
+              val bytes = body.bytes()
               val mime = it.header("Content-Type")?.substringBefore(';')?.trim()?.takeIf(String::isNotBlank)
               FilePreview(mime ?: "application/octet-stream", bytes)
             }
@@ -703,7 +715,10 @@ class DshApi(
       else metadata.optBoolean("blank", false)
     // lastPromptAt 是“已经收到过用户 prompt”的持久事实；即使 blank 是旧缓存，也不能把有 prompt 的会话藏掉。
     val prompted = (metadata.opt("lastPromptAt") as? Number)?.toLong()?.let { it > 0 } == true
-    val blank = listedBlank && !prompted && !item.optBoolean("running") && previous?.blank != false
+    val running = item.optBoolean("running")
+    if (executions.status(id, running)) clearKnownOutcome(id)
+    val blank = listedBlank && !prompted && !running && previous?.blank != false
+    val model = modelChoice(values.obj("modelSelection"), previous?.model)
     return Session(
       id = id,
       directory = directory,
@@ -713,18 +728,34 @@ class DshApi(
       subagentMode = values.obj("subagent").str("mode").takeIf { it.isNotBlank() },
       projectId = directory.ifBlank { null },
       created = previous?.created ?: updated,
-      archived = id in archivedSessions || previous?.archived == true,
+      archived = if (archiveBaselineKnown) id in archivedSessions else previous?.archived == true,
       permission = values.obj("permissions").str("currentValue").ifBlank { previous?.permission.orEmpty() },
       agent = values.str("agentPreset").ifBlank { previous?.agent }?.takeIf(String::isNotBlank),
-      model = previous?.model,
+      model = model,
       viewed = previous?.viewed ?: 0,
-      idle = if (item.optBoolean("running")) 0 else previous?.idle ?: 0,
-      // 列表没有结局字段。保留本机已经从 `turn/end` 读到的那一轮，空闲对账才能把它写成未读结果。
-      outcome = outcomes[id] ?: previous?.outcome,
+      idle = if (running) 0 else previous?.idle ?: 0,
+      // A result belongs to one execution. Never project the prior turn's result while a new turn runs.
+      outcome = if (running) null else executions.outcome(id),
       revertMessageId = null,
       serverId = previous?.serverId,
       blank = blank
     )
+  }
+
+  /** The official projection is flat: `modelSelection.next/lastUsed`, not a nested selection object. */
+  private fun modelChoice(selection: JSONObject, fallback: ModelChoice?): ModelChoice? {
+    val next = selection.obj("next")
+    val last = selection.obj("lastUsed")
+    val chosen = if (next.length() > 0) next else last
+    val provider = chosen.str("provider")
+    val model = chosen.str("model")
+    return if (provider.isBlank() || model.isBlank()) fallback
+    else ModelChoice(provider, model, fallback?.label?.takeIf { fallback.providerId == provider && fallback.modelId == model } ?: model,
+      chosen.str("reasoningEffort").takeIf { it.isNotBlank() })
+  }
+
+  private fun clearKnownOutcome(sessionId: String) {
+    known.computeIfPresent(sessionId) { _, current -> current.copy(outcome = null) }
   }
 
   private suspend fun sessionOrFetch(id: String): Session = known[id] ?: run {
@@ -792,8 +823,7 @@ class DshApi(
         "baseline" -> {
           val value = frame.obj("value")
           workspaceItems = value.arr("items").objects()
-          archivedSessions.clear()
-          archivedSessions += value.arr("archivedSessionIds").strings()
+          replaceArchiveSet(value.arr("archivedSessionIds").strings())
           serverPinned.clear()
           serverPinned += value.arr("pinnedSessionIds").strings()
         }
@@ -809,8 +839,7 @@ class DshApi(
           val value = frame.obj("value")
           workspaceItems = value.arr("items").objects()
           if (value.has("archivedSessionIds")) {
-            archivedSessions.clear()
-            archivedSessions += value.arr("archivedSessionIds").strings()
+            replaceArchiveSet(value.arr("archivedSessionIds").strings())
           }
         }
         "upsert" -> {
@@ -831,13 +860,19 @@ class DshApi(
           }
         }
         "archived" -> {
-          archivedSessions.clear()
-          archivedSessions += frame.arr("archivedSessionIds").strings()
+          replaceArchiveSet(frame.arr("archivedSessionIds").strings())
         }
       }
       workspaceItems
     }
     snapshot?.let { workspacePublisher.tryEmit(workspaceProjects(it)) }
+  }
+
+  private fun replaceArchiveSet(ids: List<String>) {
+    archivedSessions.clear()
+    archivedSessions.addAll(ids)
+    archiveBaselineKnown = true
+    known.replaceAll { id, session -> session.copy(archived = id in archivedSessions) }
   }
 
   override suspend fun projectAt(directory: String): Project? {
@@ -960,74 +995,292 @@ class DshApi(
   ): WebSocket = withContext(Dispatchers.IO) {
     val wirePayload = payload.json
     remoteBackend?.let { return@withContext it.open(endpoint, wirePayload, onItem, onClosed) }
-    val current = cookie()
-    val streamId = UUID.randomUUID().toString()
-    // OkHttp 的 WebSocket 直接接受 http(s) URL 并发起 Upgrade；HttpUrl 不接受 ws/wss 方案。
-    val socketUrl = base.newBuilder()
-      .addEncodedPathSegment("api")
-      .addEncodedPathSegment("remote.mux")
-      .build()
-    val request = Request.Builder().url(socketUrl).header("Cookie", current).build()
-    // 每条逻辑流只收尾一次：error 帧、end 帧、主动 cancel 与底层失败可能先后到达。
-    val finished = java.util.concurrent.atomic.AtomicBoolean(false)
-    fun finish(webSocket: WebSocket, cause: Throwable?) {
-      if (!finished.compareAndSet(false, true)) return
-      // 立即关闭：mux 流不需要关闭握手，优雅关闭会让 MockWebServer 一类的对端等待超时。
-      webSocket.cancel()
-      onClosed(cause)
-    }
-    val listener = object : WebSocketListener() {
-      override fun onOpen(webSocket: WebSocket, response: Response) {
-        val open = JSONObject()
-          .put("type", "open")
-          .put("streamId", streamId)
-          .put("endpoint", endpoint)
-          .put("payload", wirePayload)
-        // false 表示 OkHttp 已拒绝入队（常见原因是 socket 正在关闭）。忽略它会让上层永远等首帧。
-        if (!webSocket.send(open.toString())) finish(webSocket, IOException("mux open 帧发送失败"))
-      }
+    muxOwner.open(endpoint, wirePayload, onItem, onClosed)
+  }
 
-      override fun onMessage(webSocket: WebSocket, text: String) {
+  /** Test seam for exercising physical API-Peer ownership without starting the full event loops. */
+  internal suspend fun openMuxForTest(
+    endpoint: String,
+    payload: JSONObject = JSONObject(),
+    onItem: (JSONObject) -> Unit,
+    onClosed: (Throwable?) -> Unit
+  ): WebSocket = openMux(endpoint, RpcPayload(payload), onItem, onClosed)
+
+  /**
+   * One API Peer socket carrying many logical streams.  The logical handles deliberately retain the
+   * small WebSocket surface used by the rest of DshApi (cancel only); the physical owner owns frame
+   * routing, bounded callback queues, and close/error fan-out.
+   */
+  private class MuxLogicalState(
+    val id: String,
+    val endpoint: String,
+    val onItem: (JSONObject) -> Unit,
+    val onClosed: (Throwable?) -> Unit,
+    val frames: Channel<JSONObject> = Channel(MUX_STREAM_BUFFER),
+    var worker: Job? = null
+  )
+
+  private inner class PhysicalMuxOwner {
+    private val lock = Any()
+    private val streams = LinkedHashMap<String, MuxLogicalState>()
+    private val pendingOpens = LinkedHashMap<String, String>()
+    @Volatile private var physical: WebSocket? = null
+    private var connectingSocket: WebSocket? = null
+    // Allocate before cookie() suspends; every callback and send belongs to exactly this attempt.
+    private var generation = 0L
+    private var activeGeneration: Long? = null
+    @Volatile private var ownerClosed = false
+
+    suspend fun open(endpoint: String, payload: JSONObject, onItem: (JSONObject) -> Unit,
+      onClosed: (Throwable?) -> Unit): WebSocket {
+      if (ownerClosed || closed) throw IOException("DSH mux 已关闭")
+      val id = UUID.randomUUID().toString()
+      val state = MuxLogicalState(id, endpoint, onItem, onClosed)
+      state.worker = ioScope.launch {
+        var failure: Throwable? = null
         try {
-          val frame = try { JSONObject(text) } catch (error: Exception) { throw IOException("mux 帧不是有效 JSON", error) }
-          val type = frame.str("type")
-          if (type !in setOf("item", "end", "error")) return // 前向兼容新的控制帧。
-          if (frame.str("streamId") != streamId) throw IOException("mux 流身份不匹配")
-          when (type) {
-            "item" -> {
-              val value = frame.opt("value") as? JSONObject ?: throw IOException("mux item 缺少对象载荷")
-              try { onItem(value) } catch (error: Exception) {
-                Diagnostics.warn("DshApi", "mux 事件翻译失败", error)
-                throw IOException("mux 事件翻译失败", error)
+          while (true) {
+            val result = state.frames.receiveCatching()
+            if (result.isClosed) {
+              failure = result.exceptionOrNull()
+              break
+            }
+            state.onItem(result.getOrThrow())
+          }
+        } catch (cancel: CancellationException) {
+          failure = cancel
+          throw cancel
+        } catch (error: Throwable) {
+          failure = error
+        } finally {
+          val stillOwned = synchronized(lock) { streams[id] === state }
+          if (stillOwned && failure != null) {
+            // A callback/parser failure belongs to this logical stream. Cancel its server-side
+            // producer, but keep the physical API-Peer socket and all sibling streams alive.
+            cancelLogical(id)
+          } else {
+            synchronized(lock) {
+              if (streams[id] === state) {
+                streams.remove(id)
+                pendingOpens.remove(id)
               }
             }
-            "error" -> finish(webSocket, IOException(frame.obj("error").str("message").ifBlank { "会话流出错" }))
-            "end" -> finish(webSocket, null)
           }
-        } catch (error: Exception) {
-          // 坏帧可能正好包含终态或快照；静默跳过会把损坏投影当成权威状态。断开并重连对账。
-          finish(webSocket, if (error is IOException) error else IOException("mux 帧处理失败", error))
+          state.onClosed(failure)
         }
       }
 
-      override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-        if (response?.code == 401) {
-          // Cookie 失效：丢弃，让下一次调用重新换取。
-          ioScope.launch { rejectCookie(current) }
+      var startGeneration: Long? = null
+      var existing: Pair<Long, WebSocket>? = null
+      synchronized(lock) {
+        if (ownerClosed || closed) {
+          state.frames.close(IOException("DSH mux 已关闭"))
+        } else {
+          streams[id] = state
+          val open = JSONObject().put("type", "open").put("streamId", id)
+            .put("endpoint", endpoint).put("payload", payload).toString()
+          pendingOpens[id] = open
+          existing = physical?.let { activeGeneration!! to it }
+          if (activeGeneration == null) {
+            startGeneration = ++generation
+            activeGeneration = startGeneration
+          }
         }
-        finish(webSocket, t)
       }
-
-      override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
-        // 服务端主动关闭整条连接（dsh 重启、Host 下线）：按异常断开处理，让上层重连。
-        finish(webSocket, IOException("DeepSeek Harness 关闭了连接（$code）"))
+      if (ownerClosed || closed) {
+        state.worker?.cancel()
+        throw IOException("DSH mux 已关闭")
       }
+      startGeneration?.let { connectPhysical(it) }
+        ?: existing?.let { (attempt, socket) -> sendPending(attempt, socket) }
+      return LogicalSocket(id, state, this)
+    }
 
-      override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-        finish(webSocket, null)
+    private fun isActive(attempt: Long): Boolean =
+      !ownerClosed && !closed && activeGeneration == attempt
+
+    private suspend fun connectPhysical(attempt: Long) {
+      val current = try { cookie() } catch (error: Throwable) {
+        failPhysical(attempt, error)
+        throw error
+      }
+      if (!synchronized(lock) { isActive(attempt) }) return
+      val socketUrl = base.newBuilder()
+        .addEncodedPathSegment("api")
+        .addEncodedPathSegment("remote.mux")
+        .build()
+      val request = Request.Builder().url(socketUrl).header("Cookie", current).build()
+      val listener = object : WebSocketListener() {
+        override fun onOpen(webSocket: WebSocket, response: Response) {
+          val accepted = synchronized(lock) {
+            if (!isActive(attempt)) false else {
+              physical = webSocket
+              connectingSocket = null
+              true
+            }
+          }
+          if (!accepted) {
+            webSocket.cancel()
+            return
+          }
+          sendPending(attempt, webSocket)
+        }
+
+        override fun onMessage(webSocket: WebSocket, text: String) {
+          if (!synchronized(lock) { isActive(attempt) && physical === webSocket }) return
+          val frame = try { JSONObject(text) } catch (error: Exception) {
+            failPhysical(attempt, IOException("mux 帧不是有效 JSON", error)); return
+          }
+          val type = frame.str("type")
+          if (type !in setOf("item", "end", "error")) return
+          val id = frame.str("streamId")
+          synchronized(lock) {
+            if (!isActive(attempt) || physical !== webSocket) return
+            val state = streams[id] ?: return
+            when (type) {
+              "item" -> {
+                val value = frame.opt("value") as? JSONObject
+                if (value == null) finishLogical(id, IOException("mux item 缺少对象载荷"), cancel = true)
+                else if (state.frames.trySend(value).isFailure) {
+                  finishLogical(id, IOException("mux 流消费者过慢"), cancel = true)
+                }
+              }
+              "error" -> {
+                val error = frame.obj("error")
+                val code = error.str("code").takeIf { it.isNotBlank() }
+                val details = error.optJSONObject("details")
+                finishLogical(id, ApiException(502,
+                  friendlyMessage(code.orEmpty(), error.str("message").ifBlank { "会话流出错" }), code, details))
+              }
+              "end" -> finishLogical(id, null)
+            }
+          }
+        }
+
+        override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+          if (!synchronized(lock) { isActive(attempt) }) return
+          val error = if (response?.code == 409) IOException("DSH API Peer 已有连接（HTTP 409）", t) else t
+          if (response?.code == 401) ioScope.launch {
+            // Reject before releasing this generation so a replacement cannot reuse its cookie.
+            authLock.withLock {
+              synchronized(lock) {
+                if (!isActive(attempt)) return@withLock
+                if (sessionCookie == current) {
+                  sessionCookie = null
+                  if (signingSecret != null && base.isHttps && !plainListener) plainListener = true
+                  else {
+                    cookieRejected = true
+                    if (DshCookie.isDurable(current)) runCatching { onCookie("") }
+                  }
+                }
+                failPhysical(attempt, error)
+              }
+            }
+          } else failPhysical(attempt, error)
+        }
+
+        override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+          failPhysical(attempt, IOException("DeepSeek Harness 关闭了连接（$code）"))
+        }
+
+        override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+          // Some peers emit onClosed without onClosing; only this generation may settle streams.
+          failPhysical(attempt, IOException("DeepSeek Harness 物理 mux 已关闭（$code）"))
+        }
+      }
+      val socket = try { streamHttp.newWebSocket(request, listener) } catch (error: Throwable) {
+        failPhysical(attempt, error)
+        throw error
+      }
+      // onFailure/onOpen may run before newWebSocket returns. Never resurrect a retired attempt.
+      val accepted = synchronized(lock) {
+        if (!isActive(attempt)) false else {
+          if (physical == null) connectingSocket = socket
+          true
+        }
+      }
+      if (!accepted) socket.cancel()
+    }
+
+    private fun sendPending(attempt: Long, socket: WebSocket) {
+      synchronized(lock) {
+        if (!isActive(attempt) || physical !== socket) return
+        val pending = pendingOpens.toMap()
+        for ((id, open) in pending) {
+          if (pendingOpens.remove(id) == null || !streams.containsKey(id)) continue
+          if (!socket.send(open)) {
+            failPhysical(attempt, IOException("mux open 帧发送失败"))
+            return
+          }
+        }
       }
     }
-    streamHttp.newWebSocket(request, listener)
+
+    private fun finishLogical(id: String, cause: Throwable?, cancel: Boolean = false) {
+      val state = synchronized(lock) {
+        val removed = streams.remove(id) ?: return
+        val wasPending = pendingOpens.remove(id) != null
+        if (cancel && !wasPending) {
+          physical?.send(JSONObject().put("type", "cancel").put("streamId", id).toString())
+        }
+        removed
+      }
+      state.frames.close(cause)
+      // API-Peer cookies own a lifecycle socket. An idle socket must survive logical end/cancel.
+    }
+
+    private fun cancelLogical(id: String) = finishLogical(id, null, cancel = true)
+
+    private fun failPhysical(attempt: Long, error: Throwable) {
+      val states: List<MuxLogicalState>
+      val socket: WebSocket?
+      synchronized(lock) {
+        if (!isActive(attempt)) return
+        activeGeneration = null
+        socket = physical ?: connectingSocket
+        physical = null
+        connectingSocket = null
+        states = streams.values.toList()
+        streams.clear()
+        pendingOpens.clear()
+      }
+      states.forEach { it.frames.close(error) }
+      socket?.cancel()
+    }
+
+    fun close() {
+      val states: List<MuxLogicalState>
+      val socket: WebSocket?
+      synchronized(lock) {
+        ownerClosed = true
+        activeGeneration = null
+        states = streams.values.toList()
+        streams.clear()
+        pendingOpens.clear()
+        socket = physical ?: connectingSocket
+        physical = null
+        connectingSocket = null
+      }
+      states.forEach { it.frames.close() }
+      socket?.cancel()
+    }
+
+    private inner class LogicalSocket(
+      private val id: String,
+      private val state: MuxLogicalState,
+      private val owner: PhysicalMuxOwner
+    ) : WebSocket {
+      private val finished = java.util.concurrent.atomic.AtomicBoolean(false)
+      override fun request(): Request = Request.Builder().url(base).build()
+      override fun queueSize(): Long = physical?.queueSize() ?: 0L
+      override fun send(text: String): Boolean = false
+      override fun send(bytes: okio.ByteString): Boolean = false
+      override fun close(code: Int, reason: String?): Boolean { cancel(); return true }
+      override fun cancel() {
+        if (!finished.compareAndSet(false, true)) return
+        owner.cancelLogical(id)
+      }
+    }
   }
 
   /**
@@ -1059,9 +1312,11 @@ class DshApi(
   /** 把流层的失败折成用户能看懂、也能定位的一层错误（保留上游 code）。 */
   private fun streamFailure(endpoint: String, error: Throwable): ApiException {
     if (error is ApiException) return error
-    val code = (error as? RemoteGatewayException)?.code ?: (error as? RemoteRpcException)?.code
+    val gateway = error as? RemoteGatewayException
+    val code = gateway?.code ?: (error as? RemoteRpcException)?.code
+    val details = gateway?.details
     val reason = error.message?.takeIf { it.isNotBlank() } ?: error.javaClass.simpleName
-    return ApiException(502, "读取 $endpoint 失败：$reason", code)
+    return ApiException(502, "读取 $endpoint 失败：${friendlyMessage(code.orEmpty(), reason)}", code, details)
   }
 
   /**
@@ -1130,7 +1385,10 @@ class DshApi(
     if (type == "turn/start" && turn != null) durableTurns[session.id] = turn
     val base = JSONObject().put("sessionID", session.id).put("sequence", seq).putOpt("turn", turn)
     when (type) {
-      "turn/start" -> emit("session.execution.started", base.put("at", time))
+      "turn/start" -> {
+        if (executions.start(session.id, seq)) clearKnownOutcome(session.id)
+        emit("session.execution.started", base.put("at", time))
+      }
       "turn/end" -> emitTurnEnd(session, base, data, ::emit)
       "step/start" -> emit("session.step.started", base
         .put("assistantMessageID", messageId(data))
@@ -1212,16 +1470,18 @@ class DshApi(
           emit("session.agent.selected", base.put("agent", preset))
         }
       }
-      // `model/selection` 同样是耐久事实；不读它，重启后药丸只能显示本机记得的那个模型。
+      // `model/selection` is the durable selection intent itself: `{provider, model, reasoningEffort?}`.
+      // The projection shape (`modelSelection.next/lastUsed`) is only for session/projections.
       "model/selection" -> {
-        val selection = data.obj("next").takeIf { it.length() > 0 } ?: data.obj("lastUsed")
-        val provider = selection.str("provider")
-        val modelId = selection.str("model")
+        val provider = data.str("provider")
+        val modelId = data.str("model")
         if (provider.isNotBlank() && modelId.isNotBlank()) {
-          known[session.id]?.let {
-            known[session.id] = it.copy(model = ModelChoice(provider, modelId, modelId,
-              selection.str("reasoningEffort").takeIf { effort -> effort.isNotBlank() }))
-          }
+          val selected = ModelChoice(provider, modelId, modelId,
+            data.str("reasoningEffort").takeIf(String::isNotBlank))
+          known.computeIfPresent(session.id) { _, current -> current.copy(model = selected) }
+          emit("session.model.selected", base.put("model", JSONObject()
+            .put("providerID", provider).put("id", modelId).put("name", modelId)
+            .putOpt("variant", selected.variant)))
         }
       }
       // 清单与目标都是整值投影：`todo/write` 每次都是完整替换，`goal/change` 是完整快照。
@@ -1358,35 +1618,32 @@ class DshApi(
    */
   private fun emitTurnEnd(session: Session, base: JSONObject, data: JSONObject, emit: (String, JSONObject) -> Unit) {
     val reason = data.obj("reason")
+    val outcome = when (reason.str("kind")) {
+      "completed", "forked" -> "succeeded"
+      "aborted", "blocked", "interrupted" -> "interrupted"
+      else -> "failed"
+    }
+    if (!executions.settle(session.id, base.optLong("sequence"), outcome)) return
+    known.computeIfPresent(session.id) { _, current -> current.copy(outcome = outcome) }
     when (reason.str("kind")) {
       "completed", "forked" -> {
-        rememberOutcome(session, "succeeded")
         emit("session.execution.succeeded", base)
       }
       "aborted", "blocked", "interrupted" -> {
-        rememberOutcome(session, "interrupted")
         emit("session.execution.interrupted", base.put("reason", reason.obj("reason").str("kind").ifBlank { "user" }))
       }
       "max-tokens" -> {
-        rememberOutcome(session, "failed")
         emit("session.execution.failed", base.put("error", JSONObject()
           .put("type", "max-tokens")
           .put("message", "达到输出长度上限")))
       }
       else -> {
-        rememberOutcome(session, "failed")
         val error = reason.obj("error")
         emit("session.execution.failed", base.put("error", JSONObject()
           .put("type", error.str("code").ifBlank { reason.str("kind").ifBlank { "error" } })
           .put("message", error.str("message").ifBlank { "执行失败" })))
       }
     }
-  }
-
-  /** 记下本机见过的最新一轮结局，并写回会话缓存，让随后的列表读取带上它。 */
-  private fun rememberOutcome(session: Session, outcome: String) {
-    outcomes[session.id] = outcome
-    known[session.id]?.let { known[session.id] = it.copy(outcome = outcome) }
   }
 
   private fun parseArguments(raw: String): Any =
@@ -1414,7 +1671,7 @@ class DshApi(
         continue
       }
       if (budget <= 0) continue
-      val loaded = readAttachment(sessionId, attachmentId, attachment.str("mediaType")) ?: continue
+      val loaded = readAttachment(sessionId, attachment) ?: continue
       budget -= loaded.length
       if (attachmentBlobs.size >= ATTACHMENT_CACHE_LIMIT) attachmentBlobs.clear()
       attachmentBlobs[attachmentId] = loaded
@@ -1425,11 +1682,21 @@ class DshApi(
   }
 
   /** `session/attachment` → `data:<mediaType>;base64,…`；失败返回 null（只丢图片，不丢消息）。 */
-  private suspend fun readAttachment(sessionId: String, attachmentId: String, mediaType: String): String? = try {
-    val value = callObject("session/attachment", requestArgs(JSONObject()
-      .put("sessionId", sessionId).put("attachmentId", attachmentId)))
+  private suspend fun readAttachment(sessionId: String, attachment: JSONObject): String? = try {
+    val canUseFull = DshAttachmentRequest.hasVerifiedReference(attachment)
+    val full = fullAttachmentReference ?: canUseFull
+    suspend fun load(style: Boolean): JSONObject = callObject("session/attachment",
+      envelope(DshAttachmentRequest.args(sessionId, attachment, style)))
+    val value = try {
+      load(full).also { fullAttachmentReference = full }
+    } catch (error: ApiException) {
+      if (error.code != "gateway/arguments-invalid" || (!full && !canUseFull)) throw error
+      load(!full).also { fullAttachmentReference = !full }
+    }
+    val resultRef = value.optJSONObject("attachment") ?: attachment
+    if (resultRef.str("attachmentId") != attachment.str("attachmentId")) throw ApiException(502, "附件身份不匹配")
     value.optString("data").takeIf(String::isNotBlank)?.let { encoded ->
-      "data:${mediaType.ifBlank { "application/octet-stream" }};base64,$encoded"
+      "data:${resultRef.str("mediaType").ifBlank { "application/octet-stream" }};base64,$encoded"
     }
   } catch (cancel: CancellationException) {
     throw cancel
@@ -1641,6 +1908,7 @@ class DshApi(
   }
 
   private fun emitStatus(id: String, running: Boolean, push: (ServerEvent) -> Unit) {
+    if (executions.status(id, running)) clearKnownOutcome(id)
     val now = System.currentTimeMillis()
     push(ServerEvent(id = "dsh:status:$id:$running:$now", directory = known[id]?.directory.orEmpty(),
       type = "session.status", properties = JSONObject()
@@ -1655,20 +1923,21 @@ class DshApi(
    * 读不到、或这一轮已经翻译过，就什么都不补：没有见过结局不能猜成成功。
    */
   private suspend fun publishSettledOutcome(id: String, push: (ServerEvent) -> Unit) {
-    if (id.isBlank() || !outcomeReads.add(id)) return
+    if (id.isBlank() || executions.running(id)) return
+    val epoch = executions.epoch(id)
+    if (outcomeReads.putIfAbsent(id, epoch) != null) return
     try {
-      if (outcomes[id] != null) return
+      if (executions.outcome(id) != null) return
       val session = known[id] ?: return
       val event = latestTurnEnd(session) ?: return
-      // follow 可能在这次读取期间自己投递了 turn/end；以先到的为准，不重复发。
-      if (outcomes[id] != null) return
+      if (executions.epoch(id) != epoch || executions.running(id) || executions.outcome(id) != null) return
       translate(session, event).filter { it.type.startsWith("session.execution.") }.forEach(push)
     } catch (cancel: CancellationException) {
       throw cancel
     } catch (error: Exception) {
       Diagnostics.warn("DshApi", "读取会话结局失败", error)
     } finally {
-      outcomeReads.remove(id)
+      outcomeReads.remove(id, epoch)
     }
   }
 
@@ -1682,7 +1951,7 @@ class DshApi(
    * 也不能猜成成功。
    */
   private suspend fun latestTurnEnd(session: Session): JSONObject? {
-    val through = knownCursor(session) ?: return null
+    val through = knownCursor(session, refresh = true) ?: return null
     var before: Long? = null
     repeat(OUTCOME_PAGE_ATTEMPTS) {
       val request = JSONObject().put("address", address(session.id)).put("throughSeq", through)
@@ -1690,8 +1959,9 @@ class DshApi(
       if (before != null) request.put("beforeSeq", before)
       val page = callObject("session/page", requestArgs(request))
       val records = page.arr("records").objects()
-      val turnEnd = records.map { it.obj("event") }.lastOrNull { it.str("type") == "turn/end" }
-      if (turnEnd != null) return turnEnd
+      val lifecycle = records.map { it.obj("event") }.lastOrNull { it.str("type") in setOf("turn/start", "turn/end") }
+      if (lifecycle?.str("type") == "turn/start") return null
+      if (lifecycle?.str("type") == "turn/end") return lifecycle
       if (!page.optBoolean("hasMore") || records.isEmpty()) return null
       before = records.mapNotNull { it.obj("event").optDouble("seq", 0.0).toLong().takeIf { seq -> seq > 0 } }.minOrNull()
         ?: return null
@@ -1703,9 +1973,9 @@ class DshApi(
    * 一条会话当前已知的日志切点。本机读过就用记住的那个，否则开一条**一次性** follow 只取快照的
    * `cursor` 再立刻关掉（与 `job/list` 同一种用法，不占长期流预算）；取不到就返回 null。
    */
-  private suspend fun knownCursor(session: Session): Long? {
+  private suspend fun knownCursor(session: Session, refresh: Boolean = false): Long? {
     val remembered = maxOf(cursors[session.id] ?: 0L, lastSeq(session.id))
-    if (remembered > 0) return remembered
+    if (!refresh && remembered > 0) return remembered
     val snapshot = try {
       oneShotStreams.withPermit {
         fetchFirstFrame("session/follow", requestArgs(JSONObject()
@@ -1782,14 +2052,7 @@ class DshApi(
         val id = args.optString(0).takeUnless { it == "null" }.orEmpty()
         if (id.isBlank()) return
         val running = args.optBoolean(1, false)
-        val now = System.currentTimeMillis()
-        push(ServerEvent(id = "dsh:status:$id:$running:$now", directory = known[id]?.directory.orEmpty(), type = "session.status",
-          properties = JSONObject()
-            .put("sessionID", id)
-            .put("status", JSONObject().put("type", if (running) "busy" else "idle")), created = now))
-        // 停下来时日志里才有结局。follow 没开（后台监控、流预算已满）就读不到 turn/end，
-        // 这里补读最后一轮，再补发一条带结局的执行事件，未读账本才有“已完成”。
-        if (!running) ioScope.launch { publishSettledOutcome(id, push) }
+        emitStatus(id, running, push)
       }
       "api-session/activity" -> {
         val id = args.optString(0).takeUnless { it == "null" }.orEmpty()
@@ -2619,7 +2882,7 @@ class DshApi(
       )))
     } catch (error: ApiException) {
       // Unsupported preview endpoints are a capability gap, not a failed file read.
-      if (error.code.orEmpty().startsWith("gateway/") || error.status == 404) return@withContext null
+      if (error.isDshMethodUnavailable) return@withContext null
       throw error
     }
     val encoded = value.optString("data").takeIf { it.isNotBlank() } ?: return@withContext null
@@ -2865,19 +3128,15 @@ class DshApi(
   }
 
   override suspend fun createSession(directory: String, title: String, workspaceId: String?): Session = withContext(Dispatchers.IO) {
-    // `session/create` 的请求只有 cwd/workspaceId/sessionId/agentPreset，网关按严格 schema 校验，
-    // 多带 title 会以 gateway/arguments-invalid 失败；标题在创建后用 rename 设置。
-    // 复用同目录已有的空白会话：DSH Web 也是这么做的，否则每次新建都会留下一个服务端草稿。
+    // `session/create` may durably create the Session before a workspace attach fails. The official
+    // error carries details.sessionId; reconcile that identity and never replay creation.
     val reusable = reusableBlank(directory)
-    // Host 只在请求带 workspaceId 时把新会话记进工作区（`session.create` 里的 attachSession）。
-    // 只带 cwd 会建出「未分组」的孤儿会话：远端按工作区枚举会话的客户端（Remote 中枢的会话目录、
-    // 电脑端工作区视图）都看不到它，而且没有任何 RPC 能事后补挂。
     val resolvedWorkspaceId = workspaceId?.takeIf(String::isNotBlank) ?: workspaceIdFor(directory)
     try {
       createSessionOnce(directory, title, reusable, resolvedWorkspaceId)
     } catch (error: ApiException) {
-      // 这些错误明确表示“没有创建/没有复用”，换一次不带 sessionId 的请求是安全的；
-      // 网络错误不能重试，否则可能重复创建。
+      if (error.code == "session/workspace-attach-failed") throw error
+      // These errors explicitly mean “no creation/reuse”; only a blank reuse can safely be retried.
       if (reusable == null || error.code !in BLANK_REUSE_DECLINED) throw error
       createSessionOnce(directory, title, null, resolvedWorkspaceId)
     }
@@ -2930,9 +3189,11 @@ class DshApi(
   override suspend fun setArchived(session: Session, archived: Boolean, now: Long) {
     val request = JSONObject().put("sessionId", session.id)
     if (archived) request.put("stopActivity", true)
-    callObject(if (archived) "workspace/archiveSession" else "workspace/unarchiveSession", requestArgs(request))
-    if (archived) archivedSessions += session.id else archivedSessions -= session.id
-    known[session.id] = session.copy(archived = archived)
+    val result = callObject(if (archived) "workspace/archiveSession" else "workspace/unarchiveSession", requestArgs(request))
+    val authoritative = result.optJSONArray("archivedSessionIds")
+      ?: throw ApiException(502, "归档响应缺少完整集合，请刷新核实状态", "workspace/archive-response-invalid")
+    replaceArchiveSet(authoritative.strings())
+    known[session.id] = session.copy(archived = session.id in archivedSessions)
   }
 
   override suspend fun deleteSession(session: Session) {
@@ -2984,7 +3245,7 @@ class DshApi(
     id: String,
     delivery: Delivery
   ) {
-    if (model != null) runCatching { selectModel(session, model) }
+    if (model != null) selectModel(session, model)
     selectPreset(session, agent)
     val content = JSONArray()
     val remote = remoteBackend
@@ -3029,7 +3290,7 @@ class DshApi(
         uploadFileAttachment(session.id, bytes, file.name)
       } catch (error: ApiException) {
         // 旧实例/未装附件插件时才退回「文本内联」，二进制文件仍然明确失败。
-        if (kind != AttachmentPolicy.Kind.TEXT || !(error.code.orEmpty().startsWith("gateway/") || error.status == 404)) throw error
+        if (kind != AttachmentPolicy.Kind.TEXT || !error.isDshMethodUnavailable) throw error
         inlineContent(file)?.let { content.put(it) }
         continue
       }
@@ -3131,16 +3392,44 @@ class DshApi(
     inline: List<InlineFile>,
     delivery: Delivery
   ) {
-    if (model != null) runCatching { selectModel(session, model) }
-    executeCommand(session, "/$name $arguments".trim())
+    if (references.isNotEmpty()) {
+      // commands/execute accepts only encoded images and staged file receipts. A FileReference is a
+      // server path mention, not a receipt; dropping it would change the command's meaning.
+      throw ApiException(400, "DeepSeek Harness 命令不支持文件引用，请改为上传附件", "command/attachments-unsupported")
+    }
+    val submitted = commandAttachments(session.id, inline)
+    if (model != null) selectModel(session, model)
+    executeCommand(session, "/$name $arguments".trim(), submitted)
   }
 
-  /** `commands/execute`：DSH 的命令是独立通道，不创建模型消息。 */
-  private suspend fun executeCommand(session: Session, line: String) {
+  private suspend fun commandAttachments(sessionId: String, inline: List<InlineFile>): JSONArray {
+    if (inline.isEmpty()) return JSONArray()
+    if (remoteBackend != null && inline.any { AttachmentPolicy.kind(it.mime, it.name) != AttachmentPolicy.Kind.IMAGE }) {
+      throw ApiException(400, "此远程主机未提供命令文件附件通道，请更新 Host 连接器或改用普通消息上传", "command/attachments-unsupported")
+    }
+    val submitted = JSONArray()
+    for (file in inline) {
+      val bytes = readInlineBytes(file) ?: throw ApiException(400, "附件无法读取：${file.name}")
+      val mime = file.mime.substringBefore(';').trim().lowercase()
+      if (AttachmentPolicy.kind(mime, file.name) == AttachmentPolicy.Kind.IMAGE) {
+        if (mime !in setOf("image/png", "image/jpeg", "image/webp", "image/gif"))
+          throw ApiException(400, "命令图片附件类型不受支持：$mime", "command/attachment-invalid")
+        submitted.put(JSONObject().put("type", "image").put("mediaType", mime)
+          .put("data", java.util.Base64.getEncoder().encodeToString(bytes)).putOpt("name", file.name.takeIf { it.isNotBlank() }))
+      } else {
+        val receipt = uploadFileAttachment(sessionId, bytes, file.name)
+        submitted.put(JSONObject().put("type", "file").put("receiptId", receipt))
+      }
+    }
+    return submitted
+  }
+
+  /** `commands/execute` accepts the complete line plus submitted attachments as its third argument. */
+  private suspend fun executeCommand(session: Session, line: String, submittedAttachments: JSONArray = JSONArray()) {
     val args = JSONObject()
       .put("agentId", session.id)
       .put("line", line)
-      .put("submittedAttachments", JSONArray())
+      .put("submittedAttachments", submittedAttachments)
     val value = call("commands/execute", envelope(args))
     val execution = value as? JSONObject
     if (execution == null) throw ApiException(501, "该实例没有 ${line.substringBefore(' ')} 命令")
@@ -3171,7 +3460,7 @@ class DshApi(
   /** `agentPresets/list` 的预设名册：默认预设排第一，不能组合会话的（`broken`）不提供。 */
   override suspend fun agents(directory: String): List<AgentChoice> = withContext(Dispatchers.IO) {
     val roster = try { callObject("agentPresets/list", noArgs()) } catch (error: ApiException) {
-      if (error.code?.startsWith("gateway/") != true) throw error
+      if (!error.isDshMethodUnavailable) throw error
       // 没有预设注册表的实例：退回列表行里出现过的预设。
       val names = LinkedHashSet<String>()
       for (item in listing().items) item.obj("projections").obj("values").str("agentPreset").takeIf(String::isNotBlank)?.let(names::add)
@@ -3229,7 +3518,7 @@ class DshApi(
     } catch (cancel: CancellationException) {
       throw cancel
     } catch (error: ApiException) {
-      if (error.code.orEmpty().startsWith("gateway/") || error.status == 404) return@withContext emptyList()
+      if (error.isDshMethodUnavailable) return@withContext emptyList()
       throw error
     }
     value.arr("options").objects().mapNotNull { option ->
@@ -3478,6 +3767,8 @@ class DshApi(
   }
 
   internal companion object {
+    const val MUX_STREAM_BUFFER = 256
+    const val MAX_RPC_RESPONSE_BYTES = 64L * 1024 * 1024
     const val WATCH_LIMIT = 12
 
     /** 首帧等待上限；只覆盖“流被打开到第一帧到达”，不含后续分片/transfer 读取。 */
@@ -3500,7 +3791,7 @@ class DshApi(
      */
     private val BLANK_REUSE_DECLINED = setOf(
       "session/conflict", "session/agent-busy", "session/writer-held", "session/not-found",
-      "session/workspace-attach-failed", "gateway/arguments-invalid"
+      "gateway/arguments-invalid"
     )
 
     /** 认证失效的错误码：控制器据此提示重新配对，而不是当成网络抖动。 */
@@ -3569,7 +3860,8 @@ class DshApi(
       documented = false,
       deleteSession = false,
       fork = true,
-      jobOutputStream = true
+      jobOutputStream = true,
+      stopShell = true
     )
 
     /** Capabilities for a tunneled SSH client created before its DshApi instance exists. */

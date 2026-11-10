@@ -101,7 +101,7 @@ internal class RemoteAccountManager(
         if (!equalFingerprint(actual, expected)) throw IOException("主机指纹与确认值不匹配")
         val scope = RemotePeerScope(origin, name, host.deviceId)
         RemotePeerTrust(pins).pinAfterConfirmation(scope, host)
-        val slot = deviceSlot(host.deviceId)
+        val slot = deviceSlot(host.deviceId, name)
         val manager = RemoteDeviceManager(devices, slot, origin, name,
           registerer = { descriptor, accountToken -> api.register(descriptor, accountToken) },
           refresher = { id, refresh -> api.refresh(id, refresh) })
@@ -109,6 +109,8 @@ internal class RemoteAccountManager(
         registered[host.deviceId] = device.identity.deviceId
         val index = catalogHosts.indexOfFirst { it.hostId == host.deviceId }
         if (index >= 0) catalogHosts[index] = catalogHosts[index].copy(trust = RemoteTrustState.PINNED)
+      } catch (cancel: kotlinx.coroutines.CancellationException) {
+        throw cancel
       } catch (error: Exception) {
         failures[candidate.hostId] = userFacingError(error, "接入主机失败")
       }
@@ -123,13 +125,15 @@ internal class RemoteAccountManager(
   suspend fun signOut(catalog: RemoteCatalog) {
     val name = catalog.account
     for (host in catalog.hosts) {
-      val slot = deviceSlot(host.hostId)
+      val slot = deviceSlot(host.hostId, catalog.account)
       val record = runCatching { devices.load(slot) }.getOrNull() ?: continue
       val token = try {
         RemoteDeviceManager(devices, slot, origin, name,
           refresher = { id, refresh -> api.refresh(id, refresh) }).access().tokens?.accessToken
+      } catch (cancel: kotlinx.coroutines.CancellationException) {
+        throw cancel
       } catch (_: Exception) { null }
-      if (token != null) try { api.revokeSelf(token) } catch (_: Exception) { }
+      if (token != null) try { api.revokeSelf(token) } catch (cancel: kotlinx.coroutines.CancellationException) { throw cancel } catch (_: Exception) { }
       runCatching { devices.delete(slot) }
     }
     catalogs.clear(origin, name)
@@ -158,7 +162,13 @@ internal class RemoteAccountManager(
     val details = if (accountScoped) {
       api.accountHosts(token)
     } else {
-      api.hosts(token).mapNotNull { runCatching { api.host(token, it.deviceId) }.getOrNull() }
+      api.hosts(token).map { summary ->
+        try {
+          api.host(token, summary.deviceId)
+        } catch (cancel: kotlinx.coroutines.CancellationException) {
+          throw cancel
+        }
+      }
     }
     val out = details.map { candidate(it, name) }
     candidates = out
@@ -183,19 +193,22 @@ internal class RemoteAccountManager(
 
   private suspend fun deviceToken(catalog: RemoteCatalog): String? {
     for (host in catalog.hosts) {
-      val slot = deviceSlot(host.hostId)
+      val slot = deviceSlot(host.hostId, catalog.account)
       val record = runCatching { devices.load(slot) }.getOrNull() ?: continue
       if (record.account != catalog.account || record.origin != origin) continue
       val token = try {
         RemoteDeviceManager(devices, slot, origin, catalog.account,
           refresher = { id, refresh -> api.refresh(id, refresh) }).access().tokens?.accessToken
+      } catch (cancel: kotlinx.coroutines.CancellationException) {
+        throw cancel
       } catch (_: Exception) { null }
       if (token != null) return token
     }
     return null
   }
 
-  private fun deviceSlot(hostId: String): String = "host-${hostId.replace(Regex("[^A-Za-z0-9_-]"), "_")}"
+  private fun deviceSlot(hostId: String, account: String): String =
+    resolveRemoteDeviceSlot(devices, origin, account, hostId)
 
   private fun deviceName(host: RemoteHost): String {
     val raw = "$deviceLabel · ${host.name}".replace(Regex("[\\u0000-\\u001f\\u007f]"), " ").trim()

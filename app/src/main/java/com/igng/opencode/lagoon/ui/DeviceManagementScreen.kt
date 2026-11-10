@@ -247,9 +247,9 @@ internal fun DeviceDetailScreen(
     SuperDialog(title = "删除 ${profile.name}？", show = true, onDismissRequest = { confirmingDelete = false }) {
       Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Text("$type · ${profile.endpointSummary}")
-        Text("会删除本机连接资料${if (profile.sshHostId != null) "、SSH 配置与加密凭据" else "与已保存凭据"}；远端会话不会删除。")
+        Text("只删除这个 Harness 的本机连接资料；同一主机上的其他 Harness 与远端进程、会话均不受影响。")
         DialogActions("取消", { confirmingDelete = false }, "确认删除", danger = true) {
-          if (profile.sshHostId != null) controller.deleteSshHost(profile.sshHostId) else controller.deleteServer(profile.id)
+          controller.deleteServer(profile.id)
           confirmingDelete = false
           onBack()
         }

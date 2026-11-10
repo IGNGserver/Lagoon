@@ -128,16 +128,22 @@ internal class JschSshTransportFactory : SshTransportFactory {
   private fun describe(error: Throwable, repository: VerifyingHostKeyRepository): SshFailure {
     if (error is SshFailure) return error
     repository.failure?.let { return it }
-    repository.presented?.let { key ->
+    val text = error.message.orEmpty()
+    // JSch exposes the server key before authentication. Do not let that diagnostic
+    // mask a real password/private-key failure when the key was already accepted.
+    when {
+      error is JSchUnknownHostKeyException ->
+        return SshFailure(SshFailureKind.HOST_KEY_UNKNOWN, "还没有确认主机指纹", retryable = false, presentedKey = repository.presented)
+      error is JSchChangedHostKeyException ->
+        return SshFailure(SshFailureKind.HOST_KEY_CHANGED, "主机指纹和上次不一致，已断开", retryable = false, presentedKey = repository.presented)
+      "Auth fail" in text || "auth cancel" in text || "Auth cancel" in text ->
+        return SshFailure(SshFailureKind.AUTH, "SSH 认证失败，请检查用户名、密码或私钥", retryable = false)
+    }
+    if (!repository.accepted) repository.presented?.let { key ->
       return SshFailure(SshFailureKind.HOST_KEY_UNKNOWN, "还没有确认主机指纹",
         "${key.shortType} ${key.fingerprint}", retryable = false, presentedKey = key)
     }
-    val text = error.message.orEmpty()
     return when {
-      error is JSchUnknownHostKeyException -> SshFailure(SshFailureKind.HOST_KEY_UNKNOWN, "还没有确认主机指纹", retryable = false)
-      error is JSchChangedHostKeyException -> SshFailure(SshFailureKind.HOST_KEY_CHANGED, "主机指纹和上次不一致，已断开")
-      "Auth fail" in text || "auth cancel" in text || "Auth cancel" in text ->
-        SshFailure(SshFailureKind.AUTH, "SSH 认证失败，请检查用户名、密码或私钥", retryable = false)
       "timeout" in text.lowercase() || "timed out" in text.lowercase() ->
         SshFailure(SshFailureKind.UNREACHABLE, "SSH 连接超时，请检查地址、端口和网络")
       "refused" in text.lowercase() ->
@@ -153,10 +159,13 @@ private class VerifyingHostKeyRepository(
   private val verifier: SshHostKeyVerifier,
   private val expectedType: String? = null
 ) : HostKeyRepository {
+  @Volatile var accepted: Boolean = false
   @Volatile var presented: PresentedSshHostKey? = null
   @Volatile var failure: SshFailure? = null
 
   override fun check(host: String, key: ByteArray): Int {
+    accepted = false
+    failure = null
     val hostKey = try {
       HostKey(host, key)
     } catch (_: Exception) {
@@ -179,7 +188,10 @@ private class VerifyingHostKeyRepository(
       return HostKeyRepository.NOT_INCLUDED
     }
     return try {
-      if (verifier.verify(presented)) HostKeyRepository.OK else HostKeyRepository.NOT_INCLUDED
+      if (verifier.verify(presented)) {
+        accepted = true
+        HostKeyRepository.OK
+      } else HostKeyRepository.NOT_INCLUDED
     } catch (failure: SshFailure) {
       this.failure = failure
       HostKeyRepository.NOT_INCLUDED

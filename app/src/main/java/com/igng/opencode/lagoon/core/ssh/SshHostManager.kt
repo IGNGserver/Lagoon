@@ -27,28 +27,29 @@ internal class SshHostManager(
   private val store: SshHostStore,
   private val transportFactory: SshTransportFactory = JschSshTransportFactory()
 ) {
-  private class SharedLink(val link: SshHostLink, val refs: AtomicInteger = AtomicInteger(0))
+  private class SharedLink(val hostId: String, val link: SshHostLink, val refs: AtomicInteger = AtomicInteger(0))
 
   private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
   private val links = ConcurrentHashMap<String, SharedLink>()
   private val lock = Any()
+  private val transports = SshTransportPool(transportFactory)
 
   fun client(profile: ServerProfile): HarnessClient {
     val hostId = profile.sshHostId ?: throw SshFailure(SshFailureKind.OTHER, "不是 SSH 主机资料", retryable = false)
     val config = store.load().firstOrNull { it.id == hostId }
       ?: throw SshFailure(SshFailureKind.OTHER, "SSH 主机配置已删除", retryable = false)
     val entry = synchronized(lock) {
-      val current = links[hostId]?.takeUnless { it.link.isClosed }
-      val active = current ?: SharedLink(
-        SshHostLink(scope, profile, config, store.secrets(hostId), transportFactory)
-      ).also { links[hostId] = it }
+      val current = links[profile.id]?.takeUnless { it.link.isClosed }
+      val active = current ?: SharedLink(hostId,
+        SshHostLink(scope, profile, config, store.secrets(hostId), transports)
+      ).also { links[profile.id] = it }
       active.refs.incrementAndGet()
       active
     }
     return SshDshClient(entry.link) {
       val toClose = synchronized(lock) {
-        if (entry.refs.decrementAndGet() <= 0 && links[hostId] === entry) {
-          links.remove(hostId)
+        if (entry.refs.decrementAndGet() <= 0 && links[profile.id] === entry) {
+          links.remove(profile.id)
           entry.link
         } else null
       }
@@ -56,11 +57,21 @@ internal class SshHostManager(
     }
   }
 
-  fun status(hostId: String): StateFlow<SshLinkStatus>? = links[hostId]?.link?.status
+  fun status(hostId: String): StateFlow<SshLinkStatus>? = links.values.firstOrNull { it.hostId == hostId }?.link?.status
+
+  fun closeBinding(bindingId: String) {
+    val entry = synchronized(lock) { links.remove(bindingId) }
+    entry?.link?.close()
+  }
 
   fun close(hostId: String) {
-    val entry = synchronized(lock) { links.remove(hostId) }
-    entry?.link?.close()
+    val active = synchronized(lock) {
+      links.filterValues { it.hostId == hostId }.values.toList().also {
+        links.entries.removeAll { entry -> entry.value.hostId == hostId }
+      }
+    }
+    active.forEach { it.link.close() }
+    transports.invalidate(hostId)
   }
 
   /**
@@ -69,12 +80,17 @@ internal class SshHostManager(
    * between `invalidate` and `close`.
    */
   fun replace(hostId: String) {
-    val entry = synchronized(lock) { links.remove(hostId) }
-    entry?.link?.close()
+    val active = synchronized(lock) {
+      links.filterValues { it.hostId == hostId }.values.toList().also {
+        links.entries.removeAll { entry -> entry.value.hostId == hostId }
+      }
+    }
+    active.forEach { it.link.close() }
+    transports.invalidate(hostId)
   }
 
   fun retry(hostId: String) {
-    links[hostId]?.link?.retry()
+    links.values.filter { it.hostId == hostId }.forEach { it.link.retry() }
   }
 
   fun closeAll() {
@@ -84,6 +100,7 @@ internal class SshHostManager(
       all
     }
     active.forEach { runCatching { it.link.close() } }
+    transports.close()
   }
 
   fun kickAll() {
@@ -91,17 +108,31 @@ internal class SshHostManager(
   }
 
   /** Starts a one-off link for "测试连接"; the caller must close it. */
-  fun testLink(config: SshHostConfig, secrets: SshSecrets, onStatus: (SshLinkStatus) -> Unit): SshHostLink {
+  fun testLink(config: SshHostConfig, secrets: SshSecrets, onStatus: (SshLinkStatus) -> Unit,
+    harnessKind: ServerKind = ServerKind.DSH, registrationPath: String? = null): SshHostLink {
+    require(harnessKind != ServerKind.DSH_REMOTE)
     val profile = ServerProfile(
       id = config.id,
       name = config.name,
       url = config.profileUrl(),
       username = config.user,
-      kind = ServerKind.DSH,
-      sshHostId = config.id
+      kind = harnessKind,
+      sshHostId = config.id,
+      sshServicePath = registrationPath
     )
     return SshHostLink(scope, profile, config, secrets, transportFactory, onStatus)
   }
+
+  /** A discovery scan only authenticates SSH and reads known registration files. Never bootstraps DSH. */
+  suspend fun discover(config: SshHostConfig, secrets: SshSecrets, path: String? = null): com.igng.opencode.lagoon.core.SshHarnessDiscoveryResult =
+    kotlinx.coroutines.withContext(Dispatchers.IO) {
+      val pin = config.hostKeyFingerprint?.takeIf { it.isNotBlank() }
+        ?: throw SshFailure(SshFailureKind.HOST_KEY_UNKNOWN, "请先确认 SSH 主机指纹", retryable = false)
+      transports.connect(config, secrets, SshHostKeyVerifier { key ->
+        if (key.fingerprint != pin) throw SshFailure(SshFailureKind.HOST_KEY_CHANGED, "SSH 主机指纹已变化", retryable = false, presentedKey = key)
+        true
+      }).use { SshHarnessProbe(it).discover(path) }
+    }
 
   /** Reads the presented host key without trusting it; used before pinning a new host. */
   suspend fun probeHostKey(config: SshHostConfig): PresentedSshHostKey =

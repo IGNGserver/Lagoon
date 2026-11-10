@@ -121,11 +121,31 @@ internal class RemoteServerApi(address: String, allowCleartext: Boolean = false)
   }
 
   suspend fun hosts(accessToken: String): List<RemoteHost> {
-    val body = request("GET", "api/v1/devices", bearer = accessToken)
-    val items = body.optJSONArray("items") ?: throw IOException("DSH Hub 设备列表无效")
-    if (!body.isNull("nextCursor") && body.optString("nextCursor").isNotEmpty()) throw IOException("DSH Hub 返回了暂不支持的设备分页，未使用不完整列表")
-    if (items.length() > 5000) throw IOException("DSH Hub 设备列表超过上限")
-    return (0 until items.length()).map { index -> host(items.optJSONObject(index) ?: throw IOException("DSH Hub 设备信息无效"), false) }
+    val hosts = LinkedHashMap<String, RemoteHost>()
+    val cursors = HashSet<String>()
+    var cursor: String? = null
+    var pages = 0
+    do {
+      if (++pages > 100) throw IOException("DSH Hub 设备分页超过上限，未使用不完整列表")
+      val url = base.newBuilder().addEncodedPathSegments("api/v1/devices")
+        .apply { cursor?.let { addQueryParameter("limit", "50"); addQueryParameter("cursor", it) } }.build()
+      val body = requestAt("GET", url, bearer = accessToken)
+      val items = body.optJSONArray("items") ?: throw IOException("DSH Hub 设备列表无效")
+      if (items.length() > 5000 || hosts.size + items.length() > 5000) throw IOException("DSH Hub 设备列表超过上限")
+      for (index in 0 until items.length()) {
+        val host = host(items.optJSONObject(index) ?: throw IOException("DSH Hub 设备信息无效"), false)
+        if (hosts.put(host.deviceId, host) != null) throw IOException("DSH Hub 设备分页包含重复身份，未使用不完整列表")
+      }
+      cursor = when (val next = body.opt("nextCursor")) {
+        null, JSONObject.NULL -> null
+        is String -> next.takeIf { it.isNotEmpty() }?.also {
+          if (it.length > 4096 || it.any { c -> c.code < 0x21 || c.code == 0x7f } || !cursors.add(it))
+            throw IOException("DSH Hub 返回无效或循环分页游标，未使用不完整列表")
+        }
+        else -> throw IOException("DSH Hub 返回无效分页游标")
+      }
+    } while (cursor != null)
+    return hosts.values.toList()
   }
 
   /**
@@ -143,6 +163,8 @@ internal class RemoteServerApi(address: String, allowCleartext: Boolean = false)
       throw error
     }
     val items = body.optJSONArray("items") ?: throw IOException("DSH Hub 设备列表无效")
+    if (body.has("nextCursor") && !body.isNull("nextCursor") && body.opt("nextCursor") != "")
+      throw IOException("DSH Hub 账号目录需要分页，未使用不完整列表")
     if (items.length() > 5000) throw IOException("DSH Hub 设备列表超过上限")
     return (0 until items.length()).mapNotNull { index ->
       val item = items.optJSONObject(index) ?: throw IOException("DSH Hub 设备信息无效")
@@ -205,8 +227,11 @@ internal class RemoteServerApi(address: String, allowCleartext: Boolean = false)
       val text = source.readUtf8()
       if (!response.isSuccessful) {
         val error = runCatching { JSONObject(text).optJSONObject("error") }.getOrNull()
-        val code = error?.optString("code")?.takeIf { it.matches(Regex("[A-Z0-9_]{1,80}")) }
-        throw RemoteServerException(response.code, code, error?.optBoolean("retryable") == true)
+        val rawCode = (error?.opt("code") as? String)?.takeIf { it.matches(Regex("[A-Z0-9_]{1,80}")) }
+        val validError = rawCode != null && error?.opt("message") is String && error.opt("retryable") is Boolean &&
+          (!error.has("details") || error.opt("details") is JSONObject)
+        throw RemoteServerException(response.code, rawCode.takeIf { validError },
+          if (validError) error!!.optBoolean("retryable") else response.code in setOf(401, 403, 429) || response.code >= 500)
       }
       try { JSONObject(text) } catch (_: Exception) { throw IOException("DSH Hub 返回无效 JSON") }
     }
@@ -270,4 +295,7 @@ internal data class RemoteTokenPair(val accessToken: String, val accessTokenExpi
 }
 internal data class RemoteHost(val deviceId: String, val name: String, val platform: String, val membershipId: String,
   val online: Boolean, val publicKey: String?, val clientVersion: String?, val harnessVersion: String?, val fingerprint: String? = null)
-internal class RemoteServerException(val status: Int, val code: String?, val retryable: Boolean) : IOException("DSH Hub 请求失败（HTTP $status${code?.let { ", $it" }.orEmpty()}）")
+internal class RemoteServerException(val status: Int, val code: String?, val retryable: Boolean) : IOException("DSH Hub 请求失败（HTTP $status${code?.let { ", $it" }.orEmpty()}）") {
+  val isCredentialRejected: Boolean get() = status in setOf(401, 403) && code in setOf(
+    "AUTH_REQUIRED", "AUTH_INVALID", "TOKEN_EXPIRED", "DEVICE_REVOKED", "ACCOUNT_AUTH_REQUIRED")
+}

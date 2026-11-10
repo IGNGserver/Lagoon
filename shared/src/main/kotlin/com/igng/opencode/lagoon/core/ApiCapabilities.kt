@@ -37,7 +37,9 @@ data class ApiCapabilities(
    */
   val fork: Boolean = false,
   /** DSH job/follow, independent of direct/SSH/Remote transport. */
-  val jobOutputStream: Boolean = false
+  val jobOutputStream: Boolean = false,
+  /** The protocol can terminate a background job; independent of the connection carrier. */
+  val stopShell: Boolean = false
 ) {
   fun supports(action: SessionAction) = action in actions
   companion object {
@@ -48,7 +50,8 @@ data class ApiCapabilities(
         SessionAction.UNREVERT to ActionEndpoint("DELETE", "api/session/{id}/revert")
       ),
       diff = true, sessionView = ActionEndpoint("POST", "api/session/{id}/view"),
-      archive = ArchiveEndpoint(ActionEndpoint("PATCH", "api/session/{id}"))
+      archive = ArchiveEndpoint(ActionEndpoint("PATCH", "api/session/{id}")),
+      stopShell = true
     )
 
     fun fromDocument(document: JSONObject): ApiCapabilities {
@@ -92,8 +95,11 @@ data class ApiCapabilities(
         val raw = input.obj("properties").optJSONObject("archived") ?: return@let null
         ArchiveEndpoint(ActionEndpoint("PATCH", path.removePrefix("/")), restorable = acceptsFalse(raw))
       }
+      val stopShell = paths.keys().asSequence().any { path ->
+        Regex("^/api/shell/\\{[^/}]+\\}$").matches(path) && paths.obj(path).has("delete")
+      }
       return ApiCapabilities(actions, endpoint("/diff", "GET") != null,
-        endpoint("/view", "POST", setOf("idle")), archive, documented = true)
+        endpoint("/view", "POST", setOf("idle")), archive, documented = true, stopShell = stopShell)
     }
 
     /**

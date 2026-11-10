@@ -1,0 +1,1086 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "opencode HttpApi",
+    "version": "0.0.1",
+    "description": "Experimental HttpApi surface for selected instance routes."
+  },
+  "_source": {
+    "repository": "https://github.com/anomalyco/opencode",
+    "tag": "v2.2.6",
+    "commit": "dc2ffcf8bf26f9e669b6aa22b95f50e12be15e06",
+    "file": "packages/protocol/openapi.json",
+    "sha256": "b96e18abefbce821448f0c8b0ca5b4ab3db121bc67548446ed9a967fdebfd7e2"
+  },
+  "paths": {
+    "/api/info": {
+      "get": {
+        "tags": [
+          "server"
+        ],
+        "operationId": "server.info",
+        "parameters": [],
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "ServerInfo",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServerInfo"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "UnauthorizedError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedErrorEncoded"
+                }
+              }
+            }
+          }
+        },
+        "description": "Return the server identity, connection URLs, paths, and readiness status.",
+        "summary": "Get server info"
+      }
+    },
+    "/api/event": {
+      "get": {
+        "tags": [
+          "event"
+        ],
+        "operationId": "event.subscribe",
+        "parameters": [
+          {
+            "name": "types",
+            "in": "query",
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "enum": [
+                    "location.shutdown",
+                    "models-dev.refreshed",
+                    "credential.updated",
+                    "credential.switched",
+                    "integration.updated",
+                    "provider.updated",
+                    "model.updated",
+                    "agent.updated",
+                    "session.created",
+                    "session.agent.selected",
+                    "session.model.selected",
+                    "session.moved",
+                    "session.renamed",
+                    "session.metadata.updated",
+                    "session.permissions",
+                    "session.viewed",
+                    "session.archived",
+                    "session.unarchived",
+                    "session.usage.updated",
+                    "session.deleted",
+                    "session.forked",
+                    "session.inbox.delivered",
+                    "session.inbox.enqueued",
+                    "session.inbox.cancelled",
+                    "session.inbox.delivery.changed",
+                    "session.execution.started",
+                    "session.execution.succeeded",
+                    "session.execution.failed",
+                    "session.execution.interrupted",
+                    "session.instructions.updated",
+                    "session.synthetic",
+                    "session.skill.activated",
+                    "session.shell.started",
+                    "session.shell.ended",
+                    "session.step.started",
+                    "session.step.streamed",
+                    "session.step.ended",
+                    "session.step.failed",
+                    "session.text.started",
+                    "session.text.delta",
+                    "session.text.ended",
+                    "session.reasoning.started",
+                    "session.reasoning.delta",
+                    "session.reasoning.ended",
+                    "session.tool.input.started",
+                    "session.tool.input.delta",
+                    "session.tool.input.ended",
+                    "session.tool.called",
+                    "session.tool.progress",
+                    "session.tool.success",
+                    "session.tool.failed",
+                    "session.retry.scheduled",
+                    "session.compaction.started",
+                    "session.compaction.delta",
+                    "session.compaction.ended",
+                    "session.compaction.failed",
+                    "session.revert.staged",
+                    "session.revert.cleared",
+                    "session.revert.committed",
+                    "filesystem.changed",
+                    "reference.updated",
+                    "permission.asked",
+                    "permission.replied",
+                    "plugin.updated",
+                    "project.updated",
+                    "worktree.updated",
+                    "worktree.resolved",
+                    "command.updated",
+                    "config.updated",
+                    "skill.updated",
+                    "pty.created",
+                    "pty.updated",
+                    "pty.exited",
+                    "pty.deleted",
+                    "persistent-pty.added",
+                    "persistent-pty.removed",
+                    "persistent-pty.updated",
+                    "shell.created",
+                    "shell.exited",
+                    "shell.deleted",
+                    "form.created",
+                    "form.replied",
+                    "form.cancelled",
+                    "websearch.updated",
+                    "artifact.updated",
+                    "session.status",
+                    "session.idle",
+                    "tui.prompt.append",
+                    "tui.command.execute",
+                    "tui.toast.show",
+                    "tui.session.select",
+                    "installation.updated",
+                    "installation.update-available",
+                    "vcs.branch.updated",
+                    "mcp.status.changed",
+                    "mcp.resources.changed"
+                  ]
+                },
+                {
+                  "type": "string",
+                  "pattern": "^rpc\\.[\\s\\S]*?$"
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "enum": [
+                          "location.shutdown",
+                          "models-dev.refreshed",
+                          "credential.updated",
+                          "credential.switched",
+                          "integration.updated",
+                          "provider.updated",
+                          "model.updated",
+                          "agent.updated",
+                          "session.created",
+                          "session.agent.selected",
+                          "session.model.selected",
+                          "session.moved",
+                          "session.renamed",
+                          "session.metadata.updated",
+                          "session.permissions",
+                          "session.viewed",
+                          "session.archived",
+                          "session.unarchived",
+                          "session.usage.updated",
+                          "session.deleted",
+                          "session.forked",
+                          "session.inbox.delivered",
+                          "session.inbox.enqueued",
+                          "session.inbox.cancelled",
+                          "session.inbox.delivery.changed",
+                          "session.execution.started",
+                          "session.execution.succeeded",
+                          "session.execution.failed",
+                          "session.execution.interrupted",
+                          "session.instructions.updated",
+                          "session.synthetic",
+                          "session.skill.activated",
+                          "session.shell.started",
+                          "session.shell.ended",
+                          "session.step.started",
+                          "session.step.streamed",
+                          "session.step.ended",
+                          "session.step.failed",
+                          "session.text.started",
+                          "session.text.delta",
+                          "session.text.ended",
+                          "session.reasoning.started",
+                          "session.reasoning.delta",
+                          "session.reasoning.ended",
+                          "session.tool.input.started",
+                          "session.tool.input.delta",
+                          "session.tool.input.ended",
+                          "session.tool.called",
+                          "session.tool.progress",
+                          "session.tool.success",
+                          "session.tool.failed",
+                          "session.retry.scheduled",
+                          "session.compaction.started",
+                          "session.compaction.delta",
+                          "session.compaction.ended",
+                          "session.compaction.failed",
+                          "session.revert.staged",
+                          "session.revert.cleared",
+                          "session.revert.committed",
+                          "filesystem.changed",
+                          "reference.updated",
+                          "permission.asked",
+                          "permission.replied",
+                          "plugin.updated",
+                          "project.updated",
+                          "worktree.updated",
+                          "worktree.resolved",
+                          "command.updated",
+                          "config.updated",
+                          "skill.updated",
+                          "pty.created",
+                          "pty.updated",
+                          "pty.exited",
+                          "pty.deleted",
+                          "persistent-pty.added",
+                          "persistent-pty.removed",
+                          "persistent-pty.updated",
+                          "shell.created",
+                          "shell.exited",
+                          "shell.deleted",
+                          "form.created",
+                          "form.replied",
+                          "form.cancelled",
+                          "websearch.updated",
+                          "artifact.updated",
+                          "session.status",
+                          "session.idle",
+                          "tui.prompt.append",
+                          "tui.command.execute",
+                          "tui.toast.show",
+                          "tui.session.select",
+                          "installation.updated",
+                          "installation.update-available",
+                          "vcs.branch.updated",
+                          "mcp.status.changed",
+                          "mcp.resources.changed"
+                        ]
+                      },
+                      {
+                        "type": "string",
+                        "pattern": "^rpc\\.[\\s\\S]*?$"
+                      }
+                    ]
+                  }
+                }
+              ],
+              "description": "Only send events of these types, plus the initial server.connected event. When omitted, all events are sent."
+            },
+            "required": false
+          }
+        ],
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "event": {
+                      "type": "string"
+                    },
+                    "data": {
+                      "$ref": "#/components/schemas/V2EventEncoded"
+                    }
+                  },
+                  "required": [
+                    "event",
+                    "data"
+                  ],
+                  "additionalProperties": false
+                },
+                "x-effect-stream": {
+                  "encoding": "sse",
+                  "causeSchema": {
+                    "type": "array",
+                    "items": {
+                      "anyOf": [
+                        {
+                          "type": "object",
+                          "properties": {
+                            "_tag": {
+                              "type": "string",
+                              "enum": [
+                                "Fail"
+                              ]
+                            },
+                            "error": {
+                              "not": {}
+                            }
+                          },
+                          "required": [
+                            "_tag",
+                            "error"
+                          ],
+                          "additionalProperties": false
+                        },
+                        {
+                          "type": "object",
+                          "properties": {
+                            "_tag": {
+                              "type": "string",
+                              "enum": [
+                                "Die"
+                              ]
+                            },
+                            "defect": {}
+                          },
+                          "required": [
+                            "_tag",
+                            "defect"
+                          ],
+                          "additionalProperties": false
+                        },
+                        {
+                          "type": "object",
+                          "properties": {
+                            "_tag": {
+                              "type": "string",
+                              "enum": [
+                                "Interrupt"
+                              ]
+                            },
+                            "fiberId": {
+                              "anyOf": [
+                                {
+                                  "type": "number"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
+                            }
+                          },
+                          "required": [
+                            "_tag",
+                            "fiberId"
+                          ],
+                          "additionalProperties": false
+                        }
+                      ]
+                    }
+                  },
+                  "errorSchema": {
+                    "not": {}
+                  },
+                  "failureEvent": "effect/http-api/stream/failure"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "UnauthorizedError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedErrorEncoded"
+                }
+              }
+            }
+          }
+        },
+        "description": "Subscribe to native events and plugin RPC events across all server locations. Volatile by contract: a slow consumer overflows and fails the stream, and events during disconnection are missed.",
+        "summary": "Subscribe to events"
+      }
+    },
+    "/api/shell/{id}": {
+      "get": {
+        "tags": [
+          "shell"
+        ],
+        "operationId": "shell.get",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "schema": {
+              "$ref": "#/components/schemas/Shell.ID"
+            },
+            "required": true
+          },
+          {
+            "name": "location",
+            "in": "query",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "directory": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "additionalProperties": false
+            },
+            "required": false,
+            "style": "deepObject",
+            "explode": true
+          }
+        ],
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "location": {
+                      "$ref": "#/components/schemas/Location.PublicRef"
+                    },
+                    "data": {
+                      "$ref": "#/components/schemas/Shell.Info"
+                    }
+                  },
+                  "required": [
+                    "location",
+                    "data"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "UnauthorizedError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedErrorEncoded"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "ShellNotFoundError | LocationNotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ShellNotFoundErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/LocationNotFoundErrorEncoded"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "description": "Get one shell command, including its status and exit code once exited.",
+        "summary": "Get shell command"
+      },
+      "delete": {
+        "tags": [
+          "shell"
+        ],
+        "operationId": "shell.remove",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "schema": {
+              "$ref": "#/components/schemas/Shell.ID"
+            },
+            "required": true
+          },
+          {
+            "name": "location",
+            "in": "query",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "directory": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "additionalProperties": false
+            },
+            "required": false,
+            "style": "deepObject",
+            "explode": true
+          }
+        ],
+        "security": [],
+        "responses": {
+          "204": {
+            "description": "<No Content>"
+          },
+          "400": {
+            "description": "InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "UnauthorizedError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedErrorEncoded"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "LocationNotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LocationNotFoundErrorEncoded"
+                }
+              }
+            }
+          }
+        },
+        "description": "Terminate and remove one shell command and its retained output.",
+        "summary": "Remove shell command"
+      }
+    },
+    "/api/shell/{id}/output": {
+      "get": {
+        "tags": [
+          "shell"
+        ],
+        "operationId": "shell.output",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "schema": {
+              "$ref": "#/components/schemas/Shell.ID"
+            },
+            "required": true
+          },
+          {
+            "name": "location",
+            "in": "query",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "directory": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "additionalProperties": false
+            },
+            "required": false,
+            "style": "deepObject",
+            "explode": true
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "pattern": "^[+-]?(?:\\d+(?:\\.\\d+)?|\\.\\d+)(?:[Ee][+-]?\\d+)?$"
+            },
+            "required": false
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "pattern": "^[+-]?(?:\\d+(?:\\.\\d+)?|\\.\\d+)(?:[Ee][+-]?\\d+)?$"
+            },
+            "required": false
+          }
+        ],
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "location": {
+                      "$ref": "#/components/schemas/Location.PublicRef"
+                    },
+                    "data": {
+                      "type": "object",
+                      "properties": {
+                        "output": {
+                          "type": "string"
+                        },
+                        "cursor": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        "size": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        "truncated": {
+                          "type": "boolean"
+                        }
+                      },
+                      "required": [
+                        "output",
+                        "cursor",
+                        "size",
+                        "truncated"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "location",
+                    "data"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "UnauthorizedError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedErrorEncoded"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "ShellNotFoundError | LocationNotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ShellNotFoundErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/LocationNotFoundErrorEncoded"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "description": "Page through captured combined output by absolute byte cursor.",
+        "summary": "Read shell output"
+      }
+    },
+    "/api/fs/list": {
+      "get": {
+        "tags": [
+          "filesystem"
+        ],
+        "operationId": "fs.list",
+        "parameters": [
+          {
+            "name": "location",
+            "in": "query",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "directory": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "additionalProperties": false
+            },
+            "required": false,
+            "style": "deepObject",
+            "explode": true
+          },
+          {
+            "name": "path",
+            "in": "query",
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                }
+              ],
+              "description": "An absolute path or a path relative to the requested location. Defaults to the location directory."
+            },
+            "required": false
+          }
+        ],
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "location": {
+                      "$ref": "#/components/schemas/Location.PublicRef"
+                    },
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/FileSystem.Entry"
+                      }
+                    }
+                  },
+                  "required": [
+                    "location",
+                    "data"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "UnauthorizedError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedErrorEncoded"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "FileNotFoundError | LocationNotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/FileNotFoundErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/LocationNotFoundErrorEncoded"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "description": "List direct children using an absolute path or a path relative to the requested location, including parents and siblings outside its directory. Entry paths remain relative to the requested location; listing does not switch locations.",
+        "summary": "List directory"
+      }
+    },
+    "/api/fs/find": {
+      "get": {
+        "tags": [
+          "filesystem"
+        ],
+        "operationId": "fs.find",
+        "parameters": [
+          {
+            "name": "location",
+            "in": "query",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "directory": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "additionalProperties": false
+            },
+            "required": false,
+            "style": "deepObject",
+            "explode": true
+          },
+          {
+            "name": "query",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": true
+          },
+          {
+            "name": "type",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "file",
+                "directory"
+              ]
+            },
+            "required": false
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          }
+        ],
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "location": {
+                      "$ref": "#/components/schemas/Location.PublicRef"
+                    },
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/FileSystem.Entry"
+                      }
+                    }
+                  },
+                  "required": [
+                    "location",
+                    "data"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "UnauthorizedError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedErrorEncoded"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "LocationNotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LocationNotFoundErrorEncoded"
+                }
+              }
+            }
+          }
+        },
+        "description": "Find recursively ranked filesystem entries relative to the requested location.",
+        "summary": "Find files"
+      }
+    },
+    "/api/fs/read/*": {
+      "get": {
+        "tags": [
+          "filesystem"
+        ],
+        "operationId": "fs.read",
+        "parameters": [
+          {
+            "name": "location",
+            "in": "query",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "directory": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "additionalProperties": false
+            },
+            "required": false,
+            "style": "deepObject",
+            "explode": true
+          }
+        ],
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "UnauthorizedError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedErrorEncoded"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "FileNotFoundError | LocationNotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/FileNotFoundErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/LocationNotFoundErrorEncoded"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "description": "Stream one file relative to the requested location with ETag, Last-Modified, and single-range HTTP Range support (206 Partial Content, 416 Range Not Satisfiable, and 304 Not Modified; multi-range and malformed Range headers fall back to 200).",
+        "summary": "Read file"
+      }
+    }
+  }
+}

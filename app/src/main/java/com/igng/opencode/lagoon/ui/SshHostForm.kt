@@ -26,6 +26,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
+import com.igng.opencode.lagoon.core.*
 import com.igng.opencode.lagoon.core.DEFAULT_DSH_LAUNCH_COMMAND
 import com.igng.opencode.lagoon.core.LagoonController
 import com.igng.opencode.lagoon.core.LagoonState
@@ -71,6 +72,13 @@ internal fun SshHostForm(
     state.profiles.firstOrNull { initial?.id != null && it.sshHostId == initial.id }
   }
   val enabled = existingProfile?.enabled ?: true
+
+  val initialBindings = remember(initial?.id) { state.profiles.filter { initial != null && it.sshHostId == initial.id } }
+  var useDsh by rememberSaveable(initial?.id) { mutableStateOf(initialBindings.any { it.kind == ServerKind.DSH && it.enabled } || initial == null) }
+  var useOpenCode by rememberSaveable(initial?.id) { mutableStateOf(initialBindings.any { it.kind == ServerKind.OPENCODE && it.enabled }) }
+  var registrationPath by rememberSaveable(initial?.id) { mutableStateOf((initialBindings.firstOrNull { it.kind == ServerKind.OPENCODE && it.enabled }
+      ?: initialBindings.lastOrNull { it.kind == ServerKind.OPENCODE })?.sshServicePath.orEmpty()) }
+  var discoverySummary by remember { mutableStateOf<String?>(null) }
 
   var address by rememberSaveable(initial?.id) { mutableStateOf(initial?.host.orEmpty()) }
   var user by rememberSaveable(initial?.id) { mutableStateOf(initial?.user.orEmpty()) }
@@ -208,19 +216,31 @@ internal fun SshHostForm(
   fun errorText(error: Throwable): String =
     if (error is SshFailure) error.display() else userFacingError(error, "SSH 连接失败")
 
-  fun commit(config: SshHostConfig) {
+  fun commit(config: SshHostConfig, offline: Boolean = false) {
     working = true
     result = null
     try {
-      controller.saveSshHost(
-        config = config,
-        secrets = secrets(),
-        autoConnect = true,
-        // 通知与分组属于设备层偏好，统一在「设备管理 › 设备详情」里改；这里只透传，避免被重置。
-        notifications = existingProfile?.notifications ?: true,
-        groupId = null,
-        connect = enabled
-      )
+      if (!useDsh && !useOpenCode) {
+        controller.saveSshSourceOnly(config, secrets())
+        onSaved()
+        return
+      }
+      val selected = listOfNotNull(ServerKind.DSH.takeIf { useDsh }, ServerKind.OPENCODE.takeIf { useOpenCode })
+      selected.forEach { kind ->
+        val existing = initialBindings.firstOrNull { it.kind == kind }
+        controller.saveSshHost(
+          config = config, secrets = secrets(), autoConnect = existing?.autoConnect ?: true,
+          notifications = existing?.notifications ?: true, groupId = null, connect = false,
+          harnessKind = kind,
+          registrationPath = if (kind == ServerKind.OPENCODE) registrationPath.trim().takeIf { it.isNotBlank() } else null,
+          bindingEnabled = !offline
+        )
+      }
+      initialBindings.filter { binding ->
+        (binding.kind == ServerKind.DSH && !useDsh) ||
+          (binding.kind == ServerKind.OPENCODE && (!useOpenCode ||
+            binding.sshServicePath != registrationPath.trim().takeIf { it.isNotBlank() }))
+      }.forEach { controller.setProfileEnabled(it.id, false) }
       onSaved()
     } catch (error: Exception) {
       result = errorText(error)
@@ -252,14 +272,19 @@ internal fun SshHostForm(
   }
 
   fun test() {
+    if (!useDsh && !useOpenCode) {
+      result = "未选择 Harness；请使用只读发现测试 SSH，不会启动服务。"
+      return
+    }
     val config = configOrNull() ?: return
     withPinnedKey(config) { pinned ->
       working = true; result = null; testStatus = null
       scope.launch {
         try {
-          val message = controller.testSshHost(pinned, secrets()) { status ->
-            scope.launch { testStatus = status }
-          }
+          val message = controller.testSshHost(pinned, secrets(),
+            onStatus = { status -> scope.launch { testStatus = status } },
+            harnessKind = if (useOpenCode && !useDsh) ServerKind.OPENCODE else ServerKind.DSH,
+            registrationPath = registrationPath.trim().takeIf { it.isNotBlank() })
           result = message
           hostKeyType = pinned.hostKeyType.orEmpty()
           hostKeyFingerprint = pinned.hostKeyFingerprint.orEmpty()
@@ -279,7 +304,7 @@ internal fun SshHostForm(
   fun save(offline: Boolean) {
     val config = configOrNull() ?: return
     if (offline) {
-      commit(config)
+      commit(config, offline = true)
       return
     }
     withPinnedKey(config) { pinned -> commit(pinned) }
@@ -456,6 +481,41 @@ internal fun SshHostForm(
         }
       }
     }
+    item { HyperGroupTitle("Harness") }
+    item {
+      HyperSwitchRow(title = "DeepSeek Harness", summary = "使用现有 DSH 接入；连接时可启动已配置的 dsh web",
+        checked = useDsh, onCheckedChange = { useDsh = it }, enabled = !working)
+    }
+    item {
+      HyperSwitchRow(title = "OpenCode", summary = "只附着已运行的官方服务，不会安装、启动或终止进程",
+        checked = useOpenCode, onCheckedChange = { useOpenCode = it }, enabled = !working)
+    }
+    if (useOpenCode) item {
+      TextField(value = registrationPath, onValueChange = { registrationPath = it },
+        label = "OpenCode 注册文件（留空使用 XDG 默认位置）", modifier = Modifier.fillMaxWidth())
+    }
+    item {
+      HyperButton(text = "发现 Harness（只读）", variant = HyperButtonVariant.SECONDARY, enabled = !working,
+        modifier = Modifier.fillMaxWidth(), onClick = {
+          val config = configOrNull()
+          if (config != null) withPinnedKey(config) { pinned ->
+            working = true
+            scope.launch {
+              try {
+                val found = controller.discoverSshHarnesses(pinned, secrets(), registrationPath.trim().takeIf { it.isNotBlank() })
+                discoverySummary = "OpenCode 注册：${found.openCode.state} · DSH 旧接入标记：${found.dshLegacy.state}\n发现不会启动服务；运行与身份会在连接时验证。"
+                hostKeyType = pinned.hostKeyType.orEmpty()
+                hostKeyFingerprint = pinned.hostKeyFingerprint.orEmpty()
+              } catch (cancel: CancellationException) { throw cancel }
+              catch (error: Exception) { result = errorText(error) }
+              finally { working = false }
+            }
+          }
+        })
+    }
+    discoverySummary?.let { summary -> item {
+      Text(summary, style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary))
+    } }
     item {
       HyperActionRow(
         title = "更多选项",
@@ -545,9 +605,9 @@ internal fun SshHostForm(
       item {
         Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
           HyperButton(
-            text = "仅测试连接",
+            text = if (useDsh) "测试 DSH（可能启动 dsh web）" else "测试 OpenCode 接入",
             variant = HyperButtonVariant.SECONDARY,
-            enabled = !working,
+            enabled = !working && (useDsh || useOpenCode),
             loading = working,
             onClick = { test() },
             modifier = Modifier.fillMaxWidth()
@@ -594,9 +654,8 @@ internal fun SshHostForm(
         )
         HyperButton(
           text = when {
-            !enabled -> "保存"
-            initial == null -> "连接"
-            else -> "保存并重连"
+            initial == null -> "保存所选 Harness"
+            else -> "保存 Harness 配置"
           },
           enabled = !working,
           loading = working,
@@ -619,7 +678,7 @@ internal fun SshHostForm(
     SuperDialog(title = "删除 ${initial.name}？", show = true, onDismissRequest = { confirmingDelete = false }) {
       Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Text(
-          "会删除本机的 SSH 配置、加密凭据和对应的 DSH 连接资料；远端的 dsh web 与会话不会受到影响。",
+          "会删除本机的 SSH 配置、加密凭据和该主机下全部 Harness 连接资料；远端进程与会话不会受到影响。",
           style = MiuixTheme.textStyles.body1
         )
         DialogActions("取消", { confirmingDelete = false }, "确认删除", danger = true) {

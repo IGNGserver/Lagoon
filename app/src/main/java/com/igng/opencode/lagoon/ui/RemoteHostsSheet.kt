@@ -40,7 +40,9 @@ internal fun RemoteHostsSheet(
   var confirmSignOut by remember { mutableStateOf(false) }
   val profiles = remember(catalog) { controller.state.value.profiles }
 
-  fun added(hostId: String): Boolean = profiles.any { it.kind == ServerKind.DSH_REMOTE && it.remoteHostId == hostId }
+  fun added(hostId: String): Boolean = profiles.any {
+    it.matchesRemoteHost(catalog?.origin.orEmpty(), catalog?.account.orEmpty(), hostId)
+  }
 
   fun reload() { catalogState = controller.activeRemoteCatalog() }
 

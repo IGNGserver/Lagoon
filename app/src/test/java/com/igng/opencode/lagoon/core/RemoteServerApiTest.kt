@@ -109,8 +109,35 @@ class RemoteServerApiTest {
     try { RemoteServerApi("https://example.org/prefix"); fail("expected failure") } catch (_: IllegalArgumentException) { }
   }
 
+  @Test fun devicePaginationReadsEveryPageWithTheSameDeviceCredential() = server { mock, api ->
+    mock.enqueue(MockResponse().setBody("""{"items":[{"deviceId":"$hostId","name":"One","platform":"linux","role":"host","membershipId":"member","online":true}],"nextCursor":"more"}"""))
+    mock.enqueue(MockResponse().setBody("""{"items":[{"deviceId":"$id","name":"Two","platform":"linux","role":"host","membershipId":"member","online":false}],"nextCursor":null}"""))
+    assertEquals(listOf(hostId, id), api.hosts(access).map { it.deviceId })
+    assertEquals("/api/v1/devices", mock.takeRequest().path)
+    val next = mock.takeRequest()
+    assertEquals("more", next.requestUrl!!.queryParameter("cursor"))
+    assertEquals("50", next.requestUrl!!.queryParameter("limit"))
+    assertEquals("Bearer $access", next.getHeader("Authorization"))
+  }
+
   @Test fun incompleteDevicePaginationIsNotPublishedAsComplete() = server { mock, api ->
     mock.enqueue(MockResponse().setBody("""{"items":[],"nextCursor":"more"}"""))
+    mock.enqueue(MockResponse().setResponseCode(503).setBody("{}"))
     try { api.hosts(access); fail("expected failure") } catch (_: IOException) { }
+  }
+
+  @Test fun cyclicDevicePaginationFailsWithoutPublishingAPartialList() = server { mock, api ->
+    repeat(2) { mock.enqueue(MockResponse().setBody("""{"items":[],"nextCursor":"same"}""")) }
+    assertTrue(runCatching { api.hosts(access) }.exceptionOrNull() is IOException)
+    assertEquals(2, mock.requestCount)
+  }
+
+  @Test fun malformedAuthorizationResponseIsNotACredentialRevocation() = server { mock, api ->
+    for (response in listOf("", "<html>proxy denied</html>", """{"error":{"code":"AUTH_INVALID"}}""")) {
+      mock.enqueue(MockResponse().setResponseCode(401).setBody(response))
+      val failure = runCatching { api.refresh(id, refresh) }.exceptionOrNull() as RemoteServerException
+      assertFalse(failure.isCredentialRejected)
+      assertTrue(failure.retryable)
+    }
   }
 }

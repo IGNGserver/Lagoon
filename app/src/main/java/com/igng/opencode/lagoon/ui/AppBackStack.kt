@@ -12,10 +12,10 @@ internal enum class RootPage(val label: String) {
   SETTINGS("设置")
 }
 
-/** 添加设备页的两段：先按 harness 分（OpenCode / DeepSeek Harness），DSH 段内再分接入方式。 */
+/** Direct compatibility entry and host-based Hub/SSH sources. Enum keys retain saved-route identity. */
 internal enum class AddDeviceTab(val label: String) {
-  OPENCODE("OpenCode"),
-  DSH("DeepSeek Harness")
+  OPENCODE("OpenCode 直连"),
+  DSH("中枢与 SSH")
 }
 
 /**

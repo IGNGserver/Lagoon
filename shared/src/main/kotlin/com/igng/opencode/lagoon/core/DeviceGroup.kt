@@ -38,7 +38,7 @@ val ServerProfile.deviceMemberRole: DeviceMemberRole
 /** 统一连接类型展示标签（OpenCode 直连、DSH 远程中枢、DSH SSH 直连、旧版直连 DSH） */
 val ServerProfile.connectionTypeLabel: String
   get() = when {
-    sshHostId != null -> "DSH SSH 直连"
+    sshHostId != null -> "${if (kind == ServerKind.OPENCODE) "OpenCode" else "DSH"} SSH 直连"
     kind == ServerKind.DSH_REMOTE -> "DSH 远程中枢"
     kind == ServerKind.OPENCODE -> "OpenCode 直连"
     else -> "旧版直连 DSH"
@@ -47,7 +47,7 @@ val ServerProfile.connectionTypeLabel: String
 /** 统一连接端点简要描述，例如 "OpenCode 直连 · http://..." */
 val ServerProfile.endpointSummary: String
   get() = when {
-    sshHostId != null -> "DSH SSH 直连 · ${url.removePrefix("ssh://")}"
+    sshHostId != null -> "$connectionTypeLabel · ${url.removePrefix("ssh://")}"
     kind == ServerKind.DSH_REMOTE -> "DSH 远程中枢 · ${remoteHostId?.take(8).orEmpty()}"
     kind == ServerKind.OPENCODE -> "OpenCode 直连 · $url"
     else -> "旧版直连 DSH · $url"

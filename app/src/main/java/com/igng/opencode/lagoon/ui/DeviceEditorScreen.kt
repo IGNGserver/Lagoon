@@ -318,7 +318,7 @@ private fun DshTab(
   ) {
     item {
       Text(
-        "DeepSeek Harness 有两种接入：登录远程中枢批量接入电脑，或直接 SSH 直连一台 POSIX 主机。",
+        "通过远程中枢或 SSH 接入电脑。一个 SSH 配置可以独立接入 OpenCode 与 DSH；发现服务不会启动或终止进程。",
         style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary)
       )
     }
@@ -362,7 +362,7 @@ private fun DshTab(
       item {
         HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(14.dp)) {
           Text(
-            "还没有 SSH 主机。添加后会自动在远端启动 dsh web 并建立加密隧道。",
+            "还没有 SSH 主机。添加后可只读发现服务，再选择要接入的 Harness；OpenCode 只附着已运行的官方服务。",
             style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary)
           )
         }
