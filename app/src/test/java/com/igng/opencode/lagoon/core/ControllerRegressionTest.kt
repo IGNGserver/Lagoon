@@ -53,7 +53,10 @@ class ControllerRegressionTest {
     put(c,"mutable", mutable); put(c,"state",mutable); put(c,"generation",1); put(c,"api",api)
     put(c,"operationScope",CoroutineScope(SupervisorJob()+Dispatchers.Unconfined))
     put(c,"scope",CoroutineScope(Job().apply { cancel() }+Dispatchers.Default))
-    put(c,"store",ServerStore(preferences(),preferences(),{it},{it}));put(c,"cache",OfflineCache(context.getSharedPreferences("cache",0),{it},{it}));put(c,"sendMutex",kotlinx.coroutines.sync.Mutex()); put(c,"referenceMutex",kotlinx.coroutines.sync.Mutex()); put(c,"monitorRequested",mutableSetOf<String>()); put(c,"draftWrites",mutableMapOf<String,Job>()); put(c,"attentionJobs",mutableMapOf<String,Job>()); put(c,"waitingEventSeqAt",mutableMapOf<String,Long>())
+    val savedStore = ServerStore(preferences(), preferences(), { it }, { it })
+    val savedProfiles = initial.profiles.ifEmpty { listOfNotNull(initial.serverId?.let { ServerProfile(it, it, "https://fixture.invalid") }) }
+    savedProfiles.forEach { savedStore.save(it, null) }
+    put(c,"store",savedStore);put(c,"cache",OfflineCache(context.getSharedPreferences("cache",0),{it},{it}));put(c,"sendMutex",kotlinx.coroutines.sync.Mutex()); put(c,"referenceMutex",kotlinx.coroutines.sync.Mutex()); put(c,"monitorRequested",mutableSetOf<String>()); put(c,"draftWrites",mutableMapOf<String,Job>()); put(c,"attentionJobs",mutableMapOf<String,Job>()); put(c,"waitingEventSeqAt",mutableMapOf<String,Long>())
     put(c, "resolvedPermissions", linkedSetOf<String>()); put(c,"directoryHealth",DirectoryHealth())
     put(c, "connectTrace", ConnectTrace()); put(c, "openTrace", ConnectTrace()); put(c, "transcriptMemory", TranscriptMemory()); put(c, "queuedSends", mutableListOf<Any>())
     put(c, "storeDispatcher", Dispatchers.IO.limitedParallelism(1))
@@ -1331,6 +1334,7 @@ class ControllerRegressionTest {
       }
       val client = api(server); client.health()
       val store = ServerStore(memoryPreferences(), memoryPreferences(), { it }, { it })
+      store.save(ServerProfile("server", "Server", server.url("/").toString(), allowCleartext = true), null)
       val (controller, state) = controller(client, LagoonState(
         serverId = "server",
         connected = true,
