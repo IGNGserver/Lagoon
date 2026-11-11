@@ -31,9 +31,9 @@
 |---|---|---|---|
 | 服务与版本发现 | managed service registration + /api/info + /openapi.json | 精确 profile/运行实例 + Host capability | SSH 仅 DSH；Hub 仅 Typert；建立通用只读发现 |
 | 工作区列举/目录选择 | project/location/fs | workspace/follow、directoryPicker/list | 保留目录真实 identity，不按显示名路由 |
-| 工作区管理 | project/worktree 官方操作 | workspace create/rename/delete/order | 按官方可远程能力补足，删除确认 |
+| 工作区管理 | PATCH project 元数据；worktree list/create/remove/refresh | workspace create/rename/delete/order | r22：OpenCode 原生元数据与 worktree 生命周期已接入独立管理面；删除是真实后端移除，默认非强制且不自动升级，创建/刷新部分提交按未知处理；官方无 project 创建/删除/排序，不以 DSH 接口代替 |
 | 会话列举与分页 | GET /api/session | session/list | 主/子会话、blank、归档边界准确 |
-| 服务端搜索 | 官方会话/消息搜索 | session/search | 不把本机未缓存数据当完整搜索结果 |
+| 服务端搜索 | 仅原生标题搜索（`session?search=` 为标题 SQL LIKE，非正文） | session/search 正文 | 不把本机未缓存数据当完整搜索结果；不把 OpenCode 标题搜索冒充正文搜索 |
 | 创建/复用 | POST /api/session，支持 client id | session/create、blank reuse | workspace attach 失败可能已创建，不盲重试 |
 | 重命名 | PATCH session，兼容旧路由 | session/rename | 等待服务端提交结果 |
 | 归档/恢复 | 顶层 archived boolean | workspace/archiveSession、unarchiveSession | DSH 外部取消归档不能被本机旧 true 覆盖 |

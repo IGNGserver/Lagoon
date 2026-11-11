@@ -192,5 +192,9 @@
 - 独立复核发现1个P2：runtime新LagoonState清空unknown-fork锁，重连/切换可重复提交。已修所有运行期状态重建保留最新锁，并补聚合→重连→原路由恢复锁定回归。`historical-fork-first.log`生产编译通过但新测试误用TaskState.RUNNING，已改当前模型构造；`historical-fork-native.log`原生矩阵通过17s，`historical-fork-matrix.log`Controller/Noise通过7s，`historical-fork-lock-fixed.log`锁修复通过6s。首轮全量旧Controller fork夹具未保存原生能力被新门禁拒绝，补原路由和已模拟cap而非放宽生产检查。
 - `historical-fork-final.log`：**1545 tests、0 failures、0 errors、14 skipped**，Debug assemble成功127s。新增OpenCode历史7、DSH历史4、Policy4、Controller4、实际Noise2、能力1、官方schema1，共23项；既有Controller90与Guarded7继续通过。APK22,146,966bytes，SHA-256 `29ad832414489948853fdfa486bd2cc5d15eddcb63f8b7d92b4c0d5fef093ae0`。HTTP/mux和Noise域数据为受控夹具，未启动daemon/模型或真机/公网操作。
 - 历史边界分叉本轮完成；下一轮继续OpenCode原生project/worktree与内容搜索官方契约专项核对，真实环境边界继续披露。整体目标仍在进行，PR保持Draft。
+- r22：按固定OpenCode 2.2.6契约接入原生项目元数据与worktree生命周期。项目PATCH仅发送改动字段并提交前新鲜比对；worktree清单读取不加载配置，创建/删除/refresh是独立写入且各自确认。删除是真实后端策略移除（可删目录与未提交内容），默认force=false且forceRequired绝不自动升级；创建directory是父目录，启动脚本在创建与库存提交后才运行，故失败按未知处理。
+- 能力发现只认实例自身OpenAPI的完整兼容形状，BASELINE不假设；项目ID进入路径段，含斜杠/反斜杠/百分号或为点段时在写入前400，读取仍可用且不换路由。未知写入按原Host+项目锁定，必须成功读取同一项目元数据与工作树清单才解除；仅元数据读取不解除worktree未知态。Controller固定原profile同leaf route，关闭/换路由后旧结果丢弃。
+- 复核发现并修复2个P2：删除页捕获了(project,worktree)但提交仍用当前项目，刷新后可能把旧目录提交到改动后的项目；编辑/创建/删除/refresh表单在只读刷新重定基后可能把他端修改当成自己草稿覆盖。现统一使用进入操作时捕获的不可变项目快照，表单基准不被刷新替换，刷新后不一致时禁用提交并要求返回详情重开。
+- 原生HTTP传输拒绝编码斜杠，故含`/`的project ID无法安全寻址：上行直接400（不发请求），不在读取侧伪造。`opencode-worktrees-matrix3.log`：45项0失败，含API9、能力17、Policy4、Controller4、编辑器2、Guarded7、实际Noise/Router/Peer worktree生命周期1。Host Node测试37项0失败0跳过（含官方Router/终端/变更/冷搜索）。CD测试曾因`localhost`解析到未监听的IPv6失败，已将夹具改绑127.0.0.1，不恢复写入自动重放。
 - 全部构建在 `/home/lvziw/.build/Lagoon/unified-harness-connections/source`，Gradle/build 输出在 `~/.build`。源码工作树无 app/build、node_modules。
 - `wt audit`：29 repos，0 missing dirs，3 detached、4 merged worktrees 属其他任务；只读报告，无清理。

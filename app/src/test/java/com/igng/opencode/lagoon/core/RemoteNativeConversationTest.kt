@@ -141,6 +141,48 @@ class RemoteNativeConversationTest {
       RemotePeerTrust(Pins(host.hostIdentity.publicKey)), account)
   }
 
+  @Test fun actualNoiseRouterAndNativePeerCarryProjectAndWorktreeOperationsWithoutReplay() = runBlocking {
+    assumeTrue("Set staged native Host to verify native management", !System.getenv("LAGOON_NATIVE_STDIO_HOST").isNullOrBlank())
+    startNode().use { node ->
+      assertTrue(withTimeout(TIMEOUT_MILLIS) { node.rpc.ready.await() }.getBoolean("router"))
+      FakeRemoteHost(nativeRpc = { method, params, _ -> runBlocking(Dispatchers.IO) { node.rpc.call(method, params) } }).use { host ->
+        node.rpc.publish = host::publishNativeEvent; host.start()
+        val session = session(host)
+        try {
+          val service = requireNotNull(session.nativeServiceCatalog()).services.single()
+          val profile = ServerProfile("native-management", "Native", RemoteNativeServices.VIRTUAL_BASE_URL,
+            kind = ServerKind.OPENCODE, remoteHostId = host.hostId, remoteServiceId = service.id)
+          RemoteBackend(session, profile, release = {}).use { backend ->
+            val api = backend.client
+            val caps = api.discoverCapabilities()
+            assertTrue(caps.openCodeProjectManagement); assertTrue(caps.openCodeWorktreeManagement)
+            val original = api.openCodeProjects()!!.single()
+            val updated = api.updateOpenCodeProject(original, OpenCodeProjectEdit(name = "Remote metadata"))!!
+            assertEquals("Remote metadata", updated.name)
+            val before = api.openCodeWorktrees(updated)!!
+            assertTrue(before.any { it.strategy == null })
+            val created = api.createOpenCodeWorktree(updated, OpenCodeWorktreeCreate(parentDirectory = "/parent", name = "created"))!!
+            assertEquals("/parent/created-1", created.directory)
+            val managed = api.openCodeWorktrees(updated)!!.single { it.directory == created.directory }
+            assertEquals(true, api.removeOpenCodeWorktree(updated, managed, false))
+            assertEquals(true, api.refreshOpenCodeWorktrees(updated))
+            node.rpc.fixture("fixture.failNextCreate")
+            val failed = runCatching { api.createOpenCodeWorktree(updated, OpenCodeWorktreeCreate(parentDirectory = "/parent", name = "created")) }.exceptionOrNull()
+            assertTrue(failed is ApiException)
+            assertTrue(api.openCodeWorktrees(updated)!!.any { it.directory == "/parent/created-2" })
+            val stats = node.rpc.fixture("fixture.stats")
+            assertEquals(1, stats.getInt("projectUpdates")); assertEquals(2, stats.getInt("worktreeCreates"))
+            assertEquals(1, stats.getInt("worktreeRemoves")); assertEquals(1, stats.getInt("worktreeRefreshes"))
+            val calls = synchronized(host.rpcCalls) { host.rpcCalls.toList() }
+            assertEquals(2, calls.count { it.optString("method") == "harness.services.call" &&
+              it.getJSONObject("params").optString("method") == "POST" && it.getJSONObject("params").optString("path") == "/api/worktree" })
+            assertTrue(calls.none { it.optString("method").startsWith("harness.remote.") })
+          }
+        } finally { session.close() }
+      }
+    }
+  }
+
   @Test fun actualPatchedRouterCarriesCatalogRenameSseBinaryAndCloseIsolation() = runBlocking {
     assumeTrue("Set LAGOON_NATIVE_STDIO_HOST to run the cross-language test",
       !System.getenv("LAGOON_NATIVE_STDIO_HOST").isNullOrBlank())

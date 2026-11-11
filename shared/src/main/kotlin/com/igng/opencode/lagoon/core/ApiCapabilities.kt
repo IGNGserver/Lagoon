@@ -46,7 +46,11 @@ data class ApiCapabilities(
   /** Native authorized Session content search; no OpenCode route is assumed. */
   val sessionContentSearch: Boolean = false,
   /** Exact native history boundary support; never inferred from whole-history fork or a baseline. */
-  val historicalFork: Boolean = false
+  val historicalFork: Boolean = false,
+  /** Native OpenCode metadata writes, only with this instance's compatible documented schema. */
+  val openCodeProjectManagement: Boolean = false,
+  /** All native inventory/create/delete/reconcile contracts must be documented together. */
+  val openCodeWorktreeManagement: Boolean = false
 ) {
   fun supports(action: SessionAction) = action in actions
   companion object {
@@ -151,10 +155,12 @@ data class ApiCapabilities(
           (!input.has("maxProperties") || input.optInt("maxProperties", 0) >= 1) &&
           schema(before).str("type") == "string"
       }
+      val projectManagement = openCodeProjectCapabilities(document)
       return ApiCapabilities(actions, endpoint("/diff", "GET") != null,
         endpoint("/view", "POST", setOf("idle")), archive, documented = true,
         fork = endpoint("/fork", "POST") != null, stopShell = stopShell, terminal = terminal,
-        historicalFork = historicalFork)
+        historicalFork = historicalFork, openCodeProjectManagement = projectManagement.first,
+        openCodeWorktreeManagement = projectManagement.second)
     }
 
     /**

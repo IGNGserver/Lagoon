@@ -155,6 +155,45 @@ class ApiCapabilitiesTest {
   private fun sessionOperation(suffix: String, operation: JSONObject, method: String = "post", parameter: String = "id") =
     JSONObject().put("paths", JSONObject().put("/api/session/{$parameter}$suffix", JSONObject().put(method, operation)))
 
+  @Test fun nativeProjectAndWorktreeManagementRequireTheCompleteInstanceContract() {
+    val document = OpenCodeProjectManagementTest.document()
+    val caps = ApiCapabilities.fromDocument(document)
+    assertTrue(caps.openCodeProjectManagement); assertTrue(caps.openCodeWorktreeManagement)
+    assertFalse(ApiCapabilities.BASELINE.openCodeProjectManagement); assertFalse(ApiCapabilities.BASELINE.openCodeWorktreeManagement)
+    assertFalse(ApiCapabilities().openCodeProjectManagement); assertFalse(ApiCapabilities().openCodeWorktreeManagement)
+    val paths = document.getJSONObject("paths")
+    paths.remove("/api/worktree/refresh")
+    assertTrue(ApiCapabilities.fromDocument(document).openCodeProjectManagement)
+    assertFalse(ApiCapabilities.fromDocument(document).openCodeWorktreeManagement)
+    paths.remove("/api/project/{id}")
+    assertFalse(ApiCapabilities.fromDocument(document).openCodeProjectManagement)
+  }
+
+  @Test fun nativeManagementRejectsRequiredExtrasPartialMetadataAndWrongWorktreeTypes() {
+    fun body(document: JSONObject, path: String, method: String) = document.getJSONObject("paths").getJSONObject(path)
+      .getJSONObject(method).getJSONObject("requestBody").getJSONObject("content").getJSONObject("application/json").getJSONObject("schema")
+    for (change in listOf<(JSONObject) -> Unit>(
+      { body(it, "/api/project/{id}", "patch").getJSONObject("properties").getJSONObject("icon").getJSONObject("properties").remove("color") },
+      { body(it, "/api/project/{id}", "patch").put("required", org.json.JSONArray().put("name")) },
+      { body(it, "/api/project/{id}", "patch").getJSONObject("properties").getJSONObject("commands").put("required", org.json.JSONArray().put("unknown")) }
+    )) {
+      val document = OpenCodeProjectManagementTest.document(); change(document)
+      assertFalse(ApiCapabilities.fromDocument(document).openCodeProjectManagement)
+      assertTrue(ApiCapabilities.fromDocument(document).openCodeWorktreeManagement)
+    }
+    for (change in listOf<(JSONObject) -> Unit>(
+      { body(it, "/api/worktree", "delete").getJSONObject("properties").put("force", JSONObject().put("type", "string")) },
+      { body(it, "/api/worktree", "delete").put("required", org.json.JSONArray().put("projectID").put("directory")) },
+      { body(it, "/api/worktree", "post").put("required", org.json.JSONArray().put("projectID").put("branch")) },
+      { body(it, "/api/worktree/refresh", "post").put("required", org.json.JSONArray().put("projectID").put("unknown")) },
+      { it.getJSONObject("paths").getJSONObject("/api/worktree").getJSONObject("get").getJSONArray("parameters").getJSONObject(0).put("required", false) }
+    )) {
+      val document = OpenCodeProjectManagementTest.document(); change(document)
+      assertTrue(ApiCapabilities.fromDocument(document).openCodeProjectManagement)
+      assertFalse(ApiCapabilities.fromDocument(document).openCodeWorktreeManagement)
+    }
+  }
+
   @Test fun aDocumentWithoutPathsMeansTheCurrentContract() {
     assertEquals(ApiCapabilities.BASELINE, ApiCapabilities.fromDocument(JSONObject("{}")))
   }

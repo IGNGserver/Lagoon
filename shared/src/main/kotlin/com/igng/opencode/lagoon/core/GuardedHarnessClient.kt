@@ -16,6 +16,17 @@ internal class GuardedHarnessClient(private val access: HarnessLeaseAccess) : Ha
   override suspend fun discoverCapabilities(): ApiCapabilities = access.useSuspending { it.discoverCapabilities() }
   override suspend fun health(): String = access.useSuspending { it.health() }
   override suspend fun projects(): List<Project> = access.useSuspending { it.projects() }
+  override suspend fun openCodeProjects(): List<OpenCodeProjectInfo>? = access.useSuspending { it.openCodeProjects() }
+  override suspend fun updateOpenCodeProject(expected: OpenCodeProjectInfo, edit: OpenCodeProjectEdit): OpenCodeProjectInfo? =
+    access.useSuspending { it.updateOpenCodeProject(expected, edit) }
+  override suspend fun openCodeWorktrees(expected: OpenCodeProjectInfo): List<OpenCodeWorktree>? =
+    access.useSuspending { it.openCodeWorktrees(expected) }
+  override suspend fun createOpenCodeWorktree(expected: OpenCodeProjectInfo, input: OpenCodeWorktreeCreate): OpenCodeWorktree? =
+    access.useSuspending { it.createOpenCodeWorktree(expected, input) }
+  override suspend fun removeOpenCodeWorktree(expected: OpenCodeProjectInfo, worktree: OpenCodeWorktree, force: Boolean): Boolean? =
+    access.useSuspending { it.removeOpenCodeWorktree(expected, worktree, force) }
+  override suspend fun refreshOpenCodeWorktrees(expected: OpenCodeProjectInfo): Boolean? =
+    access.useSuspending { it.refreshOpenCodeWorktrees(expected) }
   override suspend fun serverWorkspaces(): List<ServerWorkspace>? = access.useSuspending { it.serverWorkspaces() }
   override suspend fun registerWorkspace(path: String): WorkspaceRegistration? = access.useSuspending { it.registerWorkspace(path) }
   override suspend fun renameWorkspace(expected: ServerWorkspace, title: String): ServerWorkspace? =

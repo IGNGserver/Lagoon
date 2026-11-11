@@ -4074,6 +4074,58 @@ class LagoonController private constructor(private val appContext: Context) {
     onOpen(SessionTarget(op.serverId, sessionId))
   }
 
+  // ---- OpenCode native project/worktree operations, never DSH registration semantics ----
+  private val openCodeManagementGate = OpenCodeManagementGate()
+  private fun openCodeOperation(target: OpenCodeManagementTarget, worktrees: Boolean = false, catalog: Boolean = false): OperationContext {
+    val op = beginOperation()
+    check(target.matches(op.snapshot) && op.snapshot.canManageOpenCodeProjects()) { "OpenCode 所属 Host 或能力已变化，请重新打开" }
+    check(catalog || if (worktrees) op.snapshot.capabilities.openCodeWorktreeManagement else op.snapshot.capabilities.openCodeProjectManagement) {
+      "此实例未声明兼容的原生管理接口"
+    }
+    return op
+  }
+  private fun requireOpenCodeOperation(op: OperationContext, target: OpenCodeManagementTarget) {
+    check(op.connectionCurrent(this) && target.matches(state.value) && state.value.canManageOpenCodeProjects()) {
+      "原 OpenCode 连接已变化，旧结果已丢弃；若已提交，请在原 Host 核对"
+    }
+  }
+  internal suspend fun openCodeProjects(target: OpenCodeManagementTarget): List<OpenCodeProjectInfo> =
+    openCodeManagementGate.catalog(target.profile) {
+      val op = openCodeOperation(target, catalog = true)
+      val rows = op.client.openCodeProjects() ?: throw ApiException(501, "此实例不支持原生项目管理")
+      requireOpenCodeOperation(op, target); rows
+    }
+  internal suspend fun updateOpenCodeProject(target: OpenCodeManagementTarget, expected: OpenCodeProjectInfo, edit: OpenCodeProjectEdit): OpenCodeProjectInfo =
+    openCodeManagementGate.write(target.profile, expected.id, false) {
+      val op = openCodeOperation(target)
+      val row = op.client.updateOpenCodeProject(expected, edit) ?: throw ApiException(501, "此实例不支持原生项目修改")
+      requireOpenCodeOperation(op, target); row
+    }
+  internal suspend fun openCodeWorktrees(target: OpenCodeManagementTarget, expected: OpenCodeProjectInfo): List<OpenCodeWorktree> =
+    openCodeManagementGate.inventory(target.profile, expected.id) {
+      val op = openCodeOperation(target, true)
+      val rows = op.client.openCodeWorktrees(expected) ?: throw ApiException(501, "此实例不支持原生 worktree 清单")
+      requireOpenCodeOperation(op, target); rows
+    }
+  internal suspend fun createOpenCodeWorktree(target: OpenCodeManagementTarget, expected: OpenCodeProjectInfo, input: OpenCodeWorktreeCreate): OpenCodeWorktree =
+    openCodeManagementGate.write(target.profile, expected.id, true) {
+      val op = openCodeOperation(target, true)
+      val row = op.client.createOpenCodeWorktree(expected, input) ?: throw ApiException(501, "此实例不支持原生 worktree 创建")
+      requireOpenCodeOperation(op, target); row
+    }
+  internal suspend fun removeOpenCodeWorktree(target: OpenCodeManagementTarget, expected: OpenCodeProjectInfo, worktree: OpenCodeWorktree, force: Boolean): Unit =
+    openCodeManagementGate.write(target.profile, expected.id, true) {
+      val op = openCodeOperation(target, true)
+      check(op.client.removeOpenCodeWorktree(expected, worktree, force) == true) { "Host 未确认 worktree 移除，请只读核对；未自动升级 force" }
+      requireOpenCodeOperation(op, target)
+    }
+  internal suspend fun refreshOpenCodeWorktrees(target: OpenCodeManagementTarget, expected: OpenCodeProjectInfo): Unit =
+    openCodeManagementGate.write(target.profile, expected.id, true) {
+      val op = openCodeOperation(target, true)
+      check(op.client.refreshOpenCodeWorktrees(expected) == true) { "Host 未确认策略发现与清单调和，请只读核对" }
+      requireOpenCodeOperation(op, target)
+    }
+
   // ---- Explicit Host workspace registrations (not the device-local project registry) ----
   private val workspaceManagementGate = WorkspaceManagementGate()
 

@@ -19,7 +19,8 @@ import java.util.concurrent.TimeUnit
 
 /** Requests and payloads against the OpenCode 2.x contract (`packages/protocol`). */
 class OpenCodeApiTest {
-  private fun api(server: MockWebServer) = OpenCodeApi(ServerProfile("local", "Local", server.url("/").toString().trimEnd('/'), "opencode", allowCleartext = true), "secret")
+  // Match the fixture's loopback listener exactly; write retries must not hide localhost IPv6/IPv4 mismatches.
+  private fun api(server: MockWebServer) = OpenCodeApi(ServerProfile("local", "Local", server.url("/").newBuilder().host("127.0.0.1").build().toString().trimEnd('/'), "opencode", allowCleartext = true), "secret")
 
   @Test fun healthReadsTheServerVersionFromApiInfoWithBasicAuth() = runBlocking {
     MockWebServer().use { server ->

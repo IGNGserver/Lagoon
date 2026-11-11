@@ -45,6 +45,15 @@ interface HarnessClient {
 
   suspend fun projects(): List<Project>
 
+  /** Fresh native OpenCode metadata, including archived projects; never local registrations. */
+  suspend fun openCodeProjects(): List<OpenCodeProjectInfo>? = null
+  suspend fun updateOpenCodeProject(expected: OpenCodeProjectInfo, edit: OpenCodeProjectEdit): OpenCodeProjectInfo? = null
+  suspend fun openCodeWorktrees(expected: OpenCodeProjectInfo): List<OpenCodeWorktree>? = null
+  suspend fun createOpenCodeWorktree(expected: OpenCodeProjectInfo, input: OpenCodeWorktreeCreate): OpenCodeWorktree? = null
+  suspend fun removeOpenCodeWorktree(expected: OpenCodeProjectInfo, worktree: OpenCodeWorktree, force: Boolean = false): Boolean? = null
+  /** Native reconciliation is a write, not a read-only inventory refresh. */
+  suspend fun refreshOpenCodeWorktrees(expected: OpenCodeProjectInfo): Boolean? = null
+
   /** Fresh Host-owned registrations; null means unsupported, not an empty catalog. */
   suspend fun serverWorkspaces(): List<ServerWorkspace>? = null
   suspend fun registerWorkspace(path: String): WorkspaceRegistration? = null

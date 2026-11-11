@@ -204,6 +204,10 @@ class GuardedHarnessClientTest {
     List::class.java -> emptyList<Any>()
     Session::class.java -> Session("session", "/repo", "Title", 1)
     ServerWorkspace::class.java -> ServerWorkspace("workspace", "/repo", "Title", emptyList(), "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z")
+    OpenCodeProjectInfo::class.java -> OpenCodeProjectInfo("project", "/repo", "Name", null, null, null, null, null, 1, 1, 1, null, emptyList())
+    OpenCodeProjectEdit::class.java -> OpenCodeProjectEdit(name = "Name")
+    OpenCodeWorktree::class.java -> OpenCodeWorktree("/repo/work", "git")
+    OpenCodeWorktreeCreate::class.java -> OpenCodeWorktreeCreate(name = "work")
     ForkBoundary::class.java -> ForkBoundary.DshEvent(1)
     TerminalScope::class.java -> TerminalScope.Location("/repo")
     QueueAction::class.java -> QueueAction.Remove

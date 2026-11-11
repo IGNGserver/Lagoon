@@ -38,6 +38,11 @@ internal fun HomeScopeSheet(
   onManageDevices: () -> Unit
 ) {
   var managing by remember { mutableStateOf<WorkspaceManagementTarget?>(null) }
+  var managingOpenCode by remember { mutableStateOf<OpenCodeManagementTarget?>(null) }
+  managingOpenCode?.let { target ->
+    OpenCodeProjectManagementPanel(state, controller, target, onDismiss = { managingOpenCode = null })
+    return
+  }
   managing?.let { target ->
     ServerWorkspaceManagementPanel(state, controller, target, onDismiss = { managing = null })
     return
@@ -53,7 +58,8 @@ internal fun HomeScopeSheet(
       if (!state.allServers) item {
         if (state.homeGroup != null) WorkspaceScopeSection(state, controller, onDismiss)
         else ProjectScopeSection(state, controller, onDismiss, onRemove = { removing = it },
-          onManageWorkspaces = { state.server?.let { managing = WorkspaceManagementTarget(it) } })
+          onManageWorkspaces = { state.server?.let { managing = WorkspaceManagementTarget(it) } },
+          onManageOpenCodeProjects = { state.server?.let { managingOpenCode = OpenCodeManagementTarget(it) } })
       }
       item { HyperGroupTitle(if (state.allServers) "设备" else "切换设备") }
       item {
@@ -170,7 +176,8 @@ private fun ProjectScopeSection(
   controller: LagoonController,
   onDismiss: () -> Unit,
   onRemove: (Project) -> Unit,
-  onManageWorkspaces: () -> Unit
+  onManageWorkspaces: () -> Unit,
+  onManageOpenCodeProjects: () -> Unit
 ) {
   var query by rememberSaveable { mutableStateOf("") }
   val counts = HomeScope.counts(state.sessions, state.projects)
@@ -206,6 +213,10 @@ private fun ProjectScopeSection(
       if (state.canManageServerWorkspaces()) {
         HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
         ChoiceRow("管理 Host 工作区", "管理此 Host 的共享登记；不会自动保存到本机", false, onManageWorkspaces)
+      }
+      if (state.canManageOpenCodeProjects()) {
+        HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
+        ChoiceRow("管理 OpenCode 项目", "编辑此 Host 的项目元数据与工作树", false, onManageOpenCodeProjects)
       }
     }
   }

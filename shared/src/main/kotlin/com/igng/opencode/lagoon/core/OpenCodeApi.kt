@@ -155,7 +155,10 @@ class OpenCodeApi internal constructor(
     )
     val responseBody = response.body.toString(Charsets.UTF_8)
     if (response.statusCode !in 200..299) {
-      throw ApiException(response.statusCode, httpErrorMessage(response.statusCode, responseBody))
+      val error = runCatching { JSONObject(responseBody) }.getOrNull()
+      throw ApiException(response.statusCode, httpErrorMessage(response.statusCode, responseBody),
+        code = (error?.opt("name") as? String)?.takeIf { it == "WorktreeError" },
+        details = error?.optJSONObject("data"))
     }
     return responseBody
   }
@@ -255,6 +258,19 @@ class OpenCodeApi internal constructor(
     }
     return info.str("version").ifBlank { "2.x" }.also { version = it }
   }
+
+  private val projectManagement by lazy { OpenCodeProjectManagement(::capabilities, ::request) {
+    displayProjects = null; displayProjectsAt = 0L; displayProjectsFailedAt = 0L
+  } }
+  override suspend fun openCodeProjects(): List<OpenCodeProjectInfo>? = projectManagement.projects()
+  override suspend fun updateOpenCodeProject(expected: OpenCodeProjectInfo, edit: OpenCodeProjectEdit): OpenCodeProjectInfo? =
+    projectManagement.update(expected, edit)
+  override suspend fun openCodeWorktrees(expected: OpenCodeProjectInfo): List<OpenCodeWorktree>? = projectManagement.worktrees(expected)
+  override suspend fun createOpenCodeWorktree(expected: OpenCodeProjectInfo, input: OpenCodeWorktreeCreate): OpenCodeWorktree? =
+    projectManagement.create(expected, input)
+  override suspend fun removeOpenCodeWorktree(expected: OpenCodeProjectInfo, worktree: OpenCodeWorktree, force: Boolean): Boolean? =
+    projectManagement.remove(expected, worktree, force)
+  override suspend fun refreshOpenCodeWorktrees(expected: OpenCodeProjectInfo): Boolean? = projectManagement.refresh(expected)
 
   override suspend fun projects(): List<Project> {
     val listed = try {

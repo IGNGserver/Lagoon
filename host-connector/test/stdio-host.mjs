@@ -29,8 +29,22 @@ const large = Buffer.from(Array.from({ length: CHUNK + 23 }, (_, index) => index
 let title = 'Native fixture', renameCount = 0, largeMutations = 0, uploadCount = 0, revision = 0, stopping = false;
 let peer, router, registration;
 const session = () => ({ id: 'ses_native /one', title, location: { directory: '/repo' }, time: { created: 1, updated: 2 + renameCount } });
+const nativeProject = { id: 'p_native', canonical: '/repo', name: 'Native', vcs: 'git', commands: {},
+  time: { created: 1, updated: 2, active: 1 }, sandboxes: ['/repo'] };
+let worktreeRows = [{ directory: '/repo' }, { directory: '/repo/existing', strategy: 'git' }];
+let projectUpdates = 0, worktreeCreates = 0, worktreeRemoves = 0, worktreeRefreshes = 0, failCreate = false;
+const requestBody = (properties, required = []) => ({ requestBody: { content: { 'application/json': { schema: { type: 'object', properties, required } } } } });
+const textSchema = { type: 'string' };
 const paths = {
-  '/api/project': { get: {} }, '/api/session': { get: {} },
+  '/api/project': { get: {} },
+  '/api/project/{projectID}': { patch: requestBody({ canonical: textSchema, name: textSchema,
+    icon: { type: 'object', properties: { override: textSchema, color: textSchema } },
+    commands: { type: 'object', properties: { start: textSchema } } }) },
+  '/api/worktree': { get: { parameters: [{ in: 'query', name: 'projectID', required: true, schema: textSchema }] },
+    post: requestBody({ projectID: textSchema, from: textSchema, branch: textSchema, directory: textSchema, name: textSchema }, ['projectID']),
+    delete: requestBody({ projectID: textSchema, directory: textSchema, force: { type: 'boolean' } }, ['projectID', 'directory', 'force']) },
+  '/api/worktree/refresh': { post: requestBody({ projectID: textSchema }, ['projectID']) },
+  '/api/session': { get: {} },
   '/api/session/{sessionID}': { get: {}, patch: { requestBody: { content: { 'application/json': {
     schema: { type: 'object', properties: { title: { type: 'string' } }, required: ['title'] },
   } } } } },
@@ -43,7 +57,32 @@ const server = http.createServer(async (req, res) => {
     requests.push({ method: req.method, path: req.url, authenticated: req.headers.authorization === authorization });
     if (path === '/api/info') { json(res, { pid: process.pid, version: '2.2.6' }); return; }
     if (req.headers.authorization !== authorization) { res.writeHead(401).end(); return; }
-    if (path === '/api/project') { json(res, { data: [{ id: 'p_native', directory: '/repo', name: 'Native' }] }); return; }
+    if (path === '/api/project') { json(res, [nativeProject]); return; }
+    if (path === '/api/project/p_native' && req.method === 'PATCH') {
+      const chunks = []; for await (const chunk of req) chunks.push(chunk);
+      const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      assert.deepEqual(Object.keys(body), ['name']); assert.equal(typeof body.name, 'string');
+      nativeProject.name = body.name; nativeProject.time.updated++; projectUpdates++;
+      json(res, nativeProject); return;
+    }
+    if (path === '/api/worktree' || path === '/api/worktree/refresh') {
+      if (req.method === 'GET') {
+        assert.equal(new URL(req.url, 'http://127.0.0.1').searchParams.get('projectID'), 'p_native'); json(res, worktreeRows); return;
+      }
+      const chunks = []; for await (const chunk of req) chunks.push(chunk);
+      const body = JSON.parse(Buffer.concat(chunks).toString('utf8')); assert.equal(body.projectID, 'p_native');
+      if (path.endsWith('/refresh')) { assert.deepEqual(Object.keys(body), ['projectID']); worktreeRefreshes++; res.writeHead(204).end(); return; }
+      if (req.method === 'POST') {
+        assert.deepEqual(Object.keys(body).sort(), ['directory', 'name', 'projectID']);
+        assert.equal(body.directory, '/parent'); assert.equal(body.name, 'created');
+        worktreeCreates++; const directory = `/parent/created-${worktreeCreates}`; worktreeRows.push({ directory, strategy: 'git' });
+        if (failCreate) { failCreate = false; res.statusCode = 400; json(res, { name: 'WorktreeError', data: { message: 'Setup failed after inventory commit' } }); return; }
+        json(res, { directory }); return;
+      }
+      assert.equal(req.method, 'DELETE'); assert.deepEqual(Object.keys(body).sort(), ['directory', 'force', 'projectID']);
+      assert.equal(body.force, false); assert.ok(worktreeRows.some(row => row.directory === body.directory && row.strategy));
+      worktreeRows = worktreeRows.filter(row => row.directory !== body.directory); worktreeRemoves++; res.writeHead(204).end(); return;
+    }
     if (path === '/openapi.json') { json(res, { openapi: '3.1.0', paths }); return; }
     if (path === '/api/session') { json(res, { data: [session()], cursor: {} }); return; }
     if (path.startsWith('/api/session/')) {
@@ -97,7 +136,8 @@ server.on('upgrade', (req, socket, head) => {
 function output(value) {
   return new Promise((done, reject) => process.stdout.write(`${JSON.stringify(value)}\n`, error => error ? reject(error) : done()));
 }
-function stats() { return { requests: [...requests], renameCount, largeMutations, uploadCount, activeSse: streams.size, title }; }
+function stats() { return { requests: [...requests], renameCount, largeMutations, uploadCount, activeSse: streams.size, title,
+  projectUpdates, worktreeCreates, worktreeRemoves, worktreeRefreshes, worktreeRows: structuredClone(worktreeRows) }; }
 async function waitForStreams(count) {
   if (streams.size === count) return stats();
   await new Promise((done, reject) => {
@@ -112,6 +152,7 @@ async function dispatch(message) {
   const { id, method, params = {} } = message;
   assert.equal(typeof id, 'string'); assert.equal(typeof method, 'string');
   if (method === 'fixture.stats') return stats();
+  if (method === 'fixture.failNextCreate') { failCreate = true; return { configured: true }; }
   if (method === 'fixture.waitForStreams') return waitForStreams(params.count);
   if (method === 'fixture.rotate') {
     registration = { ...registration, id: `replacement-${++revision}` };

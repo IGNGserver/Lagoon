@@ -100,6 +100,24 @@ Remote mutation 不因响应过大切换路径重发。坏/丢失 ack 不假造�
 锁定，重连或切换视图不清除。只读核对同时包含最近根会话与源子分支，列表可能不完整，不能证明是否曾创建；
 用户人工确认后才解除锁定、重新确认新的动作。此运行期锁定不是跨进程持久事务或幂等性保证。
 
+## OpenCode 原生项目与 worktree
+
+固定 2.2.6 契约（`dc2ffcf8`）下，`PATCH /api/project/:projectID` 只接受可选的
+`canonical`、`name`、`icon{override,color}`、`commands{start}`，返回裸 Project；
+`GET /api/project?archived=true` 才是包含归档项的完整清单。客户端只发送实际改动字段，
+空字符串表示清除可选项，未改字段不发送；官方无 CAS，因此提交前重新读取同一项目并比对身份与元数据。
+
+`GET /api/worktree?projectID=` 是纯读取，不加载配置；`POST /api/worktree`、`DELETE /api/worktree`
+与 `POST /api/worktree/refresh` 是写入：refresh 会加载 canonical 配置与插件、枚举策略并调和库存。
+创建的 `directory` 是**父目录**，最终路径由 Host 策略决定；官方在创建工作树并写入库存后才运行
+`commands.start`，所以 400/连接失败也可能已经创建。删除只对清单中记录了策略的条目执行，
+由该策略真正移除目录（内置 git 策略会移除工作树），不保证保留文件或会话，也不是 DSH 的登记移除。
+
+`force` 是必需布尔值；客户端始终先发 `false`，服务端 `WorktreeError.data.forceRequired` 只用于提示，
+不会自动改为强制。项目 ID 进入路径段，含 `/`、`\`、`%` 或为 `.`/`..` 时直接 400，不寻找替代路由。
+未知写入按原 Host 与项目锁定；必须成功只读刷新同一项目的元数据与工作树清单后才可重新确认，
+元数据读取不能解除 worktree 未知态。运行期锁不是跨进程事务或服务端幂等保证。
+
 ## 实现与验证边界
 
 Host companion 和 SHA 校验的固定上游 Router/HostPluginRuntime overlay、Android HTTP/SSE/WS/分片 carrier、同 Host 共享 Noise 会话和服务选择 UI 已有实现。构建、测试入口见 [Host 连接器说明](<../host-connector/README.md>)。
