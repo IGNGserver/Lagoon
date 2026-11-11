@@ -87,6 +87,22 @@ The actual release binary protects `/api/info` despite the OpenAPI public declar
 
 Android JVM opt-ins are `LAGOON_OFFICIAL_OPENCODE_REGISTRATION`, `LAGOON_OFFICIAL_DSH_CONNECTION` (private JSON `{url,token}` for a fresh standalone official DSH WebHost), and `LAGOON_OFFICIAL_SSH_CONNECTION` (scratch-confined pinned SSH descriptor). Unset variables skip only those explicit live tests; provided invalid configurations fail. With the staged stdio Host and actual patched Router enabled, the encrypted native test also targets the official daemon. These tests do not replace public-Hub, production-Host, Desktop-attachment or Android-device acceptance.
 
+## Remote DSH terminal verification
+
+The verification entry also exports the pinned `HarnessRemoteBridge`, `TerminalPolicy` and
+`TerminalCarrierCompat`, without changing their behavior. [Terminal policy tests](<test/upstream-terminal.test.mjs>)
+exercise Host enablement, device ownership, attachment identity, provider-ACK waits and detach-only
+cleanup against those actual implementations. They use a processless native provider, not an
+invented bridge.
+
+[The terminal stdio Host](<test/stdio-terminal-host.mjs>) supports Kotlin Noise integration through
+the same router. Its optional [official HTTP/mux adapter](<test/official-terminal-gateway.mjs>) reads
+`LAGOON_STDIO_OFFICIAL_DSH_CONNECTION` only for an explicitly supplied isolated official WebHost.
+The JVM opt-in is `LAGOON_OFFICIAL_REMOTE_DSH_CONNECTION`, together with `LAGOON_TERMINAL_STDIO_HOST`
+and `LAGOON_PATCHED_ROUTER`. The test creates its own Session/terminal, sends a fixed `printf` probe,
+and explicitly closes the terminal; it never sends a model prompt or touches the user's WebHost.
+No public-Hub or Android-device acceptance is implied.
+
 ## Local Host opt-in
 
 Set these on the Host process that loads the patched plugin:

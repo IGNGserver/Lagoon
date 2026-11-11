@@ -84,6 +84,9 @@ export async function buildVerified({ upstream, out, tools, routerOnly = false }
   const entries = [{ name: 'patched-router', outfile: routerFile, stdin: {
     contents: [
       "export { RpcRouter } from './packages/plugin/src/rpc-router.ts';",
+      "export { HarnessRemoteBridge } from './packages/plugin/src/harness-remote-bridge.ts';",
+      "export { TerminalPolicy } from './packages/plugin/src/terminal-policy.ts';",
+      "export { TerminalCarrierCompat } from './packages/plugin/src/terminal-carrier-compat.ts';",
       "export { ConnectionController, ConnectionRejectedError } from './packages/plugin/src/connection-controller.ts';",
       "export { NativeServicePeer, NativeServiceError, NATIVE_SERVICE_CAPABILITY } from './packages/plugin/src/lagoon-native-services.mjs';",
       "export { createRpcRequest, createEvent, parseRemoteMessage } from './packages/protocol/src/index.ts';",

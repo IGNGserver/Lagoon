@@ -37,6 +37,47 @@ class RemoteBackend internal constructor(
   internal fun credentials(): RemoteCredentialSummary = session.credentials()
   internal fun streamStats(): RemoteStreamStats? = session.streamStats()
   internal suspend fun supportsWorkspaceUpload(): Boolean = session.capabilities().supportsWorkspaceUpload
+  internal fun terminalAvailable(): Boolean = !isClosed && session.terminalAvailable() &&
+    (pinnedTerminalGateway?.let(session::isCurrentGateway) != false)
+  internal suspend fun discoverTerminal(): Boolean = !isClosed && session.capabilities().hasTerminal
+  private val terminalLock = Any()
+  @Volatile private var pinnedTerminalGateway: RemoteGateway? = null
+  private val terminalSockets = java.util.concurrent.ConcurrentHashMap.newKeySet<WebSocket>()
+
+  /** Terminal inputs never migrate to a replacement encrypted connection. Reopen the owner first. */
+  private suspend fun terminalGateway(): RemoteGateway {
+    check(!isClosed) { "Remote 终端连接已关闭" }
+    val current = session.terminalGateway()
+    synchronized(terminalLock) {
+      val previous = pinnedTerminalGateway
+      check(previous == null || previous === current) { "Remote 终端连接代次已变化，请重新连接并打开终端；没有重放输入" }
+      check(session.isCurrentGateway(current)) { "Remote 终端连接已失效" }
+      pinnedTerminalGateway = current
+    }
+    return current
+  }
+  internal suspend fun terminalCall(endpoint: String, payload: JSONObject): Any? {
+    require(endpoint in setOf("terminal/environment", "terminal/shells", "terminal/list", "terminal/create", "terminal/rename", "terminal/close"))
+    return terminalGateway().call(endpoint, payload)
+  }
+  internal suspend fun terminalOpen(endpoint: String, payload: JSONObject, onItem: (JSONObject) -> Unit,
+    onClosed: (Throwable?) -> Unit): WebSocket {
+    val gateway = terminalGateway()
+    if (endpoint == "terminal/attach") {
+      val socket = RemoteTerminalSocket.open(gateway, payload, onItem, onClosed) { terminalSockets.remove(it) }
+      terminalSockets += socket
+      if (isClosed || !session.isCurrentGateway(gateway)) { terminalSockets.remove(socket); socket.cancel(); throw IOException("Remote 终端打开时连接已变化") }
+      return socket
+    }
+    require(endpoint == "terminal/retain")
+    val stream = gateway.open(endpoint, payload)
+    if (isClosed || !session.isCurrentGateway(gateway)) { stream.closeNow(); throw IOException("Remote 终端保留流所属连接已变化") }
+    val reference = java.util.concurrent.atomic.AtomicReference<WebSocket>()
+    val socket = StreamSocket(stream, onItem) { error -> reference.get()?.let { terminalSockets.remove(it) }; onClosed(error) }
+    reference.set(socket); terminalSockets += socket
+    if (isClosed || !session.isCurrentGateway(gateway)) { terminalSockets.remove(socket); socket.cancel(); throw IOException("Remote 终端保留流打开时连接已变化") }
+    return socket
+  }
   internal suspend fun nativeServiceCatalog(): NativeServiceCatalog? = session.nativeServiceCatalog()
   internal suspend fun hostServices(): RemoteHostServices = RemoteHostServices(
     dshAvailable = session.capabilities().sessionFormat != null,
@@ -73,6 +114,7 @@ class RemoteBackend internal constructor(
 
   override fun close() {
     if (closed.compareAndSet(false, true)) {
+      terminalSockets.toList().forEach { it.cancel() }; terminalSockets.clear()
       try { if (nativeProfile != null) harness.close() } finally { release() }
     }
   }

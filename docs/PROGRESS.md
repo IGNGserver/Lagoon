@@ -74,7 +74,9 @@
 - 终端以 location 归属，不冒充 Session 资源。UI 默认只读，明确附加/输入确认；离开仅 detach，只有确认终止才 DELETE。原路由/会话/目录捕获并按输入逐次许可；原始 UTF-8 无 ACK，游标按 UTF-16，输入不自动重放/重连。Host 仅在原生 POST /api/pty/{id}/connect-token 放行 x-opencode-ticket:1。
 - r13：DSH Direct/SSH Session 归属终端已接入，不能从目录推断 Session；与 OpenCode location scope 明确区分。同目录会话不会串用终端，PID 未提供则显示未知，实际 cwd 单独展示。
 - retain 确认后才 attach，首帧 snapshot/后续 output/ACK 按官方序号验证；write/resize 共用序号和 UTF-8/编码帧预算，ACK 仅代表 provider 接收，不冒充执行完成。附加明确提示立即夺取输入控制，旧附着只读，新附着退出不自动恢复旧控制；断线/未确认输入不重放，关闭页面只 cancel 附着与 hold。
-- UI 还保留本机输入确认，拒绝 ACK 即使序号前进也恢复草稿并提示核对；显式分离同步记录未确认状态，避免收集器调度丢失提示。Direct/SSH 官方终端实测已通过；Remote 双向终端桥与 capability 协商仍未实现，保持 terminal=false 且不发送 terminal/*，不能按 harness.remote.v3 推断支持。未跑 Android 真机布局、可访问性、预测式返回。
+- UI 还保留本机输入确认，拒绝 ACK 即使序号前进也恢复草稿并提示核对；显式分离同步记录未确认状态，避免收集器调度丢失提示。Direct/SSH 官方终端实测已通过；未跑 Android 真机布局、可访问性、预测式返回。
+- r14：Remote 复用固定上游 `harness.terminal.v1` 的 Host 开关/设备归属/attachmentId 策略；native attach 转为 `terminal/follow`，write/resize 走上游兼容 RPC，只有 provider ACK 使 RPC 成功后才生成客户端 ACK。仅从 controllerId 判断输入权，不能信任自报 writable 或按 harness.remote.v3 推断。
+- 终端固定到当前加密 gateway，旧代次不能把输入或 mutation 转到新连接；有界32项/256KiB单发送队列、10s超时、取消丢弃待发输入、未知结果不确认/重放。闭合 Gateway 拒绝新调用，普通只读流仍无上行。Host 设备策略继续过滤其他终端、拒绝其他设备和关闭开关后的调用，不增加绕过通道。
 
 ### 阶段 7：验证与交付仍进行中
 - 本地 fake Hub/实际 Noise/真实 Node connector 互操作不等于公网 Hub、真实官方 daemon 或 Android 真机验收。
@@ -141,5 +143,9 @@
 - 独立复核未发现新增明确高风险项；额外修复 ACK 与超时竞争（按过期序号在结束锁内重核对）、拒绝 ACK 序号前进却被 UI 当成功、分离 pending 时收集器交接与快速 ACK 先到 UI 不更新等边界。增加3个回执状态纯逻辑测试，不把接收确认冒充执行完成。
 - `dsh-terminal-full.log`：1380项0失败/0错误/11跳过，Debug126s。`dsh-terminal-final.log`：**1380 tests、0 failures、0 errors、11 skipped**，Debug assemble 成功121s；官方 DSH Direct 与真实 pinned SSH 终端2项均实际运行0跳过，fixture Noise3项运行，先前停止的 OpenCode/DSH只读 opt-in 不冒充重跑。APK 21,945,880 bytes，SHA-256 `e8bd4f2ebb3f34a73c8a67b16a4f88d63a7bc092d91eb3a9407d3e267c31d78e`。
 - DSH 终端验收用全新 scratch HOME/DSH_HOME、随机 loopback WebHost/sshd，新建测试会话与 shell，仅固定 printf 探针，无模型 prompt；每个终端显式关闭并读回空列表后停止本任务服务。没有操作用户 port3080/SSH配置/现有会话。未提供的 Remote 终端能力仍保留明确拒绝与0 terminal/*发送回归。
+- r14 构建固定上游完整插件且仅扩展 verification-entry exports；运行时插件未改行为，4,029,973 bytes / SHA-256 `701a39fa59835b3b9274cbd9476b2065c892b18b48ce2d2c1e646a285208d64a`。验证入口实际包含 Router、HarnessRemoteBridge、TerminalPolicy、TerminalCarrierCompat；`remote-terminal-host-all.log` 原生16+Router5+终端6共27项通过。
+- `remote-terminal-first.log` 首轮 Kotlin 转换与能力门禁通过15s。初轮 Node 1项因未等待异步 snapshot 失败、加密用例先遇旧暂存能力脚本再遇测试桥仅准 harness.services.* 而拒绝 harness.remote.frame，已分别修正事件等待、重同步与精确两个 Remote 事件名；未放宽生产策略。`remote-terminal-event-fixed.log` 实际 Noise→Router/Policy/Compat 的延迟 provider ACK、设备过滤、开关拒绝、detach不kill通过8s。独立复核0个新增明确高风险生产问题，指出上述测试桥事件白名单缺陷。
+- `remote-terminal-official.log`：实际 Kotlin Noise→固定上游 Router/设备策略/Compat→隔离官方 rc.5 WebHost 的终端创建、输入/resize ACK、分离保留与明确终止通过3s。Node 测试适配器只负责本地官方 HTTP/mux，不启动服务、不重试或绕过设备策略，token 仅 scratch 私有文件读入；无模型 prompt/用户项目命令。
+- `remote-terminal-final.log`：**1395 tests、0 failures、0 errors、13 skipped**，Debug assemble 成功119s。新增 RemoteSocket12、实际加密 provider2、capability1项，官方 encrypted DSH 1项实际执行；原先停止的 Direct/SSH/OpenCode opt-in 如实跳过。APK 21,961,103 bytes，SHA-256 `33800dc5c4ea7ecd4f604a3e6ac84390a8f47760de5adfe98ec42ff9d420b520`。所有子进程关闭、测试终端明确删除且清单为空后停止隔离 WebHost；不是公网 Host/Android 真机验收。
 - 全部构建在 `/home/lvziw/.build/Lagoon/unified-harness-connections/source`，Gradle/build 输出在 `~/.build`。源码工作树无 app/build、node_modules。
 - `wt audit`：29 repos，0 missing dirs，3 detached、4 merged worktrees 属其他任务；只读报告，无清理。

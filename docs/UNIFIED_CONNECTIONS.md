@@ -90,7 +90,8 @@
 - r11 已接入公开调度目录/历史/删除/CAS 更新，封闭完整记录、原会话绑定、独立时区、冲突保留改动意图；不虚构 rc.5 未公开的创建/立即执行/启停接口。
 - r12 OpenCode 原生 simple PTY 文本终端接入 Direct/SSH/Remote：固定官方原始文本/游标协议，一次性票据，严格 location 与 route，明确创建/输入/终止与 detach-only 关闭；不宣称完整 VT。
 - r13 DSH Direct/SSH Session 归属终端接入官方 retain/attach 双向 mux、输入/resize 顺序 ACK 与控制权变化；目录不推断 Session。显式创建/附加/输入/终止，默认不自动抢回控制，不重放未确认输入。
-- 尚未完成：DSH Remote terminal bridge/capability、真实桌面 DSH profile 附着、公共库跨实例 events owner 复用、非 Linux 原生 Host 归属证明、完整原生能力真环境矩阵、真实设备交互验收与 PR 最终就绪。
+- r14 Remote DSH 终端按实际上游 follow/write/resize + harness.terminal.v1 接入，Host 设备归属和开关不绕过，provider ACK 后才回执，固定 gateway/取消丢弃/无输入重放；实际 Noise→Router/Policy/Compat→官方 DSH 终端验收已取得。
+- 尚未完成：真实桌面 DSH profile 附着、公共库跨实例 events owner 复用、非 Linux 原生 Host 归属证明、完整原生能力真环境矩阵、真实设备交互验收与 PR 最终就绪。
 
 - 工作区已创建且 HEAD 与 origin/main 基线相同。
 - 本机盘可用约 96 GiB（2026-11-09）；构建区 `~/.build`。

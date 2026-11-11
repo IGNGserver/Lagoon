@@ -35,7 +35,9 @@ internal class FakeRemoteHost(
   ),
   private val strictOfficialContracts: Boolean = false,
   /** Optional real native connector bridge; DSH calls keep their existing fixture behavior. */
-  private val nativeRpc: ((method: String, params: JSONObject, publish: (String, JSONObject) -> Unit) -> JSONObject)? = null
+  private val nativeRpc: ((method: String, params: JSONObject, publish: (String, JSONObject) -> Unit) -> JSONObject)? = null,
+  /** Actual upstream Harness bridge for encrypted terminal integration; never an application route. */
+  private val harnessRpc: ((method: String, params: JSONObject, publish: (String, JSONObject) -> Unit) -> JSONObject)? = null
 ) : AutoCloseable {
   val server = MockWebServer()
   val requests: MutableList<String> = Collections.synchronizedList(mutableListOf())
@@ -48,7 +50,7 @@ internal class FakeRemoteHost(
   // One gate covers the Noise sender nonce, fragment order and WebSocket enqueue order, including
   // callbacks from the stdio reader. Never hold it while waiting for an external RPC response.
   private val wireGate = Any()
-  private val nativeWorker = nativeRpc?.let {
+  private val nativeWorker = (nativeRpc ?: harnessRpc)?.let {
     Executors.newSingleThreadExecutor { task -> Thread(task, "fake-remote-native-rpc").apply { isDaemon = true } }
   }
   @Volatile private var cipher: CipherStatePair? = null
@@ -124,7 +126,7 @@ internal class FakeRemoteHost(
 
   /** Safe from a bridge reader/executor thread, including before its open RPC has completed. */
   fun publishNativeEvent(event: String, data: JSONObject) {
-    require(event.startsWith("harness.services."))
+    require(event.startsWith("harness.services.") || event == "harness.remote.frame" || event == "harness.remote.stream.closed")
     val socket = controlSocket ?: return
     publish(socket, event, data)
   }
@@ -256,6 +258,19 @@ internal class FakeRemoteHost(
       }.exceptionOrNull()?.message
       if (failure != null) contractViolations += failure
       return failure
+    }
+    if (harnessRpc != null && (method == "harness.transport.describe" || method.startsWith("harness.remote."))) {
+      // Keep a provider-ACK wait off the encrypted receiver; events/close must still make progress.
+      nativeWorker!!.execute {
+        try { respond(harnessRpc.invoke(method, params, ::publishNativeEvent)) }
+        catch (error: Exception) {
+          val code = (error as? RemoteRpcException)?.code ?: (error as? NativeRemoteException)?.code ?: "HARNESS_BRIDGE_FAILED"
+          sendMessage(socket, JSONObject().put("v", 1).put("id", id).put("type", "rpc.error")
+            .put("timestamp", System.currentTimeMillis())
+            .put("payload", JSONObject().put("requestId", id).put("code", code).put("message", code)))
+        }
+      }
+      return
     }
     when (method) {
       "harness.transport.describe" -> respond(JSONObject().put("capabilities", JSONArray(

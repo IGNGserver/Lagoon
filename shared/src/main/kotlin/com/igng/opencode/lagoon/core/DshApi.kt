@@ -274,20 +274,21 @@ class DshApi(
 
   override val isClosed: Boolean get() = closing.get() || closed || remoteBackend?.isClosed == true
 
-  override fun capabilities(): ApiCapabilities = if (remoteBackend == null) CAPABILITIES else CAPABILITIES.copy(diff = false, terminal = false)
+  override fun capabilities(): ApiCapabilities = if (remoteBackend == null) CAPABILITIES else CAPABILITIES.copy(diff = false, terminal = remoteBackend.terminalAvailable())
 
   private val terminalApiDelegate = lazy { DshTerminalApi(
     call = { endpoint, args ->
-      require(remoteBackend == null) { "当前 Remote Host 未协商双向终端能力" }
-      call(endpoint, RpcPayload(JSONObject().put("args", args)), retried = true)
+      val payload = RpcPayload(JSONObject().put("args", args))
+      if (remoteBackend == null) call(endpoint, payload, retried = true)
+      else remoteBackend.terminalCall(endpoint, payload.json)
     },
     open = { endpoint, args, onItem, onClosed ->
-      require(remoteBackend == null) { "当前 Remote Host 未协商双向终端能力" }
-      openMux(endpoint, RpcPayload(JSONObject().put("args", args)), onItem, onClosed)
+      val payload = RpcPayload(JSONObject().put("args", args))
+      if (remoteBackend == null) openMux(endpoint, payload, onItem, onClosed)
+      else remoteBackend.terminalOpen(endpoint, payload.json, onItem, onClosed)
     }, ownerClosed = { isClosed }
   ) }
   private fun sessionTerminal(scope: TerminalScope): TerminalScope.Session {
-    check(remoteBackend == null) { "当前 Remote Host 未协商双向终端能力" }
     return scope as? TerminalScope.Session ?: throw ApiException(400, "DSH 终端必须指定原会话，不能从目录推断")
   }
   override suspend fun terminals(scope: TerminalScope): List<NativeTerminal> = terminalApiDelegate.value.terminals(sessionTerminal(scope))
@@ -344,7 +345,10 @@ class DshApi(
 
   override suspend fun awaitClosed() { shutdown.await() }
 
-  override suspend fun discoverCapabilities(): ApiCapabilities = capabilities()
+  override suspend fun discoverCapabilities(): ApiCapabilities {
+    remoteBackend?.discoverTerminal()
+    return capabilities()
+  }
 
   // ---------------------------------------------------------------- 鉴权
 

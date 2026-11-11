@@ -48,6 +48,7 @@ internal class RemoteGateway(private val transferFrames: Boolean = false, privat
   }
 
   suspend fun call(endpoint: String, payload: JSONObject): Any? {
+    if (closed) throw IOException("Remote Gateway 已关闭；没有重放请求")
     require(validEndpoint(endpoint))
     warnIfNotAllowlisted(endpoint)
     val request = JSONObject().put("endpoint", endpoint).put("payload", payload)

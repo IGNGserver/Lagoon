@@ -46,6 +46,16 @@ internal class RemoteSession(
 
   suspend fun gateway(): RemoteGateway = ensure().gateway
   suspend fun capabilities(): RemoteCapabilities = ensure().capabilities
+  /** Synchronous UI projection only; actual terminal requests recheck their pinned carrier. */
+  internal fun terminalAvailable(): Boolean = active?.let { !closed && !it.connection.isClosed && it.capabilities.hasTerminal } == true
+  internal suspend fun terminalGateway(): RemoteGateway {
+    val current = ensure()
+    if (!current.capabilities.hasTerminal) throw IOException("Host 未声明 harness.terminal.v1；请在 Host 确认远程终端能力")
+    return current.gateway
+  }
+  internal fun isCurrentGateway(gateway: RemoteGateway): Boolean = active?.let {
+    !closed && !it.connection.isClosed && it.gateway === gateway
+  } == true
   internal suspend fun nativeServiceCatalog(): NativeServiceCatalog? {
     val current = ensure()
     if (!current.capabilities.hasNativeServices) return null
