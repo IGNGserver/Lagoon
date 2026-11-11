@@ -665,6 +665,122 @@ class ControllerRegressionTest {
       assertEquals(listOf("per_1"), state.value.permissions.map { it.id })
     }
   }
+  @Test fun hostSettingsRejectStaleSameIdDialogBeforeResolvingOrDialingAnotherClient() = runBlocking {
+    MockWebServer().use { server ->
+      val saved = ServerProfile("server", "Host", server.url("/").toString(), allowCleartext = true, kind = ServerKind.DSH)
+      val (controller, _) = controller(api(server), LagoonState(profiles = listOf(saved), serverId = saved.id, connected = true))
+      val old = saved.copy(url = "https://previous-host.example/")
+      val failures = listOf(
+        runCatching { controller.pluginBundles(old) }.exceptionOrNull(),
+        runCatching { controller.pluginEntries(old) }.exceptionOrNull(),
+        runCatching { controller.setPluginBundle(old, "bundle", true) }.exceptionOrNull(),
+        runCatching { controller.setPluginEntry(old, "entry", true) }.exceptionOrNull(),
+        runCatching { controller.credentialStatus(old, "API_KEY") }.exceptionOrNull(),
+        runCatching { controller.setCredential(old, "API_KEY", "fixture-never-sent") }.exceptionOrNull(),
+        runCatching { controller.clearCredential(old, "API_KEY") }.exceptionOrNull(),
+        runCatching { controller.createProviderRoute(old, "route", "Route", "openai-completions",
+          "https://models.example/", "API_KEY", "model", "fixture-never-sent") }.exceptionOrNull())
+      assertTrue(failures.all { it is StaleConnectionRouteException })
+      assertEquals(0, server.requestCount)
+    }
+  }
+
+  @Test fun hostSettingsRejectUnsupportedProtocolAndDisabledProfileBeforeClientLookup() = runBlocking {
+    MockWebServer().use { server ->
+      val profile = ServerProfile("server", "Native", server.url("/").toString(), allowCleartext = true)
+      val (controller, _) = controller(api(server), LagoonState(profiles = listOf(profile), serverId = profile.id, connected = true))
+      assertTrue(runCatching { controller.setCredential(profile, "API_KEY", "fixture-never-sent") }.isFailure)
+      val store = LagoonController::class.java.getDeclaredField("store").apply { isAccessible = true }.get(controller) as ServerStore
+      val disabled = profile.copy(kind = ServerKind.DSH, enabled = false)
+      store.save(disabled, null)
+      assertTrue(runCatching { controller.pluginBundles(disabled) }.isFailure)
+      assertEquals(0, server.requestCount)
+    }
+  }
+
+  @Test fun nativeRevertAndRestoreUpdateBoundaryOnlyAfterAcknowledgement() = runBlocking {
+    MockWebServer().use { server ->
+      server.enqueue(MockResponse().setBody("{}")); server.enqueue(MockResponse().setBody("{}"))
+      val original = Session("session", "/repo", "Task", 1)
+      val message = Message("msg_2", "user", 1, listOf(MessagePart("part", "text", text = "Task")))
+      val profile = ServerProfile("server", "Native", server.url("/").toString(), allowCleartext = true)
+      val (controller, state) = controller(api(server), LagoonState(profiles = listOf(profile), serverId = profile.id,
+        connected = true, sessions = listOf(original), sessionId = original.id, messages = listOf(message),
+        capabilities = ApiCapabilities.BASELINE))
+      var callbacks = 0
+      controller.revert(message.id, onReverted = { callbacks++ }, expected = TimelineMutationTarget(profile, original.id)).join()
+      assertEquals(message.id, state.value.session?.revertMessageId)
+      assertEquals(1, callbacks)
+      val revert = server.takeRequest(2, TimeUnit.SECONDS)!!
+      assertEquals("POST", revert.method); assertEquals("/api/session/session/revert/stage", revert.path)
+      assertEquals(message.id, org.json.JSONObject(revert.body.readUtf8()).getString("messageID"))
+      controller.unrevert(TimelineMutationTarget(profile, original.id, message.id), onRestored = { callbacks++ }).join()
+      assertNull(state.value.session?.revertMessageId); assertEquals(2, callbacks)
+      val restore = server.takeRequest(2, TimeUnit.SECONDS)!!
+      assertEquals("DELETE", restore.method); assertEquals("/api/session/session/revert", restore.path)
+    }
+  }
+
+  @Test fun timelineMutationRejectsQueuedBusyAndStaleDialogWithoutNetwork() = runBlocking {
+    MockWebServer().use { server ->
+      val original = Session("session", "/repo", "Task", 1)
+      val human = Message("msg_2", "user", 1, emptyList())
+      val profile = ServerProfile("server", "Native", server.url("/").toString(), allowCleartext = true)
+      val initial = LagoonState(profiles = listOf(profile), serverId = profile.id, connected = true,
+        sessions = listOf(original), sessionId = original.id, capabilities = ApiCapabilities.BASELINE)
+      val (controller, state) = controller(api(server), initial.copy(messages = listOf(human.copy(queued = true))))
+      controller.revert(human.id).join()
+      state.value = initial.copy(messages = listOf(human), tasks = mapOf(original.id to TaskState(original.id, TaskPhase.THINKING)))
+      controller.revert(human.id).join()
+      state.value = initial.copy(messages = listOf(human))
+      controller.revert(human.id, expected = TimelineMutationTarget(profile, "other-session")).join()
+      controller.unrevert().join() // No staged boundary is not a server action.
+      assertEquals(0, server.requestCount)
+      assertNull(state.value.session?.revertMessageId)
+    }
+  }
+
+  @Test fun sendingDuringTimelineMutationKeepsDraftAndDoesNotIssueASecondMutation() = runBlocking {
+    MockWebServer().use { server ->
+      server.enqueue(MockResponse().setBody("{}").setBodyDelay(250, TimeUnit.MILLISECONDS))
+      val original = Session("session", "/repo", "Task", 1)
+      val message = Message("msg_2", "user", 1, emptyList())
+      val profile = ServerProfile("server", "Native", server.url("/").toString(), allowCleartext = true)
+      val (controller, state) = controller(api(server), LagoonState(profiles = listOf(profile), serverId = profile.id,
+        connected = true, sessions = listOf(original), sessionId = original.id, messages = listOf(message),
+        capabilities = ApiCapabilities.BASELINE, draft = "Do not lose this draft"))
+      val revert = controller.revert(message.id)
+      assertNotNull(server.takeRequest(2, TimeUnit.SECONDS))
+      var accepted = false
+      controller.send("Do not lose this draft", accepted = { accepted = true }).join()
+      revert.join()
+      assertFalse(accepted); assertEquals("Do not lose this draft", state.value.draft)
+      assertEquals(1, server.requestCount)
+    }
+  }
+
+  @Test fun delayedTimelineMutationCannotCommitIntoReplacedRouteOrInvokeOldDialog() = runBlocking {
+    MockWebServer().use { server ->
+      server.enqueue(MockResponse().setBody("{}").setBodyDelay(250, TimeUnit.MILLISECONDS))
+      val original = Session("session", "/repo", "Task", 1)
+      val message = Message("msg_2", "user", 1, emptyList())
+      val profile = ServerProfile("server", "Native", server.url("/").toString(), allowCleartext = true)
+      val (controller, state) = controller(api(server), LagoonState(profiles = listOf(profile), serverId = profile.id,
+        connected = true, sessions = listOf(original), sessionId = original.id, messages = listOf(message),
+        capabilities = ApiCapabilities.BASELINE))
+      var callbacks = 0
+      val job = controller.revert(message.id, onReverted = { callbacks++ })
+      assertNotNull(server.takeRequest(2, TimeUnit.SECONDS))
+      val replacement = profile.copy(url = "https://replacement.example/")
+      val store = LagoonController::class.java.getDeclaredField("store").apply { isAccessible = true }.get(controller) as ServerStore
+      store.save(replacement, null)
+      state.value = state.value.copy(profiles = listOf(replacement))
+      job.join()
+      assertNull(state.value.session?.revertMessageId); assertEquals(0, callbacks)
+      assertEquals(1, server.requestCount)
+    }
+  }
+
   @Test fun forkResponseSelectsNewSession() = runBlocking {
     MockWebServer().use { s ->
       s.enqueue(MockResponse().setBody("""{"version":"2.0.22"}"""));s.enqueue(MockResponse().setBody("""{"data":{"id":"forked","location":{"directory":"/repo"},"title":"Fork","time":{}}}"""))

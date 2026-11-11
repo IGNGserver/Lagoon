@@ -246,6 +246,29 @@ class OpenCodeApiTest {
     }
   }
 
+  @Test fun revertUsesTheDocumentedStageRouteAndRefusesMissingCapability() = runBlocking {
+    MockWebServer().use { server ->
+      server.enqueue(MockResponse().setBody("""{"paths":{"/api/session/{sessionID}/revert/stage":{"post":{"requestBody":{"content":{"application/json":{"schema":{"type":"object","properties":{"messageID":{"type":"string"}},"required":["messageID"]}}}}}}}}"""))
+      server.enqueue(MockResponse().setResponseCode(204))
+      val client = api(server)
+      assertTrue(client.discoverCapabilities().supports(SessionAction.REVERT))
+      server.takeRequest()
+      client.revert(Session("ses_native", "/repo", "Task", 0), "msg_native")
+      val request = server.takeRequest()
+      assertEquals("POST", request.method); assertEquals("/api/session/ses_native/revert/stage", request.path)
+      assertEquals("msg_native", JSONObject(request.body.readUtf8()).getString("messageID"))
+      client.close()
+    }
+    MockWebServer().use { server ->
+      server.enqueue(MockResponse().setBody("""{"paths":{}}"""))
+      val client = api(server)
+      client.discoverCapabilities(); server.takeRequest()
+      assertTrue(runCatching { client.revert(Session("s", "/repo", "Task", 0), "msg_native") }.isFailure)
+      assertEquals(1, server.requestCount)
+      client.close()
+    }
+  }
+
   @Test fun renameAndUnrevertFollowTheDocumentedRoutes() = runBlocking {
     MockWebServer().use { server ->
       // An early 2.0.x instance: POST /rename and POST /revert/clear.

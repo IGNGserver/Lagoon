@@ -867,30 +867,39 @@ class LagoonController private constructor(private val appContext: Context) {
     return runCatching { allOverview.client(serverId) }.getOrNull()
   }
 
-  internal suspend fun pluginBundles(serverId: String): List<RemotePluginBundle> =
-    clientFor(serverId)?.pluginBundles().orEmpty()
+  /** A settings dialog may not retarget an edited same-ID Host, especially with credential values. */
+  private fun settingsClient(expected: ServerProfile): HarnessClient {
+    check(expected.kind == ServerKind.DSH || expected.kind == ServerKind.DSH_REMOTE) { "此原生协议未提供 DSH 主机设置" }
+    val route = store.runtimeRoute(expected)
+    val client = requireNotNull(clientFor(expected.id)) { "主机尚未就绪或连接已停用" }
+    check(store.runtimeRoute(expected) == route) { "主机路由已变化，请重新打开设置" }
+    return client
+  }
 
-  internal suspend fun pluginEntries(serverId: String): List<RemotePluginEntry> =
-    clientFor(serverId)?.pluginEntries().orEmpty()
+  internal suspend fun pluginBundles(expected: ServerProfile): List<RemotePluginBundle> =
+    settingsClient(expected).pluginBundles()
 
-  internal suspend fun setPluginBundle(serverId: String, name: String, enabled: Boolean): Boolean =
-    clientFor(serverId)?.setPluginBundle(name, enabled) == true
+  internal suspend fun pluginEntries(expected: ServerProfile): List<RemotePluginEntry> =
+    settingsClient(expected).pluginEntries()
 
-  internal suspend fun setPluginEntry(serverId: String, entryId: String, enabled: Boolean): Boolean =
-    clientFor(serverId)?.setPluginEntry(entryId, enabled) == true
+  internal suspend fun setPluginBundle(expected: ServerProfile, name: String, enabled: Boolean): Boolean =
+    settingsClient(expected).setPluginBundle(name, enabled)
 
-  internal suspend fun credentialStatus(serverId: String, ref: String): RemoteCredentialStatus? =
-    clientFor(serverId)?.credentialStatus(listOf(ref))?.get(ref)
+  internal suspend fun setPluginEntry(expected: ServerProfile, entryId: String, enabled: Boolean): Boolean =
+    settingsClient(expected).setPluginEntry(entryId, enabled)
 
-  internal suspend fun setCredential(serverId: String, ref: String, value: String): Boolean =
-    clientFor(serverId)?.setCredential(ref, value) == true
+  internal suspend fun credentialStatus(expected: ServerProfile, ref: String): RemoteCredentialStatus? =
+    settingsClient(expected).credentialStatus(listOf(ref))[ref]
 
-  internal suspend fun createProviderRoute(serverId: String, route: String, displayName: String, api: String,
+  internal suspend fun setCredential(expected: ServerProfile, ref: String, value: String): Boolean =
+    settingsClient(expected).setCredential(ref, value)
+
+  internal suspend fun createProviderRoute(expected: ServerProfile, route: String, displayName: String, api: String,
     baseUrl: String, apiKeyEnv: String, modelId: String, apiKey: String): Boolean =
-    clientFor(serverId)?.createProviderRoute(route, displayName, api, baseUrl, apiKeyEnv, modelId, apiKey) == true
+    settingsClient(expected).createProviderRoute(route, displayName, api, baseUrl, apiKeyEnv, modelId, apiKey)
 
-  internal suspend fun clearCredential(serverId: String, ref: String): Boolean =
-    clientFor(serverId)?.clearCredential(ref) == true
+  internal suspend fun clearCredential(expected: ServerProfile, ref: String): Boolean =
+    settingsClient(expected).clearCredential(ref)
 
   /**
    * Reads the goal shown above the composer. `goals/get` is the only source of the process-local
@@ -4316,6 +4325,10 @@ class LagoonController private constructor(private val appContext: Context) {
       updateState { it.copy(error = "当前会话已切换，消息未发送，请重试") }
       return operationScope.launch { onFailed?.invoke(false) }
     }
+    if (state.value.pending("revert") || state.value.pending("unrevert")) {
+      updateState { it.copy(error = "会话回退正在提交，消息未发送；请等待服务器确认") }
+      return operationScope.launch { onFailed?.invoke(false) }
+    }
     if (state.value.canQueueSend) {
       queuePrompt(text, accepted)
       return operationScope.launch { }
@@ -4472,15 +4485,19 @@ class LagoonController private constructor(private val appContext: Context) {
     op.commitConnection { it.copy(sessions = (listOf(fork) + it.sessions).distinctBy { s -> s.id }) }
     if (op.isCurrent(this)) { selectSession(fork.id); onForked?.invoke(fork) }
   }
-  fun revert(messageId: String, onReverted: (() -> Unit)? = null) = withSession("revert") { op, client, session ->
+  internal fun revert(messageId: String, onReverted: (() -> Unit)? = null, expected: TimelineMutationTarget? = null) = withSession("revert") { op, client, session ->
+    check(expected == null || expected.matches(op.snapshot)) { "会话或连接已变化，请重新选择要回退的消息" }
+    check(op.snapshot.canRevertMessage(messageId)) { "当前无法回退此消息：请等待任务结束并同步会话，确认原生服务支持回退" }
     client.revert(session, messageId)
     op.commitConnection { current -> current.copy(sessions = current.sessions.map { if (it.id == session.id) it.copy(revertMessageId = messageId) else it }) }
     if (op.isCurrent(this)) { op.commit { it.copy(message = "已撤销，可通过恢复撤销还原") }; onReverted?.invoke() }
   }
-  fun unrevert() = withSession("unrevert") { op, client, session ->
+  internal fun unrevert(expected: TimelineMutationTarget? = null, onRestored: (() -> Unit)? = null) = withSession("unrevert") { op, client, session ->
+    check(expected == null || expected.matches(op.snapshot)) { "会话或连接已变化，请重新打开恢复操作" }
+    check(op.snapshot.canRestoreTimeline()) { "当前没有可恢复的回退边界，或服务尚未同步" }
     client.unrevert(session)
     op.commitConnection { current -> current.copy(sessions = current.sessions.map { if (it.id == session.id) it.copy(revertMessageId = null) else it }) }
-    if (op.isCurrent(this)) op.commit { it.copy(message = "已恢复撤销") }
+    if (op.isCurrent(this)) { op.commit { it.copy(message = "已恢复撤销") }; onRestored?.invoke() }
   }
   fun replyPermission(request: PermissionRequest, reply: String) = act("permission:${request.id}", request.directory) { op ->
     check(request in op.snapshot.permissions) { "权限请求已变化，请刷新" }

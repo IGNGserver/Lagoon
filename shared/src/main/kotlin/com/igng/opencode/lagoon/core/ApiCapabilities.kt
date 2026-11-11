@@ -2,8 +2,8 @@ package com.igng.opencode.lagoon.core
 
 import org.json.JSONObject
 
-/** Session operations whose route changed between OpenCode 2.0.x releases. */
-enum class SessionAction { RENAME, UNREVERT }
+/** Session actions gated by compatible routes in the instance's OpenAPI document. */
+enum class SessionAction { RENAME, UNREVERT, REVERT }
 data class ActionEndpoint(val method: String, val path: String)
 /**
  * The session update that accepts a top-level `archived` boolean (`PATCH /api/session/{id}`, OpenCode
@@ -14,10 +14,12 @@ data class ArchiveEndpoint(val endpoint: ActionEndpoint, val restorable: Boolean
 
 /**
  * Per-instance contract read from the server's `/openapi.json`. Routes that are stable across every
- * 2.x release (prompt, fork, delete, interrupt, compact, revert/stage, inbox, permission) are called
- * directly; only what moved or was added later is resolved here:
+ * 2.x release (prompt, delete, interrupt, compact, inbox, permission) are called directly;
+ * discoverable actions are gated by the instance's documented compatible routes:
  * - rename: `POST /rename` (2.0.0–2.0.x) → `PATCH /api/session/{id}` with `title`;
  * - unrevert: `POST /revert/clear` → `DELETE /revert`;
+ * - revert: `POST /revert/stage` with `messageID`;
+ * - fork: `POST /fork` accepting an empty object (optional `before` selects the history boundary);
  * - diff and view only exist on newer releases;
  * - archiving was added in 2.1.0 as a top-level `archived` boolean on the session update body. It is
  *   offered only when the instance documents that field ([ArchiveEndpoint]); 2.0.x has no way to archive.
@@ -31,10 +33,7 @@ data class ApiCapabilities(
   val documented: Boolean = false,
   /** Sessions can be permanently deleted. DeepSeek Harness only archives. */
   val deleteSession: Boolean = true,
-  /**
-   * Forking is offered on the phone. OpenCode keeps it off (revert covers "go back"); DeepSeek Harness
-   * has no message-level revert, so a fork is its way to branch off a session.
-   */
+  /** Native whole-history fork; OpenCode documents a POST `/fork` accepting an empty JSON object. */
   val fork: Boolean = false,
   /** DSH job/follow, independent of direct/SSH/Remote transport. */
   val jobOutputStream: Boolean = false,
@@ -47,11 +46,12 @@ data class ApiCapabilities(
     val BASELINE = ApiCapabilities(
       actions = mapOf(
         SessionAction.RENAME to ActionEndpoint("PATCH", "api/session/{id}"),
-        SessionAction.UNREVERT to ActionEndpoint("DELETE", "api/session/{id}/revert")
+        SessionAction.UNREVERT to ActionEndpoint("DELETE", "api/session/{id}/revert"),
+        SessionAction.REVERT to ActionEndpoint("POST", "api/session/{id}/revert/stage")
       ),
       diff = true, sessionView = ActionEndpoint("POST", "api/session/{id}/view"),
       archive = ArchiveEndpoint(ActionEndpoint("PATCH", "api/session/{id}")),
-      stopShell = true
+      fork = true, stopShell = true
     )
 
     fun fromDocument(document: JSONObject): ApiCapabilities {
@@ -83,6 +83,7 @@ data class ApiCapabilities(
       val actions = mutableMapOf<SessionAction, ActionEndpoint>()
       (endpoint("", "PATCH", setOf("title")) ?: endpoint("/rename", "POST", setOf("title")))?.let { actions[SessionAction.RENAME] = it }
       (endpoint("/revert", "DELETE") ?: endpoint("/revert/clear", "POST"))?.let { actions[SessionAction.UNREVERT] = it }
+      endpoint("/revert/stage", "POST", setOf("messageID"))?.let { actions[SessionAction.REVERT] = it }
       /*
        * Archiving is a plain boolean on the session update body (`archived: true` archives, `false`
        * restores). The body may only ever need that one field from us, so any other required sibling
@@ -99,7 +100,8 @@ data class ApiCapabilities(
         Regex("^/api/shell/\\{[^/}]+\\}$").matches(path) && paths.obj(path).has("delete")
       }
       return ApiCapabilities(actions, endpoint("/diff", "GET") != null,
-        endpoint("/view", "POST", setOf("idle")), archive, documented = true, stopShell = stopShell)
+        endpoint("/view", "POST", setOf("idle")), archive, documented = true,
+        fork = endpoint("/fork", "POST") != null, stopShell = stopShell)
     }
 
     /**

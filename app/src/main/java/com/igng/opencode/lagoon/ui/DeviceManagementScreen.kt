@@ -223,11 +223,11 @@ internal fun DeviceDetailScreen(
     LaunchedEffect(deviceId) { onBack() }
     return
   }
-  var confirmingDelete by remember { mutableStateOf(false) }
-  var showDefaults by remember { mutableStateOf(false) }
+  var confirmingDelete by remember(deviceId) { mutableStateOf(false) }
+  var showDefaults by remember(deviceId) { mutableStateOf(false) }
   var showNative by remember(deviceId) { mutableStateOf(false) }
-  var remoteDialog by remember { mutableStateOf<String?>(null) }
-  val isRemote = profile.kind == ServerKind.DSH_REMOTE
+  var remoteDialog by remember(deviceId) { mutableStateOf<String?>(null) }
+  val settingsAccess = deviceSettingsAccess(profile)
   val memberships = state.deviceGroups.filter { profile.id in it.memberIds }
   val binding = graph?.bindings?.firstOrNull { it.id == profile.id }
   val parentHost = graph?.hosts?.firstOrNull { it.id == binding?.hostBindingId }
@@ -317,22 +317,24 @@ internal fun DeviceDetailScreen(
         HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(vertical = 4.dp)) {
           if (profile.remoteServiceId == null) HyperRow(title = "编辑连接信息", summary = "地址、账号、认证与传输安全", trailing = { DropdownChevron() }, onClick = { onEditProfile(profile) })
           else HyperRow(title = "原生服务路由", summary = "Host 管理服务地址与认证；本机只保存服务标识", value = "Remote")
-          if (profile.remoteHostId != null) {
+          if (settingsAccess.remoteHub) {
             HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
             HyperRow(title = "发现 Host 原生 Harness", summary = "只读发现；逐个选择 OpenCode 原生服务", showChevron = true, onClick = { showNative = true })
-          }
-          if (isRemote) {
             HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
             HyperRow(title = "中枢与远程主机", summary = "查看账号、接入其他主机或退出中枢", trailing = { DropdownChevron() }, onClick = onManageHub)
+          }
+          if (settingsAccess.remoteDiagnostics) {
             HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
             HyperRow(title = "网络与诊断", summary = "连接延迟、错误详情与重试", trailing = { DropdownChevron() }, onClick = { remoteDialog = "connection" })
           }
         }
       }
-      if (isRemote) item {
+      if (settingsAccess.dshProtocol) item {
         HyperGroupTitle("主机高级功能")
+        Text("通过当前 DSH 连接读取；是否支持及能否修改由 Host 决定。",
+          Modifier.padding(horizontal = 6.dp), style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary))
         HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(vertical = 4.dp)) {
-          HyperRow(title = "主机扩展", summary = "管理此 Host 的插件开关", trailing = { DropdownChevron() }, onClick = { remoteDialog = "extensions" })
+          HyperRow(title = "主机扩展", summary = "查看插件包与插件条目；仅可修改 Host 允许的开关", trailing = { DropdownChevron() }, onClick = { remoteDialog = "extensions" })
           HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
           HyperRow(title = "模型密钥", summary = "只显示配置状态，不回显密钥", trailing = { DropdownChevron() }, onClick = { remoteDialog = "model-key" })
           HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
@@ -363,11 +365,15 @@ internal fun DeviceDetailScreen(
 
   if (showNative) RemoteNativeServicesSheet(controller, profile) { showNative = false }
 
-  when (remoteDialog) {
-    "connection" -> RemoteConnectionDialog(profile, state, controller) { remoteDialog = null }
-    "extensions" -> RemoteExtensionsDialog(profile, controller) { remoteDialog = null }
-    "model-key" -> RemoteModelKeyDialog(profile, controller) { remoteDialog = null }
-    "provider" -> RemoteProviderDialog(profile, controller) { remoteDialog = null }
+  // A detail route can be reused for another profile: never carry inventories or keys across it.
+  key(profile) {
+    when (remoteDialog) {
+      "connection" -> if (settingsAccess.remoteDiagnostics) RemoteConnectionDialog(profile, state, controller) { remoteDialog = null }
+      "extensions" -> if (settingsAccess.dshProtocol) RemoteExtensionsDialog(profile, controller) { remoteDialog = null }
+      "model-key" -> if (settingsAccess.dshProtocol) RemoteModelKeyDialog(profile, controller) { remoteDialog = null }
+      "provider" -> if (settingsAccess.dshProtocol) RemoteProviderDialog(profile, controller) { remoteDialog = null }
+      else -> Unit
+    }
   }
 
   if (confirmingDelete) {
@@ -385,6 +391,20 @@ internal fun DeviceDetailScreen(
     }
   }
 }
+
+/** Protocol support is not a grant of Host permissions; inventory/errors remain authoritative. */
+internal data class DeviceSettingsAccess(
+  val dshProtocol: Boolean,
+  val remoteHub: Boolean,
+  val remoteDiagnostics: Boolean
+)
+
+internal fun deviceSettingsAccess(profile: ServerProfile): DeviceSettingsAccess = DeviceSettingsAccess(
+  dshProtocol = profile.kind == ServerKind.DSH || profile.kind == ServerKind.DSH_REMOTE,
+  remoteHub = profile.remoteHostId != null,
+  // This dialog measures an encrypted Remote RPC, not direct HTTP or an SSH tunnel.
+  remoteDiagnostics = profile.kind == ServerKind.DSH_REMOTE
+)
 
 @Composable
 private fun DeviceHarnessRow(profile: ServerProfile, state: LagoonState, onOpenDevice: (String) -> Unit) {

@@ -59,6 +59,80 @@ class ApiCapabilitiesTest {
     assertTrue(ApiCapabilities.BASELINE.stopShell)
   }
 
+  @Test fun forkAcceptsThePublishedOptionalBeforeBodyForAnySessionParameterName() {
+    // OpenCode v2.2.6 packages/protocol/openapi.json: body required, `before` optional.
+    val operation = JSONObject("""{"requestBody":{"required":true,"content":{"application/json":{"schema":{
+      "type":"object","properties":{"before":{"anyOf":[{"${'$'}ref":"#/components/schemas/Session.Message.ID"},{"type":"null"}]}},
+      "additionalProperties":false}}}}}""")
+    for (parameter in listOf("id", "sessionID", "sessionId")) {
+      val document = sessionOperation("/fork", operation, parameter = parameter)
+        .put("components", JSONObject("""{"schemas":{"Session.Message.ID":{"type":"string","pattern":"^msg_"}}}"""))
+      val caps = ApiCapabilities.fromDocument(document)
+      assertTrue(parameter, caps.fork)
+      assertTrue(caps.documented)
+    }
+  }
+  @Test fun forkNeedsAnExactDocumentedPostRoute() {
+    for (document in listOf(
+      JSONObject("""{"paths":{}}"""),
+      sessionOperation("/fork", JSONObject(), method = "get"),
+      sessionOperation("/forked", JSONObject()),
+      sessionOperation("/fork/extra", JSONObject()),
+      JSONObject("""{"paths":{"/session/{id}/fork":{"post":{}}}}""")
+    )) assertFalse(document.toString(), ApiCapabilities.fromDocument(document).fork)
+    assertTrue(ApiCapabilities.fromDocument(sessionOperation("/fork", JSONObject())).fork)
+  }
+  @Test fun forkRejectsEveryRequiredPayloadFieldTheClientDoesNotWrite() {
+    for (field in listOf("before", "messageID", "reason")) {
+      val operation = jsonBody("""{"type":"object","properties":{"$field":{"type":"string"}},"required":["$field"]}""")
+      assertFalse(field, ApiCapabilities.fromDocument(sessionOperation("/fork", operation)).fork)
+    }
+  }
+  @Test fun forkResolvesLocalSchemaReferencesAndNullFirstUnions() {
+    for (union in listOf("anyOf", "oneOf")) {
+      val document = sessionOperation("/fork", jsonBody("""{"${'$'}ref":"#/components/schemas/Fork"}"""))
+        .put("components", JSONObject("""{"schemas":{"Fork":{"$union":[{"type":"null"},
+          {"type":"object","properties":{"before":{"type":"string"}}}]}}}"""))
+      assertTrue(union, ApiCapabilities.fromDocument(document).fork)
+      document.obj("components").obj("schemas").put("Fork", JSONObject("""{
+        "type":"object","properties":{"before":{"type":"string"}},"required":["before"]}"""))
+      assertFalse(ApiCapabilities.fromDocument(document).fork)
+    }
+  }
+  @Test fun revertResolvesFlatAndReferencedMessageIdBodies() {
+    val input = """{"type":"object","properties":{"messageID":{"type":"string"},"files":{"type":"boolean"}},
+      "required":["messageID"],"additionalProperties":false}"""
+    for (parameter in listOf("id", "sessionID")) {
+      val flat = sessionOperation("/revert/stage", jsonBody(input), parameter = parameter)
+      val referenced = sessionOperation("/revert/stage", jsonBody("""{"${'$'}ref":"#/components/schemas/Revert"}"""), parameter = parameter)
+        .put("components", JSONObject().put("schemas", JSONObject().put("Revert", JSONObject(input))))
+      for (document in listOf(flat, referenced)) {
+        val caps = ApiCapabilities.fromDocument(document)
+        assertTrue(caps.supports(SessionAction.REVERT))
+        assertEquals(ActionEndpoint("POST", "api/session/{$parameter}/revert/stage"), caps.actions[SessionAction.REVERT])
+      }
+    }
+  }
+  @Test fun revertNeedsAPostRouteWithTheMessageIdWriteShape() {
+    for (document in listOf(
+      JSONObject("""{"paths":{}}"""),
+      sessionOperation("/revert/stage", jsonBody("""{"properties":{"messageID":{}}}"""), method = "get"),
+      sessionOperation("/revert", jsonBody("""{"properties":{"messageID":{}}}""")),
+      sessionOperation("/revert/stage", jsonBody("""{"properties":{"before":{"type":"string"}}}""")),
+      sessionOperation("/revert/stage", jsonBody("""{"type":"object","properties":{"messageID":{},"files":{}},"required":["messageID","files"]}"""))
+    )) assertFalse(document.toString(), ApiCapabilities.fromDocument(document).supports(SessionAction.REVERT))
+  }
+  @Test fun theBaselineIncludesTheCurrentNativeForkAndRevertContract() {
+    assertTrue(ApiCapabilities.BASELINE.fork)
+    assertEquals(ActionEndpoint("POST", "api/session/{id}/revert/stage"), ApiCapabilities.BASELINE.actions[SessionAction.REVERT])
+  }
+
+  private fun jsonBody(schema: String) = JSONObject().put("requestBody", JSONObject().put("required", true)
+    .put("content", JSONObject().put("application/json", JSONObject().put("schema", JSONObject(schema)))))
+
+  private fun sessionOperation(suffix: String, operation: JSONObject, method: String = "post", parameter: String = "id") =
+    JSONObject().put("paths", JSONObject().put("/api/session/{$parameter}$suffix", JSONObject().put(method, operation)))
+
   @Test fun aDocumentWithoutPathsMeansTheCurrentContract() {
     assertEquals(ApiCapabilities.BASELINE, ApiCapabilities.fromDocument(JSONObject("{}")))
   }

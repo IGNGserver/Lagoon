@@ -2,6 +2,7 @@ package com.igng.opencode.lagoon.core
 
 import kotlinx.coroutines.flow.take
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.async
@@ -522,7 +523,10 @@ class DshApiTest {
           else -> MockResponse().setResponseCode(404)
         }
       }
-      val events = withTimeout(20_000) { api(server).events { opened.countDown() }.take(1).toList() }
+      val client = api(server)
+      val events = try {
+        withTimeout(20_000) { client.events { opened.countDown() }.filter { it.type == "session.created" }.take(1).toList() }
+      } finally { client.close(); client.awaitClosed() }
       assertTrue(opened.await(10, TimeUnit.SECONDS))
       val event = events.single()
       assertEquals("session.created", event.type)
@@ -1688,7 +1692,9 @@ class DshApiTest {
     assertFalse(capabilities.deleteSession)
     assertTrue(capabilities.fork)
     assertTrue(ApiCapabilities.BASELINE.deleteSession)
-    assertFalse(ApiCapabilities.BASELINE.fork)
+    assertTrue(ApiCapabilities.BASELINE.fork)
+    assertFalse(capabilities.supports(SessionAction.REVERT))
+    assertFalse(capabilities.supports(SessionAction.UNREVERT))
   }
 
   @Test fun concurrentListingReadsShareOneSessionListRequest() = runBlocking {

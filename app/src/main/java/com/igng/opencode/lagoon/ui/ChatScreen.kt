@@ -95,6 +95,9 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
   var childText by remember(state.serverId, state.sessionId) { mutableStateOf("") }
   var goalDialog by remember(state.serverId, state.sessionId) { mutableStateOf(false) }
   var goalText by remember(state.serverId, state.sessionId) { mutableStateOf("") }
+  var revertMessage by remember(state.serverId, state.sessionId) { mutableStateOf<String?>(null) }
+  var timelineTarget by remember(state.serverId, state.sessionId) { mutableStateOf<TimelineMutationTarget?>(null) }
+  var restoreTimeline by remember(state.serverId, state.sessionId) { mutableStateOf(false) }
   val activity = remember(state.sessions, state.presentedTasks, state.shells, state.parents, state.sessionId) { state.sessionActivity() }
   val transcriptList = rememberLazyListState()
   LaunchedEffect(sheet, state.serverId, state.sessionId) {
@@ -109,15 +112,15 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
     menu = false
     sheet = ChatSheet.ACTIVITY
   }
-  val modal = sheet != null || menu || rename || delete || composerModal || requestModal || activityGroup != null || state.shellOutput != null
+  val modal = sheet != null || menu || rename || delete || composerModal || requestModal || activityGroup != null || state.shellOutput != null || revertMessage != null || restoreTimeline
   DisposableEffect(modal) { onModal(modal); onDispose { onModal(false) } }
   fun openFile(path: String) { sheet = ChatSheet.FILES; controller.readFile(path) }
   if (session == null) {
     Column(Modifier.fillMaxSize().padding(24.dp), verticalArrangement = Arrangement.Center) { Text("会话尚未加载或已关闭"); HyperButton(text = "返回列表", onClick = onBack) }
     return
   }
-  // ⋯ 分两段：查看会话的资源，以及对会话本身的操作。整理上下文 / 撤销 / 分享不在手机上提供，已保存权限在设置页；
-  // 分叉与删除按 harness 能力显示（DSH 没有消息级撤销与删除，用分叉与归档代替）。
+  // 原生操作按服务声明的能力显示，与 Direct/SSH/Remote carrier 无关。
+  // 消息回退在具体人类消息处确认，恢复入口只在存在暂存边界时显示；DSH 不冒充支持回退。
   val menuSections = listOf(
     MenuSection(buildList {
       add(MenuAction(conversationActivityLabel(activity), MiuixIcons.MindMap) { showActivitySheet() })
@@ -135,6 +138,9 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
       add(MenuAction(if (session.id in state.pinned) "取消置顶" else "置顶", if (session.id in state.pinned) MiuixIcons.Unpin else MiuixIcons.Pin) { controller.togglePin(session.id) })
       if (state.capabilities.supports(SessionAction.RENAME)) add(MenuAction("重命名", MiuixIcons.Rename) { rename = true })
       if (state.capabilities.fork) add(MenuAction("分叉", MiuixIcons.Copy) { controller.fork() })
+      if (state.canRestoreTimeline()) add(MenuAction("恢复回退内容", MiuixIcons.Info) {
+        timelineTarget = state.server?.let { TimelineMutationTarget(it, session.id, session.revertMessageId) }; restoreTimeline = true
+      })
       // 只有服务端真的带权限投影时才显示入口（OpenCode 没有这个语义）。
       if (session.permission.isNotBlank()) add(MenuAction("权限模式", MiuixIcons.Settings) { permission = true })
       state.capabilities.archive?.let { archive ->
@@ -170,7 +176,10 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
               activityGroup = it
               activityItem = it.takeIf { row -> row.kind == "tool" }
             }, onQueuedAction = { queuedAction = it },
-            activity = activity, onOpenActivity = ::showActivitySheet, listState = transcriptList)
+            activity = activity, onOpenActivity = ::showActivitySheet, listState = transcriptList,
+            onRevertMessage = { id ->
+              timelineTarget = state.server?.let { TimelineMutationTarget(it, session.id, session.revertMessageId) }; revertMessage = id
+            })
         }
         if (session.parentId != null) ChildSessionBar(state, session, onBack,
           onContinue = if ((state.server?.kind == ServerKind.DSH || state.server?.kind == ServerKind.DSH_REMOTE) &&
@@ -285,6 +294,35 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
           val text = goalText.trim()
           goalDialog = false; goalText = ""
           controller.createGoal(text)
+        }
+      }
+    }
+  }
+  revertMessage?.let { messageId ->
+    val target = timelineTarget
+    SuperDialog(title = "回退到此消息之前？", show = true,
+      onDismissRequest = { if (!state.pending("revert")) revertMessage = null }) {
+      Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text("这条消息及其后的内容将按服务器的原生回退规则暂存。文件是否回退由服务器决定；不会重新发送消息。继续发送前可通过菜单恢复。",
+          style = MiuixTheme.textStyles.footnote2)
+        ActionError(state, "revert")
+        DialogActions("取消", { revertMessage = null }, if (state.pending("revert")) "回退中…" else "确认回退",
+          target?.matches(state) == true && state.canRevertMessage(messageId), danger = true) {
+          controller.revert(messageId, onReverted = { revertMessage = null }, expected = target)
+        }
+      }
+    }
+  }
+  if (restoreTimeline) {
+    val target = timelineTarget
+    SuperDialog(title = "恢复回退内容？", show = true,
+      onDismissRequest = { if (!state.pending("unrevert")) restoreTimeline = false }) {
+      Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text("恢复服务器暂存的会话内容；不重新执行模型任务或工具。", style = MiuixTheme.textStyles.footnote2)
+        ActionError(state, "unrevert")
+        DialogActions("取消", { restoreTimeline = false }, if (state.pending("unrevert")) "恢复中…" else "恢复",
+          target?.matches(state) == true && state.canRestoreTimeline()) {
+          controller.unrevert(expected = target, onRestored = { restoreTimeline = false })
         }
       }
     }
@@ -1069,7 +1107,7 @@ private fun ChatComposer(
   // Like the official composer, a prompt typed while the agent works steers the running turn.
   // While the server is connecting or retrying, a typed prompt is held and delivered once it answers.
   val queueing = actionKey == "send" && state.canQueueSend
-  val canSend = ready && !sending && hasContent && (state.connected || queueing && value.text.isNotBlank())
+  val canSend = ready && !sending && !state.pending("revert") && !state.pending("unrevert") && hasContent && (state.connected || queueing && value.text.isNotBlank())
   val muted = MiuixTheme.colorScheme.onSurfaceVariantSummary
   val hint = when {
     queueing -> "未连接 · 现在发送，连接恢复后会自动发出"

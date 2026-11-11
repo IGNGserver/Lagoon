@@ -401,7 +401,8 @@ class OpenCodeApi internal constructor(
       body = JSONObject().put("id", MessageIds.ascending()).put("delivery", Delivery.STEER.wire))
   }
   override suspend fun revert(session: Session, messageId: String) {
-    request("POST", sessionPath(session.id, "/revert/stage"), body = JSONObject().put("messageID", messageId))
+    val endpoint = capabilities().actions[SessionAction.REVERT] ?: unsupported("服务器未提供消息回退")
+    request(endpoint.method, endpoint.path(session), body = JSONObject().put("messageID", messageId))
   }
   override suspend fun unrevert(session: Session) {
     val endpoint = capabilities().actions[SessionAction.UNREVERT] ?: unsupported("服务器未提供恢复撤销")

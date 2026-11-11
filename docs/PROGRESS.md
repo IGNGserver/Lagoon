@@ -62,12 +62,15 @@
 - 添加入口改为 Remote Hub/SSH 接入源优先，兼容 HTTP 直连放高级区；管理页显示 source→Host→Harness 和独立开关。
 - 组合改为稳定 leaf ID 的多对多引用：一个 Harness 可加入多个组合，新建/编辑不再从其他组合偷走成员；显式 MOVE 仍是移动。
 - 详情展示所有组合成员关系，不再用一个下拉框破坏其他组合；原生服务保留准确 carrier 标签和独立操作。
-- 未跑 Android 真机布局、可访问性、预测式返回；当前仅源码与 Compose 编译验收。
+- r8 后续：DSH 插件/凭据/服务商管理按原生协议开放给 Direct/SSH/Remote，Hub 管理按 remoteHostId 单独显示；插件包与 Loader entry 均可读取/修改 Host 允许的开关，呈现只读原因/phase/可能重启，不把未确认 false 当成功。
+- 设置弹窗按完整 profile 失效；Controller settingsClient 在读写前双重校验打开时的 exact saved route，不按 ID 悄悄转向编辑后的 Host。凭据引用先读 writable 状态，值不回显。
+- OpenCode 从实际文档发现兼容 POST /fork 与 messageID /revert/stage，提供具体已落盘人类消息回退确认与暂存边界恢复入口；DSH 不冒充回退。离线缓存、任务活跃、降级未知状态、排队消息、父级禁用均拒绝；确认绑定原路由/会话/边界，回退期间不发送消息且保留草稿。
+- goals edit、schedule CRUD、交互终端仍是业务适配器缺口，不把通用 WS carrier 或 endpoint allowlist 当作已交付功能。未跑 Android 真机布局、可访问性、预测式返回；当前仅源码与 Compose 编译验收。
 
 ### 阶段 7：验证与交付仍进行中
 - 本地 fake Hub/实际 Noise/真实 Node connector 互操作不等于公网 Hub、真实官方 daemon 或 Android 真机验收。
 - DSH Desktop SSH 附着仍缺上游受支持 hook；跨 direct DshApi API-peer 复用及完整功能矩阵未全部验收。没有虚构完成。
-- 本批完整回归/独立复核/凭据模式扫描已通过，准备保存本地 checkpoint；剩余整合及最终 PR 待收口；没有部署、发布或合并。
+- 已推送分支并建立 [Draft PR #193](https://github.com/IGNGserver/Lagoon/pull/193)，官方服务验收 checkpoint 的 CI 已通过；PR 保持 draft，继续收口剩余能力，不表示全部目标完成。没有部署、发布或合并。
 
 ## 验证记录
 - `ssh-integration-r4.log`：先修复之前中断留下的 SSH owner 编译错误，ownership/model/legacy store/mux 定向通过。
@@ -107,6 +110,8 @@
 - `official-daemon-acceptance.log` 官方 OpenCode 与隔离官方 DSH rc.5 直连只读通过；`official-ssh-noise-acceptance.log` SSH 首轮失败，发现 JSch 异步通道误关闭，不当作环境问题。修复后 `official-ssh-confirmed-acceptance.log` 所有真实 SSH/DSH/Direct/Noise +相关回归通过；RemoteNativeConversationTest 3/3 包含实际 Router→官方daemon，未跳过。
 - `official-connector-full-build.log` 完整固定上游插件 bundle 4,029,731 bytes，SHA-256 `4b8a2d59ebfc75163a06b7b32f058fed649aa346b6ccd67b55bb4ef62ba6ee71`。未安装到用户 Host 或部署。
 - `official-acceptance-full.log`：**1229 tests、0 failures、0 errors、6 skipped**；三个 opt-in 官方 Direct/DSH/SSH 测试及实际 Noise3项均运行无跳过；Debug assemble 成功113s。APK 21,713,748 bytes，SHA-256 `e1f52694152156d36e0762b602430938e859fa7b810b92c9ab34341e8b6cac78`。测试后停止仅本任务拥有的三个临时 daemon。
-- 源码复核仍发现待补功能：DSH 设置管理被 Remote carrier UI 条件隐藏、原生 OpenCode revert/restore 无操作入口、OpenCode fork 能力未从文档发现；不因 read/event 验收通过就声称完整功能完成。
+- 源码复核发现 DSH 设置 UI carrier 条件、OpenCode revert/restore 缺入口和 fork 能力遗漏；后续已接入并进行回归，不因 read/event 验收通过就声称完整功能完成。
+- `native-action-ui-first.log`：初版时间线/能力/Controller 定向通过；`native-action-ui-scoped.log` 两项失败分别是旧 baseline fork=false 断言和 events 首帧假设，已按当前原生契约修正并显式 close owner。`native-action-ui-guarded.log` 是 Flow filter import 尚未同步的编译失败，补齐后 `native-action-ui-guarded-2.log` 定向通过55s。独立复核补上 degraded 任务状态未知时禁止时间线 mutation 的门禁。
+- `native-action-ui-final.log`：**1252 tests、0 failures、0 errors、10 skipped**，Debug assemble 成功113s；本次真实 daemon 已停，因此四个官方 opt-in 用例如实 skip，fixture Noise2项仍实际运行通过。新增能力发现7、timeline policy6、六carrier设置入口3、Controller6、native revert route1项。APK 21,735,293 bytes，SHA-256 `20b00047e0c1c7d6db4d371bb20ac2726cb845f32ea04fdf1804ba60d91aa7b0`。不拿本次 skip 冒充重复真实验收；真实服务证据保留在前述独立日志。
 - 全部构建在 `/home/lvziw/.build/Lagoon/unified-harness-connections/source`，Gradle/build 输出在 `~/.build`。源码工作树无 app/build、node_modules。
 - `wt audit`：29 repos，0 missing dirs，3 detached、4 merged worktrees 属其他任务；只读报告，无清理。

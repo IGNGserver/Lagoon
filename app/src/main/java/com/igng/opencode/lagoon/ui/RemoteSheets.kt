@@ -452,53 +452,109 @@ internal fun RemoteConnectionDialog(
 }
 
 
-/** Official plugin bundle switches over the authenticated Remote settings channel. */
+/** Host inventory is authoritative for both bundles and Loader entries on any DSH transport. */
 @Composable
 internal fun RemoteExtensionsDialog(
   profile: ServerProfile,
   controller: LagoonController,
   onDismiss: () -> Unit
 ) {
+  // Includes the access gate so disabling a source/Host cancels its in-flight UI operations.
+  key(profile) {
+    DshExtensionsContent(profile, controller, onDismiss)
+  }
+}
+
+@Composable
+private fun DshExtensionsContent(
+  profile: ServerProfile,
+  controller: LagoonController,
+  onDismiss: () -> Unit
+) {
   val scope = rememberCoroutineScope()
+  val profileId = profile.id
   var bundles by remember { mutableStateOf(emptyList<RemotePluginBundle>()) }
+  var entries by remember { mutableStateOf(emptyList<RemotePluginEntry>()) }
   var busy by remember { mutableStateOf(true) }
-  var saving by remember { mutableStateOf<String?>(null) }
-  var error by remember { mutableStateOf<String?>(null) }
-  fun reload() {
+  var saving by remember { mutableStateOf(false) }
+  var bundlesError by remember { mutableStateOf<String?>(null) }
+  var entriesError by remember { mutableStateOf<String?>(null) }
+  var changeError by remember { mutableStateOf<String?>(null) }
+  var changeNote by remember { mutableStateOf<String?>(null) }
+  val accessible = profile.effectiveEnabled && deviceSettingsAccess(profile).dshProtocol
+
+  suspend fun loadInventory() {
+    busy = true
+    try {
+      // The two endpoints may differ in support; a failed one must not hide the other's result.
+      try { bundles = controller.pluginBundles(profile); bundlesError = null }
+      catch (cancel: CancellationException) { throw cancel }
+      catch (e: Exception) { bundlesError = userFacingError(e, "读取插件包失败") }
+      try { entries = controller.pluginEntries(profile); entriesError = null }
+      catch (cancel: CancellationException) { throw cancel }
+      catch (e: Exception) { entriesError = userFacingError(e, "读取插件条目失败") }
+    } finally { busy = false }
+  }
+
+  fun change(action: suspend () -> Boolean) {
+    if (!accessible || busy || saving) return
+    saving = true; changeError = null; changeNote = null
     scope.launch {
-      busy = true; error = null
-      try { bundles = controller.pluginBundles(profile.id) }
-      catch (e: Exception) { error = userFacingError(e, "读取插件失败") }
-      finally { busy = false }
+      try {
+        check(action()) { "Host 未确认插件变更；请检查连接、支持情况与权限" }
+        changeNote = "Host 已接收变更；是否已应用以 Host 状态为准，部分插件需要重启 Host。"
+        controller.notifyOverviewAction(profileId)
+      } catch (cancel: CancellationException) { throw cancel }
+      catch (e: Exception) { changeError = userFacingError(e, "切换插件失败") }
+      finally {
+        try { loadInventory() } finally { saving = false }
+      }
     }
   }
-  LaunchedEffect(profile.id) { reload() }
+
+  LaunchedEffect(profileId) {
+    if (accessible) loadInventory() else busy = false
+  }
   SuperDialog(title = "主机扩展", show = true, onDismissRequest = onDismiss) {
     Column(Modifier.fillMaxWidth().heightIn(max = 480.dp).verticalScroll(rememberScrollState()).padding(top = 8.dp),
       verticalArrangement = Arrangement.spacedBy(6.dp)) {
-      Text("只列出 Host 官方允许远程开关的插件 bundle；安装、卸载和插件配置仍需在电脑上完成。",
+      Text("列出当前 DSH Host 返回的插件包与 Loader 条目；只读原因由 Host 提供。安装、卸载与配置仍在电脑上完成，开关可能需要重启 Host 才生效。",
         style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
+      if (!accessible) Text("此 Harness 或所属接入源 / 主机已停用，无法读取或修改插件。", style = MiuixTheme.textStyles.footnote2)
       if (busy) Text("正在读取插件…", style = MiuixTheme.textStyles.footnote2)
+      HyperGroupTitle("插件包")
       bundles.forEach { bundle ->
         HyperSwitchRow(
           title = bundle.name,
-          summary = listOfNotNull(bundle.version?.let { "v$it" }, bundle.description, bundle.readOnlyReason).joinToString(" · "),
+          summary = listOfNotNull(bundle.version?.let { "v$it" }, if (bundle.installed) "已安装" else "未安装",
+            if (bundle.official) "官方" else null, bundle.description, bundle.readOnlyReason?.let { "只读：$it" }).joinToString(" · "),
           checked = bundle.enabled,
-          enabled = bundle.readOnlyReason == null && saving == null,
-          onCheckedChange = { checked ->
-            saving = bundle.name
-            scope.launch {
-              try { controller.setPluginBundle(profile.id, bundle.name, checked); reload() }
-              catch (e: Exception) { error = userFacingError(e, "切换插件失败") }
-              finally { saving = null }
-            }
-          })
+          enabled = accessible && !busy && !saving && bundlesError == null && bundle.readOnlyReason == null,
+          onCheckedChange = { checked -> change { controller.setPluginBundle(profile, bundle.name, checked) } })
       }
-      if (!busy && bundles.isEmpty() && error == null) Text("没有可远程开关的插件。", style = MiuixTheme.textStyles.footnote2)
-      error?.let { Text(it, color = MiuixColorTokens.Error, style = MiuixTheme.textStyles.footnote2) }
+      if (accessible && !busy && bundles.isEmpty() && bundlesError == null) Text("Host 未返回插件包。", style = MiuixTheme.textStyles.footnote2)
+      bundlesError?.let { Text(it, color = MiuixColorTokens.Error, style = MiuixTheme.textStyles.footnote2) }
+      HyperGroupTitle("插件条目")
+      entries.forEach { entry ->
+        HyperSwitchRow(
+          title = entry.moduleName,
+          summary = listOfNotNull(entry.entryId, entry.phase?.let { "阶段：$it" }, entry.readOnlyReason?.let { "只读：$it" }).joinToString(" · "),
+          checked = entry.enabled,
+          enabled = accessible && !busy && !saving && entriesError == null && entry.readOnlyReason == null,
+          onCheckedChange = { checked -> change { controller.setPluginEntry(profile, entry.entryId, checked) } })
+      }
+      if (accessible && !busy && entries.isEmpty() && entriesError == null) Text("Host 未返回插件条目。", style = MiuixTheme.textStyles.footnote2)
+      entriesError?.let { Text(it, color = MiuixColorTokens.Error, style = MiuixTheme.textStyles.footnote2) }
+      changeNote?.let { Text(it, style = MiuixTheme.textStyles.footnote2) }
+      changeError?.let { Text(it, color = MiuixColorTokens.Error, style = MiuixTheme.textStyles.footnote2) }
       Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
         HyperTextAction(text = "关闭", onClick = onDismiss)
-        HyperButton(text = "刷新", loading = busy, onClick = { reload() })
+        HyperButton(text = "刷新", loading = busy || saving, enabled = accessible, onClick = {
+          if (!busy && !saving) {
+            busy = true
+            scope.launch { loadInventory() }
+          }
+        })
       }
     }
   }
@@ -513,27 +569,37 @@ internal fun RemoteModelKeyDialog(
   onDismiss: () -> Unit
 ) {
   val scope = rememberCoroutineScope()
-  var key by remember { mutableStateOf("") }
-  var ref by remember { mutableStateOf("DEEPSEEK_API_KEY") }
-  var status by remember { mutableStateOf<RemoteCredentialStatus?>(null) }
-  var busy by remember { mutableStateOf(true) }
-  var error by remember { mutableStateOf<String?>(null) }
-  var confirmingClear by remember { mutableStateOf(false) }
+  val profileId = profile.id
+  var key by remember(profileId) { mutableStateOf("") }
+  var ref by remember(profileId) { mutableStateOf("DEEPSEEK_API_KEY") }
+  var status by remember(profileId) { mutableStateOf<RemoteCredentialStatus?>(null) }
+  var busy by remember(profileId) { mutableStateOf(false) }
+  var error by remember(profileId) { mutableStateOf<String?>(null) }
+  var confirmingClear by remember(profileId) { mutableStateOf(false) }
+  suspend fun readStatus(reference: String) {
+    status = controller.credentialStatus(profile, reference)
+    check(status != null) { "Host 未返回凭据状态；请检查连接或支持情况" }
+  }
   fun load() {
+    if (busy || !profile.effectiveEnabled || ref.isBlank()) return
+    val reference = ref
+    busy = true; error = null; status = null
     scope.launch {
-      busy = true; error = null
-      try { status = controller.credentialStatus(profile.id, ref) }
+      try { readStatus(reference) }
+      catch (cancel: CancellationException) { throw cancel }
       catch (e: Exception) { error = userFacingError(e, "读取主机密钥失败") }
       finally { busy = false }
     }
   }
-  LaunchedEffect(profile.id) { load() }
+  LaunchedEffect(profileId, profile.effectiveEnabled) {
+    if (profile.effectiveEnabled) load() else { status = null; error = "此 Harness 或所属接入源 / 主机已停用" }
+  }
   SuperDialog(title = "主机模型密钥", show = true, onDismissRequest = onDismiss) {
     Column(Modifier.fillMaxWidth().padding(top = 8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
       Text("写入 Host 凭据引用；值不会回显。常见引用是 DEEPSEEK_API_KEY，其他服务商按 Host 配置填写。",
         style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
       Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-        TextField(value = ref, onValueChange = { ref = it.trim() }, label = "凭据引用", modifier = Modifier.weight(1f))
+        TextField(value = ref, onValueChange = { if (!busy) { ref = it.trim(); status = null; error = null } }, label = "凭据引用", modifier = Modifier.weight(1f))
         HyperTextAction(text = "读取", enabled = !busy && ref.isNotBlank(), onClick = { load() })
       }
       if (busy) Text("正在读取…", style = MiuixTheme.textStyles.footnote2)
@@ -547,10 +613,18 @@ internal fun RemoteModelKeyDialog(
       Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
         HyperTextAction(text = "关闭", onClick = onDismiss)
         if (status?.configured == true && status?.writable == true) HyperTextAction(text = "清除", danger = true, enabled = !busy, onClick = { confirmingClear = true })
-        HyperButton(text = "保存", loading = busy, enabled = key.isNotBlank(), onClick = {
+        HyperButton(text = "保存", loading = busy, enabled = profile.effectiveEnabled && status?.writable == true && key.isNotBlank(), onClick = {
+          if (busy || status?.writable != true) return@HyperButton
+          val reference = ref
+          val value = key
+          busy = true; error = null
           scope.launch {
-            busy = true; error = null
-            try { controller.setCredential(profile.id, ref, key); key = ""; load() }
+            try {
+              check(controller.setCredential(profile, reference, value)) { "Host 未确认密钥保存" }
+              key = ""
+              readStatus(reference)
+              controller.notifyOverviewAction(profileId)
+            } catch (cancel: CancellationException) { throw cancel }
             catch (e: Exception) { error = userFacingError(e, "保存失败") }
             finally { busy = false }
           }
@@ -565,11 +639,19 @@ internal fun RemoteModelKeyDialog(
         Text("将清除 Host 上 ${ref.ifBlank { "当前引用" }} 的凭据。依赖它的模型可能立即无法使用。")
         DialogActions("取消", { confirmingClear = false }, "确认清除", danger = true) {
           confirmingClear = false
-          scope.launch {
+          if (!busy && profile.effectiveEnabled && status?.writable == true) {
+            val reference = ref
             busy = true; error = null
-            try { controller.clearCredential(profile.id, ref); key = ""; load() }
-            catch (e: Exception) { error = userFacingError(e, "清除失败") }
-            finally { busy = false }
+            scope.launch {
+              try {
+                check(controller.clearCredential(profile, reference)) { "Host 未确认密钥清除" }
+                key = ""
+                readStatus(reference)
+                controller.notifyOverviewAction(profileId)
+              } catch (cancel: CancellationException) { throw cancel }
+              catch (e: Exception) { error = userFacingError(e, "清除失败") }
+              finally { busy = false }
+            }
           }
         }
       }
@@ -618,13 +700,16 @@ internal fun RemoteProviderDialog(
       error?.let { Text(it, color = MiuixColorTokens.Error, style = MiuixTheme.textStyles.footnote2) }
       Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
         HyperTextAction(text = "取消", onClick = onDismiss)
-        HyperButton(text = "保存", loading = busy, enabled = route.isNotBlank() && baseUrl.isNotBlank() && modelId.isNotBlank() && keyRef.isNotBlank(), onClick = {
+        HyperButton(text = "保存", loading = busy, enabled = !busy && profile.effectiveEnabled && route.isNotBlank() && baseUrl.isNotBlank() && modelId.isNotBlank() && keyRef.isNotBlank(), onClick = {
+          if (busy || !profile.effectiveEnabled) return@HyperButton
           scope.launch {
             busy = true; error = null
             try {
-              controller.createProviderRoute(profile.id, route, displayName, api, baseUrl, keyRef, modelId, apiKey)
+              check(controller.createProviderRoute(profile, route, displayName, api, baseUrl, keyRef, modelId, apiKey)) { "Host 未确认模型服务商保存；请检查连接、支持情况与权限" }
+              controller.notifyOverviewAction(profile.id)
               onDismiss()
-            } catch (e: Exception) { error = userFacingError(e, "保存模型服务商失败") }
+            } catch (cancel: CancellationException) { throw cancel }
+            catch (e: Exception) { error = userFacingError(e, "保存模型服务商失败") }
             finally { busy = false }
           }
         })
