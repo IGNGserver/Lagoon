@@ -69,6 +69,7 @@ class ApiCapabilitiesTest {
         .put("components", JSONObject("""{"schemas":{"Session.Message.ID":{"type":"string","pattern":"^msg_"}}}"""))
       val caps = ApiCapabilities.fromDocument(document)
       assertTrue(parameter, caps.fork)
+      assertTrue(parameter, caps.historicalFork)
       assertTrue(caps.documented)
     }
   }
@@ -79,13 +80,19 @@ class ApiCapabilitiesTest {
       sessionOperation("/forked", JSONObject()),
       sessionOperation("/fork/extra", JSONObject()),
       JSONObject("""{"paths":{"/session/{id}/fork":{"post":{}}}}""")
-    )) assertFalse(document.toString(), ApiCapabilities.fromDocument(document).fork)
+    )) {
+      assertFalse(document.toString(), ApiCapabilities.fromDocument(document).fork)
+      assertFalse(document.toString(), ApiCapabilities.fromDocument(document).historicalFork)
+    }
     assertTrue(ApiCapabilities.fromDocument(sessionOperation("/fork", JSONObject())).fork)
+    assertFalse(ApiCapabilities.fromDocument(sessionOperation("/fork", JSONObject())).historicalFork)
   }
   @Test fun forkRejectsEveryRequiredPayloadFieldTheClientDoesNotWrite() {
     for (field in listOf("before", "messageID", "reason")) {
       val operation = jsonBody("""{"type":"object","properties":{"$field":{"type":"string"}},"required":["$field"]}""")
-      assertFalse(field, ApiCapabilities.fromDocument(sessionOperation("/fork", operation)).fork)
+      val caps = ApiCapabilities.fromDocument(sessionOperation("/fork", operation))
+      assertFalse(field, caps.fork)
+      assertFalse(field, caps.historicalFork)
     }
   }
   @Test fun forkResolvesLocalSchemaReferencesAndNullFirstUnions() {
@@ -94,6 +101,7 @@ class ApiCapabilitiesTest {
         .put("components", JSONObject("""{"schemas":{"Fork":{"$union":[{"type":"null"},
           {"type":"object","properties":{"before":{"type":"string"}}}]}}}"""))
       assertTrue(union, ApiCapabilities.fromDocument(document).fork)
+      assertTrue(union, ApiCapabilities.fromDocument(document).historicalFork)
       document.obj("components").obj("schemas").put("Fork", JSONObject("""{
         "type":"object","properties":{"before":{"type":"string"}},"required":["before"]}"""))
       assertFalse(ApiCapabilities.fromDocument(document).fork)
@@ -124,7 +132,21 @@ class ApiCapabilitiesTest {
   }
   @Test fun theBaselineIncludesTheCurrentNativeForkAndRevertContract() {
     assertTrue(ApiCapabilities.BASELINE.fork)
+    assertFalse(ApiCapabilities.BASELINE.historicalFork)
+    assertFalse(ApiCapabilities().historicalFork)
     assertEquals(ActionEndpoint("POST", "api/session/{id}/revert/stage"), ApiCapabilities.BASELINE.actions[SessionAction.REVERT])
+  }
+
+  @Test fun historicalForkRejectsUnknownOrNonStringBoundariesAndNonemptyPayloadRequirements() {
+    for (schema in listOf(
+      """{"type":"object","properties":{"messageID":{"type":"string"}}}""",
+      """{"type":"object","properties":{"before":{"type":"integer"}}}""",
+      """{"type":"object","properties":{"before":{}}}""",
+      """{"type":"object","properties":{"before":{"type":"string"}},"required":["reason"]}""",
+      """{"type":"object","properties":{"before":{"type":"string"}},"minProperties":1}""",
+      """{"type":"object","properties":{"before":{"type":"string"}},"maxProperties":0}""",
+      """{"type":"array","properties":{"before":{"type":"string"}}}"""
+    )) assertFalse(schema, ApiCapabilities.fromDocument(sessionOperation("/fork", jsonBody(schema))).historicalFork)
   }
 
   private fun jsonBody(schema: String) = JSONObject().put("requestBody", JSONObject().put("required", true)

@@ -10,6 +10,15 @@ class DshPublishedContractTest {
     assertEquals("b830ec950faba0a46dda564be3e2d854afed94f1", OfficialDshContract.upstream().getString("commit"))
   }
 
+  @Test fun forkBoundaryUsesInclusiveEventSequenceNotMessageIdOrToolArguments() {
+    OfficialDshContract.assertArgs("session/fork", JSONObject("""{"request":{"sessionId":"source","atSeq":7}}"""))
+    OfficialDshContract.assertArgs("session/fork", JSONObject("""{"request":{"sessionId":"source"}}"""))
+    OfficialDshContract.assertResult("session/fork", JSONObject("""{"sessionId":"new-child"}"""))
+    for (field in listOf("messageId", "before", "row", "idempotencyKey")) {
+      assertTrue(runCatching { OfficialDshContract.assertArgs("session/fork", JSONObject().put("request", JSONObject().put("sessionId", "source").put(field, "wrong"))) }.isFailure)
+    }
+  }
+
   @Test fun sessionContentSearchIsLiteralHostQueryWithoutClientPaginationOrScopeFields() {
     OfficialDshContract.assertArgs("session/search", JSONObject("""{"request":{"query":"literal [a.*] + text"}}"""))
     OfficialDshContract.assertResult("session/search", JSONObject("""{"items":[{"sessionId":"s","snippet":"native content"}],"hasMore":false}"""))

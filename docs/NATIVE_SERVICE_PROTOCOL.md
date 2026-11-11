@@ -83,6 +83,23 @@ Controller 前后核对原 Host 路由和当前客户端，拒绝旧窗口写向
 明确点击后重新读取授权会话身份与目录，已移除/失权/旧查询/换路由结果均不能作为导航目标。
 OpenCode 未按 DSH 方法假报支持，需按其自身官方可远程契约另核对。
 
+## 原生历史边界分叉
+
+`ForkBoundary.DshEvent` 发送官方 `session/fork` 的 `atSeq`，复制包含指定原始耐久事件的精确前缀；
+省略边界时为最新已完成轮次前缀。`ForkBoundary.OpenCodeBefore` 发送 `before` 原生消息 ID，
+复制严格位于这条消息之前的投影历史；省略则为全部历史。OpenCode 边界能力只由实例自己的兼容
+OpenAPI（可选字符串 before，接受空对象）声明，不由通用 fork 或版本基线推断。
+
+依据固定 [OpenCode 协议](https://github.com/anomalyco/opencode/blob/dc2ffcf8bf26f9e669b6aa22b95f50e12be15e06/packages/protocol/src/groups/session.ts)
+及 [原生 handler](https://github.com/anomalyco/opencode/blob/dc2ffcf8bf26f9e669b6aa22b95f50e12be15e06/packages/server/src/handlers/session.ts)，
+DSH 另以固定 rc.5 generated schema 固化请求与结果。消息行使用原生 ID/严格正安全整数事件 seq，
+不使用行号或助手合并步骤的推测序号；queued、注入内容、未知序号和离线快照不能作为操作边界。
+
+原生 HTTP 写入使用关闭连接恢复的一次性请求体，阻止连接/状态自动重发；DSH fork 也禁用401换 Cookie 重放。
+Remote mutation 不因响应过大切换路径重发。坏/丢失 ack 不假造创建成功；运行期未知状态按原 Host/Session
+锁定，重连或切换视图不清除。只读核对同时包含最近根会话与源子分支，列表可能不完整，不能证明是否曾创建；
+用户人工确认后才解除锁定、重新确认新的动作。此运行期锁定不是跨进程持久事务或幂等性保证。
+
 ## 实现与验证边界
 
 Host companion 和 SHA 校验的固定上游 Router/HostPluginRuntime overlay、Android HTTP/SSE/WS/分片 carrier、同 Host 共享 Noise 会话和服务选择 UI 已有实现。构建、测试入口见 [Host 连接器说明](<../host-connector/README.md>)。

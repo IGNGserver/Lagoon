@@ -231,6 +231,9 @@ interface HarnessClient {
   suspend fun deleteSession(session: Session)
 
   suspend fun forkSession(session: Session): Session
+  /** Exact native history boundary; no row-index or cross-protocol emulation. */
+  suspend fun forkSession(session: Session, boundary: ForkBoundary): Session =
+    throw ApiException(501, "此服务未声明指定历史边界分叉")
 
   suspend fun abort(session: Session)
 

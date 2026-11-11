@@ -1655,7 +1655,7 @@ class DshApi(
    */
   internal suspend fun translate(session: Session, event: JSONObject): List<ServerEvent> {
     val type = event.str("type")
-    val seq = event.optDouble("seq", 0.0).toLong()
+    val seq = exactDshSequence(event.opt("seq")) ?: 0L
     val time = event.optDouble("time", 0.0).toLong()
     val data = event.obj("data")
     val output = mutableListOf<ServerEvent>()
@@ -3009,7 +3009,7 @@ class DshApi(
       order++
       val event = record.obj("event")
       val type = event.str("type")
-      val seq = event.optDouble("seq", 0.0).toLong()
+      val seq = exactDshSequence(event.opt("seq")) ?: 0L
       val time = event.optDouble("time", 0.0).toLong()
       val data = event.obj("data")
       when (type) {
@@ -3802,10 +3802,24 @@ class DshApi(
     setArchived(session, true)
   }
 
-  override suspend fun forkSession(session: Session): Session = withContext(Dispatchers.IO) {
-    val result = callObject("session/fork", requestArgs(JSONObject().put("sessionId", session.id)))
-    val id = result.str("sessionId").ifBlank { throw ApiException(502, "服务器没有返回分支会话") }
-    known[id] ?: session.copy(id = id, title = "${session.title} 副本", updated = System.currentTimeMillis())
+  override suspend fun forkSession(session: Session): Session = forkNativeSession(session, null)
+
+  override suspend fun forkSession(session: Session, boundary: ForkBoundary): Session {
+    val native = boundary as? ForkBoundary.DshEvent ?: throw ApiException(400, "DSH 分叉需要原生事件边界")
+    require(native.sequence in 1..9_007_199_254_740_991L) { "原生分叉序号无效" }
+    return forkNativeSession(session, native.sequence)
+  }
+
+  private suspend fun forkNativeSession(session: Session, atSeq: Long?): Session = withContext(Dispatchers.IO) {
+    val request = JSONObject().put("sessionId", session.id)
+    atSeq?.let { request.put("atSeq", it) }
+    // No auth replay, connection recovery or status-code follow-up for a non-idempotent fork.
+    val result = call("session/fork", requestArgs(request), retried = true) as? JSONObject
+      ?: throw ApiException(502, "分叉结果未确认，请核对 Host 会话列表；没有自动重试")
+    val id = (result.opt("sessionId") as? String)?.takeIf { it.isNotBlank() && it != session.id && it.length <= 512 && it.none(Char::isISOControl) }
+      ?: throw ApiException(502, "分叉未返回新的会话身份，请核对列表；没有自动重试")
+    // The official acknowledgement contains only the new identity. Do not copy source live state.
+    Session(id, session.directory, "${session.title} 副本", System.currentTimeMillis())
   }
 
   override suspend fun abort(session: Session) {
@@ -4383,7 +4397,7 @@ class DshApi(
     const val SHELL_OWNER_SCAN_SESSIONS = 8
     val ACTIVE_JOB_STATUSES = setOf("running", "stopping")
 
-    private val WORKSPACE_MUTATIONS = setOf("workspace/create", "workspace/rename", "workspace/delete", "workspace/insertBefore")
+    private val WORKSPACE_MUTATIONS = setOf("workspace/create", "workspace/rename", "workspace/delete", "workspace/insertBefore", "session/fork")
     val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
 
     /**
@@ -4402,7 +4416,8 @@ class DshApi(
       stopShell = true,
       terminal = true,
       workspaceManagement = true,
-      sessionContentSearch = true
+      sessionContentSearch = true,
+      historicalFork = true
     )
 
     /** Capabilities for a tunneled SSH client created before its DshApi instance exists. */

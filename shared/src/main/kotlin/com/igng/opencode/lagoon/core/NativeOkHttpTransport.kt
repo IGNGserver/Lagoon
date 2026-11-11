@@ -6,6 +6,7 @@ import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import okhttp3.WebSocket
@@ -40,6 +41,12 @@ internal class NativeOkHttpTransport(
     .addInterceptor(HttpMetrics.interceptor)
     .build()
 
+  // Mutations can have succeeded even when their response was lost. Connection recovery must
+  // never replay authenticated writes; one-shot bodies below also stop HTTP 408/503 follow-ups.
+  private val writeClient = client.newBuilder()
+    .retryOnConnectionFailure(false)
+    .build()
+
   private val streamClient = client.newBuilder()
     // Long-lived streams must not pin the unary in-flight metric or dispatcher slots.
     .apply { interceptors().remove(HttpMetrics.interceptor) }
@@ -66,11 +73,23 @@ internal class NativeOkHttpTransport(
   ): NativeHttpResponse {
     val normalizedMethod = requireNativeHttpMethod(method)
     requireNativeHttpResponseBudget(maxResponseBytes)
+    val mutation = normalizedMethod !in setOf("GET", "HEAD", "OPTIONS")
+    val requestBody = if (mutation) {
+      // Even an empty DELETE needs a one-shot body: a null body permits OkHttp to replay a 503.
+      val bytes = body ?: ByteArray(0)
+      object : RequestBody() {
+        override fun contentType(): okhttp3.MediaType? = null
+        override fun contentLength(): Long = bytes.size.toLong()
+        override fun isOneShot(): Boolean = true
+        override fun writeTo(sink: okio.BufferedSink) { sink.write(bytes) }
+      }
+    } else body?.toRequestBody(null)
     val request = requestBuilder(relativePath, headers)
-      .method(normalizedMethod, body?.toRequestBody(null)).build()
+      .method(normalizedMethod, requestBody).build()
     val requestedUrl = request.url.toString()
+    val requestClient = if (mutation) writeClient else client
     return suspendCancellableCoroutine { continuation ->
-      val operation = HttpCall(generation, client.newCall(request), continuation)
+      val operation = HttpCall(generation, requestClient.newCall(request), continuation)
       continuation.invokeOnCancellation {
         synchronized(gate) { operation.cancelLocked(NativeHttpGenerationCancelledException(generation)) }
       }

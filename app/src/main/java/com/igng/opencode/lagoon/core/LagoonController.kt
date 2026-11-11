@@ -1674,7 +1674,7 @@ class LagoonController private constructor(private val appContext: Context) {
         allServerSnapshots = snapshots,
         message = message,
         messageTone = FeedbackTone.INFO
-      ).homeProjection()
+      ).withForkUncertaintyFrom(latest).homeProjection()
     }
   }
 
@@ -2087,7 +2087,7 @@ class LagoonController private constructor(private val appContext: Context) {
     store.select(id, rememberedProject, rememberedSession)
     // Drop the pre-ledger “永久已完成” states and read markers; keep runs this device saw as still running.
     store.migrateTaskLedger(id)
-    updateState { LagoonState(profiles = profiles, sshHosts = previous.sshHosts,
+    updateState { latest -> LagoonState(profiles = profiles, sshHosts = previous.sshHosts,
       deviceGroups = previous.deviceGroups, deviceGroupReset = previous.deviceGroupReset,
       homeGroupId = group?.id,
       serverId = id, loading = true, projectId = rememberedProject, sessionId = rememberedSession,
@@ -2118,7 +2118,7 @@ class LagoonController private constructor(private val appContext: Context) {
       tasks = snapshot?.tasks ?: TaskReconciliation.restored(store.taskStates(id)), knownParents = store.taskParents(id), notices = store.sessionNotices(id), collapsedSections = store.collapsedSections(id), pinned = store.pinnedSessions(id),
       pendingAttachments = previous.pendingAttachments,
       modelOverrides = store.modelOverrides(id), modelVisibilityConfigured = store.modelVisibilityConfigured(id),
-      modelVariants = store.modelVariants(id), recentModels = store.recentModels(id), scopeProjectId = store.scope(id)) }
+      modelVariants = store.modelVariants(id), recentModels = store.recentModels(id), scopeProjectId = store.scope(id)).withForkUncertaintyFrom(latest) }
     if (state.value.sessions.isNotEmpty()) trace(token, ConnectMilestone.CACHE_PAINT)
     else paintCachedCatalog(id, token)
     rememberedSession?.let {
@@ -4763,10 +4763,52 @@ class LagoonController private constructor(private val appContext: Context) {
     op.commitConnection { it.copy(sessions = it.sessions.map { item -> if (item.id == session.id) item.copy(archived = archived) else item }) }
     if (op.connectionCurrent(this)) onDone?.invoke()
   }
-  fun fork(onForked: ((Session) -> Unit)? = null) = withSession("fork") { op, client, session ->
-    val fork = scoped(op.serverId, client.forkSession(session))
+  fun fork(onForked: ((Session) -> Unit)? = null): Job {
+    val current = state.value
+    val target = current.server?.let { profile -> current.sessionId?.let { ForkMutationTarget(profile, it) } }
+    return if (target == null) operationScope.launch { } else forkAt(target, onForked)
+  }
+
+  internal fun forkAt(expected: ForkMutationTarget, onForked: ((Session) -> Unit)? = null): Job = withSession("fork") { op, client, session ->
+    check(op.snapshot.canConfirmFork(expected)) { "会话、连接或历史边界已变化，请重新选择并确认分叉" }
+    check(expected.boundary == null || op.snapshot.capabilities.historicalFork) { "此服务未声明历史边界分叉" }
+    val fork = try {
+      val created = expected.boundary?.let { client.forkSession(session, it) } ?: client.forkSession(session)
+      check(created.id.isNotBlank() && created.id != session.id) { "分叉结果不是新的会话身份，请核对列表" }
+      scoped(op.serverId, created)
+    } catch (error: Throwable) {
+      // The Host may already have created the child. Keep the original route/session blocked until
+      // the user explicitly inspects the Host list; never queue or replay this mutation.
+      updateState { it.copy(uncertainForks = (it.uncertainForks + expected).distinct()) }
+      throw error
+    }
+    if (!op.isCurrent(this) || !expected.matches(state.value)) {
+      updateState { it.copy(uncertainForks = (it.uncertainForks + expected).distinct()) }
+      error("分叉返回时原会话或连接已变化，请在原 Host 核对新会话；未重新发送")
+    }
     op.commitConnection { it.copy(sessions = (listOf(fork) + it.sessions).distinctBy { s -> s.id }) }
     if (op.isCurrent(this)) { selectSession(fork.id); onForked?.invoke(fork) }
+  }
+
+  private var forkInspection: ForkInspection? = null
+  /** Read-only reconciliation after an unknown child creation; never resubmits the fork. */
+  internal suspend fun inspectForkResults(expected: ForkMutationTarget): ForkInspection {
+    val op = beginOperation()
+    check(expected.sameSource(op.snapshot)) { "原分叉 Host 或会话已变化" }
+    forkInspection = null
+    val recent = op.client.rootSessionsPage(null, null, 100)
+    val source = op.snapshot.session ?: error("原分叉会话尚未加载")
+    val children = op.client.children(source)
+    check(op.connectionCurrent(this) && expected.sameSource(state.value)) { "分叉核对结果所属连接已变化" }
+    val page = ApiPage((children + recent.items).distinctBy { it.id }, recent.next)
+    return ForkInspection(expected, page, op.client, op.route, op.token).also { forkInspection = it }
+  }
+  internal fun acknowledgeForkInspection(inspection: ForkInspection) {
+    val op = beginOperation()
+    check(forkInspection === inspection && inspection.target.sameSource(op.snapshot) &&
+      op.client === inspection.client && op.route == inspection.route && op.token == inspection.generation) { "原分叉 Host 或核对结果已变化" }
+    forkInspection = null
+    op.commitConnection { it.copy(uncertainForks = it.uncertainForks.filterNot { target -> target.sameSource(op.snapshot) }) }
   }
   internal fun revert(messageId: String, onReverted: (() -> Unit)? = null, expected: TimelineMutationTarget? = null) = withSession("revert") { op, client, session ->
     check(expected == null || expected.matches(op.snapshot)) { "会话或连接已变化，请重新选择要回退的消息" }

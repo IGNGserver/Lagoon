@@ -80,6 +80,7 @@
 - r18 受限 Remote DSH Diff 已接入：单独 harness.changes.v1 / harness.changes.read，只允许 summary/diff＋sessionId＋安全序号/索引；Host 通过官方 Connection 同一可信 owner Peer 内部执行固定 GET，无客户端 URL/认证输入、无网络 fallback。旧 Host 无能力时不发送，404过期/错误/超限不当作空改动，Direct/SSH/Remote 共用严格原生解析和补丁渲染。
 - r19 DSH 原生 workspace 管理独立于本机目录：完整目录、登记已有目录、改名、移除登记和排序以 opaque ID 调用官方接口。Controller 原 Host 路由前后核对、未知写入锁定至只读刷新，UI 再次明确确认；删除仅移除共享登记，保留文件/会话/本机偏好。官方无CAS，不承诺原子防并发；OpenCode不假报支持DSH接口。
 - r20 DSH 原生服务器正文搜索与本机已加载列表筛选分离；Host范围字面查询，500 UTF-16单元、20个命中、240 Unicode码点摘要，保留权限过滤前hasMore语义，不伪造下一页。搜索不启动Agent或打开会话流，只有显式点击才新鲜核对会话可见性；旧查询/原路由/客户端代次不匹配结果不允许打开。
+- r21 原生历史边界分叉已接入：DSH严格原事件seq包含该事件，OpenCode before排除该消息；不从行号或助手合并步骤猜边界。已同步人类输入行与普通分叉均明确确认，原路由/会话/边界门禁，queued/注入/未知序号/离线/运行状态拒绝。未知写入不重放，运行期锁跨重连保留；只读根/子会话核对后人工确认才解除。
 
 ### 阶段 7：验证与交付仍进行中
 - 本地 fake Hub/实际 Noise/真实 Node connector 互操作不等于公网 Hub、真实官方 daemon 或 Android 真机验收。
@@ -186,5 +187,10 @@
 - 官方generated session/search args/result schema按固定版本/commit/SHA导出，拒绝客户端目录/limit/cursor等多余字段。`content-search-first.log`控制器与编译19s通过；子任务测试keySet在运行前改Android兼容迭代器；`content-search-matrix.log`原生10/Controller5/实际Noise2/官方schema与Guarded通过5s。独立只读复核0个明确P1/P2。
 - `content-search-official-runtime.log`实际执行固定官方ApiSessionList.search冷搜索实现，验证字面归一化、可见current用户/助手消息筛选、20结果与Unicode摘要；提供者是受控数据，不冒充真实用户资料或daemon。`content-search-host-all.log`37项0失败0跳过，含既有36项与新官方冷搜索1项。全程无daemon/模型/真机/公网操作。
 - `content-search-full.log`：**1522 tests、0 failures、0 errors、14 skipped**，Debug assemble成功127s。新增原生搜索10、Controller5、Noise2、官方schema1，共18项；APK22,123,945bytes，SHA-256 `361ad27074119bdbe9086521b5fe0dc6106b3cc54f4be6f03eac959528aa0759`。下一轮继续历史边界fork与OpenCode原生内容搜索/project-worktree契约专项核对；整体目标继续，PR保持Draft。
+- r21：历史分叉通过 ForkBoundary.DshEvent / OpenCodeBefore 区分包含原事件与排除原消息的原生语义；仅可靠人类输入seq/ID可选，普通分叉也需确认，新增接口有完整guarded lease转发。DSH seq仅接受原始数值正安全整数，不把字符串/小数截断为边界。OpenCode历史能力只由实例自身可选string before OpenAPI声明；基础版本不假报历史边界支持。
+- 分叉是非幂等新建：DSH禁止401认证重放，所有原生HTTP写请求改为禁连接恢复+one-shot请求体（含无body DELETE），阻止丢响应/408/503 Retry-After自动补发；坏ack不假造成功/复制源实时状态。Controller固定原Host/Session/消息边界，lateack不导航新上下文，未知结果锁住源，先只读根及子分支核对，再由人工确认解除，列表不证明是否曾创建。运行期锁不是跨进程事务/服务端幂等性保证。
+- 独立复核发现1个P2：runtime新LagoonState清空unknown-fork锁，重连/切换可重复提交。已修所有运行期状态重建保留最新锁，并补聚合→重连→原路由恢复锁定回归。`historical-fork-first.log`生产编译通过但新测试误用TaskState.RUNNING，已改当前模型构造；`historical-fork-native.log`原生矩阵通过17s，`historical-fork-matrix.log`Controller/Noise通过7s，`historical-fork-lock-fixed.log`锁修复通过6s。首轮全量旧Controller fork夹具未保存原生能力被新门禁拒绝，补原路由和已模拟cap而非放宽生产检查。
+- `historical-fork-final.log`：**1545 tests、0 failures、0 errors、14 skipped**，Debug assemble成功127s。新增OpenCode历史7、DSH历史4、Policy4、Controller4、实际Noise2、能力1、官方schema1，共23项；既有Controller90与Guarded7继续通过。APK22,146,966bytes，SHA-256 `29ad832414489948853fdfa486bd2cc5d15eddcb63f8b7d92b4c0d5fef093ae0`。HTTP/mux和Noise域数据为受控夹具，未启动daemon/模型或真机/公网操作。
+- 历史边界分叉本轮完成；下一轮继续OpenCode原生project/worktree与内容搜索官方契约专项核对，真实环境边界继续披露。整体目标仍在进行，PR保持Draft。
 - 全部构建在 `/home/lvziw/.build/Lagoon/unified-harness-connections/source`，Gradle/build 输出在 `~/.build`。源码工作树无 app/build、node_modules。
 - `wt audit`：29 repos，0 missing dirs，3 detached、4 merged worktrees 属其他任务；只读报告，无清理。

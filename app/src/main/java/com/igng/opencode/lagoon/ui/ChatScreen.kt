@@ -53,6 +53,7 @@ import androidx.compose.ui.unit.sp
 import com.igng.opencode.lagoon.core.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.conflate
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -100,6 +101,7 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
   var goalCreateSession by remember(state.serverId, state.sessionId) { mutableStateOf<String?>(null) }
   var revertMessage by remember(state.serverId, state.sessionId) { mutableStateOf<String?>(null) }
   var timelineTarget by remember(state.serverId, state.sessionId) { mutableStateOf<TimelineMutationTarget?>(null) }
+  var forkTarget by remember { mutableStateOf<ForkMutationTarget?>(null) }
   var restoreTimeline by remember(state.serverId, state.sessionId) { mutableStateOf(false) }
   val activity = remember(state.sessions, state.presentedTasks, state.shells, state.parents, state.sessionId) { state.sessionActivity() }
   val transcriptList = rememberLazyListState()
@@ -115,7 +117,7 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
     menu = false
     sheet = ChatSheet.ACTIVITY
   }
-  val modal = sheet != null || menu || rename || delete || composerModal || requestModal || activityGroup != null || state.shellOutput != null || revertMessage != null || restoreTimeline || goalDialog
+  val modal = sheet != null || menu || rename || delete || composerModal || requestModal || activityGroup != null || state.shellOutput != null || revertMessage != null || forkTarget != null || restoreTimeline || goalDialog
   DisposableEffect(modal) { onModal(modal); onDispose { onModal(false) } }
   fun openFile(path: String) { sheet = ChatSheet.FILES; controller.readFile(path) }
   if (session == null) {
@@ -143,7 +145,9 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
     MenuSection(buildList {
       add(MenuAction(if (session.id in state.pinned) "取消置顶" else "置顶", if (session.id in state.pinned) MiuixIcons.Unpin else MiuixIcons.Pin) { controller.togglePin(session.id) })
       if (state.capabilities.supports(SessionAction.RENAME)) add(MenuAction("重命名", MiuixIcons.Rename) { rename = true })
-      if (state.capabilities.fork) add(MenuAction("分叉", MiuixIcons.Copy) { controller.fork() })
+      if (state.canForkSession() || state.uncertainForks.any { it.sameSource(state) }) add(MenuAction("分叉…", MiuixIcons.Copy) {
+        forkTarget = state.server?.let { ForkMutationTarget(it, session.id) }
+      })
       if (state.canRestoreTimeline()) add(MenuAction("恢复回退内容", MiuixIcons.Info) {
         timelineTarget = state.server?.let { TimelineMutationTarget(it, session.id, session.revertMessageId) }; restoreTimeline = true
       })
@@ -185,7 +189,7 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
             activity = activity, onOpenActivity = ::showActivitySheet, listState = transcriptList,
             onRevertMessage = { id ->
               timelineTarget = state.server?.let { TimelineMutationTarget(it, session.id, session.revertMessageId) }; revertMessage = id
-            })
+            }, onForkMessage = { id -> state.forkTarget(id)?.let { forkTarget = it } })
         }
         if (session.parentId != null) ChildSessionBar(state, session, onBack,
           onContinue = if ((state.server?.kind == ServerKind.DSH || state.server?.kind == ServerKind.DSH_REMOTE) &&
@@ -316,6 +320,63 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
           controller.createGoal(goalText.trim(), maxRounds = cap.getOrNull(), onCreated = {
             goalDialog = false; goalText = ""; goalCapText = ""
           }, expectedProfile = goalCreateProfile, expectedSession = goalCreateSession)
+        }
+      }
+    }
+  }
+  forkTarget?.let { captured ->
+    val inspectionScope = rememberCoroutineScope()
+    var inspection by remember(captured) { mutableStateOf<ForkInspection?>(null) }
+    var inspecting by remember(captured) { mutableStateOf(false) }
+    var inspectionError by remember(captured) { mutableStateOf<String?>(null) }
+    val pending = state.pending("fork")
+    val sameTarget = captured.matches(state)
+    val uncertain = state.uncertainForks.any { it.sameSource(state) }
+    val sourceHost = captured.profile.remoteHostId ?: android.net.Uri.parse(captured.profile.url).host ?: captured.profile.id
+    val boundaryText = when (val boundary = captured.boundary) {
+      is ForkBoundary.DshEvent -> "复制截至此原生事件（序号 ${boundary.sequence}）的历史，包含这条用户输入；后续回复不包含。截点由 Host 写入必要的结束记录。新会话不会自动发送任务。"
+      is ForkBoundary.OpenCodeBefore -> "复制此消息之前的投影历史，不包含本条消息和后续内容。不会回退或删除原会话。"
+      null -> when (captured.profile.kind) {
+        ServerKind.DSH, ServerKind.DSH_REMOTE -> "复制最新已完成轮次前缀。"
+        ServerKind.OPENCODE -> "复制当前完整历史。"
+      }
+    }
+    SuperDialog(title = "确认分叉？", show = true, onDismissRequest = { if (!pending) forkTarget = null }) {
+      Column(Modifier.heightIn(max = 520.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text("来源：${captured.profile.name.ifBlank { captured.profile.id }} · $sourceHost\n会话：${captured.sessionId}",
+          style = MiuixTheme.textStyles.footnote2)
+        Text(boundaryText, style = MiuixTheme.textStyles.footnote2)
+        Text("分叉会创建新会话，但不修改原会话或发送模型任务；结果未确认时请核对列表，不要重复提交。",
+          style = MiuixTheme.textStyles.footnote2)
+        if (!sameTarget) Text("连接、会话或所选消息已变化，请关闭后重新选择。", color = HyperTheme.colors.warning)
+        if (uncertain) {
+          Text("上次分叉结果尚未确认，已暂停再次提交。请先核对原 Host 的会话列表。", color = HyperTheme.colors.warning)
+          HyperTextAction(if (inspecting) "正在只读核对…" else "读取原 Host 会话核对", enabled = !inspecting && !pending && captured.sameSource(state), onClick = {
+            if (!inspecting) {
+              inspecting = true; inspection = null; inspectionError = null
+              inspectionScope.launch {
+                try { inspection = controller.inspectForkResults(captured) }
+                catch (cancel: kotlinx.coroutines.CancellationException) { throw cancel }
+                catch (_: Exception) { inspectionError = "无法读取原 Host 的会话，请保持锁定并稍后核对。" }
+                finally { inspecting = false }
+              }
+            }
+          })
+          inspectionError?.let { Text(it, color = HyperTheme.colors.error) }
+          inspection?.let { checked ->
+            Text("最近会话（只读，不证明是否曾创建成功）：", style = MiuixTheme.textStyles.footnote2)
+            checked.page.items.take(20).forEach { found -> Text("${found.title.ifBlank { found.id }} · ${found.id}", style = MiuixTheme.textStyles.footnote2) }
+            if (checked.page.next != null || checked.page.items.size > 20) Text("此处仅展示部分会话，请在原 Host 列表继续核对。", color = HyperTheme.colors.warning)
+            HyperTextAction("已人工核对，解除锁定后重新确认", enabled = !pending && !inspecting && captured.sameSource(state), onClick = {
+              runCatching { controller.acknowledgeForkInspection(checked) }.onSuccess { inspection = null }
+                .onFailure { inspectionError = "连接或核对结果已变化，请重新读取。" }
+            })
+          }
+        }
+        ActionError(state, "fork")
+        DialogActions("取消", { if (!pending) forkTarget = null }, if (pending) "分叉中…" else "确认分叉",
+          sameTarget && !pending && !uncertain && state.canConfirmFork(captured)) {
+          controller.forkAt(captured) { forkTarget = null }
         }
       }
     }

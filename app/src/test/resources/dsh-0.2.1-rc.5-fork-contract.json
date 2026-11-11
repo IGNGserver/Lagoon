@@ -1,0 +1,68 @@
+{
+  "version": 1,
+  "upstream": {
+    "repository": "https://github.com/deepseek-ai/deepseek-harness",
+    "tag": "dsh-v0.2.1-rc.5",
+    "commit": "b830ec950faba0a46dda564be3e2d854afed94f1",
+    "version": "0.2.1-rc.5"
+  },
+  "sources": [
+    {
+      "package": "@deepseek-ai/dsh-api-session-controller",
+      "version": "0.2.1-rc.5",
+      "generatedFile": "lib/typert.host.js",
+      "sha256": "0c12316ed398710bcd87520f2332ebb647f0ab5f71cdfe04551c0592b48b2c3c"
+    }
+  ],
+  "methods": {
+    "session/fork": {
+      "sourcePackage": "@deepseek-ai/dsh-api-session-controller",
+      "sourceLocation": {
+        "file": "packages/api/session-controller/src/index.ts",
+        "line": 443,
+        "column": 9
+      },
+      "args": {
+        "type": "object",
+        "properties": {
+          "request": {
+            "type": "object",
+            "properties": {
+              "sessionId": {
+                "type": "string"
+              },
+              "atSeq": {
+                "type": "number",
+                "description": "Exact inclusive source event seq; omission selects the latest completed-turn prefix."
+              },
+              "allowMigration": {
+                "type": "boolean",
+                "description": "False asks the Host to check for required migration before forking. Defaults to true."
+              }
+            },
+            "required": [
+              "sessionId"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "request"
+        ],
+        "additionalProperties": false
+      },
+      "result": {
+        "type": "object",
+        "properties": {
+          "sessionId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "sessionId"
+        ],
+        "additionalProperties": true
+      }
+    }
+  }
+}

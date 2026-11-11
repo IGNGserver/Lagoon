@@ -6,15 +6,15 @@ import { resolve, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 const [rootArg, outputArg, mode] = process.argv.slice(2)
-if (!rootArg || !outputArg) throw new Error('Usage: node scripts/export-dsh-contract.mjs <official-dsh-package-root> <new-output.json> [--session-only|--goal-only|--schedule-only|--terminal-only|--workspace-only|--search-only]')
-if (mode !== undefined && !['--session-only', '--goal-only', '--schedule-only', '--terminal-only', '--workspace-only', '--search-only'].includes(mode)) throw new Error('Unknown export mode')
+if (!rootArg || !outputArg) throw new Error('Usage: node scripts/export-dsh-contract.mjs <official-dsh-package-root> <new-output.json> [--session-only|--goal-only|--schedule-only|--terminal-only|--workspace-only|--search-only|--fork-only]')
+if (mode !== undefined && !['--session-only', '--goal-only', '--schedule-only', '--terminal-only', '--workspace-only', '--search-only', '--fork-only'].includes(mode)) throw new Error('Unknown export mode')
 const root = resolve(rootArg)
 const packageInfo = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'))
 const version = packageInfo.version
 const commits = { '0.2.1-rc.5': 'b830ec950faba0a46dda564be3e2d854afed94f1', '0.2.2-rc.1': '66491b05e3f05ad35bcdd4f6cd7ed26041d9e3db' }
 if (!(version in commits)) throw new Error(`Unreviewed official DSH version: ${version}`)
 const packages = {
-  'dsh-api-session-controller': mode === '--search-only' ? ['session/search'] : ['session/attachment', 'session/create', 'session/follow', 'session/page', 'session/prompt', 'session/projections', 'session/selectModel', 'session/updateQueue'],
+  'dsh-api-session-controller': mode === '--fork-only' ? ['session/fork'] : mode === '--search-only' ? ['session/search'] : ['session/attachment', 'session/create', 'session/follow', 'session/page', 'session/prompt', 'session/projections', 'session/selectModel', 'session/updateQueue'],
   'dsh-commands': ['commands/execute', 'commands/list'],
   'dsh-user-questions': ['userQuestions/answer', 'userQuestions/attachWait'],
   'dsh-api-workspace-controller': mode === '--workspace-only'
@@ -29,7 +29,7 @@ const packages = {
 const sources = []
 const methods = {}
 for (const [name, selected] of Object.entries(packages)) {
-  if ((mode === '--session-only' || mode === '--search-only') && name !== 'dsh-api-session-controller') continue
+  if ((mode === '--session-only' || mode === '--search-only' || mode === '--fork-only') && name !== 'dsh-api-session-controller') continue
   if (mode === '--goal-only' && name !== 'dsh-goal') continue
   if (mode === '--schedule-only' && name !== 'dsh-schedule') continue
   if (mode === '--terminal-only' && name !== 'dsh-api-terminal-controller') continue
@@ -62,7 +62,7 @@ for (const [name, selected] of Object.entries(packages)) {
     }
     const result = descriptor.result?.spec?.jsonSchema
     if (descriptor.result?.spec?.jsonSchemaError) methods[endpoint].resultSchemaError = descriptor.result.spec.jsonSchemaError
-    if (result && (mode === '--search-only' || mode === '--workspace-only' || name === 'dsh-goal' || name === 'dsh-schedule' || name === 'dsh-api-terminal-controller' || ['session/create', 'session/selectModel', 'userQuestions/attachWait', 'job/kill'].includes(endpoint))) methods[endpoint].result = result
+    if (result && (mode === '--fork-only' || mode === '--search-only' || mode === '--workspace-only' || name === 'dsh-goal' || name === 'dsh-schedule' || name === 'dsh-api-terminal-controller' || ['session/create', 'session/selectModel', 'userQuestions/attachWait', 'job/kill'].includes(endpoint))) methods[endpoint].result = result
   }
 }
 const result = { version: 1, upstream: { repository: 'https://github.com/deepseek-ai/deepseek-harness', tag: `dsh-v${version}`, commit: commits[version], version }, sources, methods }

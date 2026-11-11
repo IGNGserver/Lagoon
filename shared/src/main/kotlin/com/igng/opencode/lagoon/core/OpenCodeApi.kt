@@ -402,7 +402,31 @@ class OpenCodeApi internal constructor(
     request(archive.endpoint.method, archive.endpoint.path(session), body = JSONObject().put("archived", archived))
   }
   override suspend fun deleteSession(session: Session) { request("DELETE", sessionPath(session.id)) }
-  override suspend fun forkSession(session: Session): Session = dataObject(requestObject("POST", sessionPath(session.id, "/fork"), JSONObject())).toSession()
+  override suspend fun forkSession(session: Session): Session {
+    if (!capabilities().fork) unsupported("服务器未提供会话分叉")
+    return forkSessionOnce(session, JSONObject())
+  }
+
+  override suspend fun forkSession(session: Session, boundary: ForkBoundary): Session {
+    val before = (boundary as? ForkBoundary.OpenCodeBefore)?.messageId
+      ?: throw ApiException(400, "OpenCode 分叉需要原生消息边界")
+    if (before.isBlank() || before.length > 512 || before.any { it.isISOControl() }) {
+      throw ApiException(400, "OpenCode 分叉消息 ID 无效")
+    }
+    if (!capabilities().historicalFork) unsupported("服务器未提供历史消息分叉")
+    // OpenCode copies history BEFORE this message; this is not a DSH event sequence.
+    return forkSessionOnce(session, JSONObject().put("before", before))
+  }
+
+  private suspend fun forkSessionOnce(source: Session, body: JSONObject): Session {
+    // A lost response has an unknown outcome: never retry or emulate this non-idempotent write.
+    val result = dataObject(requestObject("POST", sessionPath(source.id, "/fork"), body))
+    val fork = result.toSession()
+    if (result.sessionInfo().opt("id") !is String || fork.id.isBlank() || fork.id == source.id) {
+      throw ApiException(502, "服务器未确认新的分叉会话，操作结果未知，请检查会话列表后再操作")
+    }
+    return fork
+  }
   override suspend fun abort(session: Session) { request("POST", sessionPath(session.id, "/interrupt")) }
   /**
    * Official compaction admission: a client-minted id makes a repeated tap idempotent, and `steer` runs

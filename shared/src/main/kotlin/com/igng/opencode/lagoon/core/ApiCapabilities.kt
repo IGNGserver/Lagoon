@@ -44,7 +44,9 @@ data class ApiCapabilities(
   /** Native Host workspace registration management, independent of direct/SSH/Remote carrier. */
   val workspaceManagement: Boolean = false,
   /** Native authorized Session content search; no OpenCode route is assumed. */
-  val sessionContentSearch: Boolean = false
+  val sessionContentSearch: Boolean = false,
+  /** Exact native history boundary support; never inferred from whole-history fork or a baseline. */
+  val historicalFork: Boolean = false
 ) {
   fun supports(action: SessionAction) = action in actions
   companion object {
@@ -75,7 +77,7 @@ data class ApiCapabilities(
           ?: value.arr("oneOf").objects().firstOrNull { it.optString("type") != "null" }
         return if (branch != null) schema(branch, depth + 1) else value
       }
-      fun body(op: JSONObject) = schema(op.obj("requestBody").obj("content").obj("application/json").obj("schema"))
+      fun body(op: JSONObject) = schema(schema(op.obj("requestBody")).obj("content").obj("application/json").obj("schema"))
       /** A session route `/api/session/{…}<suffix>` with [method] whose body accepts [fields] and requires nothing else. */
       fun endpoint(suffix: String, method: String, fields: Set<String> = emptySet()): ActionEndpoint? {
         val regex = Regex("^/api/session/\\{[^/}]+\\}" + Regex.escape(suffix) + "$")
@@ -137,9 +139,22 @@ data class ApiCapabilities(
             size != null && listOf("cols", "rows").all { schema(size.obj("properties").obj(it)).str("type") in setOf("number", "integer") } &&
             token != null && emptyBody(token) && ticketHeader && connect != null
         }
+      // Basic fork may predate boundary selection. Advertise history selection only when the
+      // instance itself documents an optional string `before` and also accepts our basic `{}` body.
+      val historicalFork = paths.keys().asSequence().any { path ->
+        if (!Regex("^/api/session/\\{[^/}]+\\}/fork$").matches(path)) return@any false
+        val op = paths.obj(path).optJSONObject("post") ?: return@any false
+        val input = body(op)
+        val before = input.obj("properties").optJSONObject("before") ?: return@any false
+        input.str("type") == "object" && input.arr("required").length() == 0 &&
+          input.optInt("minProperties", 0) == 0 &&
+          (!input.has("maxProperties") || input.optInt("maxProperties", 0) >= 1) &&
+          schema(before).str("type") == "string"
+      }
       return ApiCapabilities(actions, endpoint("/diff", "GET") != null,
         endpoint("/view", "POST", setOf("idle")), archive, documented = true,
-        fork = endpoint("/fork", "POST") != null, stopShell = stopShell, terminal = terminal)
+        fork = endpoint("/fork", "POST") != null, stopShell = stopShell, terminal = terminal,
+        historicalFork = historicalFork)
     }
 
     /**

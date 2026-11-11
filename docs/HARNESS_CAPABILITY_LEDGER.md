@@ -88,6 +88,7 @@
 - DSH session/search 的独立服务器正文搜索面已接入，字面查询、Host可见范围和有界hasMore明确展示；原本首页过滤标明仅本机已加载标题/项目。搜索与点击打开均核对原路由/最新查询，点击才重新读取授权Session目录，不启动Agent或自动导入本机项目。OpenCode内容搜索尚需核对实际官方接口，不将DSH能力外推。
 - 单实例 DshApi 的多个 events() 收集器共享唯一业务事件源，独立有界队列和 JSON 载荷副本，旁观者取消不交还前台提问；最后退出后清理并等待再换代。跨调用者另有显式 DshClientRegistry/factory opt-in 与完整 guarded lease；消息读取、前台提问与监视兴趣隔离，最后 release 才关闭 owner，旧凭据/路由/timeout 不合并；裸构造器保持独立。
 - 三层开关在连接/通知/深链/组合生效；可重叠组合保留同一 leaf 多处引用。原生服务选择不自动启用。
+- 历史分叉：DSH atSeq 精确包含原事件，OpenCode before 精确排除原消息；类型化边界、独立能力、消息级确认和原路由/会话/边界门禁已接入。通用分叉也需确认，unknown mutation 不重发，运行期锁跨重连保留；只读根/子会话核对加人工确认后才可解除。不是回退/恢复等价实现，不承诺跨进程幂等。
 - 后续原生 UI 补齐：DSH bundle/entry 插件、凭据引用和 provider 设置按协议而非 carrier 显示，使用打开时的确切 route 校验；OpenCode 分叉能力由兼容原生 route 发现，回退/恢复有消息级确认且离线/运行/未知活动状态拒绝。目标编辑另已接入官方 revision/ref 与 Long 预算契约，不自动续跑；调度 catalog/history/delete/CAS update 另按官方五方法接入并保留完整记录/原会话/独立时区；rc.5 无公开 create/run/enable，明确不提供。OpenCode simple PTY 原生文本终端业务另已接入，明确创建/附加/输入/终止，离开不 kill，票据一次性且无输入重放；不是完整 VT。DSH Direct/SSH 的 Session scope、retain、双向 mux、snapshot/output/输入与 resize ACK、控制权与文本 UI 已接入；Remote 已复用实际上游 follow/write/resize 兼容层与 harness.terminal.v1，保留 Host 开关/设备归属/attachmentId 与 provider-ACK 语义，固定旧加密 gateway 不重定向输入；无能力时仍明确拒绝。
 - r8 已取得额外真实服务证据：校验官方 v2.2.6 release 二进制的原生直连读取/SSE、真实 JSch→隔离 sshd 的两 binding 共享/关闭隔离、Kotlin Noise→actual Router/Peer→同一官方 daemon 的目录/能力/事件；另有官方 DSH rc.5 全新 WebHost 的 list/workspace/$events。未发模型 prompt、未使用用户现有资料。
 - Host Basic 仅在 Linux 内核证明登记 PID 持有确切对端 socket 后发送；macOS/Windows 暂不支持该证据路径，明确不可用。不将这些 JVM/loopback/fake relay 证据冒充公网 Hub、生产 Host、DSH Desktop 附着或 Android 真机；完整原生能力清单仍需逐项验收。

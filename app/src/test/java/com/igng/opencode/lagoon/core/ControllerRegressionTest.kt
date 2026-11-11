@@ -1270,7 +1270,9 @@ class ControllerRegressionTest {
     MockWebServer().use { s ->
       s.enqueue(MockResponse().setBody("""{"version":"2.0.22"}"""));s.enqueue(MockResponse().setBody("""{"data":{"id":"forked","location":{"directory":"/repo"},"title":"Fork","time":{}}}"""))
       val api=api(s);api.health()
-      val(c,state)=controller(api,LagoonState(serverId="server",connected=true,sessions=listOf(Session("original","/repo","Original",0)),sessionId="original"))
+      val profile = ServerProfile("server", "Native", s.url("/").toString(), allowCleartext = true)
+      val(c,state)=controller(api,LagoonState(profiles=listOf(profile),serverId="server",connected=true,
+        capabilities=ApiCapabilities.BASELINE,sessions=listOf(Session("original","/repo","Original",0)),sessionId="original"))
       c.fork().join();assertEquals("forked",state.value.sessionId);assertTrue(state.value.sessions.any{it.id=="forked"})
     }
   }

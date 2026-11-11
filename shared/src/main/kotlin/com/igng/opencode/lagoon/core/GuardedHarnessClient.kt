@@ -113,6 +113,7 @@ internal class GuardedHarnessClient(private val access: HarnessLeaseAccess) : Ha
     access.useSuspending { it.setArchived(session, archived, now) }
   override suspend fun deleteSession(session: Session): Unit = access.useSuspending { it.deleteSession(session) }
   override suspend fun forkSession(session: Session): Session = access.useSuspending { it.forkSession(session) }
+  override suspend fun forkSession(session: Session, boundary: ForkBoundary): Session = access.useSuspending { it.forkSession(session, boundary) }
   override suspend fun abort(session: Session): Unit = access.useSuspending { it.abort(session) }
   override suspend fun compact(session: Session): Unit = access.useSuspending { it.compact(session) }
   override suspend fun revert(session: Session, messageId: String): Unit = access.useSuspending { it.revert(session, messageId) }

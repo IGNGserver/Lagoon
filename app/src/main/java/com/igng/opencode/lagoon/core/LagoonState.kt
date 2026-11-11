@@ -72,6 +72,8 @@ data class LagoonState(
   val capabilities: ApiCapabilities = ApiCapabilities(),
   val previews: Map<String, SessionPreview> = emptyMap(), val resources: Map<String, ResourceStatus> = emptyMap(),
   val pendingOperations: Set<String> = emptySet(),
+  /** Unknown fork delivery cannot be retried merely by closing and reopening its dialog. */
+  val uncertainForks: List<ForkMutationTarget> = emptyList(),
   val agentChanged: Boolean = false, val modelChanged: Boolean = false,
   /**
    * [draft] is the composer text as last set by the app (restore, queued prompt returned, cleared after
