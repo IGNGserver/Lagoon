@@ -54,6 +54,7 @@ private fun TerminalPanelContent(state: LagoonState, controller: LagoonControlle
   var error by remember { mutableStateOf<String?>(null) }
   var notice by remember { mutableStateOf<String?>(null) }
   val allowed = expected.matches(state) && state.canUseNativeTerminal()
+  val sessionScoped = expected.scope is TerminalScope.Session
   fun load() {
     if (busy || !allowed) return
     busy = true; error = null
@@ -83,13 +84,14 @@ private fun TerminalPanelContent(state: LagoonState, controller: LagoonControlle
     error?.let { Text(it, color = HyperTheme.colors.error, style = MiuixTheme.textStyles.footnote2) }
     when (page) {
       TerminalPanelPage.LIST -> {
-        Text("这是当前位置的原生终端列表，不是此会话专属；可能包含其他客户端创建的终端。打开详情不会自动附加。", style = MiuixTheme.textStyles.footnote2)
+        Text(if (sessionScoped) "这是当前会话的原生终端列表；同一目录的其他会话终端不会混入。打开详情不会附加；明确附加会申请输入控制并使旧客户端只读。"
+          else "这是当前位置的原生终端列表，不是此会话专属；可能包含其他客户端创建的终端。打开详情不会自动附加。", style = MiuixTheme.textStyles.footnote2)
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
           HyperButton("刷新列表", ::load, enabled = allowed && !busy, loading = busy, variant = HyperButtonVariant.SECONDARY)
           HyperButton("新建终端…", { error = null; notice = null; page = TerminalPanelPage.CREATE_CONFIRM }, enabled = allowed && !busy)
         }
         if (busy && !loaded) Text("正在读取终端列表…", style = MiuixTheme.textStyles.footnote2)
-        if (loaded && terminals.isEmpty() && error == null && !busy) Text("服务器返回的此位置终端列表为空；不会自动新建。", style = MiuixTheme.textStyles.footnote2)
+        if (loaded && terminals.isEmpty() && error == null && !busy) Text("服务器返回的${if (sessionScoped) "此会话" else "此位置"}终端列表为空；不会自动新建。", style = MiuixTheme.textStyles.footnote2)
         LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(10.dp)) {
           items(terminals, key = { it.id }) { terminal ->
             Column(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalArrangement = Arrangement.spacedBy(3.dp)) {
@@ -107,7 +109,9 @@ private fun TerminalPanelContent(state: LagoonState, controller: LagoonControlle
         Column(Modifier.weight(1f).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
           Text("新建终端会启动远程 shell", style = MiuixTheme.textStyles.body1)
           Text("警告：shell 直接执行你的输入，绕过 Agent 的审批和安全确认，可能修改或删除文件、访问凭据和网络。不要粘贴不可信命令。", color = HyperTheme.colors.warning, style = MiuixTheme.textStyles.body2)
-          Text("目标：${expected.profile.name}\n目录：${expected.directory}\n终端属于位置，不属于会话；离开面板仅分离连接，不会终止它。创建成功后仍需手动附加。", style = MiuixTheme.textStyles.body2)
+          Text("目标：${expected.profile.name}\n目录：${expected.directory}\n" +
+            (if (sessionScoped) "终端属于当前会话 ${expected.sessionId}，不会按目录选择其他会话。" else "终端属于位置，不属于会话。") +
+            "离开面板仅分离连接，不会终止它。创建成功后仍需手动附加。", style = MiuixTheme.textStyles.body2)
           HyperButton("确认启动新终端", {
             if (!allowed || busy) return@HyperButton
             busy = true; error = null
@@ -170,34 +174,47 @@ private fun TerminalDetail(
   var deliveryUncertain by remember { mutableStateOf(false) }
   var draft by remember { mutableStateOf("") }
   var lastSubmitted by remember { mutableStateOf<String?>(null) }
-  var cols by remember { mutableStateOf("80") }
-  var rows by remember { mutableStateOf("24") }
+  var lastSubmittedSequence by remember { mutableStateOf<Long?>(null) }
+  var cols by remember { mutableStateOf((terminal.cols ?: 80).toString()) }
+  var rows by remember { mutableStateOf((terminal.rows ?: 24).toString()) }
   val allowed = expected.matches(state) && state.canUseNativeTerminal()
-  val running = terminal.status == "running" && terminal.exitCode == null
+  val sessionScoped = expected.scope is TerminalScope.Session
+  val current = stream.info ?: terminal
+  val running = current.status == "running" && current.exitCode == null
   val channel = attachment
   // Read the current attachment at disposal, including one assigned before its first recomposition.
   DisposableEffect(Unit) { onDispose { attachment?.close() } } // Detach only, never DELETE.
   LaunchedEffect(channel) {
     if (channel != null) channel.state.collect { stream = it }
   }
-  LaunchedEffect(allowed, stream.connected, stream.ended, stream.inputDeliveryUnknown) {
-    if (!allowed || !stream.connected || stream.ended || stream.inputDeliveryUnknown) inputEnabled = false
-    if (stream.inputDeliveryUnknown) {
+  LaunchedEffect(allowed, stream.connected, stream.ended, stream.inputDeliveryUnknown, stream.writable,
+    stream.inputRefusal, stream.acknowledgedSequence, lastSubmittedSequence, lastSubmitted) {
+    if (!allowed || !stream.connected || stream.ended || stream.inputDeliveryUnknown || !stream.writable) {
+      inputEnabled = false; enableInputPrompt = false
+    }
+    val receipt = terminalReceipt(stream, lastSubmittedSequence)
+    if (stream.inputDeliveryUnknown || (sessionScoped && receipt in setOf(TerminalReceipt.REFUSED, TerminalReceipt.UNKNOWN))) {
       deliveryUncertain = true
       if (draft.isEmpty()) lastSubmitted?.let { draft = it }
+    } else if (sessionScoped && receipt == TerminalReceipt.ACCEPTED) {
+      lastSubmitted = null; lastSubmittedSequence = null
+      notice = "服务器已确认接收上次输入；这不代表命令执行完成。"
     }
     if (!allowed) { attachment?.close(); attachment = null; enableInputPrompt = false }
   }
-  val sendAllowed = allowed && inputEnabled && stream.ready && stream.connected && !stream.ended &&
-    !stream.inputDeliveryUnknown && !deliveryUncertain && channel != null
+  val sendAllowed = allowed && inputEnabled && stream.writable && stream.ready && stream.connected && !stream.ended &&
+    !stream.inputDeliveryUnknown && !deliveryUncertain && channel != null && (!sessionScoped || stream.pendingInputs == 0)
   fun send() {
     if (!sendAllowed || channel == null || draft.isEmpty()) return
     val submitted = draft
     try {
+      val live = channel.state.value
+      val sequence = if (sessionScoped) live.acknowledgedSequence + live.pendingInputs + 1L else null
       if (channel.sendText(submitted + "\r")) {
-        lastSubmitted = submitted
+        lastSubmitted = submitted; lastSubmittedSequence = sequence
         draft = ""
-        notice = "已交给连接发送（不是远程执行确认）。"
+        notice = if (sessionScoped) "输入已在本机排队，等待服务器 ACK；尚未确认接收，更不代表执行完成。"
+          else "已交给连接发送（不是远程执行确认）。"
       } else {
         deliveryUncertain = true; inputEnabled = false
         notice = "输入未确认送达，已保留草稿。请手动核对远程结果；不会自动重试。"
@@ -210,15 +227,17 @@ private fun TerminalDetail(
     }
   }
   Column(modifier.fillMaxWidth().verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-    Text("${terminal.title.ifBlank { terminal.id }} · ${terminal.status}", style = MiuixTheme.textStyles.body2)
-    Text("ID：${terminal.id} · PID：${terminal.pid}\n${terminal.directory}", style = MiuixTheme.textStyles.footnote2)
-    if (terminal.exitCode != null) Text("退出码：${terminal.exitCode}。已结束终端不会自动重建。", style = MiuixTheme.textStyles.footnote2)
+    Text("${current.title.ifBlank { current.id }} · ${current.status}", style = MiuixTheme.textStyles.body2)
+    Text("ID：${current.id} · PID：${if (current.pidKnown) current.pid.toString() else "未知（服务器未提供）"}\n位置：${current.directory}\n实际工作目录：${current.cwd}", style = MiuixTheme.textStyles.footnote2)
+    if (current.cols != null && current.rows != null) Text("服务器视口：${current.cols} 列 × ${current.rows} 行", style = MiuixTheme.textStyles.footnote2)
+    if (current.exitCode != null) Text("退出码：${current.exitCode}。已结束终端不会自动重建。", style = MiuixTheme.textStyles.footnote2)
     Text("仅 ANSI 纯文本投影，不是完整 VT / 全屏终端；进度和光标布局可能不完整。输出不进入 Agent 聊天。", style = MiuixTheme.textStyles.footnote2)
     error?.let { Text(it, color = HyperTheme.colors.error, style = MiuixTheme.textStyles.footnote2) }
     notice?.let { Text(it, style = MiuixTheme.textStyles.footnote2) }
     if (attachment == null) {
-      Text("附加只读取此终端；OpenCode 允许多个客户端同时附加，不提供独占控制。不存在 / 已结束时只报错，不会改附加其他终端或自动创建。", style = MiuixTheme.textStyles.footnote2)
-      HyperButton("明确附加此终端", {
+      Text(if (sessionScoped) "注意：附加并申请输入控制会立即接管服务器输入权，使之前的客户端只读；即使这里尚未启用本机输入，也已接管。分离不会把控制权还给旧客户端。只在你明确需要时附加；不会自动附加、重连或抢回控制。"
+        else "附加先保持本机只读；OpenCode 允许多个客户端同时附加，不提供独占控制。不存在 / 已结束时只报错，不会改附加其他终端或自动创建。", style = MiuixTheme.textStyles.footnote2)
+      HyperButton(if (sessionScoped) "附加并申请输入控制" else "明确附加此终端", {
         if (busy || !allowed || !running) return@HyperButton
         busy = true; error = null
         scope.launch {
@@ -237,13 +256,32 @@ private fun TerminalDetail(
     } else {
       Text(when {
         stream.ended -> "终端已结束；不会自动新建。"
-        stream.connected && stream.ready -> if (inputEnabled) "已附加 · 已允许本机输入（非独占）" else "已附加 · 本机只读"
+        stream.connected && stream.ready && !stream.writable -> "已附加 · 服务器只读（输入控制已被其他客户端接管）"
+        stream.connected && stream.ready -> if (inputEnabled) {
+          if (sessionScoped) "已附加 · 当前持有输入控制 · 已允许本机输入" else "已附加 · 已允许本机输入（非独占）"
+        } else if (sessionScoped) "已附加 · 当前持有输入控制 · 本机输入未启用" else "已附加 · 本机只读"
         stream.connected -> "连接中，等待就绪…"
         else -> "连接已断开；不会自动重连、重发或回放输入。"
       }, style = MiuixTheme.textStyles.footnote2)
       stream.error?.let { Text(it, color = HyperTheme.colors.error, style = MiuixTheme.textStyles.footnote2) }
+      if (sessionScoped && !stream.writable) Text("不会自动夺回控制；若要重新输入，须先分离，再明确点击“附加并申请输入控制”。新客户端分离也不会恢复这里的旧控制权。", color = HyperTheme.colors.warning, style = MiuixTheme.textStyles.footnote2)
+      if (sessionScoped) Text("等待 ACK：${stream.pendingInputs} 项 · 已确认序号：${stream.acknowledgedSequence}（仅接收确认，不是执行完成）", style = MiuixTheme.textStyles.footnote2)
+      stream.inputRefusal?.let { Text("服务器拒绝了输入：$it。请手动核对上次草稿和远程结果；不会自动重发。", color = HyperTheme.colors.warning, style = MiuixTheme.textStyles.footnote2) }
       HyperTextAction("分离连接（保留进程）", {
-        attachment?.close(); attachment = null; inputEnabled = false; enableInputPrompt = false
+        val closing = attachment
+        closing?.close()
+        // Capture the synchronous final state before disposing its collector. A pending input must
+        // not become silently resendable merely because the null-channel effect wins scheduling.
+        closing?.state?.value?.let { finalState ->
+          stream = finalState
+          if (finalState.inputDeliveryUnknown || (sessionScoped && terminalReceipt(finalState, lastSubmittedSequence)
+            in setOf(TerminalReceipt.REFUSED, TerminalReceipt.UNKNOWN))) {
+            deliveryUncertain = true
+            if (draft.isEmpty()) lastSubmitted?.let { draft = it }
+            lastSubmittedSequence = null // A later attachment's ACK numbers belong to another generation.
+          }
+        }
+        attachment = null; inputEnabled = false; enableInputPrompt = false
       }, enabled = !busy)
     }
     if (stream.truncated) Text("原始输出已截断；仅展示保留片段，行首或转义序列可能不完整。", color = HyperTheme.colors.warning, style = MiuixTheme.textStyles.footnote2)
@@ -258,13 +296,13 @@ private fun TerminalDetail(
       HyperTextAction("我已手动核对（不重发）", { deliveryUncertain = false; notice = "已记录核对；仍需重新确认启用输入。" }, enabled = !stream.inputDeliveryUnknown)
     }
     if (enableInputPrompt) {
-      Text("允许输入？shell 绕过 Agent 审批；可能有其他客户端同时输入，不保证独占。发送按钮会将这一行原样加回车提交。", color = HyperTheme.colors.warning, style = MiuixTheme.textStyles.footnote2)
+      Text("允许本机输入？shell 绕过 Agent 审批；" + (if (sessionScoped) "当前服务器授予的输入权仍可能被其他客户端接管。" else "可能有其他客户端同时输入，不保证独占。") + "发送按钮会将这一行原样加回车提交。", color = HyperTheme.colors.warning, style = MiuixTheme.textStyles.footnote2)
       Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        HyperButton("确认启用输入", { inputEnabled = true; enableInputPrompt = false }, enabled = allowed && stream.connected && stream.ready && !stream.ended && !deliveryUncertain && !stream.inputDeliveryUnknown)
+        HyperButton("确认启用输入", { inputEnabled = true; enableInputPrompt = false }, enabled = allowed && stream.writable && stream.connected && stream.ready && !stream.ended && !deliveryUncertain && !stream.inputDeliveryUnknown)
         HyperTextAction("取消", { enableInputPrompt = false })
       }
     } else if (inputEnabled) HyperTextAction("关闭输入权限", { inputEnabled = false })
-    else HyperTextAction("启用输入…", { enableInputPrompt = true }, enabled = allowed && attachment != null && stream.connected && stream.ready && !stream.ended && !deliveryUncertain && !stream.inputDeliveryUnknown)
+    else HyperTextAction("启用输入…", { enableInputPrompt = true }, enabled = allowed && attachment != null && stream.writable && stream.connected && stream.ready && !stream.ended && !deliveryUncertain && !stream.inputDeliveryUnknown)
     TextField(draft, { next ->
       if (next.length <= 16_384 && next.none(Char::isISOControl)) draft = next
       else notice = "仅接受单行文本，最多 16384 字符；含控制符或多行的输入未采用，请检查后手动输入。"
@@ -273,23 +311,35 @@ private fun TerminalDetail(
       HyperButton("发送 + 回车", ::send, enabled = sendAllowed && draft.isNotEmpty())
       HyperTextAction("复制草稿", { clipboard.setText(AnnotatedString(draft)) }, enabled = draft.isNotEmpty())
     }
-    // No automatic layout resize: OpenCode's viewport is shared with other attachments.
+    // No automatic layout resize. DSH orders it on the explicitly acquired input channel.
+    val columnRange = if (sessionScoped) 2..512 else 1..512
+    val resizeAllowed = allowed && running && !stream.ended && !busy && (!sessionScoped ||
+      (channel != null && stream.connected && stream.ready && stream.writable && inputEnabled && !deliveryUncertain && !stream.inputDeliveryUnknown))
     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
       TextField(cols, { cols = it.filter(Char::isDigit).take(4) }, label = "列", singleLine = true, modifier = Modifier.weight(1f))
       TextField(rows, { rows = it.filter(Char::isDigit).take(4) }, label = "行", singleLine = true, modifier = Modifier.weight(1f))
       HyperButton("调整", {
         val width = cols.toIntOrNull(); val height = rows.toIntOrNull()
-        if (!allowed || busy || width == null || height == null || width !in 1..512 || height !in 1..200) return@HyperButton
+        if (!resizeAllowed || width == null || height == null || width !in columnRange || height !in 1..200) return@HyperButton
         busy = true; error = null
         scope.launch {
-          try { controller.resizeTerminal(expected, terminal.id, width, height); notice = "已提交共享视口尺寸。" }
+          try {
+            if (sessionScoped) {
+              notice = if (channel?.resize(width, height) == true) "尺寸已在本机排队，等待服务器 ACK；以服务器视口为准。"
+                else "尺寸未被连接接收；请核对控制权和服务器视口，不会自动重试。"
+            } else {
+              stream = stream.copy(info = controller.resizeTerminal(expected, terminal.id, width, height))
+              notice = "已提交共享视口尺寸。"
+            }
+          }
           catch (cancelled: CancellationException) { throw cancelled }
           catch (failure: Exception) { error = failure.message ?: "调整尺寸失败" }
           finally { busy = false }
         }
-      }, enabled = allowed && running && !stream.ended && !busy && cols.toIntOrNull() in 1..512 && rows.toIntOrNull() in 1..200, loading = busy, variant = HyperButtonVariant.SECONDARY)
+      }, enabled = resizeAllowed && cols.toIntOrNull() in columnRange && rows.toIntOrNull() in 1..200, loading = busy, variant = HyperButtonVariant.SECONDARY)
     }
-    Text("手动调整共享视口（列 1–512、行 1–200）会影响其他附加客户端；不会自动调整。", style = MiuixTheme.textStyles.footnote2)
+    Text("手动调整共享视口（列 ${columnRange.first}–512、行 1–200）会影响其他附加客户端；不会自动调整。" +
+      (if (sessionScoped) "须已附加、持有服务器输入权且已明确启用本机输入；不走 HTTP 调整。" else ""), style = MiuixTheme.textStyles.footnote2)
     HyperTextAction("终止并删除…", onTerminate, enabled = allowed && !busy, danger = true)
   }
 }

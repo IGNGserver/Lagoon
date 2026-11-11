@@ -143,6 +143,13 @@ internal class SshDshClient(
 
   override suspend fun shells(directory: String): List<ShellJob> = api().shells(directory)
 
+  override suspend fun terminals(scope: TerminalScope): List<NativeTerminal> = api().terminals(scope)
+  override suspend fun createTerminal(scope: TerminalScope): NativeTerminal = api().createTerminal(scope)
+  override suspend fun resizeTerminal(scope: TerminalScope, id: String, cols: Int, rows: Int): NativeTerminal = api().resizeTerminal(scope, id, cols, rows)
+  override suspend fun renameTerminal(scope: TerminalScope, id: String, title: String): NativeTerminal = api().renameTerminal(scope, id, title)
+  override suspend fun closeTerminal(scope: TerminalScope, id: String) = api().closeTerminal(scope, id)
+  override suspend fun attachTerminal(scope: TerminalScope, id: String): TerminalAttachment = api().attachTerminal(scope, id)
+
   override suspend fun terminals(directory: String): List<NativeTerminal> = api().terminals(directory)
   override suspend fun createTerminal(directory: String): NativeTerminal = api().createTerminal(directory)
   override suspend fun resizeTerminal(directory: String, id: String, cols: Int, rows: Int): NativeTerminal =

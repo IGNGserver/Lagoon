@@ -64,6 +64,22 @@ class RemoteConversationTest {
   private fun sessionRow(id: String) = JSONObject().put("sessionId", id).put("updatedAt", 100)
     .put("running", false).put("cwd", "/repo")
 
+  @Test fun legacyRemoteNeverAdvertisesOrSendsSessionTerminalBeforeBidirectionalCapabilityNegotiation() = runBlocking {
+    FakeRemoteHost().use { host ->
+      host.start()
+      val (session, backend) = backend(host)
+      try {
+        assertTrue(!backend.client.capabilities().terminal)
+        val owner = TerminalScope.Session("session", "/same-directory")
+        assertTrue(runCatching { backend.client.terminals(owner) }.isFailure)
+        assertTrue(runCatching { backend.client.createTerminal(owner) }.isFailure)
+        assertTrue(runCatching { backend.client.attachTerminal(owner, "terminal") }.isFailure)
+        assertTrue(host.rpcCalls.none { it.optString("method").startsWith("terminal/") || it.toString().contains("terminal/attach") })
+        assertTrue(host.streamOpens.none { it.optString("endpoint").startsWith("terminal/") })
+      } finally { backend.close(); session.close() }
+    }
+  }
+
   @Test fun loadsConversationFromRemoteStream() = runBlocking {
     val id = "session-${UUID.randomUUID()}"
     FakeRemoteHost().use { host ->

@@ -20,8 +20,13 @@ internal object OfficialDshContract {
     input.bufferedReader().use { JSONObject(it.readText()) }
   }
 
+  private val terminalFixture: JSONObject by lazy {
+    val input = requireNotNull(javaClass.classLoader?.getResourceAsStream("dsh-0.2.1-rc.5-terminal-contract.json"))
+    input.bufferedReader().use { JSONObject(it.readText()) }
+  }
+
   fun schema(endpoint: String): JSONObject =
-    (when { endpoint.startsWith("goals/") -> goalFixture; endpoint.startsWith("schedule/") -> scheduleFixture; else -> fixture })
+    (when { endpoint.startsWith("goals/") -> goalFixture; endpoint.startsWith("schedule/") -> scheduleFixture; endpoint.startsWith("terminal/") -> terminalFixture; else -> fixture })
       .getJSONObject("methods").getJSONObject(endpoint)
   fun schema(endpoint: String, version: String): JSONObject {
     if (version == "0.2.1-rc.5") return schema(endpoint)
@@ -29,7 +34,7 @@ internal object OfficialDshContract {
     val input = requireNotNull(javaClass.classLoader?.getResourceAsStream("dsh-0.2.2-rc.1-session-contract.json"))
     return input.bufferedReader().use { JSONObject(it.readText()) }.getJSONObject("methods").getJSONObject(endpoint)
   }
-  fun has(endpoint: String): Boolean = fixture.getJSONObject("methods").has(endpoint) || goalFixture.getJSONObject("methods").has(endpoint) || scheduleFixture.getJSONObject("methods").has(endpoint)
+  fun has(endpoint: String): Boolean = fixture.getJSONObject("methods").has(endpoint) || goalFixture.getJSONObject("methods").has(endpoint) || scheduleFixture.getJSONObject("methods").has(endpoint) || terminalFixture.getJSONObject("methods").has(endpoint)
   fun upstream(): JSONObject = fixture.getJSONObject("upstream")
 
   fun assertResult(endpoint: String, value: Any?) {

@@ -274,10 +274,36 @@ class DshApi(
 
   override val isClosed: Boolean get() = closing.get() || closed || remoteBackend?.isClosed == true
 
-  override fun capabilities(): ApiCapabilities = if (remoteBackend == null) CAPABILITIES else CAPABILITIES.copy(diff = false)
+  override fun capabilities(): ApiCapabilities = if (remoteBackend == null) CAPABILITIES else CAPABILITIES.copy(diff = false, terminal = false)
+
+  private val terminalApiDelegate = lazy { DshTerminalApi(
+    call = { endpoint, args ->
+      require(remoteBackend == null) { "当前 Remote Host 未协商双向终端能力" }
+      call(endpoint, RpcPayload(JSONObject().put("args", args)), retried = true)
+    },
+    open = { endpoint, args, onItem, onClosed ->
+      require(remoteBackend == null) { "当前 Remote Host 未协商双向终端能力" }
+      openMux(endpoint, RpcPayload(JSONObject().put("args", args)), onItem, onClosed)
+    }, ownerClosed = { isClosed }
+  ) }
+  private fun sessionTerminal(scope: TerminalScope): TerminalScope.Session {
+    check(remoteBackend == null) { "当前 Remote Host 未协商双向终端能力" }
+    return scope as? TerminalScope.Session ?: throw ApiException(400, "DSH 终端必须指定原会话，不能从目录推断")
+  }
+  override suspend fun terminals(scope: TerminalScope): List<NativeTerminal> = terminalApiDelegate.value.terminals(sessionTerminal(scope))
+  override suspend fun createTerminal(scope: TerminalScope): NativeTerminal = terminalApiDelegate.value.createTerminal(sessionTerminal(scope))
+  override suspend fun attachTerminal(scope: TerminalScope, id: String): TerminalAttachment = terminalApiDelegate.value.attachTerminal(sessionTerminal(scope), id)
+  override suspend fun closeTerminal(scope: TerminalScope, id: String) = terminalApiDelegate.value.closeTerminal(sessionTerminal(scope), id)
+  override suspend fun renameTerminal(scope: TerminalScope, id: String, title: String): NativeTerminal {
+    val owner = sessionTerminal(scope)
+    terminalApiDelegate.value.renameTerminal(owner, id, title)
+    return terminalApiDelegate.value.terminals(owner).singleOrNull { it.id == id }
+      ?: throw ApiException(409, "终端改名已返回，但当前清单无法确认；请重新读取，不会重放")
+  }
 
   override fun close() {
     if (closed || !closing.compareAndSet(false, true)) return
+    if (terminalApiDelegate.isInitialized()) terminalApiDelegate.value.close()
     if (questionCoordinatorDelegate.isInitialized()) {
       questionCoordinator.close()
       if (!questionCoordinator.hasPendingSettlements()) { closeTransportAfterQuestions(); return }
@@ -1311,6 +1337,18 @@ class DshApi(
 
     private fun cancelLogical(id: String) = finishLogical(id, null, cancel = true)
 
+    /** No buffering, reconnect, or replay: uplink belongs only to this live logical stream. */
+    private fun sendLogical(id: String, state: MuxLogicalState, text: String): Boolean {
+      if (state.endpoint != "terminal/attach" || text.toByteArray(Charsets.UTF_8).size > 256 * 1024) return false
+      val value = try { JSONObject(text) } catch (_: Exception) { return false }
+      if (value.optString("type") !in setOf("write", "resize")) return false
+      synchronized(lock) {
+        if (ownerClosed || closed || streams[id] !== state || pendingOpens.containsKey(id) || activeGeneration == null) return false
+        val socket = physical ?: return false
+        return socket.send(JSONObject().put("type", "item").put("streamId", id).put("value", value).toString())
+      }
+    }
+
     private fun failPhysical(attempt: Long, error: Throwable) {
       val states: List<MuxLogicalState>
       val socket: WebSocket?
@@ -1353,7 +1391,7 @@ class DshApi(
       private val finished = java.util.concurrent.atomic.AtomicBoolean(false)
       override fun request(): Request = Request.Builder().url(base).build()
       override fun queueSize(): Long = physical?.queueSize() ?: 0L
-      override fun send(text: String): Boolean = false
+      override fun send(text: String): Boolean = !finished.get() && owner.sendLogical(id, state, text)
       override fun send(bytes: okio.ByteString): Boolean = false
       override fun close(code: Int, reason: String?): Boolean { cancel(); return true }
       override fun cancel() {
@@ -4242,7 +4280,8 @@ class DshApi(
       deleteSession = false,
       fork = true,
       jobOutputStream = true,
-      stopShell = true
+      stopShell = true,
+      terminal = true
     )
 
     /** Capabilities for a tunneled SSH client created before its DshApi instance exists. */

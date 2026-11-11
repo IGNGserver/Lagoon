@@ -31,6 +31,43 @@ import java.util.concurrent.atomic.AtomicInteger
 
 /** Regression for the one-API-Peer/one-physical-socket DSH mux contract. */
 class DshMuxOwnershipTest {
+  @Test fun terminalInputIsWrappedAsItemValueAndNeverReplayedAcrossPhysicalGenerations() = runBlocking {
+    MuxFixture().use { fixture ->
+      val terminal = fixture.open("terminal/attach")
+      terminal.item()
+      val command = JSONObject().put("type", "write").put("sequence", 1).put("data", "echo test\r")
+      assertTrue(terminal.socket.send(command.toString()))
+      val frame = withTimeout(5_000) { fixture.uplinks.receive() }
+      assertEquals("item", frame.getString("type"))
+      assertEquals(fixture.id("terminal/attach"), frame.getString("streamId"))
+      assertEquals("echo test\r", frame.getJSONObject("value").getString("data"))
+      assertFalse(frame.has("payload")); assertFalse(frame.has("data"))
+      val old = fixture.clientSocket()
+      fixture.listener(old).onFailure(old, IOException("drop"), null)
+      withTimeout(5_000) { terminal.closed.await() }
+      assertFalse(terminal.socket.send(command.toString()))
+      val replacement = fixture.open("terminal/attach")
+      replacement.item()
+      assertFalse(terminal.socket.send(command.toString()))
+      assertTrue(fixture.uplinks.tryReceive().isFailure)
+      assertFalse(replacement.socket.send("{\"type\":\"unexpected\"}"))
+      replacement.socket.cancel()
+      assertFalse(replacement.socket.send(command.toString()))
+    }
+  }
+
+  @Test fun readOnlyLogicalStreamsDoNotGainGenericUplinkCapability() = runBlocking {
+    MuxFixture().use { fixture ->
+      val reader = fixture.open("workspace/follow"); reader.item()
+      assertFalse(reader.socket.send("{\"type\":\"write\",\"sequence\":1,\"data\":\"x\"}"))
+      val terminal = fixture.open("terminal/attach"); terminal.item()
+      assertFalse(terminal.socket.send("not json"))
+      assertFalse(terminal.socket.send(okio.ByteString.of(0x78.toByte())))
+      assertFalse(terminal.socket.send("{\"type\":\"write\",\"data\":\"${"x".repeat(256 * 1024)}\"}"))
+      assertTrue(fixture.uplinks.tryReceive().isFailure)
+    }
+  }
+
   @Test fun twoLogicalStreamsShareOneSocketAndCancelIsolatedStream() = runBlocking {
     MuxFixture().use { fixture ->
       val a = fixture.open("stream-a")
@@ -247,6 +284,7 @@ class DshMuxOwnershipTest {
     val cookieExchanges = AtomicInteger()
     val opened = ConcurrentHashMap<String, String>()
     val cancellations = Channel<String>(Channel.UNLIMITED)
+    val uplinks = Channel<JSONObject>(Channel.UNLIMITED)
     @Volatile lateinit var peer: WebSocket
     val api: DshApi
 
@@ -280,6 +318,7 @@ class DshMuxOwnershipTest {
                     webSocket.send(itemFrame(id, "first"))
                   }
                   "cancel" -> cancellations.trySend(frame.str("streamId"))
+                  "item" -> uplinks.trySend(frame)
                 }
               }
             })

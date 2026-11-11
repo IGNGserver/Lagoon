@@ -72,7 +72,9 @@
 - rc.5 generated 仅公开上述5种调度方法，没有公开 create/run/enable，不能将内部服务方法或 Agent tool 冒充客户端 API。
 - r12：OpenCode simple PTY 的原生业务模型/目录/明确创建/单次票据附着/输入/尺寸与标题更新/明确终止接入 Direct/SSH/Remote native service；能力仅从兼容路由和票据 header 声明发现，baseline 不假定支持。纯文本 ANSI 投影、OSC/clipboard 控制序列抑制，不宣称完整 VT/TUI。
 - 终端以 location 归属，不冒充 Session 资源。UI 默认只读，明确附加/输入确认；离开仅 detach，只有确认终止才 DELETE。原路由/会话/目录捕获并按输入逐次许可；原始 UTF-8 无 ACK，游标按 UTF-16，输入不自动重放/重连。Host 仅在原生 POST /api/pty/{id}/connect-token 放行 x-opencode-ticket:1。
-- DSH terminal API 已核实存在，但 Direct/SSH 双向 mux 业务和 Remote 能力协商/上行桥接仍未实现；当前不能按 harness.remote.v3 推断支持。未跑 Android 真机布局、可访问性、预测式返回；当前仅源码与 Compose 编译验收。
+- r13：DSH Direct/SSH Session 归属终端已接入，不能从目录推断 Session；与 OpenCode location scope 明确区分。同目录会话不会串用终端，PID 未提供则显示未知，实际 cwd 单独展示。
+- retain 确认后才 attach，首帧 snapshot/后续 output/ACK 按官方序号验证；write/resize 共用序号和 UTF-8/编码帧预算，ACK 仅代表 provider 接收，不冒充执行完成。附加明确提示立即夺取输入控制，旧附着只读，新附着退出不自动恢复旧控制；断线/未确认输入不重放，关闭页面只 cancel 附着与 hold。
+- UI 还保留本机输入确认，拒绝 ACK 即使序号前进也恢复草稿并提示核对；显式分离同步记录未确认状态，避免收集器调度丢失提示。Direct/SSH 官方终端实测已通过；Remote 双向终端桥与 capability 协商仍未实现，保持 terminal=false 且不发送 terminal/*，不能按 harness.remote.v3 推断支持。未跑 Android 真机布局、可访问性、预测式返回。
 
 ### 阶段 7：验证与交付仍进行中
 - 本地 fake Hub/实际 Noise/真实 Node connector 互操作不等于公网 Hub、真实官方 daemon 或 Android 真机验收。
@@ -134,5 +136,10 @@
 - `pty-connector-full-build.log` 固定上游完整 Host plugin bundle 4,029,973 bytes，SHA-256 `701a39fa59835b3b9274cbd9476b2065c892b18b48ce2d2c1e646a285208d64a`；`pty-host-router-final.log` peer16 + actual Router5 共21项通过。x-opencode-ticket仅精确POST票据路由允许，其他方法/路径/值与流头拒绝。
 - `terminal-full.log` 全量仅失败旧 ChatSheet 枚举逐字断言；改为仍核对 ACTIVITY 枚举成员并保留半屏高度/入口/返回语义断言。`terminal-final.log`：**1352 tests、0 failures、0 errors、7 skipped**，Debug assemble 成功119s；官方 Direct PTY、真实 SSH PTY、actual Noise PTY 均实际运行未跳过。新增 adapter12、文本投影6、位置/路由门禁2、Controller4、Remote header1、官方 PTY1项。APK 21,915,479 bytes，SHA-256 `e288128d2cd7d77089790928a6764fc25a93686a778a1fd51a804e8e8ec1c343`。
 - PTY 测试仅在全新 HOME/XDG/固定 scratch 工作目录创建默认 shell 或 /bin/cat，发送固定 printf 探针，无模型调用或用户项目命令；目录 PTY 列表核对为空后停止本任务拥有的随机 loopback OpenCode/sshd，不终止用户现有服务。不是公网/Android 真机或完整 VT 验收。
+- r13 固定导出官方 rc.5 terminal 的8方法 named args，generated 源 SHA-256 `3377602ada84e2de6ec192b200e7ba02ee5051fb05cf4a014b2504b63e1ace10`；adapter fake 的每个调用也用这些 schema 校验。Direct/SSH 的 item.value、retain/snapshot、UTF-8/编码预算、连续输出/ACK、拒绝/未知结果、关闭不杀进程有14个业务状态机和2个 mux 上行回归。
+- `dsh-terminal-first.log` 首轮 scope/mux/schema 通过16s；`dsh-terminal-official.log` 官方 Direct 终端通过，但4项旧 Controller fake 因 Kotlin 委托没有重载新 scope 方法而失败/超时；修正 fake 而不放松门禁。`dsh-terminal-frozen.log` 冻结后的 adapter/schema/Controller/Remote gate/官方服务通过19s；`dsh-terminal-ssh.log` 真实 pinned JSch/sshd 上相同 ACK/控制权用例通过4s。
+- 独立复核未发现新增明确高风险项；额外修复 ACK 与超时竞争（按过期序号在结束锁内重核对）、拒绝 ACK 序号前进却被 UI 当成功、分离 pending 时收集器交接与快速 ACK 先到 UI 不更新等边界。增加3个回执状态纯逻辑测试，不把接收确认冒充执行完成。
+- `dsh-terminal-full.log`：1380项0失败/0错误/11跳过，Debug126s。`dsh-terminal-final.log`：**1380 tests、0 failures、0 errors、11 skipped**，Debug assemble 成功121s；官方 DSH Direct 与真实 pinned SSH 终端2项均实际运行0跳过，fixture Noise3项运行，先前停止的 OpenCode/DSH只读 opt-in 不冒充重跑。APK 21,945,880 bytes，SHA-256 `e8bd4f2ebb3f34a73c8a67b16a4f88d63a7bc092d91eb3a9407d3e267c31d78e`。
+- DSH 终端验收用全新 scratch HOME/DSH_HOME、随机 loopback WebHost/sshd，新建测试会话与 shell，仅固定 printf 探针，无模型 prompt；每个终端显式关闭并读回空列表后停止本任务服务。没有操作用户 port3080/SSH配置/现有会话。未提供的 Remote 终端能力仍保留明确拒绝与0 terminal/*发送回归。
 - 全部构建在 `/home/lvziw/.build/Lagoon/unified-harness-connections/source`，Gradle/build 输出在 `~/.build`。源码工作树无 app/build、node_modules。
 - `wt audit`：29 repos，0 missing dirs，3 detached、4 merged worktrees 属其他任务；只读报告，无清理。

@@ -17,6 +17,27 @@ class TerminalTargetTest {
     assertFalse(TerminalTarget(profile, "session", "/different").matches(state()))
   }
 
+  @Test fun scopeSeparatesDshSessionsEvenWhenTheirDirectoriesMatch() {
+    val dsh = profile.copy(kind = ServerKind.DSH)
+    val first = TerminalTarget(dsh, "first", "/repo")
+    val second = TerminalTarget(dsh, "second", "/repo")
+    assertEquals(TerminalScope.Session("first", "/repo"), first.scope)
+    assertEquals(TerminalScope.Session("second", "/repo"), second.scope)
+    assertNotEquals(first.scope, second.scope)
+    assertEquals(TerminalScope.Session("first", "/repo"), first.copy(profile = dsh.copy(kind = ServerKind.DSH_REMOTE)).scope)
+    assertEquals(TerminalScope.Location("/repo"), first.copy(profile = profile).scope)
+  }
+
+  @Test fun sameDirectoryCannotMakeDshTargetMatchAnotherConversation() {
+    val dsh = profile.copy(kind = ServerKind.DSH)
+    val live = state().copy(profiles = listOf(dsh), sessionId = "first",
+      sessions = listOf(Session("first", "/repo", "First", 1), Session("second", "/repo", "Second", 1)))
+    val first = TerminalTarget(dsh, "first", "/repo")
+    assertTrue(first.matches(live))
+    assertFalse(first.matches(live.copy(sessionId = "second")))
+    assertTrue(TerminalTarget(dsh, "second", "/repo").matches(live.copy(sessionId = "second")))
+  }
+
   @Test fun terminalGateRequiresNegotiatedNativeBusinessCapabilityAndSynchronizedRoute() {
     val live = state()
     assertTrue(live.canUseNativeTerminal())

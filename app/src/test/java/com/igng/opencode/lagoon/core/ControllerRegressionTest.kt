@@ -674,8 +674,8 @@ class ControllerRegressionTest {
         override fun close() { detached++ }
       }
       val client = object : HarnessClient by api(server) {
-        override suspend fun attachTerminal(directory: String, id: String): TerminalAttachment = stream
-        override suspend fun closeTerminal(directory: String, id: String) { terminated++ }
+        override suspend fun attachTerminal(scope: TerminalScope, id: String): TerminalAttachment = stream
+        override suspend fun closeTerminal(scope: TerminalScope, id: String) { terminated++ }
       }
       val profile = ServerProfile("server", "Native", "https://terminal.example/")
       val (controller, state) = controller(client, LagoonState(profiles = listOf(profile), serverId = profile.id, connected = true,
@@ -695,8 +695,8 @@ class ControllerRegressionTest {
       var detached = 0; var terminated = 0
       val release = CompletableDeferred<TerminalAttachment>()
       val client = object : HarnessClient by api(server) {
-        override suspend fun attachTerminal(directory: String, id: String): TerminalAttachment = release.await()
-        override suspend fun closeTerminal(directory: String, id: String) { terminated++ }
+        override suspend fun attachTerminal(scope: TerminalScope, id: String): TerminalAttachment = release.await()
+        override suspend fun closeTerminal(scope: TerminalScope, id: String) { terminated++ }
       }
       val profile = ServerProfile("server", "Native", "https://terminal.example/")
       val (controller, state) = controller(client, LagoonState(profiles = listOf(profile), serverId = profile.id, connected = true,
@@ -717,8 +717,8 @@ class ControllerRegressionTest {
     MockWebServer().use { server ->
       var reads = 0; var creates = 0
       val client = object : HarnessClient by api(server) {
-        override suspend fun terminals(directory: String): List<NativeTerminal> { reads++; return emptyList() }
-        override suspend fun createTerminal(directory: String): NativeTerminal { creates++; error("must not run") }
+        override suspend fun terminals(scope: TerminalScope): List<NativeTerminal> { reads++; return emptyList() }
+        override suspend fun createTerminal(scope: TerminalScope): NativeTerminal { creates++; error("must not run") }
       }
       val profile = ServerProfile("server", "Native", "https://terminal.example/")
       val (controller, state) = controller(client, LagoonState(profiles = listOf(profile), serverId = profile.id, connected = true,
@@ -737,8 +737,8 @@ class ControllerRegressionTest {
     MockWebServer().use { server ->
       val created = CompletableDeferred<NativeTerminal>(); var creates = 0; var deletes = 0
       val client = object : HarnessClient by api(server) {
-        override suspend fun createTerminal(directory: String): NativeTerminal { creates++; return created.await() }
-        override suspend fun closeTerminal(directory: String, id: String) { deletes++ }
+        override suspend fun createTerminal(scope: TerminalScope): NativeTerminal { creates++; return created.await() }
+        override suspend fun closeTerminal(scope: TerminalScope, id: String) { deletes++ }
       }
       val profile = ServerProfile("server", "Native", "https://terminal.example/")
       val (controller, state) = controller(client, LagoonState(profiles = listOf(profile), serverId = profile.id, connected = true,
@@ -748,6 +748,60 @@ class ControllerRegressionTest {
       yield(); state.value = state.value.copy(sessionId = "other")
       created.complete(NativeTerminal("pty_created", "Created", "/repo", "running", "/bin/sh", emptyList(), 123))
       assertTrue(creating.await().isFailure); assertEquals(1, creates); assertEquals(0, deletes)
+    }
+  }
+
+  @Test fun dshTerminalResultsMustMatchSessionEvenInTheSameDirectory() = runBlocking {
+    MockWebServer().use { server ->
+      var returnedOwner = "first"
+      val scopes = mutableListOf<TerminalScope>()
+      val client = object : HarnessClient by api(server) {
+        override suspend fun terminals(scope: TerminalScope): List<NativeTerminal> {
+          scopes += scope
+          return listOf(NativeTerminal("pty", "Shell", "/repo", "running", "", emptyList(), 0,
+            sessionId = returnedOwner, cwd = "/actual/cwd", pidKnown = false))
+        }
+        override suspend fun createTerminal(scope: TerminalScope): NativeTerminal = terminals(scope).single()
+      }
+      val profile = ServerProfile("server", "DSH", "https://terminal.example/", kind = ServerKind.DSH)
+      val (controller, state) = controller(client, LagoonState(profiles = listOf(profile), serverId = profile.id, connected = true,
+        sessionId = "first", sessions = listOf(Session("first", "/repo", "First", 1), Session("second", "/repo", "Second", 1)),
+        capabilities = ApiCapabilities(terminal = true)))
+      val first = TerminalTarget(profile, "first", "/repo")
+      assertEquals("/actual/cwd", controller.terminals(first).single().cwd)
+      returnedOwner = "second"
+      assertTrue(runCatching { controller.terminals(first) }.isFailure)
+      assertTrue(runCatching { controller.createTerminal(first) }.isFailure)
+      state.value = state.value.copy(sessionId = "second")
+      assertEquals("second", controller.terminals(first.copy(sessionId = "second")).single().sessionId)
+      assertEquals(listOf(first.scope, first.scope, first.scope, TerminalScope.Session("second", "/repo")), scopes)
+    }
+  }
+
+  @Test fun dshAttachmentResizeCannotCrossSameDirectoryConversationSwitch() = runBlocking {
+    MockWebServer().use { server ->
+      var resized = 0; var detached = 0; var terminated = 0
+      val client = object : HarnessClient by api(server) {
+        override suspend fun attachTerminal(scope: TerminalScope, id: String): TerminalAttachment {
+          assertEquals(TerminalScope.Session("first", "/repo"), scope)
+          return object : TerminalAttachment {
+            override val state = MutableStateFlow(TerminalStreamState(connected = true, ready = true))
+            override fun sendText(text: String) = true
+            override fun resize(cols: Int, rows: Int): Boolean { resized++; return true }
+            override fun close() { detached++ }
+          }
+        }
+        override suspend fun closeTerminal(scope: TerminalScope, id: String) { terminated++ }
+      }
+      val profile = ServerProfile("server", "DSH", "https://terminal.example/", kind = ServerKind.DSH)
+      val (controller, state) = controller(client, LagoonState(profiles = listOf(profile), serverId = profile.id, connected = true,
+        sessionId = "first", sessions = listOf(Session("first", "/repo", "First", 1), Session("second", "/repo", "Second", 1)),
+        capabilities = ApiCapabilities(terminal = true)))
+      val attachment = controller.attachTerminal(TerminalTarget(profile, "first", "/repo"), "pty")
+      assertTrue(attachment.resize(80, 24))
+      state.value = state.value.copy(sessionId = "second")
+      assertFalse(attachment.resize(90, 30))
+      assertEquals(1, resized); assertTrue(detached > 0); assertEquals(0, terminated)
     }
   }
 

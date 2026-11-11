@@ -921,50 +921,58 @@ class LagoonController private constructor(private val appContext: Context) {
     check(op.isCurrent(this) && expected.matches(state.value) && state.value.canUseNativeTerminal()) { "终端连接或目录已变化，旧操作结果已丢弃" }
   }
 
+  private fun terminalMatches(expected: TerminalTarget, terminal: NativeTerminal): Boolean =
+    normalizedDirectory(terminal.directory) == normalizedDirectory(expected.directory) && when (val scope = expected.scope) {
+      is TerminalScope.Session -> terminal.sessionId == scope.sessionId
+      is TerminalScope.Location -> terminal.sessionId == null
+    }
+
   internal suspend fun terminals(expected: TerminalTarget): List<NativeTerminal> {
     val op = terminalOperation(expected)
-    val terminals = op.client.terminals(expected.directory)
+    val terminals = op.client.terminals(expected.scope)
     requireTerminalOperation(op, expected)
-    check(terminals.all { normalizedDirectory(it.directory) == normalizedDirectory(expected.directory) }) { "Host 返回了其他目录的终端" }
+    check(terminals.all { terminalMatches(expected, it) }) { "Host 返回了其他会话或位置的终端" }
     return terminals
   }
 
   /** Creating a shell is never part of list/recovery/attachment; the UI must explicitly confirm. */
   internal suspend fun createTerminal(expected: TerminalTarget): NativeTerminal {
     val op = terminalOperation(expected)
-    val terminal = op.client.createTerminal(expected.directory)
+    val terminal = op.client.createTerminal(expected.scope)
     requireTerminalOperation(op, expected)
-    check(normalizedDirectory(terminal.directory) == normalizedDirectory(expected.directory)) { "Host 返回了其他目录的终端；请重新读取核对" }
+    check(terminalMatches(expected, terminal)) { "Host 返回了其他会话或位置的终端；请重新读取核对" }
     return terminal
   }
 
   internal suspend fun attachTerminal(expected: TerminalTarget, id: String): TerminalAttachment {
     val op = terminalOperation(expected)
-    val attachment = op.client.attachTerminal(expected.directory, id)
+    val attachment = op.client.attachTerminal(expected.scope, id)
     try { requireTerminalOperation(op, expected) }
     catch (error: Throwable) { attachment.close(); throw error }
     return object : TerminalAttachment {
       override val state = attachment.state
-      override fun sendText(text: String): Boolean {
+      private fun current(): Boolean {
         if (!op.isCurrent(this@LagoonController) || !expected.matches(this@LagoonController.state.value) ||
           !this@LagoonController.state.value.canUseNativeTerminal()) { attachment.close(); return false }
-        return attachment.sendText(text)
+        return true
       }
+      override fun sendText(text: String): Boolean = current() && attachment.sendText(text)
+      override fun resize(cols: Int, rows: Int): Boolean = current() && attachment.resize(cols, rows)
       override fun close() = attachment.close() // Detach only; never terminate the remote process.
     }
   }
 
   internal suspend fun resizeTerminal(expected: TerminalTarget, id: String, cols: Int, rows: Int): NativeTerminal {
     val op = terminalOperation(expected)
-    val terminal = op.client.resizeTerminal(expected.directory, id, cols, rows)
+    val terminal = op.client.resizeTerminal(expected.scope, id, cols, rows)
     requireTerminalOperation(op, expected)
-    check(terminal.id == id && normalizedDirectory(terminal.directory) == normalizedDirectory(expected.directory)) { "Host 返回的终端身份不匹配" }
+    check(terminal.id == id && terminalMatches(expected, terminal)) { "Host 返回的终端身份不匹配" }
     return terminal
   }
 
   internal suspend fun closeTerminal(expected: TerminalTarget, id: String) {
     val op = terminalOperation(expected)
-    op.client.closeTerminal(expected.directory, id)
+    op.client.closeTerminal(expected.scope, id)
     requireTerminalOperation(op, expected)
   }
 

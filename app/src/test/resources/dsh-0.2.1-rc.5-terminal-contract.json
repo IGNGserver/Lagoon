@@ -1,0 +1,720 @@
+{
+  "version": 1,
+  "upstream": {
+    "repository": "https://github.com/deepseek-ai/deepseek-harness",
+    "tag": "dsh-v0.2.1-rc.5",
+    "commit": "b830ec950faba0a46dda564be3e2d854afed94f1",
+    "version": "0.2.1-rc.5"
+  },
+  "sources": [
+    {
+      "package": "@deepseek-ai/dsh-api-terminal-controller",
+      "version": "0.2.1-rc.5",
+      "generatedFile": "lib/typert.host.js",
+      "sha256": "3377602ada84e2de6ec192b200e7ba02ee5051fb05cf4a014b2504b63e1ace10"
+    }
+  ],
+  "methods": {
+    "terminal/environment": {
+      "sourcePackage": "@deepseek-ai/dsh-api-terminal-controller",
+      "sourceLocation": {
+        "file": "packages/api/terminal-controller/src/index.ts",
+        "line": 119,
+        "column": 3
+      },
+      "args": {
+        "type": "object",
+        "properties": {
+          "agentId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "agentId"
+        ],
+        "additionalProperties": false
+      },
+      "result": {
+        "type": "object",
+        "properties": {
+          "cwd": {
+            "type": "string",
+            "description": "Logged current directory, read without filesystem validation."
+          },
+          "maxInputBytes": {
+            "type": "number"
+          },
+          "maxBufferedBytes": {
+            "type": "number",
+            "description": "Maximum complete encoded Client input bytes retained until acknowledgement."
+          },
+          "maxCols": {
+            "type": "number"
+          },
+          "maxRows": {
+            "type": "number"
+          },
+          "scrollback": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "cwd",
+          "maxInputBytes",
+          "maxBufferedBytes",
+          "maxCols",
+          "maxRows",
+          "scrollback"
+        ],
+        "additionalProperties": true
+      }
+    },
+    "terminal/shells": {
+      "sourcePackage": "@deepseek-ai/dsh-api-terminal-controller",
+      "sourceLocation": {
+        "file": "packages/api/terminal-controller/src/index.ts",
+        "line": 134,
+        "column": 3
+      },
+      "args": {
+        "type": "object",
+        "properties": {
+          "agentId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "agentId"
+        ],
+        "additionalProperties": false
+      },
+      "result": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "args": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "name": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path",
+            "args",
+            "name"
+          ],
+          "additionalProperties": true
+        }
+      }
+    },
+    "terminal/list": {
+      "sourcePackage": "@deepseek-ai/dsh-api-terminal-controller",
+      "sourceLocation": {
+        "file": "packages/api/terminal-controller/src/index.ts",
+        "line": 145,
+        "column": 3
+      },
+      "args": {
+        "type": "object",
+        "properties": {
+          "sessionId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "sessionId"
+        ],
+        "additionalProperties": false
+      },
+      "result": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "title": {
+              "type": "string"
+            },
+            "shell": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "args": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "name": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path",
+                "args",
+                "name"
+              ],
+              "additionalProperties": true
+            },
+            "cwd": {
+              "type": "string",
+              "description": "Initial working directory; shell directory changes do not update this field."
+            },
+            "cols": {
+              "type": "number"
+            },
+            "rows": {
+              "type": "number"
+            },
+            "state": {
+              "type": "string",
+              "enum": [
+                "failed",
+                "running",
+                "exited"
+              ]
+            },
+            "exitCode": {
+              "oneOf": [
+                {
+                  "type": "null",
+                  "const": null
+                },
+                {
+                  "type": "number"
+                }
+              ]
+            },
+            "error": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "title",
+            "shell",
+            "cwd",
+            "cols",
+            "rows",
+            "state",
+            "exitCode"
+          ],
+          "additionalProperties": true
+        }
+      }
+    },
+    "terminal/create": {
+      "sourcePackage": "@deepseek-ai/dsh-api-terminal-controller",
+      "sourceLocation": {
+        "file": "packages/api/terminal-controller/src/index.ts",
+        "line": 159,
+        "column": 9
+      },
+      "args": {
+        "type": "object",
+        "properties": {
+          "agentId": {
+            "type": "string"
+          },
+          "request": {
+            "type": "object",
+            "properties": {
+              "shellPath": {
+                "type": "string",
+                "description": "A path returned by shell discovery; absent selects the execution default."
+              },
+              "id": {
+                "type": "string"
+              },
+              "cols": {
+                "type": "number"
+              },
+              "rows": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "id",
+              "cols",
+              "rows"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "agentId",
+          "request"
+        ],
+        "additionalProperties": false
+      },
+      "result": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "shell": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string"
+              },
+              "args": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "path",
+              "args",
+              "name"
+            ],
+            "additionalProperties": true
+          },
+          "cwd": {
+            "type": "string",
+            "description": "Initial working directory; shell directory changes do not update this field."
+          },
+          "cols": {
+            "type": "number"
+          },
+          "rows": {
+            "type": "number"
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "failed",
+              "running",
+              "exited"
+            ]
+          },
+          "exitCode": {
+            "oneOf": [
+              {
+                "type": "null",
+                "const": null
+              },
+              {
+                "type": "number"
+              }
+            ]
+          },
+          "error": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "title",
+          "shell",
+          "cwd",
+          "cols",
+          "rows",
+          "state",
+          "exitCode"
+        ],
+        "additionalProperties": true
+      }
+    },
+    "terminal/retain": {
+      "sourcePackage": "@deepseek-ai/dsh-api-terminal-controller",
+      "sourceLocation": {
+        "file": "packages/api/terminal-controller/src/index.ts",
+        "line": 199,
+        "column": 3
+      },
+      "args": {
+        "type": "object",
+        "properties": {
+          "sessionId": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "sessionId",
+          "id"
+        ],
+        "additionalProperties": false
+      },
+      "result": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "retained"
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "additionalProperties": true
+      }
+    },
+    "terminal/attach": {
+      "sourcePackage": "@deepseek-ai/dsh-api-terminal-controller",
+      "sourceLocation": {
+        "file": "packages/api/terminal-controller/src/index.ts",
+        "line": 216,
+        "column": 3
+      },
+      "args": {
+        "type": "object",
+        "properties": {
+          "agentId": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "agentId",
+          "id"
+        ],
+        "additionalProperties": false
+      },
+      "result": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "snapshot"
+              },
+              "sequence": {
+                "type": "number"
+              },
+              "screen": {
+                "type": "string"
+              },
+              "info": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string"
+                  },
+                  "title": {
+                    "type": "string"
+                  },
+                  "shell": {
+                    "type": "object",
+                    "properties": {
+                      "path": {
+                        "type": "string"
+                      },
+                      "args": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "name": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "path",
+                      "args",
+                      "name"
+                    ],
+                    "additionalProperties": true
+                  },
+                  "cwd": {
+                    "type": "string",
+                    "description": "Initial working directory; shell directory changes do not update this field."
+                  },
+                  "cols": {
+                    "type": "number"
+                  },
+                  "rows": {
+                    "type": "number"
+                  },
+                  "state": {
+                    "type": "string",
+                    "enum": [
+                      "failed",
+                      "running",
+                      "exited"
+                    ]
+                  },
+                  "exitCode": {
+                    "oneOf": [
+                      {
+                        "type": "null",
+                        "const": null
+                      },
+                      {
+                        "type": "number"
+                      }
+                    ]
+                  },
+                  "error": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "id",
+                  "title",
+                  "shell",
+                  "cwd",
+                  "cols",
+                  "rows",
+                  "state",
+                  "exitCode"
+                ],
+                "additionalProperties": true
+              },
+              "writable": {
+                "type": "boolean"
+              },
+              "inputWindow": {
+                "type": "object",
+                "properties": {
+                  "maxBytes": {
+                    "type": "number",
+                    "description": "Maximum complete encoded frame bytes waiting for the Host consumer."
+                  },
+                  "frameOverheadBytes": {
+                    "type": "number",
+                    "description": "UTF-8 envelope bytes added to a compact JSON item with a present value field."
+                  }
+                },
+                "required": [
+                  "maxBytes",
+                  "frameOverheadBytes"
+                ],
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "type",
+              "sequence",
+              "screen",
+              "info",
+              "writable"
+            ],
+            "additionalProperties": true
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "output"
+              },
+              "sequence": {
+                "type": "number"
+              },
+              "data": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "sequence",
+              "data"
+            ],
+            "additionalProperties": true
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "state"
+              },
+              "info": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string"
+                  },
+                  "title": {
+                    "type": "string"
+                  },
+                  "shell": {
+                    "type": "object",
+                    "properties": {
+                      "path": {
+                        "type": "string"
+                      },
+                      "args": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "name": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "path",
+                      "args",
+                      "name"
+                    ],
+                    "additionalProperties": true
+                  },
+                  "cwd": {
+                    "type": "string",
+                    "description": "Initial working directory; shell directory changes do not update this field."
+                  },
+                  "cols": {
+                    "type": "number"
+                  },
+                  "rows": {
+                    "type": "number"
+                  },
+                  "state": {
+                    "type": "string",
+                    "enum": [
+                      "failed",
+                      "running",
+                      "exited"
+                    ]
+                  },
+                  "exitCode": {
+                    "oneOf": [
+                      {
+                        "type": "null",
+                        "const": null
+                      },
+                      {
+                        "type": "number"
+                      }
+                    ]
+                  },
+                  "error": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "id",
+                  "title",
+                  "shell",
+                  "cwd",
+                  "cols",
+                  "rows",
+                  "state",
+                  "exitCode"
+                ],
+                "additionalProperties": true
+              },
+              "writable": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "type",
+              "info",
+              "writable"
+            ],
+            "additionalProperties": true
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "ack"
+              },
+              "sequence": {
+                "type": "number"
+              },
+              "refusal": {
+                "type": "string",
+                "enum": [
+                  "read-only",
+                  "not-running"
+                ]
+              }
+            },
+            "required": [
+              "type",
+              "sequence"
+            ],
+            "additionalProperties": true
+          }
+        ]
+      }
+    },
+    "terminal/rename": {
+      "sourcePackage": "@deepseek-ai/dsh-api-terminal-controller",
+      "sourceLocation": {
+        "file": "packages/api/terminal-controller/src/index.ts",
+        "line": 229,
+        "column": 3
+      },
+      "args": {
+        "type": "object",
+        "properties": {
+          "agentId": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "agentId",
+          "id",
+          "title"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "terminal/close": {
+      "sourcePackage": "@deepseek-ai/dsh-api-terminal-controller",
+      "sourceLocation": {
+        "file": "packages/api/terminal-controller/src/index.ts",
+        "line": 241,
+        "column": 9
+      },
+      "args": {
+        "type": "object",
+        "properties": {
+          "agentId": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "agentId",
+          "id"
+        ],
+        "additionalProperties": false
+      },
+      "resultSchemaError": "typert tool schema: unsupported void value"
+    }
+  }
+}

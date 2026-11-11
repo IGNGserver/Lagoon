@@ -152,6 +152,32 @@ interface HarnessClient {
 
   suspend fun shells(directory: String): List<ShellJob>
 
+  /** The scope stays explicit even if two Sessions have the same directory. */
+  suspend fun terminals(scope: TerminalScope): List<NativeTerminal> = when (scope) {
+    is TerminalScope.Location -> terminals(scope.directory)
+    is TerminalScope.Session -> throw ApiException(501, "此 harness 不支持会话归属终端")
+  }
+  suspend fun createTerminal(scope: TerminalScope): NativeTerminal = when (scope) {
+    is TerminalScope.Location -> createTerminal(scope.directory)
+    is TerminalScope.Session -> throw ApiException(501, "此 harness 不支持会话归属终端")
+  }
+  suspend fun resizeTerminal(scope: TerminalScope, id: String, cols: Int, rows: Int): NativeTerminal = when (scope) {
+    is TerminalScope.Location -> resizeTerminal(scope.directory, id, cols, rows)
+    is TerminalScope.Session -> throw ApiException(501, "会话终端尺寸必须经当前可写附着按序确认")
+  }
+  suspend fun renameTerminal(scope: TerminalScope, id: String, title: String): NativeTerminal = when (scope) {
+    is TerminalScope.Location -> renameTerminal(scope.directory, id, title)
+    is TerminalScope.Session -> throw ApiException(501, "此 harness 不支持会话归属终端")
+  }
+  suspend fun closeTerminal(scope: TerminalScope, id: String): Unit = when (scope) {
+    is TerminalScope.Location -> closeTerminal(scope.directory, id)
+    is TerminalScope.Session -> throw ApiException(501, "此 harness 不支持会话归属终端")
+  }
+  suspend fun attachTerminal(scope: TerminalScope, id: String): TerminalAttachment = when (scope) {
+    is TerminalScope.Location -> attachTerminal(scope.directory, id)
+    is TerminalScope.Session -> throw ApiException(501, "此 harness 不支持会话归属终端")
+  }
+
   /** Native interactive PTYs; unsupported harnesses fail explicitly rather than creating a shell job. */
   suspend fun terminals(directory: String): List<NativeTerminal> = throw ApiException(501, "此 harness 不支持原生终端")
   /** Only an explicit caller action may create a terminal; the server chooses its default shell. */
