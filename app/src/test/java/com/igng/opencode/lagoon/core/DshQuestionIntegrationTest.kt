@@ -505,6 +505,38 @@ class DshQuestionIntegrationTest {
     }
   }
 
+  @Test fun registryBackgroundLeaseCannotClearOrManipulateTheForegroundQuestionClaim() = runBlocking {
+    val f = Fixture(this)
+    val registry = DshClientRegistry { _, _, _, _ -> f.client }
+    val profile = ServerProfile("question-shared", "DSH", "https://question-fixture.example", kind = ServerKind.DSH)
+    val foreground = registry.acquire(profile, ServerCredentials("dsh", "fixture"))
+    val background = registry.acquire(profile, ServerCredentials("dsh", "fixture"))
+    try {
+      background.setContentWatching(false)
+      f.start()
+      foreground.questionPresentation("s1", true)
+      f.waterfall("registry-question-event")
+      val created = f.form("form.created")
+      f.form("form.updated") { it.presentation?.countdownRunning == true }
+      val claim = f.mux("open", "userQuestions/attachWait")
+      background.questionPresentation(null, false)
+      background.questionFocus(created.id, true)
+      background.questionEngage(created.id)
+      background.questionTakeTime(created.id)
+      background.setContentWatching(false)
+      background.close()
+      f.flushEvents()
+      assertTrue(f.client.forms("").single().presentation!!.countdownRunning)
+      assertTrue(f.calls.none { it.endpoint == "\$events/result" })
+      assertTrue(f.cancels.none { it.frame.optString("streamId") == claim.frame.optString("streamId") })
+      foreground.questionPresentation("s1", false)
+      val result = f.rpc("\$events/result").args
+      assertEquals("registry-question-event", result.getString("eventId"))
+      assertEquals("next", result.getJSONObject("outcome").getString("kind"))
+      assertEquals(1, f.calls.count { it.endpoint == "\$events/result" })
+    } finally { foreground.close(); background.close(); registry.close(); f.close() }
+  }
+
   @Test fun cancellingSpectatorSubscriptionDoesNotDelegateForegroundQuestionOrCancelItsClaim() = runBlocking {
     val f = Fixture(this)
     var spectator: Job? = null

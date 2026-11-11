@@ -81,7 +81,9 @@
 ### 阶段 7：验证与交付仍进行中
 - 本地 fake Hub/实际 Noise/真实 Node connector 互操作不等于公网 Hub、真实官方 daemon 或 Android 真机验收。
 - r15 单实例 DshApi 事件改为一个 business owner 和独立有界订阅队列：旁观者取消不停止兄弟流或交还前台提问，最后订阅者才清理，旧代次退出/交还后再启动新源；慢消费者明确报错而不静默丢事件，JSONObject 载荷逐订阅复制。
-- DSH Desktop SSH 附着仍缺上游受支持 hook；跨 direct DshApi API-peer 复用及完整功能矩阵未全部验收。跨实例需要 guarded lease 和独立前台/监视归属，messagesPage 的隐式全局焦点不能直接包装进共享池。单实例修复不等于全局跨实例完成。
+- r16 显式 `DshClientRegistry.acquire` / factory `dshRegistry` opt-in 入口提供跨调用者共享：完整96项接口转发均由 lease 门禁校验，关闭仅取消本 lease 操作/Flow/终端附着，最后一个释放才关闭 owner 并等提问交还；继任 owner 的业务调用先等原 owner 退出，不重放未知 mutation。原始构造器与默认 acquisition 保持独立，不做隐式全局池。
+- 共享键按确切绑定/路由/鉴权/timeout/凭据摘要区分，映射 key 不存明文；Cookie 回调逐 lease fencing。监视兴趣合并、后台 false 不关闭前台，消息读取通过调用者上下文引用计数、不隐式设置全局焦点；仅当前显式前台 token 可操作提问。终端 StateFlow/发送/尺寸/关闭同样有门禁，附着返回边界取消会回收句柄而不杀远端进程。
+- DSH Desktop SSH 附着仍缺上游受支持 hook；完整功能矩阵未全部验收。显式共享入口不会将裸构造的任意 DshApi 自动合并，也不能绕过保存的 route admission。
 - 已推送分支并建立 [Draft PR #193](https://github.com/IGNGserver/Lagoon/pull/193)，官方服务验收 checkpoint 的 CI 已通过；PR 保持 draft，继续收口剩余能力，不表示全部目标完成。没有部署、发布或合并。
 
 ## 验证记录
@@ -153,5 +155,10 @@
 - 独立源码复核0个新增明确高风险项。追加 physical disconnect 清除ready、Unconfined回调取消不破坏 fanout 集合、载荷深复制与 ready前最后退订也必须取消逻辑生产者等回归；旧事件源在首次ready等待被取消时现由finally统一回收，保留共享物理API Peer。
 - `event-owner-cancel-final.log`：**1411 tests、0 failures、0 errors、14 skipped**，Debug assemble 成功120s。新增事件订阅8、有界hub7、提问旁观者1项；fixture Noise/Router 测试实际执行，已停止的官方daemon opt-in 如实跳过，本轮不启动真实服务。APK 21,970,612 bytes，SHA-256 `092445cdb50b2bc476da22a276a835c25e659a3fac552f062700558aa562c07a`。
 - 跨实例共享仍待 guarded lease 与前台/监视归属 seam：messagesPage 当前会隐式开启 contentWatching 并设置 activeSessionId，不能把裸 DshApi 放入全局池或仅靠引用计数包装。当前单实例广播不冒充跨实例 owner 修复。
+- r16 实现 explicit DshClientRegistry / factory opt-in、完整 guarded 92方法+4属性、Cookie回调/Flow/终端StateFlow门禁；调用者兴趣和前台 token 隔离。真实 MockWebServer/OkHttp 验证两独立lease仅一次认证/一个mux/$events，后台消息读取不夺焦点，control-only读取不启动workspace内容；后台lease不能操作或清掉实际前台提问认领。
+- 首轮 `client-lease-first.log` 生产编译通过，测试替身 Function0/Function3 分支推断冲突，已明确 Any；`client-lease-registry.log` fake用了错误 getIsClosed JVM名使屏障不达，修正为 isClosed 并给等待加期限。`client-lease-registry-fixed.log` 冷Flow内部尚未进入owner就close造成预期活动取消测试失败，新增明确收集屏障，生产门禁未放宽。
+- `client-lease-guarded.log` 门禁/兴趣/registry/事件/提问定向通过4s。真实mux夹具 Dispatcher import冲突和session address错误字段已修正。新增终端句柄回归发现 `use` 解析成 Closeable.use 导致发送即detach，改为显式 this@Access.use 并幂等close；`client-lease-terminal-fixed.log` 真实mux与终端清理通过3s。独立源码复核0个新增明确高风险项。
+- `client-lease-full.log`：1438项0失败/14跳过 Debug124s；追加失败的旧owner清理不能作为继任权限的fail-closed回归，`client-lease-handoff.log` 通过4s。`client-lease-final.log`：**1439 tests、0 failures、0 errors、14 skipped**，Debug assemble 成功120s；新增 Guarded7、Interests8、Registry10、真实mux2、提问lease1项。APK 22,023,492 bytes，SHA-256 `b39bb202f62c12997685325467a8abc8fe9df6e955b08f7cffc14d198d76b820`。本轮不启动真实服务；fixture Noise/Router运行，已停止的官方daemon opt-in 如实跳过。
+- 原始构造器不隐式池化，显式 direct registry 的不同绑定/路由/凭据/timeout 不合并；最后release才关闭owner，有界交还未确认时保留继任失败门禁。应用默认 acquisition 暂不改为全局共享，调用者可通过已提供的 opt-in 接入。
 - 全部构建在 `/home/lvziw/.build/Lagoon/unified-harness-connections/source`，Gradle/build 输出在 `~/.build`。源码工作树无 app/build、node_modules。
 - `wt audit`：29 repos，0 missing dirs，3 detached、4 merged worktrees 属其他任务；只读报告，无清理。

@@ -41,11 +41,29 @@
 - 幂等/中断可恢复/版本化迁移与确切 credential slot refs；保留 ID、disabled、分组/草稿等。
 - 原有资料通过兼容投影保留；实际执行按 exact 图链准入快照分派 carrier/native 协议。raw/图不一致时拒绝执行，不自动改路，unknown 协议不默认为 OpenCode。
 
-### 3. 传输和生命周期（HTTP/SSE/WS 和实例级 mux 已落地，跨实例验收未完成）
+### 3. 传输和生命周期（carrier/mux 与显式跨调用者 lease 已落地，真实环境矩阵未完成）
 
 - NativeHttpTransport（HTTP/SSE/WS/binary），DshTransport（unary/stream/duplex），真实物理 mux。
 - Source/Host 连接 owner、子服务 leases、generation/error/backpressure/取消统一。
 - 同一目标 test/monitor/controller/notification 不互踢；无写重放。
+
+#### Direct DSH 的显式共享入口
+
+```kotlin
+val registry = DshClientRegistry()
+val foreground = createHarnessClient(profile, credentials, dshRegistry = registry)
+val monitor = registry.acquire(profile, credentials)
+monitor.setContentWatching(false)
+foreground.questionPresentation(sessionId, foreground = true)
+// 各调用者独立使用、收集事件；取消自己的 Flow 不停止兄弟订阅。
+monitor.close()
+monitor.awaitClosed() // 只等自己的工作；不是最后一个 lease 时不关闭 owner。
+foreground.close()
+foreground.awaitClosed() // 最后释放等待有界提问交还和 owner 关闭。
+registry.close()
+```
+
+共享只接受相同完整 direct 路由、凭据和 timeout；名称等展示偏好不影响身份，凭据以摘要参与 map key。关闭后的调用/延迟 Flow/回调/终端句柄均由门禁拒绝；未知 mutation 不重放。后台读取会话只保留读取所需 follow，不选择前台、不隐式开启全局内容监视。显式前台 token 独占提问呈现控制；旧前台/后台关闭不能清掉当前前台，也不自动恢复之前的前台。原始 `DshApi(...)` 和没有传入 registry 的 factory 保持独立，不偷偷合并或跨路由使用。
 
 ### 4. SSH 多 Harness（原生 OpenCode/legacy DSH 接线已落地，profile 附着未完成）
 
@@ -91,8 +109,9 @@
 - r12 OpenCode 原生 simple PTY 文本终端接入 Direct/SSH/Remote：固定官方原始文本/游标协议，一次性票据，严格 location 与 route，明确创建/输入/终止与 detach-only 关闭；不宣称完整 VT。
 - r13 DSH Direct/SSH Session 归属终端接入官方 retain/attach 双向 mux、输入/resize 顺序 ACK 与控制权变化；目录不推断 Session。显式创建/附加/输入/终止，默认不自动抢回控制，不重放未确认输入。
 - r14 Remote DSH 终端按实际上游 follow/write/resize + harness.terminal.v1 接入，Host 设备归属和开关不绕过，provider ACK 后才回执，固定 gateway/取消丢弃/无输入重放；实际 Noise→Router/Policy/Compat→官方 DSH 终端验收已取得。
-- r15 单实例 events() 共享一个业务 owner，多订阅者各自有界队列与载荷副本；取消一个不清理其他订阅者或前台提问，最后退出后串行清理再换代。cross-instance registry/lease 与前台焦点隔离另待完成。
-- 尚未完成：真实桌面 DSH profile 附着、公共库跨实例 events owner 复用、非 Linux 原生 Host 归属证明、完整原生能力真环境矩阵、真实设备交互验收与 PR 最终就绪。
+- r15 单实例 events() 共享一个业务 owner，多订阅者各自有界队列与载荷副本；取消一个不清理其他订阅者或前台提问，最后退出后串行清理再换代。cross-instance registry/lease 的显式入口于 r16 另接入。
+- r16 通过显式 registry/factory opt-in 的 direct DSH owner 共享与完整 guarded lease 接入：独立取消/回调/附着句柄，原 owner 交还后继任业务才可开始；前台/watch/read 归属隔离，不将后台读消息变成选中会话。原始构造器不自动共享。
+- 尚未完成：真实桌面 DSH profile 附着、非 Linux 原生 Host 归属证明、完整原生能力真环境矩阵、真实设备交互验收与 PR 最终就绪。
 
 - 工作区已创建且 HEAD 与 origin/main 基线相同。
 - 本机盘可用约 96 GiB（2026-11-09）；构建区 `~/.build`。

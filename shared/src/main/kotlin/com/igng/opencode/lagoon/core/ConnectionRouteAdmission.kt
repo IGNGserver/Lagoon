@@ -104,7 +104,8 @@ internal fun createRoutedHarnessClient(
   callTimeoutSeconds: Long = 60,
   onCookie: (String) -> Unit = {},
   remoteFactory: ((ServerProfile, ServerCredentials) -> RemoteBackend)? = null,
-  sshFactory: ((ServerProfile, ServerCredentials) -> HarnessClient)? = null
+  sshFactory: ((ServerProfile, ServerCredentials) -> HarnessClient)? = null,
+  dshRegistry: DshClientRegistry? = null
 ): HarnessClient {
   val profile = route.executionProfile(preferences)
   return when (route.carrierId) {
@@ -112,7 +113,8 @@ internal fun createRoutedHarnessClient(
     ConnectionCarrierId.SSH_FORWARD -> (sshFactory ?: error("SSH carrier 尚未配置"))(profile, credentials)
     ConnectionCarrierId.DIRECT_HTTP -> when (route.protocolId) {
       HarnessProtocolId.OPENCODE_NATIVE -> OpenCodeApi(profile, credentials, callTimeoutSeconds)
-      HarnessProtocolId.DSH_TYPERT -> DshApi(profile, credentials, callTimeoutSeconds, onCookie)
+      HarnessProtocolId.DSH_TYPERT -> dshRegistry?.acquire(profile, credentials, callTimeoutSeconds, onCookie)
+         ?: DshApi(profile, credentials, callTimeoutSeconds, onCookie)
     }
   }
 }

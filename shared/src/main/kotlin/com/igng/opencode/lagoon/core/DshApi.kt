@@ -229,7 +229,25 @@ class DshApi(
   private val workspacePublisher = MutableSharedFlow<List<Project>>(replay = 1, extraBufferCapacity = 1)
   override val workspaceUpdates: Flow<List<Project>> = workspacePublisher.asSharedFlow()
   /** False for background notification monitors: keep `$events`, skip workspace/follows. */
+  @Volatile private var leaseManaged = false
+  @Volatile private var leaseSnapshot = DshInterestSnapshot(false, emptySet(), emptySet(), null)
   private val contentWatching = MutableStateFlow(true)
+
+  /** Used only by the explicit shared-client registry; raw constructor semantics stay unchanged. */
+  internal fun manageLeaseInterests(snapshot: DshInterestSnapshot) {
+    leaseManaged = true
+    leaseSnapshot = snapshot
+    activeSessionId = snapshot.foregroundSession
+    contentWatching.value = snapshot.content
+    if (closed) return
+    val keep = snapshot.watched + snapshot.reading
+    val stop = mutableListOf<String>()
+    synchronized(watched) {
+      watched.removeAll { id -> if (id !in keep && (!snapshot.content || !executions.running(id))) { stop += id; true } else false }
+    }
+    stop.forEach(::stopFollow)
+    rememberWatched(keep.mapNotNull(known::get))
+  }
   override fun setContentWatching(enabled: Boolean) { contentWatching.value = enabled }
   override fun transportStatus(): String? = remoteBackend?.connectionStatus()?.let { status ->
     val transport = when {
@@ -1019,11 +1037,15 @@ class DshApi(
 
   override suspend fun messagesPage(id: String, cursor: String?, size: Int): ApiPage<Message> = withContext(Dispatchers.IO) {
     val session = sessionOrFetch(id)
-    // Reading a transcript always needs a follow, even if a background monitor had switched
-    // content off before this server became writable.
-    setContentWatching(true)
-    // 当前阅读的会话固定保留；首页刷新只能替换其他 follow。
-    activeSessionId = session.id
+    val caller = kotlin.coroutines.coroutineContext[DshLeaseContext]
+    check(!leaseManaged || caller != null) { "共享 DSH owner 的消息读取必须指定调用者 lease" }
+    val interest = caller?.read?.invoke(session.id)
+    try {
+    if (!leaseManaged) {
+      // Raw clients retain the historical behavior; leases manage independent foreground interest.
+      setContentWatching(true)
+      activeSessionId = session.id
+    }
     rememberWatched(listOf(session))
     val wanted = size.coerceIn(1, SNAPSHOT_MAX_MESSAGES)
     if (cursor == null) {
@@ -1083,6 +1105,7 @@ class DshApi(
       val next = if (page.optBoolean("hasMore")) earlierCursor(records) else null
       ApiPage(messages, next)
     }
+    } finally { interest?.close() }
   }
 
   private fun earlierCursor(records: List<JSONObject>): String? =
@@ -1876,7 +1899,7 @@ class DshApi(
         contentJob?.cancel()
         contentJob = null
         if (!enabled) {
-          followStates.values.toList().forEach(::stopFollowState)
+          followStates.values.filter { !leaseManaged || it.sessionId !in leaseSnapshot.reading }.forEach(::stopFollowState)
           return@collect
         }
         contentJob = launch {
@@ -1902,7 +1925,7 @@ class DshApi(
       statusJob.cancelAndJoin()
       contentWatcher.cancelAndJoin()
       contentJob?.cancelAndJoin()
-      followStates.values.toList().forEach(::stopFollowState)
+      followStates.values.filter { !leaseManaged || it.sessionId !in leaseSnapshot.reading }.forEach(::stopFollowState)
       channel.cancel()
       if (eventChannel === channel) eventChannel = null
     } }
@@ -2560,7 +2583,7 @@ class DshApi(
   private fun releaseFollowForRetry(exclude: String): Boolean {
     val victim = synchronized(watched) {
       watched.firstOrNull { id ->
-        id != activeSessionId && id != exclude && followStates[id]?.socket != null
+        id != activeSessionId && id != exclude && (!leaseManaged || id !in leaseSnapshot.reading) && followStates[id]?.socket != null
       }?.also { watched.remove(it) }
     } ?: return false
     Diagnostics.warn("DshApi", "流预算已满，释放旧的会话 follow：${victim.take(24)}")
@@ -2761,7 +2784,7 @@ class DshApi(
         watched.add(session.id)
       }
       while (watched.size > WATCH_LIMIT) {
-        val oldest = watched.firstOrNull { it != activeSessionId } ?: break
+        val oldest = watched.firstOrNull { it != activeSessionId && (!leaseManaged || it !in leaseSnapshot.reading) } ?: break
         watched.remove(oldest)
         evicted += oldest
       }
@@ -2769,7 +2792,11 @@ class DshApi(
     }
     // 先停掉被淘汰的，释放槽位后再启动新流。
     evicted.forEach(::stopFollow)
-    if (eventChannel == null || !contentWatching.value) return
+    if (eventChannel == null) return
+    if (!contentWatching.value) {
+      if (leaseManaged) retained.filter { it in leaseSnapshot.reading }.forEach(::startFollow)
+      return
+    }
     retained.forEach(::startFollow)
   }
 

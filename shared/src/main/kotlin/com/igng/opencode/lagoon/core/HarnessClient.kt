@@ -363,7 +363,9 @@ fun createHarnessClient(
   onCookie: (String) -> Unit = {},
   remoteBackend: RemoteBackend? = null,
   /** App-provided factory for `sshHostId != null`; shared/ has no Android SSH implementation. */
-  sshClientFactory: ((ServerProfile, ServerCredentials) -> HarnessClient)? = null
+  sshClientFactory: ((ServerProfile, ServerCredentials) -> HarnessClient)? = null,
+  /** Explicit caller-isolated direct DSH sharing. Raw constructors/default acquisition stay independent. */
+  dshRegistry: DshClientRegistry? = null
 ): HarnessClient = if (profile.remoteHostId != null && profile.kind == ServerKind.OPENCODE) {
   require(profile.sshHostId == null) { "同一个绑定不能混合 SSH 与 Remote carrier" }
   (remoteBackend ?: throw IllegalStateException("Host 原生服务 backend 尚未配置")).client
@@ -372,6 +374,7 @@ fun createHarnessClient(
   sshClientFactory?.invoke(profile, credentials) ?: throw IllegalStateException("SSH backend 尚未配置")
 } else when (profile.kind) {
   ServerKind.OPENCODE -> OpenCodeApi(profile, credentials, callTimeoutSeconds)
-  ServerKind.DSH -> DshApi(profile, credentials, callTimeoutSeconds, onCookie)
+  ServerKind.DSH -> dshRegistry?.acquire(profile, credentials, callTimeoutSeconds, onCookie)
+    ?: DshApi(profile, credentials, callTimeoutSeconds, onCookie)
   ServerKind.DSH_REMOTE -> (remoteBackend ?: throw IllegalStateException("DSH Remote backend 尚未配置")).client
 }
