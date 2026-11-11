@@ -100,7 +100,10 @@ LAGOON_NATIVE_REGISTRATIONS='["/absolute/private/state/opencode/service.json"]'
 Without the path override, discovery reads
 `$XDG_STATE_HOME/opencode/service.json`, or
 `$HOME/.local/state/opencode/service.json`. Registration contents (including
-passwords and loopback addresses) stay local. Do not pass registration paths or
+passwords and loopback addresses) stay local. Native simple PTY uses the instance's documented
+HTTP/WS routes; `x-opencode-ticket: 1` is accepted only on its POST connect-token route.
+The returned short-lived, single-use ticket is not a long-lived Host credential. Attachment
+cancellation never deletes the PTY; process creation and termination require explicit UI actions. Do not pass registration paths or
 credentials through Remote RPC parameters. Each accepted, trusted connection owns
 its own peer and handles; disconnect only cancels that peer's operations, never
 stops the externally running native service. See [the protocol](<../docs/NATIVE_SERVICE_PROTOCOL.md>)

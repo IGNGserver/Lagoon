@@ -143,6 +143,15 @@ internal class SshDshClient(
 
   override suspend fun shells(directory: String): List<ShellJob> = api().shells(directory)
 
+  override suspend fun terminals(directory: String): List<NativeTerminal> = api().terminals(directory)
+  override suspend fun createTerminal(directory: String): NativeTerminal = api().createTerminal(directory)
+  override suspend fun resizeTerminal(directory: String, id: String, cols: Int, rows: Int): NativeTerminal =
+    api().resizeTerminal(directory, id, cols, rows)
+  override suspend fun renameTerminal(directory: String, id: String, title: String): NativeTerminal =
+    api().renameTerminal(directory, id, title)
+  override suspend fun closeTerminal(directory: String, id: String) = api().closeTerminal(directory, id)
+  override suspend fun attachTerminal(directory: String, id: String): TerminalAttachment = api().attachTerminal(directory, id)
+
   override suspend fun shellInfo(id: String, directory: String): ShellSnapshot? = api().shellInfo(id, directory)
 
   override suspend fun shellOutput(id: String, directory: String, cursor: Long?, limit: Int): ShellOutput? =

@@ -34,6 +34,7 @@ async function fixture(t, options = {}) {
     '/api/large': { post: {} }, '/api/chunked': { get: {} }, '/api/redirect': { get: {} },
     '/api/ws': { get: {} }, '/api/hang': { get: {} }, '/api/item/{id}': { get: {} },
     '/api/session/{id}/message': { post: {} }, '/api/fs/read/*': { get: {} },
+    '/api/pty/{ptyID}/connect-token': { post: {} },
   };
   const server = http.createServer(async (req, res) => {
     requests.push({ path: req.url, method: req.method, headers: req.headers });
@@ -131,6 +132,19 @@ test('real authenticated HTTP methods and binary, stable path identity, safe err
   await assert.rejects(call(peer, s, '/api/echo', { method: 'POST', body: 'not base64' }), error => {
     assert.ok(!error.message.includes('not base64')); return errorCode('INVALID_PARAMS')(error);
   });
+});
+
+test('PTY ticket header is exact and restricted to the native POST ticket route', { timeout: 10_000 }, async t => {
+  const f = await fixture(t), { value: peer } = f.peer(), s = await service(peer);
+  const response = await call(peer, s, '/api/pty/pty_safe/connect-token?location%5Bdirectory%5D=%2Frepo',
+    { method: 'POST', body: encode('{}'), headers: { 'X-OpenCode-Ticket': '1' } });
+  assert.equal(response.status, 200);
+  assert.equal(f.requests.at(-1).headers['x-opencode-ticket'], '1');
+  const before = f.requests.length;
+  for (const [path, method, value] of [['/api/echo', 'POST', '1'], ['/api/pty/pty_safe/connect-token', 'GET', '1'], ['/api/pty/pty_safe/connect-token', 'POST', 'secret']]) {
+    await assert.rejects(call(peer, s, path, { method, headers: { 'x-opencode-ticket': value } }), errorCode('INVALID_PARAMS'));
+  }
+  assert.equal(f.requests.length, before);
 });
 
 test('protected identity authenticates only on the same socket owned by the registered PID', { timeout: 10_000, skip: process.platform !== 'linux' }, async t => {

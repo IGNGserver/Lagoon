@@ -38,7 +38,9 @@ data class ApiCapabilities(
   /** DSH job/follow, independent of direct/SSH/Remote transport. */
   val jobOutputStream: Boolean = false,
   /** The protocol can terminate a background job; independent of the connection carrier. */
-  val stopShell: Boolean = false
+  val stopShell: Boolean = false,
+  /** Native PTY routes plus the documented single-use WebSocket ticket handshake. Never assumed. */
+  val terminal: Boolean = false
 ) {
   fun supports(action: SessionAction) = action in actions
   companion object {
@@ -99,9 +101,41 @@ data class ApiCapabilities(
       val stopShell = paths.keys().asSequence().any { path ->
         Regex("^/api/shell/\\{[^/}]+\\}$").matches(path) && paths.obj(path).has("delete")
       }
+      fun compatibleBody(op: JSONObject, fields: Map<String, String>): Boolean {
+        val input = body(op)
+        val required = input.arr("required")
+        // Rename and resize are separate writes; neither may require its absent sibling.
+        if (required.length() != 0) return false
+        return fields.all { (name, type) ->
+          val raw = input.obj("properties").optJSONObject(name) ?: return@all false
+          schema(raw).str("type") == type
+        }
+      }
+      fun emptyBody(op: JSONObject): Boolean {
+        val required = body(op).arr("required")
+        return required.length() == 0
+      }
+      val pty = paths.optJSONObject("/api/pty")
+      val terminal = pty?.optJSONObject("get") != null && pty.optJSONObject("post")?.let(::emptyBody) == true &&
+        paths.keys().asSequence().filter { Regex("^/api/pty/\\{[^/}]+\\}$").matches(it) }.any { path ->
+          val item = paths.obj(path)
+          val put = item.optJSONObject("put")
+          val tokenPath = paths.optJSONObject("$path/connect-token")
+          val token = tokenPath?.optJSONObject("post")
+          val connect = paths.obj("$path/connect").optJSONObject("get")
+          val parameters = listOfNotNull(tokenPath, token).flatMap { it.arr("parameters").objects() }.map(::schema)
+          val ticketHeader = parameters.any {
+            it.str("in") == "header" && it.str("name").equals("x-opencode-ticket", ignoreCase = true)
+          }
+          val size = put?.let { schema(body(it).obj("properties").obj("size")) }
+          item.optJSONObject("get") != null && item.optJSONObject("delete") != null && put != null &&
+            compatibleBody(put, mapOf("title" to "string", "size" to "object")) &&
+            size != null && listOf("cols", "rows").all { schema(size.obj("properties").obj(it)).str("type") in setOf("number", "integer") } &&
+            token != null && emptyBody(token) && ticketHeader && connect != null
+        }
       return ApiCapabilities(actions, endpoint("/diff", "GET") != null,
         endpoint("/view", "POST", setOf("idle")), archive, documented = true,
-        fork = endpoint("/fork", "POST") != null, stopShell = stopShell)
+        fork = endpoint("/fork", "POST") != null, stopShell = stopShell, terminal = terminal)
     }
 
     /**

@@ -69,7 +69,10 @@
 - 编辑与清除确认捕获 exact route/session/goal revision；旧版本仅重读状态，不自动重发编辑，失败保留输入；完整 GoalView 响应直接提交并按版本挡住旧投影。create ref-only ack 不推断 armed，保留确认前收到的同目标激活事件；同 revision 激活变化、迟到空读取与清除 tombstone 均有缓存/Controller 防回滚门禁。
 - r11：官方调度 catalog/list/history/delete/update 已接入三种 DSH carrier。完整六类 ScheduleRecord 作为封闭 CAS 快照，原会话、状态、lastDelivery 单独保存，不混入 expected；时区/计划目标原样保留，修改定时须明确勾选，after 仅明确改为 at。
 - UI 有活跃/非活跃目录、投递回执分页（不冒充 Agent 运行完成）、保留/修剪提示、删除确认、分阶段编辑与冲突后显式重新读取；已改字段保留，未改字段随服务器更新，避免回写他端编辑。写操作前后按原路由/会话/完整记录隔离；未知结果只读核对，不自动重发，HTTP401 也不重放调度 mutation。
-- rc.5 generated 仅公开上述5种调度方法，没有公开 create/run/enable，不能将内部服务方法或 Agent tool 冒充客户端 API。交互终端仍待业务适配，不把通用 WS carrier 当作已交付功能。未跑 Android 真机布局、可访问性、预测式返回；当前仅源码与 Compose 编译验收。
+- rc.5 generated 仅公开上述5种调度方法，没有公开 create/run/enable，不能将内部服务方法或 Agent tool 冒充客户端 API。
+- r12：OpenCode simple PTY 的原生业务模型/目录/明确创建/单次票据附着/输入/尺寸与标题更新/明确终止接入 Direct/SSH/Remote native service；能力仅从兼容路由和票据 header 声明发现，baseline 不假定支持。纯文本 ANSI 投影、OSC/clipboard 控制序列抑制，不宣称完整 VT/TUI。
+- 终端以 location 归属，不冒充 Session 资源。UI 默认只读，明确附加/输入确认；离开仅 detach，只有确认终止才 DELETE。原路由/会话/目录捕获并按输入逐次许可；原始 UTF-8 无 ACK，游标按 UTF-16，输入不自动重放/重连。Host 仅在原生 POST /api/pty/{id}/connect-token 放行 x-opencode-ticket:1。
+- DSH terminal API 已核实存在，但 Direct/SSH 双向 mux 业务和 Remote 能力协商/上行桥接仍未实现；当前不能按 harness.remote.v3 推断支持。未跑 Android 真机布局、可访问性、预测式返回；当前仅源码与 Compose 编译验收。
 
 ### 阶段 7：验证与交付仍进行中
 - 本地 fake Hub/实际 Noise/真实 Node connector 互操作不等于公网 Hub、真实官方 daemon 或 Android 真机验收。
@@ -126,5 +129,10 @@
 - `schedule-reviewed.log` 官方 schema、Controller/dirty-field、实际 Noise 调度目录/历史/更新/删除等定向通过21s；写操作 401 不重放，冲突/未知只读核对。固定导出5种官方请求契约，结果 schema 无法表达的重叠 union 保留 resultSchemaError，不手造成功 schema。
 - `schedule-full.log`：**1325 tests、0 failures、0 errors、10 skipped**；Debug assemble 成功122s。新增 ScheduleApi12、ScheduleMutationPolicy4、ScheduleEditorPolicy7、Controller10、官方调度契约2、实际加密调度1项。APK 21,842,052 bytes，SHA-256 `61cd28a5625e4686ba0b349cb13fc74219e9d080b79017e608b326e8bde62e4a`；本轮不启动真实 daemon，4个 live opt-in 保持 skip，fixture Noise 实际运行。
 - `schedule-timing-rebase-final.log`：按 time/zone/weekdays 等字段分别保留实际编辑意图，避免仅改时间后把他端新时区覆盖；新增1回归。**1326 tests、0 failures、0 errors、10 skipped**，Debug assemble 成功117s。APK 21,842,299 bytes，SHA-256 `516bf2b2f16be324e36fc3c99e6badce07ec0cb7e496b69a4367a27a0e486e54`。
+- r12 固定官方源码验证 simple PTY 原始 text / binary0+cursor / UTF-16 / detach 协议；`official-pty-protocol.log` 隔离官方 v2.2.6 上 /bin/cat 的创建、输入回显、metadata、detach 后仍运行、resize、204 删除均通过。
+- `terminal-first.log` Android 原生直连 PTY 实测及初版 UI/门禁通过16s；`terminal-native-encrypted.log` actual Noise→patched Router→官方 PTY 与回归通过12s。独立复核发现终端 stateLock 与 carrier callback gate 反向嵌套可死锁，已将 send/cancel 移至状态锁外，新增可重复触发旧竞态的双线程回归；`terminal-reviewed.log` 包含真实 PTY 的定向通过11s。
+- `pty-connector-full-build.log` 固定上游完整 Host plugin bundle 4,029,973 bytes，SHA-256 `701a39fa59835b3b9274cbd9476b2065c892b18b48ce2d2c1e646a285208d64a`；`pty-host-router-final.log` peer16 + actual Router5 共21项通过。x-opencode-ticket仅精确POST票据路由允许，其他方法/路径/值与流头拒绝。
+- `terminal-full.log` 全量仅失败旧 ChatSheet 枚举逐字断言；改为仍核对 ACTIVITY 枚举成员并保留半屏高度/入口/返回语义断言。`terminal-final.log`：**1352 tests、0 failures、0 errors、7 skipped**，Debug assemble 成功119s；官方 Direct PTY、真实 SSH PTY、actual Noise PTY 均实际运行未跳过。新增 adapter12、文本投影6、位置/路由门禁2、Controller4、Remote header1、官方 PTY1项。APK 21,915,479 bytes，SHA-256 `e288128d2cd7d77089790928a6764fc25a93686a778a1fd51a804e8e8ec1c343`。
+- PTY 测试仅在全新 HOME/XDG/固定 scratch 工作目录创建默认 shell 或 /bin/cat，发送固定 printf 探针，无模型调用或用户项目命令；目录 PTY 列表核对为空后停止本任务拥有的随机 loopback OpenCode/sshd，不终止用户现有服务。不是公网/Android 真机或完整 VT 验收。
 - 全部构建在 `/home/lvziw/.build/Lagoon/unified-harness-connections/source`，Gradle/build 输出在 `~/.build`。源码工作树无 app/build、node_modules。
 - `wt audit`：29 repos，0 missing dirs，3 detached、4 merged worktrees 属其他任务；只读报告，无清理。

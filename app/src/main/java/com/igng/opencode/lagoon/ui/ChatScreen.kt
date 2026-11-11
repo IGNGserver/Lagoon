@@ -65,7 +65,7 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
 import top.yukonga.miuix.kmp.theme.miuixCapsuleShape
 import top.yukonga.miuix.kmp.theme.miuixShape
 
-private enum class ChatSheet { CHANGES, FILES, SCHEDULES, ACTIVITY }
+private enum class ChatSheet { CHANGES, FILES, SCHEDULES, ACTIVITY, TERMINAL }
 
 internal fun conversationActivityCount(activity: SessionActivity): Int =
   activity.subSessions.size + activity.shells.size
@@ -129,6 +129,7 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
       add(MenuAction(conversationActivityLabel(activity), MiuixIcons.MindMap) { showActivitySheet() })
       if (state.capabilities.diff) add(MenuAction("改动（${state.changes.size}）", MiuixIcons.Merge) { sheet = ChatSheet.CHANGES })
       add(MenuAction("文件", MiuixIcons.Folder) { sheet = ChatSheet.FILES; controller.listFiles() })
+      if (state.capabilities.terminal) add(MenuAction("文本终端", MiuixIcons.Info) { sheet = ChatSheet.TERMINAL })
       if (state.server?.kind == ServerKind.DSH || state.server?.kind == ServerKind.DSH_REMOTE) {
         add(MenuAction("定时任务", MiuixIcons.Info) { sheet = ChatSheet.SCHEDULES; controller.loadSchedules() })
         // DSH 允许用新目标替换已完成的目标；进行中/暂停中必须先继续或清除。
@@ -230,6 +231,7 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
       ChatSheet.FILES -> "文件"
       ChatSheet.SCHEDULES -> "定时任务"
       ChatSheet.ACTIVITY -> conversationActivityLabel(activity)
+      ChatSheet.TERMINAL -> "原生文本终端"
     }
     HyperBottomSheet(title = title, show = true, onDismissRequest = { sheet = null }) {
       Column(Modifier.fillMaxWidth().fillMaxHeight(0.72f).padding(vertical = 8.dp)) {
@@ -245,6 +247,7 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
           }
           ChatSheet.FILES -> FilesPanel(state, controller) { path -> controller.addReference(path); sheet = null }
           ChatSheet.SCHEDULES -> SchedulesPanel(state, controller)
+          ChatSheet.TERMINAL -> NativeTerminalPanel(state, controller)
           // 子会话整页打开；后台命令有自己的输出抽屉，这一层先收起，不把两个抽屉叠在一起。
           ChatSheet.ACTIVITY -> ActivityPanel(state, activity, state.messages.filter { it.isBackgroundActivityMessage }, controller,
             modifier = Modifier.fillMaxWidth().weight(1f).padding(horizontal = 8.dp),

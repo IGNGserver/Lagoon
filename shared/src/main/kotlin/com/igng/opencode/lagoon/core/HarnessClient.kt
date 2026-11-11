@@ -152,6 +152,17 @@ interface HarnessClient {
 
   suspend fun shells(directory: String): List<ShellJob>
 
+  /** Native interactive PTYs; unsupported harnesses fail explicitly rather than creating a shell job. */
+  suspend fun terminals(directory: String): List<NativeTerminal> = throw ApiException(501, "此 harness 不支持原生终端")
+  /** Only an explicit caller action may create a terminal; the server chooses its default shell. */
+  suspend fun createTerminal(directory: String): NativeTerminal = throw ApiException(501, "此 harness 不支持原生终端")
+  suspend fun resizeTerminal(directory: String, id: String, cols: Int, rows: Int): NativeTerminal =
+    throw ApiException(501, "此 harness 不支持原生终端")
+  suspend fun renameTerminal(directory: String, id: String, title: String): NativeTerminal =
+    throw ApiException(501, "此 harness 不支持原生终端")
+  suspend fun closeTerminal(directory: String, id: String): Unit = throw ApiException(501, "此 harness 不支持原生终端")
+  suspend fun attachTerminal(directory: String, id: String): TerminalAttachment = throw ApiException(501, "此 harness 不支持原生终端")
+
   /**
    * One shell command including its terminal status. OpenCode exposes this as `GET /api/shell/{id}`;
    * harnesses without a shell route return null and the UI hides the output action.

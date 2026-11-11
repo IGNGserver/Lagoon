@@ -177,12 +177,14 @@ function ownershipAgent(r, signal) {
   return agent;
 }
 
-function requestHeaders(input = {}) {
+function requestHeaders(input = {}, method, path) {
   if (!object(input)) fail('INVALID_PARAMS');
   const out = {};
   for (const [key, value] of Object.entries(input)) {
     const lower = key.toLowerCase();
-    if (!['accept', 'content-type'].includes(lower) || Object.hasOwn(out, lower) || typeof value !== 'string' || value.length > 4096 || CONTROL.test(value)) fail('INVALID_PARAMS');
+    const ptyTicket = lower === 'x-opencode-ticket' && value === '1' && method === 'POST' &&
+      typeof path === 'string' && /^\/api\/pty\/[^/?]+\/connect-token(?:\?|$)/.test(path);
+    if ((!['accept', 'content-type'].includes(lower) && !ptyTicket) || Object.hasOwn(out, lower) || typeof value !== 'string' || value.length > 4096 || CONTROL.test(value)) fail('INVALID_PARAMS');
     out[lower] = value;
   }
   return out;
@@ -371,7 +373,7 @@ export class NativeServicePeer {
   async #currentStream(s) { try { if ((await registration(s.path)).generation === s.generation) return; } catch {} await this.#finish(s, 'STALE_SERVICE'); fail('STALE_SERVICE'); }
   async #callHTTP(p, options = {}) {
     if (typeof p.method !== 'string' || !/^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)$/.test(p.method) || !integer(p.maxResponseBytes, 1, TOTAL)) fail('INVALID_PARAMS');
-    const headers = requestHeaders(p.headers), body = options.bodyOverride === undefined ? (p.body === undefined ? undefined : base64(p.body)) : options.bodyOverride;
+    const headers = requestHeaders(p.headers, p.method, p.path), body = options.bodyOverride === undefined ? (p.body === undefined ? undefined : base64(p.body)) : options.bodyOverride;
     const r = await this.#service(p, p.method); this.#assertOpen();
     if (!options.slotReserved && this.#transfers.size + this.#incoming.size + this.#pendingTransfers >= 4) fail('RESOURCE_LIMIT');
     const c = this.#controller(); if (!options.slotReserved) this.#pendingTransfers++; let held = 0;
@@ -394,7 +396,7 @@ export class NativeServicePeer {
     if (typeof p.method !== 'string' || !/^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)$/.test(p.method) ||
         !integer(p.maxResponseBytes, 1, TOTAL) || !Number.isSafeInteger(p.totalBytes) || p.totalBytes < 0) fail('INVALID_PARAMS');
     if (p.totalBytes > TOTAL) fail('RESOURCE_LIMIT');
-    const headers = requestHeaders(p.headers), r = await this.#service(p, p.method); this.#assertOpen();
+    const headers = requestHeaders(p.headers, p.method, p.path), r = await this.#service(p, p.method); this.#assertOpen();
     if (this.#transfers.size + this.#incoming.size + this.#pendingTransfers >= 4) fail('RESOURCE_LIMIT');
     this.#reserve(p.totalBytes);
     let bytes;

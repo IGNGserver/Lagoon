@@ -7,6 +7,7 @@ import java.io.OutputStream
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.launchIn
+import kotlinx.coroutines.flow.first
 import org.json.JSONObject
 import org.junit.Assert.*
 import org.junit.Assume.assumeTrue
@@ -90,6 +91,22 @@ class OfficialSshServiceTest {
           val stream = clients[1].events { opened.complete(Unit) }.launchIn(this)
           try { withTimeout(10_000) { opened.await() } } finally { stream.cancelAndJoin() }
           assertTrue(stream.isCompleted)
+          System.getenv("LAGOON_OFFICIAL_PTY_DIRECTORY")?.let { directory ->
+            stage = "native terminal"
+            assertTrue(clients[1].discoverCapabilities().terminal)
+            val terminal = clients[1].createTerminal(directory)
+            var attached: TerminalAttachment? = null
+            try {
+              attached = clients[1].attachTerminal(directory, terminal.id)
+              withTimeout(10_000) { attached.state.first { it.ready } }
+              assertTrue(attached.sendText("printf 'LAGOON_%s\\n' SSH_PTY_ACCEPTANCE\r"))
+              withTimeout(10_000) { attached.state.first { it.output.contains("LAGOON_SSH_PTY_ACCEPTANCE") } }
+              attached.close(); attached = null
+              assertEquals("running", clients[1].terminals(directory).single { it.id == terminal.id }.status)
+              assertEquals(terminal.id, clients[1].resizeTerminal(directory, terminal.id, 80, 24).id)
+            } finally { attached?.close(); clients[1].closeTerminal(directory, terminal.id) }
+            assertTrue(clients[1].terminals(directory).none { it.id == terminal.id })
+          }
           stage = "sibling ownership"
           links[0].close()
           clients[0].awaitClosed()

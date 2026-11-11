@@ -62,13 +62,25 @@ class OpenCodeApi internal constructor(
   private val nativeEndpoint = NativeHttpEndpoint(base.toString())
   private val nativeTransport: NativeHttpTransport = transport ?: NativeOkHttpTransport(nativeEndpoint, callTimeoutSeconds, streamIdleSeconds)
   @Volatile private var closed = false
+  private val terminalApiDelegate = lazy { OpenCodeTerminalApi(nativeTransport, ::requestHeaders) { closed } }
+  private val terminalApi: OpenCodeTerminalApi get() = terminalApiDelegate.value
   override val isClosed: Boolean get() = closed
   override fun close() {
     if (!closed) {
       closed = true
+      if (terminalApiDelegate.isInitialized()) terminalApi.close()
       nativeTransport.close()
     }
   }
+
+  override suspend fun terminals(directory: String): List<NativeTerminal> = terminalApi.terminals(directory)
+  override suspend fun createTerminal(directory: String): NativeTerminal = terminalApi.createTerminal(directory)
+  override suspend fun resizeTerminal(directory: String, id: String, cols: Int, rows: Int): NativeTerminal =
+    terminalApi.resizeTerminal(directory, id, cols, rows)
+  override suspend fun renameTerminal(directory: String, id: String, title: String): NativeTerminal =
+    terminalApi.renameTerminal(directory, id, title)
+  override suspend fun closeTerminal(directory: String, id: String) = terminalApi.closeTerminal(directory, id)
+  override suspend fun attachTerminal(directory: String, id: String): TerminalAttachment = terminalApi.attachTerminal(directory, id)
   @Volatile private var version: String? = null
   @Volatile private var discoveredCapabilities: ApiCapabilities? = null
   /** Row-label titles only; the server's project list is never imported into the local registry. */

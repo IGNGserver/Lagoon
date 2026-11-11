@@ -39,7 +39,7 @@ Host 从本机官方 OpenCode registration 读取 URL/Basic password，验证 lo
 
 URL/端口/Authorization/Cookie 不能由 Remote 请求提供；响应剔除 Set-Cookie 等敏感 headers。仅相对 OpenCode 路由和 Host 读取的 OpenAPI method/path 匹配；显式允许 `/api/info`、`/openapi.json`、`/api/event`。禁止绝对URL、authority、userinfo、fragment、遍历、反斜杠、未列出 method/path、重定向。服务 ID 非手机 URL。
 
-请求 headers 仅 Accept/Content-Type 与必要协议 header 白名单；Host 独立注入凭据。registration 缺失/损坏/不可读为 partial/issue，不等于权威空目录。不启动、不安装、不终止外部服务。
+请求 headers 仅 Accept/Content-Type 与必要协议 header 白名单；`x-opencode-ticket: 1` 仅允许用于已列入 OpenAPI 的 `POST /api/pty/{id}/connect-token`，其他值/方法/路径或 SSE/WS header 均拒绝。票据只作一次性附着 URL 参数，不记录到持久日志；Host 独立注入凭据。registration 缺失/损坏/不可读为 partial/issue，不等于权威空目录。不启动、不安装、不终止外部服务。
 
 ## 实现与验证边界
 
@@ -47,6 +47,8 @@ Host companion 和 SHA 校验的固定上游 Router/HostPluginRuntime overlay、
 
 本地跨语言 fixture 集成实际经过 Kotlin Noise/Relay → patched upstream RpcRouter → NativeServicePeer，验证会话列表/改名/SSE/2 MiB 上传与大响应分片/兄弟关闭隔离。另有 opt-in 测试实际连到校验后的官方 OpenCode v2.2.6 daemon：Android 原生直连、真实 JSch/sshd 原生附着，以及 Kotlin Noise → actual Router/Peer → 同一官方 daemon 的目录/能力/事件读取均通过；没有发送模型 prompt。Fake Hub/Host relay + 真实 Noise/Router 不等于公网 Hub/生产 Host，JVM 也不等于 Android 真机。
 
-官方 DSH 0.2.1-rc.5 另以全新隔离 WebHost 验证 session/list、workspace/follow、$events 就绪/取消/关闭；不声称附着现有 Desktop。旧 Host 没有声明原生能力时不发送原生调用，显示升级要求，不走 ACP。
+OpenCode simple PTY 协议另按固定提交 `dc2ffcf8bf26f9e669b6aa22b95f50e12be15e06` 的 [wire protocol](https://github.com/anomalyco/opencode/blob/dc2ffcf8bf26f9e669b6aa22b95f50e12be15e06/packages/core/src/pty/protocol.ts)、[连接 handler](https://github.com/anomalyco/opencode/blob/dc2ffcf8bf26f9e669b6aa22b95f50e12be15e06/packages/server/src/handlers/pty.ts) 和 [domain](https://github.com/anomalyco/opencode/blob/dc2ffcf8bf26f9e669b6aa22b95f50e12be15e06/packages/core/src/pty.ts) 验证：原始 UTF-8 text、binary 0x00 + JSON cursor 的回放界线、UTF-16 输出计数，不移用 persistent-pty 帧或虚构 ACK。原生文本终端明确创建/附着/输入/resize/DELETE，附着 close 只 detach；隔离官方 v2.2.6 的 Direct 与 Noise 路径已实际验证，真实 SSH 验收在专项测试中执行。UI 是有界 ANSI 纯文本投影而非完整 VT/TUI。
+
+官方 DSH 0.2.1-rc.5 另以全新隔离 WebHost 验证 session/list、workspace/follow、$events 就绪/取消/关闭；不声称附着现有 Desktop。DSH 当前 LogicalSocket/Remote StreamSocket 不支持上行，Remote allowlist 无 terminal/*；在实现受认证双向桥与明确能力前，不因 v3 存在就宣称可输入终端。旧 Host 没有声明原生能力时不发送原生调用，显示升级要求，不走 ACP。
 
 服务 ID 是 Host 本地注册路径的稳定 locator；不声称物理机器全局身份、跨路径服务合并或 DSH Desktop 附着。Host 插件必须由用户显式构建/安装/启用；本任务没有部署。

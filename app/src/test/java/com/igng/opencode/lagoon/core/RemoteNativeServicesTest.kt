@@ -61,6 +61,21 @@ class RemoteNativeServicesTest {
     }
   }
 
+  @Test fun ptyTicketHeaderOnlyCrossesItsExactNativePostRoute() = runBlocking {
+    val fake = FakeRpc()
+    val registry = fake.registry()
+    try {
+      val transport = registry.transport("one", "g1")
+      transport.request("POST", "/api/pty/pty_safe/connect-token", mapOf("X-OpenCode-Ticket" to "1"), "{}".toByteArray())
+      val call = fake.calls.last { it.method == "harness.services.call" }
+      assertEquals("1", call.params.getJSONObject("headers").getString("X-OpenCode-Ticket"))
+      for ((method, path, value) in listOf(Triple("GET", "/api/pty/pty_safe/connect-token", "1"),
+        Triple("POST", "/api/session", "1"), Triple("POST", "/api/pty/pty_safe/connect-token", "secret"))) {
+        assertEquals("INVALID_HEADERS", failureCode { transport.request(method, path, mapOf("x-opencode-ticket" to value)) })
+      }
+    } finally { registry.close() }
+  }
+
   @Test fun multipleServicesShareConnectionWithoutCredentialOrOriginLeaks() = runBlocking {
     val fake = FakeRpc().apply { catalog = catalog(service("one"), service("two", generation = "g2")) }
     val leases = AtomicInteger()

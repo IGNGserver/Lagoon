@@ -6,6 +6,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
@@ -275,6 +276,21 @@ class RemoteNativeConversationTest {
             val collector = launch(Dispatchers.IO) { backend.client.events { opened.complete(Unit) }.collect {} }
             try { withTimeout(TIMEOUT_MILLIS) { opened.await() } } finally { collector.cancel(); collector.join() }
             assertEquals("2.2.6", withTimeout(TIMEOUT_MILLIS) { backend.client.health() })
+            System.getenv("LAGOON_OFFICIAL_PTY_DIRECTORY")?.let { directory ->
+              assertTrue(backend.client.discoverCapabilities().terminal)
+              val terminal = withTimeout(TIMEOUT_MILLIS) { backend.client.createTerminal(directory) }
+              var attached: TerminalAttachment? = null
+              try {
+                attached = withTimeout(TIMEOUT_MILLIS) { backend.client.attachTerminal(directory, terminal.id) }
+                withTimeout(TIMEOUT_MILLIS) { attached.state.first { it.ready } }
+                assertTrue(attached.sendText("printf 'LAGOON_%s\\n' NOISE_PTY_ACCEPTANCE\r"))
+                withTimeout(TIMEOUT_MILLIS) { attached.state.first { it.output.contains("LAGOON_NOISE_PTY_ACCEPTANCE") } }
+                attached.close(); attached = null
+                assertEquals("running", backend.client.terminals(directory).single { it.id == terminal.id }.status)
+                assertEquals(terminal.id, backend.client.resizeTerminal(directory, terminal.id, 80, 24).id)
+              } finally { attached?.close(); withTimeout(TIMEOUT_MILLIS) { backend.client.closeTerminal(directory, terminal.id) } }
+              assertTrue(backend.client.terminals(directory).none { it.id == terminal.id })
+            }
           }
           assertEquals(1, session.status.value.generation)
           assertEquals(1, synchronized(host.requests) { host.requests.count { it == "GET /ws/v1/connect" } })

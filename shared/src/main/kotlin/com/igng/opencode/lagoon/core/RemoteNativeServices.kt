@@ -213,6 +213,10 @@ internal class RemoteNativeServices(
       val normalized = requireNativeHttpMethod(method)
       val path = checkedPath(relativePath)
       val checkedHeaders = requestHeaders(headers)
+      headers.entries.firstOrNull { it.key.equals("x-opencode-ticket", true) }?.let {
+        if (normalized != "POST" || it.value != "1" || !Regex("^/api/pty/[^/?]+/connect-token(?:\\?|$)").containsMatchIn(path))
+          throw nativeError("INVALID_HEADERS")
+      }
       if (body != null && body.size > MAX_NATIVE_HTTP_RESPONSE_BYTES) throw nativeError("REQUEST_TOO_LARGE")
       if (body != null && "binary" !in service.capabilities) throw nativeError("UNSUPPORTED_CAPABILITY")
       return operation(generation) {
@@ -312,6 +316,7 @@ internal class RemoteNativeServices(
       if (kind !in service.capabilities) throw nativeError("UNSUPPORTED_CAPABILITY")
       val path = checkedPath(relativePath)
       val checkedHeaders = requestHeaders(headers)
+      if (headers.keys.any { it.equals("x-opencode-ticket", true) }) throw nativeError("INVALID_HEADERS")
       val stream = RemoteStream(UUID.randomUUID().toString(), kind, generation, callback, listener)
       synchronized(lock) {
         requireActive(generation)
@@ -549,7 +554,7 @@ internal class RemoteNativeServices(
     private const val SEND_QUEUE = 32
     private val LOCATOR = Regex("[A-Za-z0-9][A-Za-z0-9._:-]{0,255}")
     private val CODE = Regex("[A-Za-z0-9_./-]{1,128}")
-    private val REQUEST_HEADERS = setOf("accept", "content-type", "last-event-id", "sec-websocket-protocol")
+    private val REQUEST_HEADERS = setOf("accept", "content-type", "last-event-id", "sec-websocket-protocol", "x-opencode-ticket")
     private val SENSITIVE_HEADERS = setOf("authorization", "proxy-authorization", "cookie", "cookie2", "set-cookie", "set-cookie2")
 
     private fun requireLocator(value: String) {

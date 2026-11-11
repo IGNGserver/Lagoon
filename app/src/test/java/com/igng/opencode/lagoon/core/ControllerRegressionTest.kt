@@ -665,6 +665,92 @@ class ControllerRegressionTest {
       assertEquals(listOf("per_1"), state.value.permissions.map { it.id })
     }
   }
+  @Test fun terminalAttachmentRefusesInputAfterRouteReplacementAndDetachesOnly() = runBlocking {
+    MockWebServer().use { server ->
+      var sent = 0; var detached = 0; var terminated = 0
+      val stream = object : TerminalAttachment {
+        override val state = MutableStateFlow(TerminalStreamState(ready = true, connected = true))
+        override fun sendText(text: String): Boolean { sent++; return true }
+        override fun close() { detached++ }
+      }
+      val client = object : HarnessClient by api(server) {
+        override suspend fun attachTerminal(directory: String, id: String): TerminalAttachment = stream
+        override suspend fun closeTerminal(directory: String, id: String) { terminated++ }
+      }
+      val profile = ServerProfile("server", "Native", "https://terminal.example/")
+      val (controller, state) = controller(client, LagoonState(profiles = listOf(profile), serverId = profile.id, connected = true,
+        sessionId = "session", sessions = listOf(Session("session", "/repo", "Task", 1)), capabilities = ApiCapabilities(terminal = true)))
+      val attachment = controller.attachTerminal(TerminalTarget(profile, "session", "/repo"), "pty_1")
+      assertTrue(attachment.sendText("first\r"))
+      val replacement = profile.copy(url = "https://other-terminal.example/")
+      val store = LagoonController::class.java.getDeclaredField("store").apply { isAccessible = true }.get(controller) as ServerStore
+      store.save(replacement, null); state.value = state.value.copy(profiles = listOf(replacement))
+      assertFalse(attachment.sendText("must not send\r"))
+      assertEquals(1, sent); assertTrue(detached > 0); assertEquals(0, terminated)
+    }
+  }
+
+  @Test fun lateTerminalAttachmentIsClosedWhenSelectionChangesBeforeOpenCompletes() = runBlocking {
+    MockWebServer().use { server ->
+      var detached = 0; var terminated = 0
+      val release = CompletableDeferred<TerminalAttachment>()
+      val client = object : HarnessClient by api(server) {
+        override suspend fun attachTerminal(directory: String, id: String): TerminalAttachment = release.await()
+        override suspend fun closeTerminal(directory: String, id: String) { terminated++ }
+      }
+      val profile = ServerProfile("server", "Native", "https://terminal.example/")
+      val (controller, state) = controller(client, LagoonState(profiles = listOf(profile), serverId = profile.id, connected = true,
+        sessionId = "session", sessions = listOf(Session("session", "/repo", "Task", 1), Session("other", "/different", "Other", 1)),
+        capabilities = ApiCapabilities(terminal = true)))
+      val opening = async { runCatching { controller.attachTerminal(TerminalTarget(profile, "session", "/repo"), "pty_1") } }
+      yield(); state.value = state.value.copy(sessionId = "other")
+      release.complete(object : TerminalAttachment {
+        override val state = MutableStateFlow(TerminalStreamState())
+        override fun sendText(text: String) = false
+        override fun close() { detached++ }
+      })
+      assertTrue(opening.await().isFailure); assertEquals(1, detached); assertEquals(0, terminated)
+    }
+  }
+
+  @Test fun nativeTerminalReadsAndCreatesNeverRetargetOldDirectoryOrUnsupportedCarrier() = runBlocking {
+    MockWebServer().use { server ->
+      var reads = 0; var creates = 0
+      val client = object : HarnessClient by api(server) {
+        override suspend fun terminals(directory: String): List<NativeTerminal> { reads++; return emptyList() }
+        override suspend fun createTerminal(directory: String): NativeTerminal { creates++; error("must not run") }
+      }
+      val profile = ServerProfile("server", "Native", "https://terminal.example/")
+      val (controller, state) = controller(client, LagoonState(profiles = listOf(profile), serverId = profile.id, connected = true,
+        sessionId = "session", sessions = listOf(Session("session", "/repo", "Task", 1)), capabilities = ApiCapabilities(terminal = true)))
+      val target = TerminalTarget(profile, "session", "/repo")
+      assertTrue(controller.terminals(target).isEmpty()); assertEquals(0, creates)
+      assertTrue(runCatching { controller.createTerminal(target.copy(directory = "/other")) }.isFailure)
+      assertTrue(runCatching { controller.terminals(target.copy(profile = profile.copy(url = "https://old.example/"))) }.isFailure)
+      state.value = state.value.copy(capabilities = ApiCapabilities())
+      assertTrue(runCatching { controller.createTerminal(target) }.isFailure)
+      assertEquals(1, reads); assertEquals(0, creates)
+    }
+  }
+
+  @Test fun lateTerminalCreationDoesNotAutoTerminateAnUnknownRemoteProcess() = runBlocking {
+    MockWebServer().use { server ->
+      val created = CompletableDeferred<NativeTerminal>(); var creates = 0; var deletes = 0
+      val client = object : HarnessClient by api(server) {
+        override suspend fun createTerminal(directory: String): NativeTerminal { creates++; return created.await() }
+        override suspend fun closeTerminal(directory: String, id: String) { deletes++ }
+      }
+      val profile = ServerProfile("server", "Native", "https://terminal.example/")
+      val (controller, state) = controller(client, LagoonState(profiles = listOf(profile), serverId = profile.id, connected = true,
+        sessionId = "session", sessions = listOf(Session("session", "/repo", "Task", 1), Session("other", "/repo", "Other", 1)),
+        capabilities = ApiCapabilities(terminal = true)))
+      val creating = async { runCatching { controller.createTerminal(TerminalTarget(profile, "session", "/repo")) } }
+      yield(); state.value = state.value.copy(sessionId = "other")
+      created.complete(NativeTerminal("pty_created", "Created", "/repo", "running", "/bin/sh", emptyList(), 123))
+      assertTrue(creating.await().isFailure); assertEquals(1, creates); assertEquals(0, deletes)
+    }
+  }
+
   private fun scheduleRecord() = ScheduleRecord("task", "daily", "Task", "Prompt", "2099-01-01T15:00:00.000Z", time = "23:00:00.000", timeZone = "Asia/Shanghai")
   private fun scheduleState(profile: ServerProfile, record: ScheduleRecord = scheduleRecord()) = LagoonState(
     profiles = listOf(profile), serverId = profile.id, connected = true, sessionId = "owner",
