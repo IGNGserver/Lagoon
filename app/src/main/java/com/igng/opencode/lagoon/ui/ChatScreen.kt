@@ -95,6 +95,9 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
   var childText by remember(state.serverId, state.sessionId) { mutableStateOf("") }
   var goalDialog by remember(state.serverId, state.sessionId) { mutableStateOf(false) }
   var goalText by remember(state.serverId, state.sessionId) { mutableStateOf("") }
+  var goalCapText by remember(state.serverId, state.sessionId) { mutableStateOf("") }
+  var goalCreateProfile by remember(state.serverId, state.sessionId) { mutableStateOf<ServerProfile?>(null) }
+  var goalCreateSession by remember(state.serverId, state.sessionId) { mutableStateOf<String?>(null) }
   var revertMessage by remember(state.serverId, state.sessionId) { mutableStateOf<String?>(null) }
   var timelineTarget by remember(state.serverId, state.sessionId) { mutableStateOf<TimelineMutationTarget?>(null) }
   var restoreTimeline by remember(state.serverId, state.sessionId) { mutableStateOf(false) }
@@ -112,7 +115,7 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
     menu = false
     sheet = ChatSheet.ACTIVITY
   }
-  val modal = sheet != null || menu || rename || delete || composerModal || requestModal || activityGroup != null || state.shellOutput != null || revertMessage != null || restoreTimeline
+  val modal = sheet != null || menu || rename || delete || composerModal || requestModal || activityGroup != null || state.shellOutput != null || revertMessage != null || restoreTimeline || goalDialog
   DisposableEffect(modal) { onModal(modal); onDispose { onModal(false) } }
   fun openFile(path: String) { sheet = ChatSheet.FILES; controller.readFile(path) }
   if (session == null) {
@@ -130,7 +133,9 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
         add(MenuAction("定时任务", MiuixIcons.Info) { sheet = ChatSheet.SCHEDULES; controller.loadSchedules() })
         // DSH 允许用新目标替换已完成的目标；进行中/暂停中必须先继续或清除。
         if (state.goal == null || state.goal.complete) {
-          add(MenuAction("设定长期目标", MiuixIcons.Ok) { goalDialog = true })
+          add(MenuAction("设定长期目标", MiuixIcons.Ok) {
+            goalCreateProfile = state.server; goalCreateSession = state.sessionId; goalDialog = true
+          })
         }
       }
     }),
@@ -286,14 +291,26 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
     }
   }
   if (goalDialog) {
-    SuperDialog(title = "设定长期目标", show = true, onDismissRequest = { goalDialog = false }) {
-      Column(Modifier.padding(top = 8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text("目标是会话级的；完成或清除前，Host 可能自动续跑。之后可在目标面板里暂停、继续或标记完成。", style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
-        TextField(value = goalText, onValueChange = { goalText = it }, label = "目标")
-        DialogActions("取消", { goalDialog = false }, "创建", goalText.isNotBlank()) {
-          val text = goalText.trim()
-          goalDialog = false; goalText = ""
-          controller.createGoal(text)
+    val pending = state.pending("goal")
+    val cap = parseGoalRoundCap(goalCapText)
+    val sameTarget = goalCreateSession == state.sessionId && goalCreateProfile?.let { captured ->
+      state.server?.let { current -> captured.id == current.id && ConnectionRouteAdmission.sameLeafRoute(captured, current) }
+    } == true
+    SuperDialog(title = "设定长期目标", show = true, onDismissRequest = { if (!pending) goalDialog = false }) {
+      Column(Modifier.heightIn(max = 520.dp).verticalScroll(rememberScrollState()).padding(top = 8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text("目标是会话级的；创建后 Host 可能自动续跑。之后可在目标面板里编辑、暂停、继续或标记完成。", style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
+        TextField(value = goalText, onValueChange = { if (!pending) goalText = it }, label = "完整目标", singleLine = false,
+          modifier = Modifier.fillMaxWidth().heightIn(min = 112.dp, max = 220.dp))
+        TextField(value = goalCapText, onValueChange = { if (!pending) goalCapText = it }, label = "轮次上限（可选）", singleLine = true)
+        Text("留空使用 Host 默认上限；正整数，最大 $MAX_GOAL_ROUND_CAP。", style = MiuixTheme.textStyles.footnote2)
+        cap.exceptionOrNull()?.message?.let { Text(it, color = HyperTheme.colors.error, style = MiuixTheme.textStyles.footnote2) }
+        if (!sameTarget) Text("连接或会话已变化，请关闭后重新打开；草稿已保留。", color = HyperTheme.colors.warning)
+        ActionError(state, "goal")
+        DialogActions("取消", { if (!pending) goalDialog = false }, if (pending) "创建中…" else "创建",
+          sameTarget && state.goalControlsAvailable() && (state.goal == null || state.goal.complete) && goalText.isNotBlank() && cap.isSuccess) {
+          controller.createGoal(goalText.trim(), maxRounds = cap.getOrNull(), onCreated = {
+            goalDialog = false; goalText = ""; goalCapText = ""
+          }, expectedProfile = goalCreateProfile, expectedSession = goalCreateSession)
         }
       }
     }

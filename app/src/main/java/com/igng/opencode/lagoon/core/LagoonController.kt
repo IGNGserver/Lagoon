@@ -907,13 +907,8 @@ class LagoonController private constructor(private val appContext: Context) {
    * durable projection instead of making the goal vanish, and the next successful read replaces it.
    */
   fun loadGoal() = withSession("goal-refresh") { op, client, session ->
-    val fetched = try { Result.success(client.goal(session.id)) } catch (error: Exception) {
-      if (error is CancellationException) throw error
-      Result.failure(error)
-    }
-    if (op.isCurrent(this)) op.commit { current ->
-      if (fetched.isFailure) current else current.copy(goal = fetched.getOrNull())
-    }
+    val fetched = client.goal(session.id)
+    op.commit { current -> current.copy(goal = reconcileGoalRead(current.goal, op.snapshot.goal, fetched)) }
   }
 
   fun loadSchedules() = withSession("schedules") { op, client, session ->
@@ -928,20 +923,54 @@ class LagoonController private constructor(private val appContext: Context) {
     }
   }
 
-  fun createGoal(objective: String, maxRounds: Int? = null, onCreated: (() -> Unit)? = null) = withSession("goal") { op, client, session ->
+  fun createGoal(objective: String, maxRounds: Long? = null, onCreated: (() -> Unit)? = null,
+    expectedProfile: ServerProfile? = null, expectedSession: String? = null) = withSession("goal") { op, client, session ->
+    check(expectedProfile == null || op.snapshot.server?.let { it.id == expectedProfile.id && ConnectionRouteAdmission.sameLeafRoute(it, expectedProfile) } == true) { "连接已变化，目标未创建" }
+    check(expectedSession == null || expectedSession == session.id) { "会话已变化，目标未创建" }
+    check(op.snapshot.goal == null || op.snapshot.goal.complete) { "当前目标尚未完成，请编辑或清除后再创建" }
+    check(op.snapshot.canManageGoal()) { "请先连接并同步此 DSH 会话" }
     check(objective.isNotBlank()) { "目标不能为空" }
-    if (!client.createGoal(session.id, objective.trim(), maxRounds)) throw ApiException(501, "此服务器不支持长期目标")
+    check(maxRounds == null || maxRounds in 1..MAX_GOAL_ROUNDS) { "轮数上限必须是有效正整数" }
+    if (!client.createGoalWithLimit(session.id, objective.trim(), maxRounds)) throw ApiException(501, "此服务器不支持长期目标")
     if (op.isCurrent(this)) {
       loadGoal()
       onCreated?.invoke()
     }
   }
 
-  fun goalAction(action: String) = withSession("goal") { op, client, session ->
-    val current = state.value.goal ?: throw ApiException(409, "当前会话没有目标")
+  internal fun editGoal(expected: GoalMutationTarget, objective: String?, maxRounds: Long?, onEdited: (() -> Unit)? = null) =
+    withSession("goal") { op, client, session ->
+      check(op.snapshot.canManageGoal()) { "请先连接并同步此 DSH 会话" }
+      check(expected.matches(op.snapshot)) { "目标或连接已变化，请刷新目标后重新确认；未发送编辑" }
+      check(objective != null || maxRounds != null) { "至少修改目标或轮数上限中的一项" }
+      check(objective == null || objective.isNotBlank()) { "目标不能为空" }
+      check(maxRounds == null || maxRounds in 1..MAX_GOAL_ROUNDS) { "轮数上限必须是有效正整数" }
+      val result = try {
+        client.editGoal(session.id, expected.goalId, expected.revision, objective?.trim(), maxRounds)
+          ?: throw ApiException(501, "此服务器不支持目标编辑")
+      } catch (error: Exception) {
+        if (error is CancellationException) throw error
+        if (op.isCurrent(this) && error is ApiException && error.code in setOf("GOAL_STALE_REVISION", "GOAL_NOT_FOUND")) loadGoal()
+        throw error // Read new metadata only; never replay a stale or unknown-delivery mutation.
+      }
+      check(result.id == expected.goalId && result.revision > expected.revision) { "Host 未返回编辑后的目标版本，请刷新核对；不会自动重发" }
+      op.commit { it.copy(goal = reconcileGoalMutation(it.goal, expected, result)) }
+      if (op.isCurrent(this) && state.value.goal?.let { it.id == result.id && it.revision == result.revision } == true) {
+        op.commit { it.copy(message = "目标已更新，续跑状态未改变", messageTone = FeedbackTone.SUCCESS) }
+        onEdited?.invoke()
+      }
+    }
+
+  internal fun goalAction(action: String, expected: GoalMutationTarget? = null) = withSession("goal") { op, client, session ->
+    check(op.snapshot.canManageGoal()) { "请先连接并同步此 DSH 会话" }
+    check(expected == null || expected.matches(op.snapshot)) { "目标或连接已变化，请重新打开目标操作" }
+    val current = op.snapshot.goal ?: throw ApiException(409, "当前会话没有目标")
+    if (action == "resume") check(current.canResumeGoal()) { "目标续跑资格尚未核实或轮数已用尽，请刷新或编辑轮数上限" }
     if (!client.goalAction(session.id, current.id, current.revision, action)) throw ApiException(501, "此服务器不支持目标操作")
     if (op.isCurrent(this)) {
-      if (action == "clear") op.commit { it.copy(goal = null) }
+      if (action == "clear") op.commit { state ->
+        if (state.goal?.id == current.id && state.goal.revision == current.revision) state.copy(goal = null) else state
+      }
       loadGoal()
     }
   }
@@ -3465,6 +3494,7 @@ class LagoonController private constructor(private val appContext: Context) {
     // Capture before any HTTP/cache suspension, not after the page returns. Live events replace
     // immutable Message values, letting us protect only the IDs that changed during this read.
     val readStart = state.value.messages.associateBy { it.id }
+    val goalReadStart = state.value.goal
     fun liveMessages(snapshot: LagoonState) = snapshot.messages.filter { message ->
       message.id !in snapshot.provisionalMessageIds || readStart[message.id]?.let { message != it } == true
     }
@@ -3570,7 +3600,12 @@ class LagoonController private constructor(private val appContext: Context) {
       // 投影里没有清单键 = 这台 Host 不提供该能力，保留上次读到的值；null = Host 已清空。
       todos = composer.todos ?: it.todos,
       // 目标只被投影“补充”，从不被它清空：清除/完成由 goals/get 与 goalAction 的权威结果决定。
-      goal = composer.goal?.let { durable -> durable.copy(activation = it.goal?.takeIf { known -> known.id == durable.id }?.activation) } ?: it.goal,
+      goal = composer.goal?.let { durable ->
+         val known = it.goal
+         if (known?.id == durable.id && known.revision > durable.revision) known
+          else if (known?.id != goalReadStart?.id || known?.revision != goalReadStart?.revision) known
+         else durable.copy(activation = known?.takeIf { value -> value.id == durable.id && value.revision == durable.revision }?.activation ?: durable.activation)
+       } ?: it.goal,
       previews = it.previews + (session.id to preview),
       agent = if (it.agentChanged) it.agent else latestAgent,
       model = if (it.modelChanged) it.model else latestModel?.let { candidate ->

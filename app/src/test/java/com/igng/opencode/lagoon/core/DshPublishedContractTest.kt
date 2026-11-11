@@ -10,6 +10,26 @@ class DshPublishedContractTest {
     assertEquals("b830ec950faba0a46dda564be3e2d854afed94f1", OfficialDshContract.upstream().getString("commit"))
   }
 
+  @Test fun goalEditUsesAnExactRefAndOptionalReplacementFieldsNotExpectedOrToolArguments() {
+    val args = JSONObject("""{"agentId":"s","ref":{"id":"g","revision":2},"request":{"objective":"Edited","maxGoalRounds":9007199254740991}}""")
+    OfficialDshContract.assertArgs("goals/edit", args)
+    val wrongReference = JSONObject(args.toString()).apply { put("expected", remove("ref")) }
+    assertTrue(runCatching { OfficialDshContract.assertArgs("goals/edit", wrongReference) }.isFailure)
+    val wrongToolArgument = JSONObject(args.toString()).apply { obj("request").put("max_goal_rounds", 20) }
+    assertTrue(runCatching { OfficialDshContract.assertArgs("goals/edit", wrongToolArgument) }.isFailure)
+    val nullObjective = JSONObject(args.toString()).apply { obj("request").put("objective", JSONObject.NULL) }
+    assertTrue(runCatching { OfficialDshContract.assertArgs("goals/edit", nullObjective) }.isFailure)
+  }
+
+  @Test fun goalCreateAckAndEditFullViewAreDifferentOfficialResults() {
+    val reference = JSONObject("""{"ref":{"id":"g","revision":1}}""")
+    val view = JSONObject("""{"id":"g","revision":2,"objective":"Edited","phase":"paused","maxGoalRounds":20,"roundsStarted":3,"createdAt":1,"updatedAt":2,"activation":"disarmed"}""")
+    OfficialDshContract.assertResult("goals/create", reference)
+    OfficialDshContract.assertResult("goals/edit", view)
+    assertTrue(runCatching { OfficialDshContract.assertResult("goals/edit", reference) }.isFailure)
+    assertTrue(runCatching { OfficialDshContract.assertResult("goals/create", view) }.isFailure)
+  }
+
   @Test fun attachmentContractChangedToVerifiedReferenceIn022() {
     val old = JSONObject("""{"request":{"sessionId":"s","attachmentId":"image-id"}}""")
     val current = JSONObject("""{"request":{"sessionId":"s","attachment":{"attachmentId":"image-id","mediaType":"image/png","bytes":8,"width":1,"height":1}}}""")

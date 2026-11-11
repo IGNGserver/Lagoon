@@ -6,8 +6,8 @@ import { resolve, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 const [rootArg, outputArg, mode] = process.argv.slice(2)
-if (!rootArg || !outputArg) throw new Error('Usage: node scripts/export-dsh-contract.mjs <official-dsh-package-root> <new-output.json> [--session-only]')
-if (mode !== undefined && mode !== '--session-only') throw new Error('Unknown export mode')
+if (!rootArg || !outputArg) throw new Error('Usage: node scripts/export-dsh-contract.mjs <official-dsh-package-root> <new-output.json> [--session-only|--goal-only]')
+if (mode !== undefined && !['--session-only', '--goal-only'].includes(mode)) throw new Error('Unknown export mode')
 const root = resolve(rootArg)
 const packageInfo = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'))
 const version = packageInfo.version
@@ -20,11 +20,13 @@ const packages = {
   'dsh-api-workspace-controller': ['workspace/archiveSession', 'workspace/unarchiveSession', 'workspace/pinSession', 'workspace/unpinSession'],
   'dsh-api-job-controller': ['job/list', 'job/follow', 'job/kill'],
   'dsh-api-workspace-files': ['workspaceFiles/readBytes', 'workspaceFiles/list', 'workspaceFiles/read'],
+  'dsh-goal': ['goals/create', 'goals/edit', 'goals/get', 'goals/clear', 'goals/pause', 'goals/resume', 'goals/complete'],
 }
 const sources = []
 const methods = {}
 for (const [name, selected] of Object.entries(packages)) {
   if (mode === '--session-only' && name !== 'dsh-api-session-controller') continue
+  if (mode === '--goal-only' && name !== 'dsh-goal') continue
   const dir = packageInfo.name === `@deepseek-ai/${name}` ? root : join(root, 'node_modules', '@deepseek-ai', name)
   const packageVersion = JSON.parse(await readFile(join(dir, 'package.json'), 'utf8')).version
   if (packageVersion !== version) throw new Error(`${name} version mismatch: ${packageVersion}`)
@@ -52,7 +54,7 @@ for (const [name, selected] of Object.entries(packages)) {
       args: { type: 'object', properties, required, additionalProperties: false },
     }
     const result = descriptor.result?.spec?.jsonSchema
-    if (result && ['session/create', 'session/selectModel', 'userQuestions/attachWait', 'job/kill'].includes(endpoint)) methods[endpoint].result = result
+    if (result && (name === 'dsh-goal' || ['session/create', 'session/selectModel', 'userQuestions/attachWait', 'job/kill'].includes(endpoint))) methods[endpoint].result = result
   }
 }
 const result = { version: 1, upstream: { repository: 'https://github.com/deepseek-ai/deepseek-harness', tag: `dsh-v${version}`, commit: commits[version], version }, sources, methods }

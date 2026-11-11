@@ -71,7 +71,7 @@ class ControllerRegressionTest {
       if(result !== COROUTINE_SUSPENDED) cont.resume(Unit)
     }catch(e:Throwable){cont.resumeWithException(e.cause?:e)}
   }
-  private suspend fun readTranscript(c: LagoonController, client: OpenCodeApi, session: Session) = suspendCoroutine<Unit> { continuation ->
+  private suspend fun readTranscript(c: LagoonController, client: HarnessClient, session: Session) = suspendCoroutine<Unit> { continuation ->
     try {
       val method = LagoonController::class.java.getDeclaredMethod("loadSession", Session::class.java, Boolean::class.javaPrimitiveType,
         Int::class.javaPrimitiveType, HarnessClient::class.java, Continuation::class.java).apply { isAccessible = true }
@@ -665,6 +665,160 @@ class ControllerRegressionTest {
       assertEquals(listOf("per_1"), state.value.permissions.map { it.id })
     }
   }
+  @Test fun lateComposerProjectionCannotResurrectGoalClearedDuringTranscriptRead() = runBlocking {
+    MockWebServer().use { server ->
+      val goal = RemoteGoal("g", 2, "Old", "paused", "disarmed")
+      val release = CompletableDeferred<Unit>()
+      val contextRead = CompletableDeferred<Unit>()
+      val target = Session("session", "/repo", "Task", 1)
+      val client = object : HarnessClient by api(server) {
+        override val cacheableTranscripts: Boolean get() = false
+        override suspend fun messageRecords(id: String, cursor: String?, size: Int): ApiPage<MessageRecord> {
+          release.await(); return ApiPage(emptyList())
+        }
+        override suspend fun composerContext(id: String): ComposerContext { contextRead.complete(Unit); return ComposerContext(goal = goal) }
+        override suspend fun goalAction(sessionId: String, id: String, revision: Int, action: String): Boolean = true
+        override suspend fun goal(sessionId: String): RemoteGoal? = null
+      }
+      val profile = ServerProfile("server", "DSH", "https://goal.example/", kind = ServerKind.DSH)
+      val (controller, state) = controller(client, LagoonState(profiles = listOf(profile), serverId = profile.id, connected = true,
+        sessionId = target.id, sessions = listOf(target), goal = goal, messages = listOf(Message("human", "user", 1, emptyList()))))
+      val reading = async { readTranscript(controller, client, target) }
+      contextRead.await()
+      controller.goalAction("clear", GoalMutationTarget(profile, target.id, goal.id, goal.revision)).join()
+      assertNull(state.value.goal)
+      release.complete(Unit); reading.await()
+      assertNull(state.value.goal)
+    }
+  }
+
+  @Test fun goalCreationRejectsOldDialogAndActiveGoalWithoutRpc() = runBlocking {
+    MockWebServer().use { server ->
+      var calls = 0
+      val client = object : HarnessClient by api(server) {
+        override suspend fun createGoalWithLimit(sessionId: String, objective: String, maxRounds: Long?): Boolean { calls++; return true }
+      }
+      val profile = ServerProfile("server", "DSH", "https://goal.example/", kind = ServerKind.DSH)
+      val base = LagoonState(profiles = listOf(profile), serverId = profile.id, connected = true,
+        sessionId = "session", sessions = listOf(Session("session", "/repo", "Task", 1)))
+      val (controller, state) = controller(client, base)
+      controller.createGoal("new", expectedProfile = profile.copy(url = "https://old.example/"), expectedSession = "session").join()
+      controller.createGoal("new", expectedProfile = profile, expectedSession = "other").join()
+      state.value = base.copy(goal = RemoteGoal("g", 2, "Active", "active"))
+      controller.createGoal("new", expectedProfile = profile, expectedSession = "session").join()
+      assertEquals(0, calls)
+    }
+  }
+
+  @Test fun goalEditCommitsReturnedRevisionAndActivationWithoutResumeOrStaleReload() = runBlocking {
+    MockWebServer().use { server ->
+      val original = RemoteGoal("g", 2, "Old", "paused", "disarmed", maxGoalRounds = 20L, roundsStarted = 4L)
+      val edited = original.copy(revision = 3, objective = "Edited", maxGoalRounds = 40L)
+      val calls = mutableListOf<String>()
+      val client = object : HarnessClient by api(server) {
+        override suspend fun editGoal(sessionId: String, id: String, revision: Int, objective: String?, maxRounds: Long?): RemoteGoal {
+          calls += "edit"; assertEquals("session", sessionId); assertEquals("g", id); assertEquals(2, revision)
+          assertEquals("Edited", objective); assertEquals(40L, maxRounds)
+          return edited
+        }
+        override suspend fun goal(sessionId: String): RemoteGoal? { calls += "get"; return original }
+        override suspend fun goalAction(sessionId: String, id: String, revision: Int, action: String): Boolean { calls += action; return true }
+      }
+      val profile = ServerProfile("server", "DSH", "https://goal.example/", kind = ServerKind.DSH)
+      val (controller, state) = controller(client, LagoonState(profiles = listOf(profile), serverId = profile.id, connected = true,
+        sessionId = "session", sessions = listOf(Session("session", "/repo", "Task", 1)), goal = original))
+      var acknowledged = false
+      controller.editGoal(GoalMutationTarget(profile, "session", "g", 2), " Edited ", 40L) { acknowledged = true }.join()
+      assertTrue(acknowledged); assertEquals(edited, state.value.goal)
+      assertEquals(listOf("edit"), calls); assertEquals("disarmed", state.value.goal?.activation)
+    }
+  }
+
+  @Test fun goalEditRejectsStaleDialogDisabledRouteAndInvalidLimitWithoutRpc() = runBlocking {
+    MockWebServer().use { server ->
+      var edits = 0
+      val client = object : HarnessClient by api(server) {
+        override suspend fun editGoal(sessionId: String, id: String, revision: Int, objective: String?, maxRounds: Long?): RemoteGoal? { edits++; return null }
+      }
+      val profile = ServerProfile("server", "DSH", "https://goal.example/", kind = ServerKind.DSH)
+      val goal = RemoteGoal("g", 2, "Old", "active")
+      val initial = LagoonState(profiles = listOf(profile), serverId = profile.id, connected = true,
+        sessionId = "session", sessions = listOf(Session("session", "/repo", "Task", 1)), goal = goal)
+      val (controller, state) = controller(client, initial)
+      controller.editGoal(GoalMutationTarget(profile, "session", "g", 1), "New", null).join()
+      controller.editGoal(GoalMutationTarget(profile, "other", "g", 2), "New", null).join()
+      controller.editGoal(GoalMutationTarget(profile, "session", "g", 2), " ", null).join()
+      controller.editGoal(GoalMutationTarget(profile, "session", "g", 2), null, 0).join()
+      controller.editGoal(GoalMutationTarget(profile, "session", "g", 2), null, MAX_GOAL_ROUNDS + 1).join()
+      state.value = initial.copy(profiles = listOf(profile.copy(parentEnabled = false)))
+      controller.editGoal(GoalMutationTarget(profile, "session", "g", 2), "New", null).join()
+      assertEquals(0, edits); assertEquals(goal, state.value.goal)
+    }
+  }
+
+  @Test fun goalEditIsSingleFlightAndLateResultCannotMutateAnotherSelection() = runBlocking {
+    MockWebServer().use { server ->
+      val response = CompletableDeferred<RemoteGoal>()
+      var calls = 0
+      val client = object : HarnessClient by api(server) {
+        override suspend fun editGoal(sessionId: String, id: String, revision: Int, objective: String?, maxRounds: Long?): RemoteGoal { calls++; return response.await() }
+      }
+      val profile = ServerProfile("server", "DSH", "https://goal.example/", kind = ServerKind.DSH)
+      val goal = RemoteGoal("g", 2, "Old", "paused", "disarmed")
+      val (controller, state) = controller(client, LagoonState(profiles = listOf(profile), serverId = profile.id, connected = true,
+        sessionId = "session", sessions = listOf(Session("session", "/repo", "Task", 1), Session("other", "/repo", "Other", 1)), goal = goal))
+      val expected = GoalMutationTarget(profile, "session", "g", 2)
+      var acknowledged = false
+      val first = controller.editGoal(expected, "New", null) { acknowledged = true }
+      controller.editGoal(expected, "New again", null).join()
+      assertEquals(1, calls)
+      val other = goal.copy(id = "other-goal", objective = "Other")
+      state.value = state.value.copy(sessionId = "other", goal = other)
+      response.complete(goal.copy(revision = 3, objective = "New")); first.join()
+      assertEquals(other, state.value.goal); assertFalse(acknowledged); assertEquals(1, calls)
+    }
+  }
+
+  @Test fun goalReadStartedBeforeEditCannotRollbackTheAcknowledgedRevision() = runBlocking {
+    MockWebServer().use { server ->
+      val delayedRead = CompletableDeferred<RemoteGoal?>()
+      val goal = RemoteGoal("g", 2, "Old", "paused", "disarmed")
+      val edited = goal.copy(revision = 3, objective = "New")
+      val client = object : HarnessClient by api(server) {
+        override suspend fun goal(sessionId: String): RemoteGoal? = delayedRead.await()
+        override suspend fun editGoal(sessionId: String, id: String, revision: Int, objective: String?, maxRounds: Long?): RemoteGoal = edited
+      }
+      val profile = ServerProfile("server", "DSH", "https://goal.example/", kind = ServerKind.DSH)
+      val (controller, state) = controller(client, LagoonState(profiles = listOf(profile), serverId = profile.id, connected = true,
+        sessionId = "session", sessions = listOf(Session("session", "/repo", "Task", 1)), goal = goal))
+      val reading = controller.loadGoal()
+      controller.editGoal(GoalMutationTarget(profile, "session", "g", 2), "New", null).join()
+      delayedRead.complete(goal); reading.join()
+      assertEquals(edited, state.value.goal)
+    }
+  }
+
+  @Test fun staleGoalRevisionRefreshesMetadataButNeverRetriesOrRearms() = runBlocking {
+    MockWebServer().use { server ->
+      val old = RemoteGoal("g", 2, "Old", "paused", "disarmed")
+      val newer = old.copy(revision = 4, objective = "Edited elsewhere")
+      val calls = mutableListOf<String>()
+      val client = object : HarnessClient by api(server) {
+        override suspend fun editGoal(sessionId: String, id: String, revision: Int, objective: String?, maxRounds: Long?): RemoteGoal? {
+          calls += "edit"; throw ApiException(409, "Goal changed", "GOAL_STALE_REVISION")
+        }
+        override suspend fun goal(sessionId: String): RemoteGoal? { calls += "get"; return newer }
+        override suspend fun goalAction(sessionId: String, id: String, revision: Int, action: String): Boolean { calls += action; return true }
+      }
+      val profile = ServerProfile("server", "DSH", "https://goal.example/", kind = ServerKind.DSH)
+      val (controller, state) = controller(client, LagoonState(profiles = listOf(profile), serverId = profile.id, connected = true,
+        sessionId = "session", sessions = listOf(Session("session", "/repo", "Task", 1)), goal = old))
+      controller.editGoal(GoalMutationTarget(profile, "session", "g", 2), "My draft", null).join()
+      assertEquals(listOf("edit", "get"), calls); assertEquals(newer, state.value.goal)
+      assertEquals(ResourceState.ERROR, state.value.resource("action:goal").state)
+    }
+  }
+
   @Test fun hostSettingsRejectStaleSameIdDialogBeforeResolvingOrDialingAnotherClient() = runBlocking {
     MockWebServer().use { server ->
       val saved = ServerProfile("server", "Host", server.url("/").toString(), allowCleartext = true, kind = ServerKind.DSH)

@@ -136,7 +136,17 @@ class DshApi(
    * 进程内的目标续跑状态（`armed`/`disarmed`）。投影里刻意没有它（只在进程内），远程模式下
    * 也不允许 `goals/get`，所以只能从转发事件 `goal/activation-changed` 与 mutation 的返回值里收集。
    */
-  private val goalActivation = ConcurrentHashMap<String, String>()
+  private data class GoalActivation(val id: String, val revision: Int, val activation: String)
+  private val goalCacheLock = Any()
+  private val goalActivation = mutableMapOf<String, GoalActivation>()
+  /** Full mutation views fence lagging durable projections at the exact goal revision. */
+  private val latestGoalViews = mutableMapOf<String, RemoteGoal>()
+  /** Reads started before a mutation cannot clear or replace its acknowledged result. */
+  private val goalCacheEpochs = mutableMapOf<String, Long>()
+  private data class ClearedGoal(val id: String, val revision: Int)
+  private val clearedGoalRefs = mutableMapOf<String, ClearedGoal>()
+  private fun goalCacheEpoch(id: String): Long = synchronized(goalCacheLock) { goalCacheEpochs[id] ?: 0L }
+  private fun advanceGoalCacheEpoch(id: String) { goalCacheEpochs[id] = (goalCacheEpochs[id] ?: 0L) + 1L }
   /** 每个后台任务输出流已读到的字节位移（`job/follow` 的 `from`），断线重连时续读。 */
   private val jobOffsets = ConcurrentHashMap<String, Long>()
   /** A waterfall belongs to the exact $events client that delivered it. */
@@ -2159,14 +2169,39 @@ class DshApi(
         }
       }
       // 目标续跑状态（`armed`/`disarmed`）只存在于进程内，投影刻意不含它，远程也没有 `goals/get`。
-      // 事件 `goal/activation-changed` 是这条事实唯一的远程通道。
+      // Full mutation responses also carry it; events must match the exact goal id AND revision.
       "goal/activation-changed" -> {
         val payload = args.optJSONObject(0) ?: return
         val id = payload.str("sessionId").takeIf { it.isNotBlank() } ?: return
-        val activation = payload.obj("goal").str("activation").takeIf { it.isNotBlank() }
-        if (activation != null) goalActivation[id] = activation else goalActivation.remove(id)
-        push(ServerEvent(id = "dsh:goal:$id:${activation.orEmpty()}", directory = known[id]?.directory.orEmpty(),
-          type = "session.goal.changed", properties = JSONObject().put("sessionID", id), created = System.currentTimeMillis()))
+        val current = payload.optJSONObject("goal")
+        if (current == null) synchronized(goalCacheLock) {
+          val previous = latestGoalViews[id]
+          val activation = goalActivation[id]
+          val clearedId = previous?.id ?: activation?.id
+          val clearedRevision = previous?.revision ?: activation?.revision
+          clearGoalCache(id)
+          if (clearedId != null && clearedRevision != null) clearedGoalRefs[id] = ClearedGoal(clearedId, clearedRevision)
+        }
+        else {
+          val goalId = current.str("id").takeIf { it.isNotBlank() } ?: return
+          val revision = current.optInt("revision", 0).takeIf { it > 0 } ?: return
+          val activation = current.str("activation").takeIf { it == "armed" || it == "disarmed" } ?: return
+          synchronized(goalCacheLock) {
+            val latest = latestGoalViews[id]
+            val previous = goalActivation[id]
+            // Delayed events cannot overwrite a view/event for a newer revision of this goal.
+            if ((latest?.id != goalId || latest.revision <= revision) &&
+              (previous?.id != goalId || previous.revision <= revision)) {
+              advanceGoalCacheEpoch(id)
+              goalActivation[id] = GoalActivation(goalId, revision, activation)
+              if (latest?.id == goalId && latest.revision == revision)
+                latestGoalViews[id] = latest.copy(activation = activation)
+            }
+          }
+        }
+        push(ServerEvent(id = "dsh:goal:$id:${current?.str("id").orEmpty()}:${current?.optInt("revision", 0) ?: 0}",
+          directory = known[id]?.directory.orEmpty(), type = "session.goal.changed",
+          properties = JSONObject().put("sessionID", id), created = System.currentTimeMillis()))
       }
     }
   }
@@ -2865,11 +2900,14 @@ class DshApi(
    * 进程内的 `activation` 不在投影里，仍由 [goal] 在 Agent 活跃时补齐。
    */
   override suspend fun composerContext(id: String): ComposerContext = withContext(Dispatchers.IO) {
+    val goalEpoch = goalCacheEpoch(id)
     val value = call("session/projections", requestArgs(JSONObject().put("sessionId", id))) as? JSONObject
       ?: return@withContext ComposerContext()
     val values = value.obj("values")
     questionCoordinator.reconcile(id, values)
-    ComposerContext(inbox = inboxMessages(values), todos = values.todoProjection(), goal = values.goalProjection())
+    ComposerContext(inbox = inboxMessages(values), todos = values.todoProjection(),
+      goal = if (values.has("goal")) mergeGoalRead(id, values.goalProjection(), startedEpoch = goalEpoch)
+         else synchronized(goalCacheLock) { latestGoalViews[id].takeIf { goalEpoch != goalCacheEpoch(id) } })
   }
 
   override suspend fun inbox(id: String): List<Message> = composerContext(id).inbox
@@ -3069,53 +3107,137 @@ class DshApi(
    * `goal/activation-changed` 补齐。直连/SSH 仍然读 `goals/get`——它是 activation 的权威来源。
    */
   override suspend fun goal(sessionId: String): RemoteGoal? {
-    if (remoteBackend != null) {
-      val durable = composerContext(sessionId).goal ?: run {
-        goalActivation.remove(sessionId)
-        return null
-      }
-      return durable.copy(activation = goalActivation[sessionId] ?: durable.activation)
-    }
-    val value = call("goals/get", envelope(argsOf("agentId" to sessionId))) as? JSONObject ?: return null
-    val id = value.optString("id").takeIf { it.isNotBlank() } ?: return null
-    val ref = value.optJSONObject("ref")
-    return RemoteGoal(
-      id = id,
-      revision = ref?.optInt("revision", 0) ?: value.optInt("revision", 0),
-      objective = value.optString("objective"),
-      phase = value.optString("phase"),
-      activation = value.optString("activation").takeIf { it.isNotBlank() },
-      blockedReason = value.optJSONObject("blockedReason")?.optString("message")?.takeIf { it.isNotBlank() }
-    )
+    if (remoteBackend != null) return composerContext(sessionId).goal
+    val goalEpoch = goalCacheEpoch(sessionId)
+    val value = call("goals/get", envelope(argsOf("agentId" to sessionId))) as? JSONObject
+    return mergeGoalRead(sessionId, value?.goalView(), direct = true, startedEpoch = goalEpoch)
   }
 
-  override suspend fun createGoal(sessionId: String, objective: String, maxRounds: Int?): Boolean {
-    val request = JSONObject().put("objective", objective)
-    if (maxRounds != null) request.put("maxGoalRounds", maxRounds)
-    val view = call("goals/create", envelope(argsOf("agentId" to sessionId, "request" to request)))
-    commitGoalView(sessionId, view)
+  override suspend fun createGoal(sessionId: String, objective: String, maxRounds: Int?): Boolean =
+    createGoalWithLimit(sessionId, objective, maxRounds?.toLong())
+
+  override suspend fun createGoalWithLimit(sessionId: String, objective: String, maxRounds: Long?): Boolean {
+    require(sessionId.isNotBlank()) { "会话 id 不能为空" }
+    val request = goalRequest(objective, maxRounds)
+    val acknowledgment = call("goals/create", envelope(argsOf("agentId" to sessionId, "request" to request))) as? JSONObject
+    // Create only acknowledges a ref. Preserve a matching activation event which can precede this ack;
+    // never invent armed/disarmed from create itself or retain the previous goal's activation.
+    val created = acknowledgment?.optJSONObject("ref")
+    synchronized(goalCacheLock) {
+      val observed = goalActivation[sessionId]?.takeIf {
+        it.id == created?.str("id") && it.revision == created.optInt("revision", 0)
+      }
+      clearGoalCache(sessionId)
+      clearedGoalRefs.remove(sessionId)
+      if (observed != null) goalActivation[sessionId] = observed
+    }
     return true
+  }
+
+  override suspend fun editGoal(
+    sessionId: String, id: String, revision: Int, objective: String?, maxRounds: Long?
+  ): RemoteGoal? {
+    requireGoalRef(sessionId, id, revision)
+    val request = goalRequest(objective, maxRounds)
+    val view = call("goals/edit", envelope(argsOf(
+      "agentId" to sessionId,
+      "ref" to JSONObject().put("id", id).put("revision", revision),
+      "request" to request
+    )))
+    val result = (view as? JSONObject)?.goalView()
+      ?: throw ApiException(502, "目标编辑响应缺少 GoalView")
+    if (result.id != id || result.revision <= revision) throw ApiException(502, "目标编辑响应的引用不匹配，请刷新核对；不会自动重发")
+    return commitGoalView(sessionId, view) ?: throw ApiException(502, "目标编辑响应无效")
+  }
+
+  private fun goalRequest(objective: String?, maxRounds: Long?): JSONObject {
+    require(objective != null || maxRounds != null) { "至少修改目标内容或轮数上限" }
+    val normalized = objective?.trim()
+    require(normalized == null || normalized.isNotEmpty()) { "目标内容不能为空" }
+    require(maxRounds == null || maxRounds in 1L..MAX_GOAL_ROUNDS) { "目标轮数必须是正安全整数" }
+    return JSONObject().apply {
+      if (normalized != null) put("objective", normalized)
+      if (maxRounds != null) put("maxGoalRounds", maxRounds)
+    }
+  }
+
+  private fun requireGoalRef(sessionId: String, id: String, revision: Int) {
+    require(sessionId.isNotBlank() && id.isNotBlank() && revision > 0) { "目标引用无效" }
   }
 
   override suspend fun goalAction(sessionId: String, id: String, revision: Int, action: String): Boolean {
     if (action !in setOf("pause", "resume", "complete", "clear")) return false
+    requireGoalRef(sessionId, id, revision)
     val view = call("goals/$action", envelope(argsOf(
       "agentId" to sessionId,
       "ref" to JSONObject().put("id", id).put("revision", revision)
     )))
-    if (action == "clear") goalActivation.remove(sessionId) else commitGoalView(sessionId, view)
+    if (action == "clear") synchronized(goalCacheLock) {
+      clearGoalCache(sessionId)
+      val returnedRevision = (view as? JSONObject)?.goalRoundNumber("revision", 1)?.takeIf { it <= Int.MAX_VALUE }?.toInt()
+      clearedGoalRefs[sessionId] = ClearedGoal(id, returnedRevision?.takeIf { it > revision } ?: revision)
+    } else commitGoalView(sessionId, view)
     return true
   }
 
-  /**
-   * 目标的 mutation 会返回权威 `GoalView`（含新的 `revision`）。丢掉它会让本地 `revision` 停在旧值，
-   * 下一次 mutation 就被 Host 以 `GOAL_STALE_REVISION` 拒绝，所以这里把返回的 activation 记下来。
-   */
-  private fun commitGoalView(sessionId: String, view: Any?) {
-    val goal = (view as? JSONObject)?.optJSONObject("goal") ?: view as? JSONObject
-    val activation = goal?.optString("activation")?.takeIf { it.isNotBlank() }
-    if (activation != null) goalActivation[sessionId] = activation else goalActivation.remove(sessionId)
+  private fun clearGoalCache(sessionId: String) = synchronized(goalCacheLock) {
+    advanceGoalCacheEpoch(sessionId)
+    goalActivation.remove(sessionId)
+    latestGoalViews.remove(sessionId)
   }
+
+  /** Mutation views are authoritative; a ref-only create ack must never enter this cache. */
+  private fun commitGoalView(sessionId: String, view: Any?): RemoteGoal? {
+    val goal = (view as? JSONObject)?.goalView() ?: return null
+    synchronized(goalCacheLock) {
+      val latest = latestGoalViews[sessionId]
+      if (latest == null || latest.id != goal.id || latest.revision <= goal.revision) {
+        advanceGoalCacheEpoch(sessionId)
+        latestGoalViews[sessionId] = goal
+        val activation = goal.activation
+        if (activation != null) goalActivation[sessionId] = GoalActivation(goal.id, goal.revision, activation)
+        else goalActivation.remove(sessionId)
+      }
+    }
+    return goal
+  }
+
+  /** Only older revisions of the SAME goal may be replaced with the last mutation response. */
+  private fun mergeGoalRead(sessionId: String, read: RemoteGoal?, direct: Boolean = false, startedEpoch: Long): RemoteGoal? =
+    synchronized(goalCacheLock) {
+      if (startedEpoch != goalCacheEpoch(sessionId)) {
+        val latest = latestGoalViews[sessionId]
+        val activation = goalActivation[sessionId]
+        if (latest != null) return@synchronized latest.copy(activation = activation?.takeIf {
+          it.id == latest.id && it.revision == latest.revision
+        }?.activation ?: latest.activation)
+        return@synchronized read?.takeIf { activation?.id == it.id && activation.revision == it.revision }
+          ?.copy(activation = activation?.activation)
+      }
+      if (read == null) {
+        clearGoalCache(sessionId)
+        return@synchronized null
+      }
+      val cleared = clearedGoalRefs[sessionId]
+      if (cleared?.id == read.id && read.revision <= cleared.revision) return@synchronized null
+      if (cleared != null && cleared.id != read.id) clearedGoalRefs.remove(sessionId)
+      val latest = latestGoalViews[sessionId]
+      val selected = if (latest?.id == read.id && (latest.revision > read.revision || !direct && latest.revision == read.revision)) {
+        latest.copy(roundsStarted = listOfNotNull(latest.roundsStarted, read.roundsStarted).maxOrNull())
+      } else read
+      if (latest != null && (latest.id != read.id || read.revision > latest.revision))
+        latestGoalViews.remove(sessionId)
+      val activation = goalActivation[sessionId]
+      val exactActivation = activation?.takeIf { it.id == selected.id && it.revision == selected.revision }
+      val result = if (direct && selected === read && read.activation != null) read
+        else selected.copy(activation = exactActivation?.activation ?: selected.activation)
+      if (direct && selected === read) {
+        if (read.activation != null) goalActivation[sessionId] = GoalActivation(read.id, read.revision, read.activation)
+        else goalActivation.remove(sessionId)
+        if (latest?.id == read.id && latest.revision == read.revision) latestGoalViews[sessionId] = result
+      }
+      result
+    }
 
   override suspend fun credentialStatus(refs: List<String>): Map<String, RemoteCredentialStatus> {
     if (refs.isEmpty()) return emptyMap()

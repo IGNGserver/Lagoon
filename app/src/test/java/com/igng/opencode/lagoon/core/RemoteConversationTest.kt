@@ -157,6 +157,41 @@ class RemoteConversationTest {
     }
   }
 
+  @Test fun goalEditCarriesExactRefAndFullViewOverEncryptedRemoteWithoutGetOrResume() = runBlocking {
+    FakeRemoteHost().use { host ->
+      host.call = { endpoint, payload ->
+        val args = payload.getJSONObject("args")
+        when (endpoint) {
+          "goals/edit" -> {
+            assertEquals(setOf("agentId", "ref", "request"), args.keys().asSequence().toSet())
+            assertEquals("s-remote", args.getString("agentId"))
+            assertEquals("g1", args.getJSONObject("ref").getString("id"))
+            assertEquals(2, args.getJSONObject("ref").getInt("revision"))
+            assertEquals(MAX_GOAL_ROUNDS, args.getJSONObject("request").getLong("maxGoalRounds"))
+            host.ok(JSONObject().put("id", "g1").put("revision", 3).put("objective", "Edited over Noise")
+              .put("phase", "paused").put("activation", "disarmed").put("maxGoalRounds", MAX_GOAL_ROUNDS)
+              .put("roundsStarted", 4).put("createdAt", 1).put("updatedAt", 2))
+          }
+          "session/projections" -> host.ok(JSONObject().put("values", JSONObject().put("goal", JSONObject()
+            .put("goal", JSONObject().put("id", "g1").put("revision", 2).put("objective", "Old").put("phase", "active").put("maxGoalRounds", 20))
+            .put("roundsStarted", 3))))
+          "goals/get", "goals/resume" -> throw AssertionError("Edit must not get or rearm a Remote goal")
+          else -> host.ok(JSONObject())
+        }
+      }
+      host.start()
+      val (session, backend) = backend(host)
+      try {
+        val edited = withTimeout(15_000) { backend.client.editGoal("s-remote", "g1", 2, "Edited over Noise", MAX_GOAL_ROUNDS) }!!
+        assertEquals(3, edited.revision); assertEquals("paused", edited.phase); assertEquals("disarmed", edited.activation)
+        val reloaded = withTimeout(15_000) { backend.client.goal("s-remote") }!!
+        assertEquals(edited, reloaded)
+        val edits = synchronized(host.rpcCalls) { host.rpcCalls.filter { it.optJSONObject("params")?.optString("endpoint") == "goals/edit" } }
+        assertEquals(1, edits.size)
+      } finally { backend.close(); session.close() }
+    }
+  }
+
   /** 与真机一致：~1.5 MB 的快照会被切成几十个 DSHF 分片，跨 Noise 逐帧送达。 */
   @Test fun loadsLargeSnapshotDeliveredInFragments() = runBlocking {
     val id = "session-${UUID.randomUUID()}"

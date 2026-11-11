@@ -113,6 +113,14 @@ interface HarnessClient {
   /** Session goal, when the harness exposes durable goals. */
   suspend fun goal(sessionId: String): RemoteGoal? = null
   suspend fun createGoal(sessionId: String, objective: String, maxRounds: Int? = null): Boolean = false
+  /** Long-cap entry point; legacy clients may only represent an Int-sized cap. */
+  suspend fun createGoalWithLimit(sessionId: String, objective: String, maxRounds: Long? = null): Boolean =
+    if (maxRounds == null || maxRounds in 1L..Int.MAX_VALUE.toLong())
+      createGoal(sessionId, objective, maxRounds?.toInt()) else false
+  /** Edit the exact current revision without changing phase or resuming continuation. */
+  suspend fun editGoal(
+    sessionId: String, id: String, revision: Int, objective: String? = null, maxRounds: Long? = null
+  ): RemoteGoal? = null
   suspend fun goalAction(sessionId: String, id: String, revision: Int, action: String): Boolean = false
 
   /** PDF/image bytes, or Office converted to PDF; null when the harness cannot preview this path. */

@@ -65,7 +65,9 @@
 - r8 后续：DSH 插件/凭据/服务商管理按原生协议开放给 Direct/SSH/Remote，Hub 管理按 remoteHostId 单独显示；插件包与 Loader entry 均可读取/修改 Host 允许的开关，呈现只读原因/phase/可能重启，不把未确认 false 当成功。
 - 设置弹窗按完整 profile 失效；Controller settingsClient 在读写前双重校验打开时的 exact saved route，不按 ID 悄悄转向编辑后的 Host。凭据引用先读 writable 状态，值不回显。
 - OpenCode 从实际文档发现兼容 POST /fork 与 messageID /revert/stage，提供具体已落盘人类消息回退确认与暂存边界恢复入口；DSH 不冒充回退。离线缓存、任务活跃、降级未知状态、排队消息、父级禁用均拒绝；确认绑定原路由/会话/边界，回退期间不发送消息且保留草稿。
-- goals edit、schedule CRUD、交互终端仍是业务适配器缺口，不把通用 WS carrier 或 endpoint allowlist 当作已交付功能。未跑 Android 真机布局、可访问性、预测式返回；当前仅源码与 Compose 编译验收。
+- r10：目标编辑已按官方 `goals/edit` 的 agentId/ref/request 接入 Direct/SSH/Remote，保存只修改 objective/cap，不改变阶段或自动续跑状态。Long cap 覆盖正 JavaScript-safe integer，缺少轮数信息显示未知；仅明确 stopped 状态且预算充足时提供独立恢复操作。
+- 编辑与清除确认捕获 exact route/session/goal revision；旧版本仅重读状态，不自动重发编辑，失败保留输入；完整 GoalView 响应直接提交并按版本挡住旧投影。create ref-only ack 不推断 armed，保留确认前收到的同目标激活事件；同 revision 激活变化、迟到空读取与清除 tombstone 均有缓存/Controller 防回滚门禁。
+- schedule CRUD、交互终端仍是业务适配器缺口，不把通用 WS carrier 或 endpoint allowlist 当作已交付功能。未跑 Android 真机布局、可访问性、预测式返回；当前仅源码与 Compose 编译验收。
 
 ### 阶段 7：验证与交付仍进行中
 - 本地 fake Hub/实际 Noise/真实 Node connector 互操作不等于公网 Hub、真实官方 daemon 或 Android 真机验收。
@@ -113,5 +115,10 @@
 - 源码复核发现 DSH 设置 UI carrier 条件、OpenCode revert/restore 缺入口和 fork 能力遗漏；后续已接入并进行回归，不因 read/event 验收通过就声称完整功能完成。
 - `native-action-ui-first.log`：初版时间线/能力/Controller 定向通过；`native-action-ui-scoped.log` 两项失败分别是旧 baseline fork=false 断言和 events 首帧假设，已按当前原生契约修正并显式 close owner。`native-action-ui-guarded.log` 是 Flow filter import 尚未同步的编译失败，补齐后 `native-action-ui-guarded-2.log` 定向通过55s。独立复核补上 degraded 任务状态未知时禁止时间线 mutation 的门禁。
 - `native-action-ui-final.log`：**1252 tests、0 failures、0 errors、10 skipped**，Debug assemble 成功113s；本次真实 daemon 已停，因此四个官方 opt-in 用例如实 skip，fixture Noise2项仍实际运行通过。新增能力发现7、timeline policy6、六carrier设置入口3、Controller6、native revert route1项。APK 21,735,293 bytes，SHA-256 `20b00047e0c1c7d6db4d371bb20ac2726cb845f32ea04fdf1804ba60d91aa7b0`。不拿本次 skip 冒充重复真实验收；真实服务证据保留在前述独立日志。
+- r10 `goal-edit-first.log` 编译/目标/API/Controller/UI 定向通过84s；`goal-edit-reviewed.log` 增加 read epoch、同 revision 激活与 create ack 的时序修复后通过55s；`goal-edit-encrypted.log` 实际 Noise 目标编辑、Controller 清除后迟到投影、原路由创建许可回归通过18s。没有发送目标编辑之外的 resume，也没有自动重放 mutation。
+- 独立复核发现并修复三处：Controller 旧 composer 投影复活已清除目标、create ack 清掉先到的同目标 activation、旧 direct get 覆盖同 revision 新 activation。额外保留 clear tombstone 防后续旧投影复活，数字 revision 不截断。`goal-edit-contract-tombstone.log` 官方导出 schema + tombstone/加密/Controller 通过20s。
+- 从官方 rc.5 generated Typert 导出7项目标方法请求/响应契约，保留版本/源 SHA；create ref-only 与 edit full GoalView 分开测试，不按手写 fake 假定相同结果。
+- `goal-edit-final.log`：**1289 tests、0 failures、0 errors、10 skipped**；Debug assemble 成功120s。新增 GoalEditApi15、GoalMutationPolicy6、GoalEditorPolicy6、Controller7、官方goal契约2、实际加密目标编辑1项；fixture Noise2项运行，已停止 daemon 的4个 opt-in 如实跳过。APK 21,766,757 bytes，SHA-256 `03557554bf9a45d95901e32f29de6bb7c4d7372989c02007d03516856b33e174`。
+- 下阶段调度契约核对：官方 rc.5 generated RPC 仅 catalog/delete/history/list/update；没有公开 create/run/enable。支持的删除/完整记录 CAS 更新与历史仍待实现，不通过调用 Agent tool 或猜 endpoint 冒充支持。
 - 全部构建在 `/home/lvziw/.build/Lagoon/unified-harness-connections/source`，Gradle/build 输出在 `~/.build`。源码工作树无 app/build、node_modules。
 - `wt audit`：29 repos，0 missing dirs，3 detached、4 merged worktrees 属其他任务；只读报告，无清理。

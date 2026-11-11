@@ -98,6 +98,13 @@ internal class SshDshClient(
   override suspend fun createGoal(sessionId: String, objective: String, maxRounds: Int?): Boolean =
     api().createGoal(sessionId, objective, maxRounds)
 
+  override suspend fun createGoalWithLimit(sessionId: String, objective: String, maxRounds: Long?): Boolean =
+    api().createGoalWithLimit(sessionId, objective, maxRounds)
+
+  override suspend fun editGoal(
+    sessionId: String, id: String, revision: Int, objective: String?, maxRounds: Long?
+  ): RemoteGoal? = api().editGoal(sessionId, id, revision, objective, maxRounds)
+
   override suspend fun goalAction(sessionId: String, id: String, revision: Int, action: String): Boolean =
     api().goalAction(sessionId, id, revision, action)
 

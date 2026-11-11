@@ -1,0 +1,657 @@
+{
+  "version": 1,
+  "upstream": {
+    "repository": "https://github.com/deepseek-ai/deepseek-harness",
+    "tag": "dsh-v0.2.1-rc.5",
+    "commit": "b830ec950faba0a46dda564be3e2d854afed94f1",
+    "version": "0.2.1-rc.5"
+  },
+  "sources": [
+    {
+      "package": "@deepseek-ai/dsh-goal",
+      "version": "0.2.1-rc.5",
+      "generatedFile": "lib/typert.host.js",
+      "sha256": "d1e4ded15cc42f433daf240d4e9f9926f4169dfb5630127983652e1a5557f0d3"
+    }
+  ],
+  "methods": {
+    "goals/create": {
+      "sourcePackage": "@deepseek-ai/dsh-goal",
+      "sourceLocation": {
+        "file": "packages/goal/goal/src/index.ts",
+        "line": 647,
+        "column": 3
+      },
+      "args": {
+        "type": "object",
+        "properties": {
+          "agentId": {
+            "type": "string"
+          },
+          "request": {
+            "type": "object",
+            "properties": {
+              "objective": {
+                "type": "string"
+              },
+              "maxGoalRounds": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "objective"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "agentId",
+          "request"
+        ],
+        "additionalProperties": false
+      },
+      "result": {
+        "type": "object",
+        "properties": {
+          "ref": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "Stable goal identity."
+              },
+              "revision": {
+                "type": "number",
+                "description": "Positive revision; every durable mutation increments it."
+              }
+            },
+            "required": [
+              "id",
+              "revision"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "required": [
+          "ref"
+        ],
+        "additionalProperties": true
+      }
+    },
+    "goals/edit": {
+      "sourcePackage": "@deepseek-ai/dsh-goal",
+      "sourceLocation": {
+        "file": "packages/goal/goal/src/index.ts",
+        "line": 329,
+        "column": 3
+      },
+      "args": {
+        "type": "object",
+        "properties": {
+          "agentId": {
+            "type": "string"
+          },
+          "ref": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "Stable goal identity."
+              },
+              "revision": {
+                "type": "number",
+                "description": "Positive revision; every durable mutation increments it."
+              }
+            },
+            "required": [
+              "id",
+              "revision"
+            ],
+            "additionalProperties": false
+          },
+          "request": {
+            "type": "object",
+            "properties": {
+              "objective": {
+                "type": "string"
+              },
+              "maxGoalRounds": {
+                "type": "number"
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "agentId",
+          "ref",
+          "request"
+        ],
+        "additionalProperties": false
+      },
+      "result": {
+        "type": "object",
+        "properties": {
+          "roundsStarted": {
+            "type": "number",
+            "description": "Highest admitted round number for this goal."
+          },
+          "createdAt": {
+            "type": "number",
+            "description": "Epoch milliseconds of the create mutation."
+          },
+          "updatedAt": {
+            "type": "number",
+            "description": "Epoch milliseconds of the latest mutation."
+          },
+          "activation": {
+            "type": "string",
+            "enum": [
+              "armed",
+              "disarmed"
+            ],
+            "description": "Process-local continuation eligibility; never persisted."
+          },
+          "objective": {
+            "type": "string",
+            "description": "Human-requested completion objective."
+          },
+          "phase": {
+            "type": "string",
+            "enum": [
+              "active",
+              "paused",
+              "blocked",
+              "complete"
+            ],
+            "description": "Durable lifecycle phase."
+          },
+          "blockedReason": {
+            "type": "object",
+            "properties": {
+              "code": {
+                "type": "string",
+                "description": "Stable lower-kebab-case classification chosen by the blocking policy."
+              },
+              "message": {
+                "type": "string",
+                "description": "Non-empty explanation shown to humans and models."
+              }
+            },
+            "required": [
+              "code",
+              "message"
+            ],
+            "additionalProperties": true,
+            "description": "Present exactly while `phase` is `blocked`."
+          },
+          "maxGoalRounds": {
+            "type": "number",
+            "description": "Total admitted goal-round cap."
+          },
+          "id": {
+            "type": "string",
+            "description": "Stable goal identity."
+          },
+          "revision": {
+            "type": "number",
+            "description": "Positive revision; every durable mutation increments it."
+          }
+        },
+        "required": [
+          "roundsStarted",
+          "createdAt",
+          "updatedAt",
+          "activation",
+          "objective",
+          "phase",
+          "maxGoalRounds",
+          "id",
+          "revision"
+        ],
+        "additionalProperties": true
+      }
+    },
+    "goals/get": {
+      "sourcePackage": "@deepseek-ai/dsh-goal",
+      "sourceLocation": {
+        "file": "packages/goal/goal/src/index.ts",
+        "line": 277,
+        "column": 3
+      },
+      "args": {
+        "type": "object",
+        "properties": {
+          "agentId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "agentId"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "goals/clear": {
+      "sourcePackage": "@deepseek-ai/dsh-goal",
+      "sourceLocation": {
+        "file": "packages/goal/goal/src/index.ts",
+        "line": 433,
+        "column": 3
+      },
+      "args": {
+        "type": "object",
+        "properties": {
+          "agentId": {
+            "type": "string"
+          },
+          "ref": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "Stable goal identity."
+              },
+              "revision": {
+                "type": "number",
+                "description": "Positive revision; every durable mutation increments it."
+              }
+            },
+            "required": [
+              "id",
+              "revision"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "agentId",
+          "ref"
+        ],
+        "additionalProperties": false
+      },
+      "result": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Stable goal identity."
+          },
+          "revision": {
+            "type": "number",
+            "description": "Positive revision; every durable mutation increments it."
+          }
+        },
+        "required": [
+          "id",
+          "revision"
+        ],
+        "additionalProperties": true
+      }
+    },
+    "goals/pause": {
+      "sourcePackage": "@deepseek-ai/dsh-goal",
+      "sourceLocation": {
+        "file": "packages/goal/goal/src/index.ts",
+        "line": 352,
+        "column": 3
+      },
+      "args": {
+        "type": "object",
+        "properties": {
+          "agentId": {
+            "type": "string"
+          },
+          "ref": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "Stable goal identity."
+              },
+              "revision": {
+                "type": "number",
+                "description": "Positive revision; every durable mutation increments it."
+              }
+            },
+            "required": [
+              "id",
+              "revision"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "agentId",
+          "ref"
+        ],
+        "additionalProperties": false
+      },
+      "result": {
+        "type": "object",
+        "properties": {
+          "roundsStarted": {
+            "type": "number",
+            "description": "Highest admitted round number for this goal."
+          },
+          "createdAt": {
+            "type": "number",
+            "description": "Epoch milliseconds of the create mutation."
+          },
+          "updatedAt": {
+            "type": "number",
+            "description": "Epoch milliseconds of the latest mutation."
+          },
+          "activation": {
+            "type": "string",
+            "enum": [
+              "armed",
+              "disarmed"
+            ],
+            "description": "Process-local continuation eligibility; never persisted."
+          },
+          "objective": {
+            "type": "string",
+            "description": "Human-requested completion objective."
+          },
+          "phase": {
+            "type": "string",
+            "enum": [
+              "active",
+              "paused",
+              "blocked",
+              "complete"
+            ],
+            "description": "Durable lifecycle phase."
+          },
+          "blockedReason": {
+            "type": "object",
+            "properties": {
+              "code": {
+                "type": "string",
+                "description": "Stable lower-kebab-case classification chosen by the blocking policy."
+              },
+              "message": {
+                "type": "string",
+                "description": "Non-empty explanation shown to humans and models."
+              }
+            },
+            "required": [
+              "code",
+              "message"
+            ],
+            "additionalProperties": true,
+            "description": "Present exactly while `phase` is `blocked`."
+          },
+          "maxGoalRounds": {
+            "type": "number",
+            "description": "Total admitted goal-round cap."
+          },
+          "id": {
+            "type": "string",
+            "description": "Stable goal identity."
+          },
+          "revision": {
+            "type": "number",
+            "description": "Positive revision; every durable mutation increments it."
+          }
+        },
+        "required": [
+          "roundsStarted",
+          "createdAt",
+          "updatedAt",
+          "activation",
+          "objective",
+          "phase",
+          "maxGoalRounds",
+          "id",
+          "revision"
+        ],
+        "additionalProperties": true
+      }
+    },
+    "goals/resume": {
+      "sourcePackage": "@deepseek-ai/dsh-goal",
+      "sourceLocation": {
+        "file": "packages/goal/goal/src/index.ts",
+        "line": 364,
+        "column": 3
+      },
+      "args": {
+        "type": "object",
+        "properties": {
+          "agentId": {
+            "type": "string"
+          },
+          "ref": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "Stable goal identity."
+              },
+              "revision": {
+                "type": "number",
+                "description": "Positive revision; every durable mutation increments it."
+              }
+            },
+            "required": [
+              "id",
+              "revision"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "agentId",
+          "ref"
+        ],
+        "additionalProperties": false
+      },
+      "result": {
+        "type": "object",
+        "properties": {
+          "roundsStarted": {
+            "type": "number",
+            "description": "Highest admitted round number for this goal."
+          },
+          "createdAt": {
+            "type": "number",
+            "description": "Epoch milliseconds of the create mutation."
+          },
+          "updatedAt": {
+            "type": "number",
+            "description": "Epoch milliseconds of the latest mutation."
+          },
+          "activation": {
+            "type": "string",
+            "enum": [
+              "armed",
+              "disarmed"
+            ],
+            "description": "Process-local continuation eligibility; never persisted."
+          },
+          "objective": {
+            "type": "string",
+            "description": "Human-requested completion objective."
+          },
+          "phase": {
+            "type": "string",
+            "enum": [
+              "active",
+              "paused",
+              "blocked",
+              "complete"
+            ],
+            "description": "Durable lifecycle phase."
+          },
+          "blockedReason": {
+            "type": "object",
+            "properties": {
+              "code": {
+                "type": "string",
+                "description": "Stable lower-kebab-case classification chosen by the blocking policy."
+              },
+              "message": {
+                "type": "string",
+                "description": "Non-empty explanation shown to humans and models."
+              }
+            },
+            "required": [
+              "code",
+              "message"
+            ],
+            "additionalProperties": true,
+            "description": "Present exactly while `phase` is `blocked`."
+          },
+          "maxGoalRounds": {
+            "type": "number",
+            "description": "Total admitted goal-round cap."
+          },
+          "id": {
+            "type": "string",
+            "description": "Stable goal identity."
+          },
+          "revision": {
+            "type": "number",
+            "description": "Positive revision; every durable mutation increments it."
+          }
+        },
+        "required": [
+          "roundsStarted",
+          "createdAt",
+          "updatedAt",
+          "activation",
+          "objective",
+          "phase",
+          "maxGoalRounds",
+          "id",
+          "revision"
+        ],
+        "additionalProperties": true
+      }
+    },
+    "goals/complete": {
+      "sourcePackage": "@deepseek-ai/dsh-goal",
+      "sourceLocation": {
+        "file": "packages/goal/goal/src/index.ts",
+        "line": 391,
+        "column": 3
+      },
+      "args": {
+        "type": "object",
+        "properties": {
+          "agentId": {
+            "type": "string"
+          },
+          "ref": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "Stable goal identity."
+              },
+              "revision": {
+                "type": "number",
+                "description": "Positive revision; every durable mutation increments it."
+              }
+            },
+            "required": [
+              "id",
+              "revision"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "agentId",
+          "ref"
+        ],
+        "additionalProperties": false
+      },
+      "result": {
+        "type": "object",
+        "properties": {
+          "roundsStarted": {
+            "type": "number",
+            "description": "Highest admitted round number for this goal."
+          },
+          "createdAt": {
+            "type": "number",
+            "description": "Epoch milliseconds of the create mutation."
+          },
+          "updatedAt": {
+            "type": "number",
+            "description": "Epoch milliseconds of the latest mutation."
+          },
+          "activation": {
+            "type": "string",
+            "enum": [
+              "armed",
+              "disarmed"
+            ],
+            "description": "Process-local continuation eligibility; never persisted."
+          },
+          "objective": {
+            "type": "string",
+            "description": "Human-requested completion objective."
+          },
+          "phase": {
+            "type": "string",
+            "enum": [
+              "active",
+              "paused",
+              "blocked",
+              "complete"
+            ],
+            "description": "Durable lifecycle phase."
+          },
+          "blockedReason": {
+            "type": "object",
+            "properties": {
+              "code": {
+                "type": "string",
+                "description": "Stable lower-kebab-case classification chosen by the blocking policy."
+              },
+              "message": {
+                "type": "string",
+                "description": "Non-empty explanation shown to humans and models."
+              }
+            },
+            "required": [
+              "code",
+              "message"
+            ],
+            "additionalProperties": true,
+            "description": "Present exactly while `phase` is `blocked`."
+          },
+          "maxGoalRounds": {
+            "type": "number",
+            "description": "Total admitted goal-round cap."
+          },
+          "id": {
+            "type": "string",
+            "description": "Stable goal identity."
+          },
+          "revision": {
+            "type": "number",
+            "description": "Positive revision; every durable mutation increments it."
+          }
+        },
+        "required": [
+          "roundsStarted",
+          "createdAt",
+          "updatedAt",
+          "activation",
+          "objective",
+          "phase",
+          "maxGoalRounds",
+          "id",
+          "revision"
+        ],
+        "additionalProperties": true
+      }
+    }
+  }
+}
