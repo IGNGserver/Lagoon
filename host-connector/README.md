@@ -24,7 +24,7 @@ under any ancestor containing `.git` (including worktrees), or overlapping the
 upstream/tooling directories. It copies only source/build inputs into a new
 scratch directory, calls [the checksum-gated overlay](<apply-upstream.mjs>), and
 bundles the actual upstream router, Host runtime and plugin entry. The overlay
-checks the pinned SHA-256 of its four upstream input files before changing the
+checks the pinned SHA-256 of its five upstream input files before changing the
 copy; obtain the complete pinned source from a trusted checkout/archive.
 
 Default outputs are `artifacts/patched-router.mjs`, `artifacts/host-runtime.mjs`,
@@ -102,6 +102,22 @@ The JVM opt-in is `LAGOON_OFFICIAL_REMOTE_DSH_CONNECTION`, together with `LAGOON
 and `LAGOON_PATCHED_ROUTER`. The test creates its own Session/terminal, sends a fixed `printf` probe,
 and explicitly closes the terminal; it never sends a model prompt or touches the user's WebHost.
 No public-Hub or Android-device acceptance is implied.
+
+## Restricted DSH changes reads
+
+[The changes peer](<dsh-changes.mjs>) exposes only `harness.changes.read` with reviewed summary/diff
+selectors, not arbitrary Fetch. It invokes the official local Connection handler with the same
+Host-created owner Peer. The checksum overlay wires this peer through the actual plugin entry,
+Host runtime and router; missing services/peers omit `harness.changes.v1` rather than falling back to
+network authentication. Reads are bounded to four in flight, ten seconds and two MiB of JSON.
+
+[Changes tests](<test/dsh-changes.test.mjs>) and [the stdio changes Host](<test/stdio-changes-host.mjs>)
+exercise actual patched router negotiation and Kotlin Noise interoperability. The optional
+[official route-runtime test](<test/official-changes-routes.test.mjs>) runs with
+`LAGOON_OFFICIAL_DSH_PACKAGE_ROOT=/absolute/path/to/@deepseek-ai/dsh`; it executes the fixed
+Connection owner fence and deliverables routes against controlled domain data, not a live model turn.
+The JVM encrypted opt-in is `LAGOON_CHANGES_STDIO_HOST`, together with `LAGOON_PATCHED_ROUTER`.
+The runtime/peer never accepts client URLs, headers, credentials or desktop-open actions.
 
 ## Local Host opt-in
 

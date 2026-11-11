@@ -134,6 +134,7 @@ class DshApi(
   private val known = ConcurrentHashMap<String, Session>()
   /** `session/follow` 快照给出的日志切点：`session/page` 的 `throughSeq`。 */
   private val cursors = ConcurrentHashMap<String, Long>()
+  private val changeAnnouncements = DshChangeAnnouncements()
   /**
    * 进程内的目标续跑状态（`armed`/`disarmed`）。投影里刻意没有它（只在进程内），远程模式下
    * 也不允许 `goals/get`，所以只能从转发事件 `goal/activation-changed` 与 mutation 的返回值里收集。
@@ -300,7 +301,7 @@ class DshApi(
 
   override val isClosed: Boolean get() = closing.get() || closed || remoteBackend?.isClosed == true
 
-  override fun capabilities(): ApiCapabilities = if (remoteBackend == null) CAPABILITIES else CAPABILITIES.copy(diff = false, terminal = remoteBackend.terminalAvailable())
+  override fun capabilities(): ApiCapabilities = if (remoteBackend == null) CAPABILITIES else CAPABILITIES.copy(diff = remoteBackend.changesAvailable(), terminal = remoteBackend.terminalAvailable())
 
   private val terminalApiDelegate = lazy { DshTerminalApi(
     call = { endpoint, args ->
@@ -359,7 +360,7 @@ class DshApi(
     eventChannel?.close()
     followStates.values.toList().forEach(::stopFollowState)
     followStates.clear()
-    durableTurns.clear(); liveParts.clear(); liveAttempts.clear()
+    durableTurns.clear(); liveParts.clear(); liveAttempts.clear(); changeAnnouncements.clear()
     synchronized(ptcProjections) { ptcProjections.clear() }
     executions.clear(); outcomeReads.clear()
     pendingApprovals.clear(); pendingQuestions.clear()
@@ -377,6 +378,7 @@ class DshApi(
 
   override suspend fun discoverCapabilities(): ApiCapabilities {
     remoteBackend?.discoverTerminal()
+    remoteBackend?.discoverChanges()
     return capabilities()
   }
 
@@ -731,20 +733,31 @@ class DshApi(
     else -> "请求失败：HTTP $status"
   }
 
-  /** 认证栅栏内的精确 GET 路由（改动摘要/对比）；失败返回 null。 */
-  private suspend fun fetchJson(url: HttpUrl): JSONObject? = withContext(Dispatchers.IO) {
-    if (remoteBackend != null) return@withContext null
+  /** Exact authenticated changes GET only. Expired/error reads are never authoritative emptiness. */
+  private suspend fun readChanges(kind: String, sessionId: String, seq: Long, index: Int?): JSONObject = withContext(Dispatchers.IO) {
+    require(kind in setOf("summary", "diff") && seq in 1..9_007_199_254_740_991L)
+    require(sessionId.isNotBlank() && sessionId.length <= 512 && sessionId.none(Char::isISOControl))
+    require(if (kind == "summary") index == null else index != null && index in 0..4999)
+    val url = base.newBuilder().addEncodedPathSegment("api").addEncodedPathSegment("changes.$kind")
+      .addQueryParameter("sessionId", sessionId).addQueryParameter("seq", seq.toString()).apply {
+        index?.let { addQueryParameter("index", it.toString()) }
+      }.build()
     val request = Request.Builder().url(url).header("Cookie", cookie()).get().build()
-    try {
-      runHttpCall(request) { response ->
-        response.use {
-          if (it.code !in 200..299) null
-          else runCatching { JSONObject(it.body?.string().orEmpty()) }.getOrNull()
-        }
-      }
-    } catch (error: IOException) {
-      null
-    }
+    runHttpCall(request) { response -> response.use {
+      if (it.code !in 200..299) throw ApiException(it.code, if (it.code == 404)
+        "该改动已不在 Host 进程中，未将缺失结果当作空改动" else "改动读取失败（HTTP ${it.code}）")
+      val body = it.body ?: throw ApiException(502, "改动读取缺少响应体")
+      val limit = 2L * 1024L * 1024L
+      if (body.contentLength() > limit || body.source().request(limit + 1)) throw ApiException(413, "改动比较超过 2 MiB 读取预算")
+      try {
+        val bytes = body.bytes()
+        val decoder = Charsets.UTF_8.newDecoder().onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
+          .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT)
+        val parser = org.json.JSONTokener(decoder.decode(java.nio.ByteBuffer.wrap(bytes)).toString())
+        (parser.nextValue() as? JSONObject)?.takeIf { parser.nextClean() == '\u0000' }
+          ?: throw IllegalArgumentException("Invalid object")
+      } catch (_: Exception) { throw ApiException(502, "改动读取返回无效 JSON 对象") }
+    } }
   }
 
   // ---------------------------------------------------------------- 会话读
@@ -2613,6 +2626,7 @@ class DshApi(
     }
     when (type) {
       "snapshot" -> {
+        frame.arr("records").objects().forEach { changeAnnouncements.record(session.id, it.obj("event")) }
         state.error = null
         state.snapshotAt = System.currentTimeMillis()
         frame.optDouble("cursor", 0.0).toLong().takeIf { it >= 0 }?.let { cursors[session.id] = it }
@@ -2649,6 +2663,7 @@ class DshApi(
       }
       "event" -> {
         val event = frame.obj("event")
+        changeAnnouncements.record(session.id, event)
         val seq = event.optDouble("seq", 0.0).toLong()
         if (seq <= 0 || seq > lastSeq(session.id)) {
           val previous = lastSeq(session.id)
@@ -4078,73 +4093,11 @@ class DshApi(
    * 逐文件对比来自认证栅栏内的 `/api/changes.diff`。摘要只在该 Host 进程内、会话存活期间提供。
    */
   override suspend fun diff(session: Session): List<FileChange> = withContext(Dispatchers.IO) {
-    val snapshot = try { snapshotFor(session, fresh = false) } catch (error: CancellationException) { throw error } catch (error: Exception) { return@withContext emptyList() }
-    val announced = mutableListOf<Long>()
-    for (record in snapshot.arr("records").objects()) {
-      val event = record.obj("event")
-      if (event.str("type") != "workspace/changes") continue
-      event.optDouble("seq", 0.0).toLong().takeIf { it > 0 }?.let(announced::add)
-    }
-    data class Changed(val file: JSONObject, val seq: Long, val index: Int)
-    val merged = LinkedHashMap<String, Changed>()
-    for (seq in announced.takeLast(MAX_CHANGE_TURNS)) {
-      val summary = changesSummary(session.id, seq) ?: continue
-      summary.arr("files").objects().forEachIndexed { index, file ->
-        val path = file.str("path")
-        if (path.isNotBlank()) merged[path] = Changed(file, seq, index)
-      }
-    }
-    merged.values
-      .sortedBy { it.file.str("display").ifBlank { it.file.str("path") } }
-      .take(MAX_CHANGED_FILES)
-      .map { changed ->
-        val file = changed.file
-        val display = file.str("display").ifBlank { file.str("path") }
-        val comparison = changesDiff(session.id, changed.seq, changed.index)
-        FileChange(
-          path = display,
-          after = when (comparison?.str("kind")) {
-            "binary" -> "二进制文件，无法预览对比"
-            "oversized" -> "文件过大，无法预览对比"
-            else -> ""
-          },
-          additions = file.optInt("added"),
-          deletions = file.optInt("deleted"),
-          patch = if (comparison?.str("kind") == "text") renderPatch(display, comparison) else ""
-        )
-      }
-  }
-
-  private suspend fun changesSummary(sessionId: String, seq: Long): JSONObject? =
-    fetchJson(base.newBuilder()
-      .addEncodedPathSegment("api")
-      .addEncodedPathSegment("changes.summary")
-      .addQueryParameter("sessionId", sessionId)
-      .addQueryParameter("seq", seq.toString())
-      .build())
-
-  private suspend fun changesDiff(sessionId: String, seq: Long, index: Int): JSONObject? =
-    fetchJson(base.newBuilder()
-      .addEncodedPathSegment("api")
-      .addEncodedPathSegment("changes.diff")
-      .addQueryParameter("sessionId", sessionId)
-      .addQueryParameter("seq", seq.toString())
-      .addQueryParameter("index", index.toString())
-      .build())
-
-  private fun renderPatch(display: String, diff: JSONObject): String {
-    val hunks = diff.arr("hunks").objects()
-    if (hunks.isEmpty()) return ""
-    val out = StringBuilder()
-    out.append("--- a/").append(display).append('\n')
-    out.append("+++ b/").append(display).append('\n')
-    for (hunk in hunks) {
-      out.append("@@ -").append(hunk.optInt("oldStart")).append(',').append(hunk.optInt("oldLines"))
-        .append(" +").append(hunk.optInt("newStart")).append(',').append(hunk.optInt("newLines")).append(" @@\n")
-      val lines = hunk.arr("lines")
-      for (i in 0 until lines.length()) out.append(lines.optString(i)).append('\n')
-    }
-    return out.toString()
+    // Capture the authenticated Remote connection before the multi-request comparison. A later
+    // reconnect cannot silently splice a new Host generation into this result.
+    val read: suspend (String, String, Long, Int?) -> JSONObject = remoteBackend?.changesReader() ?: ::readChanges
+    val snapshot = snapshotFor(session, fresh = false)
+    DshChangesReadApi(read).changes(session, changeAnnouncements.snapshot(session.id, snapshot))
   }
 
   /**

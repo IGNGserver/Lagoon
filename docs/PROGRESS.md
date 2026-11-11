@@ -77,6 +77,7 @@
 - UI 还保留本机输入确认，拒绝 ACK 即使序号前进也恢复草稿并提示核对；显式分离同步记录未确认状态，避免收集器调度丢失提示。Direct/SSH 官方终端实测已通过；未跑 Android 真机布局、可访问性、预测式返回。
 - r14：Remote 复用固定上游 `harness.terminal.v1` 的 Host 开关/设备归属/attachmentId 策略；native attach 转为 `terminal/follow`，write/resize 走上游兼容 RPC，只有 provider ACK 使 RPC 成功后才生成客户端 ACK。仅从 controllerId 判断输入权，不能信任自报 writable 或按 harness.remote.v3 推断。
 - 终端固定到当前加密 gateway，旧代次不能把输入或 mutation 转到新连接；有界32项/256KiB单发送队列、10s超时、取消丢弃待发输入、未知结果不确认/重放。闭合 Gateway 拒绝新调用，普通只读流仍无上行。Host 设备策略继续过滤其他终端、拒绝其他设备和关闭开关后的调用，不增加绕过通道。
+- r18 受限 Remote DSH Diff 已接入：单独 harness.changes.v1 / harness.changes.read，只允许 summary/diff＋sessionId＋安全序号/索引；Host 通过官方 Connection 同一可信 owner Peer 内部执行固定 GET，无客户端 URL/认证输入、无网络 fallback。旧 Host 无能力时不发送，404过期/错误/超限不当作空改动，Direct/SSH/Remote 共用严格原生解析和补丁渲染。
 
 ### 阶段 7：验证与交付仍进行中
 - 本地 fake Hub/实际 Noise/真实 Node connector 互操作不等于公网 Hub、真实官方 daemon 或 Android 真机验收。
@@ -166,5 +167,10 @@
 - 首轮全量遇旧SharedPreferences代理未实现hashCode而WeakHashMap失败，改弱引用identity表不调用equals/hashCode；定向重跑又发现旧Controller夹具putString(null)不按Android移除键，修正夹具而非降低不可读凭据校验。所有失败已调查，不当作环境跳过。
 - `store-journal-final.log`：**1460 tests、0 failures、0 errors、14 skipped**，Debug assemble 成功121s。新增GraphFault6、SaveFault10、Durability5项；Noise/Router fixture实际运行，已停止的官方daemon opt-in 如实跳过，本轮不启动服务。APK 22,030,512 bytes，SHA-256 `02a0f7df0efd9a979589f2f4b464603979b5ce0d822f2a8087580eb3e72abd60`。本地故障注入不是Android真机掉电验收。
 - 剩余能力审计确认4项实现缺口：Remote DSH受限逐文件Diff、原生workspace注册/管理、服务端内容搜索、历史边界fork；下一轮优先Diff与workspace。Desktop hook/非Linux归属证明/真机公网环境另按证据披露，不是停止有用实现的理由。
+- r18：固定官方 Connection `createSharedFetchHandler('/api').fetch(request, peer)` 的 owner fence、deliverables GET summary/diff 路由已核对并实际调用。新增受限 DshChangesPeer（4并发/10s绝对期限/2MiB/UTF-8+JSON对象/固定selector/静态非重试错误/关闭取消），只在同一可信owner和本地服务可用时声明 harness.changes.v1；没有URL/认证输入、网络fallback或桌面打开动作。SHA overlay新增第5个index输入校验，完整Host plugin构建成功4,037,725bytes，SHA-256 `b204336cc3ad0bb27a695dce30fb910a3d52660ffd7644212261d05678cd4e17`。
+- Android Direct/SSH/Remote共用DshChangesReadApi：原生公告安全序号、最新raw path合并、原生index、二进制/过大提示、严格文件/hunk shape、摘要total不完整即413，1MiB单文件/4MiB总patch预算。一次Remote多文件读取固定当前加密连接，关闭/换代丢弃结果；未声明能力不发送，404/坏数据/拒绝不是权威空列表。UI标注当前历史窗口最近8个公告/最多60文件，错误仍显示ResourceHint。
+- r18 独立复核0个新增明确P1/P2。另修复旧follow初始快照不含后续改动公告：64会话×每会话8条的有界原生公告索引，深拷贝、去重、快照原文不变、异常原始记录仍交严格解析。`remote-diff-first.log`原生兼容通过16s；`remote-diff-parser.log`解析通过2s；`remote-diff-encrypted.log`实际Noise/Router读取与旧Host/404拒绝通过8s；`remote-diff-announcements.log`全部DSH与新增索引专项103项0失败通过37s。
+- `remote-diff-host-all.log`：36项0失败0跳过，含原有native/Router/TerminalPolicy27项、新changes8项和固定官方Connection+deliverables处理器1项；数据服务和session/history是受控夹具，不是运行中的真实改动轮次。实际Kotlin Noise→固定上游Router→DshChangesPeer→受控官方形状数据2项0跳过。未启动daemon/模型，不把处理器运行冒充真机或公网实测。CI已接上新Host策略和加密Diff用例。
+- `remote-diff-final.log`：**1476 tests、0 failures、0 errors、14 skipped**，Debug assemble成功122s。新增ChangesRead10、Announcements3、NoiseChanges2、能力1项；APK22,043,934bytes，SHA-256 `c093ac316796c2d9f78560228faea9d241c452d34558f234ff88cf40c495a370`。剩余实现按原生workspace管理→服务端内容搜索→历史边界fork推进，整体目标继续，PR保持Draft。
 - 全部构建在 `/home/lvziw/.build/Lagoon/unified-harness-connections/source`，Gradle/build 输出在 `~/.build`。源码工作树无 app/build、node_modules。
 - `wt audit`：29 repos，0 missing dirs，3 detached、4 merged worktrees 属其他任务；只读报告，无清理。

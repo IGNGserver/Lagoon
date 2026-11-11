@@ -41,6 +41,24 @@ URL/端口/Authorization/Cookie 不能由 Remote 请求提供；响应剔除 Set
 
 请求 headers 仅 Accept/Content-Type 与必要协议 header 白名单；`x-opencode-ticket: 1` 仅允许用于已列入 OpenAPI 的 `POST /api/pty/{id}/connect-token`，其他值/方法/路径或 SSE/WS header 均拒绝。票据只作一次性附着 URL 参数，不记录到持久日志；Host 独立注入凭据。registration 缺失/损坏/不可读为 partial/issue，不等于权威空目录。不启动、不安装、不终止外部服务。
 
+## 受限 DSH 改动读取
+
+`harness.changes.v1` 是独立 capability，不由 Typert wire 版本推断。`harness.changes.read` 只接受
+`{kind:"summary"|"diff", sessionId, seq, index?}`；diff 必须有0–4999的索引，summary 禁止索引，
+seq 必须为正安全整数。URL、路径、方法、认证、peer、额外字段都不属于 wire 输入。
+
+每个可信 Remote 连接持有一个 DshChangesPeer。它把固定 GET 请求交给官方
+`Connection.createSharedFetchHandler('/api').fetch(request, sameOwnerPeer)`，保留 owner 认证栅栏；
+没有 HTTP/端口扫描或网络 fallback。只有该本地服务和未结束 owner peer 同时可用才声明能力。
+最多4个在途读取、10秒绝对期限、2MiB原始JSON响应，拒绝重定向/错误MIME/无效UTF-8和对象以外响应；
+关闭只取消本连接读取，不关闭 Host 或 owner service。404保留为过期，不伪造空列表。
+
+Android 对一次多文件读取固定当前加密连接并前后核对代次；解析官方摘要和 diff，共享 Direct/SSH/Remote
+业务逻辑。当前历史窗口最近8个公告、最多60个合并文件，文件或摘要部分/超限明确报错；单文件补丁1MiB、
+总补丁4MiB，不把截断当完整。初始follow快照后的原生 `workspace/changes` 公告单独有界保留，避免刷新沿用旧窗口。
+CI 同时覆盖受限参数/权限/字节预算/取消、实际patched Router与Noise链路。另有显式 opt-in 测试实际调用
+固定官方 Connection 认证和 deliverables 路由实现，但数据服务是受控夹具，不冒充真实模型轮次/文件修改。
+
 ## 实现与验证边界
 
 Host companion 和 SHA 校验的固定上游 Router/HostPluginRuntime overlay、Android HTTP/SSE/WS/分片 carrier、同 Host 共享 Noise 会话和服务选择 UI 已有实现。构建、测试入口见 [Host 连接器说明](<../host-connector/README.md>)。

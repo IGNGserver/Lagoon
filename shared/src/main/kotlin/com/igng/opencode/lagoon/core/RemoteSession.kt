@@ -56,6 +56,29 @@ internal class RemoteSession(
   internal fun isCurrentGateway(gateway: RemoteGateway): Boolean = active?.let {
     !closed && !it.connection.isClosed && it.gateway === gateway
   } == true
+  internal fun changesAvailable(): Boolean = active?.let { !closed && !it.connection.isClosed && it.capabilities.hasChanges } == true
+  /** Capture the exact authenticated connection for a multi-file read, never retarget mid-result. */
+  internal suspend fun changesReader(): suspend (String, String, Long, Int?) -> JSONObject {
+    val current = ensure()
+    if (!current.capabilities.hasChanges) throw ApiException(501, "Remote Host 未声明受限改动读取能力，请升级并启用 Host 连接器")
+    return { kind, sessionId, seq, index ->
+      check(!closed && !current.connection.isClosed && active === current) { "改动读取所属的加密连接已变化，请重新读取" }
+      require(kind in setOf("summary", "diff") && sessionId.isNotBlank() && sessionId.length <= 512 && sessionId.none(Char::isISOControl) && seq in 1..9_007_199_254_740_991L)
+      require(if (kind == "summary") index == null else index != null && index in 0..4999)
+      val params = JSONObject().put("kind", kind).put("sessionId", sessionId).put("seq", seq)
+      index?.let { params.put("index", it) }
+      val response = current.connection.call("harness.changes.read", params) as? JSONObject
+        ?: throw ApiException(502, "Remote 改动读取返回无效响应")
+      check(!closed && !current.connection.isClosed && active === current) { "改动读取返回时连接已变化，结果已丢弃" }
+      val status = response.opt("status") as? Int ?: throw ApiException(502, "Remote 改动读取状态无效")
+      when (status) {
+        404 -> throw ApiException(404, "该改动摘要或比较已不在 Host 进程中，未将缺失结果当作空改动")
+        200 -> response.opt("value") as? JSONObject ?: throw ApiException(502, "Remote 改动读取缺少 JSON 对象")
+        else -> throw ApiException(status, "Remote Host 拒绝读取改动（$status）")
+      }
+    }
+  }
+
   internal suspend fun nativeServiceCatalog(): NativeServiceCatalog? {
     val current = ensure()
     if (!current.capabilities.hasNativeServices) return null

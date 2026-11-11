@@ -237,6 +237,8 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
       Column(Modifier.fillMaxWidth().fillMaxHeight(0.72f).padding(vertical = 8.dp)) {
         when (which) {
           ChatSheet.CHANGES -> {
+            if (state.server?.kind in setOf(ServerKind.DSH, ServerKind.DSH_REMOTE))
+              Text("当前历史窗口中最近 8 条改动记录；最多合并 60 个文件。过期或超限会明确报错，不代表无改动。", style = MiuixTheme.textStyles.footnote2)
             ResourceHint(state.resource("changes"), "暂无记录", retry = { controller.loadAncillary() })
             // Server lists may repeat an entry; LazyColumn crashes on a duplicate key, so keys never come from data alone.
             LazyColumn { itemsIndexed(state.changes, key = { index, change -> "$index:${change.path}" }) { _, change ->

@@ -40,6 +40,16 @@ class RemoteBackend internal constructor(
   internal fun terminalAvailable(): Boolean = !isClosed && session.terminalAvailable() &&
     (pinnedTerminalGateway?.let(session::isCurrentGateway) != false)
   internal suspend fun discoverTerminal(): Boolean = !isClosed && session.capabilities().hasTerminal
+  internal fun changesAvailable(): Boolean = !isClosed && session.changesAvailable()
+  internal suspend fun discoverChanges(): Boolean = !isClosed && session.capabilities().hasChanges
+  internal suspend fun changesReader(): suspend (String, String, Long, Int?) -> JSONObject {
+    check(!isClosed) { "Remote backend 已关闭" }
+    val reader = session.changesReader()
+    return { kind, id, seq, index ->
+      check(!isClosed) { "Remote backend 已关闭" }
+      reader(kind, id, seq, index).also { check(!isClosed) { "Remote backend 已关闭，改动结果已丢弃" } }
+    }
+  }
   private val terminalLock = Any()
   @Volatile private var pinnedTerminalGateway: RemoteGateway? = null
   private val terminalSockets = java.util.concurrent.ConcurrentHashMap.newKeySet<WebSocket>()

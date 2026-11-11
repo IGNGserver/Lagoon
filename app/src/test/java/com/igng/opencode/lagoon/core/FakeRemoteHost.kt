@@ -259,7 +259,7 @@ internal class FakeRemoteHost(
       if (failure != null) contractViolations += failure
       return failure
     }
-    if (harnessRpc != null && (method == "harness.transport.describe" || method.startsWith("harness.remote."))) {
+    if (harnessRpc != null && (method == "harness.transport.describe" || method.startsWith("harness.remote.") || method == "harness.changes.read")) {
       // Keep a provider-ACK wait off the encrypted receiver; events/close must still make progress.
       nativeWorker!!.execute {
         try { respond(harnessRpc.invoke(method, params, ::publishNativeEvent)) }

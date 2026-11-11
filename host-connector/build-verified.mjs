@@ -89,6 +89,7 @@ export async function buildVerified({ upstream, out, tools, routerOnly = false }
       "export { TerminalCarrierCompat } from './packages/plugin/src/terminal-carrier-compat.ts';",
       "export { ConnectionController, ConnectionRejectedError } from './packages/plugin/src/connection-controller.ts';",
       "export { NativeServicePeer, NativeServiceError, NATIVE_SERVICE_CAPABILITY } from './packages/plugin/src/lagoon-native-services.mjs';",
+      "export { DshChangesPeer, DshChangesError, DSH_CHANGES_CAPABILITY } from './packages/plugin/src/lagoon-dsh-changes.mjs';",
       "export { createRpcRequest, createEvent, parseRemoteMessage } from './packages/protocol/src/index.ts';",
     ].join('\n'), resolveDir: sourceRoot, sourcefile: 'verification-entry.ts', loader: 'ts',
   } }];
