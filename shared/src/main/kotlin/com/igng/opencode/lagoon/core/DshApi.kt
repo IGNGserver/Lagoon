@@ -3,18 +3,20 @@ package com.igng.opencode.lagoon.core
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.async
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.awaitCancellation
-import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asSharedFlow
-import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
@@ -194,6 +196,12 @@ class DshApi(
   /** 最近一次会话快照的规模；只记数量/游标，不记正文。 */
   private val snapshotStats = ConcurrentHashMap<String, RemoteSnapshotStats>()
   @Volatile private var eventChannel: Channel<ServerEvent>? = null
+  private val sharedEventsDelegate = lazy { SharedEventOwner(ioScope, ::ownedEvents, { eventsReady },
+    copyForSubscriber = { it.copy(properties = JSONObject(it.properties.toString())) }) }
+  private fun ownerEvent(event: ServerEvent) {
+    val channel = eventChannel ?: return
+    if (channel.trySend(event).isFailure) channel.close(IOException("事件 owner 缓冲区已满；请重新同步"))
+  }
   @Volatile private var eventsClientId: String? = null
   /** 仍在等待回答的审批/问答瀑布；键是网关事件 id。 */
   private val pendingApprovals = ConcurrentHashMap<String, PermissionRequest>()
@@ -305,6 +313,7 @@ class DshApi(
   override fun close() {
     if (closed || !closing.compareAndSet(false, true)) return
     if (terminalApiDelegate.isInitialized()) terminalApiDelegate.value.close()
+    if (sharedEventsDelegate.isInitialized()) sharedEventsDelegate.value.close()
     if (questionCoordinatorDelegate.isInitialized()) {
       questionCoordinator.close()
       if (!questionCoordinator.hasPendingSettlements()) { closeTransportAfterQuestions(); return }
@@ -343,7 +352,10 @@ class DshApi(
     } finally { shutdown.complete(Unit) }
   }
 
-  override suspend fun awaitClosed() { shutdown.await() }
+  override suspend fun awaitClosed() {
+    shutdown.await()
+    if (sharedEventsDelegate.isInitialized()) sharedEventsDelegate.value.awaitStopped()
+  }
 
   override suspend fun discoverCapabilities(): ApiCapabilities {
     remoteBackend?.discoverTerminal()
@@ -1835,23 +1847,25 @@ class DshApi(
 
   // ---------------------------------------------------------------- 事件流
 
-  override fun events(onOpen: () -> Unit): Flow<ServerEvent> = callbackFlow {
-    val channel = Channel<ServerEvent>(Channel.UNLIMITED)
+  override fun events(onOpen: () -> Unit): Flow<ServerEvent> = sharedEventsDelegate.value.events(onOpen)
+
+  /** Only SharedEventOwner starts this source; final cleanup precedes a replacement generation. */
+  private fun ownedEvents(onOpen: () -> Unit): Flow<ServerEvent> = flow { coroutineScope {
+    check(!isClosed) { "DSH 客户端已关闭" }
+    val channel = Channel<ServerEvent>(256)
     eventChannel = channel
-    var closed = false
-    val push: (ServerEvent) -> Unit = { event -> channel.trySend(event) }
+    val ended = java.util.concurrent.atomic.AtomicBoolean(false)
+    val push: (ServerEvent) -> Unit = { event ->
+      if (!ended.get() && channel.trySend(event).isFailure) channel.close(IOException("事件 owner 消费者过慢；请重新同步"))
+    }
 
     // follow 可能先于事件流建立：把快照之后、事件流挂上之前到达的增量补送，避免“打开会话的头几秒丢了”。
     flushFollowBuffers(push)
 
     // The business waterfall outlives its UI collector long enough to hand ownership back. A
     // collector cancellation must not cancel the gateway client before its queued `next` RPC.
-    val eventsJob = ioScope.launch { runEventsLoop(push, onOpen) { closed } }
-    val statusJob = launch { runStatusFallback(push) { closed } }
-
-    val pump = launch {
-      for (event in channel) send(event)
-    }
+    val eventsJob = ioScope.launch { runEventsLoop(push, onOpen) { ended.get() || isClosed } }
+    val statusJob = launch { runStatusFallback(push) { ended.get() || isClosed } }
 
     // Content is expensive (workspace/follow + one follow per running session). Background monitors
     // keep only `$events`; the selected connection switches this on. Switching it off stops the
@@ -1866,7 +1880,7 @@ class DshApi(
           return@collect
         }
         contentJob = launch {
-          val workspace = launch { runWorkspaceLoop { closed } }
+          val workspace = launch { runWorkspaceLoop { ended.get() || isClosed } }
           try {
             synchronized(watched) { watched.toList() }.forEach(::startFollow)
             awaitCancellation()
@@ -1877,24 +1891,22 @@ class DshApi(
       }
     }
 
-    awaitClose {
-      closed = true
+    try { for (event in channel) emit(event) }
+    finally { withContext(NonCancellable) {
+      ended.set(true)
       if (questionCoordinatorDelegate.isInitialized()) questionCoordinator.presentation(null, false)
-      if (questionCoordinatorDelegate.isInitialized() && questionCoordinator.hasPendingSettlements()) {
-        ioScope.launch {
-          try { kotlinx.coroutines.withTimeoutOrNull(2_000) { questionCoordinator.awaitSettlements() } }
-          finally { eventsJob.cancel() }
-        }
-      } else eventsJob.cancel()
-      statusJob.cancel()
-      contentWatcher.cancel()
-      contentJob?.cancel()
+      // Last subscriber releases the business waterfall; a sibling subscriber never reaches here.
+      if (questionCoordinatorDelegate.isInitialized() && questionCoordinator.hasPendingSettlements())
+        kotlinx.coroutines.withTimeoutOrNull(2_000) { questionCoordinator.awaitSettlements() }
+      eventsJob.cancelAndJoin()
+      statusJob.cancelAndJoin()
+      contentWatcher.cancelAndJoin()
+      contentJob?.cancelAndJoin()
       followStates.values.toList().forEach(::stopFollowState)
-      pump.cancel()
-      channel.close()
+      channel.cancel()
       if (eventChannel === channel) eventChannel = null
-    }
-  }
+    } }
+  } }
 
   /**
    * `$events` 是状态的主实时源，但不是内容和状态的唯一来源：它断开时只标记 degraded、
@@ -1909,7 +1921,8 @@ class DshApi(
       var socket: WebSocket? = null
       var wasReady = false
       try {
-        socket = openMux("\$events", noArgs(), onItem = { frame ->
+        socket = openMux("\$events", noArgs(), onItem = item@{ frame ->
+          if (isClosed()) return@item
           eventsLastFrameAt = System.currentTimeMillis()
           when (frame.str("type")) {
             "ready" -> {
@@ -1937,7 +1950,10 @@ class DshApi(
             else -> Unit
           }
         }, onClosed = { cause ->
-          eventsReady = false
+          if (!isClosed()) {
+            sharedEventsDelegate.value.notReady()
+            eventsReady = false
+          }
           ended.complete(cause)
         })
         // TCP/TLS 建连成功不等于逻辑事件流可用。对端若一直不发 ready，必须按失败重连，
@@ -1961,12 +1977,17 @@ class DshApi(
       } catch (cancel: CancellationException) {
         throw cancel
       } catch (error: Exception) {
+        sharedEventsDelegate.value.notReady()
         eventsReady = false
         eventsError = error.message?.takeIf { it.isNotBlank() } ?: error.javaClass.simpleName
         eventsReconnects++
         if (wasReady) connectionEvent(false, eventsError)?.let(push)
         socket?.cancel()
         Diagnostics.warn("DshApi", "\$events 建立失败", error)
+      } finally {
+        // Cancellation may happen in the first-ready wait, before ended.await's own finally.
+        // Always retire this logical producer; the shared API-Peer socket stays owned by muxOwner.
+        socket?.cancel()
       }
       delay(backoff)
       backoff = (backoff * 2).coerceAtMost(EVENTS_RETRY_MAX_MILLIS)
@@ -2422,7 +2443,7 @@ class DshApi(
     val previous = pendingQuestions.toMap()
     pendingQuestions.keys.removeAll { it !in next }
     pendingQuestions.putAll(next)
-    for ((id, request) in previous) if (id !in next) eventChannel?.trySend(ServerEvent(
+    for ((id, request) in previous) if (id !in next) ownerEvent(ServerEvent(
       id = "dsh:question-removed:${nextLiveEventId()}", directory = request.directory, type = "form.cancelled",
       properties = JSONObject().put("sessionID", request.sessionId).put("id", id), created = clock()))
     for ((id, request) in next) if (request != previous[id]) {
@@ -2431,7 +2452,7 @@ class DshApi(
       request.presentation?.let { state -> form.put("questionPresentation", JSONObject()
         .putOpt("remainingMs", state.remainingMs).put("countdownRunning", state.countdownRunning)
         .put("held", state.held).put("continued", state.continued)) }
-      eventChannel?.trySend(ServerEvent(id = "dsh:question-change:${nextLiveEventId()}", directory = request.directory,
+      ownerEvent(ServerEvent(id = "dsh:question-change:${nextLiveEventId()}", directory = request.directory,
         type = if (id in previous) "form.updated" else "form.created", properties = JSONObject().put("form", form), created = clock()))
     }
   }
@@ -2664,7 +2685,7 @@ class DshApi(
   private fun emitFollow(state: FollowState, event: ServerEvent) {
     val channel = eventChannel
     if (channel != null) {
-      channel.trySend(event)
+      if (channel.trySend(event).isFailure) channel.close(IOException("会话事件缓冲区已满；请重新同步"))
       return
     }
     // 事件流还没建立：先放进有界缓冲，等 events() 挂上后补齐；不丢开场几秒。

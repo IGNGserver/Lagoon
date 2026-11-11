@@ -91,6 +91,7 @@
 - r12 OpenCode 原生 simple PTY 文本终端接入 Direct/SSH/Remote：固定官方原始文本/游标协议，一次性票据，严格 location 与 route，明确创建/输入/终止与 detach-only 关闭；不宣称完整 VT。
 - r13 DSH Direct/SSH Session 归属终端接入官方 retain/attach 双向 mux、输入/resize 顺序 ACK 与控制权变化；目录不推断 Session。显式创建/附加/输入/终止，默认不自动抢回控制，不重放未确认输入。
 - r14 Remote DSH 终端按实际上游 follow/write/resize + harness.terminal.v1 接入，Host 设备归属和开关不绕过，provider ACK 后才回执，固定 gateway/取消丢弃/无输入重放；实际 Noise→Router/Policy/Compat→官方 DSH 终端验收已取得。
+- r15 单实例 events() 共享一个业务 owner，多订阅者各自有界队列与载荷副本；取消一个不清理其他订阅者或前台提问，最后退出后串行清理再换代。cross-instance registry/lease 与前台焦点隔离另待完成。
 - 尚未完成：真实桌面 DSH profile 附着、公共库跨实例 events owner 复用、非 Linux 原生 Host 归属证明、完整原生能力真环境矩阵、真实设备交互验收与 PR 最终就绪。
 
 - 工作区已创建且 HEAD 与 origin/main 基线相同。

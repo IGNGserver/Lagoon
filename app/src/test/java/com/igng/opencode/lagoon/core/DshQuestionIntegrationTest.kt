@@ -505,6 +505,31 @@ class DshQuestionIntegrationTest {
     }
   }
 
+  @Test fun cancellingSpectatorSubscriptionDoesNotDelegateForegroundQuestionOrCancelItsClaim() = runBlocking {
+    val f = Fixture(this)
+    var spectator: Job? = null
+    try {
+      f.client.questionPresentation("s1", true)
+      f.start()
+      val spectatorReady = CompletableDeferred<Unit>()
+      spectator = launch { f.client.events { spectatorReady.complete(Unit) }.collect {} }
+      withTimeout(5_000) { spectatorReady.await() }
+      f.waterfall("shared-foreground-event")
+      f.form("form.created")
+      f.form("form.updated") { it.presentation?.countdownRunning == true }
+      val claim = f.mux("open", "userQuestions/attachWait")
+      spectator.cancelAndJoin(); spectator = null
+      f.flushEvents()
+      assertEquals(1, f.opens.count { it.endpoint == "\$events" })
+      assertTrue(f.cancels.none { it.endpoint == "\$events" || it.frame.optString("streamId") == claim.frame.optString("streamId") })
+      assertTrue(f.calls.none { it.endpoint == "\$events/result" })
+      assertTrue(f.client.forms("").single().presentation!!.countdownRunning)
+      f.client.questionPresentation("s1", false)
+      f.rpc("\$events/result")
+      assertEquals(1, f.calls.count { it.endpoint == "\$events/result" })
+    } finally { spectator?.cancelAndJoin(); f.close() }
+  }
+
   @Test fun collectorCancellationBeforeApiCloseDrainsLegacyDelegationBeforeEventsCancel() = runBlocking {
     val f = Fixture(this)
     try {

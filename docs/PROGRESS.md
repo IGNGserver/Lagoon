@@ -80,7 +80,8 @@
 
 ### 阶段 7：验证与交付仍进行中
 - 本地 fake Hub/实际 Noise/真实 Node connector 互操作不等于公网 Hub、真实官方 daemon 或 Android 真机验收。
-- DSH Desktop SSH 附着仍缺上游受支持 hook；跨 direct DshApi API-peer 复用及完整功能矩阵未全部验收。没有虚构完成。
+- r15 单实例 DshApi 事件改为一个 business owner 和独立有界订阅队列：旁观者取消不停止兄弟流或交还前台提问，最后订阅者才清理，旧代次退出/交还后再启动新源；慢消费者明确报错而不静默丢事件，JSONObject 载荷逐订阅复制。
+- DSH Desktop SSH 附着仍缺上游受支持 hook；跨 direct DshApi API-peer 复用及完整功能矩阵未全部验收。跨实例需要 guarded lease 和独立前台/监视归属，messagesPage 的隐式全局焦点不能直接包装进共享池。单实例修复不等于全局跨实例完成。
 - 已推送分支并建立 [Draft PR #193](https://github.com/IGNGserver/Lagoon/pull/193)，官方服务验收 checkpoint 的 CI 已通过；PR 保持 draft，继续收口剩余能力，不表示全部目标完成。没有部署、发布或合并。
 
 ## 验证记录
@@ -147,5 +148,10 @@
 - `remote-terminal-first.log` 首轮 Kotlin 转换与能力门禁通过15s。初轮 Node 1项因未等待异步 snapshot 失败、加密用例先遇旧暂存能力脚本再遇测试桥仅准 harness.services.* 而拒绝 harness.remote.frame，已分别修正事件等待、重同步与精确两个 Remote 事件名；未放宽生产策略。`remote-terminal-event-fixed.log` 实际 Noise→Router/Policy/Compat 的延迟 provider ACK、设备过滤、开关拒绝、detach不kill通过8s。独立复核0个新增明确高风险生产问题，指出上述测试桥事件白名单缺陷。
 - `remote-terminal-official.log`：实际 Kotlin Noise→固定上游 Router/设备策略/Compat→隔离官方 rc.5 WebHost 的终端创建、输入/resize ACK、分离保留与明确终止通过3s。Node 测试适配器只负责本地官方 HTTP/mux，不启动服务、不重试或绕过设备策略，token 仅 scratch 私有文件读入；无模型 prompt/用户项目命令。
 - `remote-terminal-final.log`：**1395 tests、0 failures、0 errors、13 skipped**，Debug assemble 成功119s。新增 RemoteSocket12、实际加密 provider2、capability1项，官方 encrypted DSH 1项实际执行；原先停止的 Direct/SSH/OpenCode opt-in 如实跳过。APK 21,961,103 bytes，SHA-256 `33800dc5c4ea7ecd4f604a3e6ac84390a8f47760de5adfe98ec42ff9d420b520`。所有子进程关闭、测试终端明确删除且清单为空后停止隔离 WebHost；不是公网 Host/Android 真机验收。
+- r15 单实例事件 owner：`events()` 不再每个收集器独立创建业务流并覆盖 eventChannel；统一源保留提问交还生命周期，订阅者独立256项队列/JSONObject副本，取消旁观者不清理兄弟，慢消费者明确失败而非静默丢事件。最终退订的清理串行 join 后才允许新源，awaitClosed 等待事件源退出。
+- `event-owner-first.log` 提问/mux基线通过7s。新增测试初次因 Source.flow 与 flow builder 同名递归推断编译失败，改为明确类型/全限定构造；另一次测试在普通 ready 回调调用 suspend currentCoroutineContext，改为提前捕获 Job。`event-owner-compiled.log` hub/native subscribers/question/mux/全部DshApi定向通过41s；`event-owner-question.log` 旁观者取消不交还前台提问通过6s。
+- 独立源码复核0个新增明确高风险项。追加 physical disconnect 清除ready、Unconfined回调取消不破坏 fanout 集合、载荷深复制与 ready前最后退订也必须取消逻辑生产者等回归；旧事件源在首次ready等待被取消时现由finally统一回收，保留共享物理API Peer。
+- `event-owner-cancel-final.log`：**1411 tests、0 failures、0 errors、14 skipped**，Debug assemble 成功120s。新增事件订阅8、有界hub7、提问旁观者1项；fixture Noise/Router 测试实际执行，已停止的官方daemon opt-in 如实跳过，本轮不启动真实服务。APK 21,970,612 bytes，SHA-256 `092445cdb50b2bc476da22a276a835c25e659a3fac552f062700558aa562c07a`。
+- 跨实例共享仍待 guarded lease 与前台/监视归属 seam：messagesPage 当前会隐式开启 contentWatching 并设置 activeSessionId，不能把裸 DshApi 放入全局池或仅靠引用计数包装。当前单实例广播不冒充跨实例 owner 修复。
 - 全部构建在 `/home/lvziw/.build/Lagoon/unified-harness-connections/source`，Gradle/build 输出在 `~/.build`。源码工作树无 app/build、node_modules。
 - `wt audit`：29 repos，0 missing dirs，3 detached、4 merged worktrees 属其他任务；只读报告，无清理。
