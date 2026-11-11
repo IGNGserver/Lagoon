@@ -196,5 +196,6 @@
 - 能力发现只认实例自身OpenAPI的完整兼容形状，BASELINE不假设；项目ID进入路径段，含斜杠/反斜杠/百分号或为点段时在写入前400，读取仍可用且不换路由。未知写入按原Host+项目锁定，必须成功读取同一项目元数据与工作树清单才解除；仅元数据读取不解除worktree未知态。Controller固定原profile同leaf route，关闭/换路由后旧结果丢弃。
 - 复核发现并修复2个P2：删除页捕获了(project,worktree)但提交仍用当前项目，刷新后可能把旧目录提交到改动后的项目；编辑/创建/删除/refresh表单在只读刷新重定基后可能把他端修改当成自己草稿覆盖。现统一使用进入操作时捕获的不可变项目快照，表单基准不被刷新替换，刷新后不一致时禁用提交并要求返回详情重开。
 - 原生HTTP传输拒绝编码斜杠，故含`/`的project ID无法安全寻址：上行直接400（不发请求），不在读取侧伪造。`opencode-worktrees-matrix3.log`：45项0失败，含API9、能力17、Policy4、Controller4、编辑器2、Guarded7、实际Noise/Router/Peer worktree生命周期1。Host Node测试37项0失败0跳过（含官方Router/终端/变更/冷搜索）。CD测试曾因`localhost`解析到未监听的IPv6失败，已将夹具改绑127.0.0.1，不恢复写入自动重放。
+- `opencode-worktrees-full.log`：**1567 tests、0 failures、0 errors、14 skipped**，Debug assemble成功128s。新增原生API9、能力2、Policy4、Controller4、编辑器快照2、实际Noise/Router/Peer生命周期1，共22项；Guarded反射7与既有Controller90继续通过。APK22,227,369bytes，SHA-256 `b2bb01448c0c29f5bf5547e73a8c9ea74f00402e638ebc4e9b0e12a1dc9ab061`。14项跳过全部是需要隔离官方daemon/SSH/上游服务的显式opt-in，非失败或静默忽略；未运行模型、未连接真机或公网Hub。
 - 全部构建在 `/home/lvziw/.build/Lagoon/unified-harness-connections/source`，Gradle/build 输出在 `~/.build`。源码工作树无 app/build、node_modules。
 - `wt audit`：29 repos，0 missing dirs，3 detached、4 merged worktrees 属其他任务；只读报告，无清理。
