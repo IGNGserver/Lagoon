@@ -126,8 +126,18 @@ interface HarnessClient {
   /** PDF/image bytes, or Office converted to PDF; null when the harness cannot preview this path. */
   suspend fun previewFile(directory: String, path: String, session: Session?): FilePreview? = null
 
-  /** Host automation reminders bound to this Session; read-only list. */
+  /** Legacy active-only reminders bound to this Session. */
   suspend fun schedules(sessionId: String): List<RemoteSchedule> = emptyList()
+  /** All reminders with original owner/status; null means unsupported, not an empty catalog. */
+  suspend fun scheduleCatalog(): List<RemoteSchedule>? = null
+  suspend fun scheduleHistory(
+    sessionId: String, id: String, before: String? = null, limit: Int = 20
+  ): ScheduleHistoryPage? = null
+  suspend fun deleteSchedule(sessionId: String, id: String): ScheduleDeleteResult? = null
+  suspend fun updateSchedule(
+    sessionId: String, id: String, expected: ScheduleRecord,
+    title: String? = null, prompt: String? = null, change: ScheduleTimingChange? = null
+  ): ScheduleUpdateResult? = null
 
   /** Creates one custom model route in the Host's pi-ai settings; false when unsupported. */
   suspend fun createProviderRoute(

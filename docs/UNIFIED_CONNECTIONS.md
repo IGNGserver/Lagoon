@@ -87,7 +87,8 @@
 - r8 独立空 source/Host catalog、最后 SSH leaf 删除边界、无叶父级许可和 signedOut 目录保留已实现；登记只保存主机，之后逐个选择 DSH/OpenCode，不默认连接。
 - r8 已补真实官方 daemon Direct/SSH/Noise 只读验收及两个实际传输缺陷修复；DSH 插件/凭据/服务商 UI 跨 carrier、OpenCode fork/revert/restore 入口继续在 [Draft PR #193](https://github.com/IGNGserver/Lagoon/pull/193) 收口。
 - r10 目标编辑/Long cap/轮数读取已接入三种 DSH carrier，显式 CAS、保留激活状态、无自动重发；旧读取/同 revision 激活/创建 ack/清除 tombstone 竞态有专项回归与固定官方 goal schema。
-- 尚未完成：定时任务 CRUD、交互终端、真实桌面 DSH profile 附着、公共库跨实例 events owner 复用、完整原生能力真环境矩阵、真实设备交互验收与 PR 最终就绪。
+- r11 已接入公开调度目录/历史/删除/CAS 更新，封闭完整记录、原会话绑定、独立时区、冲突保留改动意图；不虚构 rc.5 未公开的创建/立即执行/启停接口。
+- 尚未完成：交互终端、真实桌面 DSH profile 附着、公共库跨实例 events owner 复用、非 Linux 原生 Host 归属证明、完整原生能力真环境矩阵、真实设备交互验收与 PR 最终就绪。
 
 - 工作区已创建且 HEAD 与 origin/main 基线相同。
 - 本机盘可用约 96 GiB（2026-11-09）；构建区 `~/.build`。

@@ -10,6 +10,26 @@ class DshPublishedContractTest {
     assertEquals("b830ec950faba0a46dda564be3e2d854afed94f1", OfficialDshContract.upstream().getString("commit"))
   }
 
+  @Test fun scheduleUpdateHasCompleteClosedExpectedRecordAndNoCatalogMetadata() {
+    val expected = JSONObject("""{"id":"task","kind":"daily","title":"Task","prompt":"Review","scheduledAt":"2099-01-01T15:00:00.000Z","time":"23:00:00.000","timeZone":"Asia/Shanghai"}""")
+    val request = JSONObject().put("sessionId", "owner").put("id", "task").put("expected", expected).put("title", "Edited")
+    OfficialDshContract.assertArgs("schedule/update", JSONObject().put("request", request))
+    for (extra in listOf("sessionId", "status", "lastDelivery", "enabled")) {
+      val invalid = JSONObject(request.toString()).apply { obj("expected").put(extra, "not a record field") }
+      assertTrue(extra, runCatching { OfficialDshContract.assertArgs("schedule/update", JSONObject().put("request", invalid)) }.isFailure)
+    }
+    assertTrue(OfficialDshContract.schema("schedule/update").has("resultSchemaError"))
+    assertFalse(OfficialDshContract.schema("schedule/update").has("result"))
+  }
+
+  @Test fun scheduleDeleteAndHistoryUseOriginalOwnerAndExclusiveMessageCursor() {
+    OfficialDshContract.assertArgs("schedule/delete", JSONObject("""{"request":{"sessionId":"owner","id":"task"}}"""))
+    OfficialDshContract.assertArgs("schedule/history", JSONObject("""{"request":{"sessionId":"owner","id":"task","limit":20,"before":"message-cursor"}}"""))
+    assertTrue(runCatching { OfficialDshContract.assertArgs("schedule/delete", JSONObject("""{"request":{"id":"task"}}""")) }.isFailure)
+    assertTrue(runCatching { OfficialDshContract.assertArgs("schedule/update", JSONObject("""{"request":{"sessionId":"owner","id":"task","enabled":false}}""")) }.isFailure)
+    assertFalse(OfficialDshContract.has("schedule/create")); assertFalse(OfficialDshContract.has("schedule/run"))
+  }
+
   @Test fun goalEditUsesAnExactRefAndOptionalReplacementFieldsNotExpectedOrToolArguments() {
     val args = JSONObject("""{"agentId":"s","ref":{"id":"g","revision":2},"request":{"objective":"Edited","maxGoalRounds":9007199254740991}}""")
     OfficialDshContract.assertArgs("goals/edit", args)

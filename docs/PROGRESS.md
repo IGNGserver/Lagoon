@@ -67,7 +67,9 @@
 - OpenCode 从实际文档发现兼容 POST /fork 与 messageID /revert/stage，提供具体已落盘人类消息回退确认与暂存边界恢复入口；DSH 不冒充回退。离线缓存、任务活跃、降级未知状态、排队消息、父级禁用均拒绝；确认绑定原路由/会话/边界，回退期间不发送消息且保留草稿。
 - r10：目标编辑已按官方 `goals/edit` 的 agentId/ref/request 接入 Direct/SSH/Remote，保存只修改 objective/cap，不改变阶段或自动续跑状态。Long cap 覆盖正 JavaScript-safe integer，缺少轮数信息显示未知；仅明确 stopped 状态且预算充足时提供独立恢复操作。
 - 编辑与清除确认捕获 exact route/session/goal revision；旧版本仅重读状态，不自动重发编辑，失败保留输入；完整 GoalView 响应直接提交并按版本挡住旧投影。create ref-only ack 不推断 armed，保留确认前收到的同目标激活事件；同 revision 激活变化、迟到空读取与清除 tombstone 均有缓存/Controller 防回滚门禁。
-- schedule CRUD、交互终端仍是业务适配器缺口，不把通用 WS carrier 或 endpoint allowlist 当作已交付功能。未跑 Android 真机布局、可访问性、预测式返回；当前仅源码与 Compose 编译验收。
+- r11：官方调度 catalog/list/history/delete/update 已接入三种 DSH carrier。完整六类 ScheduleRecord 作为封闭 CAS 快照，原会话、状态、lastDelivery 单独保存，不混入 expected；时区/计划目标原样保留，修改定时须明确勾选，after 仅明确改为 at。
+- UI 有活跃/非活跃目录、投递回执分页（不冒充 Agent 运行完成）、保留/修剪提示、删除确认、分阶段编辑与冲突后显式重新读取；已改字段保留，未改字段随服务器更新，避免回写他端编辑。写操作前后按原路由/会话/完整记录隔离；未知结果只读核对，不自动重发，HTTP401 也不重放调度 mutation。
+- rc.5 generated 仅公开上述5种调度方法，没有公开 create/run/enable，不能将内部服务方法或 Agent tool 冒充客户端 API。交互终端仍待业务适配，不把通用 WS carrier 当作已交付功能。未跑 Android 真机布局、可访问性、预测式返回；当前仅源码与 Compose 编译验收。
 
 ### 阶段 7：验证与交付仍进行中
 - 本地 fake Hub/实际 Noise/真实 Node connector 互操作不等于公网 Hub、真实官方 daemon 或 Android 真机验收。
@@ -119,6 +121,9 @@
 - 独立复核发现并修复三处：Controller 旧 composer 投影复活已清除目标、create ack 清掉先到的同目标 activation、旧 direct get 覆盖同 revision 新 activation。额外保留 clear tombstone 防后续旧投影复活，数字 revision 不截断。`goal-edit-contract-tombstone.log` 官方导出 schema + tombstone/加密/Controller 通过20s。
 - 从官方 rc.5 generated Typert 导出7项目标方法请求/响应契约，保留版本/源 SHA；create ref-only 与 edit full GoalView 分开测试，不按手写 fake 假定相同结果。
 - `goal-edit-final.log`：**1289 tests、0 failures、0 errors、10 skipped**；Debug assemble 成功120s。新增 GoalEditApi15、GoalMutationPolicy6、GoalEditorPolicy6、Controller7、官方goal契约2、实际加密目标编辑1项；fixture Noise2项运行，已停止 daemon 的4个 opt-in 如实跳过。APK 21,766,757 bytes，SHA-256 `03557554bf9a45d95901e32f29de6bb7c4d7372989c02007d03516856b33e174`。
-- 下阶段调度契约核对：官方 rc.5 generated RPC 仅 catalog/delete/history/list/update；没有公开 create/run/enable。支持的删除/完整记录 CAS 更新与历史仍待实现，不通过调用 Agent tool 或猜 endpoint 冒充支持。
+- 调度契约核对：官方 rc.5 generated RPC 仅 catalog/delete/history/list/update；没有公开 create/run/enable。r11 已实现支持的删除/完整记录 CAS 更新与历史，不通过调用 Agent tool 或猜 endpoint 冒充额外接口。
+- r11 `schedule-first.log` 生产 UI/RPC 编译通过，但夹具错误使用 Android JSONObject 不存在的 similar，改为字段递归比较；`schedule-scoped.log` 定向通过62s。独立复核发现并修复 CAS 刷新把未编辑旧字段回写覆盖他端新值，以及旧会话写确认使新会话目录永久 loading，新增 dirty-field 和重叠会话读取回归。
+- `schedule-reviewed.log` 官方 schema、Controller/dirty-field、实际 Noise 调度目录/历史/更新/删除等定向通过21s；写操作 401 不重放，冲突/未知只读核对。固定导出5种官方请求契约，结果 schema 无法表达的重叠 union 保留 resultSchemaError，不手造成功 schema。
+- `schedule-full.log`：**1325 tests、0 failures、0 errors、10 skipped**；Debug assemble 成功122s。新增 ScheduleApi12、ScheduleMutationPolicy4、ScheduleEditorPolicy7、Controller10、官方调度契约2、实际加密调度1项。APK 21,842,052 bytes，SHA-256 `61cd28a5625e4686ba0b349cb13fc74219e9d080b79017e608b326e8bde62e4a`；本轮不启动真实 daemon，4个 live opt-in 保持 skip，fixture Noise 实际运行。
 - 全部构建在 `/home/lvziw/.build/Lagoon/unified-harness-connections/source`，Gradle/build 输出在 `~/.build`。源码工作树无 app/build、node_modules。
 - `wt audit`：29 repos，0 missing dirs，3 detached、4 merged worktrees 属其他任务；只读报告，无清理。

@@ -3027,28 +3027,123 @@ class DshApi(
   }
 
   override suspend fun schedules(sessionId: String): List<RemoteSchedule> {
-    val value = call("schedule/list", requestArgs(JSONObject().put("sessionId", sessionId))) as? JSONArray
-      ?: return emptyList()
-    return (0 until value.length()).mapNotNull { index ->
-      val item = value.optJSONObject(index) ?: return@mapNotNull null
-      val id = item.optString("id").takeIf { it.isNotBlank() } ?: return@mapNotNull null
-      val kind = item.optString("kind")
-      val detail = when (kind) {
-        "every" -> "${item.optInt("everySeconds")} 秒"
-        "daily" -> "${item.optString("time")} ${item.optString("timeZone")}"
-        "weekly" -> {
-          val days = item.optJSONArray("weekdays")
-          val text = if (days == null) "" else (0 until days.length()).joinToString(",") { days.optInt(it).toString() }
-          "${item.optString("time")} ${item.optString("timeZone")} · $text"
-        }
-        "cron" -> "${item.optString("expression")} ${item.optString("timeZone")}"
-        "after" -> "${item.optInt("afterSeconds")} 秒后"
-        "at" -> item.optString("scheduledAt")
-        else -> kind
-      }
-      RemoteSchedule(id, kind, item.optString("title").ifBlank { "定时任务" },
-        item.optString("prompt"), item.optString("scheduledAt"), detail)
+    require(sessionId.isNotBlank()) { "Missing schedule owner" }
+    val value = call("schedule/list", requestArgs(JSONObject().put("sessionId", sessionId)))
+    return scheduleResponse {
+      val rows = value as? JSONArray ?: throw IllegalArgumentException("Missing schedule list")
+      scheduleImmutable((0 until rows.length()).map { index ->
+        val row = rows.opt(index) as? JSONObject ?: throw IllegalArgumentException("Invalid schedule row")
+        ScheduleRecord.parse(row).toRemoteSchedule(sessionId, "active")
+      })
     }
+  }
+
+  override suspend fun scheduleCatalog(): List<RemoteSchedule>? {
+    val value = try { call("schedule/catalog", noArgs()) } catch (error: ApiException) {
+      if (error.isDshMethodUnavailable) return null
+      throw error
+    }
+    return scheduleResponse {
+      val rows = value as? JSONArray ?: throw IllegalArgumentException("Missing schedule catalog")
+      scheduleImmutable((0 until rows.length()).map { index ->
+        val row = rows.opt(index) as? JSONObject ?: throw IllegalArgumentException("Invalid schedule row")
+        val owner = scheduleString(row, "sessionId").also { require(it.isNotBlank()) }
+        val status = scheduleString(row, "status").also { require(it == "active" || it == "inactive") }
+        val delivery = if (row.has("lastDelivery")) ScheduleDelivery.parse(
+          row.opt("lastDelivery") as? JSONObject ?: throw IllegalArgumentException("Invalid delivery")
+        ) else null
+        ScheduleRecord.parse(row).toRemoteSchedule(owner, status, delivery)
+      })
+    }
+  }
+
+  override suspend fun scheduleHistory(sessionId: String, id: String, before: String?, limit: Int): ScheduleHistoryPage {
+    require(sessionId.isNotBlank() && id.isNotBlank()) { "Missing schedule owner/identity" }
+    require(limit in 1..100 && (before == null || before.isNotBlank())) { "Invalid history page/cursor" }
+    val request = JSONObject().put("sessionId", sessionId).put("id", id).put("limit", limit)
+    before?.let { request.put("before", it) }
+    val value = call("schedule/history", requestArgs(request))
+    return scheduleResponse {
+      val result = value as? JSONObject ?: throw IllegalArgumentException("Missing history result")
+      require(scheduleString(result, "id") == id) { "Mismatched history identity" }
+      if (result.has("code")) {
+        requireScheduleKeys(result, setOf("id", "code"))
+        val code = scheduleString(result, "code")
+        require(code == "schedule_not_found" || code == "delivery_cursor_not_found")
+        throw ApiException(if (code == "schedule_not_found") 404 else 409,
+          if (code == "schedule_not_found") "定时任务不存在或已删除" else "送达历史游标已失效，请重新加载", code)
+      }
+      requireScheduleKeys(result, setOf("id", "records", "earlierRecordsUnavailable", "earlierRecordsPruned", "retention"), setOf("nextBefore"))
+      val records = result.opt("records") as? JSONArray ?: throw IllegalArgumentException("Invalid history records")
+      val retention = result.opt("retention") as? JSONObject ?: throw IllegalArgumentException("Invalid retention")
+      val cursor = scheduleOptionalString(result, "nextBefore").also { require(it == null || it.isNotBlank()) }
+      ScheduleHistoryPage(id, scheduleImmutable((0 until records.length()).map { index ->
+        ScheduleDelivery.parse(records.opt(index) as? JSONObject ?: throw IllegalArgumentException("Invalid receipt"))
+      }), scheduleBoolean(result, "earlierRecordsUnavailable"), scheduleBoolean(result, "earlierRecordsPruned"),
+        scheduleLong(retention.opt("days")), scheduleLong(retention.opt("records")), cursor)
+    }
+  }
+
+  override suspend fun deleteSchedule(sessionId: String, id: String): ScheduleDeleteResult {
+    require(sessionId.isNotBlank() && id.isNotBlank()) { "Missing schedule owner/identity" }
+    // Never replay a write, including after an authentication response.
+    val value = call("schedule/delete", requestArgs(JSONObject().put("sessionId", sessionId).put("id", id)), retried = true)
+    return scheduleResponse {
+      val result = value as? JSONObject ?: throw IllegalArgumentException("Missing delete result")
+      require(scheduleString(result, "id") == id) { "Mismatched delete identity" }
+      val deleted = scheduleBoolean(result, "deleted")
+      if (deleted) {
+        requireScheduleKeys(result, setOf("id", "deleted"))
+        ScheduleDeleteResult(id, true)
+      } else {
+        requireScheduleKeys(result, setOf("id", "deleted", "code"))
+        val code = scheduleString(result, "code").also { require(it == "schedule_not_found") }
+        ScheduleDeleteResult(id, false, code)
+      }
+    }
+  }
+
+  override suspend fun updateSchedule(
+    sessionId: String, id: String, expected: ScheduleRecord,
+    title: String?, prompt: String?, change: ScheduleTimingChange?
+  ): ScheduleUpdateResult {
+    require(sessionId.isNotBlank() && id.isNotBlank() && expected.id == id) { "Invalid schedule owner/CAS identity" }
+    val normalizedTitle = title?.trim()?.also { require(it.length in 1..120) { "Invalid schedule title" } }
+    val normalizedPrompt = prompt?.trim()?.also { require(it.isNotBlank()) { "Invalid schedule prompt" } }
+    val request = JSONObject().put("sessionId", sessionId).put("id", id).put("expected", expected.toJson())
+    normalizedTitle?.let { request.put("title", it) }
+    normalizedPrompt?.let { request.put("prompt", it) }
+    change?.let { request.put("change", it.toJson()) }
+    val value = call("schedule/update", requestArgs(request), retried = true)
+    return scheduleResponse {
+      val result = value as? JSONObject ?: throw IllegalArgumentException("Missing update result")
+      if (result.has("record")) {
+        requireScheduleKeys(result, setOf("id", "updated", "record"))
+        require(scheduleString(result, "id") == id) { "Mismatched update identity" }
+        val record = ScheduleRecord.parse(result.opt("record") as? JSONObject ?: throw IllegalArgumentException("Invalid record"))
+        require(record.id == id) { "Mismatched updated record" }
+        ScheduleUpdateResult(id, scheduleBoolean(result, "updated"), record)
+      } else if (result.has("id")) {
+        requireScheduleKeys(result, setOf("id", "updated", "code"))
+        require(scheduleString(result, "id") == id && !scheduleBoolean(result, "updated"))
+        val code = scheduleString(result, "code").also { require(it in setOf("schedule_not_found", "schedule_ended", "schedule_conflict")) }
+        ScheduleUpdateResult(id, false, code = code)
+      } else {
+        requireScheduleKeys(result, setOf("code", "message"))
+        val code = scheduleString(result, "code").also { require(it in setOf("invalid_prompt", "invalid_selector", "invalid_rule",
+          "invalid_time_zone", "not_future", "time_out_of_range", "frequency_too_high", "subagent_session", "internal_error")) }
+        ScheduleUpdateResult(null, false, code = code, message = scheduleString(result, "message"))
+      }
+    }
+  }
+
+  private fun requireScheduleKeys(value: JSONObject, required: Set<String>, optional: Set<String> = emptySet()) {
+    val keys = value.keys().asSequence().toSet()
+    require(keys.containsAll(required) && keys.all { it in required || it in optional }) { "Invalid schedule result fields" }
+  }
+
+  private inline fun <T> scheduleResponse(parse: () -> T): T = try { parse() } catch (_: IllegalArgumentException) {
+    throw ApiException(502, "定时任务响应格式无效，请刷新核对；不会自动重发", "schedule/response-invalid")
   }
 
   override suspend fun previewFile(directory: String, path: String, session: Session?): FilePreview? = withContext(Dispatchers.IO) {

@@ -665,6 +665,197 @@ class ControllerRegressionTest {
       assertEquals(listOf("per_1"), state.value.permissions.map { it.id })
     }
   }
+  private fun scheduleRecord() = ScheduleRecord("task", "daily", "Task", "Prompt", "2099-01-01T15:00:00.000Z", time = "23:00:00.000", timeZone = "Asia/Shanghai")
+  private fun scheduleState(profile: ServerProfile, record: ScheduleRecord = scheduleRecord()) = LagoonState(
+    profiles = listOf(profile), serverId = profile.id, connected = true, sessionId = "owner",
+    sessions = listOf(Session("owner", "/repo", "Owner", 1), Session("other", "/repo", "Other", 1)),
+    schedules = listOf(record.toRemoteSchedule("owner", "active")))
+
+  @Test fun scheduleCatalogKeepsOnlyOriginalOwnerIncludingInactiveTasks() = runBlocking {
+    MockWebServer().use { server ->
+      val record = scheduleRecord()
+      val rows = listOf(record.toRemoteSchedule("owner", "inactive"), record.copy(id = "foreign").toRemoteSchedule("other", "active"))
+      val client = object : HarnessClient by api(server) { override suspend fun scheduleCatalog(): List<RemoteSchedule> = rows }
+      val profile = ServerProfile("server", "DSH", "https://schedule.example/", kind = ServerKind.DSH)
+      val (controller, state) = controller(client, scheduleState(profile).copy(schedules = emptyList()))
+      controller.loadSchedules().join()
+      assertEquals(listOf("task"), state.value.schedules.map { it.id })
+      assertEquals("inactive", state.value.schedules.single().status)
+      assertFalse(state.value.schedulesLoading)
+    }
+  }
+
+  @Test fun oldCatalogReadCannotRestoreTaskAfterDeletionAndForcedReconciliation() = runBlocking {
+    MockWebServer().use { server ->
+      val record = scheduleRecord(); val old = record.toRemoteSchedule("owner", "active")
+      val delayed = CompletableDeferred<List<RemoteSchedule>>()
+      var reads = 0; var writes = 0
+      val client = object : HarnessClient by api(server) {
+        override suspend fun scheduleCatalog(): List<RemoteSchedule> = if (++reads == 1) delayed.await() else emptyList()
+        override suspend fun deleteSchedule(sessionId: String, id: String): ScheduleDeleteResult { writes++; return ScheduleDeleteResult(id, true) }
+      }
+      val profile = ServerProfile("server", "DSH", "https://schedule.example/", kind = ServerKind.DSH)
+      val (controller, state) = controller(client, scheduleState(profile))
+      val reading = controller.loadSchedules()
+      controller.deleteSchedule(ScheduleMutationTarget(profile, "owner", record.id, record)).join()
+      delayed.complete(listOf(old)); reading.join()
+      assertEquals(2, reads); assertEquals(1, writes); assertTrue(state.value.schedules.isEmpty())
+      assertFalse(state.value.schedulesLoading)
+    }
+  }
+
+  @Test fun scheduleUpdateNoOpAcknowledgementIsSuccessAndNeverChangesTiming() = runBlocking {
+    MockWebServer().use { server ->
+      val record = scheduleRecord(); var updates = 0
+      val client = object : HarnessClient by api(server) {
+        override suspend fun updateSchedule(sessionId: String, id: String, expected: ScheduleRecord, title: String?, prompt: String?, change: ScheduleTimingChange?): ScheduleUpdateResult {
+          updates++; assertEquals(record, expected); assertNull(change)
+          return ScheduleUpdateResult(id, false, record)
+        }
+        override suspend fun scheduleCatalog(): List<RemoteSchedule> = listOf(record.toRemoteSchedule("owner", "active"))
+      }
+      val profile = ServerProfile("server", "DSH", "https://schedule.example/", kind = ServerKind.DSH)
+      val (controller, state) = controller(client, scheduleState(profile))
+      var acknowledged = false
+      controller.updateSchedule(ScheduleMutationTarget(profile, "owner", record.id, record), null, null) { acknowledged = true }.join()
+      assertTrue(acknowledged); assertEquals(1, updates); assertEquals(record, state.value.schedules.single().record)
+      assertEquals(ResourceState.READY, state.value.resource("action:schedule-mutation").state)
+    }
+  }
+
+  @Test fun scheduleDeleteAndCatalogRefreshUseOriginalOwnerWithoutReplaying() = runBlocking {
+    MockWebServer().use { server ->
+      val record = scheduleRecord(); val calls = mutableListOf<String>()
+      val client = object : HarnessClient by api(server) {
+        override suspend fun deleteSchedule(sessionId: String, id: String): ScheduleDeleteResult {
+          calls += "delete:$sessionId:$id"; return ScheduleDeleteResult(id, true)
+        }
+        override suspend fun scheduleCatalog(): List<RemoteSchedule> { calls += "catalog"; return emptyList() }
+      }
+      val profile = ServerProfile("server", "DSH", "https://schedule.example/", kind = ServerKind.DSH)
+      val (controller, state) = controller(client, scheduleState(profile))
+      var acknowledged = false
+      controller.deleteSchedule(ScheduleMutationTarget(profile, "owner", record.id, record)) { acknowledged = true }.join()
+      assertTrue(acknowledged); assertTrue(state.value.schedules.isEmpty())
+      assertEquals(listOf("delete:owner:task", "catalog"), calls)
+    }
+  }
+
+  @Test fun scheduleUpdateConflictRetainsDraftSnapshotRefreshesButNeverOverwrites() = runBlocking {
+    MockWebServer().use { server ->
+      val record = scheduleRecord(); val newest = record.copy(prompt = "Changed elsewhere")
+      val calls = mutableListOf<String>()
+      val client = object : HarnessClient by api(server) {
+        override suspend fun updateSchedule(sessionId: String, id: String, expected: ScheduleRecord, title: String?, prompt: String?, change: ScheduleTimingChange?): ScheduleUpdateResult {
+          calls += "update"; assertEquals(record, expected); assertNull(change)
+          return ScheduleUpdateResult(id, false, code = "schedule_conflict")
+        }
+        override suspend fun scheduleCatalog(): List<RemoteSchedule> { calls += "catalog"; return listOf(newest.toRemoteSchedule("owner", "active")) }
+      }
+      val profile = ServerProfile("server", "DSH", "https://schedule.example/", kind = ServerKind.DSH)
+      val (controller, state) = controller(client, scheduleState(profile))
+      val expected = ScheduleMutationTarget(profile, "owner", record.id, record)
+      var acknowledged = false
+      controller.updateSchedule(expected, "My retained draft", null) { acknowledged = true }.join()
+      assertFalse(acknowledged); assertEquals(listOf("update", "catalog"), calls)
+      assertEquals(newest, state.value.schedules.single().record)
+      assertEquals("Prompt", expected.record.prompt)
+      assertEquals(ResourceState.ERROR, state.value.resource("action:schedule-mutation").state)
+    }
+  }
+
+  @Test fun staleScheduleOwnerRouteRecordAndInactiveUpdateNeverCallClient() = runBlocking {
+    MockWebServer().use { server ->
+      var mutations = 0
+      val client = object : HarnessClient by api(server) {
+        override suspend fun deleteSchedule(sessionId: String, id: String): ScheduleDeleteResult? { mutations++; return null }
+        override suspend fun updateSchedule(sessionId: String, id: String, expected: ScheduleRecord, title: String?, prompt: String?, change: ScheduleTimingChange?): ScheduleUpdateResult? { mutations++; return null }
+      }
+      val profile = ServerProfile("server", "DSH", "https://schedule.example/", kind = ServerKind.DSH)
+      val record = scheduleRecord(); val (controller, state) = controller(client, scheduleState(profile))
+      val target = ScheduleMutationTarget(profile, "owner", record.id, record)
+      controller.deleteSchedule(target.copy(sessionId = "other")).join()
+      controller.deleteSchedule(target.copy(profile = profile.copy(url = "https://old.example/"))).join()
+      controller.updateSchedule(target.copy(record = record.copy(scheduledAt = "changed")), "Title", null).join()
+      state.value = state.value.copy(schedules = listOf(record.toRemoteSchedule("owner", "inactive")))
+      controller.updateSchedule(target, "Title", null).join()
+      assertEquals(0, mutations)
+    }
+  }
+
+  @Test fun oldMutationAckCannotStrandNewOwnerCatalogInLoadingState() = runBlocking {
+    MockWebServer().use { server ->
+      val mutation = CompletableDeferred<ScheduleDeleteResult>()
+      val catalog = CompletableDeferred<List<RemoteSchedule>>()
+      val started = CompletableDeferred<Unit>()
+      val record = scheduleRecord()
+      val client = object : HarnessClient by api(server) {
+        override suspend fun deleteSchedule(sessionId: String, id: String): ScheduleDeleteResult = mutation.await()
+        override suspend fun scheduleCatalog(): List<RemoteSchedule> { started.complete(Unit); return catalog.await() }
+      }
+      val profile = ServerProfile("server", "DSH", "https://schedule.example/", kind = ServerKind.DSH)
+      val (controller, state) = controller(client, scheduleState(profile))
+      val deletion = controller.deleteSchedule(ScheduleMutationTarget(profile, "owner", record.id, record))
+      state.value = state.value.copy(sessionId = "other", schedules = emptyList())
+      val reading = controller.loadSchedules(); started.await()
+      mutation.complete(ScheduleDeleteResult(record.id, true)); deletion.join()
+      val other = record.copy(id = "other-task").toRemoteSchedule("other", "active")
+      catalog.complete(listOf(other)); reading.join()
+      assertEquals(listOf(other), state.value.schedules); assertFalse(state.value.schedulesLoading)
+    }
+  }
+
+  @Test fun lateScheduleDeleteCannotChangeAnotherSelectedOwnerOrFireOldCallback() = runBlocking {
+    MockWebServer().use { server ->
+      val result = CompletableDeferred<ScheduleDeleteResult>(); var mutations = 0; var reads = 0
+      val client = object : HarnessClient by api(server) {
+        override suspend fun deleteSchedule(sessionId: String, id: String): ScheduleDeleteResult { mutations++; return result.await() }
+        override suspend fun scheduleCatalog(): List<RemoteSchedule> { reads++; return emptyList() }
+      }
+      val profile = ServerProfile("server", "DSH", "https://schedule.example/", kind = ServerKind.DSH)
+      val record = scheduleRecord(); val (controller, state) = controller(client, scheduleState(profile))
+      var acknowledged = false
+      val deletion = controller.deleteSchedule(ScheduleMutationTarget(profile, "owner", record.id, record)) { acknowledged = true }
+      val other = record.copy(id = "other-task").toRemoteSchedule("other", "active")
+      state.value = state.value.copy(sessionId = "other", schedules = listOf(other))
+      result.complete(ScheduleDeleteResult(record.id, true)); deletion.join()
+      assertFalse(acknowledged); assertEquals(listOf(other), state.value.schedules)
+      assertEquals(1, mutations); assertEquals(0, reads)
+    }
+  }
+
+  @Test fun unknownScheduleWriteResultOnlyReadsCatalogAndNeverRetriesMutation() = runBlocking {
+    MockWebServer().use { server ->
+      val calls = mutableListOf<String>()
+      val client = object : HarnessClient by api(server) {
+        override suspend fun deleteSchedule(sessionId: String, id: String): ScheduleDeleteResult? { calls += "delete"; throw java.io.IOException("lost after write") }
+        override suspend fun scheduleCatalog(): List<RemoteSchedule> { calls += "catalog"; return emptyList() }
+      }
+      val profile = ServerProfile("server", "DSH", "https://schedule.example/", kind = ServerKind.DSH)
+      val record = scheduleRecord(); val (controller, state) = controller(client, scheduleState(profile))
+      controller.deleteSchedule(ScheduleMutationTarget(profile, "owner", record.id, record)).join()
+      assertEquals(listOf("delete", "catalog"), calls); assertTrue(state.value.schedules.isEmpty())
+      assertEquals(ResourceState.ERROR, state.value.resource("action:schedule-mutation").state)
+    }
+  }
+
+  @Test fun lateHistoryFromAnotherSelectedOwnerIsDiscarded() = runBlocking {
+    MockWebServer().use { server ->
+      val response = CompletableDeferred<ScheduleHistoryPage>()
+      val client = object : HarnessClient by api(server) {
+        override suspend fun scheduleHistory(sessionId: String, id: String, before: String?, limit: Int): ScheduleHistoryPage {
+          assertEquals("owner", sessionId); assertEquals("task", id); return response.await()
+        }
+      }
+      val profile = ServerProfile("server", "DSH", "https://schedule.example/", kind = ServerKind.DSH)
+      val record = scheduleRecord(); val (controller, state) = controller(client, scheduleState(profile))
+      val reading = async { runCatching { controller.scheduleHistory(ScheduleMutationTarget(profile, "owner", record.id, record)) } }
+      yield(); state.value = state.value.copy(sessionId = "other")
+      response.complete(ScheduleHistoryPage("task", emptyList(), false, false, 7, 100))
+      assertTrue(reading.await().isFailure)
+    }
+  }
+
   @Test fun lateComposerProjectionCannotResurrectGoalClearedDuringTranscriptRead() = runBlocking {
     MockWebServer().use { server ->
       val goal = RemoteGoal("g", 2, "Old", "paused", "disarmed")

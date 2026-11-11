@@ -113,6 +113,20 @@ internal class SshDshClient(
 
   override suspend fun schedules(sessionId: String): List<RemoteSchedule> = api().schedules(sessionId)
 
+  override suspend fun scheduleCatalog(): List<RemoteSchedule>? = api().scheduleCatalog()
+
+  override suspend fun scheduleHistory(
+    sessionId: String, id: String, before: String?, limit: Int
+  ): ScheduleHistoryPage? = api().scheduleHistory(sessionId, id, before, limit)
+
+  override suspend fun deleteSchedule(sessionId: String, id: String): ScheduleDeleteResult? =
+    api().deleteSchedule(sessionId, id)
+
+  override suspend fun updateSchedule(
+    sessionId: String, id: String, expected: ScheduleRecord,
+    title: String?, prompt: String?, change: ScheduleTimingChange?
+  ): ScheduleUpdateResult? = api().updateSchedule(sessionId, id, expected, title, prompt, change)
+
   override suspend fun createProviderRoute(
     route: String,
     displayName: String,

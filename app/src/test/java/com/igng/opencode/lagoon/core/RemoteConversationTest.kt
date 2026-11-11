@@ -119,7 +119,8 @@ class RemoteConversationTest {
           }
           "schedule/list" -> {
             assertEquals("s-remote", args.getJSONObject("request").getString("sessionId"))
-            host.ok(JSONArray().put(JSONObject().put("id", "sch-1").put("kind", "every").put("everySeconds", 300).put("title", "轮询")))
+            host.ok(JSONArray().put(JSONObject().put("id", "sch-1").put("kind", "every").put("everySeconds", 300).put("title", "轮询")
+              .put("prompt", "Review tasks").put("scheduledAt", "2099-01-01T00:00:00.000Z")))
           }
           "pluginManager/setBundleEnabled" -> {
             assertEquals("dsh-bundle", args.getString("name"))
@@ -154,6 +155,60 @@ class RemoteConversationTest {
         backend.close()
         session.close()
       }
+    }
+  }
+
+  @Test fun scheduleCatalogHistoryUpdateAndDeleteCarryExactOwnerOverNoise() = runBlocking {
+    FakeRemoteHost().use { host ->
+      val record = JSONObject().put("id", "schedule-noise").put("kind", "daily").put("title", "Review")
+        .put("prompt", "Review tasks").put("scheduledAt", "2099-01-01T15:00:00.000Z")
+        .put("time", "23:00:00.000").put("timeZone", "Asia/Calcutta")
+      var updates = 0; var deletes = 0
+      host.call = { endpoint, payload ->
+        val args = payload.getJSONObject("args")
+        when (endpoint) {
+          "schedule/catalog" -> {
+            assertEquals(0, args.length())
+            host.ok(JSONArray().put(JSONObject(record.toString()).put("sessionId", "original-owner").put("status", "active")))
+          }
+          "schedule/history" -> {
+            val request = args.getJSONObject("request")
+            assertEquals("original-owner", request.getString("sessionId")); assertEquals(20, request.getInt("limit"))
+            host.ok(JSONObject().put("id", "schedule-noise").put("records", JSONArray())
+              .put("earlierRecordsUnavailable", true).put("earlierRecordsPruned", false)
+              .put("retention", JSONObject().put("days", 7).put("records", 100)))
+          }
+          "schedule/update" -> {
+            updates++
+            val request = args.getJSONObject("request")
+            assertEquals(setOf("sessionId", "id", "expected", "title"), request.keys().asSequence().toSet())
+            assertEquals("original-owner", request.getString("sessionId"))
+            assertEquals("Asia/Calcutta", request.getJSONObject("expected").getString("timeZone"))
+            assertEquals("2099-01-01T15:00:00.000Z", request.getJSONObject("expected").getString("scheduledAt"))
+            host.ok(JSONObject().put("id", "schedule-noise").put("updated", true)
+              .put("record", JSONObject(record.toString()).put("title", request.getString("title"))))
+          }
+          "schedule/delete" -> {
+            deletes++
+            assertEquals("original-owner", args.getJSONObject("request").getString("sessionId"))
+            host.ok(JSONObject().put("id", "schedule-noise").put("deleted", true))
+          }
+          "schedule/create", "schedule/run" -> throw AssertionError("Unavailable schedule method must not be called")
+          else -> host.ok(JSONObject())
+        }
+      }
+      host.start(); val (session, backend) = backend(host)
+      try {
+        val catalog = withTimeout(15_000) { backend.client.scheduleCatalog() }!!
+        val task = catalog.single(); assertEquals("original-owner", task.sessionId)
+        val history = withTimeout(15_000) { backend.client.scheduleHistory(task.sessionId!!, task.id) }!!
+        assertTrue(history.earlierRecordsUnavailable); assertTrue(history.records.isEmpty())
+        val result = withTimeout(15_000) { backend.client.updateSchedule(task.sessionId!!, task.id, task.record!!, title = "Updated") }!!
+        assertTrue(result.updated); assertEquals("Asia/Calcutta", result.record?.timeZone)
+        assertTrue(withTimeout(15_000) { backend.client.deleteSchedule(task.sessionId!!, task.id) }!!.deleted)
+        assertEquals(1, updates); assertEquals(1, deletes)
+        assertTrue(host.contractViolations.isEmpty())
+      } finally { backend.close(); session.close() }
     }
   }
 

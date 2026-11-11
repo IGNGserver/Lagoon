@@ -911,14 +911,96 @@ class LagoonController private constructor(private val appContext: Context) {
     op.commit { current -> current.copy(goal = reconcileGoalRead(current.goal, op.snapshot.goal, fetched)) }
   }
 
-  fun loadSchedules() = withSession("schedules") { op, client, session ->
-    if (op.isCurrent(this)) op.commit { it.copy(schedulesLoading = true) }
+  private var scheduleSequence = 0L
+
+  /** Catalog retains inactive tasks and authoritative owners; a legacy list is display-only. */
+  fun loadSchedules() = withSession("schedules") { op, _, session ->
+    check(op.snapshot.canManageSchedules()) { "请先连接并同步此 DSH 会话" }
+    readScheduleCatalog(op, session.id)
+  }
+
+  private suspend fun readScheduleCatalog(op: OperationContext, owner: String) {
+    val sequence = ++scheduleSequence
+    op.commit { it.copy(schedulesLoading = true, resources = it.resources + ("action:schedules" to ResourceStatus(ResourceState.LOADING))) }
     try {
-      val schedules = client.schedules(session.id)
-      if (op.isCurrent(this)) op.commit { it.copy(schedules = schedules, schedulesLoading = false) }
+      val catalog = op.client.scheduleCatalog()
+      val schedules = catalog?.filter { it.sessionId == owner } ?: op.client.schedules(owner)
+      if (sequence == scheduleSequence) op.commit { it.copy(schedules = schedules, schedulesLoading = false,
+        resources = it.resources + ("action:schedules" to ResourceStatus(ResourceState.READY))) }
+    } catch (error: Exception) {
+      if (error is CancellationException) {
+        if (sequence == scheduleSequence) op.commit { it.copy(schedulesLoading = false) }
+        throw error
+      }
+      if (sequence == scheduleSequence) op.commit { it.copy(schedulesLoading = false,
+        resources = it.resources + ("action:schedules" to ResourceStatus(ResourceState.ERROR, userFacingError(error)))) }
+      throw error
+    }
+  }
+
+  private suspend fun reconcileSchedulesAfterMutation(op: OperationContext, owner: String) {
+    if (!op.isCurrent(this)) return
+    try { readScheduleCatalog(op, owner) }
+    catch (cancel: CancellationException) { throw cancel }
+    catch (_: Exception) { /* Catalog error is visible separately; never reissue the mutation. */ }
+  }
+
+  internal suspend fun scheduleHistory(expected: ScheduleMutationTarget, before: String? = null): ScheduleHistoryPage {
+    val op = beginOperation()
+    check(op.snapshot.canManageSchedules() && expected.routeMatches(op.snapshot)) { "连接或原会话已变化，请重新打开投递历史" }
+    val page = op.client.scheduleHistory(expected.sessionId, expected.scheduleId, before, 20)
+      ?: throw ApiException(501, "此 Host 未提供投递历史")
+    check(op.isCurrent(this) && expected.routeMatches(state.value)) { "连接或原会话已变化，已丢弃旧历史结果" }
+    check(page.id == expected.scheduleId) { "Host 返回的任务身份不匹配" }
+    return page
+  }
+
+  internal fun deleteSchedule(expected: ScheduleMutationTarget, onDeleted: (() -> Unit)? = null) =
+    withSession("schedule-mutation") { op, client, _ ->
+      check(op.snapshot.canManageSchedules() && expected.matches(op.snapshot)) { "任务、连接或原会话已变化，请刷新后重新确认删除" }
+      ++scheduleSequence // An older catalog must not restore a task after acknowledged deletion.
+      try {
+        val result = client.deleteSchedule(expected.sessionId, expected.scheduleId)
+          ?: throw ApiException(501, "此 Host 未提供调度删除")
+        check(result.id == expected.scheduleId) { "Host 返回的任务身份不匹配，请刷新核对；不会自动重发" }
+        if (!result.deleted) {
+          throw ApiException(409, "任务已不存在，请刷新目录", result.code ?: "schedule_not_found")
+        }
+        if (op.isCurrent(this)) ++scheduleSequence
+        op.commit { it.copy(schedules = it.schedules.filterNot { task -> task.id == expected.scheduleId && task.sessionId == expected.sessionId },
+          schedulesLoading = false, message = "定时任务及保存的投递历史已删除；已排队消息不受影响") }
+        if (op.isCurrent(this)) { onDeleted?.invoke(); reconcileSchedulesAfterMutation(op, expected.sessionId) }
+      } catch (error: Exception) {
+        if (error is CancellationException) throw error
+        reconcileSchedulesAfterMutation(op, expected.sessionId) // Read-only reconciliation, not a second delete.
+        throw error
+      }
+    }
+
+  internal fun updateSchedule(expected: ScheduleMutationTarget, title: String?, prompt: String?,
+    change: ScheduleTimingChange? = null, onUpdated: (() -> Unit)? = null) = withSession("schedule-mutation") { op, client, _ ->
+    check(expected.canEdit(op.snapshot)) { "任务或连接已变化，或任务已经结束；请刷新后重新确认" }
+    ++scheduleSequence
+    try {
+      val result = client.updateSchedule(expected.sessionId, expected.scheduleId, expected.record, title, prompt, change)
+        ?: throw ApiException(501, "此 Host 未提供调度更新")
+      check(result.id == null || result.id == expected.scheduleId) { "Host 返回的任务身份不匹配，请刷新核对；不会自动重发" }
+      val record = result.record ?: throw ApiException(409, result.message ?: when (result.code) {
+        "schedule_conflict" -> "任务已被编辑或时间已推进，请刷新记录后重新确认；草稿保留"
+        "schedule_ended" -> "任务已结束，不能再编辑"
+        "schedule_not_found" -> "任务已不存在"
+        else -> "Host 未确认调度修改，请检查输入与权限"
+      }, result.code)
+      check(record.id == expected.scheduleId) { "Host 返回的任务记录身份不匹配" }
+      if (op.isCurrent(this)) ++scheduleSequence
+      op.commit { current -> current.copy(schedules = current.schedules.map { task ->
+        if (task.id == expected.scheduleId && task.sessionId == expected.sessionId && task.record == expected.record)
+          record.toRemoteSchedule(task.sessionId, task.status, task.lastDelivery) else task
+      }, schedulesLoading = false, message = if (result.updated) "定时任务已更新" else "任务内容未变更") }
+      if (op.isCurrent(this)) { onUpdated?.invoke(); reconcileSchedulesAfterMutation(op, expected.sessionId) }
     } catch (error: Exception) {
       if (error is CancellationException) throw error
-      if (op.isCurrent(this)) op.commit { it.copy(schedulesLoading = false) }
+      reconcileSchedulesAfterMutation(op, expected.sessionId) // CAS conflicts/unknown results never replay writes.
       throw error
     }
   }
@@ -4635,7 +4717,7 @@ class LagoonController private constructor(private val appContext: Context) {
   }
   /** Actions that render their own inline `HyperInlineNotice` / `ResourceHint` inside their container, so they must not also fire a duplicate global error toast. */
   private fun isInlineScopedAction(action: String): Boolean =
-    action in setOf("send", "create", "delete", "rename", "schedules", "goal", "child-prompt", "queue")
+    action in setOf("send", "create", "delete", "rename", "schedules", "schedule-mutation", "goal", "child-prompt", "queue")
 
   private fun act(action: String = "", directory: String? = null, surfaceError: Boolean = !isInlineScopedAction(action),
     onError: (suspend (Throwable) -> Unit)? = null, block: suspend (OperationContext) -> Unit): Job {

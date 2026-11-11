@@ -1262,22 +1262,7 @@ private fun RemoveBadge(modifier: Modifier, onRemove: () -> Unit) {
 
 @Composable
 private fun SchedulesPanel(state: LagoonState, controller: LagoonController) {
-  if (state.schedulesLoading) { Text("正在读取定时任务…", style = MiuixTheme.textStyles.footnote2); return }
-  if (state.schedules.isEmpty()) {
-    Text("此会话没有定时任务。可让 Agent 创建定时任务。",
-      style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
-    HyperTextAction(text = "刷新", onClick = { controller.loadSchedules() })
-    return
-  }
-  LazyColumn(Modifier.fillMaxWidth()) {
-    val scheduleKeys = uniqueListKeys(state.schedules) { it.id }
-    itemsIndexed(state.schedules, key = { index, _ -> scheduleKeys[index] }) { _, schedule ->
-      HyperActionRow(title = schedule.title, summary = "${schedule.detail} · ${schedule.scheduledAt}",
-        onClick = { controller.loadSchedules() })
-      Text(schedule.prompt, style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary), maxLines = 2, overflow = TextOverflow.Ellipsis,
-        modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp))
-    }
-  }
+  ScheduleManagementPanel(state, controller)
 }
 
 @Composable

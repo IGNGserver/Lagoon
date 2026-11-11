@@ -1,0 +1,1404 @@
+{
+  "version": 1,
+  "upstream": {
+    "repository": "https://github.com/deepseek-ai/deepseek-harness",
+    "tag": "dsh-v0.2.1-rc.5",
+    "commit": "b830ec950faba0a46dda564be3e2d854afed94f1",
+    "version": "0.2.1-rc.5"
+  },
+  "sources": [
+    {
+      "package": "@deepseek-ai/dsh-schedule",
+      "version": "0.2.1-rc.5",
+      "generatedFile": "lib/typert.host.js",
+      "sha256": "d41bfc4d30142f90516e2d2e5338caed1ae75fccbd5e84d869f45f7cd4d2c129"
+    }
+  ],
+  "methods": {
+    "schedule/catalog": {
+      "sourcePackage": "@deepseek-ai/dsh-schedule",
+      "sourceLocation": {
+        "file": "packages/schedule/schedule/src/index.ts",
+        "line": 285,
+        "column": 9
+      },
+      "args": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "result": {
+        "type": "array",
+        "items": {
+          "oneOf": [
+            {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "description": "Globally unique task identity."
+                },
+                "kind": {
+                  "type": "string",
+                  "const": "after",
+                  "description": "Rule discriminator for a delayed one-shot reminder."
+                },
+                "title": {
+                  "type": "string",
+                  "description": "Required stored task name; already trimmed, non-empty, and at most 120 characters."
+                },
+                "prompt": {
+                  "type": "string",
+                  "description": "Trimmed reminder content supplied at creation."
+                },
+                "afterSeconds": {
+                  "type": "number",
+                  "description": "Positive safe-integer delay accepted at creation."
+                },
+                "scheduledAt": {
+                  "type": "string",
+                  "description": "Four-digit-year RFC 3339 UTC target."
+                },
+                "sessionId": {
+                  "type": "string",
+                  "description": "Session receiving this reminder when it becomes due."
+                },
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "active",
+                    "inactive"
+                  ],
+                  "description": "Inactive reminders remain visible but never schedule another delivery."
+                },
+                "lastDelivery": {
+                  "type": "object",
+                  "properties": {
+                    "scheduledAt": {
+                      "type": "string",
+                      "description": "Canonical UTC target of the delivered occurrence."
+                    },
+                    "deliveredAt": {
+                      "type": "string",
+                      "description": "Canonical UTC time sampled after Session persistence acknowledged delivery."
+                    },
+                    "messageId": {
+                      "type": "string",
+                      "description": "Identity of the delivered message, shared by tasks in one recurring batch."
+                    }
+                  },
+                  "required": [
+                    "scheduledAt",
+                    "deliveredAt",
+                    "messageId"
+                  ],
+                  "additionalProperties": true,
+                  "description": "Most recent durably acknowledged inbox delivery, when available."
+                }
+              },
+              "required": [
+                "id",
+                "kind",
+                "title",
+                "prompt",
+                "afterSeconds",
+                "scheduledAt",
+                "sessionId",
+                "status"
+              ],
+              "additionalProperties": true
+            },
+            {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "description": "Globally unique task identity."
+                },
+                "kind": {
+                  "type": "string",
+                  "const": "at",
+                  "description": "Rule discriminator for an absolute one-shot reminder."
+                },
+                "title": {
+                  "type": "string",
+                  "description": "Required stored task name; already trimmed, non-empty, and at most 120 characters."
+                },
+                "prompt": {
+                  "type": "string",
+                  "description": "Trimmed reminder content supplied at creation."
+                },
+                "scheduledAt": {
+                  "type": "string",
+                  "description": "Four-digit-year RFC 3339 UTC target."
+                },
+                "sessionId": {
+                  "type": "string",
+                  "description": "Session receiving this reminder when it becomes due."
+                },
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "active",
+                    "inactive"
+                  ],
+                  "description": "Inactive reminders remain visible but never schedule another delivery."
+                },
+                "lastDelivery": {
+                  "type": "object",
+                  "properties": {
+                    "scheduledAt": {
+                      "type": "string",
+                      "description": "Canonical UTC target of the delivered occurrence."
+                    },
+                    "deliveredAt": {
+                      "type": "string",
+                      "description": "Canonical UTC time sampled after Session persistence acknowledged delivery."
+                    },
+                    "messageId": {
+                      "type": "string",
+                      "description": "Identity of the delivered message, shared by tasks in one recurring batch."
+                    }
+                  },
+                  "required": [
+                    "scheduledAt",
+                    "deliveredAt",
+                    "messageId"
+                  ],
+                  "additionalProperties": true,
+                  "description": "Most recent durably acknowledged inbox delivery, when available."
+                }
+              },
+              "required": [
+                "id",
+                "kind",
+                "title",
+                "prompt",
+                "scheduledAt",
+                "sessionId",
+                "status"
+              ],
+              "additionalProperties": true
+            },
+            {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "description": "Globally unique task identity."
+                },
+                "kind": {
+                  "type": "string",
+                  "const": "every",
+                  "description": "Rule discriminator for a fixed-rate recurring reminder."
+                },
+                "title": {
+                  "type": "string",
+                  "description": "Required stored task name; already trimmed, non-empty, and at most 120 characters."
+                },
+                "prompt": {
+                  "type": "string",
+                  "description": "Trimmed reminder content supplied at creation."
+                },
+                "everySeconds": {
+                  "type": "number",
+                  "description": "Fixed safe-integer interval, never below one minute."
+                },
+                "scheduledAt": {
+                  "type": "string",
+                  "description": "Next anchor-aligned occurrence while active, or final occurrence when inactive."
+                },
+                "sessionId": {
+                  "type": "string",
+                  "description": "Session receiving this reminder when it becomes due."
+                },
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "active",
+                    "inactive"
+                  ],
+                  "description": "Inactive reminders remain visible but never schedule another delivery."
+                },
+                "lastDelivery": {
+                  "type": "object",
+                  "properties": {
+                    "scheduledAt": {
+                      "type": "string",
+                      "description": "Canonical UTC target of the delivered occurrence."
+                    },
+                    "deliveredAt": {
+                      "type": "string",
+                      "description": "Canonical UTC time sampled after Session persistence acknowledged delivery."
+                    },
+                    "messageId": {
+                      "type": "string",
+                      "description": "Identity of the delivered message, shared by tasks in one recurring batch."
+                    }
+                  },
+                  "required": [
+                    "scheduledAt",
+                    "deliveredAt",
+                    "messageId"
+                  ],
+                  "additionalProperties": true,
+                  "description": "Most recent durably acknowledged inbox delivery, when available."
+                }
+              },
+              "required": [
+                "id",
+                "kind",
+                "title",
+                "prompt",
+                "everySeconds",
+                "scheduledAt",
+                "sessionId",
+                "status"
+              ],
+              "additionalProperties": true
+            },
+            {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "description": "Globally unique task identity."
+                },
+                "kind": {
+                  "type": "string",
+                  "const": "daily",
+                  "description": "Rule discriminator for a daily wall-clock reminder."
+                },
+                "title": {
+                  "type": "string",
+                  "description": "Required stored task name; already trimmed, non-empty, and at most 120 characters."
+                },
+                "prompt": {
+                  "type": "string",
+                  "description": "Trimmed reminder content supplied at creation."
+                },
+                "time": {
+                  "type": "string",
+                  "description": "Local time normalized to HH:mm:ss.SSS."
+                },
+                "timeZone": {
+                  "type": "string",
+                  "description": "Explicit IANA zone; equivalent timing edits retain the stored spelling."
+                },
+                "scheduledAt": {
+                  "type": "string",
+                  "description": "Committed next UTC instant while active, or final occurrence when inactive."
+                },
+                "sessionId": {
+                  "type": "string",
+                  "description": "Session receiving this reminder when it becomes due."
+                },
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "active",
+                    "inactive"
+                  ],
+                  "description": "Inactive reminders remain visible but never schedule another delivery."
+                },
+                "lastDelivery": {
+                  "type": "object",
+                  "properties": {
+                    "scheduledAt": {
+                      "type": "string",
+                      "description": "Canonical UTC target of the delivered occurrence."
+                    },
+                    "deliveredAt": {
+                      "type": "string",
+                      "description": "Canonical UTC time sampled after Session persistence acknowledged delivery."
+                    },
+                    "messageId": {
+                      "type": "string",
+                      "description": "Identity of the delivered message, shared by tasks in one recurring batch."
+                    }
+                  },
+                  "required": [
+                    "scheduledAt",
+                    "deliveredAt",
+                    "messageId"
+                  ],
+                  "additionalProperties": true,
+                  "description": "Most recent durably acknowledged inbox delivery, when available."
+                }
+              },
+              "required": [
+                "id",
+                "kind",
+                "title",
+                "prompt",
+                "time",
+                "timeZone",
+                "scheduledAt",
+                "sessionId",
+                "status"
+              ],
+              "additionalProperties": true
+            },
+            {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "description": "Globally unique task identity."
+                },
+                "kind": {
+                  "type": "string",
+                  "const": "weekly",
+                  "description": "Rule discriminator for a weekly wall-clock reminder."
+                },
+                "title": {
+                  "type": "string",
+                  "description": "Required stored task name; already trimmed, non-empty, and at most 120 characters."
+                },
+                "prompt": {
+                  "type": "string",
+                  "description": "Trimmed reminder content supplied at creation."
+                },
+                "time": {
+                  "type": "string",
+                  "description": "Local time normalized to HH:mm:ss.SSS."
+                },
+                "timeZone": {
+                  "type": "string",
+                  "description": "Explicit canonical IANA zone; equivalent timing edits retain the stored spelling."
+                },
+                "weekdays": {
+                  "type": "array",
+                  "items": {
+                    "type": "number"
+                  },
+                  "description": "Unique ascending ISO weekdays, Monday 1 through Sunday 7."
+                },
+                "scheduledAt": {
+                  "type": "string",
+                  "description": "Committed next UTC instant while active, or final occurrence when inactive."
+                },
+                "sessionId": {
+                  "type": "string",
+                  "description": "Session receiving this reminder when it becomes due."
+                },
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "active",
+                    "inactive"
+                  ],
+                  "description": "Inactive reminders remain visible but never schedule another delivery."
+                },
+                "lastDelivery": {
+                  "type": "object",
+                  "properties": {
+                    "scheduledAt": {
+                      "type": "string",
+                      "description": "Canonical UTC target of the delivered occurrence."
+                    },
+                    "deliveredAt": {
+                      "type": "string",
+                      "description": "Canonical UTC time sampled after Session persistence acknowledged delivery."
+                    },
+                    "messageId": {
+                      "type": "string",
+                      "description": "Identity of the delivered message, shared by tasks in one recurring batch."
+                    }
+                  },
+                  "required": [
+                    "scheduledAt",
+                    "deliveredAt",
+                    "messageId"
+                  ],
+                  "additionalProperties": true,
+                  "description": "Most recent durably acknowledged inbox delivery, when available."
+                }
+              },
+              "required": [
+                "id",
+                "kind",
+                "title",
+                "prompt",
+                "time",
+                "timeZone",
+                "weekdays",
+                "scheduledAt",
+                "sessionId",
+                "status"
+              ],
+              "additionalProperties": true
+            },
+            {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "description": "Globally unique task identity."
+                },
+                "kind": {
+                  "type": "string",
+                  "const": "cron",
+                  "description": "Rule discriminator for a five-field cron wall-clock reminder."
+                },
+                "title": {
+                  "type": "string",
+                  "description": "Required stored task name; already trimmed, non-empty, and at most 120 characters."
+                },
+                "prompt": {
+                  "type": "string",
+                  "description": "Trimmed reminder content supplied at creation."
+                },
+                "expression": {
+                  "type": "string",
+                  "description": "Canonical five-field cron expression: minute hour day-of-month month day-of-week."
+                },
+                "timeZone": {
+                  "type": "string",
+                  "description": "Explicit IANA zone; equivalent timing edits retain the stored spelling."
+                },
+                "scheduledAt": {
+                  "type": "string",
+                  "description": "Committed next UTC instant while active, or final occurrence when inactive."
+                },
+                "sessionId": {
+                  "type": "string",
+                  "description": "Session receiving this reminder when it becomes due."
+                },
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "active",
+                    "inactive"
+                  ],
+                  "description": "Inactive reminders remain visible but never schedule another delivery."
+                },
+                "lastDelivery": {
+                  "type": "object",
+                  "properties": {
+                    "scheduledAt": {
+                      "type": "string",
+                      "description": "Canonical UTC target of the delivered occurrence."
+                    },
+                    "deliveredAt": {
+                      "type": "string",
+                      "description": "Canonical UTC time sampled after Session persistence acknowledged delivery."
+                    },
+                    "messageId": {
+                      "type": "string",
+                      "description": "Identity of the delivered message, shared by tasks in one recurring batch."
+                    }
+                  },
+                  "required": [
+                    "scheduledAt",
+                    "deliveredAt",
+                    "messageId"
+                  ],
+                  "additionalProperties": true,
+                  "description": "Most recent durably acknowledged inbox delivery, when available."
+                }
+              },
+              "required": [
+                "id",
+                "kind",
+                "title",
+                "prompt",
+                "expression",
+                "timeZone",
+                "scheduledAt",
+                "sessionId",
+                "status"
+              ],
+              "additionalProperties": true
+            }
+          ]
+        }
+      }
+    },
+    "schedule/list": {
+      "sourcePackage": "@deepseek-ai/dsh-schedule",
+      "sourceLocation": {
+        "file": "packages/schedule/schedule/src/index.ts",
+        "line": 271,
+        "column": 9
+      },
+      "args": {
+        "type": "object",
+        "properties": {
+          "request": {
+            "type": "object",
+            "properties": {
+              "sessionId": {
+                "type": "string",
+                "description": "Original Session binding."
+              }
+            },
+            "required": [
+              "sessionId"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "request"
+        ],
+        "additionalProperties": false
+      },
+      "result": {
+        "type": "array",
+        "items": {
+          "oneOf": [
+            {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "description": "Globally unique task identity."
+                },
+                "kind": {
+                  "type": "string",
+                  "const": "after",
+                  "description": "Rule discriminator for a delayed one-shot reminder."
+                },
+                "title": {
+                  "type": "string",
+                  "description": "Required stored task name; already trimmed, non-empty, and at most 120 characters."
+                },
+                "prompt": {
+                  "type": "string",
+                  "description": "Trimmed reminder content supplied at creation."
+                },
+                "afterSeconds": {
+                  "type": "number",
+                  "description": "Positive safe-integer delay accepted at creation."
+                },
+                "scheduledAt": {
+                  "type": "string",
+                  "description": "Four-digit-year RFC 3339 UTC target."
+                }
+              },
+              "required": [
+                "id",
+                "kind",
+                "title",
+                "prompt",
+                "afterSeconds",
+                "scheduledAt"
+              ],
+              "additionalProperties": true
+            },
+            {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "description": "Globally unique task identity."
+                },
+                "kind": {
+                  "type": "string",
+                  "const": "at",
+                  "description": "Rule discriminator for an absolute one-shot reminder."
+                },
+                "title": {
+                  "type": "string",
+                  "description": "Required stored task name; already trimmed, non-empty, and at most 120 characters."
+                },
+                "prompt": {
+                  "type": "string",
+                  "description": "Trimmed reminder content supplied at creation."
+                },
+                "scheduledAt": {
+                  "type": "string",
+                  "description": "Four-digit-year RFC 3339 UTC target."
+                }
+              },
+              "required": [
+                "id",
+                "kind",
+                "title",
+                "prompt",
+                "scheduledAt"
+              ],
+              "additionalProperties": true
+            },
+            {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "description": "Globally unique task identity."
+                },
+                "kind": {
+                  "type": "string",
+                  "const": "every",
+                  "description": "Rule discriminator for a fixed-rate recurring reminder."
+                },
+                "title": {
+                  "type": "string",
+                  "description": "Required stored task name; already trimmed, non-empty, and at most 120 characters."
+                },
+                "prompt": {
+                  "type": "string",
+                  "description": "Trimmed reminder content supplied at creation."
+                },
+                "everySeconds": {
+                  "type": "number",
+                  "description": "Fixed safe-integer interval, never below one minute."
+                },
+                "scheduledAt": {
+                  "type": "string",
+                  "description": "Next anchor-aligned occurrence while active, or final occurrence when inactive."
+                }
+              },
+              "required": [
+                "id",
+                "kind",
+                "title",
+                "prompt",
+                "everySeconds",
+                "scheduledAt"
+              ],
+              "additionalProperties": true
+            },
+            {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "description": "Globally unique task identity."
+                },
+                "kind": {
+                  "type": "string",
+                  "const": "daily",
+                  "description": "Rule discriminator for a daily wall-clock reminder."
+                },
+                "title": {
+                  "type": "string",
+                  "description": "Required stored task name; already trimmed, non-empty, and at most 120 characters."
+                },
+                "prompt": {
+                  "type": "string",
+                  "description": "Trimmed reminder content supplied at creation."
+                },
+                "time": {
+                  "type": "string",
+                  "description": "Local time normalized to HH:mm:ss.SSS."
+                },
+                "timeZone": {
+                  "type": "string",
+                  "description": "Explicit IANA zone; equivalent timing edits retain the stored spelling."
+                },
+                "scheduledAt": {
+                  "type": "string",
+                  "description": "Committed next UTC instant while active, or final occurrence when inactive."
+                }
+              },
+              "required": [
+                "id",
+                "kind",
+                "title",
+                "prompt",
+                "time",
+                "timeZone",
+                "scheduledAt"
+              ],
+              "additionalProperties": true
+            },
+            {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "description": "Globally unique task identity."
+                },
+                "kind": {
+                  "type": "string",
+                  "const": "weekly",
+                  "description": "Rule discriminator for a weekly wall-clock reminder."
+                },
+                "title": {
+                  "type": "string",
+                  "description": "Required stored task name; already trimmed, non-empty, and at most 120 characters."
+                },
+                "prompt": {
+                  "type": "string",
+                  "description": "Trimmed reminder content supplied at creation."
+                },
+                "time": {
+                  "type": "string",
+                  "description": "Local time normalized to HH:mm:ss.SSS."
+                },
+                "timeZone": {
+                  "type": "string",
+                  "description": "Explicit canonical IANA zone; equivalent timing edits retain the stored spelling."
+                },
+                "weekdays": {
+                  "type": "array",
+                  "items": {
+                    "type": "number"
+                  },
+                  "description": "Unique ascending ISO weekdays, Monday 1 through Sunday 7."
+                },
+                "scheduledAt": {
+                  "type": "string",
+                  "description": "Committed next UTC instant while active, or final occurrence when inactive."
+                }
+              },
+              "required": [
+                "id",
+                "kind",
+                "title",
+                "prompt",
+                "time",
+                "timeZone",
+                "weekdays",
+                "scheduledAt"
+              ],
+              "additionalProperties": true
+            },
+            {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "description": "Globally unique task identity."
+                },
+                "kind": {
+                  "type": "string",
+                  "const": "cron",
+                  "description": "Rule discriminator for a five-field cron wall-clock reminder."
+                },
+                "title": {
+                  "type": "string",
+                  "description": "Required stored task name; already trimmed, non-empty, and at most 120 characters."
+                },
+                "prompt": {
+                  "type": "string",
+                  "description": "Trimmed reminder content supplied at creation."
+                },
+                "expression": {
+                  "type": "string",
+                  "description": "Canonical five-field cron expression: minute hour day-of-month month day-of-week."
+                },
+                "timeZone": {
+                  "type": "string",
+                  "description": "Explicit IANA zone; equivalent timing edits retain the stored spelling."
+                },
+                "scheduledAt": {
+                  "type": "string",
+                  "description": "Committed next UTC instant while active, or final occurrence when inactive."
+                }
+              },
+              "required": [
+                "id",
+                "kind",
+                "title",
+                "prompt",
+                "expression",
+                "timeZone",
+                "scheduledAt"
+              ],
+              "additionalProperties": true
+            }
+          ]
+        }
+      }
+    },
+    "schedule/history": {
+      "sourcePackage": "@deepseek-ai/dsh-schedule",
+      "sourceLocation": {
+        "file": "packages/schedule/schedule/src/index.ts",
+        "line": 303,
+        "column": 9
+      },
+      "args": {
+        "type": "object",
+        "properties": {
+          "request": {
+            "type": "object",
+            "properties": {
+              "limit": {
+                "type": "number",
+                "description": "Required safe-integer page size from 1 through 100."
+              },
+              "before": {
+                "type": "string",
+                "description": "Message identity of the oldest entry in the previous page; excluded from this page."
+              },
+              "id": {
+                "type": "string",
+                "description": "Task to remove."
+              },
+              "sessionId": {
+                "type": "string",
+                "description": "Original Session binding."
+              }
+            },
+            "required": [
+              "limit",
+              "id",
+              "sessionId"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "request"
+        ],
+        "additionalProperties": false
+      },
+      "resultSchemaError": "typert tool schema: selected union branches overlap or have no required discriminator"
+    },
+    "schedule/delete": {
+      "sourcePackage": "@deepseek-ai/dsh-schedule",
+      "sourceLocation": {
+        "file": "packages/schedule/schedule/src/index.ts",
+        "line": 326,
+        "column": 9
+      },
+      "args": {
+        "type": "object",
+        "properties": {
+          "request": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "Task to remove."
+              },
+              "sessionId": {
+                "type": "string",
+                "description": "Original Session binding."
+              }
+            },
+            "required": [
+              "id",
+              "sessionId"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "request"
+        ],
+        "additionalProperties": false
+      },
+      "result": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "deleted": {
+                "type": "boolean",
+                "const": true
+              }
+            },
+            "required": [
+              "id",
+              "deleted"
+            ],
+            "additionalProperties": true
+          },
+          {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "deleted": {
+                "type": "boolean",
+                "const": false
+              },
+              "code": {
+                "type": "string",
+                "const": "schedule_not_found"
+              }
+            },
+            "required": [
+              "id",
+              "deleted",
+              "code"
+            ],
+            "additionalProperties": true
+          }
+        ]
+      }
+    },
+    "schedule/update": {
+      "sourcePackage": "@deepseek-ai/dsh-schedule",
+      "sourceLocation": {
+        "file": "packages/schedule/schedule/src/index.ts",
+        "line": 356,
+        "column": 9
+      },
+      "args": {
+        "type": "object",
+        "properties": {
+          "request": {
+            "type": "object",
+            "properties": {
+              "expected": {
+                "oneOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "id": {
+                        "type": "string",
+                        "description": "Globally unique task identity."
+                      },
+                      "kind": {
+                        "type": "string",
+                        "const": "after",
+                        "description": "Rule discriminator for a delayed one-shot reminder."
+                      },
+                      "title": {
+                        "type": "string",
+                        "description": "Required stored task name; already trimmed, non-empty, and at most 120 characters."
+                      },
+                      "prompt": {
+                        "type": "string",
+                        "description": "Trimmed reminder content supplied at creation."
+                      },
+                      "afterSeconds": {
+                        "type": "number",
+                        "description": "Positive safe-integer delay accepted at creation."
+                      },
+                      "scheduledAt": {
+                        "type": "string",
+                        "description": "Four-digit-year RFC 3339 UTC target."
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "kind",
+                      "title",
+                      "prompt",
+                      "afterSeconds",
+                      "scheduledAt"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "id": {
+                        "type": "string",
+                        "description": "Globally unique task identity."
+                      },
+                      "kind": {
+                        "type": "string",
+                        "const": "at",
+                        "description": "Rule discriminator for an absolute one-shot reminder."
+                      },
+                      "title": {
+                        "type": "string",
+                        "description": "Required stored task name; already trimmed, non-empty, and at most 120 characters."
+                      },
+                      "prompt": {
+                        "type": "string",
+                        "description": "Trimmed reminder content supplied at creation."
+                      },
+                      "scheduledAt": {
+                        "type": "string",
+                        "description": "Four-digit-year RFC 3339 UTC target."
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "kind",
+                      "title",
+                      "prompt",
+                      "scheduledAt"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "id": {
+                        "type": "string",
+                        "description": "Globally unique task identity."
+                      },
+                      "kind": {
+                        "type": "string",
+                        "const": "every",
+                        "description": "Rule discriminator for a fixed-rate recurring reminder."
+                      },
+                      "title": {
+                        "type": "string",
+                        "description": "Required stored task name; already trimmed, non-empty, and at most 120 characters."
+                      },
+                      "prompt": {
+                        "type": "string",
+                        "description": "Trimmed reminder content supplied at creation."
+                      },
+                      "everySeconds": {
+                        "type": "number",
+                        "description": "Fixed safe-integer interval, never below one minute."
+                      },
+                      "scheduledAt": {
+                        "type": "string",
+                        "description": "Next anchor-aligned occurrence while active, or final occurrence when inactive."
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "kind",
+                      "title",
+                      "prompt",
+                      "everySeconds",
+                      "scheduledAt"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "id": {
+                        "type": "string",
+                        "description": "Globally unique task identity."
+                      },
+                      "kind": {
+                        "type": "string",
+                        "const": "daily",
+                        "description": "Rule discriminator for a daily wall-clock reminder."
+                      },
+                      "title": {
+                        "type": "string",
+                        "description": "Required stored task name; already trimmed, non-empty, and at most 120 characters."
+                      },
+                      "prompt": {
+                        "type": "string",
+                        "description": "Trimmed reminder content supplied at creation."
+                      },
+                      "time": {
+                        "type": "string",
+                        "description": "Local time normalized to HH:mm:ss.SSS."
+                      },
+                      "timeZone": {
+                        "type": "string",
+                        "description": "Explicit IANA zone; equivalent timing edits retain the stored spelling."
+                      },
+                      "scheduledAt": {
+                        "type": "string",
+                        "description": "Committed next UTC instant while active, or final occurrence when inactive."
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "kind",
+                      "title",
+                      "prompt",
+                      "time",
+                      "timeZone",
+                      "scheduledAt"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "id": {
+                        "type": "string",
+                        "description": "Globally unique task identity."
+                      },
+                      "kind": {
+                        "type": "string",
+                        "const": "weekly",
+                        "description": "Rule discriminator for a weekly wall-clock reminder."
+                      },
+                      "title": {
+                        "type": "string",
+                        "description": "Required stored task name; already trimmed, non-empty, and at most 120 characters."
+                      },
+                      "prompt": {
+                        "type": "string",
+                        "description": "Trimmed reminder content supplied at creation."
+                      },
+                      "time": {
+                        "type": "string",
+                        "description": "Local time normalized to HH:mm:ss.SSS."
+                      },
+                      "timeZone": {
+                        "type": "string",
+                        "description": "Explicit canonical IANA zone; equivalent timing edits retain the stored spelling."
+                      },
+                      "weekdays": {
+                        "type": "array",
+                        "items": {
+                          "type": "number"
+                        },
+                        "description": "Unique ascending ISO weekdays, Monday 1 through Sunday 7."
+                      },
+                      "scheduledAt": {
+                        "type": "string",
+                        "description": "Committed next UTC instant while active, or final occurrence when inactive."
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "kind",
+                      "title",
+                      "prompt",
+                      "time",
+                      "timeZone",
+                      "weekdays",
+                      "scheduledAt"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "id": {
+                        "type": "string",
+                        "description": "Globally unique task identity."
+                      },
+                      "kind": {
+                        "type": "string",
+                        "const": "cron",
+                        "description": "Rule discriminator for a five-field cron wall-clock reminder."
+                      },
+                      "title": {
+                        "type": "string",
+                        "description": "Required stored task name; already trimmed, non-empty, and at most 120 characters."
+                      },
+                      "prompt": {
+                        "type": "string",
+                        "description": "Trimmed reminder content supplied at creation."
+                      },
+                      "expression": {
+                        "type": "string",
+                        "description": "Canonical five-field cron expression: minute hour day-of-month month day-of-week."
+                      },
+                      "timeZone": {
+                        "type": "string",
+                        "description": "Explicit IANA zone; equivalent timing edits retain the stored spelling."
+                      },
+                      "scheduledAt": {
+                        "type": "string",
+                        "description": "Committed next UTC instant while active, or final occurrence when inactive."
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "kind",
+                      "title",
+                      "prompt",
+                      "expression",
+                      "timeZone",
+                      "scheduledAt"
+                    ],
+                    "additionalProperties": false
+                  }
+                ],
+                "description": "Complete record observed when editing began, including the committed target."
+              },
+              "change": {
+                "oneOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "kind": {
+                        "type": "string",
+                        "const": "at"
+                      },
+                      "at": {
+                        "oneOf": [
+                          {
+                            "type": "string"
+                          },
+                          {
+                            "type": "object",
+                            "properties": {
+                              "date": {
+                                "type": "string",
+                                "description": "Four-digit ISO calendar date."
+                              },
+                              "time": {
+                                "type": "string",
+                                "description": "Local wall-clock time with optional one-to-three digit milliseconds."
+                              },
+                              "time_zone": {
+                                "type": "string",
+                                "description": "Explicit UTC or IANA Area/Location zone."
+                              }
+                            },
+                            "required": [
+                              "date",
+                              "time",
+                              "time_zone"
+                            ],
+                            "additionalProperties": false
+                          }
+                        ]
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "at"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "kind": {
+                        "type": "string",
+                        "const": "every"
+                      },
+                      "every_seconds": {
+                        "type": "number"
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "every_seconds"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "kind": {
+                        "type": "string",
+                        "const": "daily"
+                      },
+                      "daily": {
+                        "type": "object",
+                        "properties": {
+                          "time": {
+                            "type": "string",
+                            "description": "Local HH:mm:ss time with optional one-to-three fractional digits."
+                          },
+                          "time_zone": {
+                            "type": "string",
+                            "description": "Explicit UTC or IANA Area/Location zone."
+                          }
+                        },
+                        "required": [
+                          "time",
+                          "time_zone"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "daily"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "kind": {
+                        "type": "string",
+                        "const": "weekly"
+                      },
+                      "weekly": {
+                        "type": "object",
+                        "properties": {
+                          "time": {
+                            "type": "string",
+                            "description": "Local HH:mm:ss time with optional one-to-three fractional digits."
+                          },
+                          "time_zone": {
+                            "type": "string",
+                            "description": "Explicit UTC or IANA Area/Location zone."
+                          },
+                          "weekdays": {
+                            "type": "array",
+                            "items": {
+                              "type": "number"
+                            },
+                            "description": "Non-empty ISO weekday set, Monday 1 through Sunday 7, without repetitions."
+                          }
+                        },
+                        "required": [
+                          "time",
+                          "time_zone",
+                          "weekdays"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "weekly"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "kind": {
+                        "type": "string",
+                        "const": "cron"
+                      },
+                      "cron": {
+                        "type": "object",
+                        "properties": {
+                          "expression": {
+                            "type": "string",
+                            "description": "Five-field Vixie cron expression: minute hour day-of-month month day-of-week."
+                          },
+                          "time_zone": {
+                            "type": "string",
+                            "description": "Explicit UTC or IANA Area/Location zone."
+                          }
+                        },
+                        "required": [
+                          "expression",
+                          "time_zone"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "cron"
+                    ],
+                    "additionalProperties": false
+                  }
+                ],
+                "description": "New timing; its kind may differ from the stored record's kind, and an omitted value keeps the committed target."
+              },
+              "id": {
+                "type": "string",
+                "description": "Task to remove."
+              },
+              "sessionId": {
+                "type": "string",
+                "description": "Original Session binding."
+              },
+              "title": {
+                "type": "string",
+                "description": "Task name of at most 120 characters, non-empty after trimming; omitted keeps the stored name."
+              },
+              "prompt": {
+                "type": "string",
+                "description": "Reminder instruction, non-empty after trimming; omitted keeps the stored instruction."
+              }
+            },
+            "required": [
+              "expected",
+              "id",
+              "sessionId"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "request"
+        ],
+        "additionalProperties": false
+      },
+      "resultSchemaError": "typert tool schema: selected union branches overlap or have no required discriminator"
+    }
+  }
+}
