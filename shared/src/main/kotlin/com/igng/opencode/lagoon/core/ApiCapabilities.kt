@@ -40,7 +40,9 @@ data class ApiCapabilities(
   /** The protocol can terminate a background job; independent of the connection carrier. */
   val stopShell: Boolean = false,
   /** Native PTY routes plus the documented single-use WebSocket ticket handshake. Never assumed. */
-  val terminal: Boolean = false
+  val terminal: Boolean = false,
+  /** Native Host workspace registration management, independent of direct/SSH/Remote carrier. */
+  val workspaceManagement: Boolean = false
 ) {
   fun supports(action: SessionAction) = action in actions
   companion object {

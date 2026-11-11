@@ -4030,6 +4030,63 @@ class LagoonController private constructor(private val appContext: Context) {
     updateState { it.copy(scopeWorkspaceKey = key, scopeProjectId = null) }
   }
 
+  // ---- Explicit Host workspace registrations (not the device-local project registry) ----
+  private val workspaceManagementGate = WorkspaceManagementGate()
+
+  private fun workspaceOperation(expected: WorkspaceManagementTarget): OperationContext {
+    val op = beginOperation()
+    check(op.snapshot.canManageServerWorkspaces() && expected.matches(op.snapshot)) { "Host 或原生工作区能力已变化，请重新打开管理" }
+    return op
+  }
+  private fun requireWorkspaceOperation(op: OperationContext, expected: WorkspaceManagementTarget) {
+    check(op.connectionCurrent(this) && expected.matches(state.value) && state.value.canManageServerWorkspaces()) {
+      "工作区所属连接已变化，旧结果已丢弃；若刚提交写入，请在原 Host 刷新核对"
+    }
+  }
+  internal suspend fun serverWorkspaces(expected: WorkspaceManagementTarget): List<ServerWorkspace> =
+    workspaceManagementGate.read(expected.profile) {
+      val op = workspaceOperation(expected)
+      val items = op.client.serverWorkspaces() ?: throw ApiException(501, "此 Host 未提供原生工作区管理")
+      requireWorkspaceOperation(op, expected)
+      items
+    }
+  internal suspend fun registerWorkspace(expected: WorkspaceManagementTarget, path: String): WorkspaceRegistration =
+    workspaceManagementGate.write(expected.profile) {
+      val op = workspaceOperation(expected)
+      val result = op.client.registerWorkspace(path) ?: throw ApiException(501, "此 Host 未提供工作区登记")
+      requireWorkspaceOperation(op, expected)
+      result
+    }
+  internal suspend fun renameWorkspace(expected: WorkspaceManagementTarget, workspace: ServerWorkspace, title: String): ServerWorkspace =
+    workspaceManagementGate.write(expected.profile) {
+      val op = workspaceOperation(expected)
+      val result = op.client.renameWorkspace(workspace, title) ?: throw ApiException(501, "此 Host 未提供工作区改名")
+      requireWorkspaceOperation(op, expected)
+      result
+    }
+  internal suspend fun deleteWorkspace(expected: WorkspaceManagementTarget, workspace: ServerWorkspace): Unit =
+    workspaceManagementGate.write(expected.profile) {
+      val op = workspaceOperation(expected)
+      check(op.client.deleteWorkspace(workspace) == true) { "Host 未确认移除登记，请刷新核对；未清理本机资料" }
+      requireWorkspaceOperation(op, expected)
+    }
+  internal suspend fun moveWorkspace(expected: WorkspaceManagementTarget, workspace: ServerWorkspace, before: ServerWorkspace?): List<String> =
+    workspaceManagementGate.write(expected.profile) {
+      val op = workspaceOperation(expected)
+      val order = op.client.moveWorkspace(workspace, before) ?: throw ApiException(501, "此 Host 未提供工作区排序")
+      requireWorkspaceOperation(op, expected)
+      order
+    }
+  /** Explicit local save after rechecking that this exact native identity is still registered. */
+  internal suspend fun saveWorkspaceOnDevice(expected: WorkspaceManagementTarget, workspace: ServerWorkspace) {
+    val items = serverWorkspaces(expected)
+    check(items.any { it == workspace }) { "Host 登记已变化，请刷新后重新选择保存" }
+    val op = workspaceOperation(expected)
+    requireWorkspaceOperation(op, expected)
+    val projects = store.addLocalProject(op.serverId, Project(workspace.id, workspace.path, workspace.title, serverId = op.serverId))
+    op.commitConnection { withSummary(it.copy(projects = projects)) }
+  }
+
   // ---- Device-local projects ----
   /** Resolve [directory] on the server and register the canonical project on this device. */
   fun addProject(directory: String): Job = act("project-add", directory) { op ->

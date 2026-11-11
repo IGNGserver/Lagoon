@@ -59,6 +59,18 @@ Android 对一次多文件读取固定当前加密连接并前后核对代次；
 CI 同时覆盖受限参数/权限/字节预算/取消、实际patched Router与Noise链路。另有显式 opt-in 测试实际调用
 固定官方 Connection 认证和 deliverables 路由实现，但数据服务是受控夹具，不冒充真实模型轮次/文件修改。
 
+## DSH 原生工作区登记管理
+
+工作区管理使用已有 Typert `workspace/create`、`rename`、`delete`、`insertBefore` 和 `follow`，
+不增加任意远程文件操作。create 仅登记已有目录，Host 返回规范路径与 opaque workspaceId；delete 仅移除
+共享登记，保留文件和 Sessions。界面与本机项目保存/移除明确分开，只有显式本机保存才导入目录记录。
+
+管理读取要求完整且严格的 baseline，不将缺失/坏帧当空目录；提交前重新核对目标及排序锚点的完整快照。
+官方接口没有 CAS/revision，读后到写前仍有不可消除的 Host 并发窗口，不承诺原子锁。写入禁用认证401重放、
+HTTP连接恢复，并使用一次性请求体阻止状态码 Retry-After 自动重发；未知结果先只读刷新，再由用户重新确认。
+Controller 前后核对原 Host 路由和当前客户端，拒绝旧窗口写向编辑后的同 ID 地址，late ack 不改新 Host 状态。
+写入失效后只有完整 baseline 才重建目录，孤立增量不能冒充完整清单。
+
 ## 实现与验证边界
 
 Host companion 和 SHA 校验的固定上游 Router/HostPluginRuntime overlay、Android HTTP/SSE/WS/分片 carrier、同 Host 共享 Noise 会话和服务选择 UI 已有实现。构建、测试入口见 [Host 连接器说明](<../host-connector/README.md>)。

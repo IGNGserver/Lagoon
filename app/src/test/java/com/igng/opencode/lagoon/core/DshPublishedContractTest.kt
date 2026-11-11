@@ -10,6 +10,21 @@ class DshPublishedContractTest {
     assertEquals("b830ec950faba0a46dda564be3e2d854afed94f1", OfficialDshContract.upstream().getString("commit"))
   }
 
+  @Test fun nativeWorkspaceContractUsesOpaqueIdsAndRetainsFilesWithoutInventedCasFields() {
+    OfficialDshContract.assertArgs("workspace/create", JSONObject("""{"request":{"path":"/existing"}}"""))
+    OfficialDshContract.assertArgs("workspace/rename", JSONObject("""{"request":{"workspaceId":"w","title":"Renamed"}}"""))
+    OfficialDshContract.assertArgs("workspace/delete", JSONObject("""{"request":{"workspaceId":"w"}}"""))
+    OfficialDshContract.assertArgs("workspace/insertBefore", JSONObject("""{"request":{"workspaceId":"w"}}"""))
+    OfficialDshContract.assertArgs("workspace/insertBefore", JSONObject("""{"request":{"workspaceId":"w","beforeWorkspaceId":"anchor"}}"""))
+    OfficialDshContract.assertResult("workspace/delete", JSONObject("""{"deleted":true}"""))
+    OfficialDshContract.assertResult("workspace/insertBefore", JSONObject("""{"workspaceIds":["w","anchor"]}"""))
+    for (extra in listOf("deleteFiles", "deleteSessions", "expected", "revision")) {
+      val invalid = JSONObject().put("request", JSONObject().put("workspaceId", "w").put(extra, true))
+      assertTrue(runCatching { OfficialDshContract.assertArgs("workspace/delete", invalid) }.isFailure)
+    }
+    assertTrue(runCatching { OfficialDshContract.assertArgs("workspace/create", JSONObject("""{"request":{"path":"/existing","title":"Not a create parameter"}}""")) }.isFailure)
+  }
+
   @Test fun scheduleUpdateHasCompleteClosedExpectedRecordAndNoCatalogMetadata() {
     val expected = JSONObject("""{"id":"task","kind":"daily","title":"Task","prompt":"Review","scheduledAt":"2099-01-01T15:00:00.000Z","time":"23:00:00.000","timeZone":"Asia/Shanghai"}""")
     val request = JSONObject().put("sessionId", "owner").put("id", "task").put("expected", expected).put("title", "Edited")

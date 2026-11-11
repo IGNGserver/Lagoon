@@ -78,6 +78,7 @@
 - r14：Remote 复用固定上游 `harness.terminal.v1` 的 Host 开关/设备归属/attachmentId 策略；native attach 转为 `terminal/follow`，write/resize 走上游兼容 RPC，只有 provider ACK 使 RPC 成功后才生成客户端 ACK。仅从 controllerId 判断输入权，不能信任自报 writable 或按 harness.remote.v3 推断。
 - 终端固定到当前加密 gateway，旧代次不能把输入或 mutation 转到新连接；有界32项/256KiB单发送队列、10s超时、取消丢弃待发输入、未知结果不确认/重放。闭合 Gateway 拒绝新调用，普通只读流仍无上行。Host 设备策略继续过滤其他终端、拒绝其他设备和关闭开关后的调用，不增加绕过通道。
 - r18 受限 Remote DSH Diff 已接入：单独 harness.changes.v1 / harness.changes.read，只允许 summary/diff＋sessionId＋安全序号/索引；Host 通过官方 Connection 同一可信 owner Peer 内部执行固定 GET，无客户端 URL/认证输入、无网络 fallback。旧 Host 无能力时不发送，404过期/错误/超限不当作空改动，Direct/SSH/Remote 共用严格原生解析和补丁渲染。
+- r19 DSH 原生 workspace 管理独立于本机目录：完整目录、登记已有目录、改名、移除登记和排序以 opaque ID 调用官方接口。Controller 原 Host 路由前后核对、未知写入锁定至只读刷新，UI 再次明确确认；删除仅移除共享登记，保留文件/会话/本机偏好。官方无CAS，不承诺原子防并发；OpenCode不假报支持DSH接口。
 
 ### 阶段 7：验证与交付仍进行中
 - 本地 fake Hub/实际 Noise/真实 Node connector 互操作不等于公网 Hub、真实官方 daemon 或 Android 真机验收。
@@ -172,5 +173,12 @@
 - r18 独立复核0个新增明确P1/P2。另修复旧follow初始快照不含后续改动公告：64会话×每会话8条的有界原生公告索引，深拷贝、去重、快照原文不变、异常原始记录仍交严格解析。`remote-diff-first.log`原生兼容通过16s；`remote-diff-parser.log`解析通过2s；`remote-diff-encrypted.log`实际Noise/Router读取与旧Host/404拒绝通过8s；`remote-diff-announcements.log`全部DSH与新增索引专项103项0失败通过37s。
 - `remote-diff-host-all.log`：36项0失败0跳过，含原有native/Router/TerminalPolicy27项、新changes8项和固定官方Connection+deliverables处理器1项；数据服务和session/history是受控夹具，不是运行中的真实改动轮次。实际Kotlin Noise→固定上游Router→DshChangesPeer→受控官方形状数据2项0跳过。未启动daemon/模型，不把处理器运行冒充真机或公网实测。CI已接上新Host策略和加密Diff用例。
 - `remote-diff-final.log`：**1476 tests、0 failures、0 errors、14 skipped**，Debug assemble成功122s。新增ChangesRead10、Announcements3、NoiseChanges2、能力1项；APK22,043,934bytes，SHA-256 `c093ac316796c2d9f78560228faea9d241c452d34558f234ff88cf40c495a370`。剩余实现按原生workspace管理→服务端内容搜索→历史边界fork推进，整体目标继续，PR保持Draft。
+- r19：DSH 原生工作区严格目录、登记已有目录、改名、移除登记和排序接入；Direct/SSH/Remote共用同一适配器。新增独立Host管理面，与本机项目保存/移除区分；删登记保留文件与Session，既有本机目录/草稿/分组不清理。5个新HarnessClient方法均有完整guarded lease转发，不向OpenCode假报支持。
+- 固定rc.5官方generated workspace5方法请求/结果schema导出为夹具，附tag/commit/generated SHA。serverWorkspaces要求完整严格baseline与唯一ID/有效时间/有界目录；改名/删除/排序提交前核对目标与锚点快照，但官方无CAS，只是预检而非原子并发锁。新工作区HTTP写入禁用401认证重放、OkHttp连接恢复，并标记one-shot阻止503 Retry-After:0状态重发；断线与坏ack不隐式补发。
+- Controller固定原Host route前后校验并隔离未知结果，任一不确定写入后先成功只读刷新再允许新的显式操作；UI再要求重新确认，读失败保留上次目录并标明过期，ack成功但刷新失败与写失败分开显示。只有显式“保存到本机”才导入，后台目录不自动影响新会话目标。
+- 独立复核发现1个P2：写入失效后workspaceItems=null，后续upsert/remove从空重建部分目录。已修为未知基线不能消费增量并冒充完整清单，完整读取才恢复；另对读取期间已知实时变化返回409，不用已淘汰快照授权写入。新增两项回归验证兄弟登记不丢与陈旧基线零写入。
+- 验证过程：首轮编译/Controller/Policy/Noise/Guarded通过23s；子任务测试keySet与Android JSON编译面不兼容已改迭代器，不降低校验；冻结协议矩阵通过4s；缓存修复回归通过14s。一次全量与专项误共享输出并行引起XML报告写入冲突，结果作废并串行重跑；后续一次性body全量触发新Noise用例读取日志列表的ConcurrentModificationException，改受锁快照后再全量，所有失败保留日志并调查。
+- `workspaces-verified-final.log`：**1504 tests、0 failures、0 errors、14 skipped**，Debug assemble成功123s。新增DshWorkspace17、Controller4、Policy4、实际Noise2、官方schema1，共28项；完整guarded接口反射回归继续通过。APK22,094,904bytes，SHA-256 `fb365c697a56556a57080c722eb14fb04b5496ca61d4179e47c8ad3f350da795`。本轮无daemon/模型/真机/公网操作，MockWebServer真实HTTP/mux与Noise链路数据仍为受控夹具，未夸大为生产Host验收。
+- DSH工作区管理本轮完成，后续优先服务端内容搜索和历史边界fork；OpenCode project/worktree官方可远程管理另需专项核对，不能用DSH登记能力替代。Desktop attach/非Linux证明/Android及公网环境仍按已披露边界保留，整体目标继续，PR保持Draft。
 - 全部构建在 `/home/lvziw/.build/Lagoon/unified-harness-connections/source`，Gradle/build 输出在 `~/.build`。源码工作树无 app/build、node_modules。
 - `wt audit`：29 repos，0 missing dirs，3 detached、4 merged worktrees 属其他任务；只读报告，无清理。

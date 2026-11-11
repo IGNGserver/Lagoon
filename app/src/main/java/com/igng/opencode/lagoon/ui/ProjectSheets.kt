@@ -37,6 +37,11 @@ internal fun HomeScopeSheet(
   onEditGroup: (DeviceGroup) -> Unit,
   onManageDevices: () -> Unit
 ) {
+  var managing by remember { mutableStateOf<WorkspaceManagementTarget?>(null) }
+  managing?.let { target ->
+    ServerWorkspaceManagementPanel(state, controller, target, onDismiss = { managing = null })
+    return
+  }
   if (state.browsePath != null) { DirectoryBrowserSheet(state, controller); return }
   var removing by remember { mutableStateOf<Project?>(null) }
   val online = state.enabledProfiles.count { profile ->
@@ -47,7 +52,8 @@ internal fun HomeScopeSheet(
     LazyColumn(Modifier.fillMaxWidth().heightIn(max = 680.dp), contentPadding = PaddingValues(bottom = 16.dp)) {
       if (!state.allServers) item {
         if (state.homeGroup != null) WorkspaceScopeSection(state, controller, onDismiss)
-        else ProjectScopeSection(state, controller, onDismiss, onRemove = { removing = it })
+        else ProjectScopeSection(state, controller, onDismiss, onRemove = { removing = it },
+          onManageWorkspaces = { state.server?.let { managing = WorkspaceManagementTarget(it) } })
       }
       item { HyperGroupTitle(if (state.allServers) "设备" else "切换设备") }
       item {
@@ -163,7 +169,8 @@ private fun ProjectScopeSection(
   state: LagoonState,
   controller: LagoonController,
   onDismiss: () -> Unit,
-  onRemove: (Project) -> Unit
+  onRemove: (Project) -> Unit,
+  onManageWorkspaces: () -> Unit
 ) {
   var query by rememberSaveable { mutableStateOf("") }
   val counts = HomeScope.counts(state.sessions, state.projects)
@@ -196,6 +203,10 @@ private fun ProjectScopeSection(
     Spacer(Modifier.height(10.dp))
     HyperCard(Modifier.fillMaxWidth().padding(horizontal = 8.dp), insidePadding = PaddingValues(vertical = 2.dp)) {
       ChoiceRow("添加服务器目录…", "浏览服务器目录并添加为项目", false) { controller.openDirectoryBrowser() }
+      if (state.canManageServerWorkspaces()) {
+        HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
+        ChoiceRow("管理 Host 工作区", "管理此 Host 的共享登记；不会自动保存到本机", false, onManageWorkspaces)
+      }
     }
   }
 }

@@ -16,6 +16,13 @@ internal class GuardedHarnessClient(private val access: HarnessLeaseAccess) : Ha
   override suspend fun discoverCapabilities(): ApiCapabilities = access.useSuspending { it.discoverCapabilities() }
   override suspend fun health(): String = access.useSuspending { it.health() }
   override suspend fun projects(): List<Project> = access.useSuspending { it.projects() }
+  override suspend fun serverWorkspaces(): List<ServerWorkspace>? = access.useSuspending { it.serverWorkspaces() }
+  override suspend fun registerWorkspace(path: String): WorkspaceRegistration? = access.useSuspending { it.registerWorkspace(path) }
+  override suspend fun renameWorkspace(expected: ServerWorkspace, title: String): ServerWorkspace? =
+    access.useSuspending { it.renameWorkspace(expected, title) }
+  override suspend fun deleteWorkspace(expected: ServerWorkspace): Boolean? = access.useSuspending { it.deleteWorkspace(expected) }
+  override suspend fun moveWorkspace(expected: ServerWorkspace, before: ServerWorkspace?): List<String>? =
+    access.useSuspending { it.moveWorkspace(expected, before) }
   override suspend fun projectsForDisplay(): List<Project> = access.useSuspending { it.projectsForDisplay() }
   override suspend fun session(id: String): Session = access.useSuspending { it.session(id) }
   override suspend fun projectAt(directory: String): Project? = access.useSuspending { it.projectAt(directory) }

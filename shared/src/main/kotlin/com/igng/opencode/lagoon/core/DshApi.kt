@@ -226,6 +226,10 @@ class DshApi(
   /** `workspace/follow` 的最新工作区清单；null 表示尚未读取。 */
   @Volatile private var workspaceItems: List<JSONObject>? = null
   private val workspaceLock = Any()
+  private var workspaceEpoch = 0L
+  private val workspaceMutationLock = Mutex()
+  /** Workspace writes must never be replayed by OkHttp after an ambiguous transport failure. */
+  private val workspaceMutationHttp = http.newBuilder().retryOnConnectionFailure(false).build()
   /** Replays the current workspace titles to a controller that starts watching mid-session. */
   private val workspacePublisher = MutableSharedFlow<List<Project>>(replay = 1, extraBufferCapacity = 1)
   override val workspaceUpdates: Flow<List<Project>> = workspacePublisher.asSharedFlow()
@@ -564,7 +568,9 @@ class DshApi(
    */
   private suspend fun <T> runHttpCall(request: Request, read: (Response) -> T): T =
     suspendCancellableCoroutine { continuation ->
-      val call = http.newCall(request)
+      val client = if (request.url.encodedPath.substringAfterLast("/api/", "") in WORKSPACE_MUTATIONS)
+        workspaceMutationHttp else http
+      val call = client.newCall(request)
       val worker = ioScope.launch {
         try {
           val value = call.execute().use(read)
@@ -610,11 +616,18 @@ class DshApi(
         .put("rpcId", UUID.randomUUID().toString())
         .put("method", endpoint)
         .put("payload", wirePayload)
+      val encodedBody = envelope.toString().toRequestBody(JSON_MEDIA_TYPE)
+      val outgoingBody = if (endpoint in WORKSPACE_MUTATIONS) object : okhttp3.RequestBody() {
+        override fun contentType() = encodedBody.contentType()
+        override fun contentLength() = encodedBody.contentLength()
+        override fun isOneShot() = true // Also prevents HTTP 503 Retry-After:0 status follow-ups.
+        override fun writeTo(sink: okio.BufferedSink) = encodedBody.writeTo(sink)
+      } else encodedBody
       val request = Request.Builder()
         .url(url)
         .header("Content-Type", "application/json; charset=utf-8")
         .header("Cookie", current)
-        .post(envelope.toString().toRequestBody(JSON_MEDIA_TYPE))
+        .post(outgoingBody)
         .build()
       val (status, contentType, body) = try {
         runHttpCall(request) { response ->
@@ -908,6 +921,70 @@ class DshApi(
 
   override suspend fun session(id: String): Session = sessionOrFetch(id)
 
+  override suspend fun serverWorkspaces(): List<ServerWorkspace> =
+    fetchWorkspaceBaseline(strict = true).map(ServerWorkspaceCodec::workspace)
+
+  override suspend fun registerWorkspace(path: String): WorkspaceRegistration = workspaceMutationLock.withLock {
+    if (!ServerWorkspaceCodec.validPath(path))
+      throw ApiException(400, "请输入主机上的绝对目录路径，不能包含首尾空白或控制字符", "workspace/path-invalid")
+    val result = workspaceMutation("workspace/create", JSONObject().put("path", path))
+    val workspace = ServerWorkspaceCodec.workspace(result.opt("workspace"))
+    val created = result.opt("created") as? Boolean ?: ServerWorkspaceCodec.invalid()
+    // Canonical paths are chosen by the Host (symlinks and platform normalization are authoritative).
+    WorkspaceRegistration(workspace, created)
+  }
+
+  override suspend fun renameWorkspace(expected: ServerWorkspace, title: String): ServerWorkspace = workspaceMutationLock.withLock {
+    val cleanTitle = ServerWorkspaceCodec.title(title)
+    workspacePreflight(expected)
+    val result = workspaceMutation("workspace/rename", JSONObject().put("workspaceId", expected.id).put("title", cleanTitle))
+    val workspace = ServerWorkspaceCodec.workspace(result.opt("workspace"))
+    if (workspace.id != expected.id || workspace.path != expected.path || workspace.createdAt != expected.createdAt)
+      ServerWorkspaceCodec.invalid()
+    workspace
+  }
+
+  override suspend fun deleteWorkspace(expected: ServerWorkspace): Boolean = workspaceMutationLock.withLock {
+    workspacePreflight(expected)
+    val result = workspaceMutation("workspace/delete", JSONObject().put("workspaceId", expected.id))
+    if (result.opt("deleted") != true) ServerWorkspaceCodec.invalid()
+    true
+  }
+
+  override suspend fun moveWorkspace(expected: ServerWorkspace, before: ServerWorkspace?): List<String> = workspaceMutationLock.withLock {
+    if (before?.id == expected.id)
+      throw ApiException(400, "不能把工作区移动到自身之前", "workspace/anchor-invalid")
+    workspacePreflight(expected, before)
+    val request = JSONObject().put("workspaceId", expected.id)
+    if (before != null) request.put("beforeWorkspaceId", before.id)
+    val result = workspaceMutation("workspace/insertBefore", request)
+    val ids = ServerWorkspaceCodec.ids(result.opt("workspaceIds"), ServerWorkspaceCodec.MAX_WORKSPACES)
+    if (expected.id !in ids || (before != null && before.id !in ids)) ServerWorkspaceCodec.invalid()
+    ids
+  }
+
+  /** Fresh full snapshots reject stale targets and anchors, but cannot close a Host-side TOCTOU race. */
+  private suspend fun workspacePreflight(expected: ServerWorkspace, before: ServerWorkspace? = null) {
+    val catalog = serverWorkspaces()
+    for (snapshot in listOfNotNull(expected, before)) {
+      val current = catalog.firstOrNull { it.id == snapshot.id }
+        ?: throw ApiException(404, "工作区已不存在，请刷新列表", "workspace/not-found")
+      if (current != snapshot)
+        throw ApiException(409, "工作区已被其他客户端修改，请刷新后重新确认", "workspace/snapshot-conflict")
+    }
+  }
+
+  private suspend fun workspaceMutation(endpoint: String, request: JSONObject): JSONObject {
+    try {
+      // retried=true disables the generic auth-401 replay too. There is no mutation fallback/retry.
+      return call(endpoint, requestArgs(request), retried = true) as? JSONObject ?: ServerWorkspaceCodec.invalid()
+    } finally {
+      // Even an error can follow a durable Host commit. Do not patch a newer live frame with a late
+      // acknowledgement; the next project lookup/explicit catalog refresh must read server facts.
+      synchronized(workspaceLock) { workspaceEpoch++; workspaceItems = null }
+    }
+  }
+
   override suspend fun projects(): List<Project> = withContext(Dispatchers.IO) {
     // DSH 的 Workspace 就是「项目」：workspace/follow 的 baseline 给出全量清单。
     val items = workspaceItems ?: fetchWorkspaceBaseline()
@@ -936,7 +1013,8 @@ class DshApi(
    * 参数形状按代际不同：0.2.1 线只接受 `{args:{}}`，更新的代际用 `{args:{request:{}}}`。
    * 先用本机已知形状，被 `gateway/arguments-invalid` 拒绝时换另一种并记住，避免把协议代际写死。
    */
-  private suspend fun fetchWorkspaceBaseline(): List<JSONObject> {
+  private suspend fun fetchWorkspaceBaseline(strict: Boolean = false): List<JSONObject> {
+    val startEpoch = synchronized(workspaceLock) { workspaceEpoch }
     var frame: JSONObject
     if (workspaceArgsStyle == WorkspaceArgsStyle.REQUEST) {
       frame = try {
@@ -955,13 +1033,31 @@ class DshApi(
         fetchFirstFrame("workspace/follow", requestArgs(JSONObject()))
       }
     }
-    if (frame.str("type") == "baseline") applyWorkspaceFrame(frame)
-    return workspaceItems ?: throw ApiException(502, "工作区列表为空：workspace/follow 没有返回 baseline")
+    if (frame.str("type") != "baseline")
+      throw ApiException(502, "workspace/follow 没有返回完整 baseline，请刷新核实", "workspace/baseline-invalid")
+    val items = frame.optJSONObject("value")?.optJSONArray("items")
+      ?: throw ApiException(502, "workspace/follow baseline 缺少工作区清单", "workspace/baseline-invalid")
+    if (strict) {
+      ServerWorkspaceCodec.catalog(items)
+      val value = frame.getJSONObject("value")
+      ServerWorkspaceCodec.ids(value.opt("archivedSessionIds"), ServerWorkspaceCodec.MAX_SESSION_IDS)
+      ServerWorkspaceCodec.ids(value.opt("pinnedSessionIds"), ServerWorkspaceCodec.MAX_SESSION_IDS)
+    } else if ((0 until items.length()).any { items.opt(it) !is JSONObject }) ServerWorkspaceCodec.invalid()
+    val snapshot = items.objects()
+    // A fresh query returns its own baseline, never an unrelated cached fallback. A live follow (or
+    // mutation invalidation) that advanced while it was in flight keeps ownership of the cache.
+    synchronized(workspaceLock) {
+      if (strict && workspaceEpoch != startEpoch)
+        throw ApiException(409, "读取期间 Host 工作区已变化，请刷新后重新确认", "workspace/snapshot-conflict")
+      if (workspaceEpoch == startEpoch) applyWorkspaceFrame(frame)
+    }
+    return snapshot
   }
 
   /** baseline / upsert / remove / order / archived 帧；pinned 暂不消费。 */
   private fun applyWorkspaceFrame(frame: JSONObject) {
     val snapshot = synchronized(workspaceLock) {
+      workspaceEpoch++
       when (frame.str("type")) {
         "baseline" -> {
           val value = frame.obj("value")
@@ -988,11 +1084,13 @@ class DshApi(
         "upsert" -> {
           val workspace = frame.obj("workspace")
           val id = workspace.str("workspaceId")
-          if (id.isNotBlank()) workspaceItems = ((workspaceItems ?: emptyList()).filterNot { it.str("workspaceId") == id } + workspace)
+          // A mutation invalidation means the complete baseline is unknown. An increment cannot
+          // recreate it as a one-item catalog, hiding all unaffected sibling registrations.
+          workspaceItems?.let { list -> if (id.isNotBlank()) workspaceItems = list.filterNot { it.str("workspaceId") == id } + workspace }
         }
         "remove" -> {
           val id = frame.str("workspaceId")
-          if (id.isNotBlank()) workspaceItems = (workspaceItems ?: emptyList()).filterNot { it.str("workspaceId") == id }
+          workspaceItems?.let { list -> if (id.isNotBlank()) workspaceItems = list.filterNot { it.str("workspaceId") == id } }
         }
         "order" -> {
           val order = frame.arr("workspaceIds").strings()
@@ -4270,6 +4368,7 @@ class DshApi(
     const val SHELL_OWNER_SCAN_SESSIONS = 8
     val ACTIVE_JOB_STATUSES = setOf("running", "stopping")
 
+    private val WORKSPACE_MUTATIONS = setOf("workspace/create", "workspace/rename", "workspace/delete", "workspace/insertBefore")
     val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
 
     /**
@@ -4286,7 +4385,8 @@ class DshApi(
       fork = true,
       jobOutputStream = true,
       stopShell = true,
-      terminal = true
+      terminal = true,
+      workspaceManagement = true
     )
 
     /** Capabilities for a tunneled SSH client created before its DshApi instance exists. */

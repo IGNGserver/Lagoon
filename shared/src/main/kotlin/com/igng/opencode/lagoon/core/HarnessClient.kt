@@ -45,6 +45,16 @@ interface HarnessClient {
 
   suspend fun projects(): List<Project>
 
+  /** Fresh Host-owned registrations; null means unsupported, not an empty catalog. */
+  suspend fun serverWorkspaces(): List<ServerWorkspace>? = null
+  suspend fun registerWorkspace(path: String): WorkspaceRegistration? = null
+  /** Snapshot preflight only: the native Host has no atomic compare-and-swap/revision contract. */
+  suspend fun renameWorkspace(expected: ServerWorkspace, title: String): ServerWorkspace? = null
+  /** Removes the registration only; files and Sessions are retained by the Host. */
+  suspend fun deleteWorkspace(expected: ServerWorkspace): Boolean? = null
+  /** Null anchor means move to the end of the Host's display order. */
+  suspend fun moveWorkspace(expected: ServerWorkspace, before: ServerWorkspace?): List<String>? = null
+
   /**
    * 行内展示用的项目/工作区标题，绝不参与筛选、计数或新建会话目标。
    * 已经持续维护工作区清单的 harness 直接返回本地清单，不额外开流；其余可以按需做一次廉价读取。

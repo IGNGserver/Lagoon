@@ -203,6 +203,7 @@ class GuardedHarnessClientTest {
     Boolean::class.javaPrimitiveType, Boolean::class.javaObjectType -> false
     List::class.java -> emptyList<Any>()
     Session::class.java -> Session("session", "/repo", "Title", 1)
+    ServerWorkspace::class.java -> ServerWorkspace("workspace", "/repo", "Title", emptyList(), "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z")
     TerminalScope::class.java -> TerminalScope.Location("/repo")
     QueueAction::class.java -> QueueAction.Remove
     ModelChoice::class.java -> ModelChoice("provider", "model", "Model")
