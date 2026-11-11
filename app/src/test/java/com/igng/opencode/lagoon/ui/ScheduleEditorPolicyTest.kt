@@ -80,9 +80,25 @@ class ScheduleEditorPolicyTest {
     assertEquals("America/New_York", titleOnly.timing.timeZone)
     val dirtyTiming = originalTiming.copy(time = "10:11:12")
     val allDirty = rebaseScheduleDraft(record, latest, "My title", "My prompt", dirtyTiming)
-    assertEquals("My prompt", allDirty.prompt); assertEquals(dirtyTiming, allDirty.timing)
+    assertEquals("My prompt", allDirty.prompt)
+    assertEquals("10:11:12", allDirty.timing.time)
+    assertEquals("America/New_York", allDirty.timing.timeZone) // Untouched zone follows the new server record.
     val second = rebaseScheduleDraft(latest, latest.copy(prompt = "Newer"), titleOnly.title, titleOnly.prompt, titleOnly.timing)
     assertEquals("Newer", second.prompt); assertEquals("My title", second.title)
+  }
+
+  @Test fun partialTimingRebaseDoesNotOverwriteUntouchedExternalZoneOrWeekdays() {
+    val previous = record.copy(kind = "weekly", weekdays = listOf(1, 3))
+    val latest = previous.copy(time = "12:00:00", timeZone = "America/St_Johns", weekdays = listOf(2, 4))
+    val edited = ScheduleTimingDraft.from(previous).copy(time = "10:00:00")
+    val rebased = rebaseScheduleDraft(previous, latest, previous.title, previous.prompt, edited)
+    assertEquals("10:00:00", rebased.timing.time)
+    assertEquals("America/St_Johns", rebased.timing.timeZone)
+    assertEquals("2,4", rebased.timing.weekdays)
+    assertEquals(ScheduleTimingChange.Weekly("10:00:00", "America/St_Johns", listOf(2, 4)),
+      parseScheduleTiming(true, rebased.timing).getOrThrow())
+    val changedZone = edited.copy(timeZone = "Etc/UTC")
+    assertEquals("Etc/UTC", rebaseScheduleDraft(previous, latest, previous.title, previous.prompt, changedZone).timing.timeZone)
   }
 
   @Test fun inactiveBusyOfflineCachedAndInvalidContentDisableEdit() {

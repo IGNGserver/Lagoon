@@ -125,5 +125,6 @@
 - r11 `schedule-first.log` 生产 UI/RPC 编译通过，但夹具错误使用 Android JSONObject 不存在的 similar，改为字段递归比较；`schedule-scoped.log` 定向通过62s。独立复核发现并修复 CAS 刷新把未编辑旧字段回写覆盖他端新值，以及旧会话写确认使新会话目录永久 loading，新增 dirty-field 和重叠会话读取回归。
 - `schedule-reviewed.log` 官方 schema、Controller/dirty-field、实际 Noise 调度目录/历史/更新/删除等定向通过21s；写操作 401 不重放，冲突/未知只读核对。固定导出5种官方请求契约，结果 schema 无法表达的重叠 union 保留 resultSchemaError，不手造成功 schema。
 - `schedule-full.log`：**1325 tests、0 failures、0 errors、10 skipped**；Debug assemble 成功122s。新增 ScheduleApi12、ScheduleMutationPolicy4、ScheduleEditorPolicy7、Controller10、官方调度契约2、实际加密调度1项。APK 21,842,052 bytes，SHA-256 `61cd28a5625e4686ba0b349cb13fc74219e9d080b79017e608b326e8bde62e4a`；本轮不启动真实 daemon，4个 live opt-in 保持 skip，fixture Noise 实际运行。
+- `schedule-timing-rebase-final.log`：按 time/zone/weekdays 等字段分别保留实际编辑意图，避免仅改时间后把他端新时区覆盖；新增1回归。**1326 tests、0 failures、0 errors、10 skipped**，Debug assemble 成功117s。APK 21,842,299 bytes，SHA-256 `516bf2b2f16be324e36fc3c99e6badce07ec0cb7e496b69a4367a27a0e486e54`。
 - 全部构建在 `/home/lvziw/.build/Lagoon/unified-harness-connections/source`，Gradle/build 输出在 `~/.build`。源码工作树无 app/build、node_modules。
 - `wt audit`：29 repos，0 missing dirs，3 detached、4 merged worktrees 属其他任务；只读报告，无清理。

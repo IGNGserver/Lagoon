@@ -81,8 +81,23 @@ internal fun rebaseScheduleDraft(previous: ScheduleRecord, latest: ScheduleRecor
   timing: ScheduleTimingDraft): RebasedScheduleDraft = RebasedScheduleDraft(
   title = if (title == previous.title) latest.title else title,
   prompt = if (prompt == previous.prompt) latest.prompt else prompt,
-  timing = if (timing == ScheduleTimingDraft.from(previous)) ScheduleTimingDraft.from(latest) else timing
+  timing = rebaseScheduleTimingDraft(ScheduleTimingDraft.from(previous), ScheduleTimingDraft.from(latest), timing)
 )
+
+private fun rebaseScheduleTimingDraft(previous: ScheduleTimingDraft, latest: ScheduleTimingDraft,
+  edited: ScheduleTimingDraft): ScheduleTimingDraft {
+  // A type change is a different rule. Keep an explicitly edited rule together for user review;
+  // within the same kind, preserve only fields the reader actually changed.
+  if (previous.kind != latest.kind) return if (edited == previous) latest else edited
+  return edited.copy(
+    at = if (edited.at == previous.at) latest.at else edited.at,
+    seconds = if (edited.seconds == previous.seconds) latest.seconds else edited.seconds,
+    time = if (edited.time == previous.time) latest.time else edited.time,
+    timeZone = if (edited.timeZone == previous.timeZone) latest.timeZone else edited.timeZone,
+    weekdays = if (edited.weekdays == previous.weekdays) latest.weekdays else edited.weekdays,
+    expression = if (edited.expression == previous.expression) latest.expression else edited.expression
+  )
+}
 
 internal fun scheduleEditorCanSave(state: LagoonState, expected: ScheduleMutationTarget?, title: String, prompt: String,
   changeTiming: Boolean, draft: ScheduleTimingDraft): Boolean = state.canManageSchedules() &&
