@@ -10,6 +10,17 @@ class DshPublishedContractTest {
     assertEquals("b830ec950faba0a46dda564be3e2d854afed94f1", OfficialDshContract.upstream().getString("commit"))
   }
 
+  @Test fun sessionContentSearchIsLiteralHostQueryWithoutClientPaginationOrScopeFields() {
+    OfficialDshContract.assertArgs("session/search", JSONObject("""{"request":{"query":"literal [a.*] + text"}}"""))
+    OfficialDshContract.assertResult("session/search", JSONObject("""{"items":[{"sessionId":"s","snippet":"native content"}],"hasMore":false}"""))
+    OfficialDshContract.assertResult("session/search", JSONObject("""{"items":[],"hasMore":true}"""))
+    for (field in listOf("directory", "workspaceId", "limit", "cursor", "regex")) {
+      val invalid = JSONObject().put("request", JSONObject().put("query", "text").put(field, "not accepted"))
+      assertTrue(runCatching { OfficialDshContract.assertArgs("session/search", invalid) }.isFailure)
+    }
+    assertTrue(runCatching { OfficialDshContract.assertResult("session/search", JSONObject("""{"items":[]}""")) }.isFailure)
+  }
+
   @Test fun nativeWorkspaceContractUsesOpaqueIdsAndRetainsFilesWithoutInventedCasFields() {
     OfficialDshContract.assertArgs("workspace/create", JSONObject("""{"request":{"path":"/existing"}}"""))
     OfficialDshContract.assertArgs("workspace/rename", JSONObject("""{"request":{"workspaceId":"w","title":"Renamed"}}"""))

@@ -63,6 +63,12 @@ interface HarnessClient {
 
   suspend fun session(id: String): Session
 
+  /** Explicit server-side literal content search; null means unsupported, never an empty result. */
+  suspend fun searchSessionContent(query: String): SessionContentSearchResult? = null
+
+  /** Resolve a clicked hit's current metadata; DSH requires a fresh authorized listing. */
+  suspend fun searchResultSession(id: String): Session? = session(id)
+
   suspend fun projectAt(directory: String): Project?
 
   suspend fun rootSessionsPage(directory: String? = null, cursor: String? = null, size: Int = 100): ApiPage<Session>

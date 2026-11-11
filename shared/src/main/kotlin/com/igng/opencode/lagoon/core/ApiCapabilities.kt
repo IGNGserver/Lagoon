@@ -42,7 +42,9 @@ data class ApiCapabilities(
   /** Native PTY routes plus the documented single-use WebSocket ticket handshake. Never assumed. */
   val terminal: Boolean = false,
   /** Native Host workspace registration management, independent of direct/SSH/Remote carrier. */
-  val workspaceManagement: Boolean = false
+  val workspaceManagement: Boolean = false,
+  /** Native authorized Session content search; no OpenCode route is assumed. */
+  val sessionContentSearch: Boolean = false
 ) {
   fun supports(action: SessionAction) = action in actions
   companion object {

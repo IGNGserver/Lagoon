@@ -71,6 +71,18 @@ HTTP连接恢复，并使用一次性请求体阻止状态码 Retry-After 自动
 Controller 前后核对原 Host 路由和当前客户端，拒绝旧窗口写向编辑后的同 ID 地址，late ack 不改新 Host 状态。
 写入失效后只有完整 baseline 才重建目录，孤立增量不能冒充完整清单。
 
+## DSH 服务器正文搜索
+
+`session/search` 只发送 `args.request.query`，去首尾空白后最多500个UTF-16单元，不接受 NUL，
+按字面搜索 Host 当前可见的消息内容，不接受目录、分页游标或正则开关。搜索不会恢复 Agent 或打开消息流。
+官方返回最多20个不同Session及240个Unicode码点的摘要；结果不完整、类型错误或超限是错误而非空列表。
+`hasMore` 在远端访问过滤前计算，所以空列表加 true 仍表示有未展示结果，客户端不会伪造下一页。
+
+独立界面标明搜索整个原 Host 可见范围，不受本机项目筛选约束；原首页筛选明确只处理本机已加载标题/项目。
+查询、摘要仅在内存展示，不写到本机配置、草稿或日志。控制器绑定原客户端、路由、连接代次和最新查询；
+明确点击后重新读取授权会话身份与目录，已移除/失权/旧查询/换路由结果均不能作为导航目标。
+OpenCode 未按 DSH 方法假报支持，需按其自身官方可远程契约另核对。
+
 ## 实现与验证边界
 
 Host companion 和 SHA 校验的固定上游 Router/HostPluginRuntime overlay、Android HTTP/SSE/WS/分片 carrier、同 Host 共享 Noise 会话和服务选择 UI 已有实现。构建、测试入口见 [Host 连接器说明](<../host-connector/README.md>)。

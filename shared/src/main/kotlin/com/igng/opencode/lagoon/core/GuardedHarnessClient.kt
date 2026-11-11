@@ -25,6 +25,9 @@ internal class GuardedHarnessClient(private val access: HarnessLeaseAccess) : Ha
     access.useSuspending { it.moveWorkspace(expected, before) }
   override suspend fun projectsForDisplay(): List<Project> = access.useSuspending { it.projectsForDisplay() }
   override suspend fun session(id: String): Session = access.useSuspending { it.session(id) }
+  override suspend fun searchSessionContent(query: String): SessionContentSearchResult? =
+    access.useSuspending { it.searchSessionContent(query) }
+  override suspend fun searchResultSession(id: String): Session? = access.useSuspending { it.searchResultSession(id) }
   override suspend fun projectAt(directory: String): Project? = access.useSuspending { it.projectAt(directory) }
   override suspend fun rootSessionsPage(directory: String?, cursor: String?, size: Int): ApiPage<Session> =
     access.useSuspending { it.rootSessionsPage(directory, cursor, size) }

@@ -72,6 +72,15 @@ This validates the patched router/connection seam, not a physical Android-to-
 production-Host end-to-end connection. [Peer-focused tests](<test/native-services.test.mjs>)
 cover additional registration, allowlist, expiry and resource-limit cases.
 
+## Official cold-search runtime verification
+
+[The native session-search test](<test/official-session-search.test.mjs>) runs the fixed official
+`ApiSessionList.search` implementation with a controlled query provider. Set
+`LAGOON_OFFICIAL_DSH_PACKAGE_ROOT` to an installed `@deepseek-ai/dsh@0.2.1-rc.5` package root.
+It verifies literal normalization, visible-current message filtering, bounded results and Unicode
+snippets without starting an Agent or daemon. This is source-runtime evidence, not a production
+Host or physical Android acceptance run; the provider data remains a fixture.
+
 ## Real official-service acceptance (explicit opt-in)
 
 [The official-service test](<test/official-service.mjs>) reads a caller-owned, isolated OpenCode **2.2.6** registration. It never starts/stops a daemon, sends a model prompt, or writes its registration. Run against a scratch copy with the locked tooling dependencies available:

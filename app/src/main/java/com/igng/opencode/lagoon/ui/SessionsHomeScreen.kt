@@ -59,6 +59,7 @@ internal fun HomeScreen(
   val preferences = LocalContext.current.getSharedPreferences("ui", Context.MODE_PRIVATE)
   var grouping by remember { mutableStateOf(runCatching { HomeGrouping.valueOf(preferences.getString("homeGrouping", null)!!) }.getOrDefault(HomeGrouping.DATE)) }
   var menu by remember { mutableStateOf(false) }
+  var contentSearchTarget by remember { mutableStateOf<SessionContentSearchTarget?>(null) }
   var searching by rememberSaveable { mutableStateOf(false) }
   var query by rememberSaveable(state.allServers, state.serverId, state.homeGroupId) { mutableStateOf("") }
   var renaming by remember { mutableStateOf<Session?>(null) }
@@ -98,11 +99,16 @@ internal fun HomeScreen(
                   controller.markServerRead()
                 }
               ), title = "已读同步"))
-              add(MenuSection(listOf(
-                MenuAction("搜索", MiuixIcons.Search) { searching = true },
-                MenuAction("设备管理", MiuixIcons.GridView) { onManageDevices() },
-                MenuAction("设置", MiuixIcons.Settings) { onPage(RootPage.SETTINGS) }
-              )))
+              add(MenuSection(buildList {
+                add(MenuAction("本机已加载筛选", MiuixIcons.Search) { searching = true })
+                if (state.canSearchSessionContent()) add(MenuAction("服务器正文搜索", MiuixIcons.Search) {
+                  if (state.canSearchSessionContent()) state.server?.let { profile ->
+                    contentSearchTarget = SessionContentSearchTarget(profile)
+                  }
+                })
+                add(MenuAction("设备管理", MiuixIcons.GridView) { onManageDevices() })
+                add(MenuAction("设置", MiuixIcons.Settings) { onPage(RootPage.SETTINGS) })
+              }))
             })
           }
         }
@@ -161,6 +167,9 @@ internal fun HomeScreen(
       }
     }
   }
+  contentSearchTarget?.let { captured ->
+    ServerContentSearchPanel(state, controller, captured, onDismiss = { contentSearchTarget = null }, onOpen = onOpen)
+  }
   renaming?.let { session -> RenameSessionDialog(state, controller, session) { renaming = null } }
   deleting?.let { session ->
     SuperDialog(title = "删除此会话？", show = true, onDismissRequest = { if (!state.pending("delete")) deleting = null }) {
@@ -197,11 +206,14 @@ private fun SearchTopBar(query: String, onQuery: (String) -> Unit, onClose: () -
         onSearch = {},
         expanded = true,
         onExpandedChange = {},
-        label = "搜索会话标题或项目",
+        label = "筛选已加载标题或项目",
         modifier = Modifier.weight(1f).focusRequester(focus)
       )
       HyperTextAction("取消", onClick = onClose)
     }
+    Text("只筛选本机已加载列表，不搜索正文或未缓存会话",
+      Modifier.padding(start = 16.dp, end = 16.dp, bottom = 8.dp),
+      color = HyperTheme.colors.textSecondary, fontSize = 12.sp)
     HorizontalDivider(color = HyperTheme.colors.divider)
   }
 }

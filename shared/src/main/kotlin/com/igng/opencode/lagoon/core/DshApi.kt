@@ -921,6 +921,21 @@ class DshApi(
 
   override suspend fun session(id: String): Session = sessionOrFetch(id)
 
+  override suspend fun searchSessionContent(query: String): SessionContentSearchResult {
+    val normalized = SessionContentSearchCodec.normalizeQuery(query)
+    return SessionContentSearchCodec.decode(normalized,
+      call("session/search", requestArgs(JSONObject().put("query", normalized))))
+  }
+
+  override suspend fun searchResultSession(id: String): Session? {
+    if (!SessionContentSearchCodec.validSessionId(id)) return null
+    // Do not reuse known or a listing already in flight before the explicit hit-open action.
+    val row = fetchListing().items.filter { it.opt("sessionId") == id }.singleOrNull() ?: return null
+    val directory = row.opt("cwd") as? String ?: return null
+    if (directory.isBlank()) return null
+    return itemToSession(row)?.takeIf { it.id == id && it.directory == directory }
+  }
+
   override suspend fun serverWorkspaces(): List<ServerWorkspace> =
     fetchWorkspaceBaseline(strict = true).map(ServerWorkspaceCodec::workspace)
 
@@ -4386,7 +4401,8 @@ class DshApi(
       jobOutputStream = true,
       stopShell = true,
       terminal = true,
-      workspaceManagement = true
+      workspaceManagement = true,
+      sessionContentSearch = true
     )
 
     /** Capabilities for a tunneled SSH client created before its DshApi instance exists. */

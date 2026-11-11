@@ -4030,6 +4030,50 @@ class LagoonController private constructor(private val appContext: Context) {
     updateState { it.copy(scopeWorkspaceKey = key, scopeProjectId = null) }
   }
 
+  // ---- Explicit server-side message-content search, separate from loaded-list filtering ----
+  private var contentSearchSequence = 0L
+  private var contentSearchPage: SessionContentSearchPage? = null
+
+  private fun contentSearchOperation(expected: SessionContentSearchTarget): OperationContext {
+    val op = beginOperation()
+    check(op.snapshot.canSearchSessionContent() && expected.matches(op.snapshot)) { "搜索所属 Host 或能力已变化，请重新打开" }
+    return op
+  }
+  private fun requireContentSearchOperation(op: OperationContext, expected: SessionContentSearchTarget) {
+    check(op.connectionCurrent(this) && expected.matches(state.value) && state.value.canSearchSessionContent()) {
+      "搜索所属连接已变化，旧结果已丢弃"
+    }
+  }
+  internal suspend fun searchSessionContent(expected: SessionContentSearchTarget, query: String): SessionContentSearchPage {
+    val op = contentSearchOperation(expected)
+    val sequence = ++contentSearchSequence
+    contentSearchPage = null
+    val result = op.client.searchSessionContent(query) ?: throw ApiException(501, "此 Host 未提供服务器正文搜索")
+    requireContentSearchOperation(op, expected)
+    check(sequence == contentSearchSequence) { "已有更新的搜索请求，旧结果已丢弃" }
+    return SessionContentSearchPage(expected, result, op.client, op.route, op.token).also { contentSearchPage = it }
+  }
+  /** Resolve authorization again on explicit open; search never selects, resumes or creates a Session. */
+  internal suspend fun openSearchHit(page: SessionContentSearchPage, sessionId: String, onOpen: (SessionTarget) -> Unit) {
+    val op = contentSearchOperation(page.target)
+    fun requirePage() {
+      requireContentSearchOperation(op, page.target)
+      check(contentSearchPage === page && op.client === page.client && op.route == page.route && op.token == page.generation) {
+        "搜索结果已过期，请在原 Host 重新搜索"
+      }
+      check(page.result.items.any { it.sessionId == sessionId }) { "此会话不在该次服务器搜索结果中" }
+    }
+    requirePage()
+    val session = op.client.searchResultSession(sessionId) ?: throw ApiException(404, "此会话已不可见或不存在，请重新搜索")
+    requirePage()
+    check(session.id == sessionId && session.directory.isNotBlank()) { "Host 返回了不匹配或不完整的会话身份" }
+    // Only this explicit navigation seeds runtime metadata; no local project or persisted draft is changed.
+    val resolved = scoped(op.serverId, session)
+    op.commitConnection { it.copy(sessions = (it.sessions.filterNot { existing -> existing.id == resolved.id } + resolved)) }
+    requirePage()
+    onOpen(SessionTarget(op.serverId, sessionId))
+  }
+
   // ---- Explicit Host workspace registrations (not the device-local project registry) ----
   private val workspaceManagementGate = WorkspaceManagementGate()
 

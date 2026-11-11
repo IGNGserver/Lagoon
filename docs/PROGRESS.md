@@ -79,6 +79,7 @@
 - 终端固定到当前加密 gateway，旧代次不能把输入或 mutation 转到新连接；有界32项/256KiB单发送队列、10s超时、取消丢弃待发输入、未知结果不确认/重放。闭合 Gateway 拒绝新调用，普通只读流仍无上行。Host 设备策略继续过滤其他终端、拒绝其他设备和关闭开关后的调用，不增加绕过通道。
 - r18 受限 Remote DSH Diff 已接入：单独 harness.changes.v1 / harness.changes.read，只允许 summary/diff＋sessionId＋安全序号/索引；Host 通过官方 Connection 同一可信 owner Peer 内部执行固定 GET，无客户端 URL/认证输入、无网络 fallback。旧 Host 无能力时不发送，404过期/错误/超限不当作空改动，Direct/SSH/Remote 共用严格原生解析和补丁渲染。
 - r19 DSH 原生 workspace 管理独立于本机目录：完整目录、登记已有目录、改名、移除登记和排序以 opaque ID 调用官方接口。Controller 原 Host 路由前后核对、未知写入锁定至只读刷新，UI 再次明确确认；删除仅移除共享登记，保留文件/会话/本机偏好。官方无CAS，不承诺原子防并发；OpenCode不假报支持DSH接口。
+- r20 DSH 原生服务器正文搜索与本机已加载列表筛选分离；Host范围字面查询，500 UTF-16单元、20个命中、240 Unicode码点摘要，保留权限过滤前hasMore语义，不伪造下一页。搜索不启动Agent或打开会话流，只有显式点击才新鲜核对会话可见性；旧查询/原路由/客户端代次不匹配结果不允许打开。
 
 ### 阶段 7：验证与交付仍进行中
 - 本地 fake Hub/实际 Noise/真实 Node connector 互操作不等于公网 Hub、真实官方 daemon 或 Android 真机验收。
@@ -180,5 +181,10 @@
 - 验证过程：首轮编译/Controller/Policy/Noise/Guarded通过23s；子任务测试keySet与Android JSON编译面不兼容已改迭代器，不降低校验；冻结协议矩阵通过4s；缓存修复回归通过14s。一次全量与专项误共享输出并行引起XML报告写入冲突，结果作废并串行重跑；后续一次性body全量触发新Noise用例读取日志列表的ConcurrentModificationException，改受锁快照后再全量，所有失败保留日志并调查。
 - `workspaces-verified-final.log`：**1504 tests、0 failures、0 errors、14 skipped**，Debug assemble成功123s。新增DshWorkspace17、Controller4、Policy4、实际Noise2、官方schema1，共28项；完整guarded接口反射回归继续通过。APK22,094,904bytes，SHA-256 `fb365c697a56556a57080c722eb14fb04b5496ca61d4179e47c8ad3f350da795`。本轮无daemon/模型/真机/公网操作，MockWebServer真实HTTP/mux与Noise链路数据仍为受控夹具，未夸大为生产Host验收。
 - DSH工作区管理本轮完成，后续优先服务端内容搜索和历史边界fork；OpenCode project/worktree官方可远程管理另需专项核对，不能用DSH登记能力替代。Desktop attach/非Linux证明/Android及公网环境仍按已披露边界保留，整体目标继续，PR保持Draft。
+- r20：DSH 服务器正文搜索与本机已加载筛选分离。新增原生session/search（仅query）与显式点击后新鲜授权Session读取，2个HarnessClient方法均完整guarded转发；500 UTF-16查询/20结果/240 Unicode码点摘要按官方rc.5严格解码。保留空结果+hasMore=true的权限过滤前语义，无伪分页/目录参数/正则模式，OpenCode不假报支持。
+- 控制器签发搜索页包含原Host、客户端、确切路由、generation和latest查询身份；新的查询废弃旧结果，点击时核对命中成员并新鲜读取会话目录，失权/删除/换同ID路由或迟到返回均拒绝。搜索不改本机资料/项目/草稿或选择，不打开follow/启动Agent；只有明确点击才更新运行时会话元数据并导航。UI取消关闭/换路由读任务，不保存query/snippet到配置，摘要纯Text并按完整Unicode显示；原首页筛选标签明确只处理已加载标题/项目。
+- 官方generated session/search args/result schema按固定版本/commit/SHA导出，拒绝客户端目录/limit/cursor等多余字段。`content-search-first.log`控制器与编译19s通过；子任务测试keySet在运行前改Android兼容迭代器；`content-search-matrix.log`原生10/Controller5/实际Noise2/官方schema与Guarded通过5s。独立只读复核0个明确P1/P2。
+- `content-search-official-runtime.log`实际执行固定官方ApiSessionList.search冷搜索实现，验证字面归一化、可见current用户/助手消息筛选、20结果与Unicode摘要；提供者是受控数据，不冒充真实用户资料或daemon。`content-search-host-all.log`37项0失败0跳过，含既有36项与新官方冷搜索1项。全程无daemon/模型/真机/公网操作。
+- `content-search-full.log`：**1522 tests、0 failures、0 errors、14 skipped**，Debug assemble成功127s。新增原生搜索10、Controller5、Noise2、官方schema1，共18项；APK22,123,945bytes，SHA-256 `361ad27074119bdbe9086521b5fe0dc6106b3cc54f4be6f03eac959528aa0759`。下一轮继续历史边界fork与OpenCode原生内容搜索/project-worktree契约专项核对；整体目标继续，PR保持Draft。
 - 全部构建在 `/home/lvziw/.build/Lagoon/unified-harness-connections/source`，Gradle/build 输出在 `~/.build`。源码工作树无 app/build、node_modules。
 - `wt audit`：29 repos，0 missing dirs，3 detached、4 merged worktrees 属其他任务；只读报告，无清理。

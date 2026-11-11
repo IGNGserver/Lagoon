@@ -85,6 +85,7 @@
 - 同 Host 两个服务共享加密连接，关一个服务不关兄弟；关闭、慢消费者、旧代次、pending open cancellation 有专项回归。请求超时不自动改路或重发。
 - Remote DSH 逐文件 Diff 另按独立 changes capability 和固定官方认证 GET 入口接入；只收会话/序号/索引，不提供任意 Fetch。过期、拒绝、部分摘要、超限和坏数据均明确报错，与 Direct/SSH 共用解析，UI标注最近窗口与文件预算。
 - DSH workspace create/rename/delete/insertBefore 与完整 follow 目录已接入独立 Host 管理面和确认流程，使用 opaque workspaceId、原路由与新鲜快照，不修改本机记录；仅明确“保存到本机”才导入。未知写入无认证/网络重放，刷新后需重新确认；删除语义保留文件与 Session。官方无CAS，提交前快照不是原子并发锁。OpenCode project/worktree 尚需独立官方操作验收，不能按DSH能力推断。
+- DSH session/search 的独立服务器正文搜索面已接入，字面查询、Host可见范围和有界hasMore明确展示；原本首页过滤标明仅本机已加载标题/项目。搜索与点击打开均核对原路由/最新查询，点击才重新读取授权Session目录，不启动Agent或自动导入本机项目。OpenCode内容搜索尚需核对实际官方接口，不将DSH能力外推。
 - 单实例 DshApi 的多个 events() 收集器共享唯一业务事件源，独立有界队列和 JSON 载荷副本，旁观者取消不交还前台提问；最后退出后清理并等待再换代。跨调用者另有显式 DshClientRegistry/factory opt-in 与完整 guarded lease；消息读取、前台提问与监视兴趣隔离，最后 release 才关闭 owner，旧凭据/路由/timeout 不合并；裸构造器保持独立。
 - 三层开关在连接/通知/深链/组合生效；可重叠组合保留同一 leaf 多处引用。原生服务选择不自动启用。
 - 后续原生 UI 补齐：DSH bundle/entry 插件、凭据引用和 provider 设置按协议而非 carrier 显示，使用打开时的确切 route 校验；OpenCode 分叉能力由兼容原生 route 发现，回退/恢复有消息级确认且离线/运行/未知活动状态拒绝。目标编辑另已接入官方 revision/ref 与 Long 预算契约，不自动续跑；调度 catalog/history/delete/CAS update 另按官方五方法接入并保留完整记录/原会话/独立时区；rc.5 无公开 create/run/enable，明确不提供。OpenCode simple PTY 原生文本终端业务另已接入，明确创建/附加/输入/终止，离开不 kill，票据一次性且无输入重放；不是完整 VT。DSH Direct/SSH 的 Session scope、retain、双向 mux、snapshot/output/输入与 resize ACK、控制权与文本 UI 已接入；Remote 已复用实际上游 follow/write/resize 兼容层与 harness.terminal.v1，保留 Host 开关/设备归属/attachmentId 与 provider-ACK 语义，固定旧加密 gateway 不重定向输入；无能力时仍明确拒绝。
