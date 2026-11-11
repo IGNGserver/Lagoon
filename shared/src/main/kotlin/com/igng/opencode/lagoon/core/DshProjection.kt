@@ -64,9 +64,11 @@ internal fun dshToolState(data: JSONObject): JSONObject {  val message = data.ob
   val state = JSONObject().put("status", if (failed) "error" else "completed")
     .put("content", JSONArray(message.arr("content").toString())).put("metadata", metadata)
   if (failed) {
-    val failure = data.obj("error")
-    state.put("error", JSONObject().put("message", failure.str("reason").ifBlank { failure.str("message") }
-      .ifBlank { message.arr("content").contentText() }.ifBlank { "工具执行失败" }))
+    val failure = JSONObject(data.obj("error").toString())
+    failure.put("message", failure.str("reason").ifBlank { failure.str("message") }
+      .ifBlank { message.arr("content").contentText() }.ifBlank { "工具执行失败" })
+    state.put("error", failure)
+    metadata.put("error", JSONObject(failure.toString()))
   }
   return state
 }

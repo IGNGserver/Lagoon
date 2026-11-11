@@ -19,6 +19,18 @@ class RemoteCapabilitiesTest {
     assertFalse(capabilities.supportsWorkspaceUpload)
   }
 
+  @Test fun terminalRequiresItsOwnHostPermissionAndAnActualHarnessCarrier() {
+    assertFalse(RemoteCapabilities.parse(JSONObject("""{"capabilities":["harness.remote.v3"]}""")).hasTerminal)
+    assertTrue(RemoteCapabilities.parse(JSONObject("""{"capabilities":["harness.remote.v3","harness.terminal.v1"]}""")).hasTerminal)
+    assertFalse(RemoteCapabilities.parse(JSONObject("""{"capabilities":["agent.acp.pi.v1","harness.terminal.v1"]}""")).hasTerminal)
+  }
+
+  @Test fun changesRequireTheRestrictedHostCapabilityNotOnlySessionWireVersion() {
+    assertFalse(RemoteCapabilities.parse(JSONObject("""{"capabilities":["harness.remote.v3"]}""")).hasChanges)
+    assertTrue(RemoteCapabilities.parse(JSONObject("""{"capabilities":["harness.remote.v3","harness.changes.v1"]}""")).hasChanges)
+    assertFalse(RemoteCapabilities.parse(JSONObject("""{"capabilities":["agent.acp.pi.v1","harness.changes.v1"]}""")).hasChanges)
+  }
+
   @Test fun workspaceUploadIsCapabilityGated() {
     val supported = RemoteCapabilities.parse(JSONObject("""{"capabilities":["harness.remote.v3","workspace.upload.v1"]}"""))
     assertTrue(supported.supportsWorkspaceUpload)

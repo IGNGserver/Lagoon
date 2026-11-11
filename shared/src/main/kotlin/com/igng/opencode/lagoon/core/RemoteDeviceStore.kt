@@ -67,9 +67,9 @@ internal fun canonicalRemoteOrigin(address: String): String {
 }
 
 /**
- * Serializes token rotation, and marks in-flight mutations on disk first. A crash or network error
- * after refresh leaves the record uncertain: replaying the old refresh token may revoke the device.
- * Recovery requires explicit account reauthentication and registration of the same identity.
+ * Serializes token rotation and journals in-flight credential mutations before sending them.
+ * Unknown refresh results retain the prior pair and back off; supported Servers can recover its
+ * direct successor. Only a structured authorization rejection requires explicit reauthentication.
  */
 internal class RemoteDeviceManager(private val store: RemoteDeviceStore, private val slot: String, address: String, account: String,
   private val registerer: suspend (RemoteClientDescriptor, String) -> RemoteTokenPair = { _, _ -> throw IOException("Remote 设备未注册") },
@@ -122,8 +122,8 @@ internal class RemoteDeviceManager(private val store: RemoteDeviceStore, private
   }
 
   /**
-   * 刷新令牌。失败一律把记录恢复成“可重试”，只有服务端明确拒绝（401/403）才判定需要重新登录；
-   * 结果未知时保留旧令牌，下一次以 401 收场后同样落到重新登录，不会出现无解的死锁状态。
+   * 刷新令牌。先保存 REFRESHING；网络/代理响应不明时保留旧 pair 和时间戳以退避恢复。
+   * 只有结构化 AUTH_INVALID/TOKEN_EXPIRED/DEVICE_REVOKED 等协议拒绝才要求重新登录。
    */
   private suspend fun refreshLocked(current: RemoteDeviceRecord, pair: RemoteTokenPair, now: Long,
     refresh: suspend (String, String) -> RemoteTokenPair): RemoteDeviceRecord {
@@ -135,8 +135,9 @@ internal class RemoteDeviceManager(private val store: RemoteDeviceStore, private
     } catch (cancel: kotlinx.coroutines.CancellationException) {
       throw cancel
     } catch (error: RemoteServerException) {
-      // 明确被拒 = 刷新令牌已失效：恢复记录并要求重新登录。
-      if (error.status == 401 || error.status == 403) {
+      // Only a structured protocol rejection invalidates authorization. A proxy's empty 401/403
+      // is an unknown refresh result and must preserve the credential/transition for backoff.
+      if (error.isCredentialRejected) {
         store.save(slot, RemoteDeviceRecord(origin, account, current.identity, pair))
         throw IOException("Remote 登录已失效，请重新登录", error)
       }

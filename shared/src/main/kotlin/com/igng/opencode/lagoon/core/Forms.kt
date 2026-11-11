@@ -26,7 +26,10 @@ internal fun JSONObject.toForm(directory: String) = QuestionRequest(str("id"), s
       else f.arr("options").objects().map { it.toQuestionOption() }
     QuestionPrompt(f.str("title").ifBlank { f.str("key") } + f.str("description").takeIf { it.isNotBlank() }?.let { "\n$it" }.orEmpty(),
       options, f.str("type") == "multiselect", f.str("type") in setOf("string", "number", "integer") && (options.isEmpty() || f.optBoolean("custom")) || f.optBoolean("custom"), f.toString())
-  }, form = true)
+  }, form = true, presentation = optJSONObject("questionPresentation")?.let { state ->
+    QuestionPresentation(state.optLong("remainingMs").takeIf { state.has("remainingMs") },
+      state.optBoolean("countdownRunning"), state.optBoolean("held"), state.optBoolean("continued"))
+  })
 
 internal fun QuestionPrompt.defaultAnswers(): List<String> {
   if (field.isBlank()) return emptyList()

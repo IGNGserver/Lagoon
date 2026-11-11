@@ -2,8 +2,8 @@ package com.igng.opencode.lagoon.core
 
 import org.json.JSONObject
 
-/** Session operations whose route changed between OpenCode 2.0.x releases. */
-enum class SessionAction { RENAME, UNREVERT }
+/** Session actions gated by compatible routes in the instance's OpenAPI document. */
+enum class SessionAction { RENAME, UNREVERT, REVERT }
 data class ActionEndpoint(val method: String, val path: String)
 /**
  * The session update that accepts a top-level `archived` boolean (`PATCH /api/session/{id}`, OpenCode
@@ -14,10 +14,12 @@ data class ArchiveEndpoint(val endpoint: ActionEndpoint, val restorable: Boolean
 
 /**
  * Per-instance contract read from the server's `/openapi.json`. Routes that are stable across every
- * 2.x release (prompt, fork, delete, interrupt, compact, revert/stage, inbox, permission) are called
- * directly; only what moved or was added later is resolved here:
+ * 2.x release (prompt, delete, interrupt, compact, inbox, permission) are called directly;
+ * discoverable actions are gated by the instance's documented compatible routes:
  * - rename: `POST /rename` (2.0.0–2.0.x) → `PATCH /api/session/{id}` with `title`;
  * - unrevert: `POST /revert/clear` → `DELETE /revert`;
+ * - revert: `POST /revert/stage` with `messageID`;
+ * - fork: `POST /fork` accepting an empty object (optional `before` selects the history boundary);
  * - diff and view only exist on newer releases;
  * - archiving was added in 2.1.0 as a top-level `archived` boolean on the session update body. It is
  *   offered only when the instance documents that field ([ArchiveEndpoint]); 2.0.x has no way to archive.
@@ -31,13 +33,24 @@ data class ApiCapabilities(
   val documented: Boolean = false,
   /** Sessions can be permanently deleted. DeepSeek Harness only archives. */
   val deleteSession: Boolean = true,
-  /**
-   * Forking is offered on the phone. OpenCode keeps it off (revert covers "go back"); DeepSeek Harness
-   * has no message-level revert, so a fork is its way to branch off a session.
-   */
+  /** Native whole-history fork; OpenCode documents a POST `/fork` accepting an empty JSON object. */
   val fork: Boolean = false,
   /** DSH job/follow, independent of direct/SSH/Remote transport. */
-  val jobOutputStream: Boolean = false
+  val jobOutputStream: Boolean = false,
+  /** The protocol can terminate a background job; independent of the connection carrier. */
+  val stopShell: Boolean = false,
+  /** Native PTY routes plus the documented single-use WebSocket ticket handshake. Never assumed. */
+  val terminal: Boolean = false,
+  /** Native Host workspace registration management, independent of direct/SSH/Remote carrier. */
+  val workspaceManagement: Boolean = false,
+  /** Native authorized Session content search; no OpenCode route is assumed. */
+  val sessionContentSearch: Boolean = false,
+  /** Exact native history boundary support; never inferred from whole-history fork or a baseline. */
+  val historicalFork: Boolean = false,
+  /** Native OpenCode metadata writes, only with this instance's compatible documented schema. */
+  val openCodeProjectManagement: Boolean = false,
+  /** All native inventory/create/delete/reconcile contracts must be documented together. */
+  val openCodeWorktreeManagement: Boolean = false
 ) {
   fun supports(action: SessionAction) = action in actions
   companion object {
@@ -45,10 +58,12 @@ data class ApiCapabilities(
     val BASELINE = ApiCapabilities(
       actions = mapOf(
         SessionAction.RENAME to ActionEndpoint("PATCH", "api/session/{id}"),
-        SessionAction.UNREVERT to ActionEndpoint("DELETE", "api/session/{id}/revert")
+        SessionAction.UNREVERT to ActionEndpoint("DELETE", "api/session/{id}/revert"),
+        SessionAction.REVERT to ActionEndpoint("POST", "api/session/{id}/revert/stage")
       ),
       diff = true, sessionView = ActionEndpoint("POST", "api/session/{id}/view"),
-      archive = ArchiveEndpoint(ActionEndpoint("PATCH", "api/session/{id}"))
+      archive = ArchiveEndpoint(ActionEndpoint("PATCH", "api/session/{id}")),
+      fork = true, stopShell = true
     )
 
     fun fromDocument(document: JSONObject): ApiCapabilities {
@@ -66,7 +81,7 @@ data class ApiCapabilities(
           ?: value.arr("oneOf").objects().firstOrNull { it.optString("type") != "null" }
         return if (branch != null) schema(branch, depth + 1) else value
       }
-      fun body(op: JSONObject) = schema(op.obj("requestBody").obj("content").obj("application/json").obj("schema"))
+      fun body(op: JSONObject) = schema(schema(op.obj("requestBody")).obj("content").obj("application/json").obj("schema"))
       /** A session route `/api/session/{…}<suffix>` with [method] whose body accepts [fields] and requires nothing else. */
       fun endpoint(suffix: String, method: String, fields: Set<String> = emptySet()): ActionEndpoint? {
         val regex = Regex("^/api/session/\\{[^/}]+\\}" + Regex.escape(suffix) + "$")
@@ -80,6 +95,7 @@ data class ApiCapabilities(
       val actions = mutableMapOf<SessionAction, ActionEndpoint>()
       (endpoint("", "PATCH", setOf("title")) ?: endpoint("/rename", "POST", setOf("title")))?.let { actions[SessionAction.RENAME] = it }
       (endpoint("/revert", "DELETE") ?: endpoint("/revert/clear", "POST"))?.let { actions[SessionAction.UNREVERT] = it }
+      endpoint("/revert/stage", "POST", setOf("messageID"))?.let { actions[SessionAction.REVERT] = it }
       /*
        * Archiving is a plain boolean on the session update body (`archived: true` archives, `false`
        * restores). The body may only ever need that one field from us, so any other required sibling
@@ -92,8 +108,59 @@ data class ApiCapabilities(
         val raw = input.obj("properties").optJSONObject("archived") ?: return@let null
         ArchiveEndpoint(ActionEndpoint("PATCH", path.removePrefix("/")), restorable = acceptsFalse(raw))
       }
+      val stopShell = paths.keys().asSequence().any { path ->
+        Regex("^/api/shell/\\{[^/}]+\\}$").matches(path) && paths.obj(path).has("delete")
+      }
+      fun compatibleBody(op: JSONObject, fields: Map<String, String>): Boolean {
+        val input = body(op)
+        val required = input.arr("required")
+        // Rename and resize are separate writes; neither may require its absent sibling.
+        if (required.length() != 0) return false
+        return fields.all { (name, type) ->
+          val raw = input.obj("properties").optJSONObject(name) ?: return@all false
+          schema(raw).str("type") == type
+        }
+      }
+      fun emptyBody(op: JSONObject): Boolean {
+        val required = body(op).arr("required")
+        return required.length() == 0
+      }
+      val pty = paths.optJSONObject("/api/pty")
+      val terminal = pty?.optJSONObject("get") != null && pty.optJSONObject("post")?.let(::emptyBody) == true &&
+        paths.keys().asSequence().filter { Regex("^/api/pty/\\{[^/}]+\\}$").matches(it) }.any { path ->
+          val item = paths.obj(path)
+          val put = item.optJSONObject("put")
+          val tokenPath = paths.optJSONObject("$path/connect-token")
+          val token = tokenPath?.optJSONObject("post")
+          val connect = paths.obj("$path/connect").optJSONObject("get")
+          val parameters = listOfNotNull(tokenPath, token).flatMap { it.arr("parameters").objects() }.map(::schema)
+          val ticketHeader = parameters.any {
+            it.str("in") == "header" && it.str("name").equals("x-opencode-ticket", ignoreCase = true)
+          }
+          val size = put?.let { schema(body(it).obj("properties").obj("size")) }
+          item.optJSONObject("get") != null && item.optJSONObject("delete") != null && put != null &&
+            compatibleBody(put, mapOf("title" to "string", "size" to "object")) &&
+            size != null && listOf("cols", "rows").all { schema(size.obj("properties").obj(it)).str("type") in setOf("number", "integer") } &&
+            token != null && emptyBody(token) && ticketHeader && connect != null
+        }
+      // Basic fork may predate boundary selection. Advertise history selection only when the
+      // instance itself documents an optional string `before` and also accepts our basic `{}` body.
+      val historicalFork = paths.keys().asSequence().any { path ->
+        if (!Regex("^/api/session/\\{[^/}]+\\}/fork$").matches(path)) return@any false
+        val op = paths.obj(path).optJSONObject("post") ?: return@any false
+        val input = body(op)
+        val before = input.obj("properties").optJSONObject("before") ?: return@any false
+        input.str("type") == "object" && input.arr("required").length() == 0 &&
+          input.optInt("minProperties", 0) == 0 &&
+          (!input.has("maxProperties") || input.optInt("maxProperties", 0) >= 1) &&
+          schema(before).str("type") == "string"
+      }
+      val projectManagement = openCodeProjectCapabilities(document)
       return ApiCapabilities(actions, endpoint("/diff", "GET") != null,
-        endpoint("/view", "POST", setOf("idle")), archive, documented = true)
+        endpoint("/view", "POST", setOf("idle")), archive, documented = true,
+        fork = endpoint("/fork", "POST") != null, stopShell = stopShell, terminal = terminal,
+        historicalFork = historicalFork, openCodeProjectManagement = projectManagement.first,
+        openCodeWorktreeManagement = projectManagement.second)
     }
 
     /**

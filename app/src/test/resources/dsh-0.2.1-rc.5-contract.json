@@ -1,0 +1,1217 @@
+{
+  "version": 1,
+  "upstream": {
+    "repository": "https://github.com/deepseek-ai/deepseek-harness",
+    "tag": "dsh-v0.2.1-rc.5",
+    "commit": "b830ec950faba0a46dda564be3e2d854afed94f1",
+    "version": "0.2.1-rc.5"
+  },
+  "sources": [
+    {
+      "package": "@deepseek-ai/dsh-api-session-controller",
+      "version": "0.2.1-rc.5",
+      "generatedFile": "lib/typert.host.js",
+      "sha256": "0c12316ed398710bcd87520f2332ebb647f0ab5f71cdfe04551c0592b48b2c3c"
+    },
+    {
+      "package": "@deepseek-ai/dsh-commands",
+      "version": "0.2.1-rc.5",
+      "generatedFile": "lib/typert.host.js",
+      "sha256": "c8359570bb029548e574fa398eb9caad00b80da29f92987cafb1de075c0e10ac"
+    },
+    {
+      "package": "@deepseek-ai/dsh-user-questions",
+      "version": "0.2.1-rc.5",
+      "generatedFile": "lib/typert.host.js",
+      "sha256": "041f0620dc0fe93e1c7fdd65fc40ec518b4516a41cc78cb6edc6b73ec92feacd"
+    },
+    {
+      "package": "@deepseek-ai/dsh-api-workspace-controller",
+      "version": "0.2.1-rc.5",
+      "generatedFile": "lib/typert.host.js",
+      "sha256": "d8d43921e8be756dea73c58b175fdb533175698ecaf07b0615a928122e85b3ba"
+    },
+    {
+      "package": "@deepseek-ai/dsh-api-job-controller",
+      "version": "0.2.1-rc.5",
+      "generatedFile": "lib/typert.host.js",
+      "sha256": "0c5aa69d3861e00d11c4f616d41589a80ca25b1900ff27c1674d187ad163096f"
+    },
+    {
+      "package": "@deepseek-ai/dsh-api-workspace-files",
+      "version": "0.2.1-rc.5",
+      "generatedFile": "lib/typert.host.js",
+      "sha256": "ffb407b64b813e4e9909cb380eb53b6bf7038f74a41fd55b4bafa932658f19c4"
+    }
+  ],
+  "methods": {
+    "session/attachment": {
+      "sourcePackage": "@deepseek-ai/dsh-api-session-controller",
+      "sourceLocation": {
+        "file": "packages/api/session-controller/src/index.ts",
+        "line": 494,
+        "column": 3
+      },
+      "args": {
+        "type": "object",
+        "properties": {
+          "request": {
+            "type": "object",
+            "properties": {
+              "sessionId": {
+                "type": "string"
+              },
+              "attachmentId": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "sessionId",
+              "attachmentId"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "request"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "session/create": {
+      "sourcePackage": "@deepseek-ai/dsh-api-session-controller",
+      "sourceLocation": {
+        "file": "packages/api/session-controller/src/index.ts",
+        "line": 301,
+        "column": 3
+      },
+      "args": {
+        "type": "object",
+        "properties": {
+          "request": {
+            "type": "object",
+            "properties": {
+              "workspaceId": {
+                "type": "string",
+                "description": "Workspace the Session joins; exclusive with `cwd`."
+              },
+              "cwd": {
+                "type": "string",
+                "description": "Directory the Session owns when no Workspace is named."
+              },
+              "sessionId": {
+                "type": "string",
+                "description": "Blank Session to reuse while it is reusable, or the identity of a new Session when none is stored under it."
+              },
+              "agentPreset": {
+                "type": "string",
+                "description": "Preset the Session runs, replacing a reused Session's recorded preset; the configured default when omitted."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "request"
+        ],
+        "additionalProperties": false
+      },
+      "result": {
+        "type": "object",
+        "properties": {
+          "sessionId": {
+            "type": "string",
+            "description": "The created or reused Session, which may differ from the requested `sessionId`."
+          },
+          "agentPreset": {
+            "type": "string",
+            "description": "Preset the Session runs, when the deployment composes a preset roster."
+          }
+        },
+        "required": [
+          "sessionId"
+        ],
+        "additionalProperties": true
+      }
+    },
+    "session/follow": {
+      "sourcePackage": "@deepseek-ai/dsh-api-session-controller",
+      "sourceLocation": {
+        "file": "packages/api/session-controller/src/index.ts",
+        "line": 537,
+        "column": 3
+      },
+      "args": {
+        "type": "object",
+        "properties": {
+          "request": {
+            "type": "object",
+            "properties": {
+              "address": {
+                "oneOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "kind": {
+                        "type": "string",
+                        "const": "session"
+                      },
+                      "sessionId": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "sessionId"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "kind": {
+                        "type": "string",
+                        "const": "subagent"
+                      },
+                      "parentSessionId": {
+                        "type": "string"
+                      },
+                      "childSessionId": {
+                        "type": "string"
+                      },
+                      "mode": {
+                        "type": "string",
+                        "enum": [
+                          "one-shot",
+                          "continuable",
+                          "unknown"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "parentSessionId",
+                      "childSessionId",
+                      "mode"
+                    ],
+                    "additionalProperties": false
+                  }
+                ]
+              },
+              "assistantStream": {
+                "type": "boolean",
+                "const": true,
+                "description": "Include process-local assistant presentation frames for the Web client."
+              },
+              "maxMessages": {
+                "type": "number"
+              },
+              "turnWindow": {
+                "type": "object",
+                "properties": {
+                  "minMessages": {
+                    "type": "number",
+                    "description": "Minimum append-origin user/assistant messages; must not exceed maxMessages."
+                  },
+                  "minTurns": {
+                    "type": "number",
+                    "description": "Minimum Turn starts crossed, including the partial Turn at beforeSeq."
+                  }
+                },
+                "required": [
+                  "minMessages",
+                  "minTurns"
+                ],
+                "additionalProperties": false,
+                "description": "Stop at a Turn start after both minima, unless maxMessages or history exhaustion wins."
+              }
+            },
+            "required": [
+              "address"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "request"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "session/page": {
+      "sourcePackage": "@deepseek-ai/dsh-api-session-controller",
+      "sourceLocation": {
+        "file": "packages/api/session-controller/src/index.ts",
+        "line": 525,
+        "column": 3
+      },
+      "args": {
+        "type": "object",
+        "properties": {
+          "request": {
+            "type": "object",
+            "properties": {
+              "address": {
+                "oneOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "kind": {
+                        "type": "string",
+                        "const": "session"
+                      },
+                      "sessionId": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "sessionId"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "kind": {
+                        "type": "string",
+                        "const": "subagent"
+                      },
+                      "parentSessionId": {
+                        "type": "string"
+                      },
+                      "childSessionId": {
+                        "type": "string"
+                      },
+                      "mode": {
+                        "type": "string",
+                        "enum": [
+                          "one-shot",
+                          "continuable",
+                          "unknown"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "parentSessionId",
+                      "childSessionId",
+                      "mode"
+                    ],
+                    "additionalProperties": false
+                  }
+                ]
+              },
+              "throughSeq": {
+                "type": "number",
+                "description": "Inclusive log cut obtained from the corresponding follow opening frame."
+              },
+              "beforeSeq": {
+                "type": "number"
+              },
+              "maxMessages": {
+                "type": "number"
+              },
+              "turnWindow": {
+                "type": "object",
+                "properties": {
+                  "minMessages": {
+                    "type": "number",
+                    "description": "Minimum append-origin user/assistant messages; must not exceed maxMessages."
+                  },
+                  "minTurns": {
+                    "type": "number",
+                    "description": "Minimum Turn starts crossed, including the partial Turn at beforeSeq."
+                  }
+                },
+                "required": [
+                  "minMessages",
+                  "minTurns"
+                ],
+                "additionalProperties": false,
+                "description": "Stop at a Turn start after both minima, unless maxMessages or history exhaustion wins."
+              }
+            },
+            "required": [
+              "address",
+              "throughSeq"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "request"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "session/prompt": {
+      "sourcePackage": "@deepseek-ai/dsh-api-session-controller",
+      "sourceLocation": {
+        "file": "packages/api/session-controller/src/index.ts",
+        "line": 462,
+        "column": 9
+      },
+      "args": {
+        "type": "object",
+        "properties": {
+          "request": {
+            "type": "object",
+            "properties": {
+              "requestId": {
+                "type": "string",
+                "description": "Client-minted identity persisted on the exact accepted user message."
+              },
+              "sessionId": {
+                "type": "string"
+              },
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "queue",
+                  "steer"
+                ]
+              },
+              "content": {
+                "type": "array",
+                "items": {
+                  "oneOf": [
+                    {
+                      "type": "object",
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "text"
+                        },
+                        "text": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "type",
+                        "text"
+                      ],
+                      "additionalProperties": false
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "image"
+                        },
+                        "mediaType": {
+                          "type": "string",
+                          "enum": [
+                            "image/png",
+                            "image/jpeg",
+                            "image/webp",
+                            "image/gif"
+                          ]
+                        },
+                        "data": {
+                          "type": "string"
+                        },
+                        "name": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "type",
+                        "mediaType",
+                        "data"
+                      ],
+                      "additionalProperties": false
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "file"
+                        },
+                        "receiptId": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "type",
+                        "receiptId"
+                      ],
+                      "additionalProperties": false
+                    }
+                  ]
+                },
+                "description": "At least one non-whitespace text part or attachment."
+              },
+              "clientTimeZone": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "requestId",
+              "sessionId",
+              "mode",
+              "content"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "request"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "session/projections": {
+      "sourcePackage": "@deepseek-ai/dsh-api-session-controller",
+      "sourceLocation": {
+        "file": "packages/api/session-controller/src/index.ts",
+        "line": 548,
+        "column": 9
+      },
+      "args": {
+        "type": "object",
+        "properties": {
+          "request": {
+            "type": "object",
+            "properties": {
+              "sessionId": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "sessionId"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "request"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "session/selectModel": {
+      "sourcePackage": "@deepseek-ai/dsh-api-session-controller",
+      "sourceLocation": {
+        "file": "packages/api/session-controller/src/index.ts",
+        "line": 311,
+        "column": 3
+      },
+      "args": {
+        "type": "object",
+        "properties": {
+          "request": {
+            "type": "object",
+            "properties": {
+              "sessionId": {
+                "type": "string"
+              },
+              "provider": {
+                "type": "string"
+              },
+              "model": {
+                "type": "string"
+              },
+              "reasoningEffort": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "sessionId",
+              "provider",
+              "model"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "request"
+        ],
+        "additionalProperties": false
+      },
+      "result": {
+        "type": "object",
+        "properties": {
+          "selected": {
+            "type": "object",
+            "properties": {
+              "provider": {
+                "type": "string"
+              },
+              "model": {
+                "type": "string"
+              },
+              "reasoningEffort": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "provider",
+              "model"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "required": [
+          "selected"
+        ],
+        "additionalProperties": true
+      }
+    },
+    "session/updateQueue": {
+      "sourcePackage": "@deepseek-ai/dsh-api-session-controller",
+      "sourceLocation": {
+        "file": "packages/api/session-controller/src/index.ts",
+        "line": 504,
+        "column": 3
+      },
+      "args": {
+        "type": "object",
+        "properties": {
+          "request": {
+            "type": "object",
+            "properties": {
+              "sessionId": {
+                "type": "string"
+              },
+              "itemId": {
+                "type": "string"
+              },
+              "action": {
+                "oneOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "kind": {
+                        "type": "string",
+                        "const": "edit"
+                      },
+                      "content": {
+                        "type": "array",
+                        "items": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string",
+                              "const": "text"
+                            },
+                            "text": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "type",
+                            "text"
+                          ],
+                          "additionalProperties": false
+                        },
+                        "description": "Non-empty text-only replacement content."
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "content"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "kind": {
+                        "type": "string",
+                        "const": "remove"
+                      }
+                    },
+                    "required": [
+                      "kind"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "kind": {
+                        "type": "string",
+                        "const": "steer"
+                      }
+                    },
+                    "required": [
+                      "kind"
+                    ],
+                    "additionalProperties": false
+                  }
+                ]
+              }
+            },
+            "required": [
+              "sessionId",
+              "itemId",
+              "action"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "request"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "commands/execute": {
+      "sourcePackage": "@deepseek-ai/dsh-commands",
+      "sourceLocation": {
+        "file": "packages/interaction/commands/src/index.ts",
+        "line": 361,
+        "column": 9
+      },
+      "args": {
+        "type": "object",
+        "properties": {
+          "agentId": {
+            "type": "string"
+          },
+          "line": {
+            "type": "string"
+          },
+          "submittedAttachments": {
+            "type": "array",
+            "items": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "image"
+                    },
+                    "mediaType": {
+                      "type": "string",
+                      "enum": [
+                        "image/png",
+                        "image/jpeg",
+                        "image/webp",
+                        "image/gif"
+                      ],
+                      "description": "Declared media type, verified against the decoded bytes during admission."
+                    },
+                    "data": {
+                      "type": "string",
+                      "description": "Canonical base64 encoding of the image bytes."
+                    },
+                    "name": {
+                      "type": "string",
+                      "description": "Optional display name; it is never interpreted as a path."
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "mediaType",
+                    "data"
+                  ],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "file"
+                    },
+                    "receiptId": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "receiptId"
+                  ],
+                  "additionalProperties": false
+                }
+              ]
+            }
+          }
+        },
+        "required": [
+          "agentId",
+          "line",
+          "submittedAttachments"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "commands/list": {
+      "sourcePackage": "@deepseek-ai/dsh-commands",
+      "sourceLocation": {
+        "file": "packages/interaction/commands/src/index.ts",
+        "line": 315,
+        "column": 3
+      },
+      "args": {
+        "type": "object",
+        "properties": {
+          "agentId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "agentId"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "userQuestions/answer": {
+      "sourcePackage": "@deepseek-ai/dsh-user-questions",
+      "sourceLocation": {
+        "file": "packages/interaction/user-questions/src/index.ts",
+        "line": 165,
+        "column": 3
+      },
+      "args": {
+        "type": "object",
+        "properties": {
+          "agentId": {
+            "type": "string"
+          },
+          "callId": {
+            "type": "string"
+          },
+          "answer": {
+            "type": "object",
+            "properties": {
+              "answers": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "description": "The answered question id."
+                    },
+                    "selected": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "Selected option labels. May accompany custom text for a multi-select question."
+                    },
+                    "custom": {
+                      "type": "string",
+                      "description": "Optional free-text \"Other\" answer."
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "selected"
+                  ],
+                  "additionalProperties": false
+                },
+                "description": "Structured answers keyed by question id."
+              }
+            },
+            "required": [
+              "answers"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "agentId",
+          "callId",
+          "answer"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "userQuestions/attachWait": {
+      "sourcePackage": "@deepseek-ai/dsh-user-questions",
+      "sourceLocation": {
+        "file": "packages/interaction/user-questions/src/index.ts",
+        "line": 216,
+        "column": 10
+      },
+      "args": {
+        "type": "object",
+        "properties": {
+          "agentId": {
+            "type": "string"
+          },
+          "callId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "agentId",
+          "callId"
+        ],
+        "additionalProperties": false
+      },
+      "result": {
+        "type": "object",
+        "properties": {
+          "remainingMs": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "remainingMs"
+        ],
+        "additionalProperties": true
+      }
+    },
+    "workspace/archiveSession": {
+      "sourcePackage": "@deepseek-ai/dsh-api-workspace-controller",
+      "sourceLocation": {
+        "file": "packages/api/workspace-controller/src/index.ts",
+        "line": 160,
+        "column": 3
+      },
+      "args": {
+        "type": "object",
+        "properties": {
+          "request": {
+            "type": "object",
+            "properties": {
+              "sessionId": {
+                "type": "string"
+              },
+              "stopActivity": {
+                "type": "boolean",
+                "description": "Stop the Session's running work — its turn, subagent descendants, owned background jobs, and active schedules — instead of refusing the archive as `workspace/session-active`. The stops are requested before the archive write and are not awaited; the response arrives once the archive set is durable."
+              }
+            },
+            "required": [
+              "sessionId"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "request"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "workspace/unarchiveSession": {
+      "sourcePackage": "@deepseek-ai/dsh-api-workspace-controller",
+      "sourceLocation": {
+        "file": "packages/api/workspace-controller/src/index.ts",
+        "line": 170,
+        "column": 3
+      },
+      "args": {
+        "type": "object",
+        "properties": {
+          "request": {
+            "type": "object",
+            "properties": {
+              "sessionId": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "sessionId"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "request"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "workspace/pinSession": {
+      "sourcePackage": "@deepseek-ai/dsh-api-workspace-controller",
+      "sourceLocation": {
+        "file": "packages/api/workspace-controller/src/index.ts",
+        "line": 180,
+        "column": 3
+      },
+      "args": {
+        "type": "object",
+        "properties": {
+          "request": {
+            "type": "object",
+            "properties": {
+              "sessionId": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "sessionId"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "request"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "workspace/unpinSession": {
+      "sourcePackage": "@deepseek-ai/dsh-api-workspace-controller",
+      "sourceLocation": {
+        "file": "packages/api/workspace-controller/src/index.ts",
+        "line": 190,
+        "column": 3
+      },
+      "args": {
+        "type": "object",
+        "properties": {
+          "request": {
+            "type": "object",
+            "properties": {
+              "sessionId": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "sessionId"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "request"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "job/list": {
+      "sourcePackage": "@deepseek-ai/dsh-api-job-controller",
+      "sourceLocation": {
+        "file": "packages/api/job-controller/src/index.ts",
+        "line": 76,
+        "column": 3
+      },
+      "args": {
+        "type": "object",
+        "properties": {
+          "request": {
+            "type": "object",
+            "properties": {
+              "sessionId": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "sessionId"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "request"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "job/follow": {
+      "sourcePackage": "@deepseek-ai/dsh-api-job-controller",
+      "sourceLocation": {
+        "file": "packages/api/job-controller/src/index.ts",
+        "line": 91,
+        "column": 3
+      },
+      "args": {
+        "type": "object",
+        "properties": {
+          "request": {
+            "type": "object",
+            "properties": {
+              "sessionId": {
+                "type": "string",
+                "description": "Owning session for the fenced read. Omitted for an unowned job, which any caller may observe."
+              },
+              "jobId": {
+                "type": "string"
+              },
+              "from": {
+                "type": "number",
+                "description": "Absolute byte offset to resume from (a prior frame's `next`). Omitted, the stream starts at the oldest retained byte."
+              }
+            },
+            "required": [
+              "jobId"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "request"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "job/kill": {
+      "sourcePackage": "@deepseek-ai/dsh-api-job-controller",
+      "sourceLocation": {
+        "file": "packages/api/job-controller/src/index.ts",
+        "line": 110,
+        "column": 3
+      },
+      "args": {
+        "type": "object",
+        "properties": {
+          "request": {
+            "type": "object",
+            "properties": {
+              "sessionId": {
+                "type": "string",
+                "description": "Session whose job list carries the job; the fenced lookup reads as it."
+              },
+              "jobId": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "sessionId",
+              "jobId"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "request"
+        ],
+        "additionalProperties": false
+      },
+      "result": {
+        "type": "object",
+        "properties": {
+          "outcome": {
+            "type": "string",
+            "enum": [
+              "requested",
+              "already-finished"
+            ]
+          }
+        },
+        "required": [
+          "outcome"
+        ],
+        "additionalProperties": true
+      }
+    },
+    "workspaceFiles/readBytes": {
+      "sourcePackage": "@deepseek-ai/dsh-api-workspace-files",
+      "sourceLocation": {
+        "file": "packages/api/workspace-files/src/index.ts",
+        "line": 258,
+        "column": 9
+      },
+      "args": {
+        "type": "object",
+        "properties": {
+          "workspaceFileScopeId": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "options": {
+            "type": "object",
+            "properties": {
+              "range": {
+                "type": "object",
+                "properties": {
+                  "offset": {
+                    "type": "number",
+                    "description": "First byte of the window. Defaults to 0."
+                  },
+                  "length": {
+                    "type": "number",
+                    "description": "Largest number of bytes in the window. Defaults to, and may not exceed, the configured `maxBytes`."
+                  }
+                },
+                "required": [],
+                "additionalProperties": false,
+                "description": "Byte window; omit to read the complete file under the configured `maxFileBytes` cap."
+              },
+              "baseFile": {
+                "type": "string",
+                "description": "Base file, absolute or workspace-relative; resolve the relative target from its directory."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "workspaceFileScopeId",
+          "path",
+          "options"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "workspaceFiles/list": {
+      "sourcePackage": "@deepseek-ai/dsh-api-workspace-files",
+      "sourceLocation": {
+        "file": "packages/api/workspace-files/src/index.ts",
+        "line": 304,
+        "column": 9
+      },
+      "args": {
+        "type": "object",
+        "properties": {
+          "workspaceFileScopeId": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspaceFileScopeId",
+          "path"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "workspaceFiles/read": {
+      "sourcePackage": "@deepseek-ai/dsh-api-workspace-files",
+      "sourceLocation": {
+        "file": "packages/api/workspace-files/src/index.ts",
+        "line": 234,
+        "column": 9
+      },
+      "args": {
+        "type": "object",
+        "properties": {
+          "workspaceFileScopeId": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "range": {
+            "type": "object",
+            "properties": {
+              "offset": {
+                "type": "number",
+                "description": "First line of the page. Defaults to 1."
+              },
+              "limit": {
+                "type": "number",
+                "description": "Largest number of lines on the page. Defaults to, and may not exceed, the configured `maxLines`."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "workspaceFileScopeId",
+          "path",
+          "range"
+        ],
+        "additionalProperties": false
+      }
+    }
+  }
+}

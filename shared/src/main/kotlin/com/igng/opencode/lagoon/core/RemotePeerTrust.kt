@@ -12,6 +12,8 @@ internal interface RemotePeerTrustStore {
   fun pinned(scope: RemotePeerScope): String?
   /** Atomically insert only if absent; return the key actually stored. */
   fun pinIfAbsent(scope: RemotePeerScope, publicKey: String): String
+  /** Atomically replace [expectedPublicKey] with [replacementPublicKey]. */
+  fun replaceIfMatches(scope: RemotePeerScope, expectedPublicKey: String, replacementPublicKey: String): Boolean = false
 }
 
 internal class RemoteTrustException(message: String, val changed: Boolean) : IOException(message)
@@ -23,6 +25,34 @@ internal class RemotePeerTrust(private val store: RemotePeerTrustStore) {
     val stored = store.pinIfAbsent(scope, key)
     if (!sameKey(stored, key)) throw RemoteTrustException("Host 身份公钥已变更，请先移除旧信任记录", changed = true)
     return key
+  }
+
+  /**
+   * Replace a changed pin only after the caller has explicitly confirmed the new Host key.
+   * The expected key is compared atomically by the store; a race never overwrites another key.
+   */
+  fun replaceAfterConfirmation(
+    scope: RemotePeerScope,
+    host: RemoteHost,
+    expectedPublicKey: String
+  ): String {
+    validateScope(scope, host)
+    val replacement = host.publicKey?.takeIf(RemoteServerApi::validPublicKey)
+      ?: throw IOException("Host 身份公钥无效")
+    if (!RemoteServerApi.validPublicKey(expectedPublicKey)) throw IOException("旧 Host 身份公钥无效")
+    if (sameKey(expectedPublicKey, replacement)) {
+      val stored = store.pinned(scope)
+      if (stored != null && sameKey(stored, replacement)) return replacement
+      throw RemoteTrustException("Host 身份公钥尚未获信任，请重新核对身份", changed = false)
+    }
+    if (!store.replaceIfMatches(scope, expectedPublicKey, replacement)) {
+      throw RemoteTrustException("Host 身份公钥已变化，请重新核对身份", changed = true)
+    }
+    val stored = store.pinned(scope)
+    if (stored == null || !sameKey(stored, replacement)) {
+      throw RemoteTrustException("Host 身份公钥替换未生效，请重新核对身份", changed = true)
+    }
+    return replacement
   }
 
   fun verify(scope: RemotePeerScope, host: RemoteHost): String {

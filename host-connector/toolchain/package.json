@@ -1,0 +1,22 @@
+{
+  "name": "connector-tools",
+  "private": true,
+  "description": "Scratch-only verifier toolchain; install using the committed lockfile outside this repository",
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.5",
+    "@lukeburns/clatterjs": "^1.0.0",
+    "@noble/ciphers": "^1.3.0",
+    "@noble/curves": "^1.9.7",
+    "@noble/hashes": "^1.8.0",
+    "@types/node": "^24.9.0",
+    "@types/ws": "^8.18.1",
+    "@xterm/addon-serialize": "^0.14.0",
+    "@xterm/headless": "^6.0.0",
+    "esbuild": "^0.25.12",
+    "qrcode": "^1.5.4",
+    "typescript": "^5.9.3",
+    "werift": "^0.26.0",
+    "ws": "^8.21.3",
+    "zod": "^4.6.7"
+  }
+}

@@ -9,7 +9,8 @@ import java.util.concurrent.ConcurrentHashMap
 
 class ServerStore internal constructor(private val preferences: SharedPreferences, private val secrets: SharedPreferences,
   private val encryptValue: (String) -> String, private val decryptValue: (String) -> String,
-  private val appContext: Context? = null) : OverviewStore {
+  private val appContext: Context? = null,
+  private val readConnectionGraph: (() -> ConnectionGraph?)? = null) : OverviewStore, ConnectionRouteStore {
   init {
     if (preferences.getInt(PREVIEW_FORMAT_VERSION_KEY, 0) != PREVIEW_FORMAT_VERSION) {
       val plain = preferences.edit()
@@ -19,6 +20,9 @@ class ServerStore internal constructor(private val preferences: SharedPreference
       secrets.all.keys.filter { it.startsWith("preview:") }.forEach(encrypted::remove)
       encrypted.apply()
     }
+    // Configuration writes span the plain and encrypted stores. Recover locally, never by dialing.
+    runCatching { synchronized(configurationLock) { recoverConfigurationWrite() } }
+      .onFailure { Diagnostics.warn("ServerStore", "配置保存日志无法恢复，保留原资料并暂停认证") }
   }
   internal val remoteDevices: RemoteDeviceStore by lazy {
     AndroidRemoteDeviceStore(requireNotNull(appContext) { "Remote device storage needs Android Context" })
@@ -41,26 +45,110 @@ class ServerStore internal constructor(private val preferences: SharedPreference
     context.applicationContext
   )
 
+  /** Weak identity table: SharedPreferences proxies need not implement equals/hashCode. */
+  private class PendingConfigurations {
+    private val entries = mutableListOf<Pair<java.lang.ref.WeakReference<SharedPreferences>, String>>()
+    private fun prune() { entries.removeAll { it.first.get() == null } }
+    operator fun get(key: SharedPreferences): String? { prune(); return entries.firstOrNull { it.first.get() === key }?.second }
+    operator fun set(key: SharedPreferences, value: String) { remove(key); entries += java.lang.ref.WeakReference(key) to value }
+    fun containsKey(key: SharedPreferences): Boolean = get(key) != null
+    fun remove(key: SharedPreferences) { entries.removeAll { it.first.get() == null || it.first.get() === key } }
+  }
+
   private val previewCache = ConcurrentHashMap<String, SessionPreview>()
 
-  fun profiles(): List<ServerProfile> = try {
-    JSONArray(preferences.getString("profiles", "[]")).objects().map {
-      val id = it.str("id")
-      ServerProfile(id, it.str("name"), it.str("url"), it.str("username"),
-        it.optBoolean("autoConnect", true), it.optBoolean("notifications", true), it.optBoolean("allowCleartext", false),
-        ServerKind.fromWire(it.str("kind")), DshAuthMode.fromWire(it.str("dshAuth")), it.str("remoteHostId").takeIf(String::isNotBlank),
-        it.str("remoteHostFingerprint").takeIf(String::isNotBlank), it.str("sshHostId").takeIf(String::isNotBlank),
-        it.optBoolean("enabled", true))
+  /** Runtime view only. Profile writers and graph migration must keep using [readProfiles]. */
+  fun profiles(): List<ServerProfile> {
+    val raw = try {
+      readProfiles()
+    } catch (error: Exception) {
+      Diagnostics.warn("ServerStore", "profiles 解析失败，保留原记录并停止资料写入", error)
+      return emptyList()
     }
-  } catch (error: Exception) {
-    Diagnostics.warn("ServerStore", "profiles 解析失败，已忽略全部服务器资料", error)
-    emptyList()
+    if (hasPendingConfiguration()) return ConnectionRuntimeProjection.apply(raw, graph = null, unavailable = true)
+    val graph = try {
+      if (readConnectionGraph != null) readConnectionGraph.invoke() else readStoredConnectionGraph()
+    } catch (_: Exception) {
+      // A present but unreadable/future graph is not the same as an absent graph. Preserve every
+      // raw leaf and user preference, but fail closed until the parent gates can be read safely.
+      Diagnostics.warn("ServerStore", "connection graph 不可读，保留资料并暂停连接")
+      return ConnectionRuntimeProjection.apply(raw, graph = null, unavailable = true)
+    }
+    return ConnectionRuntimeProjection.apply(raw, graph)
+  }
+
+  /** Execution admission is stricter than the display overlay; it never migrates or writes. */
+  override fun runtimeProfile(expected: ServerProfile): ServerProfile {
+    val (current, route) = admitExpectedRoute(expected)
+    return route.executionProfile(current).copy(parentEnabled = true)
+  }
+
+  override fun runtimeRoute(expected: ServerProfile): ConnectionRouteSnapshot = admitExpectedRoute(expected).second
+
+  private fun admitExpectedRoute(expected: ServerProfile): Pair<ServerProfile, ConnectionRouteSnapshot> {
+    check(expected.effectiveEnabled) { "连接或其所属接入源/主机已停用" }
+    check(!hasPendingConfiguration()) { "连接配置保存尚未恢复，已暂停认证，请重试保存" }
+    val current = readProfiles().singleOrNull { it.id == expected.id } ?: error("连接资料已移除")
+    if (!ConnectionRouteAdmission.sameLeafRoute(current, expected)) {
+      throw StaleConnectionRouteException("连接路由已变化，旧页面或客户端不能继续操作，请重新连接")
+    }
+    val graph = if (readConnectionGraph != null) readConnectionGraph.invoke() else readStoredConnectionGraph()
+    return current to ConnectionRouteAdmission.requireCurrent(current, graph)
+  }
+
+  /** Saved sources may exist without leaves; discovery still obeys their committed parent gates. */
+  internal fun requireParentRoute(sourceId: String, hostId: String): Pair<ConnectionSource, HostBinding> {
+    val graph = (if (readConnectionGraph != null) readConnectionGraph.invoke() else readStoredConnectionGraph())
+      ?: error("接入源尚未保存到连接图，请重新保存后发现服务")
+    val source = graph.sources.singleOrNull { it.id == sourceId } ?: error("接入源已移除")
+    val host = graph.hosts.singleOrNull { it.id == hostId && it.sourceId == sourceId } ?: error("主机绑定已移除")
+    check(source.enabled && host.enabled) { "接入源或主机已停用，请先启用父级" }
+    return source to host
+  }
+
+  private fun readStoredConnectionGraph(): ConnectionGraph? {
+    val graphPreferences = appContext?.getSharedPreferences("connection-graph", Context.MODE_PRIVATE) ?: return null
+    if (!graphPreferences.contains("graph")) return null
+    val raw = graphPreferences.getString("graph", null) ?: error("Connection graph is not a string")
+    // Do not call ConnectionGraphStore here: runtime reads must not migrate, recover a journal or
+    // write anything. Only the committed primary document is authoritative for parent gating.
+    return ConnectionGraphCodec.decode(raw)
+  }
+
+  /** Raw leaf preferences only. Writers/migration must never replace an unreadable document. */
+  internal fun readProfiles(): List<ServerProfile> = decodeProfiles(preferences.getString("profiles", "[]") ?: error("连接资料不是文本"))
+
+  private fun decodeProfiles(raw: String): List<ServerProfile> {
+    try {
+      val array = JSONArray(raw)
+      check(array.length() <= 5000) { "连接资料超过上限" }
+      val profiles = (0 until array.length()).map { index ->
+        val item = array.getJSONObject(index)
+        val id = item.getString("id").also { check(it.isNotBlank() && it.length <= 512 && '\u0000' !in it) }
+        ServerProfile(id, item.str("name"), item.str("url"), item.str("username"),
+          item.optBoolean("autoConnect", true), item.optBoolean("notifications", true), item.optBoolean("allowCleartext", false),
+          if (!item.has("kind")) ServerKind.OPENCODE else MigrationProjection.legacyKind(item.getString("kind")),
+          DshAuthMode.fromWire(item.str("dshAuth")), item.str("remoteHostId").takeIf(String::isNotBlank),
+          item.str("remoteHostFingerprint").takeIf(String::isNotBlank), item.str("sshHostId").takeIf(String::isNotBlank),
+          item.optBoolean("enabled", true), item.str("sshServicePath").takeIf(String::isNotBlank),
+          parentEnabled = true, remoteServiceId = item.str("remoteServiceId").takeIf(String::isNotBlank))
+      }
+      check(profiles.distinctBy { it.id }.size == profiles.size) { "连接资料身份重复" }
+      return profiles
+    } catch (error: Exception) {
+      throw java.io.IOException("连接资料损坏，已停止写入以保护原记录", error)
+    }
   }
 
   private companion object {
     const val PREVIEW_FORMAT_VERSION_KEY = "projectedPreviewFormatVersion"
     const val PREVIEW_FORMAT_VERSION = 3
     val taskLock = Any()
+    val configurationLock = Any()
+    const val CONFIGURATION_JOURNAL_KEY = "configuration-save-journal-v1"
+    // Android commit(false) still changes the in-process map. Retain the encrypted journal until
+    // every durability barrier succeeded, even if a failed cleanup already removed its key in RAM.
+    val unconfirmedConfigurations = PendingConfigurations()
   }
 
   override fun taskStates(id: String): Map<String, TaskState> = preferences.all.filterKeys { it.startsWith("taskState:$id:") }
@@ -363,28 +451,33 @@ class ServerStore internal constructor(private val preferences: SharedPreference
 
   fun deviceId(): String = preferences.getString("deviceId", null) ?: UUID.randomUUID().toString().also { preferences.edit().putString("deviceId", it).apply() }
 
+  override fun requireCurrentAuthentication(id: String, captured: ServerCredentials) {
+    check(!hasPendingConfiguration()) { "连接配置保存尚未恢复，已暂停认证" }
+    check(readProfiles().any { it.id == id }) { "连接资料已移除，旧认证不能继续使用" }
+    val current = credentials(id)
+    check(current.username == captured.username && current.password == captured.password) {
+      "连接认证已变化，请重新连接后操作"
+    }
+  }
+
   override fun credentials(id: String): ServerCredentials {
     val profile = profiles().firstOrNull { it.id == id }
     val fallback = profile?.username ?: "opencode"
+    if (profile == null) return ServerCredentials(fallback)
+    if (hasPendingConfiguration()) return ServerCredentials(fallback)
     // SSH credentials live in the dedicated SSH store. Never try to interpret `ssh://…` as an HTTP origin.
-    if (profile?.sshHostId != null) return ServerCredentials(fallback)
+    if (profile.sshHostId != null) return ServerCredentials(fallback)
     return try {
       val raw = decrypt(id)
       when {
         raw == null -> ServerCredentials(fallback)
         !raw.trimStart().startsWith("{") -> {
-          // 旧版明文凭据没有 origin 绑定：读取时迁移为 JSON（绑定当前地址），之后改地址会像新格式一样拒绝旧凭据。
-          if (profile != null) {
-            val payload = JSONObject().put("origin", credentialOrigin(profile.url)).put("username", fallback)
-              .put("password", raw).put("cookie", "")
-            runCatching { secrets.edit().putString(id, encryptValue(payload.toString())).apply() }
-              .onFailure { Diagnostics.warn("ServerStore", "旧凭据迁移失败，保留原格式") }
-          }
+          // Legacy material is read-only here. Only an explicit journaled save may bind/replace it.
           ServerCredentials(fallback, raw)
         }
         else -> {
           val json = JSONObject(raw)
-          if (json.has("origin") && (profile == null || json.str("origin") != credentialOrigin(profile.url))) return ServerCredentials(fallback)
+          if (json.has("origin") && json.str("origin") != credentialOrigin(profile.url)) return ServerCredentials(fallback)
           ServerCredentials(
             username = json.str("username").ifBlank { fallback },
             password = json.str("password"),
@@ -408,33 +501,127 @@ class ServerStore internal constructor(private val preferences: SharedPreference
       .putString("location:$id:project", project).putString("location:$id:session", session).apply()
   }
 
-  fun save(profile: ServerProfile, password: String?, cookie: String? = null, credentialUsername: String? = null) {
-    val previousProfile = profiles().firstOrNull { it.id == profile.id }
+  private fun hasPendingConfiguration(): Boolean = synchronized(configurationLock) {
+    secrets.contains(CONFIGURATION_JOURNAL_KEY) || unconfirmedConfigurations.containsKey(secrets)
+  }
+
+  /** Recover only an exact prepared before/after pair; an unrelated current document is never overwritten. */
+  private fun recoverConfigurationWrite() {
+    if (!hasPendingConfiguration()) return
+    fun invalid(): Nothing = throw java.io.IOException("连接配置保存日志不可读，已保留原资料并停止认证")
+    val cached = unconfirmedConfigurations[secrets]
+    val stored = if (secrets.contains(CONFIGURATION_JOURNAL_KEY)) secrets.getString(CONFIGURATION_JOURNAL_KEY, null) ?: invalid() else null
+    if (stored != null && cached != null && stored != cached) invalid()
+    val encrypted = stored ?: cached ?: invalid()
+    val journal = try {
+      val parser = org.json.JSONTokener(decryptValue(encrypted))
+      (parser.nextValue() as? JSONObject)?.takeIf { parser.nextClean() == '\u0000' } ?: invalid()
+    } catch (_: Exception) { invalid() }
+    val keys = setOf("version", "id", "before", "after", "beforeMigration", "afterMigration", "oldSecret", "newSecret", "beforeToken", "afterToken")
+    if (journal.keys().asSequence().toSet() != keys || journal.opt("version") != 1) invalid()
+    fun text(key: String): String? = when (val value = journal.opt(key)) {
+      JSONObject.NULL -> null
+      is String -> value
+      else -> invalid()
+    }
+    val id = text("id")?.takeIf { it.isNotBlank() && it.length <= 512 && '\u0000' !in it } ?: invalid()
+    val before = text("before")
+    val after = text("after") ?: invalid()
+    val oldProfiles = decodeProfiles(before ?: "[]")
+    val newProfiles = decodeProfiles(after)
+    if (newProfiles.count { it.id == id } != 1 || oldProfiles.filterNot { it.id == id } != newProfiles.filterNot { it.id == id }) invalid()
+    val migrationKey = "remoteMigration:$id"
+    val previousMigration = text("beforeMigration")
+    val nextMigration = text("afterMigration")
+    val oldSecret = text("oldSecret")
+    val newSecret = text("newSecret")
+    val current = preferences.getString("profiles", null)
+    val currentMigration = preferences.getString(migrationKey, null)
+    val slot = secrets.getString(id, null)
+    val token = preferences.getString("configuration-save-token", null)
+    val beforeToken = text("beforeToken")
+    val afterToken = text("afterToken")?.takeIf { it.isNotBlank() && it.length <= 128 } ?: invalid()
+    // Android commit(false) can still update memory. Both exact snapshots are valid, no third one is.
+    val committed = current == after && currentMigration == nextMigration && token == afterToken
+    val unchanged = current == before && currentMigration == previousMigration && token == beforeToken
+    if (!committed && !unchanged || slot != oldSecret && slot != newSecret) invalid()
+    val desired = if (committed) newSecret else oldSecret
+    unconfirmedConfigurations[secrets] = encrypted
+    // RAM equality is NOT disk evidence. First durably re-prepare the recovery record, then
+    // durably reaffirm the selected plain snapshot; only then may old credentials be retired.
+    check(secrets.edit().putString(CONFIGURATION_JOURNAL_KEY, encrypted).commit()) { "配置恢复准备尚未确认，已暂停认证" }
+    check(preferences.edit().putString("profiles", if (committed) after else before)
+      .putString(migrationKey, if (committed) nextMigration else previousMigration)
+      .putString("configuration-save-token", if (committed) afterToken else beforeToken).commit()) {
+      "配置恢复的资料落盘未确认，已保留旧凭据和保存日志"
+    }
+    if (!secrets.edit().putString(id, desired).remove(CONFIGURATION_JOURNAL_KEY).commit())
+      throw java.io.IOException("连接配置恢复尚未确认，已保留保存日志并暂停认证")
+    unconfirmedConfigurations.remove(secrets)
+  }
+
+  /** Preserve malformed-but-decryptable records too; fallback reads are never overwrite authority. */
+  private fun requireReadableCredentials(id: String) {
+    if (!secrets.contains(id)) return
+    val encrypted = secrets.getString(id, null) ?: error("已保存凭据不是文本，已停止覆盖")
+    val raw = try { decryptValue(encrypted) } catch (_: Exception) {
+      throw java.io.IOException("已保存凭据暂不可读，已停止覆盖并保留原记录")
+    }
+    if (raw.trimStart().startsWith("{")) try {
+      val parser = org.json.JSONTokener(raw)
+      val json = parser.nextValue() as? JSONObject ?: error("Credential record is not an object")
+      check(parser.nextClean() == '\u0000')
+      for (key in listOf("origin", "username", "password", "cookie"))
+        check(!json.has(key) || json.opt(key) is String)
+    } catch (_: Exception) { throw java.io.IOException("已保存凭据格式损坏，已停止覆盖并保留原记录") }
+  }
+
+  fun save(profile: ServerProfile, password: String?, cookie: String? = null, credentialUsername: String? = null) = synchronized(configurationLock) {
+    recoverConfigurationWrite()
+    val currentProfiles = readProfiles()
+    val previousProfile = currentProfiles.firstOrNull { it.id == profile.id }
+    if (password == null || cookie == null) requireReadableCredentials(profile.id)
     val previousCredentials = credentials(profile.id)
     val next = profileCredentials(previousProfile?.url, profile.url, previousCredentials,
       credentialUsername ?: profile.username, password, cookie)
-    // Encrypt everything before mutating either store. Credentials carry their own origin, so a
-    // crash between these two preference commits can only cause a missing login, never a leak.
+    // Prepare both representations before a durable change. Keep the old credential slot until
+    // the profile commit is known; an encrypted journal preserves both snapshots across restart.
     // SSH-backed DSH profiles keep their private key/password in the SSH secret store; their URL is
     // a synthetic `ssh://…` identity that must never be parsed as an HTTP credential origin.
     val encoded = if (profile.sshHostId != null || (next.password.isEmpty() && next.cookie.isEmpty())) null else encryptValue(JSONObject()
       .put("origin", credentialOrigin(profile.url)).put("username", next.username).put("password", next.password).put("cookie", next.cookie).toString())
-    val updated = profiles().filterNot { it.id == profile.id } + profile
+    val updated = currentProfiles.filterNot { it.id == profile.id } + profile
     val json = profilesJson(updated)
-    check(secrets.edit().putString(profile.id, encoded).commit()) { "无法保存凭据，请重试" }
     val migration = DshRemoteMigration.plan(profile)
-    val editor = preferences.edit().putString("profiles", json)
-    if (migration == null) editor.remove("remoteMigration:${profile.id}")
-    else editor.putString("remoteMigration:${profile.id}", JSONObject().put("retained", true).put("reason", migration.reason).toString())
-    check(editor.commit()) { "无法保存服务器资料，请重试" }
+    val migrationKey = "remoteMigration:${profile.id}"
+    val migrationValue = migration?.let { JSONObject().put("retained", true).put("reason", it.reason).toString() }
+    val before = preferences.getString("profiles", null)
+    val transaction = UUID.randomUUID().toString()
+    val journal = JSONObject().put("version", 1).put("id", profile.id)
+      .put("beforeToken", preferences.getString("configuration-save-token", null) ?: JSONObject.NULL).put("afterToken", transaction)
+      .put("before", before ?: JSONObject.NULL).put("after", json)
+      .put("beforeMigration", preferences.getString(migrationKey, null) ?: JSONObject.NULL)
+      .put("afterMigration", migrationValue ?: JSONObject.NULL)
+      .put("oldSecret", secrets.getString(profile.id, null) ?: JSONObject.NULL)
+      .put("newSecret", encoded ?: JSONObject.NULL)
+    val encryptedJournal = encryptValue(journal.toString())
+    unconfirmedConfigurations[secrets] = encryptedJournal
+    check(secrets.edit().putString(CONFIGURATION_JOURNAL_KEY, encryptedJournal).commit()) { "无法准备配置保存，原凭据已保留" }
+    val editor = preferences.edit().putString("profiles", json).putString(migrationKey, migrationValue).putString("configuration-save-token", transaction)
+    check(editor.commit()) { "无法保存服务器资料，原凭据已保留，请重试" }
+    check(secrets.edit().putString(profile.id, encoded).remove(CONFIGURATION_JOURNAL_KEY).commit()) {
+      "配置保存结果尚未确认，已暂停认证；请重启或重试保存以恢复"
+    }
+    unconfirmedConfigurations.remove(secrets)
   }
 
   /**
    * Changes only the display name. Credentials, routing, migration notes and every other field stay
    * untouched, so a naming repair can never invalidate a login.
    */
-  fun rename(id: String, name: String) {
-    val updated = profiles().map { if (it.id == id) it.copy(name = name) else it }
+  fun rename(id: String, name: String) = synchronized(configurationLock) {
+    recoverConfigurationWrite()
+    val updated = readProfiles().map { if (it.id == id) it.copy(name = name) else it }
     check(preferences.edit().putString("profiles", profilesJson(updated)).commit()) { "无法保存服务器资料，请重试" }
   }
 
@@ -442,12 +629,22 @@ class ServerStore internal constructor(private val preferences: SharedPreference
    * Enables or disables one saved connection without touching credentials, caches, drafts or the
    * unread ledger. A no-op when the profile is already in the requested state.
    */
-  fun setProfileEnabled(id: String, enabled: Boolean): Boolean {
-    val current = profiles()
-    val profile = current.firstOrNull { it.id == id } ?: return false
-    if (profile.enabled == enabled) return true
+  fun setProfileEnabled(id: String, enabled: Boolean): Boolean = synchronized(configurationLock) {
+    recoverConfigurationWrite()
+    val current = readProfiles()
+    val profile = current.firstOrNull { it.id == id } ?: return@synchronized false
+    if (profile.enabled == enabled) return@synchronized true
     val updated = current.map { if (it.id == id) it.copy(enabled = enabled) else it }
-    return preferences.edit().putString("profiles", profilesJson(updated)).commit()
+    preferences.edit().putString("profiles", profilesJson(updated)).commit()
+  }
+
+  /** Updates display routes for all leaves of one saved source without rewriting child preferences or credentials. */
+  fun updateSshSourceRoute(hostId: String, url: String, username: String) = synchronized(configurationLock) {
+    recoverConfigurationWrite()
+    val updated = readProfiles().map { profile ->
+      if (profile.sshHostId == hostId) profile.copy(url = url, username = username) else profile
+    }
+    check(preferences.edit().putString("profiles", profilesJson(updated)).commit()) { "无法保存 SSH source 路由" }
   }
 
   private fun profilesJson(profiles: List<ServerProfile>): String = JSONArray().apply {
@@ -458,7 +655,8 @@ class ServerStore internal constructor(private val preferences: SharedPreference
         .put("allowCleartext", item.allowCleartext).put("kind", item.kind.wire).put("dshAuth", item.dshAuth.wire)
         .put("enabled", item.enabled)
         .putOpt("remoteHostId", item.remoteHostId).putOpt("remoteHostFingerprint", item.remoteHostFingerprint)
-        .putOpt("sshHostId", item.sshHostId))
+        .putOpt("sshHostId", item.sshHostId).putOpt("sshServicePath", item.sshServicePath)
+        .putOpt("remoteServiceId", item.remoteServiceId))
     }
   }.toString()
 
@@ -473,12 +671,17 @@ class ServerStore internal constructor(private val preferences: SharedPreference
    * 只更新已保存凭据里的会话 Cookie（DSH 换到新 Cookie 或旧 Cookie 被拒）。[url] 是签发该 Cookie
    * 时的服务器地址：资料已改到别的地址时丢弃，绝不把旧地址的 Cookie 绑到新地址上。
    */
-  override fun rememberCookie(id: String, url: String, cookie: String) {
-    val profile = profiles().firstOrNull { it.id == id } ?: return
-    if (profile.sshHostId != null) return
-    if (profile.url != url) return
+  override fun rememberCookie(id: String, url: String, cookie: String) = synchronized(configurationLock) {
+    if (hasPendingConfiguration()) return@synchronized
+    val profile = profiles().firstOrNull { it.id == id } ?: return@synchronized
+    if (profile.sshHostId != null) return@synchronized
+    if (profile.url != url) return@synchronized
+    try { requireReadableCredentials(id) } catch (_: Exception) {
+      Diagnostics.warn("ServerStore", "旧认证回调未覆盖不可读凭据")
+      return@synchronized
+    }
     val current = credentials(id)
-    if (current.cookie == cookie) return
+    if (current.cookie == cookie) return@synchronized
     val encoded = if (current.password.isEmpty() && cookie.isEmpty()) null else encryptValue(JSONObject()
       .put("origin", credentialOrigin(profile.url)).put("username", current.username).put("password", current.password).put("cookie", cookie).toString())
     secrets.edit().putString(id, encoded).apply()
@@ -487,20 +690,22 @@ class ServerStore internal constructor(private val preferences: SharedPreference
     val value = secrets.getString(id, null) ?: return null
     decryptValue(value)
   } catch (_: Exception) { null }
-  fun delete(id: String) {
+  fun delete(id: String) = synchronized(configurationLock) {
+    recoverConfigurationWrite()
+    val remaining = readProfiles().filterNot { it.id == id }
     previewCache.keys.removeAll { it.startsWith("$id\u0000") }
-    val editor = preferences.edit().putString("profiles", profilesJson(profiles().filterNot { it.id == id }))
+    val editor = preferences.edit().putString("profiles", profilesJson(remaining))
       .remove("directories:$id").remove("sessionNotices:$id").remove("collapsedSections:$id").remove("collapsedProjects:$id").remove("pinned:$id").remove("remoteMigration:$id")
       .remove("backgroundRunning:$id")
       .remove("modelVisibility:$id").remove("modelVisibilityConfigured:$id").remove("modelVariants:$id").remove("recentModels:$id").remove("scope:$id")
       .remove("newSessionDefaults:$id")
     val prefixes = listOf("location", "preview", "configuration", "taskRead", "taskState", "taskParent", "taskTime", "notification", "taskLedgerVersion").map { "$it:$id:" }
     preferences.all.keys.filter { key -> prefixes.any(key::startsWith) }.forEach(editor::remove)
-    editor.apply()
+    check(editor.commit()) { "服务器资料删除未确认，已保留凭据和草稿，请刷新核对" }
     val encrypted = secrets.edit().remove(id)
     val secretPrefixes = listOf("draft", "references", "preview").map { "$it:$id:" }
     secrets.all.keys.filter { key -> secretPrefixes.any(key::startsWith) }.forEach(encrypted::remove)
-    encrypted.apply()
+    check(encrypted.commit()) { "服务器资料已移除，但加密记录清理未确认，请刷新核对" }
     if (selectedId() == id) select("", null, null)
   }
 }

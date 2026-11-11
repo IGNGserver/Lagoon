@@ -3,18 +3,20 @@ package com.igng.opencode.lagoon.core
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.async
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.awaitCancellation
-import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asSharedFlow
-import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
@@ -121,6 +123,7 @@ class DshApi(
     .build()
 
   private val ioScope = SharedHttp.ioScope
+  private val muxOwner = PhysicalMuxOwner()
 
   init {
     require(base.scheme == "https" || base.scheme == "http" && profile.allowCleartext) { "HTTP 明文连接未获授权，请在服务器资料中明确开启" }
@@ -131,18 +134,55 @@ class DshApi(
   private val known = ConcurrentHashMap<String, Session>()
   /** `session/follow` 快照给出的日志切点：`session/page` 的 `throughSeq`。 */
   private val cursors = ConcurrentHashMap<String, Long>()
+  private val changeAnnouncements = DshChangeAnnouncements()
   /**
    * 进程内的目标续跑状态（`armed`/`disarmed`）。投影里刻意没有它（只在进程内），远程模式下
    * 也不允许 `goals/get`，所以只能从转发事件 `goal/activation-changed` 与 mutation 的返回值里收集。
    */
-  private val goalActivation = ConcurrentHashMap<String, String>()
+  private data class GoalActivation(val id: String, val revision: Int, val activation: String)
+  private val goalCacheLock = Any()
+  private val goalActivation = mutableMapOf<String, GoalActivation>()
+  /** Full mutation views fence lagging durable projections at the exact goal revision. */
+  private val latestGoalViews = mutableMapOf<String, RemoteGoal>()
+  /** Reads started before a mutation cannot clear or replace its acknowledged result. */
+  private val goalCacheEpochs = mutableMapOf<String, Long>()
+  private data class ClearedGoal(val id: String, val revision: Int)
+  private val clearedGoalRefs = mutableMapOf<String, ClearedGoal>()
+  private fun goalCacheEpoch(id: String): Long = synchronized(goalCacheLock) { goalCacheEpochs[id] ?: 0L }
+  private fun advanceGoalCacheEpoch(id: String) { goalCacheEpochs[id] = (goalCacheEpochs[id] ?: 0L) + 1L }
   /** 每个后台任务输出流已读到的字节位移（`job/follow` 的 `from`），断线重连时续读。 */
   private val jobOffsets = ConcurrentHashMap<String, Long>()
-  /** 已认领的定时问答：瀑布 eventId → `userQuestions/attachWait` 的逻辑流。 */
-  private val questionClaims = ConcurrentHashMap<String, WebSocket>()
-  private val claimedQuestions = ConcurrentHashMap.newKeySet<String>()
-  /** 瀑布 eventId → 工具调用 id；瀑布关闭后用它走 `userQuestions/answer`。 */
-  private val questionCallIds = ConcurrentHashMap<String, String>()
+  /** A waterfall belongs to the exact $events client that delivered it. */
+  private data class QuestionDelivery(val clientId: String, val wireEventId: String, val sessionId: String, val callId: String?)
+  private val questionEventClients = ConcurrentHashMap<String, QuestionDelivery>()
+  private val closing = java.util.concurrent.atomic.AtomicBoolean(false)
+  private val shutdown = CompletableDeferred<Unit>()
+  private fun questionDeliveryId(clientId: String, eventId: String) = "${clientId.length}:$clientId:${eventId.length}:$eventId"
+  @Volatile private var questionSession: String? = null
+  @Volatile private var questionForeground = false
+  private val questionRefreshes = ConcurrentHashMap<String, Job>()
+  private val dirtyQuestionRefreshes = ConcurrentHashMap.newKeySet<String>()
+  private val questionCoordinatorDelegate = lazy {
+    DshQuestionCoordinator(ioScope, clock,
+      openClaim = { session, _, callId, remaining, ended ->
+        val socket = openMux("userQuestions/attachWait", envelope(argsOf("agentId" to session, "callId" to callId)),
+          onItem = { item ->
+            val value = item.opt("remainingMs") as? Number ?: throw IOException("提问认领缺少 remainingMs")
+            require(value.toDouble().isFinite() && value.toDouble() >= 0 && value.toDouble() <= Long.MAX_VALUE.toDouble())
+            remaining(value.toLong())
+          }, onClosed = { ended() })
+        java.io.Closeable { socket.cancel() }
+      },
+      settle = { eventId, outcome -> settleQuestionOutcome(eventId, outcome) },
+      answer = { session, callId, answer ->
+        val accepted = call("userQuestions/answer", envelope(argsOf("agentId" to session, "callId" to callId, "answer" to answer)))
+        if (accepted != true) throw ApiException(409, "提问已经结束，请刷新后确认")
+      },
+      refresh = { session -> refreshQuestionProjection(session) },
+      publish = { snapshots -> publishQuestionSnapshots(snapshots) },
+      onError = { error -> Diagnostics.warn("DshApi", "提问状态更新失败", error) })
+  }
+  private val questionCoordinator: DshQuestionCoordinator get() = questionCoordinatorDelegate.value
   /** 需要实时事件（`session/follow`）的会话，最近打开的放最后。 */
   private val watched = LinkedHashSet<String>()
   /** 当前打开的会话；容量淘汰时优先保留，避免首页刷新把正在阅读的 follow 挤掉。 */
@@ -157,6 +197,12 @@ class DshApi(
   /** 最近一次会话快照的规模；只记数量/游标，不记正文。 */
   private val snapshotStats = ConcurrentHashMap<String, RemoteSnapshotStats>()
   @Volatile private var eventChannel: Channel<ServerEvent>? = null
+  private val sharedEventsDelegate = lazy { SharedEventOwner(ioScope, ::ownedEvents, { eventsReady },
+    copyForSubscriber = { it.copy(properties = JSONObject(it.properties.toString())) }) }
+  private fun ownerEvent(event: ServerEvent) {
+    val channel = eventChannel ?: return
+    if (channel.trySend(event).isFailure) channel.close(IOException("事件 owner 缓冲区已满；请重新同步"))
+  }
   @Volatile private var eventsClientId: String? = null
   /** 仍在等待回答的审批/问答瀑布；键是网关事件 id。 */
   private val pendingApprovals = ConcurrentHashMap<String, PermissionRequest>()
@@ -174,16 +220,39 @@ class DshApi(
   @Volatile private var catalog: JSONObject? = null
   /** 已归档会话集合（`workspace/follow` 的 baseline 与 `archived` 增量维护）。 */
   private val archivedSessions = ConcurrentHashMap.newKeySet<String>()
+  @Volatile private var archiveBaselineKnown = false
   /** 服务端置顶集合（`workspace/follow` 的 `pinnedSessionIds`，含 `pinned` 增量帧）。 */
   private val serverPinned = ConcurrentHashMap.newKeySet<String>()
   /** `workspace/follow` 的最新工作区清单；null 表示尚未读取。 */
   @Volatile private var workspaceItems: List<JSONObject>? = null
   private val workspaceLock = Any()
+  private var workspaceEpoch = 0L
+  private val workspaceMutationLock = Mutex()
+  /** Workspace writes must never be replayed by OkHttp after an ambiguous transport failure. */
+  private val workspaceMutationHttp = http.newBuilder().retryOnConnectionFailure(false).build()
   /** Replays the current workspace titles to a controller that starts watching mid-session. */
   private val workspacePublisher = MutableSharedFlow<List<Project>>(replay = 1, extraBufferCapacity = 1)
   override val workspaceUpdates: Flow<List<Project>> = workspacePublisher.asSharedFlow()
   /** False for background notification monitors: keep `$events`, skip workspace/follows. */
+  @Volatile private var leaseManaged = false
+  @Volatile private var leaseSnapshot = DshInterestSnapshot(false, emptySet(), emptySet(), null)
   private val contentWatching = MutableStateFlow(true)
+
+  /** Used only by the explicit shared-client registry; raw constructor semantics stay unchanged. */
+  internal fun manageLeaseInterests(snapshot: DshInterestSnapshot) {
+    leaseManaged = true
+    leaseSnapshot = snapshot
+    activeSessionId = snapshot.foregroundSession
+    contentWatching.value = snapshot.content
+    if (closed) return
+    val keep = snapshot.watched + snapshot.reading
+    val stop = mutableListOf<String>()
+    synchronized(watched) {
+      watched.removeAll { id -> if (id !in keep && (!snapshot.content || !executions.running(id))) { stop += id; true } else false }
+    }
+    stop.forEach(::stopFollow)
+    rememberWatched(keep.mapNotNull(known::get))
+  }
   override fun setContentWatching(enabled: Boolean) { contentWatching.value = enabled }
   override fun transportStatus(): String? = remoteBackend?.connectionStatus()?.let { status ->
     val transport = when {
@@ -200,6 +269,7 @@ class DshApi(
    * `session/attachment`；同一条消息在快照/实时/翻页里会重复出现，缓存避免重复拉取。
    */
   private val attachmentBlobs = ConcurrentHashMap<String, String>()
+  @Volatile private var fullAttachmentReference: Boolean? = null
   /**
    * 一次性读取（当前只有 `job/list`）的并发闸门。首页会按最多 8 个目录并发读作业，
    * 每条 `job/list` 都是一条流；不限流会和 `$events`/`session/follow` 抢预算。
@@ -218,32 +288,103 @@ class DshApi(
   private val liveAttempts = ConcurrentHashMap<String, String>()
   /** 每个会话已经投影过的最大事件 seq：消息页与实时流之间按 seq 去重。 */
   private val lastSeqs = ConcurrentHashMap<String, Long>()
-  /**
-   * 本机已经见过的最新一轮结局（`succeeded` / `failed` / `interrupted`）。DSH 的列表只有 `running`，
-   * 没有 OpenCode 的持久 `outcome`；`$events` 的 `api-session/status` 也只给布尔值。结局只写在日志的
-   * `turn/end` 里，所以这里记下本机翻译过或读到过的那一轮，供收尾时补未读结果。
-   */
-  private val outcomes = ConcurrentHashMap<String, String>()
-  /** 正在为一次 idle 收尾补读日志的会话，避免状态事件连发时重复翻页。 */
-  private val outcomeReads = ConcurrentHashMap.newKeySet<String>()
+  /** Execution-scoped outcomes: old history/late reads cannot overwrite a newer running turn. */
+  private val executions = DshExecutionTracker()
+  private val outcomeReads = ConcurrentHashMap<String, Long>()
+  /** PTC ancestry survives page/snapshot boundaries; session eviction bounds retained tool data. */
+  private val ptcProjections = LinkedHashMap<String, DshPtcProjection>()
+  private fun ptcProjection(sessionId: String): DshPtcProjection = synchronized(ptcProjections) {
+    ptcProjections.remove(sessionId)?.also { ptcProjections[sessionId] = it } ?: DshPtcProjection().also {
+      ptcProjections[sessionId] = it
+      while (ptcProjections.size > WATCH_LIMIT) {
+        val victim = ptcProjections.keys.firstOrNull { id -> id != sessionId && id != activeSessionId } ?: break
+        ptcProjections.remove(victim)
+      }
+    }
+  }
 
-  override val isClosed: Boolean get() = closed || remoteBackend?.isClosed == true
+  override val isClosed: Boolean get() = closing.get() || closed || remoteBackend?.isClosed == true
 
-  override fun capabilities(): ApiCapabilities = if (remoteBackend == null) CAPABILITIES else CAPABILITIES.copy(diff = false)
+  override fun capabilities(): ApiCapabilities = if (remoteBackend == null) CAPABILITIES else CAPABILITIES.copy(diff = remoteBackend.changesAvailable(), terminal = remoteBackend.terminalAvailable())
+
+  private val terminalApiDelegate = lazy { DshTerminalApi(
+    call = { endpoint, args ->
+      val payload = RpcPayload(JSONObject().put("args", args))
+      if (remoteBackend == null) call(endpoint, payload, retried = true)
+      else remoteBackend.terminalCall(endpoint, payload.json)
+    },
+    open = { endpoint, args, onItem, onClosed ->
+      val payload = RpcPayload(JSONObject().put("args", args))
+      if (remoteBackend == null) openMux(endpoint, payload, onItem, onClosed)
+      else remoteBackend.terminalOpen(endpoint, payload.json, onItem, onClosed)
+    }, ownerClosed = { isClosed }
+  ) }
+  private fun sessionTerminal(scope: TerminalScope): TerminalScope.Session {
+    return scope as? TerminalScope.Session ?: throw ApiException(400, "DSH 终端必须指定原会话，不能从目录推断")
+  }
+  override suspend fun terminals(scope: TerminalScope): List<NativeTerminal> = terminalApiDelegate.value.terminals(sessionTerminal(scope))
+  override suspend fun createTerminal(scope: TerminalScope): NativeTerminal = terminalApiDelegate.value.createTerminal(sessionTerminal(scope))
+  override suspend fun attachTerminal(scope: TerminalScope, id: String): TerminalAttachment = terminalApiDelegate.value.attachTerminal(sessionTerminal(scope), id)
+  override suspend fun closeTerminal(scope: TerminalScope, id: String) = terminalApiDelegate.value.closeTerminal(sessionTerminal(scope), id)
+  override suspend fun renameTerminal(scope: TerminalScope, id: String, title: String): NativeTerminal {
+    val owner = sessionTerminal(scope)
+    terminalApiDelegate.value.renameTerminal(owner, id, title)
+    return terminalApiDelegate.value.terminals(owner).singleOrNull { it.id == id }
+      ?: throw ApiException(409, "终端改名已返回，但当前清单无法确认；请重新读取，不会重放")
+  }
 
   override fun close() {
+    if (closed || !closing.compareAndSet(false, true)) return
+    if (terminalApiDelegate.isInitialized()) terminalApiDelegate.value.close()
+    if (sharedEventsDelegate.isInitialized()) sharedEventsDelegate.value.close()
+    if (questionCoordinatorDelegate.isInitialized()) {
+      questionCoordinator.close()
+      if (!questionCoordinator.hasPendingSettlements()) { closeTransportAfterQuestions(); return }
+      // Keep the physical carrier alive until ownership handoffs are delivered. Local channel close
+      // alone does not settle an unowned Host waterfall. Bound teardown so a dead socket cannot
+      // retain this client indefinitely.
+      ioScope.launch {
+        try {
+          val drained = kotlinx.coroutines.withTimeoutOrNull(2_000) { questionCoordinator.awaitSettlements(); true } == true
+          if (!drained) {
+            Diagnostics.warn("DshApi", "提问交还请求未在关闭期限内确认，结果未知；释放认领且不重放")
+            questionCoordinator.abortSettlements()
+          }
+        } finally { closeTransportAfterQuestions() }
+      }
+      return
+    }
+    closeTransportAfterQuestions()
+  }
+
+  private fun closeTransportAfterQuestions() {
+    if (closed) return
     closed = true
     activeSessionId = null
     eventChannel?.close()
     followStates.values.toList().forEach(::stopFollowState)
     followStates.clear()
-    durableTurns.clear(); liveParts.clear(); liveAttempts.clear()
-    outcomes.clear(); outcomeReads.clear()
+    durableTurns.clear(); liveParts.clear(); liveAttempts.clear(); changeAnnouncements.clear()
+    synchronized(ptcProjections) { ptcProjections.clear() }
+    executions.clear(); outcomeReads.clear()
     pendingApprovals.clear(); pendingQuestions.clear()
-    remoteBackend?.close()
+    questionEventClients.clear()
+    try {
+      muxOwner.close()
+      remoteBackend?.close()
+    } finally { shutdown.complete(Unit) }
   }
 
-  override suspend fun discoverCapabilities(): ApiCapabilities = capabilities()
+  override suspend fun awaitClosed() {
+    shutdown.await()
+    if (sharedEventsDelegate.isInitialized()) sharedEventsDelegate.value.awaitStopped()
+  }
+
+  override suspend fun discoverCapabilities(): ApiCapabilities {
+    remoteBackend?.discoverTerminal()
+    remoteBackend?.discoverChanges()
+    return capabilities()
+  }
 
   // ---------------------------------------------------------------- 鉴权
 
@@ -427,7 +568,9 @@ class DshApi(
    */
   private suspend fun <T> runHttpCall(request: Request, read: (Response) -> T): T =
     suspendCancellableCoroutine { continuation ->
-      val call = http.newCall(request)
+      val client = if (request.url.encodedPath.substringAfterLast("/api/", "") in WORKSPACE_MUTATIONS)
+        workspaceMutationHttp else http
+      val call = client.newCall(request)
       val worker = ioScope.launch {
         try {
           val value = call.execute().use(read)
@@ -455,7 +598,7 @@ class DshApi(
         // fingerprint or host recovery. Only untyped I/O is collapsed into a transport failure.
         catch (error: RemoteFailureException) { throw error }
         catch (error: RemoteServerException) { throw remoteServerFailure(error) }
-        catch (error: RemoteGatewayException) { throw ApiException(502, friendlyMessage(error.code, error.message.orEmpty()), error.code) }
+        catch (error: RemoteGatewayException) { throw ApiException(502, friendlyMessage(error.code, error.message.orEmpty()), error.code, error.details) }
         // The transport died, or its pending RPC could not finish. This is not a Host contract
         // rejection: name it as a connection problem (and keep the upstream code) so the controller
         // can reconnect instead of toasting “transfer closed” / WebSocket internals.
@@ -473,15 +616,27 @@ class DshApi(
         .put("rpcId", UUID.randomUUID().toString())
         .put("method", endpoint)
         .put("payload", wirePayload)
+      val encodedBody = envelope.toString().toRequestBody(JSON_MEDIA_TYPE)
+      val outgoingBody = if (endpoint in WORKSPACE_MUTATIONS) object : okhttp3.RequestBody() {
+        override fun contentType() = encodedBody.contentType()
+        override fun contentLength() = encodedBody.contentLength()
+        override fun isOneShot() = true // Also prevents HTTP 503 Retry-After:0 status follow-ups.
+        override fun writeTo(sink: okio.BufferedSink) = encodedBody.writeTo(sink)
+      } else encodedBody
       val request = Request.Builder()
         .url(url)
         .header("Content-Type", "application/json; charset=utf-8")
         .header("Cookie", current)
-        .post(envelope.toString().toRequestBody(JSON_MEDIA_TYPE))
+        .post(outgoingBody)
         .build()
       val (status, contentType, body) = try {
         runHttpCall(request) { response ->
-          response.use { Triple(it.code, it.header("Content-Type"), it.body?.bytes() ?: ByteArray(0)) }
+          response.use {
+            val body = it.body
+            if (body != null && (body.contentLength() > MAX_RPC_RESPONSE_BYTES || body.source().request(MAX_RPC_RESPONSE_BYTES + 1)))
+              throw ApiException(413, "DSH 响应超过本机读取上限", "response/too-large")
+            Triple(it.code, it.header("Content-Type"), body?.bytes() ?: ByteArray(0))
+          }
         }
       } catch (error: ApiException) {
         throw error
@@ -493,15 +648,15 @@ class DshApi(
         rejectCookie(current)
         return@withContext call(endpoint, payload, retried = true)
       }
-      if (status == 401) throw ApiException(401, repairMessage(), AUTH_EXPIRED)
-      if (status !in 200..299) throw ApiException(status, httpMessage(status), "http/$status")
+      if (status == 401) throw ApiException(401, repairMessage(), AUTH_EXPIRED, JSONObject().put("status", status))
+      if (status !in 200..299) throw ApiException(status, httpMessage(status), "http/$status", JSONObject().put("status", status))
       val parsed = decodeRpcResponse(status, contentType, body)
       val result = parsed.optJSONObject("result") ?: throw ApiException(status, "服务器响应缺少 result")
       if (result.optBoolean("ok")) return@withContext result.opt("value")
       val failure = result.optJSONObject("error")
       val code = failure?.optString("code").orEmpty()
       val message = failure?.optString("message").orEmpty()
-      throw ApiException(status, friendlyMessage(code, message.ifBlank { "请求失败" }), code.ifBlank { null })
+      throw ApiException(status, friendlyMessage(code, message.ifBlank { "请求失败" }), code.ifBlank { null }, failure?.optJSONObject("details"))
     }
 
   /**
@@ -591,20 +746,31 @@ class DshApi(
     else -> "请求失败：HTTP $status"
   }
 
-  /** 认证栅栏内的精确 GET 路由（改动摘要/对比）；失败返回 null。 */
-  private suspend fun fetchJson(url: HttpUrl): JSONObject? = withContext(Dispatchers.IO) {
-    if (remoteBackend != null) return@withContext null
+  /** Exact authenticated changes GET only. Expired/error reads are never authoritative emptiness. */
+  private suspend fun readChanges(kind: String, sessionId: String, seq: Long, index: Int?): JSONObject = withContext(Dispatchers.IO) {
+    require(kind in setOf("summary", "diff") && seq in 1..9_007_199_254_740_991L)
+    require(sessionId.isNotBlank() && sessionId.length <= 512 && sessionId.none(Char::isISOControl))
+    require(if (kind == "summary") index == null else index != null && index in 0..4999)
+    val url = base.newBuilder().addEncodedPathSegment("api").addEncodedPathSegment("changes.$kind")
+      .addQueryParameter("sessionId", sessionId).addQueryParameter("seq", seq.toString()).apply {
+        index?.let { addQueryParameter("index", it.toString()) }
+      }.build()
     val request = Request.Builder().url(url).header("Cookie", cookie()).get().build()
-    try {
-      runHttpCall(request) { response ->
-        response.use {
-          if (it.code !in 200..299) null
-          else runCatching { JSONObject(it.body?.string().orEmpty()) }.getOrNull()
-        }
-      }
-    } catch (error: IOException) {
-      null
-    }
+    runHttpCall(request) { response -> response.use {
+      if (it.code !in 200..299) throw ApiException(it.code, if (it.code == 404)
+        "该改动已不在 Host 进程中，未将缺失结果当作空改动" else "改动读取失败（HTTP ${it.code}）")
+      val body = it.body ?: throw ApiException(502, "改动读取缺少响应体")
+      val limit = 2L * 1024L * 1024L
+      if (body.contentLength() > limit || body.source().request(limit + 1)) throw ApiException(413, "改动比较超过 2 MiB 读取预算")
+      try {
+        val bytes = body.bytes()
+        val decoder = Charsets.UTF_8.newDecoder().onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
+          .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT)
+        val parser = org.json.JSONTokener(decoder.decode(java.nio.ByteBuffer.wrap(bytes)).toString())
+        (parser.nextValue() as? JSONObject)?.takeIf { parser.nextClean() == '\u0000' }
+          ?: throw IllegalArgumentException("Invalid object")
+      } catch (_: Exception) { throw ApiException(502, "改动读取返回无效 JSON 对象") }
+    } }
   }
 
   // ---------------------------------------------------------------- 会话读
@@ -628,8 +794,10 @@ class DshApi(
             it.code == 413 -> throw ApiException(413, "文件超过预览上限")
             it.code !in 200..299 -> null
             else -> {
-              val bytes = it.body?.bytes() ?: return@use null
-              if (bytes.size > maxBytes) throw ApiException(413, "文件超过预览上限")
+              val body = it.body ?: return@use null
+              if (body.contentLength() > maxBytes || body.source().request(maxBytes.toLong() + 1))
+                throw ApiException(413, "文件超过预览上限")
+              val bytes = body.bytes()
               val mime = it.header("Content-Type")?.substringBefore(';')?.trim()?.takeIf(String::isNotBlank)
               FilePreview(mime ?: "application/octet-stream", bytes)
             }
@@ -703,7 +871,10 @@ class DshApi(
       else metadata.optBoolean("blank", false)
     // lastPromptAt 是“已经收到过用户 prompt”的持久事实；即使 blank 是旧缓存，也不能把有 prompt 的会话藏掉。
     val prompted = (metadata.opt("lastPromptAt") as? Number)?.toLong()?.let { it > 0 } == true
-    val blank = listedBlank && !prompted && !item.optBoolean("running") && previous?.blank != false
+    val running = item.optBoolean("running")
+    if (executions.status(id, running)) clearKnownOutcome(id)
+    val blank = listedBlank && !prompted && !running && previous?.blank != false
+    val model = modelChoice(values.obj("modelSelection"), previous?.model)
     return Session(
       id = id,
       directory = directory,
@@ -713,18 +884,34 @@ class DshApi(
       subagentMode = values.obj("subagent").str("mode").takeIf { it.isNotBlank() },
       projectId = directory.ifBlank { null },
       created = previous?.created ?: updated,
-      archived = id in archivedSessions || previous?.archived == true,
+      archived = if (archiveBaselineKnown) id in archivedSessions else previous?.archived == true,
       permission = values.obj("permissions").str("currentValue").ifBlank { previous?.permission.orEmpty() },
       agent = values.str("agentPreset").ifBlank { previous?.agent }?.takeIf(String::isNotBlank),
-      model = previous?.model,
+      model = model,
       viewed = previous?.viewed ?: 0,
-      idle = if (item.optBoolean("running")) 0 else previous?.idle ?: 0,
-      // 列表没有结局字段。保留本机已经从 `turn/end` 读到的那一轮，空闲对账才能把它写成未读结果。
-      outcome = outcomes[id] ?: previous?.outcome,
+      idle = if (running) 0 else previous?.idle ?: 0,
+      // A result belongs to one execution. Never project the prior turn's result while a new turn runs.
+      outcome = if (running) null else executions.outcome(id),
       revertMessageId = null,
       serverId = previous?.serverId,
       blank = blank
     )
+  }
+
+  /** The official projection is flat: `modelSelection.next/lastUsed`, not a nested selection object. */
+  private fun modelChoice(selection: JSONObject, fallback: ModelChoice?): ModelChoice? {
+    val next = selection.obj("next")
+    val last = selection.obj("lastUsed")
+    val chosen = if (next.length() > 0) next else last
+    val provider = chosen.str("provider")
+    val model = chosen.str("model")
+    return if (provider.isBlank() || model.isBlank()) fallback
+    else ModelChoice(provider, model, fallback?.label?.takeIf { fallback.providerId == provider && fallback.modelId == model } ?: model,
+      chosen.str("reasoningEffort").takeIf { it.isNotBlank() })
+  }
+
+  private fun clearKnownOutcome(sessionId: String) {
+    known.computeIfPresent(sessionId) { _, current -> current.copy(outcome = null) }
   }
 
   private suspend fun sessionOrFetch(id: String): Session = known[id] ?: run {
@@ -733,6 +920,85 @@ class DshApi(
   }
 
   override suspend fun session(id: String): Session = sessionOrFetch(id)
+
+  override suspend fun searchSessionContent(query: String): SessionContentSearchResult {
+    val normalized = SessionContentSearchCodec.normalizeQuery(query)
+    return SessionContentSearchCodec.decode(normalized,
+      call("session/search", requestArgs(JSONObject().put("query", normalized))))
+  }
+
+  override suspend fun searchResultSession(id: String): Session? {
+    if (!SessionContentSearchCodec.validSessionId(id)) return null
+    // Do not reuse known or a listing already in flight before the explicit hit-open action.
+    val row = fetchListing().items.filter { it.opt("sessionId") == id }.singleOrNull() ?: return null
+    val directory = row.opt("cwd") as? String ?: return null
+    if (directory.isBlank()) return null
+    return itemToSession(row)?.takeIf { it.id == id && it.directory == directory }
+  }
+
+  override suspend fun serverWorkspaces(): List<ServerWorkspace> =
+    fetchWorkspaceBaseline(strict = true).map(ServerWorkspaceCodec::workspace)
+
+  override suspend fun registerWorkspace(path: String): WorkspaceRegistration = workspaceMutationLock.withLock {
+    if (!ServerWorkspaceCodec.validPath(path))
+      throw ApiException(400, "请输入主机上的绝对目录路径，不能包含首尾空白或控制字符", "workspace/path-invalid")
+    val result = workspaceMutation("workspace/create", JSONObject().put("path", path))
+    val workspace = ServerWorkspaceCodec.workspace(result.opt("workspace"))
+    val created = result.opt("created") as? Boolean ?: ServerWorkspaceCodec.invalid()
+    // Canonical paths are chosen by the Host (symlinks and platform normalization are authoritative).
+    WorkspaceRegistration(workspace, created)
+  }
+
+  override suspend fun renameWorkspace(expected: ServerWorkspace, title: String): ServerWorkspace = workspaceMutationLock.withLock {
+    val cleanTitle = ServerWorkspaceCodec.title(title)
+    workspacePreflight(expected)
+    val result = workspaceMutation("workspace/rename", JSONObject().put("workspaceId", expected.id).put("title", cleanTitle))
+    val workspace = ServerWorkspaceCodec.workspace(result.opt("workspace"))
+    if (workspace.id != expected.id || workspace.path != expected.path || workspace.createdAt != expected.createdAt)
+      ServerWorkspaceCodec.invalid()
+    workspace
+  }
+
+  override suspend fun deleteWorkspace(expected: ServerWorkspace): Boolean = workspaceMutationLock.withLock {
+    workspacePreflight(expected)
+    val result = workspaceMutation("workspace/delete", JSONObject().put("workspaceId", expected.id))
+    if (result.opt("deleted") != true) ServerWorkspaceCodec.invalid()
+    true
+  }
+
+  override suspend fun moveWorkspace(expected: ServerWorkspace, before: ServerWorkspace?): List<String> = workspaceMutationLock.withLock {
+    if (before?.id == expected.id)
+      throw ApiException(400, "不能把工作区移动到自身之前", "workspace/anchor-invalid")
+    workspacePreflight(expected, before)
+    val request = JSONObject().put("workspaceId", expected.id)
+    if (before != null) request.put("beforeWorkspaceId", before.id)
+    val result = workspaceMutation("workspace/insertBefore", request)
+    val ids = ServerWorkspaceCodec.ids(result.opt("workspaceIds"), ServerWorkspaceCodec.MAX_WORKSPACES)
+    if (expected.id !in ids || (before != null && before.id !in ids)) ServerWorkspaceCodec.invalid()
+    ids
+  }
+
+  /** Fresh full snapshots reject stale targets and anchors, but cannot close a Host-side TOCTOU race. */
+  private suspend fun workspacePreflight(expected: ServerWorkspace, before: ServerWorkspace? = null) {
+    val catalog = serverWorkspaces()
+    for (snapshot in listOfNotNull(expected, before)) {
+      val current = catalog.firstOrNull { it.id == snapshot.id }
+        ?: throw ApiException(404, "工作区已不存在，请刷新列表", "workspace/not-found")
+      if (current != snapshot)
+        throw ApiException(409, "工作区已被其他客户端修改，请刷新后重新确认", "workspace/snapshot-conflict")
+    }
+  }
+
+  private suspend fun workspaceMutation(endpoint: String, request: JSONObject): JSONObject {
+    try {
+      // retried=true disables the generic auth-401 replay too. There is no mutation fallback/retry.
+      return call(endpoint, requestArgs(request), retried = true) as? JSONObject ?: ServerWorkspaceCodec.invalid()
+    } finally {
+      // Even an error can follow a durable Host commit. Do not patch a newer live frame with a late
+      // acknowledgement; the next project lookup/explicit catalog refresh must read server facts.
+      synchronized(workspaceLock) { workspaceEpoch++; workspaceItems = null }
+    }
+  }
 
   override suspend fun projects(): List<Project> = withContext(Dispatchers.IO) {
     // DSH 的 Workspace 就是「项目」：workspace/follow 的 baseline 给出全量清单。
@@ -762,7 +1028,8 @@ class DshApi(
    * 参数形状按代际不同：0.2.1 线只接受 `{args:{}}`，更新的代际用 `{args:{request:{}}}`。
    * 先用本机已知形状，被 `gateway/arguments-invalid` 拒绝时换另一种并记住，避免把协议代际写死。
    */
-  private suspend fun fetchWorkspaceBaseline(): List<JSONObject> {
+  private suspend fun fetchWorkspaceBaseline(strict: Boolean = false): List<JSONObject> {
+    val startEpoch = synchronized(workspaceLock) { workspaceEpoch }
     var frame: JSONObject
     if (workspaceArgsStyle == WorkspaceArgsStyle.REQUEST) {
       frame = try {
@@ -781,19 +1048,36 @@ class DshApi(
         fetchFirstFrame("workspace/follow", requestArgs(JSONObject()))
       }
     }
-    if (frame.str("type") == "baseline") applyWorkspaceFrame(frame)
-    return workspaceItems ?: throw ApiException(502, "工作区列表为空：workspace/follow 没有返回 baseline")
+    if (frame.str("type") != "baseline")
+      throw ApiException(502, "workspace/follow 没有返回完整 baseline，请刷新核实", "workspace/baseline-invalid")
+    val items = frame.optJSONObject("value")?.optJSONArray("items")
+      ?: throw ApiException(502, "workspace/follow baseline 缺少工作区清单", "workspace/baseline-invalid")
+    if (strict) {
+      ServerWorkspaceCodec.catalog(items)
+      val value = frame.getJSONObject("value")
+      ServerWorkspaceCodec.ids(value.opt("archivedSessionIds"), ServerWorkspaceCodec.MAX_SESSION_IDS)
+      ServerWorkspaceCodec.ids(value.opt("pinnedSessionIds"), ServerWorkspaceCodec.MAX_SESSION_IDS)
+    } else if ((0 until items.length()).any { items.opt(it) !is JSONObject }) ServerWorkspaceCodec.invalid()
+    val snapshot = items.objects()
+    // A fresh query returns its own baseline, never an unrelated cached fallback. A live follow (or
+    // mutation invalidation) that advanced while it was in flight keeps ownership of the cache.
+    synchronized(workspaceLock) {
+      if (strict && workspaceEpoch != startEpoch)
+        throw ApiException(409, "读取期间 Host 工作区已变化，请刷新后重新确认", "workspace/snapshot-conflict")
+      if (workspaceEpoch == startEpoch) applyWorkspaceFrame(frame)
+    }
+    return snapshot
   }
 
   /** baseline / upsert / remove / order / archived 帧；pinned 暂不消费。 */
   private fun applyWorkspaceFrame(frame: JSONObject) {
     val snapshot = synchronized(workspaceLock) {
+      workspaceEpoch++
       when (frame.str("type")) {
         "baseline" -> {
           val value = frame.obj("value")
           workspaceItems = value.arr("items").objects()
-          archivedSessions.clear()
-          archivedSessions += value.arr("archivedSessionIds").strings()
+          replaceArchiveSet(value.arr("archivedSessionIds").strings())
           serverPinned.clear()
           serverPinned += value.arr("pinnedSessionIds").strings()
         }
@@ -809,18 +1093,19 @@ class DshApi(
           val value = frame.obj("value")
           workspaceItems = value.arr("items").objects()
           if (value.has("archivedSessionIds")) {
-            archivedSessions.clear()
-            archivedSessions += value.arr("archivedSessionIds").strings()
+            replaceArchiveSet(value.arr("archivedSessionIds").strings())
           }
         }
         "upsert" -> {
           val workspace = frame.obj("workspace")
           val id = workspace.str("workspaceId")
-          if (id.isNotBlank()) workspaceItems = ((workspaceItems ?: emptyList()).filterNot { it.str("workspaceId") == id } + workspace)
+          // A mutation invalidation means the complete baseline is unknown. An increment cannot
+          // recreate it as a one-item catalog, hiding all unaffected sibling registrations.
+          workspaceItems?.let { list -> if (id.isNotBlank()) workspaceItems = list.filterNot { it.str("workspaceId") == id } + workspace }
         }
         "remove" -> {
           val id = frame.str("workspaceId")
-          if (id.isNotBlank()) workspaceItems = (workspaceItems ?: emptyList()).filterNot { it.str("workspaceId") == id }
+          workspaceItems?.let { list -> if (id.isNotBlank()) workspaceItems = list.filterNot { it.str("workspaceId") == id } }
         }
         "order" -> {
           val order = frame.arr("workspaceIds").strings()
@@ -831,13 +1116,19 @@ class DshApi(
           }
         }
         "archived" -> {
-          archivedSessions.clear()
-          archivedSessions += frame.arr("archivedSessionIds").strings()
+          replaceArchiveSet(frame.arr("archivedSessionIds").strings())
         }
       }
       workspaceItems
     }
     snapshot?.let { workspacePublisher.tryEmit(workspaceProjects(it)) }
+  }
+
+  private fun replaceArchiveSet(ids: List<String>) {
+    archivedSessions.clear()
+    archivedSessions.addAll(ids)
+    archiveBaselineKnown = true
+    known.replaceAll { id, session -> session.copy(archived = id in archivedSessions) }
   }
 
   override suspend fun projectAt(directory: String): Project? {
@@ -872,11 +1163,15 @@ class DshApi(
 
   override suspend fun messagesPage(id: String, cursor: String?, size: Int): ApiPage<Message> = withContext(Dispatchers.IO) {
     val session = sessionOrFetch(id)
-    // Reading a transcript always needs a follow, even if a background monitor had switched
-    // content off before this server became writable.
-    setContentWatching(true)
-    // 当前阅读的会话固定保留；首页刷新只能替换其他 follow。
-    activeSessionId = session.id
+    val caller = kotlin.coroutines.coroutineContext[DshLeaseContext]
+    check(!leaseManaged || caller != null) { "共享 DSH owner 的消息读取必须指定调用者 lease" }
+    val interest = caller?.read?.invoke(session.id)
+    try {
+    if (!leaseManaged) {
+      // Raw clients retain the historical behavior; leases manage independent foreground interest.
+      setContentWatching(true)
+      activeSessionId = session.id
+    }
     rememberWatched(listOf(session))
     val wanted = size.coerceIn(1, SNAPSHOT_MAX_MESSAGES)
     if (cursor == null) {
@@ -936,6 +1231,7 @@ class DshApi(
       val next = if (page.optBoolean("hasMore")) earlierCursor(records) else null
       ApiPage(messages, next)
     }
+    } finally { interest?.close() }
   }
 
   private fun earlierCursor(records: List<JSONObject>): String? =
@@ -957,77 +1253,317 @@ class DshApi(
     payload: RpcPayload,
     onItem: (JSONObject) -> Unit,
     onClosed: (Throwable?) -> Unit
-  ): WebSocket = withContext(Dispatchers.IO) {
-    val wirePayload = payload.json
-    remoteBackend?.let { return@withContext it.open(endpoint, wirePayload, onItem, onClosed) }
-    val current = cookie()
-    val streamId = UUID.randomUUID().toString()
-    // OkHttp 的 WebSocket 直接接受 http(s) URL 并发起 Upgrade；HttpUrl 不接受 ws/wss 方案。
-    val socketUrl = base.newBuilder()
-      .addEncodedPathSegment("api")
-      .addEncodedPathSegment("remote.mux")
-      .build()
-    val request = Request.Builder().url(socketUrl).header("Cookie", current).build()
-    // 每条逻辑流只收尾一次：error 帧、end 帧、主动 cancel 与底层失败可能先后到达。
-    val finished = java.util.concurrent.atomic.AtomicBoolean(false)
-    fun finish(webSocket: WebSocket, cause: Throwable?) {
-      if (!finished.compareAndSet(false, true)) return
-      // 立即关闭：mux 流不需要关闭握手，优雅关闭会让 MockWebServer 一类的对端等待超时。
-      webSocket.cancel()
-      onClosed(cause)
-    }
-    val listener = object : WebSocketListener() {
-      override fun onOpen(webSocket: WebSocket, response: Response) {
-        val open = JSONObject()
-          .put("type", "open")
-          .put("streamId", streamId)
-          .put("endpoint", endpoint)
-          .put("payload", wirePayload)
-        // false 表示 OkHttp 已拒绝入队（常见原因是 socket 正在关闭）。忽略它会让上层永远等首帧。
-        if (!webSocket.send(open.toString())) finish(webSocket, IOException("mux open 帧发送失败"))
+  ): WebSocket {
+    var acquired: WebSocket? = null
+    try {
+      return withContext(Dispatchers.IO) {
+        val wirePayload = payload.json
+        (remoteBackend?.open(endpoint, wirePayload, onItem, onClosed)
+          ?: muxOwner.open(endpoint, wirePayload, onItem, onClosed)).also { acquired = it }
       }
+    } catch (error: Throwable) {
+      // withContext has prompt cancellation on the return dispatcher: a freshly opened resource
+      // may never reach its caller. Keep ownership here until that handoff actually succeeds.
+      acquired?.cancel()
+      throw error
+    }
+  }
 
-      override fun onMessage(webSocket: WebSocket, text: String) {
+  /** Test seam for exercising physical API-Peer ownership without starting the full event loops. */
+  internal suspend fun openMuxForTest(
+    endpoint: String,
+    payload: JSONObject = JSONObject(),
+    onItem: (JSONObject) -> Unit,
+    onClosed: (Throwable?) -> Unit
+  ): WebSocket = openMux(endpoint, RpcPayload(payload), onItem, onClosed)
+
+  /**
+   * One API Peer socket carrying many logical streams.  The logical handles deliberately retain the
+   * small WebSocket surface used by the rest of DshApi (cancel only); the physical owner owns frame
+   * routing, bounded callback queues, and close/error fan-out.
+   */
+  private class MuxLogicalState(
+    val id: String,
+    val endpoint: String,
+    val onItem: (JSONObject) -> Unit,
+    val onClosed: (Throwable?) -> Unit,
+    val frames: Channel<JSONObject> = Channel(MUX_STREAM_BUFFER),
+    var worker: Job? = null
+  )
+
+  private inner class PhysicalMuxOwner {
+    private val lock = Any()
+    private val streams = LinkedHashMap<String, MuxLogicalState>()
+    private val pendingOpens = LinkedHashMap<String, String>()
+    @Volatile private var physical: WebSocket? = null
+    private var connectingSocket: WebSocket? = null
+    // Allocate before cookie() suspends; every callback and send belongs to exactly this attempt.
+    private var generation = 0L
+    private var activeGeneration: Long? = null
+    @Volatile private var ownerClosed = false
+
+    suspend fun open(endpoint: String, payload: JSONObject, onItem: (JSONObject) -> Unit,
+      onClosed: (Throwable?) -> Unit): WebSocket {
+      if (ownerClosed || closed) throw IOException("DSH mux 已关闭")
+      val id = UUID.randomUUID().toString()
+      val state = MuxLogicalState(id, endpoint, onItem, onClosed)
+      state.worker = ioScope.launch {
+        var failure: Throwable? = null
         try {
-          val frame = try { JSONObject(text) } catch (error: Exception) { throw IOException("mux 帧不是有效 JSON", error) }
-          val type = frame.str("type")
-          if (type !in setOf("item", "end", "error")) return // 前向兼容新的控制帧。
-          if (frame.str("streamId") != streamId) throw IOException("mux 流身份不匹配")
-          when (type) {
-            "item" -> {
-              val value = frame.opt("value") as? JSONObject ?: throw IOException("mux item 缺少对象载荷")
-              try { onItem(value) } catch (error: Exception) {
-                Diagnostics.warn("DshApi", "mux 事件翻译失败", error)
-                throw IOException("mux 事件翻译失败", error)
+          while (true) {
+            val result = state.frames.receiveCatching()
+            if (result.isClosed) {
+              failure = result.exceptionOrNull()
+              break
+            }
+            state.onItem(result.getOrThrow())
+          }
+        } catch (cancel: CancellationException) {
+          failure = cancel
+          throw cancel
+        } catch (error: Throwable) {
+          failure = error
+        } finally {
+          val stillOwned = synchronized(lock) { streams[id] === state }
+          if (stillOwned && failure != null) {
+            // A callback/parser failure belongs to this logical stream. Cancel its server-side
+            // producer, but keep the physical API-Peer socket and all sibling streams alive.
+            cancelLogical(id)
+          } else {
+            synchronized(lock) {
+              if (streams[id] === state) {
+                streams.remove(id)
+                pendingOpens.remove(id)
               }
             }
-            "error" -> finish(webSocket, IOException(frame.obj("error").str("message").ifBlank { "会话流出错" }))
-            "end" -> finish(webSocket, null)
           }
-        } catch (error: Exception) {
-          // 坏帧可能正好包含终态或快照；静默跳过会把损坏投影当成权威状态。断开并重连对账。
-          finish(webSocket, if (error is IOException) error else IOException("mux 帧处理失败", error))
+          state.onClosed(failure)
         }
       }
 
-      override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-        if (response?.code == 401) {
-          // Cookie 失效：丢弃，让下一次调用重新换取。
-          ioScope.launch { rejectCookie(current) }
+      var startGeneration: Long? = null
+      var existing: Pair<Long, WebSocket>? = null
+      synchronized(lock) {
+        if (ownerClosed || closed) {
+          state.frames.close(IOException("DSH mux 已关闭"))
+        } else {
+          streams[id] = state
+          val open = JSONObject().put("type", "open").put("streamId", id)
+            .put("endpoint", endpoint).put("payload", payload).toString()
+          pendingOpens[id] = open
+          existing = physical?.let { activeGeneration!! to it }
+          if (activeGeneration == null) {
+            startGeneration = ++generation
+            activeGeneration = startGeneration
+          }
         }
-        finish(webSocket, t)
       }
-
-      override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
-        // 服务端主动关闭整条连接（dsh 重启、Host 下线）：按异常断开处理，让上层重连。
-        finish(webSocket, IOException("DeepSeek Harness 关闭了连接（$code）"))
+      if (ownerClosed || closed) {
+        state.worker?.cancel()
+        throw IOException("DSH mux 已关闭")
       }
+      startGeneration?.let { connectPhysical(it) }
+        ?: existing?.let { (attempt, socket) -> sendPending(attempt, socket) }
+      return LogicalSocket(id, state, this)
+    }
 
-      override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-        finish(webSocket, null)
+    private fun isActive(attempt: Long): Boolean =
+      !ownerClosed && !closed && activeGeneration == attempt
+
+    private suspend fun connectPhysical(attempt: Long) {
+      val current = try { cookie() } catch (error: Throwable) {
+        failPhysical(attempt, error)
+        throw error
+      }
+      if (!synchronized(lock) { isActive(attempt) }) return
+      val socketUrl = base.newBuilder()
+        .addEncodedPathSegment("api")
+        .addEncodedPathSegment("remote.mux")
+        .build()
+      val request = Request.Builder().url(socketUrl).header("Cookie", current).build()
+      val listener = object : WebSocketListener() {
+        override fun onOpen(webSocket: WebSocket, response: Response) {
+          val accepted = synchronized(lock) {
+            if (!isActive(attempt)) false else {
+              physical = webSocket
+              connectingSocket = null
+              true
+            }
+          }
+          if (!accepted) {
+            webSocket.cancel()
+            return
+          }
+          sendPending(attempt, webSocket)
+        }
+
+        override fun onMessage(webSocket: WebSocket, text: String) {
+          if (!synchronized(lock) { isActive(attempt) && physical === webSocket }) return
+          val frame = try { JSONObject(text) } catch (error: Exception) {
+            failPhysical(attempt, IOException("mux 帧不是有效 JSON", error)); return
+          }
+          val type = frame.str("type")
+          if (type !in setOf("item", "end", "error")) return
+          val id = frame.str("streamId")
+          synchronized(lock) {
+            if (!isActive(attempt) || physical !== webSocket) return
+            val state = streams[id] ?: return
+            when (type) {
+              "item" -> {
+                val value = frame.opt("value") as? JSONObject
+                if (value == null) finishLogical(id, IOException("mux item 缺少对象载荷"), cancel = true)
+                else if (state.frames.trySend(value).isFailure) {
+                  finishLogical(id, IOException("mux 流消费者过慢"), cancel = true)
+                }
+              }
+              "error" -> {
+                val error = frame.obj("error")
+                val code = error.str("code").takeIf { it.isNotBlank() }
+                val details = error.optJSONObject("details")
+                finishLogical(id, ApiException(502,
+                  friendlyMessage(code.orEmpty(), error.str("message").ifBlank { "会话流出错" }), code, details))
+              }
+              "end" -> finishLogical(id, null)
+            }
+          }
+        }
+
+        override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+          if (!synchronized(lock) { isActive(attempt) }) return
+          val error = if (response?.code == 409) IOException("DSH API Peer 已有连接（HTTP 409）", t) else t
+          if (response?.code == 401) ioScope.launch {
+            // Reject before releasing this generation so a replacement cannot reuse its cookie.
+            authLock.withLock {
+              synchronized(lock) {
+                if (!isActive(attempt)) return@withLock
+                if (sessionCookie == current) {
+                  sessionCookie = null
+                  if (signingSecret != null && base.isHttps && !plainListener) plainListener = true
+                  else {
+                    cookieRejected = true
+                    if (DshCookie.isDurable(current)) runCatching { onCookie("") }
+                  }
+                }
+                failPhysical(attempt, error)
+              }
+            }
+          } else failPhysical(attempt, error)
+        }
+
+        override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+          failPhysical(attempt, IOException("DeepSeek Harness 关闭了连接（$code）"))
+        }
+
+        override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+          // Some peers emit onClosed without onClosing; only this generation may settle streams.
+          failPhysical(attempt, IOException("DeepSeek Harness 物理 mux 已关闭（$code）"))
+        }
+      }
+      val socket = try { streamHttp.newWebSocket(request, listener) } catch (error: Throwable) {
+        failPhysical(attempt, error)
+        throw error
+      }
+      // onFailure/onOpen may run before newWebSocket returns. Never resurrect a retired attempt.
+      val accepted = synchronized(lock) {
+        if (!isActive(attempt)) false else {
+          if (physical == null) connectingSocket = socket
+          true
+        }
+      }
+      if (!accepted) socket.cancel()
+    }
+
+    private fun sendPending(attempt: Long, socket: WebSocket) {
+      synchronized(lock) {
+        if (!isActive(attempt) || physical !== socket) return
+        val pending = pendingOpens.toMap()
+        for ((id, open) in pending) {
+          if (pendingOpens.remove(id) == null || !streams.containsKey(id)) continue
+          if (!socket.send(open)) {
+            failPhysical(attempt, IOException("mux open 帧发送失败"))
+            return
+          }
+        }
       }
     }
-    streamHttp.newWebSocket(request, listener)
+
+    private fun finishLogical(id: String, cause: Throwable?, cancel: Boolean = false) {
+      val state = synchronized(lock) {
+        val removed = streams.remove(id) ?: return
+        val wasPending = pendingOpens.remove(id) != null
+        if (cancel && !wasPending) {
+          physical?.send(JSONObject().put("type", "cancel").put("streamId", id).toString())
+        }
+        removed
+      }
+      state.frames.close(cause)
+      // API-Peer cookies own a lifecycle socket. An idle socket must survive logical end/cancel.
+    }
+
+    private fun cancelLogical(id: String) = finishLogical(id, null, cancel = true)
+
+    /** No buffering, reconnect, or replay: uplink belongs only to this live logical stream. */
+    private fun sendLogical(id: String, state: MuxLogicalState, text: String): Boolean {
+      if (state.endpoint != "terminal/attach" || text.toByteArray(Charsets.UTF_8).size > 256 * 1024) return false
+      val value = try { JSONObject(text) } catch (_: Exception) { return false }
+      if (value.optString("type") !in setOf("write", "resize")) return false
+      synchronized(lock) {
+        if (ownerClosed || closed || streams[id] !== state || pendingOpens.containsKey(id) || activeGeneration == null) return false
+        val socket = physical ?: return false
+        return socket.send(JSONObject().put("type", "item").put("streamId", id).put("value", value).toString())
+      }
+    }
+
+    private fun failPhysical(attempt: Long, error: Throwable) {
+      val states: List<MuxLogicalState>
+      val socket: WebSocket?
+      synchronized(lock) {
+        if (!isActive(attempt)) return
+        activeGeneration = null
+        socket = physical ?: connectingSocket
+        physical = null
+        connectingSocket = null
+        states = streams.values.toList()
+        streams.clear()
+        pendingOpens.clear()
+      }
+      states.forEach { it.frames.close(error) }
+      socket?.cancel()
+    }
+
+    fun close() {
+      val states: List<MuxLogicalState>
+      val socket: WebSocket?
+      synchronized(lock) {
+        ownerClosed = true
+        activeGeneration = null
+        states = streams.values.toList()
+        streams.clear()
+        pendingOpens.clear()
+        socket = physical ?: connectingSocket
+        physical = null
+        connectingSocket = null
+      }
+      states.forEach { it.frames.close() }
+      socket?.cancel()
+    }
+
+    private inner class LogicalSocket(
+      private val id: String,
+      private val state: MuxLogicalState,
+      private val owner: PhysicalMuxOwner
+    ) : WebSocket {
+      private val finished = java.util.concurrent.atomic.AtomicBoolean(false)
+      override fun request(): Request = Request.Builder().url(base).build()
+      override fun queueSize(): Long = physical?.queueSize() ?: 0L
+      override fun send(text: String): Boolean = !finished.get() && owner.sendLogical(id, state, text)
+      override fun send(bytes: okio.ByteString): Boolean = false
+      override fun close(code: Int, reason: String?): Boolean { cancel(); return true }
+      override fun cancel() {
+        if (!finished.compareAndSet(false, true)) return
+        owner.cancelLogical(id)
+      }
+    }
   }
 
   /**
@@ -1059,9 +1595,11 @@ class DshApi(
   /** 把流层的失败折成用户能看懂、也能定位的一层错误（保留上游 code）。 */
   private fun streamFailure(endpoint: String, error: Throwable): ApiException {
     if (error is ApiException) return error
-    val code = (error as? RemoteGatewayException)?.code ?: (error as? RemoteRpcException)?.code
+    val gateway = error as? RemoteGatewayException
+    val code = gateway?.code ?: (error as? RemoteRpcException)?.code
+    val details = gateway?.details
     val reason = error.message?.takeIf { it.isNotBlank() } ?: error.javaClass.simpleName
-    return ApiException(502, "读取 $endpoint 失败：$reason", code)
+    return ApiException(502, "读取 $endpoint 失败：${friendlyMessage(code.orEmpty(), reason)}", code, details)
   }
 
   /**
@@ -1117,7 +1655,7 @@ class DshApi(
    */
   internal suspend fun translate(session: Session, event: JSONObject): List<ServerEvent> {
     val type = event.str("type")
-    val seq = event.optDouble("seq", 0.0).toLong()
+    val seq = exactDshSequence(event.opt("seq")) ?: 0L
     val time = event.optDouble("time", 0.0).toLong()
     val data = event.obj("data")
     val output = mutableListOf<ServerEvent>()
@@ -1130,7 +1668,10 @@ class DshApi(
     if (type == "turn/start" && turn != null) durableTurns[session.id] = turn
     val base = JSONObject().put("sessionID", session.id).put("sequence", seq).putOpt("turn", turn)
     when (type) {
-      "turn/start" -> emit("session.execution.started", base.put("at", time))
+      "turn/start" -> {
+        if (executions.start(session.id, seq)) clearKnownOutcome(session.id)
+        emit("session.execution.started", base.put("at", time))
+      }
       "turn/end" -> emitTurnEnd(session, base, data, ::emit)
       "step/start" -> emit("session.step.started", base
         .put("assistantMessageID", messageId(data))
@@ -1159,12 +1700,15 @@ class DshApi(
           .put("content", data.obj("message").arr("content")))
       }
       "tool/call" -> {
+        val projection = ptcProjection(session.id)
+        synchronized(projection) { projection.indexRoots(listOf(event)) }
         val callId = data.str("callId")
-        val name = data.str("name")
-        if (callId.isNotBlank()) {
+        val assistantId = nativeToolMessageId(data)
+        // The bounded PTC ancestry cache must never limit native tool cards.
+        if (callId.isNotBlank() && assistantId != null) {
           val input = parseArguments(data.str("arguments"))
-          emit("session.tool.input.started", base.put("assistantMessageID", messageId(data)).put("id", callId).put("name", name))
-          emit("session.tool.called", base.put("assistantMessageID", messageId(data)).put("id", callId).put("name", name).put("input", input))
+          emit("session.tool.input.started", base.put("assistantMessageID", assistantId).put("id", callId).put("name", data.str("name")))
+          emit("session.tool.called", base.put("assistantMessageID", assistantId).put("id", callId).put("name", data.str("name")).put("input", input))
         }
       }
       "tool/result" -> {
@@ -1182,25 +1726,19 @@ class DshApi(
       // PTC（程序化工具调用）的子调用是**耐久事件**，不是实时增量。v1 代际把它记作
       // `tool/code-dispatch*`，v3 改名成 `tool/ptc-dispatch*`；两个名字都得认，否则开着 PTC
       // 的主机上工具卡片整段缺席。
-      "tool/ptc-dispatch-start", "tool/code-dispatch-start" -> {
-        val callId = data.str("subCallId").ifBlank { data.str("callId") }
-        if (callId.isNotBlank()) {
-          val name = data.str("name")
-          emit("session.tool.input.started", base.put("assistantMessageID", messageId(data)).put("id", callId).put("name", name))
-          emit("session.tool.called", base.put("assistantMessageID", messageId(data)).put("id", callId).put("name", name)
-            .put("input", data.opt("arguments") ?: JSONObject()))
-        }
-      }
+      "tool/ptc-dispatch-start", "tool/code-dispatch-start",
       "tool/ptc-dispatch", "tool/code-dispatch" -> {
-        val callId = data.str("subCallId").ifBlank { data.str("callId") }
-        if (callId.isNotBlank()) {
-          val name = data.str("name")
-          val properties = base.put("assistantMessageID", messageId(data)).put("id", callId)
-            .put("content", data.arr("content"))
-            .put("metadata", JSONObject().put("tool", name))
-            .put("name", name)
-          if (data.optBoolean("isError")) emit("session.tool.failed", properties.put("error", data.obj("error")))
-          else emit("session.tool.success", properties)
+        val projection = ptcProjection(session.id)
+        val child = synchronized(projection) { projection.process(type, data, seq, time) }
+        if (child != null) {
+          val properties = child.properties().put("sessionID", session.id).put("sequence", seq)
+          // Child payloads have no turn/step; ancestry is anchored by the native root call.
+          if (child.kind == DshPtcEvent.Kind.START) {
+            emit("session.tool.input.started", properties)
+            emit("session.tool.called", properties)
+          } else {
+            emit(if (child.state.isError) "session.tool.failed" else "session.tool.success", properties)
+          }
         }
       }
       "session/title" -> emit("session.renamed", base.put("title", data.str("title")))
@@ -1212,16 +1750,18 @@ class DshApi(
           emit("session.agent.selected", base.put("agent", preset))
         }
       }
-      // `model/selection` 同样是耐久事实；不读它，重启后药丸只能显示本机记得的那个模型。
+      // `model/selection` is the durable selection intent itself: `{provider, model, reasoningEffort?}`.
+      // The projection shape (`modelSelection.next/lastUsed`) is only for session/projections.
       "model/selection" -> {
-        val selection = data.obj("next").takeIf { it.length() > 0 } ?: data.obj("lastUsed")
-        val provider = selection.str("provider")
-        val modelId = selection.str("model")
+        val provider = data.str("provider")
+        val modelId = data.str("model")
         if (provider.isNotBlank() && modelId.isNotBlank()) {
-          known[session.id]?.let {
-            known[session.id] = it.copy(model = ModelChoice(provider, modelId, modelId,
-              selection.str("reasoningEffort").takeIf { effort -> effort.isNotBlank() }))
-          }
+          val selected = ModelChoice(provider, modelId, modelId,
+            data.str("reasoningEffort").takeIf(String::isNotBlank))
+          known.computeIfPresent(session.id) { _, current -> current.copy(model = selected) }
+          emit("session.model.selected", base.put("model", JSONObject()
+            .put("providerID", provider).put("id", modelId).put("name", modelId)
+            .putOpt("variant", selected.variant)))
         }
       }
       // 清单与目标都是整值投影：`todo/write` 每次都是完整替换，`goal/change` 是完整快照。
@@ -1252,6 +1792,15 @@ class DshApi(
 
   /** `msg_<turn>:<step>`：同一步的 `step/start`、`assistant/message`、`tool/call` 共用一个消息 id。 */
   private fun messageId(data: JSONObject): String = "msg_${data.optDouble("turn", 0.0).toLong()}:${data.optDouble("step", 0.0).toLong()}"
+
+  private fun nativeToolMessageId(data: JSONObject): String? {
+    listOf("assistantMessageID", "assistantMessageId", "messageID", "messageId").forEach { key ->
+      (data.opt(key) as? String)?.takeIf(String::isNotBlank)?.let { return it }
+    }
+    val turn = data.optLong("turn").takeIf { it > 0 } ?: return null
+    val step = data.optLong("step").takeIf { it > 0 } ?: return null
+    return "msg_$turn:$step"
+  }
 
   private fun liveKey(sessionId: String, data: JSONObject): String =
     "$sessionId|${data.optDouble("turn", 0.0).toLong()}|${data.optDouble("step", 0.0).toLong()}"
@@ -1358,35 +1907,32 @@ class DshApi(
    */
   private fun emitTurnEnd(session: Session, base: JSONObject, data: JSONObject, emit: (String, JSONObject) -> Unit) {
     val reason = data.obj("reason")
+    val outcome = when (reason.str("kind")) {
+      "completed", "forked" -> "succeeded"
+      "aborted", "blocked", "interrupted" -> "interrupted"
+      else -> "failed"
+    }
+    if (!executions.settle(session.id, base.optLong("sequence"), outcome)) return
+    known.computeIfPresent(session.id) { _, current -> current.copy(outcome = outcome) }
     when (reason.str("kind")) {
       "completed", "forked" -> {
-        rememberOutcome(session, "succeeded")
         emit("session.execution.succeeded", base)
       }
       "aborted", "blocked", "interrupted" -> {
-        rememberOutcome(session, "interrupted")
         emit("session.execution.interrupted", base.put("reason", reason.obj("reason").str("kind").ifBlank { "user" }))
       }
       "max-tokens" -> {
-        rememberOutcome(session, "failed")
         emit("session.execution.failed", base.put("error", JSONObject()
           .put("type", "max-tokens")
           .put("message", "达到输出长度上限")))
       }
       else -> {
-        rememberOutcome(session, "failed")
         val error = reason.obj("error")
         emit("session.execution.failed", base.put("error", JSONObject()
           .put("type", error.str("code").ifBlank { reason.str("kind").ifBlank { "error" } })
           .put("message", error.str("message").ifBlank { "执行失败" })))
       }
     }
-  }
-
-  /** 记下本机见过的最新一轮结局，并写回会话缓存，让随后的列表读取带上它。 */
-  private fun rememberOutcome(session: Session, outcome: String) {
-    outcomes[session.id] = outcome
-    known[session.id]?.let { known[session.id] = it.copy(outcome = outcome) }
   }
 
   private fun parseArguments(raw: String): Any =
@@ -1414,7 +1960,7 @@ class DshApi(
         continue
       }
       if (budget <= 0) continue
-      val loaded = readAttachment(sessionId, attachmentId, attachment.str("mediaType")) ?: continue
+      val loaded = readAttachment(sessionId, attachment) ?: continue
       budget -= loaded.length
       if (attachmentBlobs.size >= ATTACHMENT_CACHE_LIMIT) attachmentBlobs.clear()
       attachmentBlobs[attachmentId] = loaded
@@ -1425,11 +1971,21 @@ class DshApi(
   }
 
   /** `session/attachment` → `data:<mediaType>;base64,…`；失败返回 null（只丢图片，不丢消息）。 */
-  private suspend fun readAttachment(sessionId: String, attachmentId: String, mediaType: String): String? = try {
-    val value = callObject("session/attachment", requestArgs(JSONObject()
-      .put("sessionId", sessionId).put("attachmentId", attachmentId)))
+  private suspend fun readAttachment(sessionId: String, attachment: JSONObject): String? = try {
+    val canUseFull = DshAttachmentRequest.hasVerifiedReference(attachment)
+    val full = fullAttachmentReference ?: canUseFull
+    suspend fun load(style: Boolean): JSONObject = callObject("session/attachment",
+      envelope(DshAttachmentRequest.args(sessionId, attachment, style)))
+    val value = try {
+      load(full).also { fullAttachmentReference = full }
+    } catch (error: ApiException) {
+      if (error.code != "gateway/arguments-invalid" || (!full && !canUseFull)) throw error
+      load(!full).also { fullAttachmentReference = !full }
+    }
+    val resultRef = value.optJSONObject("attachment") ?: attachment
+    if (resultRef.str("attachmentId") != attachment.str("attachmentId")) throw ApiException(502, "附件身份不匹配")
     value.optString("data").takeIf(String::isNotBlank)?.let { encoded ->
-      "data:${mediaType.ifBlank { "application/octet-stream" }};base64,$encoded"
+      "data:${resultRef.str("mediaType").ifBlank { "application/octet-stream" }};base64,$encoded"
     }
   } catch (cancel: CancellationException) {
     throw cancel
@@ -1440,21 +1996,25 @@ class DshApi(
 
   // ---------------------------------------------------------------- 事件流
 
-  override fun events(onOpen: () -> Unit): Flow<ServerEvent> = callbackFlow {
-    val channel = Channel<ServerEvent>(Channel.UNLIMITED)
+  override fun events(onOpen: () -> Unit): Flow<ServerEvent> = sharedEventsDelegate.value.events(onOpen)
+
+  /** Only SharedEventOwner starts this source; final cleanup precedes a replacement generation. */
+  private fun ownedEvents(onOpen: () -> Unit): Flow<ServerEvent> = flow { coroutineScope {
+    check(!isClosed) { "DSH 客户端已关闭" }
+    val channel = Channel<ServerEvent>(256)
     eventChannel = channel
-    var closed = false
-    val push: (ServerEvent) -> Unit = { event -> channel.trySend(event) }
+    val ended = java.util.concurrent.atomic.AtomicBoolean(false)
+    val push: (ServerEvent) -> Unit = { event ->
+      if (!ended.get() && channel.trySend(event).isFailure) channel.close(IOException("事件 owner 消费者过慢；请重新同步"))
+    }
 
     // follow 可能先于事件流建立：把快照之后、事件流挂上之前到达的增量补送，避免“打开会话的头几秒丢了”。
     flushFollowBuffers(push)
 
-    val eventsJob = launch { runEventsLoop(push, onOpen) { closed } }
-    val statusJob = launch { runStatusFallback(push) { closed } }
-
-    val pump = launch {
-      for (event in channel) send(event)
-    }
+    // The business waterfall outlives its UI collector long enough to hand ownership back. A
+    // collector cancellation must not cancel the gateway client before its queued `next` RPC.
+    val eventsJob = ioScope.launch { runEventsLoop(push, onOpen) { ended.get() || isClosed } }
+    val statusJob = launch { runStatusFallback(push) { ended.get() || isClosed } }
 
     // Content is expensive (workspace/follow + one follow per running session). Background monitors
     // keep only `$events`; the selected connection switches this on. Switching it off stops the
@@ -1465,11 +2025,11 @@ class DshApi(
         contentJob?.cancel()
         contentJob = null
         if (!enabled) {
-          followStates.values.toList().forEach(::stopFollowState)
+          followStates.values.filter { !leaseManaged || it.sessionId !in leaseSnapshot.reading }.forEach(::stopFollowState)
           return@collect
         }
         contentJob = launch {
-          val workspace = launch { runWorkspaceLoop { closed } }
+          val workspace = launch { runWorkspaceLoop { ended.get() || isClosed } }
           try {
             synchronized(watched) { watched.toList() }.forEach(::startFollow)
             awaitCancellation()
@@ -1480,18 +2040,22 @@ class DshApi(
       }
     }
 
-    awaitClose {
-      closed = true
-      eventsJob.cancel()
-      statusJob.cancel()
-      contentWatcher.cancel()
-      contentJob?.cancel()
-      followStates.values.toList().forEach(::stopFollowState)
-      pump.cancel()
-      channel.close()
+    try { for (event in channel) emit(event) }
+    finally { withContext(NonCancellable) {
+      ended.set(true)
+      if (questionCoordinatorDelegate.isInitialized()) questionCoordinator.presentation(null, false)
+      // Last subscriber releases the business waterfall; a sibling subscriber never reaches here.
+      if (questionCoordinatorDelegate.isInitialized() && questionCoordinator.hasPendingSettlements())
+        kotlinx.coroutines.withTimeoutOrNull(2_000) { questionCoordinator.awaitSettlements() }
+      eventsJob.cancelAndJoin()
+      statusJob.cancelAndJoin()
+      contentWatcher.cancelAndJoin()
+      contentJob?.cancelAndJoin()
+      followStates.values.filter { !leaseManaged || it.sessionId !in leaseSnapshot.reading }.forEach(::stopFollowState)
+      channel.cancel()
       if (eventChannel === channel) eventChannel = null
-    }
-  }
+    } }
+  } }
 
   /**
    * `$events` 是状态的主实时源，但不是内容和状态的唯一来源：它断开时只标记 degraded、
@@ -1506,11 +2070,19 @@ class DshApi(
       var socket: WebSocket? = null
       var wasReady = false
       try {
-        socket = openMux("\$events", noArgs(), onItem = { frame ->
+        socket = openMux("\$events", noArgs(), onItem = item@{ frame ->
+          if (isClosed()) return@item
           eventsLastFrameAt = System.currentTimeMillis()
           when (frame.str("type")) {
             "ready" -> {
-              eventsClientId = frame.str("clientId")
+              val nextClientId = frame.str("clientId")
+              for ((deliveryId, delivery) in questionEventClients.toMap()) {
+                if (delivery.clientId != nextClientId) {
+                  if (questionCoordinatorDelegate.isInitialized()) questionCoordinator.cancelled(deliveryId)
+                  questionEventClients.remove(deliveryId, delivery)
+                }
+              }
+              eventsClientId = nextClientId
               eventsReady = true
               wasReady = true
               readySignal.complete(Unit)
@@ -1527,7 +2099,10 @@ class DshApi(
             else -> Unit
           }
         }, onClosed = { cause ->
-          eventsReady = false
+          if (!isClosed()) {
+            sharedEventsDelegate.value.notReady()
+            eventsReady = false
+          }
           ended.complete(cause)
         })
         // TCP/TLS 建连成功不等于逻辑事件流可用。对端若一直不发 ready，必须按失败重连，
@@ -1551,12 +2126,17 @@ class DshApi(
       } catch (cancel: CancellationException) {
         throw cancel
       } catch (error: Exception) {
+        sharedEventsDelegate.value.notReady()
         eventsReady = false
         eventsError = error.message?.takeIf { it.isNotBlank() } ?: error.javaClass.simpleName
         eventsReconnects++
         if (wasReady) connectionEvent(false, eventsError)?.let(push)
         socket?.cancel()
         Diagnostics.warn("DshApi", "\$events 建立失败", error)
+      } finally {
+        // Cancellation may happen in the first-ready wait, before ended.await's own finally.
+        // Always retire this logical producer; the shared API-Peer socket stays owned by muxOwner.
+        socket?.cancel()
       }
       delay(backoff)
       backoff = (backoff * 2).coerceAtMost(EVENTS_RETRY_MAX_MILLIS)
@@ -1641,6 +2221,7 @@ class DshApi(
   }
 
   private fun emitStatus(id: String, running: Boolean, push: (ServerEvent) -> Unit) {
+    if (executions.status(id, running)) clearKnownOutcome(id)
     val now = System.currentTimeMillis()
     push(ServerEvent(id = "dsh:status:$id:$running:$now", directory = known[id]?.directory.orEmpty(),
       type = "session.status", properties = JSONObject()
@@ -1655,20 +2236,21 @@ class DshApi(
    * 读不到、或这一轮已经翻译过，就什么都不补：没有见过结局不能猜成成功。
    */
   private suspend fun publishSettledOutcome(id: String, push: (ServerEvent) -> Unit) {
-    if (id.isBlank() || !outcomeReads.add(id)) return
+    if (id.isBlank() || executions.running(id)) return
+    val epoch = executions.epoch(id)
+    if (outcomeReads.putIfAbsent(id, epoch) != null) return
     try {
-      if (outcomes[id] != null) return
+      if (executions.outcome(id) != null) return
       val session = known[id] ?: return
       val event = latestTurnEnd(session) ?: return
-      // follow 可能在这次读取期间自己投递了 turn/end；以先到的为准，不重复发。
-      if (outcomes[id] != null) return
+      if (executions.epoch(id) != epoch || executions.running(id) || executions.outcome(id) != null) return
       translate(session, event).filter { it.type.startsWith("session.execution.") }.forEach(push)
     } catch (cancel: CancellationException) {
       throw cancel
     } catch (error: Exception) {
       Diagnostics.warn("DshApi", "读取会话结局失败", error)
     } finally {
-      outcomeReads.remove(id)
+      outcomeReads.remove(id, epoch)
     }
   }
 
@@ -1682,7 +2264,7 @@ class DshApi(
    * 也不能猜成成功。
    */
   private suspend fun latestTurnEnd(session: Session): JSONObject? {
-    val through = knownCursor(session) ?: return null
+    val through = knownCursor(session, refresh = true) ?: return null
     var before: Long? = null
     repeat(OUTCOME_PAGE_ATTEMPTS) {
       val request = JSONObject().put("address", address(session.id)).put("throughSeq", through)
@@ -1690,8 +2272,9 @@ class DshApi(
       if (before != null) request.put("beforeSeq", before)
       val page = callObject("session/page", requestArgs(request))
       val records = page.arr("records").objects()
-      val turnEnd = records.map { it.obj("event") }.lastOrNull { it.str("type") == "turn/end" }
-      if (turnEnd != null) return turnEnd
+      val lifecycle = records.map { it.obj("event") }.lastOrNull { it.str("type") in setOf("turn/start", "turn/end") }
+      if (lifecycle?.str("type") == "turn/start") return null
+      if (lifecycle?.str("type") == "turn/end") return lifecycle
       if (!page.optBoolean("hasMore") || records.isEmpty()) return null
       before = records.mapNotNull { it.obj("event").optDouble("seq", 0.0).toLong().takeIf { seq -> seq > 0 } }.minOrNull()
         ?: return null
@@ -1703,9 +2286,9 @@ class DshApi(
    * 一条会话当前已知的日志切点。本机读过就用记住的那个，否则开一条**一次性** follow 只取快照的
    * `cursor` 再立刻关掉（与 `job/list` 同一种用法，不占长期流预算）；取不到就返回 null。
    */
-  private suspend fun knownCursor(session: Session): Long? {
+  private suspend fun knownCursor(session: Session, refresh: Boolean = false): Long? {
     val remembered = maxOf(cursors[session.id] ?: 0L, lastSeq(session.id))
-    if (remembered > 0) return remembered
+    if (!refresh && remembered > 0) return remembered
     val snapshot = try {
       oneShotStreams.withPermit {
         fetchFirstFrame("session/follow", requestArgs(JSONObject()
@@ -1782,14 +2365,7 @@ class DshApi(
         val id = args.optString(0).takeUnless { it == "null" }.orEmpty()
         if (id.isBlank()) return
         val running = args.optBoolean(1, false)
-        val now = System.currentTimeMillis()
-        push(ServerEvent(id = "dsh:status:$id:$running:$now", directory = known[id]?.directory.orEmpty(), type = "session.status",
-          properties = JSONObject()
-            .put("sessionID", id)
-            .put("status", JSONObject().put("type", if (running) "busy" else "idle")), created = now))
-        // 停下来时日志里才有结局。follow 没开（后台监控、流预算已满）就读不到 turn/end，
-        // 这里补读最后一轮，再补发一条带结局的执行事件，未读账本才有“已完成”。
-        if (!running) ioScope.launch { publishSettledOutcome(id, push) }
+        emitStatus(id, running, push)
       }
       "api-session/activity" -> {
         val id = args.optString(0).takeUnless { it == "null" }.orEmpty()
@@ -1805,19 +2381,45 @@ class DshApi(
         }
       }
       // 目标续跑状态（`armed`/`disarmed`）只存在于进程内，投影刻意不含它，远程也没有 `goals/get`。
-      // 事件 `goal/activation-changed` 是这条事实唯一的远程通道。
+      // Full mutation responses also carry it; events must match the exact goal id AND revision.
       "goal/activation-changed" -> {
         val payload = args.optJSONObject(0) ?: return
         val id = payload.str("sessionId").takeIf { it.isNotBlank() } ?: return
-        val activation = payload.obj("goal").str("activation").takeIf { it.isNotBlank() }
-        if (activation != null) goalActivation[id] = activation else goalActivation.remove(id)
-        push(ServerEvent(id = "dsh:goal:$id:${activation.orEmpty()}", directory = known[id]?.directory.orEmpty(),
-          type = "session.goal.changed", properties = JSONObject().put("sessionID", id), created = System.currentTimeMillis()))
+        val current = payload.optJSONObject("goal")
+        if (current == null) synchronized(goalCacheLock) {
+          val previous = latestGoalViews[id]
+          val activation = goalActivation[id]
+          val clearedId = previous?.id ?: activation?.id
+          val clearedRevision = previous?.revision ?: activation?.revision
+          clearGoalCache(id)
+          if (clearedId != null && clearedRevision != null) clearedGoalRefs[id] = ClearedGoal(clearedId, clearedRevision)
+        }
+        else {
+          val goalId = current.str("id").takeIf { it.isNotBlank() } ?: return
+          val revision = current.optInt("revision", 0).takeIf { it > 0 } ?: return
+          val activation = current.str("activation").takeIf { it == "armed" || it == "disarmed" } ?: return
+          synchronized(goalCacheLock) {
+            val latest = latestGoalViews[id]
+            val previous = goalActivation[id]
+            // Delayed events cannot overwrite a view/event for a newer revision of this goal.
+            if ((latest?.id != goalId || latest.revision <= revision) &&
+              (previous?.id != goalId || previous.revision <= revision)) {
+              advanceGoalCacheEpoch(id)
+              goalActivation[id] = GoalActivation(goalId, revision, activation)
+              if (latest?.id == goalId && latest.revision == revision)
+                latestGoalViews[id] = latest.copy(activation = activation)
+            }
+          }
+        }
+        push(ServerEvent(id = "dsh:goal:$id:${current?.str("id").orEmpty()}:${current?.optInt("revision", 0) ?: 0}",
+          directory = known[id]?.directory.orEmpty(), type = "session.goal.changed",
+          properties = JSONObject().put("sessionID", id), created = System.currentTimeMillis()))
       }
     }
   }
 
   private fun handleWaterfall(frame: JSONObject, push: (ServerEvent) -> Unit) {
+    if (closing.get()) return
     val name = frame.str("event")
     val eventId = frame.str("eventId")
     if (eventId.isNotBlank()) redelivered += eventId
@@ -1844,39 +2446,14 @@ class DshApi(
           properties = properties, created = System.currentTimeMillis()))
       }
       "user-questions/request" -> {
-        if (eventId.isBlank()) return
-        // 定时问答（`wait.timed`）只有"某客户端认领"时 Host 才不会自己到点关窗。
-        // 不认领的话手机切走再回来，卡片已经被主机取消，且 answered 太晚的 `$events/result` 会被丢弃。
-        val wait = request.obj("wait")
-        // 记下 callId：瀑布关闭后（`pending`/`continued`）只能靠它走 `userQuestions/answer` 作答。
-        wait.str("callId").takeIf { it.isNotBlank() }?.let { questionCallIds[eventId] = it }
-        if (wait.optBoolean("timed")) claimTimedQuestion(sessionId, eventId, wait.str("callId"))
-        val fields = JSONArray()
-        for (question in request.arr("questions").objects()) {
-          val options = JSONArray()
-          for (option in question.arr("options").objects()) {
-            val label = option.str("label")
-            // DSH 没有独立的选项 value：答案按 label 回显，表单身份也只能取 label。
-            options.put(JSONObject()
-              .put("label", label)
-              .put("description", option.str("description"))
-              .put("value", label))
-          }
-          fields.put(JSONObject()
-            .put("key", question.str("id"))
-            .put("title", question.str("question"))
-            .put("description", question.str("detail"))
-            .put("type", if (question.optBoolean("multiSelect")) "multiselect" else "select")
-            .put("options", options)
-            .put("custom", true))
-        }
-        // 控制器从 `properties.form` 读表单；id 用瀑布事件 id，回答时按它结算。
-        val form = JSONObject().put("id", eventId).put("sessionID", sessionId).put("fields", fields)
-        val properties = JSONObject().put("form", form)
-        val parsed = try { form.toForm(directory) } catch (error: Exception) { null }
-        if (parsed != null) pendingQuestions[eventId] = parsed
-        push(ServerEvent(id = "dsh:question:$eventId", directory = directory, type = "form.created",
-          properties = properties, created = System.currentTimeMillis()))
+        if (eventId.isBlank() || sessionId.isBlank()) return
+        val clientId = eventsClientId ?: return
+        val deliveryId = questionDeliveryId(clientId, eventId)
+        if (questionEventClients.size >= 1024 && !questionEventClients.containsKey(deliveryId))
+          throw IOException("提问事件超过客户端预算")
+        questionEventClients[deliveryId] = QuestionDelivery(clientId, eventId, sessionId,
+          request.optJSONObject("wait")?.optString("callId")?.takeIf { it.isNotBlank() })
+        questionCoordinator.receive(sessionId, deliveryId, request)
       }
     }
   }
@@ -1888,7 +2465,7 @@ class DshApi(
   private fun reconcileAfterReady(push: (ServerEvent) -> Unit) {
     val generation = readyGeneration.incrementAndGet()
     redelivered.clear()
-    val stale = pendingApprovals.keys.toSet() + pendingQuestions.keys.toSet()
+    val stale = pendingApprovals.keys.toSet() + questionEventClients.values.map { it.wireEventId }.toSet()
     if (stale.isEmpty()) return
     ioScope.launch {
       kotlinx.coroutines.delay(REDELIVERY_GRACE_MILLIS)
@@ -1905,7 +2482,14 @@ class DshApi(
   }
 
   private fun settleLocally(eventId: String, push: (ServerEvent) -> Unit) {
-    releaseQuestionClaim(eventId)
+    val deliveryId = eventsClientId?.let { questionDeliveryId(it, eventId) }
+    val delivery = deliveryId?.let { questionEventClients.remove(it) }
+    if (deliveryId != null && questionCoordinatorDelegate.isInitialized()) questionCoordinator.cancelled(deliveryId)
+    if (delivery != null && !closed) ioScope.launch {
+      try { reconcileCancelledQuestion(delivery) }
+      catch (cancel: CancellationException) { throw cancel }
+      catch (error: Exception) { Diagnostics.warn("DshApi", "提问取消后的投影对账失败", error) }
+    }
     val now = System.currentTimeMillis()
     val permission = pendingApprovals.remove(eventId)
     if (permission != null) {
@@ -1913,12 +2497,7 @@ class DshApi(
         properties = JSONObject().put("sessionID", permission.sessionId).put("id", eventId), created = now))
       return
     }
-    val question = pendingQuestions.remove(eventId)
-    if (question != null) {
-      questionCallIds.remove(eventId)
-      push(ServerEvent(id = "dsh:question-settled:$eventId", directory = question.directory, type = "form.cancelled",
-        properties = JSONObject().put("sessionID", question.sessionId).put("id", eventId), created = now))
-    }
+
   }
 
   /** 回一条瀑布：`{clientId, eventId, outcome}`，结果值按事件类型自己决定。 */
@@ -1944,43 +2523,97 @@ class DshApi(
     } catch (error: Exception) {
       Diagnostics.info("DshApi", "瀑布结算失败，尝试备用通道：${error.message.orEmpty().take(120)}")
       false
+    }
+  }
+
+  private suspend fun settleQuestionOutcome(eventId: String, outcome: JSONObject) {
+    val delivery = questionEventClients[eventId] ?: throw ApiException(409, "提问事件通道已变化，请刷新后确认")
+    try {
+      call("\$events/result", envelope(JSONObject().put("clientId", delivery.clientId)
+        .put("eventId", delivery.wireEventId).put("outcome", outcome)))
     } finally {
-      releaseQuestionClaim(eventId)
+      questionEventClients.remove(eventId, delivery)
     }
   }
 
-  /**
-   * 认领一条定时问答：`userQuestions/attachWait` 是一条流，只要它还开着，Host 就认为有客户端在等，
-   * 不会到点自己关窗。认领失败只降级成"被动等待"，不影响作答。
-   */
-  private fun claimTimedQuestion(sessionId: String, eventId: String, callId: String) {
-    if (callId.isBlank() || sessionId.isBlank() || closed) return
-    if (!claimedQuestions.add(eventId)) return
-    ioScope.launch {
-      try {
-        val socket = openMux("userQuestions/attachWait", envelope(argsOf("agentId" to sessionId, "callId" to callId)),
-          onItem = { }, onClosed = { })
-        questionClaims[eventId] = socket
-      } catch (cancel: CancellationException) {
-        claimedQuestions.remove(eventId)
-        throw cancel
-      } catch (error: Exception) {
-        claimedQuestions.remove(eventId)
-        Diagnostics.warn("DshApi", "认领定时问答失败，改为被动等待", error)
+  private suspend fun refreshQuestionProjection(sessionId: String) {
+    val result = call("session/projections", requestArgs(JSONObject().put("sessionId", sessionId))) as? JSONObject
+      ?: throw IOException("提问投影不是对象")
+    questionCoordinator.reconcile(sessionId, result.obj("values"))
+  }
+
+  private fun refreshQuestionsAfterDurableEvent(sessionId: String, event: JSONObject) {
+    if (!questionCoordinatorDelegate.isInitialized() || closing.get()) return
+    if (event.str("type") !in setOf("tool/result", "user/message", "turn/end", "session/inbox")) return
+    synchronized(questionRefreshes) {
+      if (questionRefreshes[sessionId]?.isActive == true) {
+        dirtyQuestionRefreshes += sessionId
+        return
       }
+      val job = ioScope.launch(start = kotlinx.coroutines.CoroutineStart.LAZY) {
+        var attempts = 0
+        do {
+          dirtyQuestionRefreshes.remove(sessionId)
+          try { refreshQuestionProjection(sessionId) }
+          catch (cancel: CancellationException) { throw cancel }
+          catch (error: Exception) { Diagnostics.warn("DshApi", "提问耐久事件对账失败", error) }
+          attempts++
+        } while (!closed && !closing.get() && dirtyQuestionRefreshes.contains(sessionId) && attempts < 8)
+      }
+      questionRefreshes[sessionId] = job
+      job.invokeOnCompletion {
+        val again = synchronized(questionRefreshes) {
+          val removed = questionRefreshes.remove(sessionId, job)
+          removed && !closed && !closing.get() && dirtyQuestionRefreshes.remove(sessionId)
+        }
+        if (again) refreshQuestionsAfterDurableEvent(sessionId, JSONObject().put("type", "tool/result"))
+      }
+      job.start()
     }
   }
 
-  /**
-   * 结算/取消后释放认领，避免一直占着一条逻辑流。
-   *
-   * 刻意**不**清 `questionCallIds`：结算失败要回落到 `userQuestions/answer`，那条路还需要 callId。
-   * 它由 [settleLocally]（提问真的结束时）和作答成功时清理。
-   */
-  private fun releaseQuestionClaim(eventId: String) {
-    claimedQuestions.remove(eventId)
-    questionClaims.remove(eventId)?.cancel()
+  private suspend fun reconcileCancelledQuestion(delivery: QuestionDelivery) {
+    // Gateway cancellation precedes the durable pending tool result. Retry READS only while that
+    // exact call is still open; never replay a settlement/answer mutation.
+    for (attempt in 0..4) {
+      if (closed || closing.get()) return
+      if (attempt > 0) delay(100L shl (attempt - 1))
+      refreshQuestionProjection(delivery.sessionId)
+      val state = delivery.callId?.let { questionCoordinator.snapshotForCall(delivery.sessionId, it) }
+      if (state?.state != "open" || state.eventId != null) return
+    }
   }
+
+  private fun publishQuestionSnapshots(snapshots: List<DshQuestionRegistry.Snapshot>) {
+    val next = snapshots.map { snapshot -> snapshot.toQuestionForm(known[snapshot.sessionId]?.directory.orEmpty()).copy(
+      presentation = QuestionPresentation(snapshot.remainingMs?.let { remaining ->
+        (remaining.coerceAtMost(Long.MAX_VALUE - 999) + 999) / 1000 * 1000
+      }, snapshot.countdownRunning, snapshot.held, snapshot.state == "continued")) }.associateBy { it.id }
+    val previous = pendingQuestions.toMap()
+    pendingQuestions.keys.removeAll { it !in next }
+    pendingQuestions.putAll(next)
+    for ((id, request) in previous) if (id !in next) ownerEvent(ServerEvent(
+      id = "dsh:question-removed:${nextLiveEventId()}", directory = request.directory, type = "form.cancelled",
+      properties = JSONObject().put("sessionID", request.sessionId).put("id", id), created = clock()))
+    for ((id, request) in next) if (request != previous[id]) {
+      val form = JSONObject().put("id", id).put("sessionID", request.sessionId)
+        .put("fields", JSONArray().apply { request.questions.forEach { put(JSONObject(it.field)) } })
+      request.presentation?.let { state -> form.put("questionPresentation", JSONObject()
+        .putOpt("remainingMs", state.remainingMs).put("countdownRunning", state.countdownRunning)
+        .put("held", state.held).put("continued", state.continued)) }
+      ownerEvent(ServerEvent(id = "dsh:question-change:${nextLiveEventId()}", directory = request.directory,
+        type = if (id in previous) "form.updated" else "form.created", properties = JSONObject().put("form", form), created = clock()))
+    }
+  }
+
+  override fun questionPresentation(sessionId: String?, foreground: Boolean) {
+    questionSession = sessionId
+    questionForeground = foreground
+    if (!isClosed) questionCoordinator.presentation(sessionId, foreground)
+  }
+  override fun questionFocus(id: String, focused: Boolean) = questionCoordinator.focus(id, focused)
+  override fun questionEngage(id: String) = questionCoordinator.engage(id)
+  override fun questionTakeTime(id: String) = questionCoordinator.takeTime(id)
 
   /** 拒绝一条瀑布：`{kind:"rejected", error:{name, message}}`。 */
   private suspend fun reject(eventId: String, message: String) {
@@ -2076,7 +2709,7 @@ class DshApi(
   private fun releaseFollowForRetry(exclude: String): Boolean {
     val victim = synchronized(watched) {
       watched.firstOrNull { id ->
-        id != activeSessionId && id != exclude && followStates[id]?.socket != null
+        id != activeSessionId && id != exclude && (!leaseManaged || id !in leaseSnapshot.reading) && followStates[id]?.socket != null
       }?.also { watched.remove(it) }
     } ?: return false
     Diagnostics.warn("DshApi", "流预算已满，释放旧的会话 follow：${victim.take(24)}")
@@ -2106,12 +2739,21 @@ class DshApi(
     }
     when (type) {
       "snapshot" -> {
+        frame.arr("records").objects().forEach { changeAnnouncements.record(session.id, it.obj("event")) }
         state.error = null
         state.snapshotAt = System.currentTimeMillis()
         frame.optDouble("cursor", 0.0).toLong().takeIf { it >= 0 }?.let { cursors[session.id] = it }
         frame.arr("records").objects().lastOrNull { it.obj("event").str("type") == "turn/start" }
           ?.obj("event")?.obj("data")?.optLong("turn")?.takeIf { it > 0 }?.let { durableTurns[session.id] = it }
         val baseline = lastSeq(session.id)
+        val projection = ptcProjection(session.id)
+        synchronized(projection) {
+          val records = frame.arr("records").objects()
+          projection.indexRoots(records)
+          // Seed already-covered ancestors before newer children arrive, even without a message read.
+          records.filter { baseline == 0L || it.obj("event").optLong("seq") <= baseline }
+            .forEach { projection.process(it) }
+        }
         if (!state.snapshot.isCompleted) state.snapshot.complete(frame)
         // 重连/重同步：只补投时间线还没有的耐久记录，避免整页重复。
         if (baseline > 0) {
@@ -2134,6 +2776,7 @@ class DshApi(
       }
       "event" -> {
         val event = frame.obj("event")
+        changeAnnouncements.record(session.id, event)
         val seq = event.optDouble("seq", 0.0).toLong()
         if (seq <= 0 || seq > lastSeq(session.id)) {
           val previous = lastSeq(session.id)
@@ -2146,6 +2789,7 @@ class DshApi(
             }
           }
           translate(session, event).forEach { emitFollow(state, it) }
+          refreshQuestionsAfterDurableEvent(session.id, event)
           if (seq > 0) advanceSeq(session.id, seq)
         }
       }
@@ -2192,7 +2836,7 @@ class DshApi(
   private fun emitFollow(state: FollowState, event: ServerEvent) {
     val channel = eventChannel
     if (channel != null) {
-      channel.trySend(event)
+      if (channel.trySend(event).isFailure) channel.close(IOException("会话事件缓冲区已满；请重新同步"))
       return
     }
     // 事件流还没建立：先放进有界缓冲，等 events() 挂上后补齐；不丢开场几秒。
@@ -2236,6 +2880,9 @@ class DshApi(
 
   private fun stopFollow(id: String) {
     followStates[id]?.let(::stopFollowState)
+    if (id != activeSessionId && !synchronized(watched) { id in watched }) {
+      synchronized(ptcProjections) { ptcProjections.remove(id) }
+    }
   }
 
   private fun stopFollowState(state: FollowState) {
@@ -2265,7 +2912,7 @@ class DshApi(
         watched.add(session.id)
       }
       while (watched.size > WATCH_LIMIT) {
-        val oldest = watched.firstOrNull { it != activeSessionId } ?: break
+        val oldest = watched.firstOrNull { it != activeSessionId && (!leaseManaged || it !in leaseSnapshot.reading) } ?: break
         watched.remove(oldest)
         evicted += oldest
       }
@@ -2273,7 +2920,11 @@ class DshApi(
     }
     // 先停掉被淘汰的，释放槽位后再启动新流。
     evicted.forEach(::stopFollow)
-    if (eventChannel == null || !contentWatching.value) return
+    if (eventChannel == null) return
+    if (!contentWatching.value) {
+      if (leaseManaged) retained.filter { it in leaseSnapshot.reading }.forEach(::startFollow)
+      return
+    }
     retained.forEach(::startFollow)
   }
 
@@ -2330,11 +2981,19 @@ class DshApi(
    * 模型侧原文，也不丢失轮次起点。
    */
   internal suspend fun recordsToMessages(session: Session, records: List<JSONObject>): List<Message> {
-    data class ToolEntry(val id: String, val name: String, val input: JSONObject, var state: JSONObject?)
-    data class Step(val turn: Long, val step: Long, var started: Long, var order: Int,
-      val blocks: MutableList<JSONObject>, val tools: MutableMap<String, ToolEntry>, var ended: Long)
+    // Durable seq is authoritative even if a reconstructed/stitched window arrives out of order.
+    val orderedRecords = records.withIndex().sortedWith(compareBy<IndexedValue<JSONObject>> {
+      it.value.obj("event").optLong("seq").takeIf { seq -> seq > 0 } ?: Long.MAX_VALUE
+    }.thenBy { it.index }).map { it.value }
+    data class ToolEntry(val id: String, val name: String, val input: Any, var state: JSONObject?)
+    data class Step(val id: String, val turn: Long?, var started: Long, var order: Int,
+      val blocks: MutableList<JSONObject>, val tools: MutableMap<String, ToolEntry>, var ended: Long,
+      val toolOrder: MutableSet<String> = LinkedHashSet())
 
-    val steps = LinkedHashMap<Pair<Long, Long>, Step>()
+    val sessionPtc = ptcProjection(session.id)
+    val ptc = synchronized(sessionPtc) { sessionPtc.replayFor(orderedRecords) }
+    val ptcParts = LinkedHashMap<String, LinkedHashMap<String, MessagePart>>()
+    val steps = LinkedHashMap<String, Step>()
     val inputs = mutableListOf<Triple<Long, Int, Message>>()
     var lifecycleNotices = emptyList<Message>()
     var currentTurn: Long? = null
@@ -2342,14 +3001,15 @@ class DshApi(
     fun stepOf(data: JSONObject): Step {
       val turn = data.optDouble("turn", 0.0).toLong()
       val number = data.optDouble("step", 0.0).toLong()
-      return steps.getOrPut(turn to number) { Step(turn, number, 0, order, mutableListOf(), mutableMapOf(), 0) }
+      val id = "msg_$turn:$number"
+      return steps.getOrPut(id) { Step(id, turn, 0, order, mutableListOf(), mutableMapOf(), 0) }
     }
 
-    for (record in records) {
+    for (record in orderedRecords) {
       order++
       val event = record.obj("event")
       val type = event.str("type")
-      val seq = event.optDouble("seq", 0.0).toLong()
+      val seq = exactDshSequence(event.opt("seq")) ?: 0L
       val time = event.optDouble("time", 0.0).toLong()
       val data = event.obj("data")
       when (type) {
@@ -2377,10 +3037,26 @@ class DshApi(
           }
         }
         "tool/call" -> {
-          val step = stepOf(data)
+          val callId = data.str("callId").takeIf(String::isNotBlank) ?: continue
+          val assistantId = nativeToolMessageId(data) ?: continue
+          val step = steps.getOrPut(assistantId) {
+            Step(assistantId, data.optLong("turn").takeIf { it > 0 }, 0, order, mutableListOf(), mutableMapOf(), 0)
+          }
           if (step.started == 0L) step.started = time
-          val callId = data.str("callId")
-          if (callId.isNotBlank()) step.tools[callId] = ToolEntry(callId, data.str("name"), parseArguments(data.str("arguments")) as? JSONObject ?: JSONObject(), null)
+          step.tools[callId] = ToolEntry(callId, data.str("name"), parseArguments(data.str("arguments")), null)
+          step.toolOrder += callId
+        }
+        "tool/ptc-dispatch-start", "tool/code-dispatch-start",
+        "tool/ptc-dispatch", "tool/code-dispatch" -> {
+          val child = ptc.process(type, data, seq, time) ?: continue
+          synchronized(sessionPtc) { sessionPtc.process(type, data, seq, time) }
+          val root = ptc.indexedRoots()[child.rootCallId] ?: continue
+          val step = steps.getOrPut(child.assistantMessageId) {
+            Step(child.assistantMessageId, root.turn, time, order, mutableListOf(), mutableMapOf(), 0)
+          }
+          if (step.started == 0L) step.started = time
+          ptcParts.getOrPut(step.id) { LinkedHashMap() }[child.subCallId] = child.state.messagePart()
+          step.toolOrder += child.subCallId
         }
         "tool/result" -> {
           val step = stepOf(data)
@@ -2398,7 +3074,7 @@ class DshApi(
     entries += inputs
     lifecycleNotices.forEach { message -> entries += Triple(message.created, 0, message) }
     for (step in steps.values) {
-      val id = "msg_${step.turn}:${step.step}"
+      val id = step.id
       val content = JSONArray()
       for (block in step.blocks) {
         val kind = block.str("type")
@@ -2410,7 +3086,8 @@ class DshApi(
         state.put("input", tool.input)
         content.put(JSONObject().put("type", "tool").put("id", tool.id).put("name", tool.name).put("state", state))
       }
-      if (content.length() == 0) continue
+      val children = ptcParts[id]?.values.orEmpty()
+      if (content.length() == 0 && children.isEmpty()) continue
       val json = JSONObject()
         .put("id", id)
         .put("type", "assistant")
@@ -2422,8 +3099,12 @@ class DshApi(
       if (model != null) {
         json.put("model", JSONObject().put("providerID", model.providerId).put("id", model.modelId).put("name", model.label))
       }
+      val message = json.toMessage()
+      val nativeParts = message.parts.filter { it.type == "tool" }.associateBy { it.id }
+      val orderedTools = step.toolOrder.mapNotNull { toolId -> nativeParts[toolId] ?: ptcParts[id]?.get(toolId) }
       entries += Triple(step.started, step.order,
-        json.toMessage().copy(turnId = "turn:${step.turn}", sequence = records.getOrNull(step.order - 1)?.obj("event")?.optLong("seq")))
+        message.copy(parts = message.parts.filterNot { it.type == "tool" } + orderedTools, turnId = step.turn?.let { "turn:$it" },
+          sequence = orderedRecords.getOrNull(step.order - 1)?.obj("event")?.optLong("seq")))
     }
     entries.sortWith(compareBy<Triple<Long, Int, Message>> { it.first }.thenBy { it.second })
     return entries.map { it.third }
@@ -2437,10 +3118,14 @@ class DshApi(
    * 进程内的 `activation` 不在投影里，仍由 [goal] 在 Agent 活跃时补齐。
    */
   override suspend fun composerContext(id: String): ComposerContext = withContext(Dispatchers.IO) {
+    val goalEpoch = goalCacheEpoch(id)
     val value = call("session/projections", requestArgs(JSONObject().put("sessionId", id))) as? JSONObject
       ?: return@withContext ComposerContext()
     val values = value.obj("values")
-    ComposerContext(inbox = inboxMessages(values), todos = values.todoProjection(), goal = values.goalProjection())
+    questionCoordinator.reconcile(id, values)
+    ComposerContext(inbox = inboxMessages(values), todos = values.todoProjection(),
+      goal = if (values.has("goal")) mergeGoalRead(id, values.goalProjection(), startedEpoch = goalEpoch)
+         else synchronized(goalCacheLock) { latestGoalViews[id].takeIf { goalEpoch != goalCacheEpoch(id) } })
   }
 
   override suspend fun inbox(id: String): List<Message> = composerContext(id).inbox
@@ -2560,28 +3245,123 @@ class DshApi(
   }
 
   override suspend fun schedules(sessionId: String): List<RemoteSchedule> {
-    val value = call("schedule/list", requestArgs(JSONObject().put("sessionId", sessionId))) as? JSONArray
-      ?: return emptyList()
-    return (0 until value.length()).mapNotNull { index ->
-      val item = value.optJSONObject(index) ?: return@mapNotNull null
-      val id = item.optString("id").takeIf { it.isNotBlank() } ?: return@mapNotNull null
-      val kind = item.optString("kind")
-      val detail = when (kind) {
-        "every" -> "${item.optInt("everySeconds")} 秒"
-        "daily" -> "${item.optString("time")} ${item.optString("timeZone")}"
-        "weekly" -> {
-          val days = item.optJSONArray("weekdays")
-          val text = if (days == null) "" else (0 until days.length()).joinToString(",") { days.optInt(it).toString() }
-          "${item.optString("time")} ${item.optString("timeZone")} · $text"
-        }
-        "cron" -> "${item.optString("expression")} ${item.optString("timeZone")}"
-        "after" -> "${item.optInt("afterSeconds")} 秒后"
-        "at" -> item.optString("scheduledAt")
-        else -> kind
-      }
-      RemoteSchedule(id, kind, item.optString("title").ifBlank { "定时任务" },
-        item.optString("prompt"), item.optString("scheduledAt"), detail)
+    require(sessionId.isNotBlank()) { "Missing schedule owner" }
+    val value = call("schedule/list", requestArgs(JSONObject().put("sessionId", sessionId)))
+    return scheduleResponse {
+      val rows = value as? JSONArray ?: throw IllegalArgumentException("Missing schedule list")
+      scheduleImmutable((0 until rows.length()).map { index ->
+        val row = rows.opt(index) as? JSONObject ?: throw IllegalArgumentException("Invalid schedule row")
+        ScheduleRecord.parse(row).toRemoteSchedule(sessionId, "active")
+      })
     }
+  }
+
+  override suspend fun scheduleCatalog(): List<RemoteSchedule>? {
+    val value = try { call("schedule/catalog", noArgs()) } catch (error: ApiException) {
+      if (error.isDshMethodUnavailable) return null
+      throw error
+    }
+    return scheduleResponse {
+      val rows = value as? JSONArray ?: throw IllegalArgumentException("Missing schedule catalog")
+      scheduleImmutable((0 until rows.length()).map { index ->
+        val row = rows.opt(index) as? JSONObject ?: throw IllegalArgumentException("Invalid schedule row")
+        val owner = scheduleString(row, "sessionId").also { require(it.isNotBlank()) }
+        val status = scheduleString(row, "status").also { require(it == "active" || it == "inactive") }
+        val delivery = if (row.has("lastDelivery")) ScheduleDelivery.parse(
+          row.opt("lastDelivery") as? JSONObject ?: throw IllegalArgumentException("Invalid delivery")
+        ) else null
+        ScheduleRecord.parse(row).toRemoteSchedule(owner, status, delivery)
+      })
+    }
+  }
+
+  override suspend fun scheduleHistory(sessionId: String, id: String, before: String?, limit: Int): ScheduleHistoryPage {
+    require(sessionId.isNotBlank() && id.isNotBlank()) { "Missing schedule owner/identity" }
+    require(limit in 1..100 && (before == null || before.isNotBlank())) { "Invalid history page/cursor" }
+    val request = JSONObject().put("sessionId", sessionId).put("id", id).put("limit", limit)
+    before?.let { request.put("before", it) }
+    val value = call("schedule/history", requestArgs(request))
+    return scheduleResponse {
+      val result = value as? JSONObject ?: throw IllegalArgumentException("Missing history result")
+      require(scheduleString(result, "id") == id) { "Mismatched history identity" }
+      if (result.has("code")) {
+        requireScheduleKeys(result, setOf("id", "code"))
+        val code = scheduleString(result, "code")
+        require(code == "schedule_not_found" || code == "delivery_cursor_not_found")
+        throw ApiException(if (code == "schedule_not_found") 404 else 409,
+          if (code == "schedule_not_found") "定时任务不存在或已删除" else "送达历史游标已失效，请重新加载", code)
+      }
+      requireScheduleKeys(result, setOf("id", "records", "earlierRecordsUnavailable", "earlierRecordsPruned", "retention"), setOf("nextBefore"))
+      val records = result.opt("records") as? JSONArray ?: throw IllegalArgumentException("Invalid history records")
+      val retention = result.opt("retention") as? JSONObject ?: throw IllegalArgumentException("Invalid retention")
+      val cursor = scheduleOptionalString(result, "nextBefore").also { require(it == null || it.isNotBlank()) }
+      ScheduleHistoryPage(id, scheduleImmutable((0 until records.length()).map { index ->
+        ScheduleDelivery.parse(records.opt(index) as? JSONObject ?: throw IllegalArgumentException("Invalid receipt"))
+      }), scheduleBoolean(result, "earlierRecordsUnavailable"), scheduleBoolean(result, "earlierRecordsPruned"),
+        scheduleLong(retention.opt("days")), scheduleLong(retention.opt("records")), cursor)
+    }
+  }
+
+  override suspend fun deleteSchedule(sessionId: String, id: String): ScheduleDeleteResult {
+    require(sessionId.isNotBlank() && id.isNotBlank()) { "Missing schedule owner/identity" }
+    // Never replay a write, including after an authentication response.
+    val value = call("schedule/delete", requestArgs(JSONObject().put("sessionId", sessionId).put("id", id)), retried = true)
+    return scheduleResponse {
+      val result = value as? JSONObject ?: throw IllegalArgumentException("Missing delete result")
+      require(scheduleString(result, "id") == id) { "Mismatched delete identity" }
+      val deleted = scheduleBoolean(result, "deleted")
+      if (deleted) {
+        requireScheduleKeys(result, setOf("id", "deleted"))
+        ScheduleDeleteResult(id, true)
+      } else {
+        requireScheduleKeys(result, setOf("id", "deleted", "code"))
+        val code = scheduleString(result, "code").also { require(it == "schedule_not_found") }
+        ScheduleDeleteResult(id, false, code)
+      }
+    }
+  }
+
+  override suspend fun updateSchedule(
+    sessionId: String, id: String, expected: ScheduleRecord,
+    title: String?, prompt: String?, change: ScheduleTimingChange?
+  ): ScheduleUpdateResult {
+    require(sessionId.isNotBlank() && id.isNotBlank() && expected.id == id) { "Invalid schedule owner/CAS identity" }
+    val normalizedTitle = title?.trim()?.also { require(it.length in 1..120) { "Invalid schedule title" } }
+    val normalizedPrompt = prompt?.trim()?.also { require(it.isNotBlank()) { "Invalid schedule prompt" } }
+    val request = JSONObject().put("sessionId", sessionId).put("id", id).put("expected", expected.toJson())
+    normalizedTitle?.let { request.put("title", it) }
+    normalizedPrompt?.let { request.put("prompt", it) }
+    change?.let { request.put("change", it.toJson()) }
+    val value = call("schedule/update", requestArgs(request), retried = true)
+    return scheduleResponse {
+      val result = value as? JSONObject ?: throw IllegalArgumentException("Missing update result")
+      if (result.has("record")) {
+        requireScheduleKeys(result, setOf("id", "updated", "record"))
+        require(scheduleString(result, "id") == id) { "Mismatched update identity" }
+        val record = ScheduleRecord.parse(result.opt("record") as? JSONObject ?: throw IllegalArgumentException("Invalid record"))
+        require(record.id == id) { "Mismatched updated record" }
+        ScheduleUpdateResult(id, scheduleBoolean(result, "updated"), record)
+      } else if (result.has("id")) {
+        requireScheduleKeys(result, setOf("id", "updated", "code"))
+        require(scheduleString(result, "id") == id && !scheduleBoolean(result, "updated"))
+        val code = scheduleString(result, "code").also { require(it in setOf("schedule_not_found", "schedule_ended", "schedule_conflict")) }
+        ScheduleUpdateResult(id, false, code = code)
+      } else {
+        requireScheduleKeys(result, setOf("code", "message"))
+        val code = scheduleString(result, "code").also { require(it in setOf("invalid_prompt", "invalid_selector", "invalid_rule",
+          "invalid_time_zone", "not_future", "time_out_of_range", "frequency_too_high", "subagent_session", "internal_error")) }
+        ScheduleUpdateResult(null, false, code = code, message = scheduleString(result, "message"))
+      }
+    }
+  }
+
+  private fun requireScheduleKeys(value: JSONObject, required: Set<String>, optional: Set<String> = emptySet()) {
+    val keys = value.keys().asSequence().toSet()
+    require(keys.containsAll(required) && keys.all { it in required || it in optional }) { "Invalid schedule result fields" }
+  }
+
+  private inline fun <T> scheduleResponse(parse: () -> T): T = try { parse() } catch (_: IllegalArgumentException) {
+    throw ApiException(502, "定时任务响应格式无效，请刷新核对；不会自动重发", "schedule/response-invalid")
   }
 
   override suspend fun previewFile(directory: String, path: String, session: Session?): FilePreview? = withContext(Dispatchers.IO) {
@@ -2619,7 +3399,7 @@ class DshApi(
       )))
     } catch (error: ApiException) {
       // Unsupported preview endpoints are a capability gap, not a failed file read.
-      if (error.code.orEmpty().startsWith("gateway/") || error.status == 404) return@withContext null
+      if (error.isDshMethodUnavailable) return@withContext null
       throw error
     }
     val encoded = value.optString("data").takeIf { it.isNotBlank() } ?: return@withContext null
@@ -2640,53 +3420,137 @@ class DshApi(
    * `goal/activation-changed` 补齐。直连/SSH 仍然读 `goals/get`——它是 activation 的权威来源。
    */
   override suspend fun goal(sessionId: String): RemoteGoal? {
-    if (remoteBackend != null) {
-      val durable = composerContext(sessionId).goal ?: run {
-        goalActivation.remove(sessionId)
-        return null
-      }
-      return durable.copy(activation = goalActivation[sessionId] ?: durable.activation)
-    }
-    val value = call("goals/get", envelope(argsOf("agentId" to sessionId))) as? JSONObject ?: return null
-    val id = value.optString("id").takeIf { it.isNotBlank() } ?: return null
-    val ref = value.optJSONObject("ref")
-    return RemoteGoal(
-      id = id,
-      revision = ref?.optInt("revision", 0) ?: value.optInt("revision", 0),
-      objective = value.optString("objective"),
-      phase = value.optString("phase"),
-      activation = value.optString("activation").takeIf { it.isNotBlank() },
-      blockedReason = value.optJSONObject("blockedReason")?.optString("message")?.takeIf { it.isNotBlank() }
-    )
+    if (remoteBackend != null) return composerContext(sessionId).goal
+    val goalEpoch = goalCacheEpoch(sessionId)
+    val value = call("goals/get", envelope(argsOf("agentId" to sessionId))) as? JSONObject
+    return mergeGoalRead(sessionId, value?.goalView(), direct = true, startedEpoch = goalEpoch)
   }
 
-  override suspend fun createGoal(sessionId: String, objective: String, maxRounds: Int?): Boolean {
-    val request = JSONObject().put("objective", objective)
-    if (maxRounds != null) request.put("maxGoalRounds", maxRounds)
-    val view = call("goals/create", envelope(argsOf("agentId" to sessionId, "request" to request)))
-    commitGoalView(sessionId, view)
+  override suspend fun createGoal(sessionId: String, objective: String, maxRounds: Int?): Boolean =
+    createGoalWithLimit(sessionId, objective, maxRounds?.toLong())
+
+  override suspend fun createGoalWithLimit(sessionId: String, objective: String, maxRounds: Long?): Boolean {
+    require(sessionId.isNotBlank()) { "会话 id 不能为空" }
+    val request = goalRequest(objective, maxRounds)
+    val acknowledgment = call("goals/create", envelope(argsOf("agentId" to sessionId, "request" to request))) as? JSONObject
+    // Create only acknowledges a ref. Preserve a matching activation event which can precede this ack;
+    // never invent armed/disarmed from create itself or retain the previous goal's activation.
+    val created = acknowledgment?.optJSONObject("ref")
+    synchronized(goalCacheLock) {
+      val observed = goalActivation[sessionId]?.takeIf {
+        it.id == created?.str("id") && it.revision == created.optInt("revision", 0)
+      }
+      clearGoalCache(sessionId)
+      clearedGoalRefs.remove(sessionId)
+      if (observed != null) goalActivation[sessionId] = observed
+    }
     return true
+  }
+
+  override suspend fun editGoal(
+    sessionId: String, id: String, revision: Int, objective: String?, maxRounds: Long?
+  ): RemoteGoal? {
+    requireGoalRef(sessionId, id, revision)
+    val request = goalRequest(objective, maxRounds)
+    val view = call("goals/edit", envelope(argsOf(
+      "agentId" to sessionId,
+      "ref" to JSONObject().put("id", id).put("revision", revision),
+      "request" to request
+    )))
+    val result = (view as? JSONObject)?.goalView()
+      ?: throw ApiException(502, "目标编辑响应缺少 GoalView")
+    if (result.id != id || result.revision <= revision) throw ApiException(502, "目标编辑响应的引用不匹配，请刷新核对；不会自动重发")
+    return commitGoalView(sessionId, view) ?: throw ApiException(502, "目标编辑响应无效")
+  }
+
+  private fun goalRequest(objective: String?, maxRounds: Long?): JSONObject {
+    require(objective != null || maxRounds != null) { "至少修改目标内容或轮数上限" }
+    val normalized = objective?.trim()
+    require(normalized == null || normalized.isNotEmpty()) { "目标内容不能为空" }
+    require(maxRounds == null || maxRounds in 1L..MAX_GOAL_ROUNDS) { "目标轮数必须是正安全整数" }
+    return JSONObject().apply {
+      if (normalized != null) put("objective", normalized)
+      if (maxRounds != null) put("maxGoalRounds", maxRounds)
+    }
+  }
+
+  private fun requireGoalRef(sessionId: String, id: String, revision: Int) {
+    require(sessionId.isNotBlank() && id.isNotBlank() && revision > 0) { "目标引用无效" }
   }
 
   override suspend fun goalAction(sessionId: String, id: String, revision: Int, action: String): Boolean {
     if (action !in setOf("pause", "resume", "complete", "clear")) return false
+    requireGoalRef(sessionId, id, revision)
     val view = call("goals/$action", envelope(argsOf(
       "agentId" to sessionId,
       "ref" to JSONObject().put("id", id).put("revision", revision)
     )))
-    if (action == "clear") goalActivation.remove(sessionId) else commitGoalView(sessionId, view)
+    if (action == "clear") synchronized(goalCacheLock) {
+      clearGoalCache(sessionId)
+      val returnedRevision = (view as? JSONObject)?.goalRoundNumber("revision", 1)?.takeIf { it <= Int.MAX_VALUE }?.toInt()
+      clearedGoalRefs[sessionId] = ClearedGoal(id, returnedRevision?.takeIf { it > revision } ?: revision)
+    } else commitGoalView(sessionId, view)
     return true
   }
 
-  /**
-   * 目标的 mutation 会返回权威 `GoalView`（含新的 `revision`）。丢掉它会让本地 `revision` 停在旧值，
-   * 下一次 mutation 就被 Host 以 `GOAL_STALE_REVISION` 拒绝，所以这里把返回的 activation 记下来。
-   */
-  private fun commitGoalView(sessionId: String, view: Any?) {
-    val goal = (view as? JSONObject)?.optJSONObject("goal") ?: view as? JSONObject
-    val activation = goal?.optString("activation")?.takeIf { it.isNotBlank() }
-    if (activation != null) goalActivation[sessionId] = activation else goalActivation.remove(sessionId)
+  private fun clearGoalCache(sessionId: String) = synchronized(goalCacheLock) {
+    advanceGoalCacheEpoch(sessionId)
+    goalActivation.remove(sessionId)
+    latestGoalViews.remove(sessionId)
   }
+
+  /** Mutation views are authoritative; a ref-only create ack must never enter this cache. */
+  private fun commitGoalView(sessionId: String, view: Any?): RemoteGoal? {
+    val goal = (view as? JSONObject)?.goalView() ?: return null
+    synchronized(goalCacheLock) {
+      val latest = latestGoalViews[sessionId]
+      if (latest == null || latest.id != goal.id || latest.revision <= goal.revision) {
+        advanceGoalCacheEpoch(sessionId)
+        latestGoalViews[sessionId] = goal
+        val activation = goal.activation
+        if (activation != null) goalActivation[sessionId] = GoalActivation(goal.id, goal.revision, activation)
+        else goalActivation.remove(sessionId)
+      }
+    }
+    return goal
+  }
+
+  /** Only older revisions of the SAME goal may be replaced with the last mutation response. */
+  private fun mergeGoalRead(sessionId: String, read: RemoteGoal?, direct: Boolean = false, startedEpoch: Long): RemoteGoal? =
+    synchronized(goalCacheLock) {
+      if (startedEpoch != goalCacheEpoch(sessionId)) {
+        val latest = latestGoalViews[sessionId]
+        val activation = goalActivation[sessionId]
+        if (latest != null) return@synchronized latest.copy(activation = activation?.takeIf {
+          it.id == latest.id && it.revision == latest.revision
+        }?.activation ?: latest.activation)
+        return@synchronized read?.takeIf { activation?.id == it.id && activation.revision == it.revision }
+          ?.copy(activation = activation?.activation)
+      }
+      if (read == null) {
+        clearGoalCache(sessionId)
+        return@synchronized null
+      }
+      val cleared = clearedGoalRefs[sessionId]
+      if (cleared?.id == read.id && read.revision <= cleared.revision) return@synchronized null
+      if (cleared != null && cleared.id != read.id) clearedGoalRefs.remove(sessionId)
+      val latest = latestGoalViews[sessionId]
+      val selected = if (latest?.id == read.id && (latest.revision > read.revision || !direct && latest.revision == read.revision)) {
+        latest.copy(roundsStarted = listOfNotNull(latest.roundsStarted, read.roundsStarted).maxOrNull())
+      } else read
+      if (latest != null && (latest.id != read.id || read.revision > latest.revision))
+        latestGoalViews.remove(sessionId)
+      val activation = goalActivation[sessionId]
+      val exactActivation = activation?.takeIf { it.id == selected.id && it.revision == selected.revision }
+      val result = if (direct && selected === read && read.activation != null) read
+        else selected.copy(activation = exactActivation?.activation ?: selected.activation)
+      if (direct && selected === read) {
+        if (read.activation != null) goalActivation[sessionId] = GoalActivation(read.id, read.revision, read.activation)
+        else goalActivation.remove(sessionId)
+        if (latest?.id == read.id && latest.revision == read.revision) latestGoalViews[sessionId] = result
+      }
+      result
+    }
 
   override suspend fun credentialStatus(refs: List<String>): Map<String, RemoteCredentialStatus> {
     if (refs.isEmpty()) return emptyMap()
@@ -2865,19 +3729,15 @@ class DshApi(
   }
 
   override suspend fun createSession(directory: String, title: String, workspaceId: String?): Session = withContext(Dispatchers.IO) {
-    // `session/create` 的请求只有 cwd/workspaceId/sessionId/agentPreset，网关按严格 schema 校验，
-    // 多带 title 会以 gateway/arguments-invalid 失败；标题在创建后用 rename 设置。
-    // 复用同目录已有的空白会话：DSH Web 也是这么做的，否则每次新建都会留下一个服务端草稿。
+    // `session/create` may durably create the Session before a workspace attach fails. The official
+    // error carries details.sessionId; reconcile that identity and never replay creation.
     val reusable = reusableBlank(directory)
-    // Host 只在请求带 workspaceId 时把新会话记进工作区（`session.create` 里的 attachSession）。
-    // 只带 cwd 会建出「未分组」的孤儿会话：远端按工作区枚举会话的客户端（Remote 中枢的会话目录、
-    // 电脑端工作区视图）都看不到它，而且没有任何 RPC 能事后补挂。
     val resolvedWorkspaceId = workspaceId?.takeIf(String::isNotBlank) ?: workspaceIdFor(directory)
     try {
       createSessionOnce(directory, title, reusable, resolvedWorkspaceId)
     } catch (error: ApiException) {
-      // 这些错误明确表示“没有创建/没有复用”，换一次不带 sessionId 的请求是安全的；
-      // 网络错误不能重试，否则可能重复创建。
+      if (error.code == "session/workspace-attach-failed") throw error
+      // These errors explicitly mean “no creation/reuse”; only a blank reuse can safely be retried.
       if (reusable == null || error.code !in BLANK_REUSE_DECLINED) throw error
       createSessionOnce(directory, title, null, resolvedWorkspaceId)
     }
@@ -2930,9 +3790,11 @@ class DshApi(
   override suspend fun setArchived(session: Session, archived: Boolean, now: Long) {
     val request = JSONObject().put("sessionId", session.id)
     if (archived) request.put("stopActivity", true)
-    callObject(if (archived) "workspace/archiveSession" else "workspace/unarchiveSession", requestArgs(request))
-    if (archived) archivedSessions += session.id else archivedSessions -= session.id
-    known[session.id] = session.copy(archived = archived)
+    val result = callObject(if (archived) "workspace/archiveSession" else "workspace/unarchiveSession", requestArgs(request))
+    val authoritative = result.optJSONArray("archivedSessionIds")
+      ?: throw ApiException(502, "归档响应缺少完整集合，请刷新核实状态", "workspace/archive-response-invalid")
+    replaceArchiveSet(authoritative.strings())
+    known[session.id] = session.copy(archived = session.id in archivedSessions)
   }
 
   override suspend fun deleteSession(session: Session) {
@@ -2940,10 +3802,24 @@ class DshApi(
     setArchived(session, true)
   }
 
-  override suspend fun forkSession(session: Session): Session = withContext(Dispatchers.IO) {
-    val result = callObject("session/fork", requestArgs(JSONObject().put("sessionId", session.id)))
-    val id = result.str("sessionId").ifBlank { throw ApiException(502, "服务器没有返回分支会话") }
-    known[id] ?: session.copy(id = id, title = "${session.title} 副本", updated = System.currentTimeMillis())
+  override suspend fun forkSession(session: Session): Session = forkNativeSession(session, null)
+
+  override suspend fun forkSession(session: Session, boundary: ForkBoundary): Session {
+    val native = boundary as? ForkBoundary.DshEvent ?: throw ApiException(400, "DSH 分叉需要原生事件边界")
+    require(native.sequence in 1..9_007_199_254_740_991L) { "原生分叉序号无效" }
+    return forkNativeSession(session, native.sequence)
+  }
+
+  private suspend fun forkNativeSession(session: Session, atSeq: Long?): Session = withContext(Dispatchers.IO) {
+    val request = JSONObject().put("sessionId", session.id)
+    atSeq?.let { request.put("atSeq", it) }
+    // No auth replay, connection recovery or status-code follow-up for a non-idempotent fork.
+    val result = call("session/fork", requestArgs(request), retried = true) as? JSONObject
+      ?: throw ApiException(502, "分叉结果未确认，请核对 Host 会话列表；没有自动重试")
+    val id = (result.opt("sessionId") as? String)?.takeIf { it.isNotBlank() && it != session.id && it.length <= 512 && it.none(Char::isISOControl) }
+      ?: throw ApiException(502, "分叉未返回新的会话身份，请核对列表；没有自动重试")
+    // The official acknowledgement contains only the new identity. Do not copy source live state.
+    Session(id, session.directory, "${session.title} 副本", System.currentTimeMillis())
   }
 
   override suspend fun abort(session: Session) {
@@ -2984,7 +3860,7 @@ class DshApi(
     id: String,
     delivery: Delivery
   ) {
-    if (model != null) runCatching { selectModel(session, model) }
+    if (model != null) selectModel(session, model)
     selectPreset(session, agent)
     val content = JSONArray()
     val remote = remoteBackend
@@ -3029,7 +3905,7 @@ class DshApi(
         uploadFileAttachment(session.id, bytes, file.name)
       } catch (error: ApiException) {
         // 旧实例/未装附件插件时才退回「文本内联」，二进制文件仍然明确失败。
-        if (kind != AttachmentPolicy.Kind.TEXT || !(error.code.orEmpty().startsWith("gateway/") || error.status == 404)) throw error
+        if (kind != AttachmentPolicy.Kind.TEXT || !error.isDshMethodUnavailable) throw error
         inlineContent(file)?.let { content.put(it) }
         continue
       }
@@ -3131,16 +4007,44 @@ class DshApi(
     inline: List<InlineFile>,
     delivery: Delivery
   ) {
-    if (model != null) runCatching { selectModel(session, model) }
-    executeCommand(session, "/$name $arguments".trim())
+    if (references.isNotEmpty()) {
+      // commands/execute accepts only encoded images and staged file receipts. A FileReference is a
+      // server path mention, not a receipt; dropping it would change the command's meaning.
+      throw ApiException(400, "DeepSeek Harness 命令不支持文件引用，请改为上传附件", "command/attachments-unsupported")
+    }
+    val submitted = commandAttachments(session.id, inline)
+    if (model != null) selectModel(session, model)
+    executeCommand(session, "/$name $arguments".trim(), submitted)
   }
 
-  /** `commands/execute`：DSH 的命令是独立通道，不创建模型消息。 */
-  private suspend fun executeCommand(session: Session, line: String) {
+  private suspend fun commandAttachments(sessionId: String, inline: List<InlineFile>): JSONArray {
+    if (inline.isEmpty()) return JSONArray()
+    if (remoteBackend != null && inline.any { AttachmentPolicy.kind(it.mime, it.name) != AttachmentPolicy.Kind.IMAGE }) {
+      throw ApiException(400, "此远程主机未提供命令文件附件通道，请更新 Host 连接器或改用普通消息上传", "command/attachments-unsupported")
+    }
+    val submitted = JSONArray()
+    for (file in inline) {
+      val bytes = readInlineBytes(file) ?: throw ApiException(400, "附件无法读取：${file.name}")
+      val mime = file.mime.substringBefore(';').trim().lowercase()
+      if (AttachmentPolicy.kind(mime, file.name) == AttachmentPolicy.Kind.IMAGE) {
+        if (mime !in setOf("image/png", "image/jpeg", "image/webp", "image/gif"))
+          throw ApiException(400, "命令图片附件类型不受支持：$mime", "command/attachment-invalid")
+        submitted.put(JSONObject().put("type", "image").put("mediaType", mime)
+          .put("data", java.util.Base64.getEncoder().encodeToString(bytes)).putOpt("name", file.name.takeIf { it.isNotBlank() }))
+      } else {
+        val receipt = uploadFileAttachment(sessionId, bytes, file.name)
+        submitted.put(JSONObject().put("type", "file").put("receiptId", receipt))
+      }
+    }
+    return submitted
+  }
+
+  /** `commands/execute` accepts the complete line plus submitted attachments as its third argument. */
+  private suspend fun executeCommand(session: Session, line: String, submittedAttachments: JSONArray = JSONArray()) {
     val args = JSONObject()
       .put("agentId", session.id)
       .put("line", line)
-      .put("submittedAttachments", JSONArray())
+      .put("submittedAttachments", submittedAttachments)
     val value = call("commands/execute", envelope(args))
     val execution = value as? JSONObject
     if (execution == null) throw ApiException(501, "该实例没有 ${line.substringBefore(' ')} 命令")
@@ -3171,7 +4075,7 @@ class DshApi(
   /** `agentPresets/list` 的预设名册：默认预设排第一，不能组合会话的（`broken`）不提供。 */
   override suspend fun agents(directory: String): List<AgentChoice> = withContext(Dispatchers.IO) {
     val roster = try { callObject("agentPresets/list", noArgs()) } catch (error: ApiException) {
-      if (error.code?.startsWith("gateway/") != true) throw error
+      if (!error.isDshMethodUnavailable) throw error
       // 没有预设注册表的实例：退回列表行里出现过的预设。
       val names = LinkedHashSet<String>()
       for (item in listing().items) item.obj("projections").obj("values").str("agentPreset").takeIf(String::isNotBlank)?.let(names::add)
@@ -3229,7 +4133,7 @@ class DshApi(
     } catch (cancel: CancellationException) {
       throw cancel
     } catch (error: ApiException) {
-      if (error.code.orEmpty().startsWith("gateway/") || error.status == 404) return@withContext emptyList()
+      if (error.isDshMethodUnavailable) return@withContext emptyList()
       throw error
     }
     value.arr("options").objects().mapNotNull { option ->
@@ -3264,7 +4168,21 @@ class DshApi(
   override suspend fun pendingPermissions(directory: String): List<PermissionRequest> =
     pendingApprovals.values.toList()
 
-  override suspend fun forms(directory: String): List<QuestionRequest> = pendingQuestions.values.toList()
+  override val recoverableQuestions: Boolean get() = true
+
+  override suspend fun forms(directory: String): List<QuestionRequest> {
+    val listed = if (known.isEmpty() && questionSession == null && directory.isNotBlank())
+      listing().items.mapNotNull(::itemToSession) else emptyList()
+    val matching = (known.values + listed).distinctBy { it.id }.filter { !it.archived && !it.blank &&
+      (directory.isBlank() || normalizedDirectory(it.directory) == normalizedDirectory(directory)) }
+    val sessions = (matching.map { it.id } + listOfNotNull(questionSession)).distinct()
+    // A partial scan is never an authoritative empty directory. The overview retains its last
+    // question snapshot on this explicit error instead of silently losing unscanned requests.
+    if (sessions.size > 256) throw ApiException(409, "目录中的会话过多，提问对账未完成，请打开目标会话")
+    if (directory.isNotBlank() && sessions.isEmpty()) return emptyList()
+    for (id in sessions) refreshQuestionProjection(id)
+    return pendingQuestions.values.filter { directory.isBlank() || normalizedDirectory(it.directory) == normalizedDirectory(directory) }
+  }
 
   override suspend fun replyPermission(request: PermissionRequest, reply: String) {
     pendingApprovals.remove(request.id)
@@ -3276,36 +4194,20 @@ class DshApi(
   }
 
   override suspend fun replyQuestion(request: QuestionRequest, answers: List<List<String>>) {
-    pendingQuestions.remove(request.id)
+    require(answers.size == request.questions.size) { "提问字段已变化，请刷新" }
     val payload = JSONArray()
     request.questions.forEachIndexed { index, prompt ->
-      val row = answers.getOrNull(index).orEmpty().filter(String::isNotBlank)
-      // `field` 是 OpenCode 形状的表单字段 JSON，问题 id 存在 `key` 里。
+      val row = answers[index].filter(String::isNotBlank)
       val questionId = runCatching { JSONObject(prompt.field).str("key") }.getOrNull()?.takeIf(String::isNotBlank)
         ?: prompt.field.ifBlank { prompt.title }
       val (selected, custom) = row.splitAnswer(prompt.options)
-      val answer = JSONObject().put("id", questionId).put("selected", JSONArray(selected))
-      if (custom != null) answer.put("custom", custom)
-      payload.put(answer)
+      payload.put(JSONObject().put("id", questionId).put("selected", JSONArray(selected))
+        .apply { if (custom != null) put("custom", custom) })
     }
-    val answer = JSONObject().put("answers", payload)
-    if (trySettle(request.id, answer)) return
-    // 瀑布已经不在等（Host 到点把提问结算成 `pending`/`continued`，或事件流重连过）：
-    // `$events/result` 迟到的答案会被静默丢弃，改用按 `callId` 找回那次提问的
-    // `userQuestions/answer`。
-    val callId = questionCallIds[request.id]
-    if (callId.isNullOrBlank()) throw ApiException(409, "这次提问已经结束，请让 Agent 重新提问")
-    call("userQuestions/answer", envelope(argsOf(
-      "agentId" to request.sessionId, "callId" to callId, "answer" to answer
-    )))
-    questionCallIds.remove(request.id)
-    releaseQuestionClaim(request.id)
+    questionCoordinator.answer(request.id, JSONObject().put("answers", payload))
   }
 
-  override suspend fun rejectQuestion(request: QuestionRequest) {
-    pendingQuestions.remove(request.id)
-    reject(request.id, "用户取消了回答")
-  }
+  override suspend fun rejectQuestion(request: QuestionRequest) = questionCoordinator.dismiss(request.id)
 
   override suspend fun children(session: Session): List<Session> = withContext(Dispatchers.IO) {
     listing().items.mapNotNull { itemToSession(it) }.filter { it.parentId == session.id && !it.blank }
@@ -3318,73 +4220,11 @@ class DshApi(
    * 逐文件对比来自认证栅栏内的 `/api/changes.diff`。摘要只在该 Host 进程内、会话存活期间提供。
    */
   override suspend fun diff(session: Session): List<FileChange> = withContext(Dispatchers.IO) {
-    val snapshot = try { snapshotFor(session, fresh = false) } catch (error: CancellationException) { throw error } catch (error: Exception) { return@withContext emptyList() }
-    val announced = mutableListOf<Long>()
-    for (record in snapshot.arr("records").objects()) {
-      val event = record.obj("event")
-      if (event.str("type") != "workspace/changes") continue
-      event.optDouble("seq", 0.0).toLong().takeIf { it > 0 }?.let(announced::add)
-    }
-    data class Changed(val file: JSONObject, val seq: Long, val index: Int)
-    val merged = LinkedHashMap<String, Changed>()
-    for (seq in announced.takeLast(MAX_CHANGE_TURNS)) {
-      val summary = changesSummary(session.id, seq) ?: continue
-      summary.arr("files").objects().forEachIndexed { index, file ->
-        val path = file.str("path")
-        if (path.isNotBlank()) merged[path] = Changed(file, seq, index)
-      }
-    }
-    merged.values
-      .sortedBy { it.file.str("display").ifBlank { it.file.str("path") } }
-      .take(MAX_CHANGED_FILES)
-      .map { changed ->
-        val file = changed.file
-        val display = file.str("display").ifBlank { file.str("path") }
-        val comparison = changesDiff(session.id, changed.seq, changed.index)
-        FileChange(
-          path = display,
-          after = when (comparison?.str("kind")) {
-            "binary" -> "二进制文件，无法预览对比"
-            "oversized" -> "文件过大，无法预览对比"
-            else -> ""
-          },
-          additions = file.optInt("added"),
-          deletions = file.optInt("deleted"),
-          patch = if (comparison?.str("kind") == "text") renderPatch(display, comparison) else ""
-        )
-      }
-  }
-
-  private suspend fun changesSummary(sessionId: String, seq: Long): JSONObject? =
-    fetchJson(base.newBuilder()
-      .addEncodedPathSegment("api")
-      .addEncodedPathSegment("changes.summary")
-      .addQueryParameter("sessionId", sessionId)
-      .addQueryParameter("seq", seq.toString())
-      .build())
-
-  private suspend fun changesDiff(sessionId: String, seq: Long, index: Int): JSONObject? =
-    fetchJson(base.newBuilder()
-      .addEncodedPathSegment("api")
-      .addEncodedPathSegment("changes.diff")
-      .addQueryParameter("sessionId", sessionId)
-      .addQueryParameter("seq", seq.toString())
-      .addQueryParameter("index", index.toString())
-      .build())
-
-  private fun renderPatch(display: String, diff: JSONObject): String {
-    val hunks = diff.arr("hunks").objects()
-    if (hunks.isEmpty()) return ""
-    val out = StringBuilder()
-    out.append("--- a/").append(display).append('\n')
-    out.append("+++ b/").append(display).append('\n')
-    for (hunk in hunks) {
-      out.append("@@ -").append(hunk.optInt("oldStart")).append(',').append(hunk.optInt("oldLines"))
-        .append(" +").append(hunk.optInt("newStart")).append(',').append(hunk.optInt("newLines")).append(" @@\n")
-      val lines = hunk.arr("lines")
-      for (i in 0 until lines.length()) out.append(lines.optString(i)).append('\n')
-    }
-    return out.toString()
+    // Capture the authenticated Remote connection before the multi-request comparison. A later
+    // reconnect cannot silently splice a new Host generation into this result.
+    val read: suspend (String, String, Long, Int?) -> JSONObject = remoteBackend?.changesReader() ?: ::readChanges
+    val snapshot = snapshotFor(session, fresh = false)
+    DshChangesReadApi(read).changes(session, changeAnnouncements.snapshot(session.id, snapshot))
   }
 
   /**
@@ -3478,6 +4318,8 @@ class DshApi(
   }
 
   internal companion object {
+    const val MUX_STREAM_BUFFER = 256
+    const val MAX_RPC_RESPONSE_BYTES = 64L * 1024 * 1024
     const val WATCH_LIMIT = 12
 
     /** 首帧等待上限；只覆盖“流被打开到第一帧到达”，不含后续分片/transfer 读取。 */
@@ -3500,7 +4342,7 @@ class DshApi(
      */
     private val BLANK_REUSE_DECLINED = setOf(
       "session/conflict", "session/agent-busy", "session/writer-held", "session/not-found",
-      "session/workspace-attach-failed", "gateway/arguments-invalid"
+      "gateway/arguments-invalid"
     )
 
     /** 认证失效的错误码：控制器据此提示重新配对，而不是当成网络抖动。 */
@@ -3555,6 +4397,7 @@ class DshApi(
     const val SHELL_OWNER_SCAN_SESSIONS = 8
     val ACTIVE_JOB_STATUSES = setOf("running", "stopping")
 
+    private val WORKSPACE_MUTATIONS = setOf("workspace/create", "workspace/rename", "workspace/delete", "workspace/insertBefore", "session/fork")
     val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
 
     /**
@@ -3569,7 +4412,12 @@ class DshApi(
       documented = false,
       deleteSession = false,
       fork = true,
-      jobOutputStream = true
+      jobOutputStream = true,
+      stopShell = true,
+      terminal = true,
+      workspaceManagement = true,
+      sessionContentSearch = true,
+      historicalFork = true
     )
 
     /** Capabilities for a tunneled SSH client created before its DshApi instance exists. */

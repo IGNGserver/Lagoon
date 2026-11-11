@@ -275,7 +275,9 @@ class OverviewReconciliationTest {
     try {
       overview.start(listOf(profile))
       withTimeout(5_000) { firstStarted.await() }
-      overview.start(listOf(profile.copy(url = "http://127.0.0.2")))
+      val replacement = profile.copy(url = "http://127.0.0.2")
+      store.save(replacement, password = "secret")
+      overview.start(listOf(replacement))
       withTimeout(5_000) { secondStarted.await(); firstCleaning.await() }
       releaseFirst.complete(Unit)
       delay(200)

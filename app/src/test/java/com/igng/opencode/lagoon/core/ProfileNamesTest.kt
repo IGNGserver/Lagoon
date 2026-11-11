@@ -65,6 +65,12 @@ class ProfileNamesTest {
     assertSame(profiles, ProfileNames.repairGeneratedSuffixes(profiles, emptyList()))
   }
 
+  @Test fun anotherAccountsCatalogCannotRenameThisProfilesDevice() {
+    val profiles = listOf(device("dsh", "ubuntu-dev (2)"))
+    val other = catalog().copy(account = "another@example.org")
+    assertEquals(profiles, ProfileNames.repairGeneratedSuffixes(profiles, listOf(other)))
+  }
+
   @Test fun adoptHostNameOnlyRepairsTheMatchingHost() {
     val profiles = listOf(device("dsh", "ubuntu-dev (2)"))
     assertEquals("ubuntu-dev", ProfileNames.adoptHostName(profiles.single(), "ubuntu-dev", profiles)?.name)

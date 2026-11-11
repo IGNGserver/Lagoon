@@ -72,7 +72,7 @@ class RemoteAccountManagerTest {
       val result = manager.enroll(listOf(host), mapOf(hostId to host.meta.fingerprint!!))
       assertTrue(result.failures.isEmpty())
       assertEquals(setOf(hostId), result.registered.keys)
-      assertNotNull(devices.values["host-$hostId"])
+      assertNotNull(devices.values[scopedRemoteDeviceSlot(mock.url("/").toString(), "user@example.org", hostId)])
       assertEquals(RemoteTrustState.PINNED, catalog.value!!.hosts.single().trust)
 
       assertEquals("/api/v1/auth/login", mock.takeRequest().path)
@@ -85,7 +85,44 @@ class RemoteAccountManagerTest {
     }
   }
 
-  /** A saved catalog refreshes with the registered Client token, not the account token. */
+  @Test fun failedRegistrationIsReportedWithoutPublishingRegistration() = runBlocking {
+    MockWebServer().use { mock ->
+      mock.start()
+      mock.enqueue(MockResponse().setBody(loginBody()))
+      mock.enqueue(MockResponse().setBody(accountDirectory()))
+      mock.enqueue(MockResponse().setResponseCode(503).setBody("{}"))
+      val devices = Devices()
+      val manager = RemoteAccountManager(mock.url("/").toString(), true, "Lagoon", "android", "1.0", devices, Pins(), Catalog())
+      val host = manager.loginWithPassword("user@example.org", "pw").single()
+      val result = manager.enroll(listOf(host), mapOf(hostId to host.meta.fingerprint!!))
+      assertTrue(result.registered.isEmpty())
+      assertTrue(result.failures.containsKey(hostId))
+      val retryable = devices.values[scopedRemoteDeviceSlot(mock.url("/").toString(), "user@example.org", hostId)]
+      assertNotNull(retryable)
+      assertNull(retryable?.tokens)
+    }
+  }
+
+  @Test fun detailFailureDoesNotPublishPartialCandidateCatalog() = runBlocking {
+    MockWebServer().use { mock ->
+      mock.start()
+      mock.enqueue(MockResponse().setBody(loginBody()))
+      mock.enqueue(MockResponse().setBody(accountDirectory()))
+      mock.enqueue(MockResponse().setBody(pair().toString()))
+      mock.enqueue(MockResponse().setBody("""{"items":[{"deviceId":"$hostId","name":"Mac","platform":"darwin","role":"host","membershipId":"member","online":true}],"nextCursor":null}"""))
+      mock.enqueue(MockResponse().setResponseCode(503).setBody("{}"))
+      val devices = Devices()
+      val catalogs = Catalog()
+      val manager = RemoteAccountManager(mock.url("/").toString(), true, "Lagoon", "android", "1.0", devices, Pins(), catalogs)
+      val initial = manager.loginWithPassword("user@example.org", "pw")
+      assertEquals(hostId, initial.single().hostId)
+      assertTrue(manager.enroll(initial, mapOf(hostId to initial.single().meta.fingerprint!!)).failures.isEmpty())
+      val failure = runCatching { manager.refresh() }.exceptionOrNull()
+      assertNotNull(failure)
+      assertEquals(hostId, manager.cachedCandidates().single().hostId)
+    }
+  }
+
   @Test fun refreshUsesRegisteredClientTokenDirectory() = runBlocking {
     MockWebServer().use { mock ->
       mock.start()

@@ -124,6 +124,21 @@ class RemoteDeviceStoreTest {
     assertEquals(RemoteDeviceRecord.Transition.NONE, store.load("phone")!!.transition)
   }
 
+  @Test fun unstructuredAuthorizationFailureKeepsUnknownRefreshAndCredentials() = runBlocking {
+    for (status in listOf(401, 403)) {
+      val store = TestStore()
+      val before = seeded(store)
+      val manager = RemoteDeviceManager(store, "phone", "https://hub.example", "user@example.com")
+      val failure = runCatching { manager.access(now = 200_000) { _, _ ->
+        throw RemoteServerException(status, null, true)
+      } }.exceptionOrNull()
+      assertTrue(failure is IOException)
+      assertFalse(failure!!.message.orEmpty().contains("重新登录"))
+      assertEquals(RemoteDeviceRecord.Transition.REFRESHING, store.load("phone")!!.transition)
+      assertEquals(before.tokens, store.load("phone")!!.tokens)
+    }
+  }
+
   /** 注册失败同样恢复记录：同一 identity 重新注册是幂等的。 */
   @Test fun failedRegistrationRestoresRecord() = runBlocking {
     val store = TestStore()

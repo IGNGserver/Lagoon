@@ -19,7 +19,8 @@ import java.util.concurrent.TimeUnit
 
 /** Requests and payloads against the OpenCode 2.x contract (`packages/protocol`). */
 class OpenCodeApiTest {
-  private fun api(server: MockWebServer) = OpenCodeApi(ServerProfile("local", "Local", server.url("/").toString().trimEnd('/'), "opencode", allowCleartext = true), "secret")
+  // Match the fixture's loopback listener exactly; write retries must not hide localhost IPv6/IPv4 mismatches.
+  private fun api(server: MockWebServer) = OpenCodeApi(ServerProfile("local", "Local", server.url("/").newBuilder().host("127.0.0.1").build().toString().trimEnd('/'), "opencode", allowCleartext = true), "secret")
 
   @Test fun healthReadsTheServerVersionFromApiInfoWithBasicAuth() = runBlocking {
     MockWebServer().use { server ->
@@ -243,6 +244,29 @@ class OpenCodeApiTest {
       val request = server.takeRequest()
       assertEquals("/api/shell", request.requestUrl?.encodedPath)
       assertEquals("/repo", request.requestUrl?.queryParameter("location[directory]"))
+    }
+  }
+
+  @Test fun revertUsesTheDocumentedStageRouteAndRefusesMissingCapability() = runBlocking {
+    MockWebServer().use { server ->
+      server.enqueue(MockResponse().setBody("""{"paths":{"/api/session/{sessionID}/revert/stage":{"post":{"requestBody":{"content":{"application/json":{"schema":{"type":"object","properties":{"messageID":{"type":"string"}},"required":["messageID"]}}}}}}}}"""))
+      server.enqueue(MockResponse().setResponseCode(204))
+      val client = api(server)
+      assertTrue(client.discoverCapabilities().supports(SessionAction.REVERT))
+      server.takeRequest()
+      client.revert(Session("ses_native", "/repo", "Task", 0), "msg_native")
+      val request = server.takeRequest()
+      assertEquals("POST", request.method); assertEquals("/api/session/ses_native/revert/stage", request.path)
+      assertEquals("msg_native", JSONObject(request.body.readUtf8()).getString("messageID"))
+      client.close()
+    }
+    MockWebServer().use { server ->
+      server.enqueue(MockResponse().setBody("""{"paths":{}}"""))
+      val client = api(server)
+      client.discoverCapabilities(); server.takeRequest()
+      assertTrue(runCatching { client.revert(Session("s", "/repo", "Task", 0), "msg_native") }.isFailure)
+      assertEquals(1, server.requestCount)
+      client.close()
     }
   }
 

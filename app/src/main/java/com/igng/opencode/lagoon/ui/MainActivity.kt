@@ -229,7 +229,7 @@ class MainActivity : ComponentActivity() {
          handledDeepLink = "$server:$session"
           val profile = state.profiles.firstOrNull { it.id == server }
           if (profile == null) { globalMessage = "这个设备已移除"; globalMessageType = MiuixToastType.ERROR; deepLink = null }
-          else if (!profile.enabled) { globalMessage = "这个连接已禁用，请先在设备管理中启用"; globalMessageType = MiuixToastType.ERROR; deepLink = null }
+          else if (!profile.effectiveEnabled) { globalMessage = "这个连接已禁用，请先在设备管理中启用"; globalMessageType = MiuixToastType.ERROR; deepLink = null }
           else {
             navigator.navigate(SessionNavigation()); openSession(SessionTarget(server, session)); deepLink = null
           }
@@ -474,7 +474,10 @@ class MainActivity : ComponentActivity() {
             })
             if (showingRemoteEnroll) RemoteEnrollSheet(controller, onDismiss = { showingRemoteEnroll = false }, onDone = { added ->
               showingRemoteEnroll = false
-              if (added > 0) { globalMessage = "已接入 $added 台远程主机"; globalMessageType = MiuixToastType.SUCCESS }
+              if (added > 0) {
+                 globalMessage = "已保存 $added 台远程主机，请逐个选择 Harness"; globalMessageType = MiuixToastType.SUCCESS
+                 showingRemoteHosts = true
+               }
             })
           }
         }

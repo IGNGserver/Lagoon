@@ -119,9 +119,12 @@ object TranscriptProjection {
       val index = message.parts.indexOfLast { it.type == kind && (kind != "reasoning" || it.status == "running") }
       if (index < 0) message else message.copy(parts = message.parts.toMutableList().also { it[index] = change(it[index]) })
     }
-    fun editTool(change: (MessagePart) -> MessagePart) = editAssistant { message ->
+    fun editTool(createPtc: Boolean = false, change: (MessagePart) -> MessagePart) = editAssistant { message ->
       val index = message.parts.indexOfLast { it.type == "tool" && it.id == p.str("id") }
-      if (index < 0) message else message.copy(parts = message.parts.toMutableList().also { it[index] = change(it[index]) })
+      if (index < 0) {
+        if (!createPtc || p.obj("metadata").str("subCallId").isBlank()) message
+        else message.copy(parts = message.parts + change(MessagePart(p.str("id"), "tool", tool = p.str("name"), status = "running")))
+      } else message.copy(parts = message.parts.toMutableList().also { it[index] = change(it[index]) })
     }
     fun insert(message: Message?): Result = if (message == null || messages.any { it.id == message.id }) Result(messages) else result(messages + message)
     fun insertUser(message: Message?): Result {
@@ -185,27 +188,39 @@ object TranscriptProjection {
       "session.reasoning.delta" -> editLast("reasoning") { it.copy(text = it.text + p.str("delta")) }
       "session.reasoning.ended" -> editLast("reasoning") { it.copy(text = p.str("text"), status = "") }
       "session.tool.input.started" -> editAssistant { message ->
-        message.copy(parts = message.parts + MessagePart(p.str("id"), "tool", tool = p.str("name"), status = "pending"))
+        if (message.parts.any { it.type == "tool" && it.id == p.str("id") }) message
+        else message.copy(parts = message.parts + MessagePart(p.str("id"), "tool", tool = p.str("name"), status = "pending",
+          metadata = p.optJSONObject("metadata")?.toString().orEmpty()))
       }
       "session.tool.input.delta" -> editTool { if (it.status == "pending") it.copy(input = it.input + p.str("delta")) else it }
       "session.tool.input.ended" -> editTool { if (it.status == "pending") it.copy(input = p.str("text")) else it }
       "session.tool.called" -> editTool { tool ->
-        val input = p.obj("input")
-        tool.copy(status = "running", input = input.toString(2), title = input.str("description").ifBlank { tool.title },
-          path = input.str("path").ifBlank { tool.path },
-          target = input.str("sessionID").takeIf { tool.tool in SUBAGENT_TOOLS && it.isNotBlank() } ?: tool.target)
+        val state = JSONObject().put("status", "running").put("input", p.opt("input") ?: JSONObject())
+          .put("metadata", p.optJSONObject("metadata") ?: runCatching { JSONObject(tool.metadata) }.getOrDefault(JSONObject()))
+        val rebuilt = JSONObject().put("type", "tool").put("id", tool.id).put("name", tool.tool).put("state", state).toAssistantPart(tool.id)
+        rebuilt.copy(title = rebuilt.title.ifBlank { tool.title }, path = rebuilt.path.ifBlank { tool.path }, target = rebuilt.target ?: tool.target)
       }
       "session.tool.progress" -> editTool { tool ->
         val child = p.obj("metadata").str("sessionID")
         if (tool.status == "running" && tool.tool in SUBAGENT_TOOLS && child.isNotBlank()) tool.copy(target = child) else tool
       }
-      "session.tool.success", "session.tool.failed" -> editTool { tool ->
+      "session.tool.success", "session.tool.failed" -> editTool(createPtc = true) { tool ->
         if (tool.status != "running" && !(event.type.endsWith("failed") && tool.status == "pending")) return@editTool tool
         // Rebuild through the snapshot parser so live and loaded tools look identical.
+        val input = p.opt("input") ?: tool.input.trim().takeIf { it.startsWith("{") }
+          ?.let { runCatching { JSONObject(it) }.getOrNull() } ?: tool.input.takeIf(String::isNotBlank) ?: JSONObject()
+        val metadata = JSONObject((p.optJSONObject("metadata")
+          ?: runCatching { JSONObject(tool.metadata) }.getOrDefault(JSONObject())).toString())
         val state = JSONObject().put("status", if (event.type.endsWith("success")) "completed" else "error")
-          .put("input", tool.input.trim().takeIf { it.startsWith("{") }?.let { runCatching { JSONObject(it) }.getOrNull() } ?: JSONObject())
-          .put("content", p.optJSONArray("content") ?: JSONArray()).put("metadata", p.optJSONObject("metadata") ?: JSONObject())
-        p.opt("error")?.takeIf { it != JSONObject.NULL }?.let { state.put("error", it) }
+          .put("input", input).put("content", p.optJSONArray("content") ?: JSONArray()).put("metadata", metadata)
+        p.opt("error")?.takeIf { it != JSONObject.NULL }?.let { raw ->
+          val error = if (raw is JSONObject) JSONObject(raw.toString()).apply {
+            if (str("message").isBlank()) put("message", str("reason"))
+          } else raw
+          state.put("error", error)
+          // MessagePart has one display error string; keep structured failure identity alongside it.
+          metadata.put("error", error)
+        }
         val rebuilt = JSONObject().put("type", "tool").put("id", tool.id).put("name", tool.tool).put("state", state).toAssistantPart(tool.id)
         rebuilt.copy(title = rebuilt.title.ifBlank { tool.title }, target = rebuilt.target ?: tool.target)
       }

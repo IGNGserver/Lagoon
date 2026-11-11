@@ -29,8 +29,24 @@ data class ServerProfile(
    * projected into the home/notification surfaces, even when it is selected or explicitly included.
    * Credentials, drafts, caches and the unread ledger stay on disk so re-enabling can resume.
    */
-  val enabled: Boolean = true
-)
+  val enabled: Boolean = true,
+  /** OpenCode registration locator on an SSH source; null selects the official default file.
+   * Never a service generation ID or an ephemeral forwarded URL, and never contains a password. */
+  val sshServicePath: String? = null,
+  /** Ephemeral source/Host gate, applied only to runtime reads; never a saved leaf preference. */
+  val parentEnabled: Boolean = true,
+  /** Opaque Host-local native service locator. Generation is negotiated, never persisted as identity. */
+  val remoteServiceId: String? = null
+) {
+  init {
+    if (remoteServiceId != null) {
+      require(kind == ServerKind.OPENCODE && !remoteHostId.isNullOrBlank() && sshHostId == null) { "原生 Remote 服务必须绑定独立 Host carrier" }
+      require(remoteServiceId.matches(Regex("[A-Za-z0-9][A-Za-z0-9._:-]{0,255}"))) { "原生 Remote 服务标识无效" }
+    }
+    require(kind != ServerKind.OPENCODE || remoteHostId == null || remoteServiceId != null) { "Remote OpenCode 必须指定原生服务" }
+  }
+  val effectiveEnabled: Boolean get() = enabled && parentEnabled
+}
 
 data class Project(val id: String, val directory: String, val name: String, val sandboxes: List<String> = emptyList(),
   /** Source server when this project is shown in the all-servers overview. */
@@ -157,7 +173,10 @@ data class QuestionPrompt(
   val custom: Boolean = false,
   val field: String = ""
 )
-data class QuestionRequest(val id: String, val sessionId: String, val directory: String, val questions: List<QuestionPrompt>, val form: Boolean = true)
+data class QuestionPresentation(val remainingMs: Long? = null, val countdownRunning: Boolean = false,
+  val held: Boolean = false, val continued: Boolean = false)
+data class QuestionRequest(val id: String, val sessionId: String, val directory: String, val questions: List<QuestionPrompt>,
+  val form: Boolean = true, val presentation: QuestionPresentation? = null)
 data class FileChange(
   val path: String,
   /** Shown when there is no patch to render: a binary/oversized file, or a patch the server truncated. */

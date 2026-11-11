@@ -68,6 +68,16 @@ class OpenCodeContractFixtureTest {
     assertTrue(properties.has("delivery"))
   }
 
+  @Test fun nativeShellTerminationAndOutputArePublishedOnTheSupportedRelease() {
+    val input = requireNotNull(javaClass.classLoader?.getResourceAsStream("opencode-2.2.6-native-services-contract.json"))
+    val native = input.bufferedReader().use { JSONObject(it.readText()) }
+    assertTrue(ApiCapabilities.fromDocument(native).stopShell)
+    val paths = native.getJSONObject("paths")
+    assertEquals("shell.get", paths.getJSONObject("/api/shell/{id}").getJSONObject("get").getString("operationId"))
+    assertTrue(paths.getJSONObject("/api/shell/{id}/output").has("get"))
+    assertEquals("event.subscribe", paths.getJSONObject("/api/event").getJSONObject("get").getString("operationId"))
+  }
+
   private companion object {
     const val FIXTURE = "opencode-2.2.6-contract.json"
   }

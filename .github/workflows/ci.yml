@@ -24,6 +24,29 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Android 单元测试与 Debug 构建
+      - name: 构建并验证固定上游 Host 连接器
+        timeout-minutes: 8
+        shell: bash
+        run: |
+          set -euo pipefail
+          scratch="${RUNNER_TEMP:?}/lagoon-native"
+          mkdir -p "$scratch/tools" "$scratch/connector" "$scratch/upstream"
+          echo "BUILD_SCRATCH_ROOT=$scratch" >> "$GITHUB_ENV"
+          cp host-connector/toolchain/package{,-lock}.json "$scratch/tools/"
+          npm ci --prefix "$scratch/tools" --ignore-scripts --no-audit --no-fund
+          curl -fL --retry 2 https://codeload.github.com/liguobao/ds-harness-remote/tar.gz/bb33f0a6eb676b61f40a9bbf7d365e8a5e93b81b -o "$scratch/upstream/source.tar.gz"
+          echo "9c7f2a773199f294f1edb97347ff142e43b7b3bf66f8949b2caf3e264ea240b8  $scratch/upstream/source.tar.gz" | sha256sum --check
+          tar -xzf "$scratch/upstream/source.tar.gz" -C "$scratch/upstream"
+          node host-connector/build-verified.mjs --upstream "$scratch/upstream/ds-harness-remote-bb33f0a6eb676b61f40a9bbf7d365e8a5e93b81b" --out "$scratch/verified" --tools "$scratch/tools/node_modules"
+          cp -a host-connector/. "$scratch/connector/"
+          ln -s "$scratch/tools/node_modules" "$scratch/connector/node_modules"
+          export LAGOON_PATCHED_ROUTER="$scratch/verified/artifacts/patched-router.mjs"
+          node --test "$scratch/connector/test/native-services.test.mjs" "$scratch/connector/test/upstream-router.test.mjs" "$scratch/connector/test/upstream-terminal.test.mjs" "$scratch/connector/test/dsh-changes.test.mjs"
+          echo "LAGOON_PATCHED_ROUTER=$LAGOON_PATCHED_ROUTER" >> "$GITHUB_ENV"
+          echo "LAGOON_NATIVE_STDIO_HOST=$scratch/connector/test/stdio-host.mjs" >> "$GITHUB_ENV"
+          echo "LAGOON_TERMINAL_STDIO_HOST=$scratch/connector/test/stdio-terminal-host.mjs" >> "$GITHUB_ENV"
+          echo "LAGOON_CHANGES_STDIO_HOST=$scratch/connector/test/stdio-changes-host.mjs" >> "$GITHUB_ENV"
+
+      - name: Android 单元测试、实际 Noise 互操作与 Debug 构建
         timeout-minutes: 25
         run: ANDROID_HOME="$ANDROID_SDK_ROOT" ./gradlew :app:testDebugUnitTest :app:assembleDebug

@@ -23,7 +23,10 @@ internal class SshDshClient(
 ) : HarnessClient {
   private val closedFlag = AtomicBoolean(false)
 
-  private suspend fun api(): DshApi = link.awaitClient()
+  private suspend fun api(): HarnessClient {
+    check(!isClosed) { "SSH binding 已关闭" }
+    return link.awaitHarness()
+  }
 
   override val isClosed: Boolean get() = closedFlag.get() || link.isClosed
 
@@ -31,7 +34,9 @@ internal class SshDshClient(
     if (closedFlag.compareAndSet(false, true)) onClose()
   }
 
-  override fun capabilities(): ApiCapabilities = DshApi.TUNNEL_CAPABILITIES
+  override fun capabilities(): ApiCapabilities = link.capabilities()
+
+  override val cacheableTranscripts: Boolean get() = link.isOpenCode
 
   override suspend fun discoverCapabilities(): ApiCapabilities = api().discoverCapabilities()
 
@@ -93,6 +98,13 @@ internal class SshDshClient(
   override suspend fun createGoal(sessionId: String, objective: String, maxRounds: Int?): Boolean =
     api().createGoal(sessionId, objective, maxRounds)
 
+  override suspend fun createGoalWithLimit(sessionId: String, objective: String, maxRounds: Long?): Boolean =
+    api().createGoalWithLimit(sessionId, objective, maxRounds)
+
+  override suspend fun editGoal(
+    sessionId: String, id: String, revision: Int, objective: String?, maxRounds: Long?
+  ): RemoteGoal? = api().editGoal(sessionId, id, revision, objective, maxRounds)
+
   override suspend fun goalAction(sessionId: String, id: String, revision: Int, action: String): Boolean =
     api().goalAction(sessionId, id, revision, action)
 
@@ -100,6 +112,20 @@ internal class SshDshClient(
     api().previewFile(directory, path, session)
 
   override suspend fun schedules(sessionId: String): List<RemoteSchedule> = api().schedules(sessionId)
+
+  override suspend fun scheduleCatalog(): List<RemoteSchedule>? = api().scheduleCatalog()
+
+  override suspend fun scheduleHistory(
+    sessionId: String, id: String, before: String?, limit: Int
+  ): ScheduleHistoryPage? = api().scheduleHistory(sessionId, id, before, limit)
+
+  override suspend fun deleteSchedule(sessionId: String, id: String): ScheduleDeleteResult? =
+    api().deleteSchedule(sessionId, id)
+
+  override suspend fun updateSchedule(
+    sessionId: String, id: String, expected: ScheduleRecord,
+    title: String?, prompt: String?, change: ScheduleTimingChange?
+  ): ScheduleUpdateResult? = api().updateSchedule(sessionId, id, expected, title, prompt, change)
 
   override suspend fun createProviderRoute(
     route: String,
@@ -117,6 +143,22 @@ internal class SshDshClient(
 
   override suspend fun shells(directory: String): List<ShellJob> = api().shells(directory)
 
+  override suspend fun terminals(scope: TerminalScope): List<NativeTerminal> = api().terminals(scope)
+  override suspend fun createTerminal(scope: TerminalScope): NativeTerminal = api().createTerminal(scope)
+  override suspend fun resizeTerminal(scope: TerminalScope, id: String, cols: Int, rows: Int): NativeTerminal = api().resizeTerminal(scope, id, cols, rows)
+  override suspend fun renameTerminal(scope: TerminalScope, id: String, title: String): NativeTerminal = api().renameTerminal(scope, id, title)
+  override suspend fun closeTerminal(scope: TerminalScope, id: String) = api().closeTerminal(scope, id)
+  override suspend fun attachTerminal(scope: TerminalScope, id: String): TerminalAttachment = api().attachTerminal(scope, id)
+
+  override suspend fun terminals(directory: String): List<NativeTerminal> = api().terminals(directory)
+  override suspend fun createTerminal(directory: String): NativeTerminal = api().createTerminal(directory)
+  override suspend fun resizeTerminal(directory: String, id: String, cols: Int, rows: Int): NativeTerminal =
+    api().resizeTerminal(directory, id, cols, rows)
+  override suspend fun renameTerminal(directory: String, id: String, title: String): NativeTerminal =
+    api().renameTerminal(directory, id, title)
+  override suspend fun closeTerminal(directory: String, id: String) = api().closeTerminal(directory, id)
+  override suspend fun attachTerminal(directory: String, id: String): TerminalAttachment = api().attachTerminal(directory, id)
+
   override suspend fun shellInfo(id: String, directory: String): ShellSnapshot? = api().shellInfo(id, directory)
 
   override suspend fun shellOutput(id: String, directory: String, cursor: Long?, limit: Int): ShellOutput? =
@@ -124,11 +166,13 @@ internal class SshDshClient(
 
   override suspend fun removeShell(id: String, directory: String) = api().removeShell(id, directory)
 
+
   override suspend fun createSession(directory: String, title: String, workspaceId: String?): Session =
     api().createSession(sessionDirectory(directory), title, workspaceId)
 
   /** Blank or home-relative requests use the SSH host's working directory; an explicit project path wins. */
   private fun sessionDirectory(requested: String): String {
+    if (link.isOpenCode) return requested
     val preferred = SshShell.absolutePath(link.workingDirectory, link.remoteHome) ?: return requested
     if (requested.isBlank()) return preferred
     val home = link.remoteHome?.trimEnd('/')
@@ -150,7 +194,7 @@ internal class SshDshClient(
     return listOf(phase, status.detail.takeIf(String::isNotBlank)).joinToString(" · ")
   }
 
-  override val workspaceUpdates: Flow<List<Project>>? get() = link.workspaceUpdates
+  override val workspaceUpdates: Flow<List<Project>>? get() = if (link.isOpenCode) null else link.workspaceUpdates
 
   override suspend fun renameSession(session: Session, title: String) = api().renameSession(session, title)
 
@@ -208,6 +252,7 @@ internal class SshDshClient(
 
   override suspend fun pendingPermissions(directory: String): List<PermissionRequest> = api().pendingPermissions(directory)
 
+  override val recoverableQuestions: Boolean get() = !link.isOpenCode
   override suspend fun forms(directory: String): List<QuestionRequest> = api().forms(directory)
 
   override suspend fun replyPermission(request: PermissionRequest, reply: String) = api().replyPermission(request, reply)
@@ -216,6 +261,11 @@ internal class SshDshClient(
     api().replyQuestion(request, answers)
 
   override suspend fun rejectQuestion(request: QuestionRequest) = api().rejectQuestion(request)
+
+  override fun questionPresentation(sessionId: String?, foreground: Boolean) = link.questionPresentation(sessionId, foreground)
+  override fun questionFocus(id: String, focused: Boolean) = link.questionFocus(id, focused)
+  override fun questionEngage(id: String) = link.questionEngage(id)
+  override fun questionTakeTime(id: String) = link.questionTakeTime(id)
 
   override suspend fun children(session: Session): List<Session> = api().children(session)
 
@@ -233,7 +283,7 @@ internal class SshDshClient(
   override fun events(onOpen: () -> Unit): Flow<ServerEvent> = flow {
     var seenGeneration = -1L
     while (currentCoroutineContext().isActive && !isClosed) {
-      val currentApi = link.awaitClient(sinceGeneration = seenGeneration)
+      val currentApi = link.awaitHarness(sinceGeneration = seenGeneration)
       seenGeneration = link.generationId
       // DshApi.events() stays open until its collector is cancelled. Leave this generation as soon
       // as the link drops CONNECTED or closes this DshApi, then bind whatever generation comes next.
@@ -258,6 +308,10 @@ internal class SshDshClient(
           events.cancel()
         }
       }.collect { emit(it) }
+      // Normal SSE EOF does not mean the SSH/runtime generation was replaced. Reopen the event
+      // stream on the same still-live API rather than waiting forever for a new SSH connection.
+      if (link.status.value.isConnected && !currentApi.isClosed && link.generationId == seenGeneration)
+        seenGeneration = -1L
       if (!isClosed && currentCoroutineContext().isActive) delay(250)
     }
   }

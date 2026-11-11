@@ -1,0 +1,10 @@
+{
+  "name": "@lagoon/native-service-connector",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Connection-scoped native OpenCode service connector for the Lagoon Remote overlay",
+  "engines": { "node": ">=20" },
+  "scripts": { "test": "node --test test/native-services.test.mjs" },
+  "dependencies": { "ws": "8.21.3" }
+}

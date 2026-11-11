@@ -21,6 +21,10 @@ internal object DshEndpointContract {
    *
    * `$events` 与 `$events/result` 是网关内部的伪端点，同样列在这里。
    */
+  /** Separate upstream terminal policy checks Host enablement and trusted device ownership. */
+  val REMOTE_TERMINAL_ENDPOINTS = setOf("terminal/environment", "terminal/shells", "terminal/list",
+    "terminal/create", "terminal/retain", "terminal/follow", "terminal/write", "terminal/resize", "terminal/rename", "terminal/close")
+
   val REMOTE_ALLOWLIST: Set<String> = setOf(
     "\$events",
     "\$events/result",
@@ -181,5 +185,5 @@ internal object DshEndpointContract {
   val IGNORED_EVENTS: Set<String> = FORWARDED_EVENTS - CONSUMED_EVENTS
 
   /** 该端点是否允许在 `harness.remote.call` 上使用。 */
-  fun isRemoteEndpoint(endpoint: String): Boolean = endpoint in REMOTE_ALLOWLIST
+  fun isRemoteEndpoint(endpoint: String): Boolean = endpoint in REMOTE_ALLOWLIST || endpoint in REMOTE_TERMINAL_ENDPOINTS
 }

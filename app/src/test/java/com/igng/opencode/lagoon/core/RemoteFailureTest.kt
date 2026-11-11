@@ -5,8 +5,13 @@ import org.junit.Test
 
 class RemoteFailureTest {
   @Test fun controlPlaneStatusesMapToActionableKinds() {
-    assertEquals(RemoteFailureKind.AUTH_REQUIRED, remoteServerFailure(RemoteServerException(401, null, false)).kind)
-    assertEquals(RemoteFailureKind.REJECTED, remoteServerFailure(RemoteServerException(403, null, false)).kind)
+    assertEquals(RemoteFailureKind.AUTH_REQUIRED, remoteServerFailure(RemoteServerException(401, "AUTH_INVALID", false)).kind)
+    assertEquals(RemoteFailureKind.REJECTED, remoteServerFailure(RemoteServerException(403, "MEMBERSHIP_REQUIRED", false)).kind)
+    for (status in listOf(401, 403)) {
+      val unknown = remoteServerFailure(RemoteServerException(status, null, false))
+      assertEquals(RemoteFailureKind.NETWORK, unknown.kind)
+      assertTrue(unknown.retryable)
+    }
     assertEquals(RemoteFailureKind.HOST_NOT_FOUND, remoteServerFailure(RemoteServerException(404, null, false)).kind)
     assertEquals(RemoteFailureKind.RATE_LIMITED, remoteServerFailure(RemoteServerException(429, null, true)).kind)
     assertEquals(RemoteFailureKind.NETWORK, remoteServerFailure(RemoteServerException(503, null, true)).kind)

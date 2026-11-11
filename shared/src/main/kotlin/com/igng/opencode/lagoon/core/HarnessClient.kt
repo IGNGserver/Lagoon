@@ -30,6 +30,9 @@ interface HarnessClient {
   /** Releases transport-owned sockets and cryptographic state; safe to call more than once. */
   fun close() = Unit
 
+  /** A carrier owner may wait for bounded business-ownership handoffs before destroying its tunnel. */
+  suspend fun awaitClosed() = Unit
+
   /** True after [close] or after the shared Remote session was released. */
   val isClosed: Boolean get() = false
 
@@ -42,6 +45,25 @@ interface HarnessClient {
 
   suspend fun projects(): List<Project>
 
+  /** Fresh native OpenCode metadata, including archived projects; never local registrations. */
+  suspend fun openCodeProjects(): List<OpenCodeProjectInfo>? = null
+  suspend fun updateOpenCodeProject(expected: OpenCodeProjectInfo, edit: OpenCodeProjectEdit): OpenCodeProjectInfo? = null
+  suspend fun openCodeWorktrees(expected: OpenCodeProjectInfo): List<OpenCodeWorktree>? = null
+  suspend fun createOpenCodeWorktree(expected: OpenCodeProjectInfo, input: OpenCodeWorktreeCreate): OpenCodeWorktree? = null
+  suspend fun removeOpenCodeWorktree(expected: OpenCodeProjectInfo, worktree: OpenCodeWorktree, force: Boolean = false): Boolean? = null
+  /** Native reconciliation is a write, not a read-only inventory refresh. */
+  suspend fun refreshOpenCodeWorktrees(expected: OpenCodeProjectInfo): Boolean? = null
+
+  /** Fresh Host-owned registrations; null means unsupported, not an empty catalog. */
+  suspend fun serverWorkspaces(): List<ServerWorkspace>? = null
+  suspend fun registerWorkspace(path: String): WorkspaceRegistration? = null
+  /** Snapshot preflight only: the native Host has no atomic compare-and-swap/revision contract. */
+  suspend fun renameWorkspace(expected: ServerWorkspace, title: String): ServerWorkspace? = null
+  /** Removes the registration only; files and Sessions are retained by the Host. */
+  suspend fun deleteWorkspace(expected: ServerWorkspace): Boolean? = null
+  /** Null anchor means move to the end of the Host's display order. */
+  suspend fun moveWorkspace(expected: ServerWorkspace, before: ServerWorkspace?): List<String>? = null
+
   /**
    * 行内展示用的项目/工作区标题，绝不参与筛选、计数或新建会话目标。
    * 已经持续维护工作区清单的 harness 直接返回本地清单，不额外开流；其余可以按需做一次廉价读取。
@@ -49,6 +71,12 @@ interface HarnessClient {
   suspend fun projectsForDisplay(): List<Project> = projects()
 
   suspend fun session(id: String): Session
+
+  /** Explicit server-side literal content search; null means unsupported, never an empty result. */
+  suspend fun searchSessionContent(query: String): SessionContentSearchResult? = null
+
+  /** Resolve a clicked hit's current metadata; DSH requires a fresh authorized listing. */
+  suspend fun searchResultSession(id: String): Session? = session(id)
 
   suspend fun projectAt(directory: String): Project?
 
@@ -110,13 +138,31 @@ interface HarnessClient {
   /** Session goal, when the harness exposes durable goals. */
   suspend fun goal(sessionId: String): RemoteGoal? = null
   suspend fun createGoal(sessionId: String, objective: String, maxRounds: Int? = null): Boolean = false
+  /** Long-cap entry point; legacy clients may only represent an Int-sized cap. */
+  suspend fun createGoalWithLimit(sessionId: String, objective: String, maxRounds: Long? = null): Boolean =
+    if (maxRounds == null || maxRounds in 1L..Int.MAX_VALUE.toLong())
+      createGoal(sessionId, objective, maxRounds?.toInt()) else false
+  /** Edit the exact current revision without changing phase or resuming continuation. */
+  suspend fun editGoal(
+    sessionId: String, id: String, revision: Int, objective: String? = null, maxRounds: Long? = null
+  ): RemoteGoal? = null
   suspend fun goalAction(sessionId: String, id: String, revision: Int, action: String): Boolean = false
 
   /** PDF/image bytes, or Office converted to PDF; null when the harness cannot preview this path. */
   suspend fun previewFile(directory: String, path: String, session: Session?): FilePreview? = null
 
-  /** Host automation reminders bound to this Session; read-only list. */
+  /** Legacy active-only reminders bound to this Session. */
   suspend fun schedules(sessionId: String): List<RemoteSchedule> = emptyList()
+  /** All reminders with original owner/status; null means unsupported, not an empty catalog. */
+  suspend fun scheduleCatalog(): List<RemoteSchedule>? = null
+  suspend fun scheduleHistory(
+    sessionId: String, id: String, before: String? = null, limit: Int = 20
+  ): ScheduleHistoryPage? = null
+  suspend fun deleteSchedule(sessionId: String, id: String): ScheduleDeleteResult? = null
+  suspend fun updateSchedule(
+    sessionId: String, id: String, expected: ScheduleRecord,
+    title: String? = null, prompt: String? = null, change: ScheduleTimingChange? = null
+  ): ScheduleUpdateResult? = null
 
   /** Creates one custom model route in the Host's pi-ai settings; false when unsupported. */
   suspend fun createProviderRoute(
@@ -130,6 +176,43 @@ interface HarnessClient {
   suspend fun activeSessions(): Set<String>
 
   suspend fun shells(directory: String): List<ShellJob>
+
+  /** The scope stays explicit even if two Sessions have the same directory. */
+  suspend fun terminals(scope: TerminalScope): List<NativeTerminal> = when (scope) {
+    is TerminalScope.Location -> terminals(scope.directory)
+    is TerminalScope.Session -> throw ApiException(501, "此 harness 不支持会话归属终端")
+  }
+  suspend fun createTerminal(scope: TerminalScope): NativeTerminal = when (scope) {
+    is TerminalScope.Location -> createTerminal(scope.directory)
+    is TerminalScope.Session -> throw ApiException(501, "此 harness 不支持会话归属终端")
+  }
+  suspend fun resizeTerminal(scope: TerminalScope, id: String, cols: Int, rows: Int): NativeTerminal = when (scope) {
+    is TerminalScope.Location -> resizeTerminal(scope.directory, id, cols, rows)
+    is TerminalScope.Session -> throw ApiException(501, "会话终端尺寸必须经当前可写附着按序确认")
+  }
+  suspend fun renameTerminal(scope: TerminalScope, id: String, title: String): NativeTerminal = when (scope) {
+    is TerminalScope.Location -> renameTerminal(scope.directory, id, title)
+    is TerminalScope.Session -> throw ApiException(501, "此 harness 不支持会话归属终端")
+  }
+  suspend fun closeTerminal(scope: TerminalScope, id: String): Unit = when (scope) {
+    is TerminalScope.Location -> closeTerminal(scope.directory, id)
+    is TerminalScope.Session -> throw ApiException(501, "此 harness 不支持会话归属终端")
+  }
+  suspend fun attachTerminal(scope: TerminalScope, id: String): TerminalAttachment = when (scope) {
+    is TerminalScope.Location -> attachTerminal(scope.directory, id)
+    is TerminalScope.Session -> throw ApiException(501, "此 harness 不支持会话归属终端")
+  }
+
+  /** Native interactive PTYs; unsupported harnesses fail explicitly rather than creating a shell job. */
+  suspend fun terminals(directory: String): List<NativeTerminal> = throw ApiException(501, "此 harness 不支持原生终端")
+  /** Only an explicit caller action may create a terminal; the server chooses its default shell. */
+  suspend fun createTerminal(directory: String): NativeTerminal = throw ApiException(501, "此 harness 不支持原生终端")
+  suspend fun resizeTerminal(directory: String, id: String, cols: Int, rows: Int): NativeTerminal =
+    throw ApiException(501, "此 harness 不支持原生终端")
+  suspend fun renameTerminal(directory: String, id: String, title: String): NativeTerminal =
+    throw ApiException(501, "此 harness 不支持原生终端")
+  suspend fun closeTerminal(directory: String, id: String): Unit = throw ApiException(501, "此 harness 不支持原生终端")
+  suspend fun attachTerminal(directory: String, id: String): TerminalAttachment = throw ApiException(501, "此 harness 不支持原生终端")
 
   /**
    * One shell command including its terminal status. OpenCode exposes this as `GET /api/shell/{id}`;
@@ -157,6 +240,9 @@ interface HarnessClient {
   suspend fun deleteSession(session: Session)
 
   suspend fun forkSession(session: Session): Session
+  /** Exact native history boundary; no row-index or cross-protocol emulation. */
+  suspend fun forkSession(session: Session, boundary: ForkBoundary): Session =
+    throw ApiException(501, "此服务未声明指定历史边界分叉")
 
   suspend fun abort(session: Session)
 
@@ -215,11 +301,20 @@ interface HarnessClient {
 
   suspend fun forms(directory: String): List<QuestionRequest>
 
+  /** Durable continued questions can remain answerable while their session is idle. */
+  val recoverableQuestions: Boolean get() = false
+
   suspend fun replyPermission(request: PermissionRequest, reply: String)
 
   suspend fun replyQuestion(request: QuestionRequest, answers: List<List<String>>)
 
   suspend fun rejectQuestion(request: QuestionRequest)
+
+  /** Presentation ownership is separate from monitoring; only the visible foreground reader may claim a timed question. */
+  fun questionPresentation(sessionId: String?, foreground: Boolean) {}
+  fun questionFocus(id: String, focused: Boolean) {}
+  fun questionEngage(id: String) {}
+  fun questionTakeTime(id: String) {}
 
   suspend fun children(session: Session): List<Session>
 
@@ -296,11 +391,18 @@ fun createHarnessClient(
   onCookie: (String) -> Unit = {},
   remoteBackend: RemoteBackend? = null,
   /** App-provided factory for `sshHostId != null`; shared/ has no Android SSH implementation. */
-  sshClientFactory: ((ServerProfile, ServerCredentials) -> HarnessClient)? = null
-): HarnessClient = when (profile.kind) {
+  sshClientFactory: ((ServerProfile, ServerCredentials) -> HarnessClient)? = null,
+  /** Explicit caller-isolated direct DSH sharing. Raw constructors/default acquisition stay independent. */
+  dshRegistry: DshClientRegistry? = null
+): HarnessClient = if (profile.remoteHostId != null && profile.kind == ServerKind.OPENCODE) {
+  require(profile.sshHostId == null) { "同一个绑定不能混合 SSH 与 Remote carrier" }
+  (remoteBackend ?: throw IllegalStateException("Host 原生服务 backend 尚未配置")).client
+} else if (profile.sshHostId != null) {
+  require(profile.kind != ServerKind.DSH_REMOTE) { "SSH binding 不能使用 Remote carrier" }
+  sshClientFactory?.invoke(profile, credentials) ?: throw IllegalStateException("SSH backend 尚未配置")
+} else when (profile.kind) {
   ServerKind.OPENCODE -> OpenCodeApi(profile, credentials, callTimeoutSeconds)
-  ServerKind.DSH -> if (profile.sshHostId != null) {
-    sshClientFactory?.invoke(profile, credentials) ?: throw IllegalStateException("SSH backend 尚未配置")
-  } else DshApi(profile, credentials, callTimeoutSeconds, onCookie)
+  ServerKind.DSH -> dshRegistry?.acquire(profile, credentials, callTimeoutSeconds, onCookie)
+    ?: DshApi(profile, credentials, callTimeoutSeconds, onCookie)
   ServerKind.DSH_REMOTE -> (remoteBackend ?: throw IllegalStateException("DSH Remote backend 尚未配置")).client
 }

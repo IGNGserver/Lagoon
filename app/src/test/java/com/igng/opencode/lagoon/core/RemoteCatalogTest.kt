@@ -34,6 +34,20 @@ class RemoteCatalogTest {
     try { RemoteCatalogCodec.decode(duplicate); fail("expected duplicate rejection") } catch (_: IOException) { }
   }
 
+  @Test fun signedOutCatalogRetainsOnlyLocalSourceAndHostHierarchyMetadata() {
+    val saved = RemoteCatalog("https://remote.example/", "user@example.org", "github", "Lagoon",
+      listOf(RemoteHostMeta(hostA, "Mac", "darwin", true, null, "0.2.1", null, "abcdef012345")), 123L)
+    val signedOut = saved.copy(signedOut = true)
+    val decoded = RemoteCatalogCodec.decode(RemoteCatalogCodec.encode(signedOut))
+
+    assertTrue(decoded.signedOut)
+    assertEquals(saved.hosts, decoded.hosts)
+    assertEquals(saved.origin, decoded.origin)
+    assertFalse(RemoteCatalogCodec.encode(decoded).contains("password", ignoreCase = true))
+    assertFalse(RemoteCatalogCodec.encode(decoded).contains("token", ignoreCase = true))
+    assertFalse(saved.signedOut)
+  }
+
   @Test fun legacyHttpCatalogDoesNotInheritCleartextConsentFromItsUrl() {
     val catalog = RemoteCatalog(
       origin = "http://localhost:4321/", account = "user@example.org", provider = null,

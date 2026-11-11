@@ -53,6 +53,7 @@ import androidx.compose.ui.unit.sp
 import com.igng.opencode.lagoon.core.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.conflate
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -65,7 +66,7 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
 import top.yukonga.miuix.kmp.theme.miuixCapsuleShape
 import top.yukonga.miuix.kmp.theme.miuixShape
 
-private enum class ChatSheet { CHANGES, FILES, SCHEDULES, ACTIVITY }
+private enum class ChatSheet { CHANGES, FILES, SCHEDULES, ACTIVITY, TERMINAL }
 
 internal fun conversationActivityCount(activity: SessionActivity): Int =
   activity.subSessions.size + activity.shells.size
@@ -95,6 +96,13 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
   var childText by remember(state.serverId, state.sessionId) { mutableStateOf("") }
   var goalDialog by remember(state.serverId, state.sessionId) { mutableStateOf(false) }
   var goalText by remember(state.serverId, state.sessionId) { mutableStateOf("") }
+  var goalCapText by remember(state.serverId, state.sessionId) { mutableStateOf("") }
+  var goalCreateProfile by remember(state.serverId, state.sessionId) { mutableStateOf<ServerProfile?>(null) }
+  var goalCreateSession by remember(state.serverId, state.sessionId) { mutableStateOf<String?>(null) }
+  var revertMessage by remember(state.serverId, state.sessionId) { mutableStateOf<String?>(null) }
+  var timelineTarget by remember(state.serverId, state.sessionId) { mutableStateOf<TimelineMutationTarget?>(null) }
+  var forkTarget by remember { mutableStateOf<ForkMutationTarget?>(null) }
+  var restoreTimeline by remember(state.serverId, state.sessionId) { mutableStateOf(false) }
   val activity = remember(state.sessions, state.presentedTasks, state.shells, state.parents, state.sessionId) { state.sessionActivity() }
   val transcriptList = rememberLazyListState()
   LaunchedEffect(sheet, state.serverId, state.sessionId) {
@@ -109,32 +117,40 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
     menu = false
     sheet = ChatSheet.ACTIVITY
   }
-  val modal = sheet != null || menu || rename || delete || composerModal || requestModal || activityGroup != null || state.shellOutput != null
+  val modal = sheet != null || menu || rename || delete || composerModal || requestModal || activityGroup != null || state.shellOutput != null || revertMessage != null || forkTarget != null || restoreTimeline || goalDialog
   DisposableEffect(modal) { onModal(modal); onDispose { onModal(false) } }
   fun openFile(path: String) { sheet = ChatSheet.FILES; controller.readFile(path) }
   if (session == null) {
     Column(Modifier.fillMaxSize().padding(24.dp), verticalArrangement = Arrangement.Center) { Text("会话尚未加载或已关闭"); HyperButton(text = "返回列表", onClick = onBack) }
     return
   }
-  // ⋯ 分两段：查看会话的资源，以及对会话本身的操作。整理上下文 / 撤销 / 分享不在手机上提供，已保存权限在设置页；
-  // 分叉与删除按 harness 能力显示（DSH 没有消息级撤销与删除，用分叉与归档代替）。
+  // 原生操作按服务声明的能力显示，与 Direct/SSH/Remote carrier 无关。
+  // 消息回退在具体人类消息处确认，恢复入口只在存在暂存边界时显示；DSH 不冒充支持回退。
   val menuSections = listOf(
     MenuSection(buildList {
       add(MenuAction(conversationActivityLabel(activity), MiuixIcons.MindMap) { showActivitySheet() })
       if (state.capabilities.diff) add(MenuAction("改动（${state.changes.size}）", MiuixIcons.Merge) { sheet = ChatSheet.CHANGES })
       add(MenuAction("文件", MiuixIcons.Folder) { sheet = ChatSheet.FILES; controller.listFiles() })
+      if (state.capabilities.terminal) add(MenuAction("文本终端", MiuixIcons.Info) { sheet = ChatSheet.TERMINAL })
       if (state.server?.kind == ServerKind.DSH || state.server?.kind == ServerKind.DSH_REMOTE) {
         add(MenuAction("定时任务", MiuixIcons.Info) { sheet = ChatSheet.SCHEDULES; controller.loadSchedules() })
         // DSH 允许用新目标替换已完成的目标；进行中/暂停中必须先继续或清除。
         if (state.goal == null || state.goal.complete) {
-          add(MenuAction("设定长期目标", MiuixIcons.Ok) { goalDialog = true })
+          add(MenuAction("设定长期目标", MiuixIcons.Ok) {
+            goalCreateProfile = state.server; goalCreateSession = state.sessionId; goalDialog = true
+          })
         }
       }
     }),
     MenuSection(buildList {
       add(MenuAction(if (session.id in state.pinned) "取消置顶" else "置顶", if (session.id in state.pinned) MiuixIcons.Unpin else MiuixIcons.Pin) { controller.togglePin(session.id) })
       if (state.capabilities.supports(SessionAction.RENAME)) add(MenuAction("重命名", MiuixIcons.Rename) { rename = true })
-      if (state.capabilities.fork) add(MenuAction("分叉", MiuixIcons.Copy) { controller.fork() })
+      if (state.canForkSession() || state.uncertainForks.any { it.sameSource(state) }) add(MenuAction("分叉…", MiuixIcons.Copy) {
+        forkTarget = state.server?.let { ForkMutationTarget(it, session.id) }
+      })
+      if (state.canRestoreTimeline()) add(MenuAction("恢复回退内容", MiuixIcons.Info) {
+        timelineTarget = state.server?.let { TimelineMutationTarget(it, session.id, session.revertMessageId) }; restoreTimeline = true
+      })
       // 只有服务端真的带权限投影时才显示入口（OpenCode 没有这个语义）。
       if (session.permission.isNotBlank()) add(MenuAction("权限模式", MiuixIcons.Settings) { permission = true })
       state.capabilities.archive?.let { archive ->
@@ -170,7 +186,10 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
               activityGroup = it
               activityItem = it.takeIf { row -> row.kind == "tool" }
             }, onQueuedAction = { queuedAction = it },
-            activity = activity, onOpenActivity = ::showActivitySheet, listState = transcriptList)
+            activity = activity, onOpenActivity = ::showActivitySheet, listState = transcriptList,
+            onRevertMessage = { id ->
+              timelineTarget = state.server?.let { TimelineMutationTarget(it, session.id, session.revertMessageId) }; revertMessage = id
+            }, onForkMessage = { id -> state.forkTarget(id)?.let { forkTarget = it } })
         }
         if (session.parentId != null) ChildSessionBar(state, session, onBack,
           onContinue = if ((state.server?.kind == ServerKind.DSH || state.server?.kind == ServerKind.DSH_REMOTE) &&
@@ -216,11 +235,14 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
       ChatSheet.FILES -> "文件"
       ChatSheet.SCHEDULES -> "定时任务"
       ChatSheet.ACTIVITY -> conversationActivityLabel(activity)
+      ChatSheet.TERMINAL -> "原生文本终端"
     }
     HyperBottomSheet(title = title, show = true, onDismissRequest = { sheet = null }) {
       Column(Modifier.fillMaxWidth().fillMaxHeight(0.72f).padding(vertical = 8.dp)) {
         when (which) {
           ChatSheet.CHANGES -> {
+            if (state.server?.kind in setOf(ServerKind.DSH, ServerKind.DSH_REMOTE))
+              Text("当前历史窗口中最近 8 条改动记录；最多合并 60 个文件。过期或超限会明确报错，不代表无改动。", style = MiuixTheme.textStyles.footnote2)
             ResourceHint(state.resource("changes"), "暂无记录", retry = { controller.loadAncillary() })
             // Server lists may repeat an entry; LazyColumn crashes on a duplicate key, so keys never come from data alone.
             LazyColumn { itemsIndexed(state.changes, key = { index, change -> "$index:${change.path}" }) { _, change ->
@@ -231,6 +253,7 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
           }
           ChatSheet.FILES -> FilesPanel(state, controller) { path -> controller.addReference(path); sheet = null }
           ChatSheet.SCHEDULES -> SchedulesPanel(state, controller)
+          ChatSheet.TERMINAL -> NativeTerminalPanel(state, controller)
           // 子会话整页打开；后台命令有自己的输出抽屉，这一层先收起，不把两个抽屉叠在一起。
           ChatSheet.ACTIVITY -> ActivityPanel(state, activity, state.messages.filter { it.isBackgroundActivityMessage }, controller,
             modifier = Modifier.fillMaxWidth().weight(1f).padding(horizontal = 8.dp),
@@ -277,14 +300,112 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
     }
   }
   if (goalDialog) {
-    SuperDialog(title = "设定长期目标", show = true, onDismissRequest = { goalDialog = false }) {
-      Column(Modifier.padding(top = 8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text("目标是会话级的；完成或清除前，Host 可能自动续跑。之后可在目标面板里暂停、继续或标记完成。", style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
-        TextField(value = goalText, onValueChange = { goalText = it }, label = "目标")
-        DialogActions("取消", { goalDialog = false }, "创建", goalText.isNotBlank()) {
-          val text = goalText.trim()
-          goalDialog = false; goalText = ""
-          controller.createGoal(text)
+    val pending = state.pending("goal")
+    val cap = parseGoalRoundCap(goalCapText)
+    val sameTarget = goalCreateSession == state.sessionId && goalCreateProfile?.let { captured ->
+      state.server?.let { current -> captured.id == current.id && ConnectionRouteAdmission.sameLeafRoute(captured, current) }
+    } == true
+    SuperDialog(title = "设定长期目标", show = true, onDismissRequest = { if (!pending) goalDialog = false }) {
+      Column(Modifier.heightIn(max = 520.dp).verticalScroll(rememberScrollState()).padding(top = 8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text("目标是会话级的；创建后 Host 可能自动续跑。之后可在目标面板里编辑、暂停、继续或标记完成。", style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
+        TextField(value = goalText, onValueChange = { if (!pending) goalText = it }, label = "完整目标", singleLine = false,
+          modifier = Modifier.fillMaxWidth().heightIn(min = 112.dp, max = 220.dp))
+        TextField(value = goalCapText, onValueChange = { if (!pending) goalCapText = it }, label = "轮次上限（可选）", singleLine = true)
+        Text("留空使用 Host 默认上限；正整数，最大 $MAX_GOAL_ROUND_CAP。", style = MiuixTheme.textStyles.footnote2)
+        cap.exceptionOrNull()?.message?.let { Text(it, color = HyperTheme.colors.error, style = MiuixTheme.textStyles.footnote2) }
+        if (!sameTarget) Text("连接或会话已变化，请关闭后重新打开；草稿已保留。", color = HyperTheme.colors.warning)
+        ActionError(state, "goal")
+        DialogActions("取消", { if (!pending) goalDialog = false }, if (pending) "创建中…" else "创建",
+          sameTarget && state.goalControlsAvailable() && (state.goal == null || state.goal.complete) && goalText.isNotBlank() && cap.isSuccess) {
+          controller.createGoal(goalText.trim(), maxRounds = cap.getOrNull(), onCreated = {
+            goalDialog = false; goalText = ""; goalCapText = ""
+          }, expectedProfile = goalCreateProfile, expectedSession = goalCreateSession)
+        }
+      }
+    }
+  }
+  forkTarget?.let { captured ->
+    val inspectionScope = rememberCoroutineScope()
+    var inspection by remember(captured) { mutableStateOf<ForkInspection?>(null) }
+    var inspecting by remember(captured) { mutableStateOf(false) }
+    var inspectionError by remember(captured) { mutableStateOf<String?>(null) }
+    val pending = state.pending("fork")
+    val sameTarget = captured.matches(state)
+    val uncertain = state.uncertainForks.any { it.sameSource(state) }
+    val sourceHost = captured.profile.remoteHostId ?: android.net.Uri.parse(captured.profile.url).host ?: captured.profile.id
+    val boundaryText = when (val boundary = captured.boundary) {
+      is ForkBoundary.DshEvent -> "复制截至此原生事件（序号 ${boundary.sequence}）的历史，包含这条用户输入；后续回复不包含。截点由 Host 写入必要的结束记录。新会话不会自动发送任务。"
+      is ForkBoundary.OpenCodeBefore -> "复制此消息之前的投影历史，不包含本条消息和后续内容。不会回退或删除原会话。"
+      null -> when (captured.profile.kind) {
+        ServerKind.DSH, ServerKind.DSH_REMOTE -> "复制最新已完成轮次前缀。"
+        ServerKind.OPENCODE -> "复制当前完整历史。"
+      }
+    }
+    SuperDialog(title = "确认分叉？", show = true, onDismissRequest = { if (!pending) forkTarget = null }) {
+      Column(Modifier.heightIn(max = 520.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text("来源：${captured.profile.name.ifBlank { captured.profile.id }} · $sourceHost\n会话：${captured.sessionId}",
+          style = MiuixTheme.textStyles.footnote2)
+        Text(boundaryText, style = MiuixTheme.textStyles.footnote2)
+        Text("分叉会创建新会话，但不修改原会话或发送模型任务；结果未确认时请核对列表，不要重复提交。",
+          style = MiuixTheme.textStyles.footnote2)
+        if (!sameTarget) Text("连接、会话或所选消息已变化，请关闭后重新选择。", color = HyperTheme.colors.warning)
+        if (uncertain) {
+          Text("上次分叉结果尚未确认，已暂停再次提交。请先核对原 Host 的会话列表。", color = HyperTheme.colors.warning)
+          HyperTextAction(if (inspecting) "正在只读核对…" else "读取原 Host 会话核对", enabled = !inspecting && !pending && captured.sameSource(state), onClick = {
+            if (!inspecting) {
+              inspecting = true; inspection = null; inspectionError = null
+              inspectionScope.launch {
+                try { inspection = controller.inspectForkResults(captured) }
+                catch (cancel: kotlinx.coroutines.CancellationException) { throw cancel }
+                catch (_: Exception) { inspectionError = "无法读取原 Host 的会话，请保持锁定并稍后核对。" }
+                finally { inspecting = false }
+              }
+            }
+          })
+          inspectionError?.let { Text(it, color = HyperTheme.colors.error) }
+          inspection?.let { checked ->
+            Text("最近会话（只读，不证明是否曾创建成功）：", style = MiuixTheme.textStyles.footnote2)
+            checked.page.items.take(20).forEach { found -> Text("${found.title.ifBlank { found.id }} · ${found.id}", style = MiuixTheme.textStyles.footnote2) }
+            if (checked.page.next != null || checked.page.items.size > 20) Text("此处仅展示部分会话，请在原 Host 列表继续核对。", color = HyperTheme.colors.warning)
+            HyperTextAction("已人工核对，解除锁定后重新确认", enabled = !pending && !inspecting && captured.sameSource(state), onClick = {
+              runCatching { controller.acknowledgeForkInspection(checked) }.onSuccess { inspection = null }
+                .onFailure { inspectionError = "连接或核对结果已变化，请重新读取。" }
+            })
+          }
+        }
+        ActionError(state, "fork")
+        DialogActions("取消", { if (!pending) forkTarget = null }, if (pending) "分叉中…" else "确认分叉",
+          sameTarget && !pending && !uncertain && state.canConfirmFork(captured)) {
+          controller.forkAt(captured) { forkTarget = null }
+        }
+      }
+    }
+  }
+  revertMessage?.let { messageId ->
+    val target = timelineTarget
+    SuperDialog(title = "回退到此消息之前？", show = true,
+      onDismissRequest = { if (!state.pending("revert")) revertMessage = null }) {
+      Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text("这条消息及其后的内容将按服务器的原生回退规则暂存。文件是否回退由服务器决定；不会重新发送消息。继续发送前可通过菜单恢复。",
+          style = MiuixTheme.textStyles.footnote2)
+        ActionError(state, "revert")
+        DialogActions("取消", { revertMessage = null }, if (state.pending("revert")) "回退中…" else "确认回退",
+          target?.matches(state) == true && state.canRevertMessage(messageId), danger = true) {
+          controller.revert(messageId, onReverted = { revertMessage = null }, expected = target)
+        }
+      }
+    }
+  }
+  if (restoreTimeline) {
+    val target = timelineTarget
+    SuperDialog(title = "恢复回退内容？", show = true,
+      onDismissRequest = { if (!state.pending("unrevert")) restoreTimeline = false }) {
+      Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text("恢复服务器暂存的会话内容；不重新执行模型任务或工具。", style = MiuixTheme.textStyles.footnote2)
+        ActionError(state, "unrevert")
+        DialogActions("取消", { restoreTimeline = false }, if (state.pending("unrevert")) "恢复中…" else "恢复",
+          target?.matches(state) == true && state.canRestoreTimeline()) {
+          controller.unrevert(expected = target, onRestored = { restoreTimeline = false })
         }
       }
     }
@@ -540,7 +661,7 @@ private fun ShellOutputSheet(state: LagoonState, controller: LagoonController) {
           snapshot.exit != null -> "已结束 · 退出码 ${snapshot.exit}"
           else -> "已结束"
         }, Modifier.weight(1f), style = MiuixTheme.textStyles.footnote1.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
-        if (snapshot?.running == true && state.server?.kind != ServerKind.DSH_REMOTE) state.shells[output.shellId]?.let { job ->
+        if (snapshot?.running == true && state.capabilities.stopShell) state.shells[output.shellId]?.let { job ->
           HyperTextAction(text = "停止", danger = true, onClick = { stopCandidate = job })
         }
       }
@@ -877,6 +998,7 @@ fun MiuixPermissionCard(request: PermissionRequest, controller: LagoonController
 
 @Composable
 fun MiuixQuestionCard(request: QuestionRequest, controller: LagoonController, pending: Boolean) {
+  DisposableEffect(request.id) { onDispose { controller.questionFocus(request, false) } }
   val answerSaver = remember(request.id) { Saver<List<List<String>>, String>(save = { rows -> org.json.JSONArray().apply { rows.forEach { put(org.json.JSONArray(it)) } }.toString() }, restore = { json ->
     val rows = org.json.JSONArray(json); (0 until rows.length()).map { i -> val row = rows.getJSONArray(i); (0 until row.length()).map { row.optString(it) } }
   }) }
@@ -923,6 +1045,20 @@ fun MiuixQuestionCard(request: QuestionRequest, controller: LagoonController, pe
     insidePadding = PaddingValues(16.dp)
   ) {
     MiuixStatePill(TaskPhase.WAITING_QUESTION, "需要你的回答")
+    request.presentation?.let { status ->
+      val remaining = status.remainingMs?.let { (it.coerceAtLeast(0) + 999) / 1000 }
+      val label = when {
+        status.continued -> "工作已继续，你仍然可以回答"
+        status.held -> "等待你回答"
+        remaining != null && status.countdownRunning -> "$remaining 秒后继续工作"
+        remaining != null -> "已暂停 · 剩余 $remaining 秒"
+        else -> null
+      }
+      if (label != null) Text(label, style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary))
+      if (!status.continued && !status.held && remaining != null) {
+        HyperTextAction(text = "慢慢回答", enabled = !pending, onClick = { controller.questionTakeTime(request) })
+      }
+    }
     if (visibleIndices.size > 1) {
       Spacer(Modifier.height(10.dp))
       Text("第 ${currentPage + 1}/${visibleIndices.size} 项", style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
@@ -949,6 +1085,7 @@ fun MiuixQuestionCard(request: QuestionRequest, controller: LagoonController, pe
             modifier = Modifier
               .fillMaxWidth()
               .clickable {
+                controller.questionEngage(request)
                 answers = answers.toMutableList().also { list ->
                   list[index] = if (question.multiple) {
                     if (option.value in list[index]) list[index] - option.value else list[index] + option.value
@@ -979,10 +1116,13 @@ fun MiuixQuestionCard(request: QuestionRequest, controller: LagoonController, pe
           Spacer(Modifier.height(6.dp))
           TextField(
             value = custom[index],
-            onValueChange = { value: String -> custom = custom.toMutableList().also { it[index] = value } },
+            onValueChange = { value: String ->
+              controller.questionEngage(request)
+              custom = custom.toMutableList().also { it[index] = value }
+            },
             useLabelAsPlaceholder = true,
             label = "输入自定义回答…",
-            modifier = Modifier.fillMaxWidth()
+            modifier = Modifier.fillMaxWidth().onFocusChanged { controller.questionFocus(request, it.isFocused) }
           )
         }
       }
@@ -1050,7 +1190,7 @@ private fun ChatComposer(
   // Like the official composer, a prompt typed while the agent works steers the running turn.
   // While the server is connecting or retrying, a typed prompt is held and delivered once it answers.
   val queueing = actionKey == "send" && state.canQueueSend
-  val canSend = ready && !sending && hasContent && (state.connected || queueing && value.text.isNotBlank())
+  val canSend = ready && !sending && !state.pending("revert") && !state.pending("unrevert") && hasContent && (state.connected || queueing && value.text.isNotBlank())
   val muted = MiuixTheme.colorScheme.onSurfaceVariantSummary
   val hint = when {
     queueing -> "未连接 · 现在发送，连接恢复后会自动发出"
@@ -1188,22 +1328,7 @@ private fun RemoveBadge(modifier: Modifier, onRemove: () -> Unit) {
 
 @Composable
 private fun SchedulesPanel(state: LagoonState, controller: LagoonController) {
-  if (state.schedulesLoading) { Text("正在读取定时任务…", style = MiuixTheme.textStyles.footnote2); return }
-  if (state.schedules.isEmpty()) {
-    Text("此会话没有定时任务。可让 Agent 创建定时任务。",
-      style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
-    HyperTextAction(text = "刷新", onClick = { controller.loadSchedules() })
-    return
-  }
-  LazyColumn(Modifier.fillMaxWidth()) {
-    val scheduleKeys = uniqueListKeys(state.schedules) { it.id }
-    itemsIndexed(state.schedules, key = { index, _ -> scheduleKeys[index] }) { _, schedule ->
-      HyperActionRow(title = schedule.title, summary = "${schedule.detail} · ${schedule.scheduledAt}",
-        onClick = { controller.loadSchedules() })
-      Text(schedule.prompt, style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary), maxLines = 2, overflow = TextOverflow.Ellipsis,
-        modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp))
-    }
-  }
+  ScheduleManagementPanel(state, controller)
 }
 
 @Composable

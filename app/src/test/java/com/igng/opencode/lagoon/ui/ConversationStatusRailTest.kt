@@ -6,8 +6,8 @@ import org.junit.Test
 import java.io.File
 
 /**
- * 回归：目标条只占一行、不再展示自动续跑轮次，任务清单以“n/m”小胶囊出现并在点开后列出明细。
- * 这些是产品决策，源码级断言能防止有人把整块卡片或轮次字段加回来。
+ * 回归：目标条只占一行；预算与编辑放在详情面板，创建目标时可填写轮次上限。
+ * 任务清单以“n/m”小胶囊出现并在点开后列出明细。
  */
 class ConversationStatusRailTest {
   private fun source(name: String): String = listOf(
@@ -19,8 +19,9 @@ class ConversationStatusRailTest {
     val chat = source("ChatScreen.kt")
     assertTrue(chat.contains("ConversationStatusRail(state, controller)"))
     assertFalse("目标卡片应由 ConversationStatusRail 承载", chat.contains("private fun GoalBar("))
-    assertFalse("轮次字段已移除，不能再渲染", chat.contains("roundsStarted"))
-    assertFalse("轮次字段已移除，不能再渲染", chat.contains("maxRounds"))
+    assertTrue("创建目标时可填写可选上限", chat.contains("parseGoalRoundCap(goalCapText)"))
+    assertTrue("创建成功前保留草稿", chat.contains("onCreated = {"))
+    assertTrue("上限通过 Long 参数传递", chat.contains("maxRounds = cap.getOrNull()"))
   }
 
   @Test fun goalCapsuleIsOneLineAndCompletedGoalsDoNotReserveSpace() {
@@ -31,6 +32,10 @@ class ConversationStatusRailTest {
     assertTrue(rail.contains("maxLines = 1"))
     assertTrue(rail.contains("overflow = TextOverflow.Ellipsis"))
     assertTrue(rail.contains("HyperBottomSheet(title = \"长期目标\""))
+    assertTrue("详情显示预算而非胶囊占多行", rail.contains("Text(goalRoundSummary(goal)"))
+    assertTrue("恢复自动续跑须走核心显式策略", rail.contains("goal.canResumeGoal()"))
+    assertTrue("编辑不会重新恢复自动续跑", rail.contains("保留阶段和自动续跑状态；不会自动恢复"))
+    assertTrue("清除确认绑定打开时的目标", rail.contains("controller.goalAction(\"clear\", expected = captured)"))
   }
 
   @Test fun todoCapsuleShowsProgressAndOpensTheList() {

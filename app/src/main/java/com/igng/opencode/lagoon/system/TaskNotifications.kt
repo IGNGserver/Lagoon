@@ -119,7 +119,7 @@ class TaskNotifications(private val context: Context) {
 
   fun show(profile: ServerProfile, session: Session, state: TaskState, permission: PermissionRequest? = null, dedupeId: String? = null) {
     if (!allowed()) return
-    if (!profile.notifications) return
+    if (!profile.notifications || !profile.effectiveEnabled) return
     if (state.phase == TaskPhase.IDLE || state.phase == TaskPhase.DISCONNECTED || state.phase == TaskPhase.WAITING_SERVER) return
     // 只有「需要处理」与终态结果发普通通知；运行中一律交给灵动岛总览，避免通知中心堆积。
     if (state.phase in TaskState.RUNNING_PHASES) return
@@ -249,11 +249,16 @@ class TaskNotifications(private val context: Context) {
 
   /** Refresh the low-key monitor when only the background target list changed. */
   fun updateBackground(profile: ServerProfile, targets: List<SessionTarget>) {
-    if (!allowed() || !profile.notifications || targets.isEmpty()) return
+    if (!allowed() || !profile.notifications || !profile.effectiveEnabled || targets.isEmpty()) return
     manager.notify(backgroundId(profile.id), buildBackgroundSummary(profile, targets))
   }
 
   fun showSummary(profile: ServerProfile, summary: TaskSummary, target: SessionTarget?, background: List<SessionTarget> = emptyList()) {
+    if (!profile.effectiveEnabled) {
+      cancelSummary(profile.id)
+      cancelBackground(profile.id)
+      return
+    }
     val stage = LiveUpdateContent.stageOf(summary)
     // 只有进行中的任务上岛。全部结束后不再保留任何总览通知：结果交给每会话的完成/失败通知，
     // 这样通知中心在空闲时不会留一条“N 已完成”的汇总。若家族仍有后台活动，改发独立的低优先级

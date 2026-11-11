@@ -15,6 +15,21 @@ internal class AndroidRemotePeerTrustStore(private val preferences: SharedPrefer
     if (!preferences.edit().putString(key, publicKey).commit()) throw IOException("Remote Host 身份保存失败")
     publicKey
   }
+
+  override fun replaceIfMatches(scope: RemotePeerScope, expectedPublicKey: String, replacementPublicKey: String): Boolean = synchronized(lock) {
+    val key = key(scope)
+    val current = preferences.getString(key, null) ?: return false
+    if (!sameKey(current, expectedPublicKey)) return false
+    if (!preferences.edit().putString(key, replacementPublicKey).commit()) throw IOException("Remote Host 身份保存失败")
+    true
+  }
+
+  private fun sameKey(left: String, right: String): Boolean = runCatching {
+    MessageDigest.isEqual(
+      java.util.Base64.getUrlDecoder().decode(left),
+      java.util.Base64.getUrlDecoder().decode(right)
+    )
+  }.getOrDefault(false)
   private fun key(scope: RemotePeerScope): String = MessageDigest.getInstance("SHA-256")
     .digest("${scope.origin}\u0000${scope.account}\u0000${scope.hostId}".toByteArray()).joinToString("") { "%02x".format(it) }
   private companion object { val lock = Any() }

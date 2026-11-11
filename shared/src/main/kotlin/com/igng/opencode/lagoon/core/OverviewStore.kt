@@ -6,7 +6,14 @@ package com.igng.opencode.lagoon.core
  * SharedPreferences ([ServerStore]).
  */
 interface OverviewStore {
+  /** Admit a fresh saved route before returning even a cached client; Android checks committed graph. */
+  fun runtimeProfile(expected: ServerProfile): ServerProfile {
+    check(expected.effectiveEnabled) { "连接或其所属接入源/主机已停用" }
+    return expected
+  }
   fun credentials(id: String): ServerCredentials
+  /** Owner-issued cookie rotations are not new auth inputs; explicit username/password edits are. */
+  fun requireCurrentAuthentication(id: String, captured: ServerCredentials) = Unit
   /** Persists a session cookie a client minted for [url]; ignored once the profile moved to another address. */
   fun rememberCookie(id: String, url: String, cookie: String)
   fun localProjects(id: String): List<Project>

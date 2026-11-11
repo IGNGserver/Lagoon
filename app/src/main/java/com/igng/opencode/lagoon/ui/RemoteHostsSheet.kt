@@ -28,19 +28,27 @@ internal fun RemoteHostsSheet(
   val scope = rememberCoroutineScope()
   var catalogState by remember { mutableStateOf(controller.activeRemoteCatalog()) }
   val catalog = catalogState
-  val managerResult = remember(catalog?.origin, catalog?.account) {
+  val managerResult = remember(catalog?.origin, catalog?.account, catalog?.signedOut) {
     catalog?.let { saved ->
-      runCatching { controller.remoteAccountManager(saved.origin, saved.allowCleartext).also { it.resume(saved) } }
+      saved.takeUnless { it.signedOut }?.let { active ->
+        runCatching { controller.remoteAccountManager(active.origin, active.allowCleartext).also { it.resume(active) } }
+      }
     }
   }
   val manager = managerResult?.getOrNull()
+  val signedOut = catalog?.signedOut == true
   val managerError = managerResult?.exceptionOrNull()?.message
   var busy by remember { mutableStateOf(false) }
   var error by remember { mutableStateOf<String?>(null) }
   var confirmSignOut by remember { mutableStateOf(false) }
-  val profiles = remember(catalog) { controller.state.value.profiles }
+  val runtime by controller.state.collectAsState()
+  val profiles = runtime.profiles
+  var choosingHost by remember { mutableStateOf<RemoteHostMeta?>(null) }
 
-  fun added(hostId: String): Boolean = profiles.any { it.kind == ServerKind.DSH_REMOTE && it.remoteHostId == hostId }
+  fun added(hostId: String): Boolean = profiles.any {
+    it.remoteHostId == hostId && it.username.trim() == catalog?.account?.trim() &&
+      runCatching { canonicalRemoteOrigin(it.url) == catalog?.origin }.getOrDefault(false)
+  }
 
   fun reload() { catalogState = controller.activeRemoteCatalog() }
 
@@ -53,8 +61,8 @@ internal fun RemoteHostsSheet(
           scope.launch {
             busy = true; error = null
             try {
-              manager?.signOut(catalog)
               controller.markRemoteSignedOut(catalog.origin, catalog.account)
+              manager?.signOut(catalog)
               reload()
               confirmSignOut = false
             } catch (cancel: CancellationException) { throw cancel }
@@ -66,7 +74,14 @@ internal fun RemoteHostsSheet(
     }
   }
 
-  HyperBottomSheet(title = "DSH 远程主机", show = true, onDismissRequest = onDismiss) {
+  val selectedHost = choosingHost
+  if (selectedHost != null && catalog != null) {
+    val parent = runCatching { controller.remoteCatalogProfile(catalog, selectedHost) }.getOrNull()
+    if (parent != null) RemoteNativeServicesSheet(controller, parent, catalog, selectedHost) { choosingHost = null }
+    else LaunchedEffect(selectedHost.hostId) { choosingHost = null; error = "主机目录已变化，请刷新" }
+  }
+
+  HyperBottomSheet(title = "远程中枢与主机", show = selectedHost == null, onDismissRequest = onDismiss) {
     Column(Modifier.fillMaxWidth().fillMaxHeight(0.78f)) {
       LazyColumn(Modifier.weight(1f).fillMaxWidth(), contentPadding = PaddingValues(horizontal = 20.dp, vertical = 8.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -91,7 +106,8 @@ internal fun RemoteHostsSheet(
           }
           if (manager == null) item {
             HyperInlineNotice(
-              message = managerError ?: "此连接需要重新登录并明确授权后才能联网",
+              message = if (signedOut) "已退出登录；本地保存的接入源、主机层级和启用偏好仍保留。重新登录后可继续管理。"
+                else managerError ?: "此连接需要重新登录并明确授权后才能联网",
               type = MiuixToastType.WARNING,
               action = "重新登录并授权",
               onAction = onEnroll
@@ -103,7 +119,7 @@ internal fun RemoteHostsSheet(
               HyperButton(text = "刷新", variant = HyperButtonVariant.TERTIARY, loading = busy, enabled = manager != null, onClick = {
                 scope.launch {
                   busy = true; error = null
-                  try { manager?.refresh(); reload() }
+                  try { manager?.refresh()?.let(controller::saveRemoteCatalog); reload() }
                   catch (cancel: CancellationException) { throw cancel }
                   catch (e: Exception) { error = userFacingError(e, "刷新中枢主机失败") }
                   finally { busy = false }
@@ -130,13 +146,16 @@ internal fun RemoteHostsSheet(
                     RemoteTrustState.UNKNOWN -> MiuixTheme.colorScheme.onSurfaceVariantSummary
                   })
               }
-              if (!added(host.hostId)) HyperTextAction(text = "接入", onClick = onEnroll)
+              if (signedOut) HyperTextAction(text = "重新登录", onClick = onEnroll)
+              else if (host.trust == RemoteTrustState.PINNED) HyperTextAction(text = "选择 Harness", onClick = { choosingHost = host })
+              else HyperTextAction(text = "核对并接入", onClick = onEnroll)
             }
           }
           item {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
               HyperButton(text = "接入更多主机", onClick = onEnroll, modifier = Modifier.weight(1f))
-              HyperButton(text = "退出登录", variant = HyperButtonVariant.DESTRUCTIVE, onClick = { confirmSignOut = true }, modifier = Modifier.weight(1f))
+              HyperButton(text = if (signedOut) "已退出登录" else "退出登录", enabled = !signedOut,
+                 variant = HyperButtonVariant.DESTRUCTIVE, onClick = { confirmSignOut = true }, modifier = Modifier.weight(1f))
             }
           }
         }

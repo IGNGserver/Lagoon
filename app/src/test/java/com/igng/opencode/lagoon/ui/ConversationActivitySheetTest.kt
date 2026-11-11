@@ -33,7 +33,7 @@ class ConversationActivitySheetTest {
 
   @Test fun activityOpensAsAHalfHeightSheet() {
     val chat = source("ChatScreen.kt")
-    assertTrue("抽屉是 ChatSheet 的一员", chat.contains("private enum class ChatSheet { CHANGES, FILES, SCHEDULES, ACTIVITY }"))
+    assertTrue("抽屉是 ChatSheet 的一员，新增页面不改变后台活动语义", Regex("private enum class ChatSheet \\{[^}]*\\bACTIVITY\\b[^}]*\\}").containsMatchIn(chat))
     assertTrue("抽屉标题与菜单同源", chat.contains("ChatSheet.ACTIVITY -> conversationActivityLabel(activity)"))
     assertTrue("抽屉内容是后台活动面板", chat.contains("ChatSheet.ACTIVITY -> ActivityPanel("))
     assertTrue("走统一的半屏抽屉底座", chat.contains("HyperBottomSheet(title = title, show = true, onDismissRequest = { sheet = null })"))

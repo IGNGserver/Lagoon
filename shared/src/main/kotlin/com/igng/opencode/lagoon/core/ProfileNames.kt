@@ -59,7 +59,6 @@ internal object ProfileNames {
     val hostId = profile.remoteHostId ?: return null
     val origin = runCatching { canonicalRemoteOrigin(profile.url) }.getOrNull() ?: return null
     val catalog = catalogs.firstOrNull { canonicalRemoteOrigin(it.origin) == origin && it.account == profile.username }
-      ?: catalogs.firstOrNull { canonicalRemoteOrigin(it.origin) == origin }
       ?: return null
     return catalog.hosts.firstOrNull { it.hostId == hostId }?.name
   }

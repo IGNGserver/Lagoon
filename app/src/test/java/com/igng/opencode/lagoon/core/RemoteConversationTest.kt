@@ -64,6 +64,22 @@ class RemoteConversationTest {
   private fun sessionRow(id: String) = JSONObject().put("sessionId", id).put("updatedAt", 100)
     .put("running", false).put("cwd", "/repo")
 
+  @Test fun legacyRemoteNeverAdvertisesOrSendsSessionTerminalBeforeBidirectionalCapabilityNegotiation() = runBlocking {
+    FakeRemoteHost().use { host ->
+      host.start()
+      val (session, backend) = backend(host)
+      try {
+        assertTrue(!backend.client.capabilities().terminal)
+        val owner = TerminalScope.Session("session", "/same-directory")
+        assertTrue(runCatching { backend.client.terminals(owner) }.isFailure)
+        assertTrue(runCatching { backend.client.createTerminal(owner) }.isFailure)
+        assertTrue(runCatching { backend.client.attachTerminal(owner, "terminal") }.isFailure)
+        assertTrue(host.rpcCalls.none { it.optString("method").startsWith("terminal/") || it.toString().contains("terminal/attach") })
+        assertTrue(host.streamOpens.none { it.optString("endpoint").startsWith("terminal/") })
+      } finally { backend.close(); session.close() }
+    }
+  }
+
   @Test fun loadsConversationFromRemoteStream() = runBlocking {
     val id = "session-${UUID.randomUUID()}"
     FakeRemoteHost().use { host ->
@@ -119,7 +135,8 @@ class RemoteConversationTest {
           }
           "schedule/list" -> {
             assertEquals("s-remote", args.getJSONObject("request").getString("sessionId"))
-            host.ok(JSONArray().put(JSONObject().put("id", "sch-1").put("kind", "every").put("everySeconds", 300).put("title", "轮询")))
+            host.ok(JSONArray().put(JSONObject().put("id", "sch-1").put("kind", "every").put("everySeconds", 300).put("title", "轮询")
+              .put("prompt", "Review tasks").put("scheduledAt", "2099-01-01T00:00:00.000Z")))
           }
           "pluginManager/setBundleEnabled" -> {
             assertEquals("dsh-bundle", args.getString("name"))
@@ -154,6 +171,95 @@ class RemoteConversationTest {
         backend.close()
         session.close()
       }
+    }
+  }
+
+  @Test fun scheduleCatalogHistoryUpdateAndDeleteCarryExactOwnerOverNoise() = runBlocking {
+    FakeRemoteHost().use { host ->
+      val record = JSONObject().put("id", "schedule-noise").put("kind", "daily").put("title", "Review")
+        .put("prompt", "Review tasks").put("scheduledAt", "2099-01-01T15:00:00.000Z")
+        .put("time", "23:00:00.000").put("timeZone", "Asia/Calcutta")
+      var updates = 0; var deletes = 0
+      host.call = { endpoint, payload ->
+        val args = payload.getJSONObject("args")
+        when (endpoint) {
+          "schedule/catalog" -> {
+            assertEquals(0, args.length())
+            host.ok(JSONArray().put(JSONObject(record.toString()).put("sessionId", "original-owner").put("status", "active")))
+          }
+          "schedule/history" -> {
+            val request = args.getJSONObject("request")
+            assertEquals("original-owner", request.getString("sessionId")); assertEquals(20, request.getInt("limit"))
+            host.ok(JSONObject().put("id", "schedule-noise").put("records", JSONArray())
+              .put("earlierRecordsUnavailable", true).put("earlierRecordsPruned", false)
+              .put("retention", JSONObject().put("days", 7).put("records", 100)))
+          }
+          "schedule/update" -> {
+            updates++
+            val request = args.getJSONObject("request")
+            assertEquals(setOf("sessionId", "id", "expected", "title"), request.keys().asSequence().toSet())
+            assertEquals("original-owner", request.getString("sessionId"))
+            assertEquals("Asia/Calcutta", request.getJSONObject("expected").getString("timeZone"))
+            assertEquals("2099-01-01T15:00:00.000Z", request.getJSONObject("expected").getString("scheduledAt"))
+            host.ok(JSONObject().put("id", "schedule-noise").put("updated", true)
+              .put("record", JSONObject(record.toString()).put("title", request.getString("title"))))
+          }
+          "schedule/delete" -> {
+            deletes++
+            assertEquals("original-owner", args.getJSONObject("request").getString("sessionId"))
+            host.ok(JSONObject().put("id", "schedule-noise").put("deleted", true))
+          }
+          "schedule/create", "schedule/run" -> throw AssertionError("Unavailable schedule method must not be called")
+          else -> host.ok(JSONObject())
+        }
+      }
+      host.start(); val (session, backend) = backend(host)
+      try {
+        val catalog = withTimeout(15_000) { backend.client.scheduleCatalog() }!!
+        val task = catalog.single(); assertEquals("original-owner", task.sessionId)
+        val history = withTimeout(15_000) { backend.client.scheduleHistory(task.sessionId!!, task.id) }!!
+        assertTrue(history.earlierRecordsUnavailable); assertTrue(history.records.isEmpty())
+        val result = withTimeout(15_000) { backend.client.updateSchedule(task.sessionId!!, task.id, task.record!!, title = "Updated") }!!
+        assertTrue(result.updated); assertEquals("Asia/Calcutta", result.record?.timeZone)
+        assertTrue(withTimeout(15_000) { backend.client.deleteSchedule(task.sessionId!!, task.id) }!!.deleted)
+        assertEquals(1, updates); assertEquals(1, deletes)
+        assertTrue(host.contractViolations.isEmpty())
+      } finally { backend.close(); session.close() }
+    }
+  }
+
+  @Test fun goalEditCarriesExactRefAndFullViewOverEncryptedRemoteWithoutGetOrResume() = runBlocking {
+    FakeRemoteHost().use { host ->
+      host.call = { endpoint, payload ->
+        val args = payload.getJSONObject("args")
+        when (endpoint) {
+          "goals/edit" -> {
+            assertEquals(setOf("agentId", "ref", "request"), args.keys().asSequence().toSet())
+            assertEquals("s-remote", args.getString("agentId"))
+            assertEquals("g1", args.getJSONObject("ref").getString("id"))
+            assertEquals(2, args.getJSONObject("ref").getInt("revision"))
+            assertEquals(MAX_GOAL_ROUNDS, args.getJSONObject("request").getLong("maxGoalRounds"))
+            host.ok(JSONObject().put("id", "g1").put("revision", 3).put("objective", "Edited over Noise")
+              .put("phase", "paused").put("activation", "disarmed").put("maxGoalRounds", MAX_GOAL_ROUNDS)
+              .put("roundsStarted", 4).put("createdAt", 1).put("updatedAt", 2))
+          }
+          "session/projections" -> host.ok(JSONObject().put("values", JSONObject().put("goal", JSONObject()
+            .put("goal", JSONObject().put("id", "g1").put("revision", 2).put("objective", "Old").put("phase", "active").put("maxGoalRounds", 20))
+            .put("roundsStarted", 3))))
+          "goals/get", "goals/resume" -> throw AssertionError("Edit must not get or rearm a Remote goal")
+          else -> host.ok(JSONObject())
+        }
+      }
+      host.start()
+      val (session, backend) = backend(host)
+      try {
+        val edited = withTimeout(15_000) { backend.client.editGoal("s-remote", "g1", 2, "Edited over Noise", MAX_GOAL_ROUNDS) }!!
+        assertEquals(3, edited.revision); assertEquals("paused", edited.phase); assertEquals("disarmed", edited.activation)
+        val reloaded = withTimeout(15_000) { backend.client.goal("s-remote") }!!
+        assertEquals(edited, reloaded)
+        val edits = synchronized(host.rpcCalls) { host.rpcCalls.filter { it.optJSONObject("params")?.optString("endpoint") == "goals/edit" } }
+        assertEquals(1, edits.size)
+      } finally { backend.close(); session.close() }
     }
   }
 

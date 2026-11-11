@@ -72,6 +72,8 @@ data class LagoonState(
   val capabilities: ApiCapabilities = ApiCapabilities(),
   val previews: Map<String, SessionPreview> = emptyMap(), val resources: Map<String, ResourceStatus> = emptyMap(),
   val pendingOperations: Set<String> = emptySet(),
+  /** Unknown fork delivery cannot be retried merely by closing and reopening its dialog. */
+  val uncertainForks: List<ForkMutationTarget> = emptyList(),
   val agentChanged: Boolean = false, val modelChanged: Boolean = false,
   /**
    * [draft] is the composer text as last set by the app (restore, queued prompt returned, cleared after
@@ -148,11 +150,11 @@ data class LagoonState(
   /** Lazily computed per state instance and offline-TTL epoch; see [homeProjection]. */
   @Volatile internal var homeProjectionCache: Pair<Int, LagoonState>? = null
   val server: ServerProfile? get() = profiles.firstOrNull { it.id == serverId }
-  /** Connections the user has not disabled. Presentation layers must use this, not [profiles]. */
-  val enabledProfiles: List<ServerProfile> by lazy(LazyThreadSafetyMode.PUBLICATION) { profiles.filter { it.enabled } }
-  val disabledProfileCount: Int get() = profiles.count { !it.enabled }
+  /** Connections allowed by both their leaf preference and parents. Runtime surfaces use this, not [profiles]. */
+  val enabledProfiles: List<ServerProfile> by lazy(LazyThreadSafetyMode.PUBLICATION) { profiles.filter { it.effectiveEnabled } }
+  val disabledProfileCount: Int get() = profiles.count { !it.effectiveEnabled }
   val homeGroup: DeviceGroup? get() = homeGroupId?.let { id -> deviceGroups.firstOrNull { it.id == id } }
-  val homeGroupProfiles: List<ServerProfile> get() = homeGroup?.memberIds?.mapNotNull { id -> profiles.firstOrNull { it.id == id && it.enabled } }.orEmpty()
+  val homeGroupProfiles: List<ServerProfile> get() = homeGroup?.memberIds?.mapNotNull { id -> profiles.firstOrNull { it.id == id && it.effectiveEnabled } }.orEmpty()
   /** The home is aggregating more than one server: all-servers mode or a device group. */
   val multiServerView: Boolean get() = allServers || homeGroup != null
   val deviceTabs: List<DeviceTab> by lazy(LazyThreadSafetyMode.PUBLICATION) {
@@ -207,7 +209,7 @@ data class LagoonState(
   val visiblePermissions: List<PermissionRequest> by lazy(LazyThreadSafetyMode.PUBLICATION) { permissions.filter { permissionPolicy.visible(it.id, autoApprovalFailures) } }
   val globalSummary: TaskSummary get() {
     val snapshots = serverSnapshots().values
-    if (snapshots.isEmpty()) return if (enabledProfiles.isEmpty()) TaskSummary.EMPTY else summary
+    if (snapshots.isEmpty()) return if (server?.let { it.effectiveEnabled && it.notifications } == true) summary else TaskSummary.EMPTY
     // 关闭通知的服务器不进入系统汇总（灵动岛 / 前台服务），但它的数据仍留在应用内首页。
     return TaskSummary.merge(snapshots.filter { it.profile.notifications }.map { it.displaySummary(permissionPolicy) })
   }

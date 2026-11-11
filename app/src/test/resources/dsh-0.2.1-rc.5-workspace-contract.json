@@ -1,0 +1,583 @@
+{
+  "version": 1,
+  "upstream": {
+    "repository": "https://github.com/deepseek-ai/deepseek-harness",
+    "tag": "dsh-v0.2.1-rc.5",
+    "commit": "b830ec950faba0a46dda564be3e2d854afed94f1",
+    "version": "0.2.1-rc.5"
+  },
+  "sources": [
+    {
+      "package": "@deepseek-ai/dsh-api-workspace-controller",
+      "version": "0.2.1-rc.5",
+      "generatedFile": "lib/typert.host.js",
+      "sha256": "d8d43921e8be756dea73c58b175fdb533175698ecaf07b0615a928122e85b3ba"
+    }
+  ],
+  "methods": {
+    "workspace/create": {
+      "sourcePackage": "@deepseek-ai/dsh-api-workspace-controller",
+      "sourceLocation": {
+        "file": "packages/api/workspace-controller/src/index.ts",
+        "line": 91,
+        "column": 3
+      },
+      "args": {
+        "type": "object",
+        "properties": {
+          "request": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "path"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "request"
+        ],
+        "additionalProperties": false
+      },
+      "result": {
+        "type": "object",
+        "properties": {
+          "workspace": {
+            "type": "object",
+            "properties": {
+              "workspaceId": {
+                "type": "string"
+              },
+              "path": {
+                "type": "string",
+                "description": "Canonical host directory path."
+              },
+              "title": {
+                "type": "string",
+                "description": "User-visible title."
+              },
+              "sessionIds": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Sessions accounted to this Workspace in manual order."
+              },
+              "createdAt": {
+                "type": "string",
+                "description": "ISO-8601 creation instant."
+              },
+              "updatedAt": {
+                "type": "string",
+                "description": "ISO-8601 last-mutation instant."
+              }
+            },
+            "required": [
+              "workspaceId",
+              "path",
+              "title",
+              "sessionIds",
+              "createdAt",
+              "updatedAt"
+            ],
+            "additionalProperties": true
+          },
+          "created": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "workspace",
+          "created"
+        ],
+        "additionalProperties": true
+      }
+    },
+    "workspace/rename": {
+      "sourcePackage": "@deepseek-ai/dsh-api-workspace-controller",
+      "sourceLocation": {
+        "file": "packages/api/workspace-controller/src/index.ts",
+        "line": 120,
+        "column": 3
+      },
+      "args": {
+        "type": "object",
+        "properties": {
+          "request": {
+            "type": "object",
+            "properties": {
+              "workspaceId": {
+                "type": "string"
+              },
+              "title": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "workspaceId",
+              "title"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "request"
+        ],
+        "additionalProperties": false
+      },
+      "result": {
+        "type": "object",
+        "properties": {
+          "workspace": {
+            "type": "object",
+            "properties": {
+              "workspaceId": {
+                "type": "string"
+              },
+              "path": {
+                "type": "string",
+                "description": "Canonical host directory path."
+              },
+              "title": {
+                "type": "string",
+                "description": "User-visible title."
+              },
+              "sessionIds": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Sessions accounted to this Workspace in manual order."
+              },
+              "createdAt": {
+                "type": "string",
+                "description": "ISO-8601 creation instant."
+              },
+              "updatedAt": {
+                "type": "string",
+                "description": "ISO-8601 last-mutation instant."
+              }
+            },
+            "required": [
+              "workspaceId",
+              "path",
+              "title",
+              "sessionIds",
+              "createdAt",
+              "updatedAt"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "required": [
+          "workspace"
+        ],
+        "additionalProperties": true
+      }
+    },
+    "workspace/delete": {
+      "sourcePackage": "@deepseek-ai/dsh-api-workspace-controller",
+      "sourceLocation": {
+        "file": "packages/api/workspace-controller/src/index.ts",
+        "line": 130,
+        "column": 3
+      },
+      "args": {
+        "type": "object",
+        "properties": {
+          "request": {
+            "type": "object",
+            "properties": {
+              "workspaceId": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "workspaceId"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "request"
+        ],
+        "additionalProperties": false
+      },
+      "result": {
+        "type": "object",
+        "properties": {
+          "deleted": {
+            "type": "boolean",
+            "const": true
+          }
+        },
+        "required": [
+          "deleted"
+        ],
+        "additionalProperties": true
+      }
+    },
+    "workspace/insertBefore": {
+      "sourcePackage": "@deepseek-ai/dsh-api-workspace-controller",
+      "sourceLocation": {
+        "file": "packages/api/workspace-controller/src/index.ts",
+        "line": 140,
+        "column": 3
+      },
+      "args": {
+        "type": "object",
+        "properties": {
+          "request": {
+            "type": "object",
+            "properties": {
+              "workspaceId": {
+                "type": "string"
+              },
+              "beforeWorkspaceId": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "workspaceId"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "request"
+        ],
+        "additionalProperties": false
+      },
+      "result": {
+        "type": "object",
+        "properties": {
+          "workspaceIds": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "workspaceIds"
+        ],
+        "additionalProperties": true
+      }
+    },
+    "workspace/follow": {
+      "sourcePackage": "@deepseek-ai/dsh-api-workspace-controller",
+      "sourceLocation": {
+        "file": "packages/api/workspace-controller/src/index.ts",
+        "line": 206,
+        "column": 10
+      },
+      "args": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "result": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "baseline"
+              },
+              "value": {
+                "type": "object",
+                "properties": {
+                  "items": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "workspaceId": {
+                          "type": "string"
+                        },
+                        "path": {
+                          "type": "string",
+                          "description": "Canonical host directory path."
+                        },
+                        "title": {
+                          "type": "string",
+                          "description": "User-visible title."
+                        },
+                        "sessionIds": {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          },
+                          "description": "Sessions accounted to this Workspace in manual order."
+                        },
+                        "createdAt": {
+                          "type": "string",
+                          "description": "ISO-8601 creation instant."
+                        },
+                        "updatedAt": {
+                          "type": "string",
+                          "description": "ISO-8601 last-mutation instant."
+                        }
+                      },
+                      "required": [
+                        "workspaceId",
+                        "path",
+                        "title",
+                        "sessionIds",
+                        "createdAt",
+                        "updatedAt"
+                      ],
+                      "additionalProperties": true
+                    }
+                  },
+                  "archivedSessionIds": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "pinnedSessionIds": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "description": "Registry-global pin set, most recently pinned first."
+                  }
+                },
+                "required": [
+                  "items",
+                  "archivedSessionIds",
+                  "pinnedSessionIds"
+                ],
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "type",
+              "value"
+            ],
+            "additionalProperties": true
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "replace"
+              },
+              "value": {
+                "type": "object",
+                "properties": {
+                  "items": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "workspaceId": {
+                          "type": "string"
+                        },
+                        "path": {
+                          "type": "string",
+                          "description": "Canonical host directory path."
+                        },
+                        "title": {
+                          "type": "string",
+                          "description": "User-visible title."
+                        },
+                        "sessionIds": {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          },
+                          "description": "Sessions accounted to this Workspace in manual order."
+                        },
+                        "createdAt": {
+                          "type": "string",
+                          "description": "ISO-8601 creation instant."
+                        },
+                        "updatedAt": {
+                          "type": "string",
+                          "description": "ISO-8601 last-mutation instant."
+                        }
+                      },
+                      "required": [
+                        "workspaceId",
+                        "path",
+                        "title",
+                        "sessionIds",
+                        "createdAt",
+                        "updatedAt"
+                      ],
+                      "additionalProperties": true
+                    }
+                  },
+                  "archivedSessionIds": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "pinnedSessionIds": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "description": "Registry-global pin set, most recently pinned first."
+                  }
+                },
+                "required": [
+                  "items",
+                  "archivedSessionIds",
+                  "pinnedSessionIds"
+                ],
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "type",
+              "value"
+            ],
+            "additionalProperties": true
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "upsert"
+              },
+              "workspace": {
+                "type": "object",
+                "properties": {
+                  "workspaceId": {
+                    "type": "string"
+                  },
+                  "path": {
+                    "type": "string",
+                    "description": "Canonical host directory path."
+                  },
+                  "title": {
+                    "type": "string",
+                    "description": "User-visible title."
+                  },
+                  "sessionIds": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "description": "Sessions accounted to this Workspace in manual order."
+                  },
+                  "createdAt": {
+                    "type": "string",
+                    "description": "ISO-8601 creation instant."
+                  },
+                  "updatedAt": {
+                    "type": "string",
+                    "description": "ISO-8601 last-mutation instant."
+                  }
+                },
+                "required": [
+                  "workspaceId",
+                  "path",
+                  "title",
+                  "sessionIds",
+                  "createdAt",
+                  "updatedAt"
+                ],
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "type",
+              "workspace"
+            ],
+            "additionalProperties": true
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "remove"
+              },
+              "workspaceId": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "workspaceId"
+            ],
+            "additionalProperties": true
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "order"
+              },
+              "workspaceIds": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "required": [
+              "type",
+              "workspaceIds"
+            ],
+            "additionalProperties": true
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "archived"
+              },
+              "archivedSessionIds": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "required": [
+              "type",
+              "archivedSessionIds"
+            ],
+            "additionalProperties": true
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "pinned"
+              },
+              "pinnedSessionIds": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "required": [
+              "type",
+              "pinnedSessionIds"
+            ],
+            "additionalProperties": true
+          }
+        ]
+      }
+    }
+  }
+}
