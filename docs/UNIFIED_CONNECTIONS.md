@@ -40,6 +40,7 @@
 - ConnectionSource → HostBinding → HarnessBinding、观测目录与本机选择分离。
 - 幂等/中断可恢复/版本化迁移与确切 credential slot refs；保留 ID、disabled、分组/草稿等。
 - 原有资料通过兼容投影保留；实际执行按 exact 图链准入快照分派 carrier/native 协议。raw/图不一致时拒绝执行，不自动改路，unknown 协议不默认为 OpenCode。
+- 保存资料和凭据使用加密 before/after 日志与非秘密事务标记：准备日志、提交资料、发布凭据并清理日志；运行时不自行恢复，未确认时暂停认证。恢复重新确认日志和选定资料的落盘后再退休旧凭据，不能把 commit(false) 后的 RAM 快照误认为磁盘提交成功。损坏/未来/不匹配日志原样保留；只有显式本地恢复可继续。
 
 ### 3. 传输和生命周期（carrier/mux 与显式跨调用者 lease 已落地，真实环境矩阵未完成）
 

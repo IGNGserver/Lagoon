@@ -24,7 +24,7 @@
 - r8：ConnectionCatalogProjection 合并独立 SSH 配置和 Hub 账号/主机目录，无 Harness 时也保留 source/Host；不创建假 leaf。删除最后一个 SSH Harness 不再删除主机配置/共享凭据，只有显式删除接入源才移除。
 - Hub 登记只保存确认的主机，不默认创建 DSH 或自动连接；DSH/OpenCode 在同一主机服务页独立选择。无子 Harness 的只读发现仍读取 committed graph 父级许可，错误/缺图不自动修复。
 - 退出登录保留 signedOut 目录及原父级/子项偏好，撤销凭据前先持久化本地状态并暂停源；重新登录不偷偷开启父级。signedOut 的发现与后台新连接明确拒绝。
-- **尚未完成**：完整跨 store 故障注入矩阵、完整原生能力交互矩阵和真机 UI 验收。
+- r17 已补资料/凭据保存和 graph prepare/commit/recovery/cleanup 的故障矩阵，含 commit(false) 后 RAM/磁盘分离；完整原生能力交互矩阵和真机 UI 验收仍未完成。
 
 ### 阶段 3：实际原生传输与 mux，已有实质交付
 - OpenCodeApi 的 HTTP/二进制/SSE 已经通过 NativeHttpTransport；public constructors 兼容，close 释放本实例 transport，不关闭共享 dispatcher/pool。
@@ -34,7 +34,7 @@
 - 11 项 mux 回归覆盖 typed errors、cancel-all/reopen、end/reopen、onClosed fan-out、旧代次/旧 401 回调、cookie exchange 期间 close、坏载荷/慢消费者/回调异常隔离。
 - r7 修复应用 saved direct DSH 诊断另建 physical mux：相同路由/认证借用 Overview owner，未改内容/问答展示，不关闭 borrowed client；编辑 draft 不用旧资料代测，保存后先退役旧 owner 再连接。注意 durable browser cookie 允许多物理 socket，并非必然 409；409 限制是相同 v2 API-peer cookie。
 - Cookie 回调按 owner token+路由+username/password 输入隔离；同URL替换认证后迟到的旧回调不能覆盖新凭据，owner 自身 cookie 轮换仍复用。
-- **尚未完成**：公共库独立 DshApi 实例的全局复用（冷 events 多 collector 仍有 ownership 风险，不以裸 refcount 共享掩盖）；真实官方 API-peer fallback 互操作。RemoteBackend 共用原加密会话。
+- r15 已完成单实例多 collector 的唯一事件 owner 与有界广播；r16 另完成显式 registry/factory opt-in 的跨调用者共享、guarded lease 和前台/watch/read 隔离。裸 DshApi 构造器保持独立，不隐式全球池化。RemoteBackend 共用原加密会话；真实官方 API-peer fallback 互操作仍待独立专项验收。
 
 ### 阶段 4：SSH 多 Harness 已接入，仍非全部完成
 - SshTransportPool 已被 SshHostManager 实际使用：同一 saved source/config/pin/credential revision 复用物理 SSH；每个 binding 有独立 runtime link/forwarder/client/refcount，最后一个引用释放才关连接。
@@ -160,5 +160,11 @@
 - `client-lease-guarded.log` 门禁/兴趣/registry/事件/提问定向通过4s。真实mux夹具 Dispatcher import冲突和session address错误字段已修正。新增终端句柄回归发现 `use` 解析成 Closeable.use 导致发送即detach，改为显式 this@Access.use 并幂等close；`client-lease-terminal-fixed.log` 真实mux与终端清理通过3s。独立源码复核0个新增明确高风险项。
 - `client-lease-full.log`：1438项0失败/14跳过 Debug124s；追加失败的旧owner清理不能作为继任权限的fail-closed回归，`client-lease-handoff.log` 通过4s。`client-lease-final.log`：**1439 tests、0 failures、0 errors、14 skipped**，Debug assemble 成功120s；新增 Guarded7、Interests8、Registry10、真实mux2、提问lease1项。APK 22,023,492 bytes，SHA-256 `b39bb202f62c12997685325467a8abc8fe9df6e955b08f7cffc14d198d76b820`。本轮不启动真实服务；fixture Noise/Router运行，已停止的官方daemon opt-in 如实跳过。
 - 原始构造器不隐式池化，显式 direct registry 的不同绑定/路由/凭据/timeout 不合并；最后release才关闭owner，有界交还未确认时保留继任失败门禁。应用默认 acquisition 暂不改为全局共享，调用者可通过已提供的 opt-in 接入。
+- r17：资料/凭据用加密 before/after 保存日志和非秘密事务 token 联合恢复；准备日志、提交资料、发布凭据并清理日志三步，旧凭据不在资料确认前覆盖。损坏/未来/不匹配日志原样保留且认证/执行 fail-closed；只读运行时不恢复，构造/显式保存可本地恢复，不拨号。旧凭据读取不再隐式迁移写入，错误密文/格式不能被空 fallback 或迟到 Cookie 覆盖。
+- 新增 graph 四种提交故障×3保存/2恢复检查点与主图运行时只读权威；保存故障10项含密码-only、加密失败、损坏日志/密文、独立删除清理保护。`store-journal-matrix.log` 初版矩阵通过2s，`store-journal-cleanup.log` 删除/Cookie保护通过3s。
+- 独立复核发现2处真实持久化漏洞：commit(false) 可改RAM但未落盘，恢复不能仅按RAM after选择newSecret并退休旧密文；失败final cleanup可从RAM移走日志，不能只用contains作为认证门禁。修为弱身份表保留未确认加密日志，恢复先durable重准备日志、重确认选定资料/token落盘，成功后才发布/清理；split RAM/disk 5项专项模拟立即重试和磁盘重启，`store-journal-durability.log` 全矩阵通过10s。
+- 首轮全量遇旧SharedPreferences代理未实现hashCode而WeakHashMap失败，改弱引用identity表不调用equals/hashCode；定向重跑又发现旧Controller夹具putString(null)不按Android移除键，修正夹具而非降低不可读凭据校验。所有失败已调查，不当作环境跳过。
+- `store-journal-final.log`：**1460 tests、0 failures、0 errors、14 skipped**，Debug assemble 成功121s。新增GraphFault6、SaveFault10、Durability5项；Noise/Router fixture实际运行，已停止的官方daemon opt-in 如实跳过，本轮不启动服务。APK 22,030,512 bytes，SHA-256 `02a0f7df0efd9a979589f2f4b464603979b5ce0d822f2a8087580eb3e72abd60`。本地故障注入不是Android真机掉电验收。
+- 剩余能力审计确认4项实现缺口：Remote DSH受限逐文件Diff、原生workspace注册/管理、服务端内容搜索、历史边界fork；下一轮优先Diff与workspace。Desktop hook/非Linux归属证明/真机公网环境另按证据披露，不是停止有用实现的理由。
 - 全部构建在 `/home/lvziw/.build/Lagoon/unified-harness-connections/source`，Gradle/build 输出在 `~/.build`。源码工作树无 app/build、node_modules。
 - `wt audit`：29 repos，0 missing dirs，3 detached、4 merged worktrees 属其他任务；只读报告，无清理。

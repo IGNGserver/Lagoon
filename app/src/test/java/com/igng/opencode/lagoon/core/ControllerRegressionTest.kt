@@ -24,7 +24,7 @@ class ControllerRegressionTest {
     val data = mutableMapOf<String, Any?>()
     val editor = Proxy.newProxyInstance(javaClass.classLoader, arrayOf(SharedPreferences.Editor::class.java)) { proxy, method, args ->
       when {
-        method.name.startsWith("put") -> { data[args!![0] as String] = args[1]; proxy }
+        method.name.startsWith("put") -> { if (args!![1] == null) data.remove(args[0] as String) else data[args[0] as String] = args[1]; proxy }
         method.name == "remove" -> { data.remove(args!![0]); proxy }
         method.name == "clear" -> { data.clear(); proxy }
         method.name == "commit" -> true
