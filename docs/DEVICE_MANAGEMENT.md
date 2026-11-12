@@ -123,6 +123,7 @@ Harness 详情（路由一层，id = leafId）
 ## 8. 验证
 
 - `DeviceProjectionTest`：一台设备多个 Harness、0 Harness、采纳规则、两级开关、发现槽位与过期。
+- `DeviceSwitchSemanticsTest`：设备停用拒绝全部 leaf 且不改写子项偏好、单条 Harness 停用不影响兄弟、图不可读时失败关闭。
 - `DeviceDiscoveryStoreTest`：往返、过期仍可读、损坏/未来版本拒绝覆盖、单设备清除。
 - `DeviceGroupTest` / `DeviceGroupStoreTest`：v3 设备成员、v2 兼容、v1 只重置一次。
 - `InformationArchitectureRegressionTest`：设备/ Harness 每一级都是路由，配置各归各位。
