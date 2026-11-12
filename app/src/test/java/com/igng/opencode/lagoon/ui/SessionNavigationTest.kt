@@ -74,8 +74,8 @@ class SessionNavigationTest {
 
   @Test fun editorIsPushedOverDetailAndPopsOneLevelAtATime() {
     val detail = SessionNavigation(RootPage.DEVICES).openDevice("dev-1")
-    val profileEditor = detail.openEditor(DeviceEditorRoute(profileId = "dev-1"))
-    val sshEditor = profileEditor.openEditor(DeviceEditorRoute(tab = AddDeviceTab.DSH, sshHostId = ""))
+    val profileEditor = detail.openEditor(DeviceEditorRoute(mode = DeviceEditorMode.DIRECT_PROFILE, profileId = "dev-1"))
+    val sshEditor = profileEditor.openEditor(DeviceEditorRoute(mode = DeviceEditorMode.SSH_HOST, access = AddDeviceAccess.SSH, sshHostId = ""))
     assertEquals(2, sshEditor.editors.size)
     assertEquals("最上层才是屏幕上那一页", "", sshEditor.route.editor?.sshHostId)
     assertTrue(sshEditor.route.depth > profileEditor.route.depth)
@@ -104,11 +104,11 @@ class SessionNavigationTest {
 
   @Test fun editorLevelsSurviveARotationThroughTheirEncodedForm() {
     val editors = listOf(
-      DeviceEditorRoute(tab = AddDeviceTab.DSH),
-      DeviceEditorRoute(tab = AddDeviceTab.DSH, sshHostId = "")
+      DeviceEditorRoute(),
+      DeviceEditorRoute(mode = DeviceEditorMode.SSH_HOST, access = AddDeviceAccess.SSH, sshHostId = "")
     )
     assertEquals(editors, decodeDeviceEditors(encodeDeviceEditors(editors)))
-    val editing = listOf(DeviceEditorRoute(tab = AddDeviceTab.OPENCODE, profileId = "dev-1", sshHostId = "host-1"))
+    val editing = listOf(DeviceEditorRoute(mode = DeviceEditorMode.SSH_HOST, access = AddDeviceAccess.SSH, sshHostId = "host-1"))
     assertEquals(editing, decodeDeviceEditors(encodeDeviceEditors(editing)))
     assertTrue("坏行不能把整页重建弄崩", decodeDeviceEditors(listOf("nonsense")).isEmpty())
   }

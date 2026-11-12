@@ -36,7 +36,6 @@ import com.igng.opencode.lagoon.core.SshAddress
 import com.igng.opencode.lagoon.core.SshAuthMethod
 import com.igng.opencode.lagoon.core.SshFailure
 import com.igng.opencode.lagoon.core.SshHostConfig
-import com.igng.opencode.lagoon.core.SshLinkStatus
 import com.igng.opencode.lagoon.core.SshSecrets
 import com.igng.opencode.lagoon.core.userFacingError
 import kotlinx.coroutines.CancellationException
@@ -62,24 +61,12 @@ internal fun SshHostForm(
   state: LagoonState,
   controller: LagoonController,
   onCancel: () -> Unit,
-  onSaved: () -> Unit
+  onSaved: (String) -> Unit
 ) {
   val context = LocalContext.current
   val scope = rememberCoroutineScope()
   val hostId = remember(initial?.id) { initial?.id ?: SshHostConfig.newId() }
   val initialSecrets = remember(initial?.id) { initial?.let { controller.sshHostSecrets(it.id) } ?: SshSecrets() }
-  val existingProfile = remember(initial?.id, state.profiles) {
-    state.profiles.firstOrNull { initial?.id != null && it.sshHostId == initial.id }
-  }
-  val enabled = existingProfile?.enabled ?: true
-
-  val initialBindings = remember(initial?.id) { state.profiles.filter { initial != null && it.sshHostId == initial.id } }
-  var useDsh by rememberSaveable(initial?.id) { mutableStateOf(initialBindings.any { it.kind == ServerKind.DSH && it.enabled } || initial == null) }
-  var useOpenCode by rememberSaveable(initial?.id) { mutableStateOf(initialBindings.any { it.kind == ServerKind.OPENCODE && it.enabled }) }
-  var useCodex by rememberSaveable(initial?.id) { mutableStateOf(initialBindings.any { it.kind == ServerKind.CODEX && it.enabled }) }
-  var registrationPath by rememberSaveable(initial?.id) { mutableStateOf((initialBindings.firstOrNull { it.kind == ServerKind.OPENCODE && it.enabled }
-      ?: initialBindings.lastOrNull { it.kind == ServerKind.OPENCODE })?.sshServicePath.orEmpty()) }
-  var discoverySummary by remember { mutableStateOf<String?>(null) }
 
   var address by rememberSaveable(initial?.id) { mutableStateOf(initial?.host.orEmpty()) }
   var user by rememberSaveable(initial?.id) { mutableStateOf(initial?.user.orEmpty()) }
@@ -113,7 +100,6 @@ internal fun SshHostForm(
   }
   var result by remember { mutableStateOf<String?>(null) }
   var working by remember { mutableStateOf(false) }
-  var testStatus by remember { mutableStateOf<SshLinkStatus?>(null) }
   var pendingKey by remember { mutableStateOf<PresentedSshHostKey?>(null) }
   var pendingAction by remember { mutableStateOf<((SshHostConfig) -> Unit)?>(null) }
   var pendingConfig by remember { mutableStateOf<SshHostConfig?>(null) }
@@ -217,35 +203,21 @@ internal fun SshHostForm(
   fun errorText(error: Throwable): String =
     if (error is SshFailure) error.display() else userFacingError(error, "SSH 连接失败")
 
+  /**
+   * 只保存设备本身的接入配置。这个表单不再预选 Harness：设备页会做一次只读发现，再由用户逐个启用；
+   * 「仅保存，不连接」与普通保存产出的都是同一台设备，只是不校验主机指纹。
+   */
   fun commit(config: SshHostConfig, offline: Boolean = false) {
     working = true
     result = null
     try {
-      if (!useDsh && !useOpenCode && !useCodex) {
-        controller.saveSshSourceOnly(config, secrets())
-        onSaved()
-        return
-      }
-      val selected = listOfNotNull(ServerKind.DSH.takeIf { useDsh }, ServerKind.OPENCODE.takeIf { useOpenCode }, ServerKind.CODEX.takeIf { useCodex })
-      selected.forEach { kind ->
-        val existing = initialBindings.firstOrNull { it.kind == kind }
-        controller.saveSshHost(
-          config = config, secrets = secrets(), autoConnect = existing?.autoConnect ?: true,
-          notifications = existing?.notifications ?: true, groupId = null, connect = false,
-          harnessKind = kind,
-          registrationPath = if (kind == ServerKind.OPENCODE) registrationPath.trim().takeIf { it.isNotBlank() } else null,
-          bindingEnabled = !offline
-        )
-      }
-      initialBindings.filter { binding ->
-        (binding.kind == ServerKind.DSH && !useDsh) ||
-          (binding.kind == ServerKind.CODEX && !useCodex) ||
-          (binding.kind == ServerKind.OPENCODE && (!useOpenCode ||
-            binding.sshServicePath != registrationPath.trim().takeIf { it.isNotBlank() }))
-      }.forEach { controller.setProfileEnabled(it.id, false) }
-      onSaved()
+      controller.saveSshSourceOnly(config, secrets())
+      result = if (offline) "已保存 SSH 设备；首次连接时会再核对主机指纹" else "已保存 SSH 设备"
+      onSaved(hostId)
+    } catch (cancel: CancellationException) {
+      throw cancel
     } catch (error: Exception) {
-      result = errorText(error)
+      result = if (error is SshFailure) error.display() else userFacingError(error, "SSH 保存失败")
       working = false
     }
   }
@@ -273,21 +245,25 @@ internal fun SshHostForm(
     }
   }
 
-  fun test() {
-    if (!useDsh && !useOpenCode && !useCodex) {
-      result = "未选择 Harness；请使用只读发现测试 SSH，不会启动服务。"
-      return
-    }
+  /**
+   * 只读连接测试：读一次主机指纹与目录标记，不启动、不终止任何远端服务，也不挑选 Harness。
+   * Harness 的可用性由设备页的「刷新发现」给出。
+   */
+  fun testConnection() {
     val config = configOrNull() ?: return
     withPinnedKey(config) { pinned ->
-      working = true; result = null; testStatus = null
+      working = true; result = null
       scope.launch {
         try {
-          val message = controller.testSshHost(pinned, secrets(),
-            onStatus = { status -> scope.launch { testStatus = status } },
-            harnessKind = if (useDsh) ServerKind.DSH else if (useOpenCode) ServerKind.OPENCODE else ServerKind.CODEX,
-            registrationPath = registrationPath.trim().takeIf { useOpenCode && it.isNotBlank() })
-          result = message
+          val found = controller.discoverSshHarnesses(pinned, secrets(), null)
+          val codex = controller.discoverSshCodex(pinned, secrets())
+          result = buildString {
+            append("SSH 可用")
+            append(" · OpenCode 注册：${found.openCode.state}")
+            append(" · DSH 标记：${found.dshLegacy.state}")
+            append(" · Codex：${when (codex.installed) { true -> codex.version ?: "已安装"; false -> "未安装"; null -> "未知" }}")
+            append("\n发现不会启动服务；在那台设备的页面启用 Harness 后才会连接。")
+          }
           hostKeyType = pinned.hostKeyType.orEmpty()
           hostKeyFingerprint = pinned.hostKeyFingerprint.orEmpty()
         } catch (cancel: CancellationException) {
@@ -321,14 +297,6 @@ internal fun SshHostForm(
     contentPadding = PaddingValues(horizontal = 20.dp, vertical = 8.dp),
     verticalArrangement = Arrangement.spacedBy(10.dp)
   ) {
-    if (!enabled) item {
-      Card(colors = CardDefaults.defaultColors(color = MiuixColorTokens.WarningSubtle), insideMargin = PaddingValues(12.dp)) {
-        Text(
-          "此设备已停用：保存不会自动连接，可稍后在设备管理中启用。",
-          style = MiuixTheme.textStyles.footnote2.copy(color = MiuixColorTokens.Warning)
-        )
-      }
-    }
     item {
       TextField(
         value = address,
@@ -483,47 +451,12 @@ internal fun SshHostForm(
         }
       }
     }
-    item { HyperGroupTitle("Harness") }
     item {
-      HyperSwitchRow(title = "DeepSeek Harness", summary = "使用现有 DSH 接入；连接时可启动已配置的 dsh web",
-        checked = useDsh, onCheckedChange = { useDsh = it }, enabled = !working)
+      Text(
+        "保存后这台主机会作为一台设备出现在「设备」里；到那台设备的页面刷新发现，再逐个启用 DSH / OpenCode / Codex。",
+        style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary)
+      )
     }
-    item {
-      HyperSwitchRow(title = "OpenCode", summary = "只附着已运行的官方服务，不会安装、启动或终止进程",
-        checked = useOpenCode, onCheckedChange = { useOpenCode = it }, enabled = !working)
-    }
-    item {
-      HyperSwitchRow(title = "Codex", summary = "通过 SSH 连接开发机上的 Codex App Server，使用该主机的登录状态",
-        checked = useCodex, onCheckedChange = { useCodex = it }, enabled = !working)
-    }
-    if (useOpenCode) item {
-      TextField(value = registrationPath, onValueChange = { registrationPath = it },
-        label = "OpenCode 注册文件（留空使用 XDG 默认位置）", modifier = Modifier.fillMaxWidth())
-    }
-    item {
-      HyperButton(text = "发现 Harness（只读）", variant = HyperButtonVariant.SECONDARY, enabled = !working,
-        modifier = Modifier.fillMaxWidth(), onClick = {
-          val config = configOrNull()
-          if (config != null) withPinnedKey(config) { pinned ->
-            working = true
-            scope.launch {
-              try {
-                val found = controller.discoverSshHarnesses(pinned, secrets(), registrationPath.trim().takeIf { it.isNotBlank() })
-                val codex = controller.discoverSshCodex(pinned, secrets())
-                val codexStatus = when (codex.installed) { true -> codex.version ?: "已安装（版本未知）"; false -> "未安装"; null -> "未知" }
-                discoverySummary = "OpenCode 注册：${found.openCode.state} · DSH 旧接入标记：${found.dshLegacy.state}\nCodex：$codexStatus\n发现不会启动服务；运行与身份会在连接时验证。"
-                hostKeyType = pinned.hostKeyType.orEmpty()
-                hostKeyFingerprint = pinned.hostKeyFingerprint.orEmpty()
-              } catch (cancel: CancellationException) { throw cancel }
-              catch (error: Exception) { result = errorText(error) }
-              finally { working = false }
-            }
-          }
-        })
-    }
-    discoverySummary?.let { summary -> item {
-      Text(summary, style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary))
-    } }
     item {
       HyperActionRow(
         title = "更多选项",
@@ -611,27 +544,14 @@ internal fun SshHostForm(
         }
       }
       item {
-        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-          HyperButton(
-            text = if (useDsh) "测试 DSH（可能启动 dsh web）" else if (useOpenCode) "测试 OpenCode 接入" else "测试 Codex 接入",
-            variant = HyperButtonVariant.SECONDARY,
-            enabled = !working && (useDsh || useOpenCode || useCodex),
-            loading = working,
-            onClick = { test() },
-            modifier = Modifier.fillMaxWidth()
-          )
-          val status = testStatus?.let(::sshStepText).orEmpty()
-          if (status.isNotBlank()) Text(
-            status,
-            style = MiuixTheme.textStyles.footnote2.copy(
-              color = when (testStatus?.phase) {
-                com.igng.opencode.lagoon.core.SshLinkPhase.CONNECTED -> MiuixColorTokens.Success
-                com.igng.opencode.lagoon.core.SshLinkPhase.FAILED -> MiuixColorTokens.Error
-                else -> HyperTheme.colors.textSecondary
-              }
-            )
-          )
-        }
+        HyperButton(
+          text = "只读测试 SSH 连接",
+          variant = HyperButtonVariant.SECONDARY,
+          enabled = !working,
+          loading = working,
+          onClick = { testConnection() },
+          modifier = Modifier.fillMaxWidth()
+        )
       }
       if (initial != null) item {
         HyperTextAction(
@@ -661,10 +581,7 @@ internal fun SshHostForm(
           modifier = Modifier.weight(1f)
         )
         HyperButton(
-          text = when {
-            initial == null -> "保存所选 Harness"
-            else -> "保存 Harness 配置"
-          },
+          text = if (initial == null) "保存 SSH 设备" else "保存设备配置",
           enabled = !working,
           loading = working,
           onClick = { save(offline = false) },
@@ -674,7 +591,7 @@ internal fun SshHostForm(
     }
     if (initial == null) item {
       HyperTextAction(
-        text = "仅保存，不连接",
+        text = "跳过指纹核对，仅保存",
         enabled = !working,
         onClick = { save(offline = true) },
         modifier = Modifier.fillMaxWidth()
@@ -692,7 +609,7 @@ internal fun SshHostForm(
         DialogActions("取消", { confirmingDelete = false }, "确认删除", danger = true) {
           controller.deleteSshHost(initial.id)
           confirmingDelete = false
-          onSaved()
+          onSaved(initial.id)
         }
       }
     }
@@ -814,14 +731,6 @@ private fun SshHostKeyDialog(
       )
     }
   }
-}
-
-private fun sshStepText(status: SshLinkStatus): String = when (status.phase) {
-  com.igng.opencode.lagoon.core.SshLinkPhase.CONNECTED -> "已连接"
-  com.igng.opencode.lagoon.core.SshLinkPhase.FAILED -> status.error?.message ?: "连接失败"
-  com.igng.opencode.lagoon.core.SshLinkPhase.RECONNECTING -> "重连中：${status.detail}"
-  com.igng.opencode.lagoon.core.SshLinkPhase.CONNECTING -> status.detail.ifBlank { "正在连接…" }
-  com.igng.opencode.lagoon.core.SshLinkPhase.IDLE -> ""
 }
 
 private const val MAX_KEY_BYTES = 64 * 1024

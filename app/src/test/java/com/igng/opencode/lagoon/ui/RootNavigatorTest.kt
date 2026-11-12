@@ -191,7 +191,7 @@ class RootNavigatorTest {
     navigator.navigate(
       SessionNavigation(RootPage.DEVICES)
         .openDevice("dev-1")
-        .openEditor(DeviceEditorRoute(profileId = "dev-1"))
+        .openEditor(DeviceEditorRoute(mode = DeviceEditorMode.DIRECT_PROFILE, profileId = "dev-1"))
     )
     swipe()
     assertEquals("编辑器之下是设备详情", "dev-1", navigator.gesture?.peek?.device)

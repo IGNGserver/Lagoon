@@ -18,6 +18,10 @@ internal fun attachmentKey(session: String?): String = session ?: "draft"
 
 data class LagoonState(
   val profiles: List<ServerProfile> = emptyList(),
+  /** Bumped when a device discovery observation is recorded; only used to refresh device pages. */
+  val discoveryRevision: Int = 0,
+  /** Device id whose discovery is running right now, so the page can show progress without a second store. */
+  val deviceRefreshInFlight: String? = null,
   /** Saved SSH host metadata; secrets stay in SshHostStore. */
   val sshHosts: List<SshHostConfig> = emptyList(),
   /** Local, user-created device groups. Presentation only; never sent to a server. */

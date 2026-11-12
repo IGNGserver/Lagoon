@@ -55,7 +55,9 @@ class ConnectionCatalogProjectionTest {
     assertTrue(withoutLeaves.bindings.isEmpty())
     assertEquals(previous.sources.map { it.id }, withoutLeaves.sources.map { it.id })
     assertEquals(previous.hosts.map { it.id }, withoutLeaves.hosts.map { it.id })
-    assertTrue(withoutLeaves.sources.none { it.enabled })
+    // SSH 源从不做第二道门禁：旧来源的停用意图下移到设备，源本身被归一化为启用。
+    assertTrue(withoutLeaves.sources.single { it.type == ConnectionSourceType.SSH }.enabled)
+    assertTrue(withoutLeaves.sources.filter { it.type == ConnectionSourceType.HUB }.none { it.enabled })
     assertTrue(withoutLeaves.hosts.none { it.enabled })
 
     val siblings = listOf(
@@ -69,7 +71,8 @@ class ConnectionCatalogProjectionTest {
     assertSame(projected.bindings, restored.bindings)
     assertTrue(restored.bindings.all { it.enabled })
     assertTrue(restored.bindings.none { restored.effectiveEnabled(it.id) })
-    assertTrue(restored.sources.none { it.enabled })
+    assertTrue(restored.sources.single { it.type == ConnectionSourceType.SSH }.enabled)
+    assertTrue(restored.sources.filter { it.type == ConnectionSourceType.HUB }.none { it.enabled })
     assertTrue(restored.hosts.none { it.enabled })
     assertEquals(siblings.map { it.id }, restored.bindings.map { it.id })
   }
@@ -120,7 +123,11 @@ class ConnectionCatalogProjectionTest {
 
     assertEquals(projected.sources.map { it.id }, graph.sources.map { it.id })
     assertEquals(projected.hosts.map { it.id }, graph.hosts.map { it.id })
-    assertEquals(projected.sources.map { it.copy(enabled = false) }, graph.sources)
+    // An SSH source is one config per device: the legacy source denial moves down to the device and
+    // the source flag is normalized, so the device switch is the only gate (docs/DEVICE_MODEL.md).
+    assertEquals(projected.sources.map {
+      if (it.type == ConnectionSourceType.SSH) it.copy(enabled = true) else it.copy(enabled = false)
+    }, graph.sources)
     assertEquals(projected.hosts.map { it.copy(enabled = false) }, graph.hosts)
     val sshSource = graph.sources.single { it.type == ConnectionSourceType.SSH }
     assertEquals(MigrationProjection.sshSourceId(config.id), sshSource.id)
@@ -178,7 +185,7 @@ class ConnectionCatalogProjectionTest {
     assertEquals(changedConfig.name, ssh.name)
     assertEquals(changedConfig.profileUrl(), ssh.endpoint)
     assertTrue(ssh.allowCleartext)
-    assertFalse(ssh.enabled)
+    assertTrue("SSH 源被归一化为启用，停用意图留在设备上", ssh.enabled)
     val sshHost = merged.hosts.single { it.sourceId == ssh.id }
     assertEquals(changedConfig.name, sshHost.name)
     assertNull(sshHost.fingerprint)
@@ -211,8 +218,8 @@ class ConnectionCatalogProjectionTest {
     val projected = MigrationProjection.fromProfiles(listOf(profile),
       compositions = listOf(BindingComposition("group-exact", "Only real leaves", listOf(profile.id, profile.id))))
     val merged = merge(projected, sshHosts = listOf(config), catalogs = listOf(catalog))
-    val disabled = merged.copy(sources = merged.sources.map { it.copy(enabled = false) },
-      hosts = merged.hosts.map { it.copy(enabled = false) })
+    // SSH 源不做门禁，所以"全部停用"的固定点是设备停、源仍启用。
+    val disabled = merged.copy(hosts = merged.hosts.map { it.copy(enabled = false) })
     val encoded = ConnectionGraphCodec.encode(disabled)
     val decoded = ConnectionGraphCodec.decode(encoded)
 

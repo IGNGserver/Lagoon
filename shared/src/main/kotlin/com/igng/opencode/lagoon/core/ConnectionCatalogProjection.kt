@@ -75,12 +75,12 @@ internal object ConnectionCatalogProjection {
     val signedOutSources = remoteCatalogs.filter { it.signedOut }.mapTo(HashSet()) {
       MigrationProjection.hubSourceId(it.origin, it.account)
     }
-    val mergedSources = sources.values.map { source ->
+    val mergedSourcesRaw = sources.values.map { source ->
       val old = oldSources[source.id]?.takeIf { sameSourceScope(source, it) }
       if (source.id in signedOutSources) source.copy(enabled = false)
       else if (old == null) source else source.copy(enabled = old.enabled)
     }
-    val mergedHosts = hosts.values.map { host ->
+    val mergedHostsRaw = hosts.values.map { host ->
       val source = requireNotNull(sources[host.sourceId])
       val oldSource = oldSources[host.sourceId]
       val old = oldHosts[host.id]?.takeIf {
@@ -89,7 +89,26 @@ internal object ConnectionCatalogProjection {
       }
       if (old == null) host else host.copy(enabled = old.enabled)
     }
-    return ConnectionGraph(mergedSources, mergedHosts, projected.bindings, projected.compositions)
+    return normalizeSshSources(
+      ConnectionGraph(mergedSourcesRaw, mergedHostsRaw, projected.bindings, projected.compositions),
+      previous
+    )
+  }
+
+  /**
+   * An SSH source is one saved config and one device (see `docs/DEVICE_MODEL.md`): the source flag is
+   * never a second gate. A legacy disabled SSH source keeps its meaning by moving the denial down to
+   * its devices once; after that the source stays enabled and the device switch is the only gate.
+   */
+  fun normalizeSshSources(graph: ConnectionGraph, previous: ConnectionGraph? = null): ConnectionGraph {
+    val disabled = (graph.sources + previous?.sources.orEmpty())
+      .filter { it.type == ConnectionSourceType.SSH && !it.enabled }
+      .mapTo(HashSet()) { it.id }
+    if (disabled.isEmpty()) return graph
+    return graph.copy(
+      sources = graph.sources.map { if (it.id in disabled) it.copy(enabled = true) else it },
+      hosts = graph.hosts.map { if (it.sourceId in disabled && it.enabled) it.copy(enabled = false) else it }
+    )
   }
 
   /** IDs must match as well as scope; a name, address or fingerprint is never an identity alias. */

@@ -18,7 +18,10 @@ import java.util.Locale
 data class DeviceGroup(
   val id: String,
   val name: String,
+  /** 展开后的 Harness leaf id；旧版分组只有这一份，读起来仍然是成员。 */
   val memberIds: List<String> = emptyList(),
+  /** 用户在编辑器里选中的设备；非空时 [memberIds] 由它展开，新增 Harness 会自动加入。 */
+  val deviceIds: List<String> = emptyList(),
   val updatedAt: Long = 0
 )
 
@@ -69,25 +72,34 @@ data class DeviceGroupState(
   /** First containing group in save order; a profile may also belong to later groups. */
   fun groupOf(profileId: String): DeviceGroup? = groups.firstOrNull { profileId in it.memberIds }
 
-  /** Removes duplicate/unknown members within each group, empty groups and duplicate group ids. */
-  fun sanitized(profileIds: Set<String>): DeviceGroupState {
+  /**
+   * Removes duplicate/unknown members within each group, empty groups and duplicate group ids.
+   * A device-based group survives even when the device currently has no Harness attached — that is
+   * a legal state (`docs/DEVICE_MODEL.md` §5), not an empty group.
+   */
+  fun sanitized(profileIds: Set<String>, deviceIds: Set<String> = emptySet()): DeviceGroupState {
     val seenGroups = HashSet<String>()
     val clean = ArrayList<DeviceGroup>(groups.size)
     for (group in groups) {
       if (group.id.isBlank() || group.id.length > 128 || group.name.isBlank() || !seenGroups.add(group.id)) continue
       val members = group.memberIds.filter { it in profileIds }.distinct()
-      if (members.isEmpty()) continue
-      clean += group.copy(name = group.name.trim().take(128), memberIds = members)
+      val devices = group.deviceIds.filter { it in deviceIds }.distinct()
+      if (members.isEmpty() && devices.isEmpty()) continue
+      clean += group.copy(name = group.name.trim().take(128), memberIds = members, deviceIds = devices)
     }
     val selected = selectedGroupId?.takeIf { id -> clean.any { it.id == id } }
     return DeviceGroupState(clean, selected)
   }
 
-  /** All groups still containing this profile after removal. Empty groups are dropped. */
+  /**
+   * All groups still containing this profile after removal. An empty leaf list only drops the group
+   * when it is not attached to devices; removing the last Harness must not delete a device group.
+   */
   fun withoutProfile(profileId: String): DeviceGroupState = copy(
     groups = groups.mapNotNull { group ->
       if (profileId !in group.memberIds) group
-      else group.copy(memberIds = group.memberIds.filterNot { it == profileId }).takeIf { it.memberIds.isNotEmpty() }
+      else group.copy(memberIds = group.memberIds.filterNot { it == profileId })
+        .takeIf { it.memberIds.isNotEmpty() || it.deviceIds.isNotEmpty() }
     }
   ).let { next ->
     next.copy(selectedGroupId = next.selectedGroupId?.takeIf { id -> next.groups.any { it.id == id } })
@@ -196,7 +208,7 @@ fun deviceWorkspaceKey(session: Session, projects: List<Project>, scope: String)
 }
 
 internal object DeviceGroupCodec {
-  const val VERSION = 2
+  const val VERSION = 3
 
   fun encode(state: DeviceGroupState): String = JSONObject()
     .put("version", VERSION)
@@ -207,7 +219,8 @@ internal object DeviceGroupCodec {
           .put("id", group.id)
           .put("name", group.name)
           .put("updatedAt", group.updatedAt)
-          .put("members", JSONArray(group.memberIds)))
+          .put("members", JSONArray(group.memberIds))
+          .put("devices", JSONArray(group.deviceIds)))
       }
     }).toString()
 
@@ -217,7 +230,8 @@ internal object DeviceGroupCodec {
   fun decode(text: String): DeviceGroupState {
     try {
       val json = JSONObject(text)
-      if (json.optInt("version") != VERSION) throw IOException("设备分组版本无效")
+      val version = json.optInt("version")
+      if (version != VERSION && version != 2) throw IOException("设备分组版本无效")
       val rawGroups = json.optJSONArray("groups") ?: JSONArray()
       if (rawGroups.length() > 64) throw IOException("设备分组过多")
       val groups = (0 until rawGroups.length()).mapNotNull { index ->
@@ -227,7 +241,11 @@ internal object DeviceGroupCodec {
         val members = item.optJSONArray("members") ?: JSONArray()
         if (members.length() > 64) throw IOException("设备分组成员过多")
         val ids = (0 until members.length()).mapNotNull { members.optString(it).takeIf(String::isNotBlank) }.distinct()
-        DeviceGroup(id, name, ids, item.optLong("updatedAt", 0))
+        val devices = item.optJSONArray("devices")
+        val deviceIds = devices?.let { array ->
+          (0 until minOf(array.length(), 64)).mapNotNull { array.optString(it).takeIf(String::isNotBlank) }.distinct()
+        }.orEmpty()
+        DeviceGroup(id, name, ids, deviceIds, item.optLong("updatedAt", 0))
       }
       val selected = json.opt("selected") as? String
       // Keep members whose profiles are not loaded yet; the controller sanitizes again with the
