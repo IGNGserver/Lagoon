@@ -2186,12 +2186,25 @@ class LagoonController private constructor(private val appContext: Context) {
     val changed = old == null || old.connectionKey != clean.connectionKey || old.hostKeyType != clean.hostKeyType ||
       old.hostKeyFingerprint != clean.hostKeyFingerprint || sshHostStore.secrets(clean.id) != secrets
     // Disable leaves before replacing source credentials; no new runtime can dial mid-update.
-    savedProfiles.filter { it.sshHostId == clean.id && it.enabled }.forEach { setProfileEnabled(it.id, false) }
+    val restore = savedProfiles.filter { it.sshHostId == clean.id && it.enabled }.map { it.id }
+    restore.forEach { setProfileEnabled(it, false) }
     sshHostStore.save(clean, secrets)
     store.updateSshSourceRoute(clean.id, clean.profileUrl(), clean.user)
     if (changed) sshHostManager.replace(clean.id)
     persistConnectionGraph()
     updateState { it.copy(profiles = store.profiles(), sshHosts = sshHostStore.load()) }
+    // 编辑设备配置不应该顺手关掉它上面的 Harness：把开关原样放回去，并让它们按新配置重连。
+    restoreLeafSwitches(restore)
+  }
+
+  /** 批量恢复 leaf 开关，只刷新一次状态，避免逐条弹出"正在连接"的提示。 */
+  private fun restoreLeafSwitches(ids: List<String>) {
+    if (ids.isEmpty()) return
+    ids.forEach { id -> runCatching { store.setProfileEnabled(id, true) } }
+    val profiles = store.profiles()
+    updateState { it.copy(profiles = profiles) }
+    allOverview.start(profiles)
+    scheduleBackgroundSync()
   }
 
   /**

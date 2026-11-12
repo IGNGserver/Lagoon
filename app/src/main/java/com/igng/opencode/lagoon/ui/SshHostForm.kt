@@ -212,7 +212,7 @@ internal fun SshHostForm(
     result = null
     try {
       controller.saveSshSourceOnly(config, secrets())
-      result = if (offline) "已保存 SSH 设备；首次连接时再核对主机指纹" else "已保存 SSH 设备"
+      result = if (offline) "已保存 SSH 设备；首次连接时会再核对主机指纹" else "已保存 SSH 设备"
       onSaved(hostId)
     } catch (cancel: CancellationException) {
       throw cancel
@@ -591,7 +591,7 @@ internal fun SshHostForm(
     }
     if (initial == null) item {
       HyperTextAction(
-        text = "仅保存，不连接",
+        text = "跳过指纹核对，仅保存",
         enabled = !working,
         onClick = { save(offline = true) },
         modifier = Modifier.fillMaxWidth()
