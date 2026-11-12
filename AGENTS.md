@@ -4,6 +4,8 @@ Collaboration: collaborative
 Validation: `ANDROID_HOME=/home/lvziw/Android/Sdk ./gradlew :app:testDebugUnitTest :app:assembleDebug`; website changes also run `node website/scripts/build-site.mjs && python3 website/scripts/check-site.py website/dist` (set `GITHUB_TOKEN` to avoid the anonymous API limit).
 Release: use `.github/workflows/release.yml`. If the user does not specify a release type, publish a pre-release. Every release tag must include a Chinese update note at `docs/releases/<tag>.md`; see `docs/RELEASE_POLICY.md`.
 
+**连接域架构已冻结：改接入源/设备/Harness 的模型、开关或页面层级之前，先读 [`docs/DEVICE_MODEL.md`](docs/DEVICE_MODEL.md)，先改文档再改代码。** 术语固定为三层：接入源 → 设备（`HostBinding`）→ Harness（`ServerProfile`）；界面里的"设备"永远指 `HostBinding`，Harness 不得当设备展示。
+
 Lagoon is a native Android coding agent harness client (OpenCode 2.x and DeepSeek Harness). Platform-neutral Kotlin lives in `shared/` and is compiled into the app. The v3 self-hosted hub and PWA web client were retired and removed; see `docs/HUB_EOL.md`. Keep server data authoritative and keep credentials out of source control. Local foreground monitoring notifies on task completion and attention requests.
 
 ## Website

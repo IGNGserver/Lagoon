@@ -8,9 +8,9 @@ Lagoon 可以通过 **SSH** 或 **DSH Remote** 连接开发机上的 Codex。Cod
 
 1. 在开发机安装 Codex CLI，并在需要时以将用于 SSH 登录的同一用户完成登录和配置。
 2. 确认该用户的非交互式登录环境能够找到 `codex` 命令。例如，从另一台机器使用该用户 SSH 登录后检查 `command -v codex` 和 `codex --version`。
-3. 在 Lagoon 添加或编辑 SSH 主机，填写地址、用户名及 SSH 凭据，核对并确认主机指纹。
-4. 在 Harness 选择中开启 **Codex**。可以与同一主机上的其他 Harness 分别启用。只读发现会检查命令和版本，不能证明账户已登录或服务已可用。
-5. 测试 Codex 接入并保存。测试时如同时选中了其他 Harness，界面会优先测试 DSH，其次 OpenCode；要单独测试 Codex，请暂时只选择 Codex。
+3. 在 Lagoon 添加 SSH 设备，填写地址、用户名及 SSH 凭据，核对并确认主机指纹。
+4. 保存后打开这台设备的页面，点「刷新发现」确认 Codex 已安装。只读发现会检查命令和版本，不能证明账户已登录或服务已可用。
+5. 在设备页启用 **Codex**：它与同一设备上的其他 Harness 各自启停，未启用的 Harness 不会占用连接与流量。启用后可进 Harness 详情单独测试 Codex 接入。
 
 SSH 路径通过非交互式 shell 查找并启动 `codex app-server`。只在交互式 shell 初始化文件中设置的 PATH、版本管理器或桌面应用内置的 Codex，可能不会被发现。当前发现与启动使用 POSIX shell，**尚未验证 Windows 原生 SSH**。
 
