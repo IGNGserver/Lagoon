@@ -203,21 +203,22 @@ object DeviceProjection {
       val key = slotKey(observed.protocol, observed.locator)
       if (slots.containsKey(key)) return@forEach
       val fresh = discovery?.isFresh(nowMs) == true
+      val canAttach = attachable(access, observed.status, nowMs)
       put(HarnessSlot(
         key = key,
         protocol = observed.protocol,
         locator = observed.locator,
         name = observed.name.ifBlank { harnessName(observed.protocol, "") },
         availability = observed.status,
-        attachable = observed.status.availableNow(nowMs),
-        reason = observed.detail.ifBlank { unavailableReason(observed.status, fresh) }
+        attachable = canAttach,
+        reason = if (canAttach) "" else observed.detail.ifBlank { unavailableReason(observed.status, fresh) }
       ))
     }
     // 没有发现结果时，仍然给出该接入方式下“恒可挂载”的槽位，避免用户被一次失败的发现锁死。
+    // 发现里已有的协议不重复给兜底槽位（SSH 的 OpenCode 注册路径就是一个典型）。
     candidates(access).forEach { (protocol, locator, name) ->
-      val key = slotKey(protocol, locator)
-      if (!slots.containsKey(key)) put(HarnessSlot(
-        key = key, protocol = protocol, locator = locator, name = name,
+      if (slots.values.none { it.protocol == protocol }) put(HarnessSlot(
+        key = slotKey(protocol, locator), protocol = protocol, locator = locator, name = name,
         attachable = true, reason = if (discovery == null) "尚未发现；启用后会按该接入方式连接" else "未检测到此 Harness"
       ))
     }
@@ -233,6 +234,17 @@ object DeviceProjection {
     )
     DeviceAccess.DIRECT -> emptyList()
   }
+
+  /**
+   * SSH 的只读发现只能证明“装了/注册了”，认证与版本要连上才知道；因此它按已安装判定可添加，
+   * 中枢则由 Host 明确声明的可用性决定。
+   */
+  private fun attachable(access: DeviceAccess, status: HarnessDiscoveryStatus, nowMs: Long): Boolean =
+    if (access == DeviceAccess.SSH) {
+      status.installed != DiscoveryValue.NO && status.configured != DiscoveryValue.NO && status.available != DiscoveryValue.NO
+    } else {
+      status.availableNow(nowMs)
+    }
 
   private fun protocolOrder(protocol: HarnessProtocolId): Int = when (protocol) {
     HarnessProtocolId.DSH_TYPERT -> 0

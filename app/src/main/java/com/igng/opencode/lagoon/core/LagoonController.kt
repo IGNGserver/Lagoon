@@ -175,6 +175,269 @@ class LagoonController private constructor(private val appContext: Context) {
     connectionGraphStore.setHostEnabled(hostId, enabled)
   }
 
+  // —— 设备模型（docs/DEVICE_MODEL.md）：界面只认「设备」与「Harness」两级 ——
+
+  private val deviceDiscoveryStore = DeviceDiscoveryStore(appContext)
+
+  /** 最近一次发现观测；null 表示从未发现过。观测不是连接许可。 */
+  fun deviceDiscovery(deviceId: String): DeviceDiscovery? = deviceDiscoveryStore.get(deviceId)
+
+  /** 记录一次发现，并让设备页重新组合（不触发任何连接）。 */
+  fun recordDeviceDiscovery(discovery: DeviceDiscovery) {
+    try {
+      deviceDiscoveryStore.put(discovery)
+      updateState { it.copy(discoveryRevision = it.discoveryRevision + 1) }
+    } catch (cancel: CancellationException) {
+      throw cancel
+    } catch (error: Exception) {
+      showNotice(userFacingError(error, "发现结果保存失败"), FeedbackTone.WARNING)
+    }
+  }
+
+  fun clearDeviceDiscovery(deviceId: String) {
+    try {
+      deviceDiscoveryStore.clear(deviceId)
+      updateState { it.copy(discoveryRevision = it.discoveryRevision + 1) }
+    } catch (cancel: CancellationException) {
+      throw cancel
+    } catch (error: Exception) {
+      Diagnostics.warn("DeviceDiscovery", "清除发现缓存失败", error)
+    }
+  }
+
+  /**
+   * 本机真正“拥有”的设备：SSH/直连由已保存配置或 leaf 直接证明；中枢 Host 必须已为本机注册过
+   * 设备身份，或至少有一条 leaf。目录里出现但从未采纳的主机不在这里。
+   */
+  fun adoptedDeviceIds(): Set<String> {
+    val graph = connectionGraphMutable.value ?: return emptySet()
+    val attachedHosts = graph.bindings.mapTo(HashSet()) { it.hostBindingId }
+    val sources = graph.sources.associateBy { it.id }
+    return graph.hosts.mapNotNullTo(LinkedHashSet()) { host ->
+      val source = sources[host.sourceId] ?: return@mapNotNullTo null
+      when (source.type) {
+        ConnectionSourceType.SSH, ConnectionSourceType.DIRECT -> host.id
+        ConnectionSourceType.HUB -> {
+          val external = host.externalHostId
+          // 采纳证据：本机为这个 Host 注册过设备身份（含旧槽位），或目录里已确认过它的指纹，
+          // 或至少有一条 Harness。仅"目录里出现"不算设备。
+          val registered = external != null && runCatching {
+            val slot = resolveRemoteDeviceSlot(store.remoteDevices, source.endpoint, source.account.orEmpty(), external)
+            store.remoteDevices.load(slot) != null
+          }.getOrDefault(false)
+          val trusted = external != null && runCatching {
+            val observed = remoteCatalog(source.endpoint, source.account.orEmpty())?.hosts
+              ?.firstOrNull { it.hostId == external }
+            observed != null && observed.trust != RemoteTrustState.UNKNOWN
+          }.getOrDefault(false)
+          host.id.takeIf { registered || trusted || host.id in attachedHosts }
+        }
+      }
+    }
+  }
+
+  /** 设备列表投影；纯读，不拨号、不写盘。 */
+  fun deviceViews(
+    graph: ConnectionGraph?,
+    profiles: List<ServerProfile>,
+    isOnline: (String) -> Boolean = { false }
+  ): List<DeviceView> = DeviceProjection.devices(
+    graph = graph,
+    profiles = profiles,
+    // 图不可用时没有可信的采纳目录：按旧行为显示全部 Host，宁可多显示也不让设备凭空消失。
+    adoptedDeviceIds = if (graph == null) null else adoptedDeviceIds(),
+    discovery = ::deviceDiscovery,
+    isOnline = isOnline
+  )
+
+  /** 设备级开关：只写 `HostBinding.enabled`，不碰任何 leaf 偏好。 */
+  fun setDeviceEnabled(deviceId: String, enabled: Boolean) = setConnectionHostEnabled(deviceId, enabled)
+
+  /** leaf 所属的设备；用于从通知/深链解析到设备页。 */
+  fun deviceOfLeaf(leafId: String): String? =
+    connectionGraphMutable.value?.bindings?.firstOrNull { it.id == leafId }?.hostBindingId
+
+  /** SSH 配置对应的设备；保存 SSH 表单后据此直接进入设备页。 */
+  fun deviceIdOfSshHost(sshHostId: String): String? {
+    val graph = connectionGraphMutable.value ?: return null
+    val sourceId = MigrationProjection.sshSourceId(sshHostId)
+    return graph.hosts.firstOrNull { it.sourceId == sourceId }?.id
+      ?: MigrationProjection.hostId(sourceId, sshHostId)
+  }
+
+  /**
+   * 为一台设备做一次只读发现。设备或接入源停用时直接拒绝——发现也会建立连接。
+   *
+   * 中枢读 Host 的服务目录；SSH 跑只读探测（注册文件/命令），不安装、不启动、不终止任何远端进程。
+   */
+  suspend fun refreshDeviceDiscovery(deviceId: String) {
+    val graph = connectionGraphMutable.value ?: error("连接图暂不可用，请重试")
+    val host = graph.hosts.firstOrNull { it.id == deviceId } ?: error("设备已移除")
+    val source = graph.sources.firstOrNull { it.id == host.sourceId } ?: error("接入源已移除")
+    check(host.enabled) { "此设备已停用：先启用再发现" }
+    check(source.enabled) { "接入源已暂停，先恢复接入源再发现" }
+    updateState { it.copy(deviceRefreshInFlight = deviceId) }
+    try {
+      val now = System.currentTimeMillis()
+      val harnesses = when (source.type) {
+        ConnectionSourceType.HUB -> hubDiscovery(source, host, now)
+        ConnectionSourceType.SSH -> sshDiscovery(source, now)
+        ConnectionSourceType.DIRECT -> emptyList()
+      }
+      recordDeviceDiscovery(DeviceDiscovery(deviceId, now, harnesses, DiscoveryCompleteness.COMPLETE))
+    } finally {
+      updateState { it.copy(deviceRefreshInFlight = null) }
+    }
+  }
+
+  private suspend fun hubDiscovery(
+    source: ConnectionSource,
+    host: HostBinding,
+    now: Long
+  ): List<DiscoveredHarness> {
+    val catalog = remoteCatalog(source.endpoint, source.account.orEmpty())?.takeUnless { it.signedOut }
+      ?: error("中枢账号已退出登录，请重新登录")
+    val meta = catalog.hosts.firstOrNull { it.hostId == host.externalHostId } ?: error("主机目录已变化，请刷新")
+    val services = remoteHostServices(catalog, meta)
+    return buildList {
+      add(DiscoveredHarness(HarnessProtocolId.DSH_TYPERT, null, "DeepSeek Harness",
+        hostedStatus(services.dshAvailable, now, "Host 未声明 DSH 通道")))
+      add(DiscoveredHarness(HarnessProtocolId.CODEX_APP_SERVER, null, "Codex",
+        hostedStatus(services.codexAvailable, now, "Host 未声明 Codex 能力")))
+      services.native?.services.orEmpty().filter { it.supported }.forEach { service ->
+        add(DiscoveredHarness(HarnessProtocolId.OPENCODE_NATIVE, service.id,
+          service.name.ifBlank { "OpenCode" }, hostedStatus(service.available, now, "Host 报告该服务尚未就绪")))
+      }
+    }
+  }
+
+  private suspend fun sshDiscovery(source: ConnectionSource, now: Long): List<DiscoveredHarness> {
+    val config = source.sshHostConfigId?.let { id -> sshHostStore.load().firstOrNull { it.id == id } }
+      ?: error("SSH 配置已移除")
+    val secrets = sshHostStore.secrets(config.id)
+    val found = discoverSshHarnesses(config, secrets, null)
+    val codex = discoverSshCodex(config, secrets)
+    val path = found.openCode.registrationPath
+    return buildList {
+      add(DiscoveredHarness(HarnessProtocolId.OPENCODE_NATIVE, path, "OpenCode",
+        found.openCodeStatus(DeviceDiscovery.DEFAULT_TTL_MS),
+        if (found.openCode.state == SshDiscoveryState.PRESENT) "" else "未找到正在运行的 OpenCode 官方服务注册"))
+      // DSH over SSH 由配置的启动命令承载，标记文件只是旧接入线索，不作为可用性前提。
+      add(DiscoveredHarness(HarnessProtocolId.DSH_TYPERT, null, "DeepSeek Harness",
+        HarnessDiscoveryStatus(
+          installed = if (found.dshLegacy.state == SshDiscoveryState.PRESENT) DiscoveryValue.YES else DiscoveryValue.UNKNOWN,
+          available = DiscoveryValue.UNKNOWN, observedAtMs = now,
+          freshUntilMs = now + DeviceDiscovery.DEFAULT_TTL_MS, completeness = found.completeness,
+          reason = "连接时启动或复用配置的 dsh web"), ""))
+      add(DiscoveredHarness(HarnessProtocolId.CODEX_APP_SERVER, null, "Codex",
+        HarnessDiscoveryStatus(
+          installed = when (codex.installed) {
+            true -> DiscoveryValue.YES
+            false -> DiscoveryValue.NO
+            null -> DiscoveryValue.UNKNOWN
+          },
+          available = DiscoveryValue.UNKNOWN, observedAtMs = now,
+          freshUntilMs = now + DeviceDiscovery.DEFAULT_TTL_MS, completeness = found.completeness,
+          reason = codex.issue ?: codex.version), codex.version.orEmpty()))
+    }
+  }
+
+  private fun hostedStatus(available: Boolean, now: Long, reason: String): HarnessDiscoveryStatus =
+    HarnessDiscoveryStatus(
+      installed = DiscoveryValue.YES, configured = DiscoveryValue.YES,
+      listening = if (available) DiscoveryValue.YES else DiscoveryValue.UNKNOWN,
+      authenticated = if (available) DiscoveryValue.YES else DiscoveryValue.UNKNOWN,
+      compatible = if (available) DiscoveryValue.YES else DiscoveryValue.UNKNOWN,
+      available = if (available) DiscoveryValue.YES else DiscoveryValue.NO,
+      observedAtMs = now, freshUntilMs = now + DeviceDiscovery.DEFAULT_TTL_MS,
+      completeness = DiscoveryCompleteness.COMPLETE, reason = if (available) null else reason
+    )
+
+  /**
+   * 在设备页添加一条 Harness：始终以“启用”加入，然后由用户自己关。
+   * 同槽位已存在时复用原 leaf（幂等），不会产生第二条记录。
+   */
+  suspend fun attachHarness(deviceId: String, protocol: HarnessProtocolId, locator: String?) {
+    val graph = connectionGraphMutable.value ?: error("连接图暂不可用，请重试")
+    val host = graph.hosts.firstOrNull { it.id == deviceId } ?: error("设备已移除")
+    val source = graph.sources.firstOrNull { it.id == host.sourceId } ?: error("接入源已移除")
+    check(host.enabled && source.enabled) { "设备或接入源已停用，先启用再添加 Harness" }
+    when (source.type) {
+      ConnectionSourceType.HUB -> {
+        val catalog = remoteCatalog(source.endpoint, source.account.orEmpty())?.takeUnless { it.signedOut }
+          ?: error("中枢账号已退出登录，请重新登录")
+        val meta = catalog.hosts.firstOrNull { it.hostId == host.externalHostId } ?: error("主机目录已变化，请刷新")
+        val parent = remoteCatalogProfile(catalog, meta)
+        when (protocol) {
+          HarnessProtocolId.DSH_TYPERT -> addRemoteDshService(parent, enabled = true)
+          HarnessProtocolId.CODEX_APP_SERVER -> {
+            val services = remoteHostServices(catalog, meta)
+            check(services.codexAvailable) { "Host 未声明 Codex 可用" }
+            addRemoteCodexService(parent, enabled = true)
+          }
+          HarnessProtocolId.OPENCODE_NATIVE -> {
+            val services = remoteHostServices(catalog, meta)
+            val service = services.native?.services?.firstOrNull { it.id == locator && it.supported }
+              ?: error("原生服务已变化，请刷新发现后重试")
+            saveRemoteNativeService(parent, service, enabled = true)
+          }
+        }
+      }
+      ConnectionSourceType.SSH -> {
+        val config = source.sshHostConfigId?.let { id -> sshHostStore.load().firstOrNull { it.id == id } }
+          ?: error("SSH 配置已移除")
+        val kind = when (protocol) {
+          HarnessProtocolId.DSH_TYPERT -> ServerKind.DSH
+          HarnessProtocolId.OPENCODE_NATIVE -> ServerKind.OPENCODE
+          HarnessProtocolId.CODEX_APP_SERVER -> ServerKind.CODEX
+        }
+        saveSshHost(
+          config = config, secrets = sshHostStore.secrets(config.id), harnessKind = kind,
+          registrationPath = locator.takeIf { kind == ServerKind.OPENCODE },
+          bindingEnabled = true, connect = false
+        )
+      }
+      ConnectionSourceType.DIRECT -> error("直连连接本身就是一条 Harness，不需要再添加")
+    }
+  }
+
+  /**
+   * 移除一台设备：删掉它的全部 Harness、接入配置与中枢设备身份，并清掉发现缓存。
+   * 只影响本机记录；远端进程、文件与会话不动。
+   */
+  fun deleteDevice(deviceId: String) {
+    val graph = connectionGraphMutable.value ?: return
+    val host = graph.hosts.firstOrNull { it.id == deviceId } ?: return
+    val source = graph.sources.firstOrNull { it.id == host.sourceId } ?: return
+    graph.bindings.filter { it.hostBindingId == host.id }.forEach { deleteServer(it.id) }
+    when (source.type) {
+      ConnectionSourceType.SSH -> source.sshHostConfigId?.let { id ->
+        sshHostManager.close(id)
+        runCatching { sshHostStore.delete(id) }
+          .onFailure { showNotice(userFacingError(it, "删除 SSH 配置失败"), FeedbackTone.WARNING) }
+      }
+      ConnectionSourceType.HUB -> host.externalHostId?.let { external ->
+        runCatching {
+          val slot = resolveRemoteDeviceSlot(store.remoteDevices, source.endpoint, source.account.orEmpty(), external)
+          store.remoteDevices.delete(slot)
+        }
+        remoteCatalog(source.endpoint, source.account.orEmpty())?.let { catalog ->
+          runCatching {
+            store.saveRemoteCatalog(catalog.copy(
+              hosts = catalog.hosts.filterNot { it.hostId == external },
+              updatedAt = System.currentTimeMillis()
+            ))
+          }
+        }
+      }
+      ConnectionSourceType.DIRECT -> Unit
+    }
+    clearDeviceDiscovery(deviceId)
+    syncGroupLeaves()
+    persistConnectionGraph()
+    updateState { it.copy(profiles = store.profiles(), sshHosts = sshHostStore.load()) }
+  }
+
   private fun setConnectionParentEnabled(change: () -> ConnectionGraph) {
     if (!connectionGraphWritable) {
       showNotice("连接图不可写，请先修复或升级；原资料已保留", FeedbackTone.WARNING)
@@ -736,7 +999,9 @@ class LagoonController private constructor(private val appContext: Context) {
     try {
       when (val result = connectionGraphStore.loadOrMigrate()) {
         is ConnectionGraphStore.LoadResult.Loaded -> {
-          connectionGraphMutable.value = result.graph
+          // SSH sources never carry a second gate; a legacy disabled source moves its denial down to
+          // the device once, before anything reads the runtime parent gates.
+          connectionGraphMutable.value = ConnectionCatalogProjection.normalizeSshSources(result.graph)
           connectionGraphWritable = true
           persistConnectionGraph()
         }
@@ -1501,7 +1766,8 @@ class LagoonController private constructor(private val appContext: Context) {
 
   /** Persists a device-group edit and publishes it without touching any server connection. */
   private fun saveDeviceGroups(groups: List<DeviceGroup>, selected: String?) {
-    val clean = DeviceGroupState(groups, selected).sanitized(store.profiles().map { it.id }.toSet())
+    val expanded = groups.map(::expandGroupMembers)
+    val clean = DeviceGroupState(expanded, selected).sanitized(store.profiles().map { it.id }.toSet())
     try {
       deviceGroupStore.save(clean)
     } catch (cancel: CancellationException) {
@@ -1528,6 +1794,61 @@ class LagoonController private constructor(private val appContext: Context) {
     val group = state.value.homeGroup ?: return
     val active = state.value.server?.takeIf { it.effectiveEnabled }
     if (active == null || active.id !in group.memberIds) selectGroup(group.id)
+  }
+
+  /** 分组按设备选：成员一旦随设备走，之后新加的 Harness 会自动进入组。 */
+  private fun expandGroupMembers(group: DeviceGroup): DeviceGroup {
+    if (group.deviceIds.isEmpty()) return group
+    val graph = connectionGraphMutable.value ?: return group
+    val leaves = group.deviceIds.flatMap { deviceId ->
+      graph.bindings.filter { it.hostBindingId == deviceId }.map { it.id }
+    }.distinct()
+    return group.copy(memberIds = leaves)
+  }
+
+  /** 设备上新挂或移除 Harness 后，把按设备成立的分组成员重新展开一次。 */
+  private fun syncGroupLeaves() {
+    val groups = state.value.deviceGroups
+    if (groups.none { it.deviceIds.isNotEmpty() }) return
+    val expanded = groups.map(::expandGroupMembers)
+    if (expanded == groups) return
+    val clean = DeviceGroupState(expanded, state.value.homeGroupId).sanitized(store.profiles().map { it.id }.toSet())
+    runCatching { deviceGroupStore.save(clean) }
+      .onFailure { Diagnostics.warn("LagoonController", "设备分组成员同步失败", it) }
+    updateState { it.copy(deviceGroups = clean.groups, homeGroupId = clean.selectedGroupId) }
+  }
+
+  fun createDeviceGroup(name: String, deviceIds: List<String>): String {
+    val graph = connectionGraphMutable.value
+    val valid = deviceIds.filter { id -> graph?.hosts?.any { it.id == id } == true }.distinct()
+    val label = name.trim().take(128)
+    if (label.isBlank() || valid.isEmpty()) return ""
+    val id = java.util.UUID.randomUUID().toString()
+    val groups = state.value.deviceGroups + DeviceGroup(
+      id = id, name = label, memberIds = emptyList(), deviceIds = valid, updatedAt = System.currentTimeMillis()
+    )
+    saveDeviceGroups(groups, state.value.homeGroupId)
+    ensureSelectedGroupActive()
+    return id
+  }
+
+  fun updateDeviceGroup(id: String, name: String, deviceIds: List<String>) {
+    val graph = connectionGraphMutable.value
+    val label = name.trim().take(128)
+    val valid = deviceIds.filter { deviceId -> graph?.hosts?.any { it.id == deviceId } == true }.distinct()
+    if (label.isBlank() || valid.isEmpty() || state.value.deviceGroups.none { it.id == id }) return
+    val groups = state.value.deviceGroups.map { group ->
+      if (group.id == id) group.copy(name = label, deviceIds = valid, updatedAt = System.currentTimeMillis()) else group
+    }
+    saveDeviceGroups(groups, state.value.homeGroupId)
+    if (state.value.homeGroupId == id) {
+      val members = store.profiles().map { it.id }.toSet().let { ids ->
+        groups.first { it.id == id }.let { expandGroupMembers(it).memberIds.filter { member -> member in ids } }
+      }
+      val active = state.value.serverId?.takeIf { it in members }
+      if (active == null) selectGroup(id)
+    }
+    ensureSelectedGroupActive()
   }
 
   fun createDevice(name: String, memberIds: List<String>): String {
@@ -1559,7 +1880,8 @@ class LagoonController private constructor(private val appContext: Context) {
     ensureSelectedGroupActive()
   }
 
-  fun deleteDevice(id: String) {
+  /** 删除设备组（不是设备）；设备用 [deleteDevice]。 */
+  fun deleteDeviceGroup(id: String) {
     if (state.value.deviceGroups.none { it.id == id }) return
     val groups = state.value.deviceGroups.filterNot { it.id == id }
     saveDeviceGroups(groups, state.value.homeGroupId?.takeIf { it != id })

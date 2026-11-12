@@ -20,7 +20,8 @@ internal class DeviceGroupStore internal constructor(private val preferences: Sh
   fun load(): Loaded {
     val text = preferences.getString(KEY, null) ?: return Loaded(DeviceGroupState(), resetLegacy = false)
     val version = DeviceGroupCodec.version(text)
-    if (version != null && version in 1 until DeviceGroupCodec.VERSION) {
+    // Only v1 changed the home model; v2 membership stays valid and is upgraded in place.
+    if (version == 1) {
       // Persist the reset immediately so a process kill during upgrade cannot wipe a second time.
       runCatching { save(DeviceGroupState()) }
         .onFailure { Diagnostics.warn("DeviceGroupStore", "旧版设备分组重置写入失败", it) }

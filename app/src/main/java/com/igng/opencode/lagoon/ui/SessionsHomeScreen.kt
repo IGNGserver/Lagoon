@@ -131,7 +131,9 @@ internal fun HomeScreen(
             title = scopeWorkspace?.name ?: if (state.allServers || state.homeGroup != null) "全部项目" else state.server?.name ?: "选择设备",
             summary = buildString {
               if (scopeWorkspace != null) append("当前项目 · ")
-              append("${scopeProfiles.size} 台设备")
+              // 设备数按 HostBinding 计：同一台机器上的多个 Harness 不再各算一台设备。
+              val deviceCount = scopeProfiles.mapNotNull { controller.deviceOfLeaf(it.id) }.distinct().size
+              append("${deviceCount.takeIf { it > 0 } ?: scopeProfiles.size} 台设备")
               if (scopeProfiles.isNotEmpty()) append(" · $online 台在线")
             },
             trailing = { DropdownChevron(18.dp, description = "切换设备与项目") },

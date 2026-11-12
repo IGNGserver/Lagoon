@@ -18,7 +18,10 @@ import java.util.Locale
 data class DeviceGroup(
   val id: String,
   val name: String,
+  /** 展开后的 Harness leaf id；旧版分组只有这一份，读起来仍然是成员。 */
   val memberIds: List<String> = emptyList(),
+  /** 用户在编辑器里选中的设备；非空时 [memberIds] 由它展开，新增 Harness 会自动加入。 */
+  val deviceIds: List<String> = emptyList(),
   val updatedAt: Long = 0
 )
 
@@ -196,7 +199,7 @@ fun deviceWorkspaceKey(session: Session, projects: List<Project>, scope: String)
 }
 
 internal object DeviceGroupCodec {
-  const val VERSION = 2
+  const val VERSION = 3
 
   fun encode(state: DeviceGroupState): String = JSONObject()
     .put("version", VERSION)
@@ -207,7 +210,8 @@ internal object DeviceGroupCodec {
           .put("id", group.id)
           .put("name", group.name)
           .put("updatedAt", group.updatedAt)
-          .put("members", JSONArray(group.memberIds)))
+          .put("members", JSONArray(group.memberIds))
+          .put("devices", JSONArray(group.deviceIds)))
       }
     }).toString()
 
@@ -217,7 +221,8 @@ internal object DeviceGroupCodec {
   fun decode(text: String): DeviceGroupState {
     try {
       val json = JSONObject(text)
-      if (json.optInt("version") != VERSION) throw IOException("设备分组版本无效")
+      val version = json.optInt("version")
+      if (version != VERSION && version != 2) throw IOException("设备分组版本无效")
       val rawGroups = json.optJSONArray("groups") ?: JSONArray()
       if (rawGroups.length() > 64) throw IOException("设备分组过多")
       val groups = (0 until rawGroups.length()).mapNotNull { index ->
@@ -227,7 +232,11 @@ internal object DeviceGroupCodec {
         val members = item.optJSONArray("members") ?: JSONArray()
         if (members.length() > 64) throw IOException("设备分组成员过多")
         val ids = (0 until members.length()).mapNotNull { members.optString(it).takeIf(String::isNotBlank) }.distinct()
-        DeviceGroup(id, name, ids, item.optLong("updatedAt", 0))
+        val devices = item.optJSONArray("devices")
+        val deviceIds = devices?.let { array ->
+          (0 until minOf(array.length(), 64)).mapNotNull { array.optString(it).takeIf(String::isNotBlank) }.distinct()
+        }.orEmpty()
+        DeviceGroup(id, name, ids, deviceIds, item.optLong("updatedAt", 0))
       }
       val selected = json.opt("selected") as? String
       // Keep members whose profiles are not loaded yet; the controller sanitizes again with the

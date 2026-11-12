@@ -42,7 +42,9 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.metrics.performance.JankStats
 import com.igng.opencode.lagoon.core.*
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import top.yukonga.miuix.kmp.basic.*
 import top.yukonga.miuix.kmp.icon.MiuixIcons
 import top.yukonga.miuix.kmp.icon.extended.*
@@ -64,6 +66,7 @@ class MainActivity : ComponentActivity() {
         page = savedInstanceState?.getString(KEY_NAV_PAGE)?.let { runCatching { RootPage.valueOf(it) }.getOrNull() } ?: RootPage.HOME,
         sessions = savedInstanceState?.getStringArrayList(KEY_NAV_SESSIONS).orEmpty(),
         device = savedInstanceState?.getString(KEY_NAV_DEVICE),
+        harness = savedInstanceState?.getString(KEY_NAV_HARNESS),
         editors = decodeDeviceEditors(savedInstanceState?.getStringArrayList(KEY_NAV_EDITORS))
       ),
       if (savedInstanceState?.containsKey(KEY_NAV_SERVER) == true) savedInstanceState.getString(KEY_NAV_SERVER) else controller.state.value.serverId
@@ -87,6 +90,7 @@ class MainActivity : ComponentActivity() {
       // 首页的聚合投影不能跟着"当前路由"走：首页在转场里也是一页（离场页、预见式返回的预览页），
       // 那些帧里栈仍指向会话页。首页统一在组合点取投影，见 [rememberHomePage]。
       val draftScope = state.homeGroup?.memberIds?.toSet()
+      val scope = rememberCoroutineScope()
       val preferences = remember { getSharedPreferences("ui", MODE_PRIVATE) }
       var themeMode by remember { mutableStateOf(runCatching { ThemeMode.valueOf(preferences.getString("themeMode", "SYSTEM")!!) }.getOrDefault(ThemeMode.SYSTEM)) }
       val systemDark = isSystemInDarkTheme()
@@ -129,14 +133,26 @@ class MainActivity : ComponentActivity() {
          focusManager.clearFocus()
          navigator.navigate(navigator.navigation.openEditor(target))
        }
-       fun addDevice(tab: AddDeviceTab = AddDeviceTab.OPENCODE) = openEditor(DeviceEditorRoute(tab = tab))
-       fun editDevice(profile: ServerProfile) = openEditor(
-         DeviceEditorRoute(
-           tab = if (profile.kind == ServerKind.OPENCODE) AddDeviceTab.OPENCODE else AddDeviceTab.DSH,
-           profileId = profile.id,
-           sshHostId = profile.sshHostId
-         )
+       fun addDevice(access: AddDeviceAccess = AddDeviceAccess.HUB) = openEditor(DeviceEditorRoute(access = access))
+       fun openSshEditor(hostId: String) = openEditor(
+         DeviceEditorRoute(mode = DeviceEditorMode.SSH_HOST, access = AddDeviceAccess.SSH, sshHostId = hostId)
        )
+       fun editDirectProfile(profile: ServerProfile) = openEditor(
+         DeviceEditorRoute(mode = DeviceEditorMode.DIRECT_PROFILE, profileId = profile.id)
+       )
+       fun openDevice(deviceId: String) {
+         focusManager.clearFocus()
+         navigator.navigate(navigator.navigation.openDevice(deviceId))
+       }
+       fun openHarness(leafId: String) {
+         focusManager.clearFocus()
+         navigator.navigate(navigator.navigation.openHarness(leafId))
+       }
+       // A saved SSH/直连资料要从编辑页回到它自己的设备页时，先退掉编辑器再压设备层。
+       fun openDeviceFromEditor(deviceId: String) {
+         focusManager.clearFocus()
+         navigator.navigate(navigator.navigation.copy(editors = emptyList()).openDevice(deviceId))
+       }
        // A blank draft always opens immediately: connecting is the page's job, not a gate on this
        // button. The server is the only mandatory choice; its workspace is picked on the page.
        fun openDraftFor(profile: ServerProfile) {
@@ -248,7 +264,8 @@ class MainActivity : ComponentActivity() {
           route.editors.isNotEmpty() -> "设备编辑器"
           route.session == DRAFT_SESSION -> "新会话"
           route.session != null -> "会话"
-          route.device != null -> "设备详情"
+          route.harness != null -> "Harness 详情"
+           route.device != null -> "设备详情"
           route.page == RootPage.DEVICES -> "设备管理"
           route.page == RootPage.SETTINGS -> "设置"
           else -> "首页"
@@ -341,28 +358,49 @@ class MainActivity : ComponentActivity() {
                 target.editors.isNotEmpty() -> DeviceEditorScreen(
                   state = state, controller = controller, route = target.editors.last(),
                   onBack = { goBack() },
-                  onEditSsh = { hostId -> openEditor(DeviceEditorRoute(tab = AddDeviceTab.DSH, sshHostId = hostId)) },
-                  onLoginHub = { goBack(); showingRemoteEnroll = true },
-                  onManageHub = { goBack(); showingRemoteHosts = true }
+                  onOpenSshEditor = { hostId -> openSshEditor(hostId) },
+                  onLoginHub = { showingRemoteEnroll = true },
+                  onManageHub = { showingRemoteHosts = true },
+                  onDeviceSaved = { deviceId -> openDeviceFromEditor(deviceId) }
                 )
                 target.session == DRAFT_SESSION -> DraftScreen(state, controller, onBack = { goBack() }, onModal = {}, interactive = active,
                   profileIds = draftScope, onSwitchServer = { profile -> switchDraftServer(profile) })
                  target.session != null -> ChatScreen(displayed, controller, onBack = { goBack() }, onOpenChild = { child ->
                    controller.state.value.serverId?.let { server -> openSession(SessionTarget(server, child), child = true) }
                  }, onModal = {}, interactive = active)
-                 target.page == RootPage.DEVICES && target.device != null -> DeviceDetailScreen(
-                   state = state, controller = controller, deviceId = target.device, onBack = { goBack() },
-                   onEditProfile = { profile -> editDevice(profile) },
-                   onManageHub = { showingRemoteHosts = true },
-                   onManageModels = { showingModelManagement = true }
-                 )
+                  target.page == RootPage.DEVICES && target.harness != null -> HarnessDetailScreen(
+                    state = state, controller = controller, leafId = target.harness, onBack = { goBack() },
+                    onEditProfile = { profile -> editDirectProfile(profile) },
+                    onManageHub = { showingRemoteHosts = true },
+                    onManageModels = { showingModelManagement = true }
+                  )
+                  target.page == RootPage.DEVICES && target.device != null -> DeviceDetailScreen(
+                    state = state, controller = controller, deviceId = target.device, onBack = { goBack() },
+                    onOpenHarness = { leafId -> openHarness(leafId) },
+                    onAddHarness = { device, slot ->
+                      scope.launch {
+                        try { controller.attachHarness(device.id.value, slot.protocol, slot.locator) }
+                        catch (cancel: CancellationException) { throw cancel }
+                        catch (error: Exception) { globalMessage = userFacingError(error, "添加 Harness 失败"); globalMessageType = MiuixToastType.ERROR }
+                      }
+                    },
+                    onRefreshDiscovery = { deviceId ->
+                      scope.launch {
+                        try { controller.refreshDeviceDiscovery(deviceId) }
+                        catch (cancel: CancellationException) { throw cancel }
+                        catch (error: Exception) { globalMessage = userFacingError(error, "发现失败"); globalMessageType = MiuixToastType.ERROR }
+                      }
+                    },
+                    onEditSsh = { hostId -> openSshEditor(hostId) },
+                    onManageHub = { showingRemoteHosts = true },
+                    onDeleteDevice = { deviceId -> controller.deleteDevice(deviceId) }
+                  )
                  target.page == RootPage.DEVICES -> DeviceManagementScreen(
                    state = state, controller = controller, onBack = { goBack() },
                    onAddDevice = { addDevice() },
                    onEditGroup = { groupId -> editingGroupId = groupId; showingDeviceGroups = true },
-                   onOpenDevice = { id -> navigator.navigate(navigator.navigation.openDevice(id)) },
-                   onManageHub = { showingRemoteHosts = true },
-                   onManageModels = { showingModelManagement = true }
+                   onOpenDevice = { id -> openDevice(id) },
+                   onManageHub = { showingRemoteHosts = true }
                  )
                  target.page == RootPage.SETTINGS -> SettingsScreen(state, controller, themeMode, { themeMode = it; preferences.edit().putString("themeMode", it.name).apply() }, previewBack, { previewBack = it; preferences.edit().putBoolean("previewBack", it).apply() }, refreshMode, { refreshMode = it; controller.setRefreshMode(it) }, {
                    if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
@@ -493,6 +531,7 @@ class MainActivity : ComponentActivity() {
       outState.putStringArrayList(KEY_NAV_SESSIONS, ArrayList(it.sessions))
       // 设备详情与编辑器也是路由上的一层：旋转回来后仍停在同一页，不退回设备列表。
       it.device?.let { id -> outState.putString(KEY_NAV_DEVICE, id) }
+      it.harness?.let { id -> outState.putString(KEY_NAV_HARNESS, id) }
       if (it.editors.isNotEmpty()) outState.putStringArrayList(KEY_NAV_EDITORS, encodeDeviceEditors(it.editors))
     }
     outState.putString(KEY_NAV_SERVER, navigator.server)
@@ -512,6 +551,7 @@ class MainActivity : ComponentActivity() {
     const val KEY_NAV_PAGE = "navPage"
     const val KEY_NAV_SESSIONS = "navSessions"
     const val KEY_NAV_DEVICE = "navDevice"
+    const val KEY_NAV_HARNESS = "navHarness"
     const val KEY_NAV_EDITORS = "navEditors"
     const val KEY_NAV_SERVER = "navServer"
   }

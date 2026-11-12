@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -19,22 +20,21 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.igng.opencode.lagoon.core.ConnectionGraph
+import com.igng.opencode.lagoon.core.DeviceView
 import com.igng.opencode.lagoon.core.LagoonController
 import com.igng.opencode.lagoon.core.LagoonState
-import com.igng.opencode.lagoon.core.ServerKind
-import com.igng.opencode.lagoon.core.endpointSummary
 import top.yukonga.miuix.kmp.basic.Checkbox
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.basic.TextField
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 
 /**
- * Create or edit one manual device group. Devices (DSH Remote / SSH hosts) and harnesses
- * (OpenCode) are listed in separate sections but stored as ordinary profile ids.
+ * 创建或编辑一个设备组。**成员按设备选**：一台设备加进来，它上面的 Harness 就都属于这个组，
+ * 之后新加的 Harness 也会自动加入。分组只影响本机展示与首页范围，不上传、不改认证或路由。
  */
 @Composable
 internal fun DeviceGroupsSheet(
@@ -45,12 +45,21 @@ internal fun DeviceGroupsSheet(
 ) {
   val editingId = initialGroupId?.takeIf { it.isNotBlank() }.orEmpty()
   val editing = state.deviceGroups.firstOrNull { it.id == editingId }
+  val graph by controller.connectionGraph.collectAsState()
+  val devices = remember(graph, state.profiles, state.discoveryRevision) {
+    controller.deviceViews(graph, state.profiles)
+  }
   var name by rememberSaveable(initialGroupId) { mutableStateOf(editing?.name.orEmpty()) }
-  var selected by remember(initialGroupId) { mutableStateOf(editing?.memberIds?.toSet().orEmpty()) }
+  // 旧分组只有 leaf id：用"成员里有这台设备的任一 Harness"回填勾选，保存后升级为按设备。
+  var selected by remember(initialGroupId, devices) {
+    mutableStateOf(
+      editing?.deviceIds?.takeIf { it.isNotEmpty() }?.toSet()
+        ?: editing?.memberIds?.let { members ->
+          devices.filter { device -> device.harnesses.any { it.leafId?.value in members } }.map { it.id.value }.toSet()
+        }.orEmpty()
+    )
+  }
   var confirmingDelete by remember { mutableStateOf(false) }
-  val opencodeMembers = state.profiles.filter { it.kind == ServerKind.OPENCODE }
-  val dshMembers = state.profiles.filter { it.kind == ServerKind.DSH || it.kind == ServerKind.DSH_REMOTE }
-  val codexMembers = state.profiles.filter { it.kind == ServerKind.CODEX }
 
   HyperBottomSheet(
     title = if (editing != null) "编辑设备组" else "新建设备组",
@@ -64,33 +73,19 @@ internal fun DeviceGroupsSheet(
     ) {
       item {
         Text(
-          "把同一台电脑上的不同连接放进一个组。首页左上角范围面板会列出「全部设备」和这些分组；分组只影响本机展示。已禁用的成员仍保留在组里，重新启用后自动恢复。",
+          "把需要一起使用的设备放进一个组。首页范围面板会列出这些分组；分组只影响本机展示，已停用的设备仍留在组里，重新启用后自动恢复。",
           style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary)
         )
       }
       item { TextField(value = name, onValueChange = { name = it }, label = "分组名称", modifier = Modifier.fillMaxWidth()) }
-      if (opencodeMembers.isNotEmpty()) {
-        item { HyperGroupTitle("OpenCode") }
-        items(opencodeMembers, key = { "oc:${it.id}" }) { profile ->
-          MemberRow(profile.name, profile.endpointSummary + if (profile.enabled) "" else " · 已禁用", profile.id in selected, profile.kind) {
-            selected = if (profile.id in selected) selected - profile.id else selected + profile.id
-          }
-        }
+      item { HyperGroupTitle("设备") }
+      if (devices.isEmpty()) item {
+        Text("还没有设备。先添加一台设备，再把它放进分组。",
+          style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary))
       }
-      if (dshMembers.isNotEmpty()) {
-        item { HyperGroupTitle("DeepSeek Harness") }
-        items(dshMembers, key = { "dsh:${it.id}" }) { profile ->
-          MemberRow(profile.name, profile.endpointSummary + if (profile.enabled) "" else " · 已禁用", profile.id in selected, profile.kind) {
-            selected = if (profile.id in selected) selected - profile.id else selected + profile.id
-          }
-        }
-      }
-      if (codexMembers.isNotEmpty()) {
-        item { HyperGroupTitle("Codex") }
-        items(codexMembers, key = { "codex:${it.id}" }) { profile ->
-          MemberRow(profile.name, profile.endpointSummary + if (profile.enabled) "" else " · 已禁用", profile.id in selected, profile.kind) {
-            selected = if (profile.id in selected) selected - profile.id else selected + profile.id
-          }
+      items(devices, key = { "device:${it.id.value}" }) { device ->
+        DeviceMemberRow(device, device.id.value in selected) {
+          selected = if (device.id.value in selected) selected - device.id.value else selected + device.id.value
         }
       }
       item {
@@ -99,8 +94,8 @@ internal fun DeviceGroupsSheet(
           enabled = name.isNotBlank() && selected.isNotEmpty(),
           onClick = {
             val ids = selected.toList()
-            if (editing == null) controller.createDevice(name, ids)
-            else controller.updateDevice(editing.id, name, ids)
+            if (editing == null) controller.createDeviceGroup(name, ids)
+            else controller.updateDeviceGroup(editing.id, name, ids)
             onDismiss()
           },
           modifier = Modifier.fillMaxWidth()
@@ -126,7 +121,7 @@ internal fun DeviceGroupsSheet(
       Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Text("只会解除分组，不会删除设备、工作区或会话。", style = MiuixTheme.textStyles.body1)
         DialogActions("取消", { confirmingDelete = false }, "确认删除", danger = true) {
-          controller.deleteDevice(editing.id)
+          controller.deleteDeviceGroup(editing.id)
           confirmingDelete = false
           onDismiss()
         }
@@ -136,13 +131,7 @@ internal fun DeviceGroupsSheet(
 }
 
 @Composable
-private fun MemberRow(
-  name: String,
-  subtitle: String,
-  checked: Boolean,
-  kind: ServerKind,
-  onToggle: () -> Unit
-) {
+private fun DeviceMemberRow(device: DeviceView, checked: Boolean, onToggle: () -> Unit) {
   HyperCard(
     Modifier.fillMaxWidth(),
     insidePadding = PaddingValues(horizontal = 12.dp, vertical = 10.dp),
@@ -151,13 +140,12 @@ private fun MemberRow(
   ) {
     Row(verticalAlignment = Alignment.CenterVertically) {
       Checkbox(checked = checked, onCheckedChange = null)
-      Spacer(Modifier.width(8.dp))
-      HarnessBadge(kind)
-      Spacer(Modifier.width(8.dp))
+      Spacer(Modifier.width(12.dp))
       Column(Modifier.weight(1f)) {
-        Text(name, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MiuixTheme.textStyles.body1.copy(fontWeight = FontWeight.Medium))
+        Text(device.name, maxLines = 1, overflow = TextOverflow.Ellipsis,
+          style = MiuixTheme.textStyles.body1.copy(fontWeight = FontWeight.Medium))
         Text(
-          subtitle,
+          "${device.access.label} · ${device.attachedCount} 个 Harness" + if (device.effectiveEnabled) "" else " · 已停用",
           maxLines = 1,
           overflow = TextOverflow.Ellipsis,
           style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary)

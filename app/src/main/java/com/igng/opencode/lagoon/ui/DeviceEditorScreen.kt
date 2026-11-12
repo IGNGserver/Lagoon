@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
@@ -36,6 +37,7 @@ import com.igng.opencode.lagoon.core.profileCredentials
 import com.igng.opencode.lagoon.core.userFacingError
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
+import top.yukonga.miuix.kmp.basic.HorizontalDivider
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.extra.SuperDialog
 import top.yukonga.miuix.kmp.theme.MiuixTheme
@@ -43,12 +45,12 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
 /**
  * 设备整页编辑器。三层共用这一页，每一层都是 [DeviceEditorRoute]：
  *
- * - 空的 [DeviceEditorRoute]：按接入源选择 Hub / SSH，高级直连保留 harness 选择提示；
- * - 填了 `profileId`：编辑已有连接，OpenCode 直连、旧版直连 DSH、DSH 远程中枢共用同一个表单；
- * - 填了 `sshHostId`：SSH 主机表单（空串 = 新建）。
+ * - [DeviceEditorMode.ADD_DEVICE]：添加设备的唯一入口，先选「经由中枢 / 经由 SSH」；兼容直连收在高级区；
+ * - [DeviceEditorMode.SSH_HOST]：SSH 设备表单（空串 = 新建），只保存设备本身的接入配置；
+ * - [DeviceEditorMode.DIRECT_PROFILE]：兼容直连资料编辑。
  *
  * 因为它由根 `AnimatedContent` 按路由渲染，进入/退出和首页进设备页完全一样；[onBack] 只退一层，
- * 所以从添加入口打开 SSH 表单再返回，落回接入源列表而不是整个设备页。
+ * 所以从添加入口打开 SSH 表单再返回，落回添加入口而不是整个设备页。
  */
 @Composable
 internal fun DeviceEditorScreen(
@@ -56,68 +58,62 @@ internal fun DeviceEditorScreen(
   controller: LagoonController,
   route: DeviceEditorRoute,
   onBack: () -> Unit,
-  onEditSsh: (String) -> Unit,
+  onOpenSshEditor: (String) -> Unit,
   onLoginHub: () -> Unit,
-  onManageHub: () -> Unit
+  onManageHub: () -> Unit,
+  onDeviceSaved: (String) -> Unit
 ) {
-  val sshHostId = route.sshHostId
-  val profileId = route.profileId
-  when {
-    sshHostId != null -> SshHostPage(
+  when (route.mode) {
+    DeviceEditorMode.SSH_HOST -> SshHostPage(
       state = state,
       controller = controller,
-      initial = sshHostId.takeIf(String::isNotBlank)?.let { id -> state.sshHosts.firstOrNull { it.id == id } },
-      creating = sshHostId.isBlank(),
-      onBack = onBack
-    )
-    profileId != null -> {
-      val existing = state.profiles.firstOrNull { it.id == profileId }
-      // 设备在别处被删除：这一层已无内容，退回上一层，而不是留一张空白页在栈上。
-      if (existing == null) LaunchedEffect(profileId) { onBack() }
-      else if (existing.kind == ServerKind.CODEX) Column(Modifier.fillMaxSize().background(HyperTheme.colors.canvas)) {
-        PageTopBar(title = "Codex 连接", onBack = onBack)
-        Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-          Text("${existing.name} · Codex", style = MiuixTheme.textStyles.body1)
-          Text("通过所属接入源管理此连接和主机配置。", style = MiuixTheme.textStyles.footnote2)
-          HyperButton(text = if (existing.sshHostId != null) "管理 SSH 主机" else "管理远程中枢",
-            onClick = { existing.sshHostId?.let(onEditSsh) ?: onManageHub() })
-        }
-      } else ProfileEditorPage(
-        state = state,
-        controller = controller,
-        existing = existing,
-        onBack = onBack,
-        onManageHub = onManageHub
-      )
-    }
-    else -> AddDevicePage(
-      state = state,
-      controller = controller,
-      initialTab = route.tab,
+      initial = route.sshHostId?.takeIf(String::isNotBlank)?.let { id -> state.sshHosts.firstOrNull { it.id == id } },
+      creating = route.sshHostId.isNullOrBlank(),
       onBack = onBack,
-      onEditSsh = onEditSsh,
+      onSaved = { hostId ->
+        val deviceId = controller.deviceIdOfSshHost(hostId)
+        if (deviceId != null) onDeviceSaved(deviceId) else onBack()
+      }
+    )
+    DeviceEditorMode.DIRECT_PROFILE -> {
+      val existing = state.profiles.firstOrNull { it.id == route.profileId }
+      if (existing == null) LaunchedEffect(route.profileId) { onBack() }
+      else DirectProfilePage(state, controller, existing, onBack, onManageHub)
+    }
+    DeviceEditorMode.ADD_DEVICE -> AddDevicePage(
+      state = state,
+      controller = controller,
+      onBack = onBack,
+      onOpenSshEditor = onOpenSshEditor,
       onLoginHub = onLoginHub,
-      onManageHub = onManageHub
+      onManageHub = onManageHub,
+      onDeviceSaved = onDeviceSaved
     )
   }
 }
 
-/** 添加入口：先选择共用接入源；兼容 HTTP 直连表单明确放在高级区。 */
+/**
+ * 添加设备：只有接入分支不同，产物都是同一台设备。
+ *
+ * 中枢分支复用账号登录与主机勾选（选完即成为设备，不默认启用任何 Harness）；SSH 分支只收地址与凭据，
+ * 保存后同样是一台设备。Harness 的选择统一放在设备页，因此这里没有 Harness 开关。
+ */
 @Composable
 private fun AddDevicePage(
   state: LagoonState,
   controller: LagoonController,
-  initialTab: AddDeviceTab,
   onBack: () -> Unit,
-  onEditSsh: (String) -> Unit,
+  onOpenSshEditor: (String) -> Unit,
   onLoginHub: () -> Unit,
-  onManageHub: () -> Unit
+  onManageHub: () -> Unit,
+  onDeviceSaved: (String) -> Unit
 ) {
-  val scope = rememberCoroutineScope()
-  // The serialized tab remains a compatibility hint for the advanced form, not a source filter.
-  var tab by rememberSaveable { mutableStateOf(initialTab) }
   var showAdvanced by rememberSaveable { mutableStateOf(false) }
-  val catalog = controller.activeRemoteCatalog()
+  var directKind by rememberSaveable { mutableStateOf(ServerKind.OPENCODE) }
+  val scope = rememberCoroutineScope()
+  // 登录/接入会改写连接图；跟着它重组，目录和"已保存的 SSH 设备"才会即时更新。
+  val graph by controller.connectionGraph.collectAsState()
+  val catalog = remember(graph) { controller.activeRemoteCatalog() }
   val directFormHeight = (LocalConfiguration.current.screenHeightDp * 0.8f).dp.coerceAtLeast(480.dp)
 
   Column(Modifier.fillMaxSize().background(HyperTheme.colors.canvas)) {
@@ -129,66 +125,59 @@ private fun AddDevicePage(
     ) {
       item {
         Text(
-          "先选择接入源，再从主机中选择 Harness。Remote Hub 与 SSH 不按 OpenCode / DSH 分开配置；发现服务不会启动或终止进程。",
+          "两种接入方式产出的都是同一种设备。设备出现在列表里之后，再逐个启用它上面的 Harness；未启用的 Harness 不占用连接与流量。",
           style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary)
         )
       }
       item {
-        HyperGroupTitle("Remote Hub · 远程中枢")
+        HyperGroupTitle("经由中枢")
         HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(vertical = 4.dp)) {
           HyperRow(
             title = catalog?.account ?: "登录 Remote Hub",
-            summary = if (catalog == null) "登录后逐个选择主机；DSH 可通过 Hub 接入，OpenCode 需 Host 升级并显式启用原生服务"
-              else "${catalog.origin} · ${catalog.hosts.size} 台可接入主机 · DSH；OpenCode 需 Host 升级并显式启用",
+            summary = when {
+              catalog == null -> "登录后勾选要接入的开发机并核对指纹；不会自动启用 Harness"
+              catalog.signedOut -> "${catalog.origin} · 已退出登录，请重新登录后再接入主机"
+              else -> "${catalog.origin} · ${catalog.hosts.size} 台可接入主机"
+            },
             showChevron = true,
-            onClick = if (catalog == null) onLoginHub else onManageHub
+            onClick = onLoginHub
+          )
+          HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
+          HyperRow(
+            title = "选择要接入的主机",
+            summary = "已登录的账号可以直接勾选主机；接入后不会默认启用 DSH",
+            showChevron = true,
+            onClick = onManageHub
           )
         }
       }
       item {
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-          HyperButton(
-            text = if (catalog == null) "登录并选择主机" else "接入更多主机",
-            onClick = onLoginHub,
-            modifier = Modifier.weight(1f)
-          )
-          HyperButton(
-            text = "管理中枢",
-            variant = HyperButtonVariant.SECONDARY,
-            onClick = onManageHub,
-            modifier = Modifier.weight(1f)
-          )
-        }
-      }
-      item {
-        HyperGroupTitle("SSH · 主机接入源")
+        HyperGroupTitle("经由 SSH")
         HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(vertical = 4.dp)) {
           HyperRow(
-            title = "添加 SSH 主机",
-            summary = "一份 SSH 配置可接入多个原生 Harness；只读发现后逐个选择",
+            title = "添加 SSH 设备",
+            summary = "地址、用户名与凭据；保存后刷新发现，逐个启用 Harness",
             showChevron = true,
-            onClick = { onEditSsh("") }
+            onClick = { onOpenSshEditor("") }
           )
         }
         Text(
-          "DSH SSH 目前由 WebHost 管理，不支持附着正在运行的 Desktop 进程；OpenCode 只附着已运行的官方服务。",
+          "SSH 表单不会预选 Harness，也不会在保存时连接或启动远端服务。",
           Modifier.padding(horizontal = 6.dp, vertical = 8.dp),
           style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary)
         )
       }
-      if (state.sshHosts.isNotEmpty()) item { HyperGroupTitle("已保存的 SSH 主机") }
+      if (state.sshHosts.isNotEmpty()) item {
+        HyperGroupTitle("已保存的 SSH 设备")
+      }
       items(state.sshHosts, key = { "ssh:${it.id}" }) { host ->
-        val profiles = state.profiles.filter { it.sshHostId == host.id }
-        val online = profiles.count { profile ->
-          profile.effectiveEnabled && if (profile.id == state.serverId) state.connected
-            else state.allServerSnapshots[profile.id]?.connected == true
-        }
+        val deviceId = controller.deviceIdOfSshHost(host.id)
         HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(vertical = 4.dp)) {
           HyperRow(
             title = host.name,
-            summary = "${host.address} · ${profiles.size} 个 Harness · $online 个在线",
+            summary = "${host.address} · 打开设备页选择 Harness",
             showChevron = true,
-            onClick = { onEditSsh(host.id) }
+            onClick = { if (deviceId != null) onDeviceSaved(deviceId) else onOpenSshEditor(host.id) }
           )
         }
       }
@@ -196,7 +185,7 @@ private fun AddDevicePage(
         HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(vertical = 4.dp)) {
           HyperActionRow(
             title = "高级 · 兼容 HTTP 直连",
-            summary = "已知服务地址或配对链接时使用，不经过 Hub 或 SSH 发现",
+            summary = "已知服务地址或配对链接时使用，不经过中枢或 SSH 发现",
             trailing = { ExpandChevron(showAdvanced) },
             onClick = { showAdvanced = !showAdvanced }
           )
@@ -205,39 +194,25 @@ private fun AddDevicePage(
       if (showAdvanced) {
         item {
           HyperSegmentedTabs(
-            tabs = AddDeviceTab.entries.map { "${it.label} 直连" },
-            selectedIndex = AddDeviceTab.entries.indexOf(tab),
-            onTabSelected = { tab = AddDeviceTab.entries[it] }
+            tabs = listOf("OpenCode 直连", "DSH 直连（旧）"),
+            selectedIndex = if (directKind == ServerKind.OPENCODE) 0 else 1,
+            onTabSelected = { directKind = if (it == 0) ServerKind.OPENCODE else ServerKind.DSH }
           )
         }
         item {
           // MiuixServerForm owns a scrolling list; give it a bounded viewport inside this section.
           Box(Modifier.fillMaxWidth().height(directFormHeight)) {
-            key(tab) {
+            key(directKind) {
               MiuixServerForm(
                 existing = null,
-                fixedKind = if (tab == AddDeviceTab.OPENCODE) ServerKind.OPENCODE else ServerKind.DSH,
+                fixedKind = directKind,
                 onCancel = onBack,
                 onDelete = null,
                 onSave = { profile, password, done ->
                   scope.launch {
-                    try {
-                      val pair = PairLinkResolver.isPairLink(profile.url)
-                      val resolved = if (pair) PairLinkResolver.resolve(profile.url) else null
-                      val actual = if (resolved == null) profile
-                      else profile.copy(url = resolved.serverUrl, username = resolved.credentials.username)
-                      val credentials = resolved?.credentials ?: profileCredentials(
-                        null, actual.url, controller.credentials(profile.id), actual.username, password
-                      )
-                      var minted: String? = null
-                      controller.testServer(actual, credentials) { minted = it }
-                      controller.saveServer(actual, credentials.password, minted ?: credentials.cookie, credentials.username)
-                      done("已连接 ${actual.kind.label} 直连")
-                      onBack()
-                    } catch (cancel: CancellationException) {
-                      throw cancel
-                    } catch (error: Exception) {
-                      done(userFacingError(error, "连接失败"))
+                    saveDirectProfile(controller, profile, password, done) { saved ->
+                      val deviceId = controller.deviceOfLeaf(saved.id)
+                      if (deviceId != null) onDeviceSaved(deviceId) else onBack()
                     }
                   }
                 }
@@ -250,12 +225,40 @@ private fun AddDevicePage(
   }
 }
 
+/** 兼容直连资料：一保存就是一台 1:1 的设备，直接进它的设备页。 */
+private suspend fun saveDirectProfile(
+  controller: LagoonController,
+  profile: ServerProfile,
+  password: String?,
+  done: (String) -> Unit,
+  onSaved: (ServerProfile) -> Unit
+) {
+  try {
+      val pair = PairLinkResolver.isPairLink(profile.url)
+      val resolved = if (pair) PairLinkResolver.resolve(profile.url) else null
+      val actual = if (resolved == null) profile
+      else profile.copy(url = resolved.serverUrl, username = resolved.credentials.username)
+      val credentials = resolved?.credentials ?: profileCredentials(
+        null, actual.url, controller.credentials(profile.id), actual.username, password
+      )
+      var minted: String? = null
+      controller.testServer(actual, credentials) { minted = it }
+      controller.saveServer(actual, credentials.password, minted ?: credentials.cookie, credentials.username)
+      val saved = controller.state.value.profiles.firstOrNull { it.id == actual.id } ?: actual
+      done("已添加 ${actual.kind.label} 直连设备")
+      onSaved(saved)
+    } catch (cancel: CancellationException) {
+      throw cancel
+    } catch (error: Exception) {
+    done(userFacingError(error, "连接失败"))
+  }
+}
+
 /**
- * 编辑一条已有连接。无论 OpenCode 直连、旧版直连 DSH 还是 DSH 远程中枢都用这一个表单：
- * 以前远程中枢走的是半屏抽屉、OpenCode 走的是整页，同一件事有两种动效。
+ * 编辑一条兼容直连资料。中枢与 SSH 设备的接入配置在设备页里改，这里只剩历史直连资料。
  */
 @Composable
-private fun ProfileEditorPage(
+private fun DirectProfilePage(
   state: LagoonState,
   controller: LagoonController,
   existing: ServerProfile,
@@ -272,7 +275,7 @@ private fun ProfileEditorPage(
     ServerKind.DSH_REMOTE -> "DSH 远程主机详情"
     ServerKind.OPENCODE -> "编辑 OpenCode 直连"
     ServerKind.CODEX -> "Codex 连接详情"
-    ServerKind.DSH -> if (existing.sshHostId != null) "编辑 SSH 直连设备" else "编辑 DeepSeek Harness"
+    ServerKind.DSH -> "编辑 DeepSeek Harness"
   }
 
   Column(Modifier.fillMaxSize().background(HyperTheme.colors.canvas)) {
@@ -296,41 +299,32 @@ private fun ProfileEditorPage(
               val pair = PairLinkResolver.isPairLink(profile.url)
               val resolved = if (pair) PairLinkResolver.resolve(profile.url) else null
               val actualProfile = if (resolved == null) profile else profile.copy(url = resolved.serverUrl, username = resolved.credentials.username)
-              val savedUrl = state.profiles.firstOrNull { it.id == profile.id }?.url
               val previous = state.profiles.firstOrNull { it.id == profile.id }
-              val credentials = if (actualProfile.kind == ServerKind.DSH_REMOTE) {
-                ServerCredentials(actualProfile.username)
-              } else resolved?.credentials ?: profileCredentials(
-                savedUrl, actualProfile.url, controller.credentials(profile.id), actualProfile.username, password,
-                // DSH 填了新令牌/密钥或换了认证方式：丢掉旧 Cookie，让这次测试真正验证新凭据。
-                cookie = "".takeIf { actualProfile.kind == ServerKind.DSH && (password != null || previous?.dshAuth != actualProfile.dshAuth) }
-              )
+              val credentials = when {
+                resolved != null -> resolved.credentials
+                actualProfile.kind == ServerKind.DSH_REMOTE -> ServerCredentials(actualProfile.username)
+                else -> profileCredentials(
+                  state.profiles.firstOrNull { it.id == profile.id }?.url, actualProfile.url,
+                  controller.credentials(profile.id), actualProfile.username, password,
+                  cookie = "".takeIf { actualProfile.kind == ServerKind.DSH && (password != null || previous?.dshAuth != actualProfile.dshAuth) }
+                )
+              }
               if (actualProfile.kind == ServerKind.DSH_REMOTE && previous?.enabled != false) {
                 val hostId = actualProfile.remoteHostId ?: error("请先选择 DSH Host")
                 val fingerprint = actualProfile.remoteHostFingerprint ?: error("请先确认 Host 指纹")
                 controller.confirmRemoteHost(actualProfile, actualProfile.username, hostId, fingerprint)
               }
-              val label = when (actualProfile.kind) {
-                ServerKind.OPENCODE -> "OpenCode 直连"
-                ServerKind.CODEX -> "Codex"
-                ServerKind.DSH_REMOTE -> "DSH 远程中枢"
-                ServerKind.DSH -> if (actualProfile.sshHostId != null) "DSH SSH 直连" else "DeepSeek Harness"
-              }
               if (previous?.enabled == false) {
-                // A disabled connection must not be dialled just because the user edited it. Save the
-                // new settings without testing; enabling it later performs the first connection.
                 controller.saveServer(actualProfile, credentials.password, null, credentials.username, connect = false)
-                done("已保存 $label（连接已禁用，未连接）")
+                done("已保存（连接已禁用，未连接）")
                 onBack()
                 return@launch
               }
               if (previous != null && actualProfile.kind == ServerKind.DSH && actualProfile.sshHostId == null &&
-                (!ConnectionRouteAdmission.sameLeafRoute(previous, actualProfile) || controller.credentials(profile.id) != credentials)) {
-                // This action is explicitly Save. Commit the changed route first so the owner can
-                // retire its old mux before constructing a replacement; a diagnostic alone cannot
-                // safely probe a competing API-peer cookie beside the live monitor.
+                (!ConnectionRouteAdmission.sameLeafRoute(previous, actualProfile) || controller.credentials(profile.id) != credentials)
+              ) {
                 controller.saveServer(actualProfile, credentials.password, credentials.cookie, credentials.username, connect = true)
-                done("已保存 $label，正在使用新配置重新连接；原连接不会被并行测试")
+                done("已保存，正在使用新配置重新连接；原连接不会被并行测试")
                 onBack()
                 return@launch
               }
@@ -338,7 +332,7 @@ private fun ProfileEditorPage(
               val version = controller.testServer(actualProfile, credentials) { minted = it }
               controller.saveServer(actualProfile, credentials.password, minted ?: credentials.cookie, credentials.username)
               val detail = if (version.isBlank() || version.equals(actualProfile.kind.label, ignoreCase = true) || version == "DeepSeek Harness") "" else " $version"
-              done("已连接 $label$detail")
+              done("已保存${detail}")
               onBack()
             } catch (cancel: CancellationException) {
               throw cancel
@@ -369,24 +363,25 @@ private fun ProfileEditorPage(
   if (remoteProvider) RemoteProviderDialog(existing, controller) { remoteProvider = false }
 }
 
-/** SSH 主机表单：从设备详情进来只有这一层，从添加入口进来是第二层，返回都只退一层。 */
+/** SSH 设备表单：从设备页进来只有这一层，从添加入口进来是第二层，返回都只退一层。 */
 @Composable
 private fun SshHostPage(
   state: LagoonState,
   controller: LagoonController,
   initial: SshHostConfig?,
   creating: Boolean,
-  onBack: () -> Unit
+  onBack: () -> Unit,
+  onSaved: (String) -> Unit
 ) {
   Column(Modifier.fillMaxSize().background(HyperTheme.colors.canvas)) {
-    PageTopBar(title = if (creating) "添加 SSH 主机" else "编辑 SSH 主机", onBack = onBack)
+    PageTopBar(title = if (creating) "添加 SSH 设备" else "编辑 SSH 设备", onBack = onBack)
     Box(Modifier.weight(1f).fillMaxWidth()) {
       SshHostForm(
         initial = initial,
         state = state,
         controller = controller,
         onCancel = onBack,
-        onSaved = onBack
+        onSaved = onSaved
       )
     }
   }
