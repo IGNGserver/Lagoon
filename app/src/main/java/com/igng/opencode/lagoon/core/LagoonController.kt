@@ -144,6 +144,12 @@ class LagoonController private constructor(private val appContext: Context) {
   val connectionGraph: StateFlow<ConnectionGraph?> = connectionGraphMutable
   private var connectionGraphWritable = false
 
+  /**
+   * 只读访问当前连接图。反射构造的测试夹具不会初始化这个字段，因此这里不用裸字段访问；
+   * 生产环境下与 `connectionGraphMutable.value` 等价。
+   */
+  private fun currentGraphOrNull(): ConnectionGraph? = runCatching { connectionGraphMutable.value }.getOrNull()
+
   /** Effective enabled state for one graph leaf, including source and host parents. */
   data class GraphEnabledProjection(
     val sourceId: String,
@@ -155,11 +161,11 @@ class LagoonController private constructor(private val appContext: Context) {
     val effectiveEnabled: Boolean
   )
 
-  fun graphBinding(bindingId: String): HarnessBinding? = connectionGraphMutable.value?.bindings?.firstOrNull { it.id == bindingId }
+  fun graphBinding(bindingId: String): HarnessBinding? = currentGraphOrNull()?.bindings?.firstOrNull { it.id == bindingId }
   fun graphEffectiveEnabled(bindingId: String): Boolean =
     store.profiles().firstOrNull { it.id == bindingId }?.effectiveEnabled ?: false
   fun graphEnabledProjection(bindingId: String): GraphEnabledProjection? {
-    val graph = connectionGraphMutable.value ?: return null
+    val graph = currentGraphOrNull() ?: return null
     val binding = graph.bindings.firstOrNull { it.id == bindingId } ?: return null
     val host = graph.hosts.firstOrNull { it.id == binding.hostBindingId } ?: return null
     val source = graph.sources.firstOrNull { it.id == host.sourceId } ?: return null
@@ -210,7 +216,7 @@ class LagoonController private constructor(private val appContext: Context) {
    * 设备身份，或至少有一条 leaf。目录里出现但从未采纳的主机不在这里。
    */
   fun adoptedDeviceIds(): Set<String> {
-    val graph = connectionGraphMutable.value ?: return emptySet()
+    val graph = currentGraphOrNull() ?: return emptySet()
     val attachedHosts = graph.bindings.mapTo(HashSet()) { it.hostBindingId }
     val sources = graph.sources.associateBy { it.id }
     return graph.hosts.mapNotNullTo(LinkedHashSet()) { host ->
@@ -255,11 +261,11 @@ class LagoonController private constructor(private val appContext: Context) {
 
   /** leaf 所属的设备；用于从通知/深链解析到设备页。 */
   fun deviceOfLeaf(leafId: String): String? =
-    connectionGraphMutable.value?.bindings?.firstOrNull { it.id == leafId }?.hostBindingId
+    currentGraphOrNull()?.bindings?.firstOrNull { it.id == leafId }?.hostBindingId
 
   /** SSH 配置对应的设备；保存 SSH 表单后据此直接进入设备页。 */
   fun deviceIdOfSshHost(sshHostId: String): String? {
-    val graph = connectionGraphMutable.value ?: return null
+    val graph = currentGraphOrNull() ?: return null
     val sourceId = MigrationProjection.sshSourceId(sshHostId)
     return graph.hosts.firstOrNull { it.sourceId == sourceId }?.id
       ?: MigrationProjection.hostId(sourceId, sshHostId)
@@ -271,7 +277,7 @@ class LagoonController private constructor(private val appContext: Context) {
    * 中枢读 Host 的服务目录；SSH 跑只读探测（注册文件/命令），不安装、不启动、不终止任何远端进程。
    */
   suspend fun refreshDeviceDiscovery(deviceId: String) {
-    val graph = connectionGraphMutable.value ?: error("连接图暂不可用，请重试")
+    val graph = currentGraphOrNull() ?: error("连接图暂不可用，请重试")
     val host = graph.hosts.firstOrNull { it.id == deviceId } ?: error("设备已移除")
     val source = graph.sources.firstOrNull { it.id == host.sourceId } ?: error("接入源已移除")
     check(host.enabled) { "此设备已停用：先启用再发现" }
@@ -358,7 +364,7 @@ class LagoonController private constructor(private val appContext: Context) {
    * 同槽位已存在时复用原 leaf（幂等），不会产生第二条记录。
    */
   suspend fun attachHarness(deviceId: String, protocol: HarnessProtocolId, locator: String?) {
-    val graph = connectionGraphMutable.value ?: error("连接图暂不可用，请重试")
+    val graph = currentGraphOrNull() ?: error("连接图暂不可用，请重试")
     val host = graph.hosts.firstOrNull { it.id == deviceId } ?: error("设备已移除")
     val source = graph.sources.firstOrNull { it.id == host.sourceId } ?: error("接入源已移除")
     check(host.enabled && source.enabled) { "设备或接入源已停用，先启用再添加 Harness" }
@@ -406,7 +412,7 @@ class LagoonController private constructor(private val appContext: Context) {
    * 只影响本机记录；远端进程、文件与会话不动。
    */
   fun deleteDevice(deviceId: String) {
-    val graph = connectionGraphMutable.value ?: return
+    val graph = currentGraphOrNull() ?: return
     val host = graph.hosts.firstOrNull { it.id == deviceId } ?: return
     val source = graph.sources.firstOrNull { it.id == host.sourceId } ?: return
     graph.bindings.filter { it.hostBindingId == host.id }.forEach { deleteServer(it.id) }
@@ -508,7 +514,7 @@ class LagoonController private constructor(private val appContext: Context) {
    * switches and discovery evidence survive the projection.
    */
   private fun projectedConnectionGraph(profiles: List<ServerProfile>, groups: List<DeviceGroup>): ConnectionGraph {
-    val existing = connectionGraphMutable.value
+    val existing = currentGraphOrNull()
     val selectedSlots = existing?.bindings.orEmpty().mapNotNull { binding ->
       binding.credentials.remoteIdentity?.selected?.key?.let { binding.id to it }
     }.toMap()
@@ -1767,7 +1773,10 @@ class LagoonController private constructor(private val appContext: Context) {
   /** Persists a device-group edit and publishes it without touching any server connection. */
   private fun saveDeviceGroups(groups: List<DeviceGroup>, selected: String?) {
     val expanded = groups.map(::expandGroupMembers)
-    val clean = DeviceGroupState(expanded, selected).sanitized(store.profiles().map { it.id }.toSet())
+    val clean = DeviceGroupState(expanded, selected).sanitized(
+      store.profiles().map { it.id }.toSet(),
+      currentGraphOrNull()?.hosts?.map { it.id }?.toSet().orEmpty()
+    )
     try {
       deviceGroupStore.save(clean)
     } catch (cancel: CancellationException) {
@@ -1799,7 +1808,7 @@ class LagoonController private constructor(private val appContext: Context) {
   /** 分组按设备选：成员一旦随设备走，之后新加的 Harness 会自动进入组。 */
   private fun expandGroupMembers(group: DeviceGroup): DeviceGroup {
     if (group.deviceIds.isEmpty()) return group
-    val graph = connectionGraphMutable.value ?: return group
+    val graph = currentGraphOrNull() ?: return group
     val leaves = group.deviceIds.flatMap { deviceId ->
       graph.bindings.filter { it.hostBindingId == deviceId }.map { it.id }
     }.distinct()
@@ -1812,14 +1821,17 @@ class LagoonController private constructor(private val appContext: Context) {
     if (groups.none { it.deviceIds.isNotEmpty() }) return
     val expanded = groups.map(::expandGroupMembers)
     if (expanded == groups) return
-    val clean = DeviceGroupState(expanded, state.value.homeGroupId).sanitized(store.profiles().map { it.id }.toSet())
+    val clean = DeviceGroupState(expanded, state.value.homeGroupId).sanitized(
+      store.profiles().map { it.id }.toSet(),
+      currentGraphOrNull()?.hosts?.map { it.id }?.toSet().orEmpty()
+    )
     runCatching { deviceGroupStore.save(clean) }
       .onFailure { Diagnostics.warn("LagoonController", "设备分组成员同步失败", it) }
     updateState { it.copy(deviceGroups = clean.groups, homeGroupId = clean.selectedGroupId) }
   }
 
   fun createDeviceGroup(name: String, deviceIds: List<String>): String {
-    val graph = connectionGraphMutable.value
+    val graph = currentGraphOrNull()
     val valid = deviceIds.filter { id -> graph?.hosts?.any { it.id == id } == true }.distinct()
     val label = name.trim().take(128)
     if (label.isBlank() || valid.isEmpty()) return ""
@@ -1833,7 +1845,7 @@ class LagoonController private constructor(private val appContext: Context) {
   }
 
   fun updateDeviceGroup(id: String, name: String, deviceIds: List<String>) {
-    val graph = connectionGraphMutable.value
+    val graph = currentGraphOrNull()
     val label = name.trim().take(128)
     val valid = deviceIds.filter { deviceId -> graph?.hosts?.any { it.id == deviceId } == true }.distinct()
     if (label.isBlank() || valid.isEmpty() || state.value.deviceGroups.none { it.id == id }) return

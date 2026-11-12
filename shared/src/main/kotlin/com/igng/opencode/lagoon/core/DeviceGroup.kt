@@ -72,25 +72,34 @@ data class DeviceGroupState(
   /** First containing group in save order; a profile may also belong to later groups. */
   fun groupOf(profileId: String): DeviceGroup? = groups.firstOrNull { profileId in it.memberIds }
 
-  /** Removes duplicate/unknown members within each group, empty groups and duplicate group ids. */
-  fun sanitized(profileIds: Set<String>): DeviceGroupState {
+  /**
+   * Removes duplicate/unknown members within each group, empty groups and duplicate group ids.
+   * A device-based group survives even when the device currently has no Harness attached — that is
+   * a legal state (`docs/DEVICE_MODEL.md` §5), not an empty group.
+   */
+  fun sanitized(profileIds: Set<String>, deviceIds: Set<String> = emptySet()): DeviceGroupState {
     val seenGroups = HashSet<String>()
     val clean = ArrayList<DeviceGroup>(groups.size)
     for (group in groups) {
       if (group.id.isBlank() || group.id.length > 128 || group.name.isBlank() || !seenGroups.add(group.id)) continue
       val members = group.memberIds.filter { it in profileIds }.distinct()
-      if (members.isEmpty()) continue
-      clean += group.copy(name = group.name.trim().take(128), memberIds = members)
+      val devices = group.deviceIds.filter { it in deviceIds }.distinct()
+      if (members.isEmpty() && devices.isEmpty()) continue
+      clean += group.copy(name = group.name.trim().take(128), memberIds = members, deviceIds = devices)
     }
     val selected = selectedGroupId?.takeIf { id -> clean.any { it.id == id } }
     return DeviceGroupState(clean, selected)
   }
 
-  /** All groups still containing this profile after removal. Empty groups are dropped. */
+  /**
+   * All groups still containing this profile after removal. An empty leaf list only drops the group
+   * when it is not attached to devices; removing the last Harness must not delete a device group.
+   */
   fun withoutProfile(profileId: String): DeviceGroupState = copy(
     groups = groups.mapNotNull { group ->
       if (profileId !in group.memberIds) group
-      else group.copy(memberIds = group.memberIds.filterNot { it == profileId }).takeIf { it.memberIds.isNotEmpty() }
+      else group.copy(memberIds = group.memberIds.filterNot { it == profileId })
+        .takeIf { it.memberIds.isNotEmpty() || it.deviceIds.isNotEmpty() }
     }
   ).let { next ->
     next.copy(selectedGroupId = next.selectedGroupId?.takeIf { id -> next.groups.any { it.id == id } })

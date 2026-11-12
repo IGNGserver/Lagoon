@@ -34,6 +34,23 @@ class DeviceGroupTest {
     assertTrue(decoded.groups.single().deviceIds.isEmpty())
   }
 
+  @Test fun aDeviceGroupSurvivesWhileItsDeviceHasNoAttachedHarness() {
+    val group = DeviceGroup("g1", "Just adopted", memberIds = emptyList(), deviceIds = listOf("host-1"))
+    val state = DeviceGroupState(listOf(group), "g1")
+
+    val clean = state.sanitized(profileIds = emptySet(), deviceIds = setOf("host-1"))
+    assertEquals(listOf("g1"), clean.groups.map { it.id })
+    assertEquals(listOf("host-1"), clean.groups.single().deviceIds)
+    assertEquals("g1", clean.selectedGroupId)
+
+    // 删除这台设备上最后一条 Harness 时，分组本身不能跟着被删掉。
+    val withoutLastLeaf = DeviceGroupState(
+      listOf(group.copy(memberIds = listOf("leaf-1"))), "g1"
+    ).withoutProfile("leaf-1")
+    assertEquals(listOf("g1"), withoutLastLeaf.groups.map { it.id })
+    assertTrue(withoutLastLeaf.groups.single().memberIds.isEmpty())
+  }
+
   @Test fun corruptCodecFailsWithoutThrowingJson() {
     try {
       DeviceGroupCodec.decode("{not-json")
