@@ -9,15 +9,15 @@ AI 工具的可引用入口。站点源码位于产品仓库的 `website/`：
 
 | 事项 | 归属 |
 | --- | --- |
-| 产品功能、版本、发布资产、产品文档 | 产品仓库 `IGNGserver/opencode-lagoon`（`website/` 之外） |
-| 页面、样式、静态资源、SEO、站点文案 | `IGNGserver/opencode-lagoon/website/` |
+| 产品功能、版本、发布资产、产品文档 | 产品仓库 `IGNGserver/Lagoon`（`website/` 之外） |
+| 页面、样式、静态资源、SEO、站点文案 | `IGNGserver/Lagoon/website/` |
 
-## 当前状态（2026-10-25）
+## 当前状态（2026-11-12）
 
 - 单页官网 `website/site/index.html` + `website/site/404.html`，桌面与移动端经浏览器实测；
 - 已部署到 Cloudflare Pages，正式地址 `https://lagoon.igng.net`（默认别名 `https://lagoon-website.pages.dev`）；
-- `.github/workflows/website.yml` 在 `main` 和正式发版后自动构建并部署；当前线上版本来自
-  0.2.4 稳定版 / 0.3.0-rc.10 预览版；
+- `.github/workflows/website.yml` 在 `main` 和每次发版后自动构建并部署；线上版本跟着 Releases 自动变，
+  本节不记死版本号（2026-11-12 核对时为 5.2.0 正式版 / 5.3.0-rc.2 预览版）；
 - 旧的独立仓库 `IGNGserver/lagoon-website` 已归档，代码与历史以产品仓库为准。
 
 ## 已定案的决策
@@ -50,33 +50,54 @@ AI 工具的可引用入口。站点源码位于产品仓库的 `website/`：
 | 连接 `#connect` | 直连、Keystore、断线对账、明文授权 | SVG 节点图：正式版点按切换当前服务器；预览版全部保持连接、点按模拟断线重连 |
 | 会话 `#session` | 下达任务、操作轨迹、授权、运行中引导、子会话 | 滚动叙事：左侧步骤驱动吸顶手机里的聊天界面 |
 | 实时更新 `#live` | Android 16 Live Updates 与旧系统回退 | 模拟器：增减任务，标题 / 胶囊 / 分段轨道 / 阶段按 App 规则实时变化 |
-| 能力 `#depths` | 正式版 v0.2.4 的能力卡片 | 玻璃卡片镜面高光 |
+| 能力 `#depths` | 正式版当前版本的能力卡片 | 玻璃卡片镜面高光 |
 | 航道图 `#roadmap` | 正式版 / 预发布版 / 规划方向 + 验收边界 | — |
 | 下载 `#download` | 下载卡、三步上手、FAQ | 复制 `opencode pair` |
 
-模拟器的文案与阶段规则镜像产品源码 `core/TaskSummary.kt`、`core/LiveUpdateContent.kt`（v0.2.4），改动时先核对源码。
+模拟器的文案与阶段规则镜像产品源码 `core/TaskSummary.kt`、`core/LiveUpdateContent.kt`，
+最近一次对齐是 0.2.4，改动时先核对源码。
 
 ## 内容原则
 
 - 只陈述产品仓库当前支持的事实，不编造路线图；版本与平台矩阵以产品仓库 `README.md` 与 Releases 为准；
 - 下载链接指向产品仓库 Releases 的稳定直链（安装包命名 `Lagoon-<version>.apk`），不在本仓库托管安装包；
 - 产品处于快速迭代期，`Latest` 只认正式版；引用版本时明确区分正式版与 pre-release；
-- 预发布版独有的能力（如 v0.2.5-rc 的“全部服务器”模式、手机端授权开关）只能出现在标注为预览的位置；
+- 预发布版独有的能力（如“全部服务器”模式、手机端授权开关）只能出现在标注为预览的位置；
 - 规划方向只写产品仓库明示的内容（目前仅“适配更多 harness”），不写时间承诺；
 - 界面图均为依据实际布局的 HTML 重绘，演示数据不得冒充真实用户数据，并保留“界面示意”标注；
 - 文案与产品仓库命名保持一致：显示名 `Lagoon`，应用标识 `com.igng.opencode.lagoon`，深链接 `lagoon://`。
 
+## 版本注入约定
+
+`website/site/index.html` 不写具体版本，只写 `__TOKEN__` 占位符；`website/scripts/build-site.mjs`
+在部署前把它们换成当前值：
+
+| 占位符 | 值 |
+| --- | --- |
+| `__REPO_URL__` | 产品仓库地址（`https://github.com/IGNGserver/Lagoon`） |
+| `__STABLE_VERSION__` / `__STABLE_DATE__` | 最新正式版的版本号（不带 `v`）/ 发布日期 |
+| `__STABLE_APK__` / `__STABLE_APK_URL__` | 安装包文件名（`Lagoon-<version>.apk`）/ 下载直链 |
+| `__STABLE_SIZE__` / `__STABLE_SIZE_SHORT__` | 安装包大小（`6.7 MB`）/ 取整（`7 MB`） |
+| `__PREVIEW_VERSION__` / `__PREVIEW_DATE__` / `__PREVIEW_SERIES__` | 最新预览版的版本号 / 日期 / 系列（如 `5.3.0-rc`） |
+| `__PREVIEW_URL__` | 预览版 Release 页面 |
+
+改文案时**保留这些占位符**：模板少一个、或写了没定义的 `__TOKEN__`，构建会直接失败，不会把旧版本号
+或未替换的占位符发上线。`check-site.py` 对 `dist/` 也会复查残留占位符。
+
+构建脚本会翻完 Releases 的所有分页，按 tag 的语义版本取最高的正式版（非 prerelease）与最高的预览版
+（prerelease）；只认 `vX.Y.Z` 与 `vX.Y.Z-<channel>.N` 两种 tag。任一渠道不存在、或正式版缺
+`Lagoon-<version>.apk`，脚本以非零状态退出，避免发布一个缺版本的页面。
+
 ## 版本更新清单
 
-产品发布新正式版或预发布版时，版本/日期/APK 名/大小/下载链接由 `website/scripts/build-site.mjs`
-自动注入，不再手工改这些字段。仍然需要人工检查的是内容层面的变化：
+版本号、日期、安装包名与大小、下载链接都由上面的占位符自动跟进，不需要手工改。仍然需要人工检查的是
+内容层面的变化：
 
 1. 新正式版吸收的预发布能力，从“预览中”移到“已发布”与“能力”章节，并复核“连接”章节两种模式的说明；
-2. 如果页面文案引用了具体版本（例如“依据 v0.2.4 实际布局重绘”），按新版本核对；
+2. 引用具体版本的文案（能力卡片、航道图、模拟器规则）按新版本核对；版本号自动注入不等于描述还成立；
 3. 跑 `node scripts/build-site.mjs`、`python3 scripts/check-site.py dist` 与浏览器验证。
 
-构建脚本取最新非 prerelease 作为正式版、最新 prerelease 作为预览版；如果某个渠道不存在，
-脚本会以非零状态退出，避免发布一个缺版本的页面。
+预览版的每条 bullet、以及“尚未在真机完成验收”这类判断，都是人工维护的文案，不会随 tag 变化。
 
 ## 浏览器验证
 

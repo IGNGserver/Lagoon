@@ -2,20 +2,21 @@
 
 Lagoon 的产品官网与下载入口，源码位于产品仓库的 `website/`：
 
-- 产品仓库（唯一事实来源）：<https://github.com/IGNGserver/opencode-lagoon>
+- 产品仓库（唯一事实来源）：<https://github.com/IGNGserver/Lagoon>
 - 正式站点：<https://lagoon.igng.net/>（Cloudflare Pages 项目 `lagoon-website`）
 - 部署：`.github/workflows/website.yml` 在 `main` 和正式发版后自动构建并上传 `dist/`
 
-站点是零构建静态页面：`site/` 下是源文件，`scripts/build-site.mjs` 从 GitHub Releases 取最新
-正式版与预览版，生成带当前版本/下载链接的 `dist/`，再由 Cloudflare Pages 发布。
+站点是零构建静态页面：`site/` 下是源文件，`scripts/build-site.mjs` 翻完 GitHub Releases，取最高 tag
+的正式版与预览版，把 `index.html` 里的 `__TOKEN__` 占位符换成当前版本/日期/大小/下载链接，
+生成 `dist/`，再由 Cloudflare Pages 发布。占位符清单见 `docs/SITE.md`。
 
 ## 目录结构
 
 | 路径 | 内容 |
 | --- | --- |
 | `site/` | 站点源文件：`index.html`、`404.html`、`assets/`、`_headers`、`sitemap.xml`、`robots.txt` |
-| `scripts/build-site.mjs` | 生成 `dist/`，注入最新正式版/预览版、日期、APK 大小和下载链接 |
-| `scripts/check-site.py` | 静态检查：本地引用、锚点、外链、元信息、体积预算 |
+| `scripts/build-site.mjs` | 生成 `dist/`，把 `__TOKEN__` 占位符注入为最新正式版/预览版、日期、APK 大小和下载链接 |
+| `scripts/check-site.py` | 静态检查：本地引用、锚点、外链、元信息、残留占位符、体积预算 |
 | `docs/SITE.md` | 官网定位、视觉语言、页面结构、内容原则、版本更新与浏览器验证 |
 | `docs/HOSTING.md` | Cloudflare 托管、自动部署与回滚 |
 | `docs/WORKSPACE.md` | 本机 worktree 与验证约定 |
