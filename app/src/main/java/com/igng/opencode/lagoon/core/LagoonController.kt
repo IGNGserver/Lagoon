@@ -2281,11 +2281,13 @@ class LagoonController private constructor(private val appContext: Context) {
   }
 
   fun deleteSshHost(hostId: String) {
+    val deviceId = deviceIdOfSshHost(hostId)
     val profiles = store.profiles().filter { it.sshHostId == hostId }
     profiles.forEach { deleteServer(it.id) }
     sshHostManager.close(hostId)
     runCatching { sshHostStore.delete(hostId) }
       .onFailure { showNotice(userFacingError(it, "删除 SSH 接入源失败"), FeedbackTone.WARNING); return }
+    deviceId?.let(::clearDeviceDiscovery)
     persistConnectionGraph()
     updateState { it.copy(sshHosts = sshHostStore.load()) }
   }

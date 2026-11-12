@@ -338,8 +338,8 @@ internal fun DeviceDetailScreen(
         Text("会删除这台设备的本机接入配置、身份和 ${device.attachedCount} 条 Harness 记录；远端任务与文件不受影响。")
         DialogActions("取消", { confirmingDelete = false }, "确认移除", danger = true) {
           confirmingDelete = false
+          // 删除后设备会从投影里消失，上方 device == null 的分支负责退这一层；这里再退会多退一级。
           onDeleteDevice(device.id.value)
-          onBack()
         }
       }
     }
@@ -569,9 +569,9 @@ internal fun HarnessDetailScreen(
         Text("${profile.connectionTypeLabel} · ${profile.endpointSummary}")
         Text("只删除这条 Harness 的本机连接资料；同一设备上的其他 Harness 与远端进程、会话均不受影响。设备本身保留。")
         DialogActions("取消", { confirmingDelete = false }, "确认移除", danger = true) {
-          controller.deleteServer(profile.id)
           confirmingDelete = false
-          onBack()
+          // 同上：Harness 消失后由 profile == null 的分支退层，避免双退。
+          controller.deleteServer(profile.id)
         }
       }
     }

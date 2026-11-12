@@ -133,19 +133,19 @@ private fun AddDevicePage(
         HyperGroupTitle("经由中枢")
         HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(vertical = 4.dp)) {
           HyperRow(
-            title = catalog?.account ?: "登录 Remote Hub",
+            title = if (catalog == null) "登录 Remote Hub" else "接入更多主机",
             summary = when {
               catalog == null -> "登录后勾选要接入的开发机并核对指纹；不会自动启用 Harness"
               catalog.signedOut -> "${catalog.origin} · 已退出登录，请重新登录后再接入主机"
-              else -> "${catalog.origin} · ${catalog.hosts.size} 台可接入主机"
+              else -> "${catalog.origin} · 已接入 ${catalog.hosts.size} 台；可再次勾选"
             },
             showChevron = true,
             onClick = onLoginHub
           )
           HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
           HyperRow(
-            title = "选择要接入的主机",
-            summary = "已登录的账号可以直接勾选主机；接入后不会默认启用 DSH",
+            title = "管理中枢与主机",
+            summary = "查看账号、暂停整个中枢或退出登录",
             showChevron = true,
             onClick = onManageHub
           )
