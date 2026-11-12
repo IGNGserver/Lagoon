@@ -50,6 +50,8 @@ class DeviceProjectionTest {
     assertEquals(2, device.enabledCount)
     assertTrue(device.effectiveEnabled)
     assertEquals(setOf("leaf-dsh", "leaf-codex"), device.harnesses.mapNotNull { it.leafId?.value }.toSet())
+    // leaf 沿用设备名时，设备页显示协议名，否则两行都会叫 ubuntu-dev。
+    assertEquals(setOf("DeepSeek Harness", "Codex"), device.harnesses.map { it.name }.toSet())
   }
 
   @Test fun disablingTheDeviceBlocksEveryHarnessWithoutLosingTheirSwitches() {

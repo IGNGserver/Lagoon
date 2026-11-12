@@ -139,10 +139,11 @@ object DeviceProjection {
         host.id !in adoptedDeviceIds && attached.isEmpty()
       ) return@mapNotNull null
       val observed = discovery(host.id)
-      val slots = slots(access, attached, observed, nowMs)
+      val displayName = host.name.ifBlank { attached.firstOrNull()?.name ?: host.externalHostId ?: "设备" }
+      val slots = slots(access, attached, observed, nowMs, displayName)
       DeviceView(
         id = DeviceId(host.id),
-        name = host.name.ifBlank { attached.firstOrNull()?.name ?: host.externalHostId ?: "设备" },
+        name = displayName,
         access = access,
         endpoint = source.endpoint,
         fingerprint = host.fingerprint,
@@ -176,7 +177,8 @@ object DeviceProjection {
     access: DeviceAccess,
     attached: List<ServerProfile>,
     discovery: DeviceDiscovery?,
-    nowMs: Long
+    nowMs: Long,
+    deviceName: String
   ): List<HarnessSlot> {
     val slots = LinkedHashMap<String, HarnessSlot>()
     fun put(slot: HarnessSlot) {
@@ -191,7 +193,8 @@ object DeviceProjection {
         key = slotKey(protocol, locator),
         protocol = protocol,
         locator = locator,
-        name = harnessName(protocol, profile.name),
+        // 很多 leaf 直接沿用设备名（中枢 DSH/Codex、SSH 首个叶子）；在设备页里它们应显示协议名。
+        name = harnessName(protocol, profile.name.takeUnless { it.isBlank() || it == deviceName }.orEmpty()),
         leafId = LeafId(profile.id),
         attached = true,
         enabled = profile.enabled,
