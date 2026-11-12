@@ -7,6 +7,8 @@
 - 外链只指向允许的主机，下载直链符合 Releases 的 Lagoon-<version>.apk 命名；
 - 每个页面具备 lang、title、description、viewport；
 - 体积预算：单文件与站点总量不超过上限，避免把大素材塞进仓库。
+
+检查 dist/ 时额外要求占位符已全部替换（site/ 源文件里的 __TOKEN__ 由 build-site.mjs 注入）。
 """
 from __future__ import annotations
 
@@ -16,9 +18,12 @@ from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import urlparse
 
-ROOT = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else Path(__file__).resolve().parent.parent / "site"
+SITE_SOURCE = (Path(__file__).resolve().parent.parent / "site").resolve()
+ROOT = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else SITE_SOURCE
+BUILD_OUTPUT = ROOT != SITE_SOURCE
 ALLOWED_HOSTS = {"github.com", "schema.org", "lagoon.igng.net"}
-APK_RE = re.compile(r"^https://github\.com/IGNGserver/opencode-lagoon/releases/download/v(\d+\.\d+\.\d+(?:-[a-z]+\.\d+)?)/Lagoon-(\1)\.apk$")
+APK_RE = re.compile(r"^https://github\.com/IGNGserver/Lagoon/releases/download/v(\d+\.\d+\.\d+(?:-[a-z]+\.\d+)?)/Lagoon-(\1)\.apk$")
+PLACEHOLDER_RE = re.compile(r"__[A-Z][A-Z0-9_]*__")
 MAX_FILE = 400 * 1024
 MAX_TOTAL = 1536 * 1024
 
@@ -84,8 +89,13 @@ def check_local(base: Path, ref: str, where: str) -> None:
 
 def check_html(path: Path) -> None:
     rel = path.relative_to(ROOT)
+    text = path.read_text(encoding="utf-8")
     page = Page()
-    page.feed(path.read_text(encoding="utf-8"))
+    page.feed(text)
+    if BUILD_OUTPUT:
+        leftover = sorted(set(PLACEHOLDER_RE.findall(text)))
+        if leftover:
+            err(f"{rel}: 构建产物里还有未替换的占位符 {', '.join(leftover)}")
     if not page.lang:
         err(f"{rel}: <html> 缺少 lang")
     if not page.has_title:
@@ -95,6 +105,9 @@ def check_html(path: Path) -> None:
     if rel.name == "index.html" and not page.meta.get("description"):
         err(f"{rel}: 缺少 description meta")
     for attr, ref in page.refs:
+        if ref.startswith("__"):
+            # site/ 源文件里的构建占位符（__STABLE_APK_URL__ 等），注入后才是真正的链接。
+            continue
         if ref.startswith("#"):
             if len(ref) > 1 and ref[1:] not in page.ids:
                 err(f"{rel}: 锚点 {ref} 没有对应元素")

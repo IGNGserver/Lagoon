@@ -1,6 +1,6 @@
 # 托管与部署（Cloudflare Pages）
 
-> 正式站点：<https://lagoon.igng.net/>。站点源码在产品仓库 `opencode-lagoon/website/`，部署由
+> 正式站点：<https://lagoon.igng.net/>。站点源码在产品仓库 `IGNGserver/Lagoon` 的 `website/`，部署由
 > `.github/workflows/website.yml` 完成。旧的独立仓库 `IGNGserver/lagoon-website` 已归档，仅作历史。
 
 ## 当前配置
@@ -8,7 +8,7 @@
 | 项 | 值 |
 | --- | --- |
 | Pages 项目 | `lagoon-website`（Direct Upload） |
-| 部署来源 | `IGNGserver/opencode-lagoon` 的 `website/` |
+| 部署来源 | `IGNGserver/Lagoon` 的 `website/` |
 | 部署工作流 | `.github/workflows/website.yml` |
 | 生产分支 | `main` |
 | 构建命令 | `node scripts/build-site.mjs`（在 `website/` 下，无 npm 依赖） |
@@ -17,8 +17,10 @@
 | 默认别名 | `https://lagoon-website.pages.dev/`（保留） |
 | DNS | proxied CNAME `lagoon.igng.net` → `lagoon-website.pages.dev` |
 
-`build-site.mjs` 从 GitHub Releases 取最新正式版和预览版，注入版本号、日期、APK 文件名/大小与
-下载链接；`check-site.py` 检查本地引用、锚点、外链、元信息和体积预算。两者都在部署前运行。
+`build-site.mjs` 翻完 GitHub Releases 的分页，取最高 tag 的正式版和预览版，替换 `site/index.html`
+里的 `__TOKEN__` 占位符（版本号、日期、APK 文件名/大小、下载直链）；`check-site.py` 检查本地引用、
+锚点、外链、元信息、残留占位符和体积预算。两者都在部署前运行，任一步失败就不会发布新版本——
+线上保持上一版，不会出现半更新的页面。
 
 ## 自动部署
 

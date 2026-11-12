@@ -29,9 +29,9 @@
     "name": "Lagoon",
     "applicationCategory": "DeveloperApplication",
     "operatingSystem": "Android 8.0+",
-    "softwareVersion": "0.2.4",
-    "downloadUrl": "https://github.com/IGNGserver/opencode-lagoon/releases/download/v0.2.4/Lagoon-0.2.4.apk",
-    "codeRepository": "https://github.com/IGNGserver/opencode-lagoon",
+    "softwareVersion": "__STABLE_VERSION__",
+    "downloadUrl": "__STABLE_APK_URL__",
+    "codeRepository": "__REPO_URL__",
     "description": "面向 coding agent 的原生 Android 控制端，首发支持 OpenCode 2.x 服务端。"
   }
   </script>
@@ -84,7 +84,7 @@
       <a href="#live">实时更新</a>
       <a href="#depths">能力</a>
       <a href="#roadmap">航道图</a>
-      <a href="#download">下载 v0.2.4</a>
+      <a href="#download">下载 v__STABLE_VERSION__</a>
     </div>
   </header>
 
@@ -109,18 +109,18 @@
           任务状态会浮现在通知与系统实时更新里，全程无需第三方中转。
         </p>
         <div class="hero__actions">
-          <a class="btn btn--primary" href="https://github.com/IGNGserver/opencode-lagoon/releases/download/v0.2.4/Lagoon-0.2.4.apk" data-magnetic>
+          <a class="btn btn--primary" href="__STABLE_APK_URL__" data-magnetic>
             <svg aria-hidden="true"><use href="#i-down"/></svg>
-            <span>下载 v0.2.4<small>APK · 10 MB · Android 8.0+</small></span>
+            <span>下载 v__STABLE_VERSION__<small>APK · __STABLE_SIZE_SHORT__ · Android 8.0+</small></span>
           </a>
-          <a class="btn btn--glass" href="https://github.com/IGNGserver/opencode-lagoon" data-magnetic>
+          <a class="btn btn--glass" href="__REPO_URL__" data-magnetic>
             <svg aria-hidden="true"><use href="#i-github"/></svg>
             <span>查看源码</span>
           </a>
         </div>
         <ul class="hero__facts" aria-label="版本信息">
-          <li><b>正式版</b> v0.2.4 · 2026-10-12</li>
-          <li><b class="is-preview">预览版</b> v0.2.5-rc.4 · 2026-10-14</li>
+          <li><b>正式版</b> v__STABLE_VERSION__ · __STABLE_DATE__</li>
+          <li><b class="is-preview">预览版</b> v__PREVIEW_VERSION__ · __PREVIEW_DATE__</li>
         </ul>
       </div>
 
@@ -155,7 +155,7 @@
                 <li class="row is-bold" data-row="b"><i class="st st--wait"></i><span>升级 Gradle 版本目录</span><em>待授权</em></li>
                 <li class="row is-bold" data-row="c"><i class="st st--unread"></i><span>修复 SSE 重连后的计数</span></li>
                 <li class="row" data-row="d"><i class="st st--run"></i><span>为通知深链补充回归测试</span></li>
-                <li class="row"><i class="st"></i><span>整理 v0.2.4 发布说明</span></li>
+                <li class="row"><i class="st"></i><span>整理 v__STABLE_VERSION__ 发布说明</span></li>
               </ul>
               <div class="grp">昨天 <i class="chev"></i></div>
               <ul class="rows">
@@ -169,7 +169,7 @@
           </div>
           <div class="phone__glare" aria-hidden="true"></div>
         </figure>
-        <figcaption class="stage-note">界面示意 · 依据 v0.2.4 实际布局重绘，数据为演示内容</figcaption>
+        <figcaption class="stage-note">界面示意 · 依据实际布局重绘，数据为演示内容</figcaption>
       </div>
 
       <a class="scroll-cue" href="#connect" aria-label="向下浏览"><span></span></a>
@@ -186,8 +186,8 @@
 
       <div class="currents reveal" data-currents>
         <div class="currents__toolbar" role="group" aria-label="版本对比">
-          <button type="button" class="seg is-on" data-mode="stable" aria-pressed="true">正式版 v0.2.4</button>
-          <button type="button" class="seg" data-mode="preview" aria-pressed="false">预览版 v0.2.5-rc</button>
+          <button type="button" class="seg is-on" data-mode="stable" aria-pressed="true">正式版 v__STABLE_VERSION__</button>
+          <button type="button" class="seg" data-mode="preview" aria-pressed="false">预览版 v__PREVIEW_SERIES__</button>
         </div>
         <div class="currents__canvas">
           <svg class="currents__svg" viewBox="0 -60 800 572" role="img" aria-labelledby="currents-title currents-desc">
@@ -270,7 +270,7 @@
                 <div class="sb sb--chat"><span class="sb__time">9:42</span><span class="sb__icons" aria-hidden="true"><i class="sig"></i><i class="bat"></i></span></div>
                 <div class="chat-top">
                   <span class="qc" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M15 5 8 12l7 7"/></svg></span>
-                  <div class="chat-top__title"><b>重构离线缓存的截断策略</b><small>opencode-lagoon · build</small></div>
+                  <div class="chat-top__title"><b>重构离线缓存的截断策略</b><small>Lagoon · build</small></div>
                   <span class="qc" data-more aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></svg></span>
                 </div>
                 <div class="chat-body">
@@ -380,7 +380,7 @@
     <!-- ============ 120 m · Depths ============ -->
     <section class="section depths" id="depths" data-depth="120" data-label="能力">
       <header class="section__head reveal">
-        <p class="eyebrow"><span class="eyebrow__depth">−120 m</span>能力 · 正式版 v0.2.4</p>
+        <p class="eyebrow"><span class="eyebrow__depth">−120 m</span>能力 · 正式版 v__STABLE_VERSION__</p>
         <h2>在深水区，<br>细节都在。</h2>
       </header>
 
@@ -441,8 +441,8 @@
       <div class="lanes">
         <article class="lane lane--stable reveal">
           <p class="lane__tag"><i></i>已发布 · 正式版</p>
-          <h3>v0.2.4</h3>
-          <p class="lane__date">2026-10-12 · GitHub Latest</p>
+          <h3>v__STABLE_VERSION__</h3>
+          <p class="lane__date">__STABLE_DATE__ · GitHub Latest</p>
           <ul>
             <li>OpenCode 2.x 服务端（以 <code>/api/info</code> 识别版本，1.x 已不再支持）</li>
             <li>项目、会话、子会话、改动与文件浏览</li>
@@ -453,8 +453,8 @@
         </article>
         <article class="lane lane--preview reveal">
           <p class="lane__tag"><i></i>预览中 · Pre-release</p>
-          <h3>v0.2.5-rc.4</h3>
-          <p class="lane__date">2026-10-14 · 尚未在真机完成验收</p>
+          <h3>v__PREVIEW_VERSION__</h3>
+          <p class="lane__date">__PREVIEW_DATE__ · 尚未在真机完成验收</p>
           <ul>
             <li>“全部服务器”模式：并行连接所有已配置服务器，聚合会话、运行中任务与未读结果</li>
             <li>持续连接：首页筛选与打开对话不再中断其他服务器的监控</li>
@@ -495,19 +495,19 @@
       <div class="download__grid">
         <div class="dl-card reveal" data-glass>
           <p class="dl-card__tag">正式版 · 推荐</p>
-          <p class="dl-card__name">Lagoon <span>v0.2.4</span></p>
+          <p class="dl-card__name">Lagoon <span>v__STABLE_VERSION__</span></p>
           <dl class="dl-card__meta">
-            <div><dt>安装包</dt><dd><code>Lagoon-0.2.4.apk</code></dd></div>
-            <div><dt>大小</dt><dd>10.0 MB</dd></div>
+            <div><dt>安装包</dt><dd><code>__STABLE_APK__</code></dd></div>
+            <div><dt>大小</dt><dd>__STABLE_SIZE__</dd></div>
             <div><dt>系统</dt><dd>Android 8.0 及以上</dd></div>
             <div><dt>服务端</dt><dd>OpenCode 2.x</dd></div>
           </dl>
-          <a class="btn btn--primary btn--block" href="https://github.com/IGNGserver/opencode-lagoon/releases/download/v0.2.4/Lagoon-0.2.4.apk" data-magnetic>
+          <a class="btn btn--primary btn--block" href="__STABLE_APK_URL__" data-magnetic>
             <svg aria-hidden="true"><use href="#i-down"/></svg><span>下载 APK</span>
           </a>
           <p class="dl-card__alt">
-            <a href="https://github.com/IGNGserver/opencode-lagoon/releases/tag/v0.2.5-rc.4">抢先体验预览版 v0.2.5-rc.4 <svg aria-hidden="true"><use href="#i-arrow"/></svg></a>
-            <a href="https://github.com/IGNGserver/opencode-lagoon/releases">全部版本与发布说明 <svg aria-hidden="true"><use href="#i-arrow"/></svg></a>
+            <a href="__PREVIEW_URL__">抢先体验预览版 v__PREVIEW_VERSION__ <svg aria-hidden="true"><use href="#i-arrow"/></svg></a>
+            <a href="__REPO_URL__/releases">全部版本与发布说明 <svg aria-hidden="true"><use href="#i-arrow"/></svg></a>
           </p>
           <p class="dl-card__note">预览版与正式版使用同一套稳定签名。从 OpenCode Lagoon 旧版本升级时，应用标识 <code>com.igng.opencode.lagoon</code> 与签名保持不变，可直接覆盖安装。</p>
         </div>
@@ -565,10 +565,10 @@
       <div><b>Lagoon</b><span>原生 Android 的 coding agent 控制端</span></div>
     </div>
     <nav class="footer__links" aria-label="外部链接">
-      <a href="https://github.com/IGNGserver/opencode-lagoon">产品仓库</a>
-      <a href="https://github.com/IGNGserver/opencode-lagoon/releases">发布说明</a>
-      <a href="https://github.com/IGNGserver/opencode-lagoon/issues">反馈问题</a>
-      <a href="https://github.com/IGNGserver/lagoon-website">官网源码</a>
+      <a href="__REPO_URL__">产品仓库</a>
+      <a href="__REPO_URL__/releases">发布说明</a>
+      <a href="__REPO_URL__/issues">反馈问题</a>
+      <a href="__REPO_URL__/tree/main/website">官网源码</a>
     </nav>
     <p class="footer__note">Lagoon 是独立开发的第三方客户端；OpenCode 名称归其项目所有。界面图均为依据实际布局重绘的示意，数据为演示内容。</p>
   </footer>
