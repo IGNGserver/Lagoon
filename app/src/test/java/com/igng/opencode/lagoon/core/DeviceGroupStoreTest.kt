@@ -7,7 +7,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class DeviceGroupStoreTest {
-  @Test fun versionOneResetsExactlyOnceAndWritesVersionTwo() {
+  @Test fun versionOneResetsExactlyOnceAndWritesTheCurrentVersion() {
     val prefs = FakeSharedPreferences()
     prefs.values["state"] = """{"version":1,"selected":"g1","groups":[{"id":"g1","name":"旧分组","members":["p1"]}]}"""
     val store = DeviceGroupStore(prefs)
@@ -16,7 +16,7 @@ class DeviceGroupStoreTest {
     assertTrue(first.resetLegacy)
     assertTrue(first.state.groups.isEmpty())
     assertNull(first.state.selectedGroupId)
-    assertEquals(2, DeviceGroupCodec.version(prefs.values["state"] as String))
+    assertEquals(DeviceGroupCodec.VERSION, DeviceGroupCodec.version(prefs.values["state"] as String))
 
     val second = store.load()
     assertFalse(second.resetLegacy)

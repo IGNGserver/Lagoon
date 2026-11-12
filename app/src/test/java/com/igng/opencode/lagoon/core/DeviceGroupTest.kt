@@ -11,11 +11,27 @@ class DeviceGroupTest {
 
   @Test fun codecRoundTripsGroupsAndSelection() {
     val state = DeviceGroupState(
-      groups = listOf(DeviceGroup("g1", "MacBook", listOf("p1", "p2"), 42), DeviceGroup("g2", "Studio", listOf("p3"))),
+      groups = listOf(DeviceGroup("g1", "MacBook", listOf("p1", "p2"), updatedAt = 42), DeviceGroup("g2", "Studio", listOf("p3"))),
       selectedGroupId = "g2"
     )
     val decoded = DeviceGroupCodec.decode(DeviceGroupCodec.encode(state))
     assertEquals(state, decoded)
+  }
+
+  @Test fun codecKeepsDeviceMembershipSoNewHarnessesJoinLater() {
+    val state = DeviceGroupState(
+      groups = listOf(DeviceGroup("g1", "MacBook", listOf("leaf-1"), deviceIds = listOf("host-1")))
+    )
+    val decoded = DeviceGroupCodec.decode(DeviceGroupCodec.encode(state))
+    assertEquals(listOf("host-1"), decoded.groups.single().deviceIds)
+    assertEquals(listOf("leaf-1"), decoded.groups.single().memberIds)
+  }
+
+  @Test fun v2GroupsWithoutDeviceIdsStillDecode() {
+    val legacy = """{"version":2,"selected":null,"groups":[{"id":"g1","name":"Old","members":["p1"],"updatedAt":1}]}"""
+    val decoded = DeviceGroupCodec.decode(legacy)
+    assertEquals(listOf("p1"), decoded.groups.single().memberIds)
+    assertTrue(decoded.groups.single().deviceIds.isEmpty())
   }
 
   @Test fun corruptCodecFailsWithoutThrowingJson() {

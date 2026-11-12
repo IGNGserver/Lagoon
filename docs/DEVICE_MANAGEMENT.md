@@ -1,146 +1,130 @@
-# 设备管理与分组（v2）
+# 设备管理与分组
 
-> **本文描述的是 2026-11 的界面行为；连接模型以 [`DEVICE_MODEL.md`](DEVICE_MODEL.md) 为准。**
-> 2026-11 第二轮重构把"设备"收敛为 `HostBinding`：一级设备列表 + 设备页（设备开关 + Harness 列表）+
-> Harness 详情；添加设备只剩一个入口（经由中枢 / 经由 SSH）；分组改为按设备选。本文中与新模型冲突的
-> 章节（三级开关平铺、按 Harness 分设备、添加页 Harness 预选）已被后续实现替换，以代码与
-> `DEVICE_MODEL.md` 为准。
+> 连接模型（接入源 → 设备 → Harness、身份、开关、流量契约）以 [`DEVICE_MODEL.md`](DEVICE_MODEL.md) 为准。
+> 本文只讲界面行为与代码落点。
 
-本文记录 2026-11 的设备管理重构：首页从“每个连接一个服务器胶囊”改成统一的左上角范围面板，
-DSH 的添加入口收进一个分页，原有直连 DSH（地址 + 启动令牌）不再作为新连接方式提供。
-
-## 1. 目标信息架构
+## 1. 页面结构
 
 ```text
-会话首页
-[全部设备 ⌄]                           ← 唯一范围入口，没有横向胶囊行
-
-设备管理
-  全部设备                        ← 聚合所有 profile
-  DSH Remote Hub                  ← 一个账号，刷新/退出/接入主机
-  设备分组
-    MacBook  2 个设备 · 1 个 Harness · 2 在线
-    + 新建设备组
-  未分组
-    设备：DSH Remote Host / SSH 主机
-    Harness：OpenCode / 旧版直连 DSH
-  添加设备
+设备
+├─ 接入源
+│    Remote Hub 账号卡片        → 账号管理（登录/退出、可接入主机、暂停中枢）
+│    添加设备                   → 添加入口
+├─ 由中枢管理
+│    ● ubuntu-dev   3 个 Harness · 2 启用 · 在线      [设备开关]
+├─ 由 SSH 管理
+│    ● arch-dev     1 个 Harness · 在线               [设备开关]
+├─ 直连（兼容）
+└─ 设备组
 ```
 
-- **全部** 是隐式聚合，不是可编辑分组；它始终存在，且包含所有 profile（包括已分组和未分组）。
-- 未分组 profile **不再**在首页单独占一个范围项；它们仍出现在「全部设备」和设备管理页。
-- 首页不再有独立的设备条；添加设备只能从「设备管理」或「设置 › 添加设备」进入。
-- 首页标题打开的「选择范围」面板是唯一的设备/分组/项目/工作区入口：全部设备、设备分组、单台连接都在这里；单台设备范围不再出现临时胶囊，回到顶部选「全部设备」即可。
+- 一个设备一行；接入方式只是它的属性，不再按 OpenCode / DSH / Codex 分成不同种类的"设备"。
+- 列表只显示**已采纳**的设备：中枢账号目录里出现但从未接入的主机不算设备，只出现在添加入口的候选里。
+- 顶部的"N 台设备 · M 个 Harness 已启用"按 `HostBinding` 与 leaf 分别计数。
+
+```text
+设备详情（路由一层，id = deviceId）
+  启用此设备 [switch]            ← 唯一的设备级开关
+  接入方式 / 地址 / 指纹
+  Harness  [刷新发现]
+    DeepSeek Harness  已启用 [switch] >
+    OpenCode          已停用 [switch]
+    Codex             未检测到 / [添加]
+  设备设置（编辑 SSH 连接 / 中枢与账号）
+  移除这台设备
+```
+
+```text
+Harness 详情（路由一层，id = leafId）
+  启用此 Harness [switch]
+  协议 / 所属设备 / 连接地址
+  组合成员、任务通知、新会话默认值、模型显示
+  连接与高级功能（DSH 主机扩展、模型密钥、服务商；Remote 网络与诊断）
+  从此设备移除这个 Harness
+```
 
 ### 1.1 设备子树的每一级都是路由
 
-设备子树的四层「列表 → 详情 → 编辑 → SSH 表单」都记在 `SessionNavigation` 上
-（`device` 与 `editors`，见 `ui/AppBackStack.kt`），由 `MainActivity` 的根 `AnimatedContent`
-统一渲染，动效规格只有 `HyperMotion.pageTransform` 一份：
+设备子树的每一级都记在 `SessionNavigation` 上（`device` / `harness` / `editors`，见 `ui/AppBackStack.kt`），
+由 `MainActivity` 的根 `AnimatedContent` 统一渲染，动效规格只有 `HyperMotion.pageTransform` 一份：
 
 - 进入：新页整幅从右侧推入，底层退 28% 并缩到 0.94；返回方向相反，底层不变透明。
-- 每一级返回只退一层：SSH 表单 → DSH 段 → 设备详情 → 设备列表 → 会话首页，下一次返回才交给系统。
-- 预测式返回预览垫在下面的是真实的上一级，而不是空白的“设备”页。
-- 不要再用 `detailId` / `showingAddDevice` 这类页面内布尔量切换整页：根过渡只认 `NavRoute` 的变化，
-  那样写回来就又是硬切（`InformationArchitectureRegressionTest` 会拦截）。
+- 每一级返回只退一层：SSH 表单 → 添加入口 → 设备详情 → Harness 详情 → 设备列表 → 会话首页。
+- 预测式返回预览垫在下面的是真实的上一级。
+- 不要再用 `detailId` / `showingAddDevice` 这类页面内布尔量切换整页：根过渡只认 `NavRoute` 的变化。
+- `device` 只装 `HostBinding.id`，`harness` 只装 `ServerProfile.id`。恢复旧状态时允许把历史 profile id 解析一次。
 
+## 2. 添加设备
 
-## 2. 添加设备页
+顶部只有一个入口，页内分两个接入分支，产物都是同一种设备：
 
-顶部两个分页：
+| 分支 | 流程 | 结果 |
+|---|---|---|
+| 经由中枢 | 登录 → 选主机（可多选）→ 核对指纹 | 每台勾选的主机是一台设备；**不默认启用任何 Harness** |
+| 经由 SSH | 地址 / 用户名 / 凭据 → 核对主机指纹 | 一台设备；保存时**不预选 Harness、不连接、不启动远端服务** |
+| 高级 · 兼容 HTTP 直连 | 地址或配对链接 | 1:1 的设备，直接进它的设备页 |
 
-| 分页 | 内容 |
-|---|---|
-| OpenCode | 原有 OpenCode 资料表单：地址/pair 链接、Basic Auth、自动连接、通知 |
-| DeepSeek Harness | 一个 DSH Remote Hub + 任意数量 SSH 主机 |
+- 设备可以先存在而没有任何 Harness；那种状态不建立任何连接。
+- 添加入口里的「已保存的 SSH 设备」点进去就是那台设备的页面，不是第二个表单。
+- 具体 SSH 字段、bootstrap、Host Key、端口转发见 [`SSH_HOSTS.md`](SSH_HOSTS.md)。
 
-DSH 分页不再提供“直连 DSH”的地址/令牌输入。已有旧版直连 DSH 资料会继续出现在设备管理
-的 Harness 区域，可编辑或删除，但新版本不再创建这类资料。
+## 3. 发现与启用 Harness
 
-### DSH Remote Hub
+- 打开设备页**不会**自动连接：先显示上次的发现结果（带时间与过期标记），刷新是显式动作。
+- 刷新会做一次只读发现：中枢读 Host 服务目录；SSH 读注册文件/命令。不安装、不启动、不终止进程。
+- 设备停用时刷新直接拒绝，页面只显示缓存；这也是"停用后不再占用连接与流量"的一部分。
+- 未挂载的 Harness 显示「添加」；添加即启用。已挂载的显示开关：关掉只是停用，不删除资料、会话、
+  草稿或缓存；删除只在 Harness 详情的「从此设备移除这个 Harness」里发生。
+- SSH 的只读发现只能证明"装了/注册了"，认证与版本在连接时验证；中枢则由 Host 明确声明的可用性决定。
+  这些差异必须显示为原因，而不是假装"可用"或假装"空列表"。
 
-- 一次登录一个 Hub 账号；设备管理只展示最近保存/更新的 Hub catalog。
-- 登录后批量发现主机，逐台核对 Host 指纹，再为每台主机注册独立 client 身份（沿用
-  `RemoteAccountManager` 的多 Host 并行模型）。
-- Hub 下的每台 Host 是独立设备/profile；不会退化成 dsh-Go 的“一次只连一台”。
-- Host 名称只在“设备”范围内去重：OpenCode / 旧版直连 DSH 属于 Harness，和设备同名不会再让
-  设备被保存成 `ubuntu-dev (2)`。旧版本已经写入的这种后缀会在启动时按 Hub 目录自动纠正；
-  只有同一分区里确实重名的第二台设备才保留 `(2)`。
+## 4. 开关语义
 
-### SSH 主机
+| 层级 | 位置 | 说明 |
+|---|---|---|
+| 接入源（中枢） | 账号管理 | 「暂停此中枢」影响源下所有设备；退出登录同样会让设备不可用但保留 |
+| 设备 | 设备页 / 列表行 | 关掉后不建中枢 Noise、不建 SSH、不发现、不刷新、不后台同步；Harness 开关原样保留 |
+| Harness | 设备页 / Harness 详情 | 关掉后不拨号、不订阅、不轮询、不推送通知、不刷新缓存；资料与未读账本保留 |
 
-- 每台 SSH 主机对应一个 DSH profile（`sshHostId`），连接、通知、会话路由都复用现有
-  `HarnessClient` 管线。
-- 添加/编辑表单只要求地址、用户名、密码；端口、认证方式、私钥、启动命令、工作目录、名称与主机
-  指纹都在「更多选项」里，非默认值会自动展开。
-- 通知、设备分组与启用开关属于设备层偏好，统一在「设备详情」里改，SSH 表单不再重复提供。
-- 保存数量没有产品上限；默认自动连接。「仅保存，不连接」允许离线保存，指纹留到首次连接确认。
-- 具体字段、bootstrap、Host Key、端口转发见 [`SSH_HOSTS.md`](SSH_HOSTS.md)。
-
-## 3. 分组语义
-
-- 分组只保存 `ServerProfile.id`，不复制连接、凭据或会话。
-- UI 按 profile 推导角色：
-  - `DSH_REMOTE` / `sshHostId != null` → 设备；
-  - `OpenCode` / 旧版直连 DSH → Harness。
-- 一个 profile 最多属于一个组；空组不持久化；删除 profile 会从组里剪掉。
-- 新建/编辑分组时可勾选「同时连接全部成员」，默认开启；关闭后仅有当前活动连接保持监控。
-- 分组只影响本机展示，不上传服务端，不改变认证、路由或会话身份。
-
-## 4. 禁用连接
-
-设备管理的每个连接行都有一个启用开关；「设备」和「Harness」两种角色都支持禁用。
-禁用是本机偏好，不删除资料、不上传服务端，也不改变远端任务。
-
-- 持久化：`ServerProfile.enabled` 默认 `true`；旧版资料没有该字段时按启用处理。
-- 禁用后该 profile 不再被 `AllServersOverview` 拨号，即使它被当前选中、被设备组
-  「同时连接全部成员」覆盖或被旧通知/深链引用。当前连接会被关闭，SSH 主机链接也会关闭。
-- 首页、设备组、搜索、全局任务行、灵动态/系统通知和「服务端已读」候选都通过
-  `ServerProjection` 过滤禁用 profile，因此不会再显示它的对话和计数。
-- 禁用时撤下该服务器的结果/待处理通知；本机未读账本、草稿、会话缓存和凭据保留。
-  重新启用后未读会回到应用内列表，但第一次快照只作为基线，不会重放旧系统通知。
-- 如果禁用的是当前设备：优先切到当前设备组的其它启用成员；单设备模式切到其它启用连接；
-  没有可用连接时回到「全部」空首页。关闭的设备组保留成员关系，重新启用后自动回到组内。
-- 重新启用会立即建立一次监控并刷新（即使该 profile 的「自动连接」是关闭的），首页先显示
-  缓存、再更新实时数据；当前没有可写连接时会自动接回该 profile。
+- SSH **不再暴露接入源开关**：一台 SSH 配置就是一台设备，设备开关就是唯一的门禁。
+- 关父级不覆写子项偏好；重新启用会立即建立一次监控并刷新（即使旧 `autoConnect` 为 false）。
 - 全部连接禁用后不再安排 WorkManager 后台同步；设备管理仍保留所有行，便于重新启用。
 
-## 5. 升级迁移
+## 5. 设备组
 
-`DeviceGroupStore` 从 v1 升到 v2：
+- 成员按**设备**选（`DeviceGroup.deviceIds`），保存时展开成该设备当前的 leaf 集合（`memberIds`）。
+- 之后在组内设备上新启用 Harness，会自动进入分组（控制器在挂载/移除后重新展开）。
+- 旧分组只有 leaf id：编辑器按"成员里有这台设备的任一 Harness"回填勾选，保存后升级为按设备。
+- 一个设备可以属于多个组；空组不持久化；删除 Harness 会从组里剪掉，删除设备则整台退出分组。
+- 分组只影响本机展示与首页范围，不上传服务端，也不改变认证、路由或会话身份。
 
-1. 读到 v1 时丢弃旧分组和旧选中项，立即写入 v2 空文档；
-2. 本次启动显示一次“设备分组已按新版规则重置”的 toast 和设备管理页 banner；
-3. 第二次启动读取 v2，不再清空；
-4. profile、凭据、会话缓存、通知账本全部保留。
+## 6. 升级迁移
 
-首页默认进入「全部」。`homeGroupId == null` 即全部；选中显式分组时 `allServers = false`。
-旧版的 `allServers` 偏好不再决定首页形态，只作为兼容字段保留。
+- `DeviceGroupCodec` v3 增加 `deviceIds`；v2 文档仍可读（只有 leaf 成员），v1 仍按旧规则重置一次。
+- 连接图不可读/版本更高时失败关闭：不连接、不迁移、不覆盖原文件；设备列表退回 leaf 投影。
+- 旧版直连 DSH 与直接 HTTP 直连保留为兼容入口，不再新建。
 
-## 6. 代码落点
+## 7. 代码落点
 
 | 层 | 文件 |
 |---|---|
-| 连接资料/启用字段 | `shared/.../Models.kt`、`app/.../core/ServerStore.kt` |
+| 设备/接入源/Harness 模型 | `docs/DEVICE_MODEL.md`、`shared/.../core/DeviceModel.kt` |
+| 连接资料与启用字段 | `shared/.../models`（`ServerProfile`）、`app/.../core/ServerStore.kt` |
+| 设备投影与发现缓存 | `shared/.../core/DeviceModel.kt`、`app/.../core/DeviceDiscoveryStore.kt` |
 | 自动连接/监控 | `shared/.../AllServersOverview.kt` |
 | 分组模型/编解码 | `shared/.../DeviceGroup.kt` |
 | 分组存储/迁移 | `app/.../core/DeviceGroupStore.kt` |
-| 首页投影/过滤 | `app/.../core/ServerProjection.kt` |
-| 首页范围面板 | `app/.../ui/ProjectSheets.kt`、`app/.../ui/SessionsHomeScreen.kt` |
-| 设备管理页（列表 + 详情） | `app/.../ui/DeviceManagementScreen.kt` |
+| 设备列表 / 设备详情 / Harness 详情 | `app/.../ui/DeviceManagementScreen.kt` |
+| 添加设备 / SSH 表单 / 兼容直连 | `app/.../ui/DeviceEditorScreen.kt`、`app/.../ui/SshHostForm.kt` |
 | 分组编辑 | `app/.../ui/DeviceGroupsSheet.kt` |
-| 添加/编辑设备整页 | `app/.../ui/DeviceEditorScreen.kt` |
 | 控制器 | `app/.../core/LagoonController.kt` |
-| 通知/深链入口 | `app/.../system/NotificationActionReceiver.kt`、`app/.../ui/MainActivity.kt` |
 | 页面路由 | `app/.../ui/AppBackStack.kt`、`MainActivity.kt` |
 
-## 7. 验证
+## 8. 验证
 
-- `DeviceGroupTest` / `DeviceGroupProjectionTest`：v2 codec、只显示显式分组、未分组 profile、
-  全部聚合、角色推导。
-- `DeviceGroupStoreTest`：v1 只重置一次、v2 往返、损坏回退。
-- `DisabledProfileTest`：`enabled` 旧资料默认值/往返/凭据保留；禁用快照不进入首页和汇总；
-  单设备回退、全禁用空首页、设备组只统计启用成员；禁用 profile 即使被 `include` 也不拨号，
-  重新启用后恢复连接。
+- `DeviceProjectionTest`：一台设备多个 Harness、0 Harness、采纳规则、两级开关、发现槽位与过期。
+- `DeviceDiscoveryStoreTest`：往返、过期仍可读、损坏/未来版本拒绝覆盖、单设备清除。
+- `DeviceGroupTest` / `DeviceGroupStoreTest`：v3 设备成员、v2 兼容、v1 只重置一次。
+- `InformationArchitectureRegressionTest`：设备/ Harness 每一级都是路由，配置各归各位。
 - `ANDROID_HOME=/home/lvziw/Android/Sdk ./gradlew :app:testDebugUnitTest :app:assembleDebug`
   全量通过。
