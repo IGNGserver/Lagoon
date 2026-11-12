@@ -49,7 +49,8 @@ internal fun DeviceGroupsSheet(
   var selected by remember(initialGroupId) { mutableStateOf(editing?.memberIds?.toSet().orEmpty()) }
   var confirmingDelete by remember { mutableStateOf(false) }
   val opencodeMembers = state.profiles.filter { it.kind == ServerKind.OPENCODE }
-  val dshMembers = state.profiles.filter { it.kind != ServerKind.OPENCODE }
+  val dshMembers = state.profiles.filter { it.kind == ServerKind.DSH || it.kind == ServerKind.DSH_REMOTE }
+  val codexMembers = state.profiles.filter { it.kind == ServerKind.CODEX }
 
   HyperBottomSheet(
     title = if (editing != null) "编辑设备组" else "新建设备组",
@@ -79,6 +80,14 @@ internal fun DeviceGroupsSheet(
       if (dshMembers.isNotEmpty()) {
         item { HyperGroupTitle("DeepSeek Harness") }
         items(dshMembers, key = { "dsh:${it.id}" }) { profile ->
+          MemberRow(profile.name, profile.endpointSummary + if (profile.enabled) "" else " · 已禁用", profile.id in selected, profile.kind) {
+            selected = if (profile.id in selected) selected - profile.id else selected + profile.id
+          }
+        }
+      }
+      if (codexMembers.isNotEmpty()) {
+        item { HyperGroupTitle("Codex") }
+        items(codexMembers, key = { "codex:${it.id}" }) { profile ->
           MemberRow(profile.name, profile.endpointSummary + if (profile.enabled) "" else " · 已禁用", profile.id in selected, profile.kind) {
             selected = if (profile.id in selected) selected - profile.id else selected + profile.id
           }

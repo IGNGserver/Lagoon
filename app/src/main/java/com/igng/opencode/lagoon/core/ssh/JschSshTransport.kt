@@ -32,9 +32,18 @@ internal fun interface SshHostKeyVerifier {
 internal interface SshTransport : Closeable {
   val isClosed: Boolean
   fun exec(script: String, timeoutMillis: Long): RemoteExecResult
+  /** Open a long-lived, non-PTY exec channel. stdout and stderr remain separate. */
+  fun openExecChannel(script: String): SshExecChannel = throw UnsupportedOperationException("SSH streaming exec unavailable")
   fun openTunnel(host: String, port: Int, input: InputStream, output: OutputStream): TunnelConnection
   fun probeTunnel(host: String, port: Int, timeoutMillis: Long): Boolean
   fun ping(timeoutMillis: Long): Boolean
+}
+
+internal interface SshExecChannel : Closeable {
+  val stdin: OutputStream
+  val stdout: InputStream
+  val stderr: InputStream
+  val isOpen: Boolean
 }
 
 /** One live direct-tcpip channel. [isOpen] lets the local forwarder prune finished pairs.
@@ -210,6 +219,28 @@ private class VerifyingHostKeyRepository(
 
 private class JschSshTransport(private val session: Session) : SshTransport {
   override val isClosed: Boolean get() = !session.isConnected
+
+  override fun openExecChannel(script: String): SshExecChannel {
+    val channel = session.openChannel("exec") as ChannelExec
+    return try {
+      channel.setPty(false)
+      channel.setCommand(SshShell.loginShell(script))
+      val stdin = channel.outputStream
+      val stdout = channel.inputStream
+      val stderr = channel.extInputStream
+      channel.connect(15_000)
+      object : SshExecChannel {
+        override val stdin: OutputStream = stdin
+        override val stdout: InputStream = stdout
+        override val stderr: InputStream = stderr
+        override val isOpen: Boolean get() = channel.isConnected && !channel.isClosed
+        override fun close() { channel.disconnect() }
+      }
+    } catch (error: Exception) {
+      runCatching { channel.disconnect() }
+      throw SshFailure(SshFailureKind.OTHER, "无法打开 SSH 双向通道", retryable = true)
+    }
+  }
 
   override fun exec(script: String, timeoutMillis: Long): RemoteExecResult {
     val channel = session.openChannel("exec") as ChannelExec

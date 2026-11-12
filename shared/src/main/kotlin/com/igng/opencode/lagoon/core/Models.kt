@@ -44,6 +44,7 @@ data class ServerProfile(
       require(remoteServiceId.matches(Regex("[A-Za-z0-9][A-Za-z0-9._:-]{0,255}"))) { "原生 Remote 服务标识无效" }
     }
     require(kind != ServerKind.OPENCODE || remoteHostId == null || remoteServiceId != null) { "Remote OpenCode 必须指定原生服务" }
+    require(kind != ServerKind.CODEX || (sshHostId != null) != (remoteHostId != null)) { "Codex 必须绑定 SSH 或 Remote Host" }
   }
   val effectiveEnabled: Boolean get() = enabled && parentEnabled
 }

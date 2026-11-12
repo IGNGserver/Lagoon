@@ -17,7 +17,14 @@ class RemoteBackend internal constructor(
   private val release: () -> Unit = { session.close() }
 ) : AutoCloseable {
   private val closed = java.util.concurrent.atomic.AtomicBoolean(false)
-  private val harness: HarnessClient = if (nativeProfile != null) {
+  private val harness: HarnessClient = if (nativeProfile?.kind == ServerKind.CODEX) {
+    require(nativeProfile.remoteHostId != null)
+    // The event collector may fail during construction; never dereference the not-yet-assigned
+    // harness from its callback. Codex has no Remote terminal handles owned by this wrapper.
+    CodexApi(LazyRemoteCodexTransport(load = { session.codexTransport() }, releaseLease = {
+      if (closed.compareAndSet(false, true)) release()
+    }))
+  } else if (nativeProfile != null) {
     require(nativeProfile.kind == ServerKind.OPENCODE && nativeProfile.remoteHostId != null)
     val serviceId = requireNotNull(nativeProfile.remoteServiceId) { "尚未选择 Host 上的原生服务" }
     val carrier = LazyNativeHttpTransport(load = { session.nativeServiceTransport(serviceId) }, releaseLease = { close() })
@@ -91,7 +98,8 @@ class RemoteBackend internal constructor(
   internal suspend fun nativeServiceCatalog(): NativeServiceCatalog? = session.nativeServiceCatalog()
   internal suspend fun hostServices(): RemoteHostServices = RemoteHostServices(
     dshAvailable = session.capabilities().sessionFormat != null,
-    native = session.nativeServiceCatalog()
+    native = session.nativeServiceCatalog(),
+    codexAvailable = session.capabilities().supportsWorkspace("codex", "codex.appserver.v1")
   )
 
   internal suspend fun probe(): RemoteProbe {

@@ -22,17 +22,22 @@ internal fun RemoteNativeServicesSheet(
   sourceHost: RemoteHostMeta? = null,
   onDismiss: () -> Unit
 ) {
-  key(controller, profile.id, profile.url, profile.username, profile.remoteHostId, sourceCatalog?.signedOut) {
+  key(controller, profile.id, profile.url, profile.username, profile.remoteHostId, profile.remoteHostFingerprint,
+    sourceCatalog?.signedOut, sourceHost?.fingerprint) {
     val state by controller.state.collectAsState()
     var catalog by remember { mutableStateOf<NativeServiceCatalog?>(null) }
     var busy by remember { mutableStateOf(true) }
     var unsupported by remember { mutableStateOf(false) }
     var dshAvailable by remember { mutableStateOf(false) }
+    var codexAvailable by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     var refresh by remember { mutableIntStateOf(0) }
     val savedProfiles = state.profiles.filter { it.matchesNativeServiceHost(profile) }
     val savedDsh = state.profiles.firstOrNull { it.remoteServiceId == null && it.kind in setOf(ServerKind.DSH, ServerKind.DSH_REMOTE) &&
       it.remoteHostId == profile.remoteHostId && it.username.trim() == profile.username.trim() &&
+      runCatching { canonicalRemoteOrigin(it.url) == canonicalRemoteOrigin(profile.url) }.getOrDefault(false) }
+    val savedCodex = state.profiles.firstOrNull { it.kind == ServerKind.CODEX && it.remoteHostId == profile.remoteHostId &&
+      it.username.trim() == profile.username.trim() &&
       runCatching { canonicalRemoteOrigin(it.url) == canonicalRemoteOrigin(profile.url) }.getOrDefault(false) }
 
     LaunchedEffect(refresh) {
@@ -40,6 +45,7 @@ internal fun RemoteNativeServicesSheet(
       error = null
       unsupported = false
       dshAvailable = false
+      codexAvailable = false
       // A failed refresh must not leave an old descriptor selectable.
       catalog = null
       try {
@@ -48,6 +54,7 @@ internal fun RemoteNativeServicesSheet(
           else controller.remoteHostServices(profile.id)
         catalog = services.native
         dshAvailable = services.dshAvailable
+        codexAvailable = services.codexAvailable
         unsupported = catalog == null
       } catch (cancel: CancellationException) { throw cancel }
       catch (failure: Exception) { error = userFacingError(failure, "读取 Host 原生服务失败") }
@@ -101,6 +108,27 @@ internal fun RemoteNativeServicesSheet(
         }
         error?.let { message ->
           item { HyperInlineNotice(message = message, type = MiuixToastType.ERROR) }
+        }
+        item {
+          HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(vertical = 4.dp)) {
+            HyperRow(title = "Codex · App Server", summary = "由 Host 管理登录与权限；功能取决于 Host 声明的能力",
+              value = if (codexAvailable) "可用" else if (busy) "检测中" else "未声明")
+            val existingCodex = savedCodex
+            if (existingCodex != null) HyperSwitchRow(title = "启用 Codex", checked = existingCodex.enabled,
+              enabled = !busy && (codexAvailable || existingCodex.enabled),
+              summary = "停用不会删除远端会话", onCheckedChange = { setEnabled(existingCodex, it) })
+            else Row(Modifier.fillMaxWidth().padding(12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+              fun saveCodex(enabled: Boolean) {
+                try { controller.addRemoteCodexService(profile, enabled) }
+                catch (cancel: CancellationException) { throw cancel }
+                catch (failure: Exception) { error = userFacingError(failure, "保存 Codex 连接失败") }
+              }
+              HyperButton(text = "加入（停用）", enabled = !busy && codexAvailable, modifier = Modifier.weight(1f),
+                variant = HyperButtonVariant.SECONDARY, onClick = { saveCodex(false) })
+              HyperButton(text = "加入并启用", enabled = !busy && codexAvailable, modifier = Modifier.weight(1f),
+                onClick = { saveCodex(true) })
+            }
+          }
         }
         item {
           HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(vertical = 4.dp)) {

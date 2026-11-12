@@ -72,7 +72,9 @@ internal class AllServersOverview(
   /** A server stopped being monitored: its last snapshot must leave the global island count too. */
   private val onSnapshotRemoved: (String) -> Unit = {},
   private val remoteBackendFactory: RemoteBackendFactory? = null,
-  private val sshClientFactory: ((ServerProfile, ServerCredentials) -> HarnessClient)? = null
+  private val sshClientFactory: ((ServerProfile, ServerCredentials) -> HarnessClient)? = null,
+  /** Current conversation only belongs to the selected server, and can change during a read. */
+  private val selectedSession: () -> String? = { null }
 ) {
   private val jobs = mutableMapOf<String, Job>()
   private val locks = mutableMapOf<String, Mutex>()
@@ -90,6 +92,7 @@ internal class AllServersOverview(
   private val childDiscoveries = mutableMapOf<String, ChildDiscovery>()
   /** The collecting job of each server's live event stream, so it can be dropped on purpose. */
   private val liveStreams = mutableMapOf<String, Job>()
+  private val codexRetryDelays = mutableMapOf<String, Long>()
 
   /**
    * Ensures one monitor per effectively enabled server. A disabled profile or parent is never
@@ -98,8 +101,12 @@ internal class AllServersOverview(
    */
   fun start(profiles: List<ServerProfile>, include: Set<String> = emptySet()) {
     val wanted = profiles.filter { it.effectiveEnabled }
-    (jobs.keys - wanted.map { it.id }.toSet()).forEach(::remove)
-    wanted.forEach { profile ->
+    (jobs.keys - wanted.map { it.id }.toSet()).forEach { remove(it) }
+    wanted.forEach { startOne(it) }
+  }
+
+  /** Start just one owner so a failed Codex route never replaces unrelated devices. */
+  private fun startOne(profile: ServerProfile, preserveCodexRetry: Boolean = false, alreadyRemoved: Boolean = false) {
       val id = profile.id
       try { (store as? ConnectionRouteStore)?.runtimeRoute(profile) }
       catch (error: Exception) {
@@ -107,16 +114,16 @@ internal class AllServersOverview(
         remove(id)
         publish(ServerOverviewSnapshot(id, profile, connected = false, loading = false,
           error = userFacingError(error, "连接路由尚未提交")))
-        return@forEach
+        return
       }
       val config = profile to store.credentials(id)
       val previous = configurations[id]
       if (jobs[id]?.isActive == true && previous?.second == config.second &&
         previous.first.copy(name = "", autoConnect = true, notifications = true) == profile.copy(name = "", autoConnect = true, notifications = true)) {
         clients[id]?.setContentWatching(id == selectedServer())
-        return@forEach
+        return
       }
-      remove(id)
+      if (!alreadyRemoved) remove(id, preserveCodexRetry)
       configurations[id] = config
       ownerTokens[id] = Any()
       wakes[id] = Channel(Channel.CONFLATED)
@@ -124,7 +131,6 @@ internal class AllServersOverview(
       publish(ServerOverviewSnapshot(id, profile, notices = store.sessionNotices(id), loading = selectedServer() != id))
       firstReads += id
       jobs[id] = scope.launch { monitor(profile) }
-    }
   }
 
   fun restart(profiles: List<ServerProfile>) { start(profiles); refreshAll() }
@@ -230,7 +236,7 @@ internal class AllServersOverview(
     snapshots[snapshot.serverId] = snapshot
     onSnapshot(snapshot)
   }
-  private fun remove(id: String) {
+  private fun remove(id: String, preserveCodexRetry: Boolean = false) {
     jobs.remove(id)?.cancel(); wakes.remove(id)?.close(); approvers.remove(id)?.dispose()
     refreshWaiters.remove(id)?.forEach { it.complete(Unit) }
     reconnectHints.remove(id)?.close()
@@ -239,11 +245,12 @@ internal class AllServersOverview(
     handoffs.remove(id)
     childDiscoveries.remove(id)
     firstReads.remove(id)
+    if (!preserveCodexRetry) codexRetryDelays.remove(id)
     onSnapshotRemoved(id)
   }
 
   fun stop() {
-    jobs.keys.toList().forEach(::remove)
+    jobs.keys.toList().forEach { remove(it) }
   }
 
   private suspend fun monitor(profile: ServerProfile) {
@@ -365,7 +372,7 @@ internal class AllServersOverview(
           refresh()
         }
       }
-      launch {
+      launch streamLoop@{
         var retry = 1_000L
         while (isActive) {
           var restarted = false
@@ -375,13 +382,16 @@ internal class AllServersOverview(
               val stream = launch(start = CoroutineStart.LAZY) {
                 client.events(onOpen = {
                   scope.launch {
+                    if (clients[id] !== client || profile.kind == ServerKind.CODEX && client.isClosed) return@launch
                     snapshot = snapshot.copy(streamConnected = true)
-                    if (clients[id] !== client) return@launch
+                    if (profile.kind == ServerKind.CODEX) codexRetryDelays.remove(id)
                     emit(snapshot)
                     refresh(id)
                     onConnected(id)
                   }
                 }).collect { event ->
+                  // A superseded stream cannot mutate the replacement connection's state/cache.
+                  if (clients[id] !== client) return@collect
                   if (event.id.isNotBlank()) {
                     if (!seenEvents.add(event.id)) return@collect
                     while (seenEvents.size > 512) seenEvents.remove(seenEvents.first())
@@ -533,6 +543,22 @@ internal class AllServersOverview(
           liveStreams.remove(id, streamJob)
           snapshot = snapshot.copy(streamConnected = false)
           emit(snapshot)
+          if (profile.kind == ServerKind.CODEX && client.isClosed) {
+            // Retire the failed owner outside its own monitor job. The identity fence prevents a
+            // delayed failure from closing a replacement after profile edits, removal or reconnect.
+            val owner = ownerTokens[id]
+            val oldClient = client
+            val wait = codexRetryDelays[id] ?: 1_000L
+            codexRetryDelays[id] = (wait * 2).coerceAtMost(30_000L)
+            scope.launch {
+              delay(wait)
+              if (owner != null && ownerTokens[id] === owner && clients[id] === oldClient && oldClient.isClosed) {
+                remove(id, preserveCodexRetry = true)
+                startOne(profile, preserveCodexRetry = true, alreadyRemoved = true)
+              }
+            }
+            return@streamLoop
+          }
           if (restarted) { retry = 1_000L; continue }
           kotlinx.coroutines.withTimeoutOrNull(retry + kotlin.random.Random.nextLong(250)) { reconnectHints[id]?.receive() }
           retry = (retry * 2).coerceAtMost(30_000L)
@@ -577,6 +603,15 @@ internal class AllServersOverview(
         }
       } }
     }
+    // Remote Codex emits thread-specific events. Restore bounded subscriptions for active tasks;
+    // the client protects the currently selected conversation while retiring expired watches.
+    val codexMonitoring = if (profile.kind == ServerKind.CODEX && profile.remoteHostId != null && active != null)
+      attempt {
+        val activeSessions = active.mapNotNull(identityMap::get)
+        if (activeSessions.size != active.size) throw java.io.IOException("Codex 活动会话目录不完整，保留现有监听")
+        client.monitorCodexSessions(activeSessions) { if (selectedServer() == id) selectedSession() else null }
+      }
+    else Result.success(Unit)
     val oldTasks = previous.tasks + store.taskStates(id).filter { (sessionId, stored) ->
       previous.tasks[sessionId]?.let { old -> stored.since > old.since || (stored.finishedAt ?: 0) > (old.finishedAt ?: 0) } ?: true
     }
@@ -705,7 +740,7 @@ internal class AllServersOverview(
     // A session is running exactly when `session.active` says so, so only that read (and the root
     // catalog, which throws out of this function) can make the page "部分数据待同步". Directory-scoped
     // reads fail permanently for deleted worktrees and cannot all fit in one sweep.
-    val degraded = activeResult.isFailure
+    val degraded = activeResult.isFailure || codexMonitoring.isFailure
     if (degraded) Diagnostics.warn("AllServers", "服务器 ${profile.name} 部分状态读取失败")
     return reconcileWaiting(previous.copy(
       profile = profile,

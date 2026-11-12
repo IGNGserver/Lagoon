@@ -5,6 +5,7 @@ import kotlinx.coroutines.flow.Flow
 /** 一台已保存服务器使用的 harness 协议。 */
 enum class ServerKind(val wire: String, val label: String) {
   OPENCODE("opencode", "OpenCode"),
+  CODEX("codex", "Codex"),
   DSH("dsh", "DeepSeek Harness"),
   DSH_REMOTE("dsh-remote", "DSH Remote");
 
@@ -45,6 +46,9 @@ interface HarnessClient {
 
   suspend fun projects(): List<Project>
 
+  /** Explicit Codex project registration; null means that this harness has no such operation. */
+  suspend fun createCodexProject(path: String): Project? = null
+
   /** Fresh native OpenCode metadata, including archived projects; never local registrations. */
   suspend fun openCodeProjects(): List<OpenCodeProjectInfo>? = null
   suspend fun updateOpenCodeProject(expected: OpenCodeProjectInfo, edit: OpenCodeProjectEdit): OpenCodeProjectInfo? = null
@@ -81,6 +85,11 @@ interface HarnessClient {
   suspend fun projectAt(directory: String): Project?
 
   suspend fun rootSessionsPage(directory: String? = null, cursor: String? = null, size: Int = 100): ApiPage<Session>
+
+  /** Set or clear the selected Codex thread independently of read acknowledgements. */
+  suspend fun selectCodexSession(session: Session?) = Unit
+  /** Refresh the bounded Codex background subscription lease; selectedId is the live foreground target. */
+  suspend fun monitorCodexSessions(active: List<Session>, selectedId: () -> String?) = Unit
 
   suspend fun viewSession(session: Session, idle: Long)
 
@@ -394,7 +403,7 @@ fun createHarnessClient(
   sshClientFactory: ((ServerProfile, ServerCredentials) -> HarnessClient)? = null,
   /** Explicit caller-isolated direct DSH sharing. Raw constructors/default acquisition stay independent. */
   dshRegistry: DshClientRegistry? = null
-): HarnessClient = if (profile.remoteHostId != null && profile.kind == ServerKind.OPENCODE) {
+): HarnessClient = if (profile.remoteHostId != null && profile.kind in setOf(ServerKind.OPENCODE, ServerKind.CODEX)) {
   require(profile.sshHostId == null) { "同一个绑定不能混合 SSH 与 Remote carrier" }
   (remoteBackend ?: throw IllegalStateException("Host 原生服务 backend 尚未配置")).client
 } else if (profile.sshHostId != null) {
@@ -402,6 +411,7 @@ fun createHarnessClient(
   sshClientFactory?.invoke(profile, credentials) ?: throw IllegalStateException("SSH backend 尚未配置")
 } else when (profile.kind) {
   ServerKind.OPENCODE -> OpenCodeApi(profile, credentials, callTimeoutSeconds)
+  ServerKind.CODEX -> throw IllegalStateException("Codex 需要 SSH 或 Remote 连接")
   ServerKind.DSH -> dshRegistry?.acquire(profile, credentials, callTimeoutSeconds, onCookie)
     ?: DshApi(profile, credentials, callTimeoutSeconds, onCookie)
   ServerKind.DSH_REMOTE -> (remoteBackend ?: throw IllegalStateException("DSH Remote backend 尚未配置")).client

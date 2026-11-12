@@ -76,6 +76,7 @@ internal fun SshHostForm(
   val initialBindings = remember(initial?.id) { state.profiles.filter { initial != null && it.sshHostId == initial.id } }
   var useDsh by rememberSaveable(initial?.id) { mutableStateOf(initialBindings.any { it.kind == ServerKind.DSH && it.enabled } || initial == null) }
   var useOpenCode by rememberSaveable(initial?.id) { mutableStateOf(initialBindings.any { it.kind == ServerKind.OPENCODE && it.enabled }) }
+  var useCodex by rememberSaveable(initial?.id) { mutableStateOf(initialBindings.any { it.kind == ServerKind.CODEX && it.enabled }) }
   var registrationPath by rememberSaveable(initial?.id) { mutableStateOf((initialBindings.firstOrNull { it.kind == ServerKind.OPENCODE && it.enabled }
       ?: initialBindings.lastOrNull { it.kind == ServerKind.OPENCODE })?.sshServicePath.orEmpty()) }
   var discoverySummary by remember { mutableStateOf<String?>(null) }
@@ -220,12 +221,12 @@ internal fun SshHostForm(
     working = true
     result = null
     try {
-      if (!useDsh && !useOpenCode) {
+      if (!useDsh && !useOpenCode && !useCodex) {
         controller.saveSshSourceOnly(config, secrets())
         onSaved()
         return
       }
-      val selected = listOfNotNull(ServerKind.DSH.takeIf { useDsh }, ServerKind.OPENCODE.takeIf { useOpenCode })
+      val selected = listOfNotNull(ServerKind.DSH.takeIf { useDsh }, ServerKind.OPENCODE.takeIf { useOpenCode }, ServerKind.CODEX.takeIf { useCodex })
       selected.forEach { kind ->
         val existing = initialBindings.firstOrNull { it.kind == kind }
         controller.saveSshHost(
@@ -238,6 +239,7 @@ internal fun SshHostForm(
       }
       initialBindings.filter { binding ->
         (binding.kind == ServerKind.DSH && !useDsh) ||
+          (binding.kind == ServerKind.CODEX && !useCodex) ||
           (binding.kind == ServerKind.OPENCODE && (!useOpenCode ||
             binding.sshServicePath != registrationPath.trim().takeIf { it.isNotBlank() }))
       }.forEach { controller.setProfileEnabled(it.id, false) }
@@ -272,7 +274,7 @@ internal fun SshHostForm(
   }
 
   fun test() {
-    if (!useDsh && !useOpenCode) {
+    if (!useDsh && !useOpenCode && !useCodex) {
       result = "未选择 Harness；请使用只读发现测试 SSH，不会启动服务。"
       return
     }
@@ -283,8 +285,8 @@ internal fun SshHostForm(
         try {
           val message = controller.testSshHost(pinned, secrets(),
             onStatus = { status -> scope.launch { testStatus = status } },
-            harnessKind = if (useOpenCode && !useDsh) ServerKind.OPENCODE else ServerKind.DSH,
-            registrationPath = registrationPath.trim().takeIf { it.isNotBlank() })
+            harnessKind = if (useDsh) ServerKind.DSH else if (useOpenCode) ServerKind.OPENCODE else ServerKind.CODEX,
+            registrationPath = registrationPath.trim().takeIf { useOpenCode && it.isNotBlank() })
           result = message
           hostKeyType = pinned.hostKeyType.orEmpty()
           hostKeyFingerprint = pinned.hostKeyFingerprint.orEmpty()
@@ -490,6 +492,10 @@ internal fun SshHostForm(
       HyperSwitchRow(title = "OpenCode", summary = "只附着已运行的官方服务，不会安装、启动或终止进程",
         checked = useOpenCode, onCheckedChange = { useOpenCode = it }, enabled = !working)
     }
+    item {
+      HyperSwitchRow(title = "Codex", summary = "通过 SSH 连接开发机上的 Codex App Server，使用该主机的登录状态",
+        checked = useCodex, onCheckedChange = { useCodex = it }, enabled = !working)
+    }
     if (useOpenCode) item {
       TextField(value = registrationPath, onValueChange = { registrationPath = it },
         label = "OpenCode 注册文件（留空使用 XDG 默认位置）", modifier = Modifier.fillMaxWidth())
@@ -503,7 +509,9 @@ internal fun SshHostForm(
             scope.launch {
               try {
                 val found = controller.discoverSshHarnesses(pinned, secrets(), registrationPath.trim().takeIf { it.isNotBlank() })
-                discoverySummary = "OpenCode 注册：${found.openCode.state} · DSH 旧接入标记：${found.dshLegacy.state}\n发现不会启动服务；运行与身份会在连接时验证。"
+                val codex = controller.discoverSshCodex(pinned, secrets())
+                val codexStatus = when (codex.installed) { true -> codex.version ?: "已安装（版本未知）"; false -> "未安装"; null -> "未知" }
+                discoverySummary = "OpenCode 注册：${found.openCode.state} · DSH 旧接入标记：${found.dshLegacy.state}\nCodex：$codexStatus\n发现不会启动服务；运行与身份会在连接时验证。"
                 hostKeyType = pinned.hostKeyType.orEmpty()
                 hostKeyFingerprint = pinned.hostKeyFingerprint.orEmpty()
               } catch (cancel: CancellationException) { throw cancel }
@@ -605,9 +613,9 @@ internal fun SshHostForm(
       item {
         Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
           HyperButton(
-            text = if (useDsh) "测试 DSH（可能启动 dsh web）" else "测试 OpenCode 接入",
+            text = if (useDsh) "测试 DSH（可能启动 dsh web）" else if (useOpenCode) "测试 OpenCode 接入" else "测试 Codex 接入",
             variant = HyperButtonVariant.SECONDARY,
-            enabled = !working && (useDsh || useOpenCode),
+            enabled = !working && (useDsh || useOpenCode || useCodex),
             loading = working,
             onClick = { test() },
             modifier = Modifier.fillMaxWidth()

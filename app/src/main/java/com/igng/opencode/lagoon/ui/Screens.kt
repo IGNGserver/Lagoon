@@ -116,6 +116,7 @@ internal fun MiuixServerForm(
   var name by rememberSaveable(existing?.id) { mutableStateOf(existing?.name ?: "") }
   var url by remember(existing?.id) { mutableStateOf(existing?.url ?: "") }
   var harness by rememberSaveable(existing?.id) { mutableStateOf(fixedKind ?: existing?.kind ?: ServerKind.OPENCODE) }
+  val directKinds = ServerKind.entries.filter { it != ServerKind.CODEX }
   val isDsh = harness == ServerKind.DSH
   var dshAuth by rememberSaveable(existing?.id) { mutableStateOf(existing?.dshAuth ?: DshAuthMode.TOKEN) }
   var remoteAccount by rememberSaveable(existing?.id) { mutableStateOf(existing?.username ?: "") }
@@ -139,10 +140,10 @@ internal fun MiuixServerForm(
     Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
       if (fixedKind == null) HyperDropdownRow(
         title = "服务类型",
-        items = ServerKind.entries.map { it.label },
-        selectedIndex = ServerKind.entries.indexOf(harness),
+        items = directKinds.map { it.label },
+        selectedIndex = directKinds.indexOf(harness),
         onSelectedIndexChange = { index ->
-          harness = ServerKind.entries[index]
+          harness = directKinds[index]
           if (name.isBlank()) name = "我的 ${harness.label}"
         }
       )
@@ -222,10 +223,10 @@ internal fun MiuixServerForm(
     if (fixedKind == null) item {
       HyperDropdownRow(
         title = "服务类型",
-        items = ServerKind.entries.map { it.label },
-        selectedIndex = ServerKind.entries.indexOf(harness),
+        items = directKinds.map { it.label },
+        selectedIndex = directKinds.indexOf(harness),
         onSelectedIndexChange = { index ->
-          harness = ServerKind.entries[index]
+          harness = directKinds[index]
           if (name.isBlank()) name = "我的 ${harness.label}"
           if (harness == ServerKind.DSH) username = "dsh"
         }

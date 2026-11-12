@@ -2754,6 +2754,16 @@ class DshApi(
           records.filter { baseline == 0L || it.obj("event").optLong("seq") <= baseline }
             .forEach { projection.process(it) }
         }
+        if (baseline == 0L) {
+          // The next frame can be processed before messagesPage resumes from snapshot.await(),
+          // especially while it loads attachments. Seed the actual covered log records here so
+          // that a later live frame can detect and repair a gap instead of jumping from zero.
+          // Do not infer coverage from the cursor when the snapshot contains no records.
+          val covered = frame.arr("records").objects().mapNotNull {
+            exactDshSequence(it.obj("event").opt("seq"))?.takeIf { seq -> seq > 0 }
+          }.maxOrNull()
+          advanceSeq(session.id, covered)
+        }
         if (!state.snapshot.isCompleted) state.snapshot.complete(frame)
         // 重连/重同步：只补投时间线还没有的耐久记录，避免整页重复。
         if (baseline > 0) {

@@ -26,6 +26,7 @@ data class ConnectionRouteSnapshot internal constructor(
     id = bindingId, url = endpoint, allowCleartext = allowCleartext, username = username,
     kind = when (protocolId) {
       HarnessProtocolId.OPENCODE_NATIVE -> ServerKind.OPENCODE
+      HarnessProtocolId.CODEX_APP_SERVER -> ServerKind.CODEX
       HarnessProtocolId.DSH_TYPERT -> if (carrierId == ConnectionCarrierId.REMOTE_NOISE) ServerKind.DSH_REMOTE else ServerKind.DSH
     }, dshAuth = dshAuth, sshHostId = sshHostId, sshServicePath = sshServicePath,
     remoteHostId = remoteHostId, remoteHostFingerprint = fingerprint, remoteServiceId = remoteServiceId
@@ -113,6 +114,7 @@ internal fun createRoutedHarnessClient(
     ConnectionCarrierId.SSH_FORWARD -> (sshFactory ?: error("SSH carrier 尚未配置"))(profile, credentials)
     ConnectionCarrierId.DIRECT_HTTP -> when (route.protocolId) {
       HarnessProtocolId.OPENCODE_NATIVE -> OpenCodeApi(profile, credentials, callTimeoutSeconds)
+      HarnessProtocolId.CODEX_APP_SERVER -> error("Codex 需要 SSH 或 Remote 连接")
       HarnessProtocolId.DSH_TYPERT -> dshRegistry?.acquire(profile, credentials, callTimeoutSeconds, onCookie)
          ?: DshApi(profile, credentials, callTimeoutSeconds, onCookie)
     }

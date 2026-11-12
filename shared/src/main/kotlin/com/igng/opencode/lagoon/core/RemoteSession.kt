@@ -28,7 +28,7 @@ internal class RemoteSession(
   @Volatile private var lastFailure: RemoteFailureException? = null
   private val statusFlow = MutableStateFlow(RemoteConnectionStatus(hostId = hostId))
   private data class Active(val connection: RemoteConnection, val gateway: RemoteGateway, val capabilities: RemoteCapabilities,
-    val nativeServices: RemoteNativeServices)
+    val nativeServices: RemoteNativeServices, val codex: RemoteCodexRegistry)
 
   /** Observable connection state; UI and the doctor report read this instead of inferring from data. */
   internal val status: StateFlow<RemoteConnectionStatus> = statusFlow.asStateFlow()
@@ -46,6 +46,13 @@ internal class RemoteSession(
 
   suspend fun gateway(): RemoteGateway = ensure().gateway
   suspend fun capabilities(): RemoteCapabilities = ensure().capabilities
+  /** Lease a Codex carrier bound to the exact current authenticated connection. */
+  internal suspend fun codexTransport(): CodexTransport {
+    val current = ensure()
+    if (!current.capabilities.supportsWorkspace("codex", "codex.appserver.v1"))
+      throw RemoteFailureException(RemoteFailureKind.INCOMPATIBLE, "Host 未启用或不支持 Codex", retryable = false)
+    return current.codex.acquire()
+  }
   /** Synchronous UI projection only; actual terminal requests recheck their pinned carrier. */
   internal fun terminalAvailable(): Boolean = active?.let { !closed && !it.connection.isClosed && it.capabilities.hasTerminal } == true
   internal suspend fun terminalGateway(): RemoteGateway {
@@ -108,6 +115,7 @@ internal class RemoteSession(
     if (closed) { publishClosed(); throw IOException("Remote 会话已关闭") }
     active?.takeUnless { it.connection.isClosed }?.let { return@withLock it }
     active?.nativeServices?.close()
+    active?.codex?.close()
     active?.gateway?.close()
     active = null
     val recent = lastFailure
@@ -153,10 +161,13 @@ internal class RemoteSession(
     }
     var gateway: RemoteGateway? = null
     var nativeServices: RemoteNativeServices? = null
+    var codex: RemoteCodexRegistry? = null
     statusFlow.value = statusFlow.value.copy(phase = RemotePhase.HANDSHAKING)
     val connection = try {
       RemoteConnection.connect(address, device.identity, token, host, key, allowCleartext, clientVersion) {
-        if (it.optString("event") == "harness.services.frame") {
+        if (it.optString("event").startsWith("codex.app.")) {
+          (codex ?: throw IOException("Codex 事件早于能力协商")).event(it)
+        } else if (it.optString("event") == "harness.services.frame") {
           (nativeServices ?: throw IOException("原生服务事件早于能力协商")).event(it)
         } else (gateway ?: throw IOException("Remote 事件早于能力协商")).event(it)
       }
@@ -175,8 +186,10 @@ internal class RemoteSession(
       gateway = nextGateway
       val nextNative = RemoteNativeServices({ method, params -> connection.call(method, params) })
       nativeServices = nextNative
-      Active(connection, nextGateway, capabilities, nextNative).also { current ->
-        if (closed) { nextNative.close(); nextGateway.close(); connection.close(); throw IOException("Remote 会话已关闭") }
+      val nextCodex = RemoteCodexRegistry("codex.appserver.transfer.v1" in capabilities.capabilities) { method, params -> connection.call(method, params) }
+      codex = nextCodex
+      Active(connection, nextGateway, capabilities, nextNative, nextCodex).also { current ->
+        if (closed) { nextCodex.close(); nextNative.close(); nextGateway.close(); connection.close(); throw IOException("Remote 会话已关闭") }
         active = current
         lastFailure = null
         failedAt = 0L
@@ -188,6 +201,7 @@ internal class RemoteSession(
           lastError = null)
         SharedHttp.ioScope.launch {
           connection.awaitClosed()
+          nextCodex.close()
           nextNative.close()
           nextGateway.close()
           if (!closed && active?.connection === connection) {
@@ -283,6 +297,7 @@ internal class RemoteSession(
     closed = true
     publishClosed()
     active?.nativeServices?.close()
+    active?.codex?.close()
     active?.gateway?.close()
     active?.connection?.close()
     active = null

@@ -11,7 +11,7 @@ enum class ConnectionSourceType(val wire: String) { HUB("hub"), SSH("ssh"), DIRE
   companion object { fun fromWire(value: String): ConnectionSourceType = entries.firstOrNull { it.wire == value }
     ?: throw IllegalArgumentException("Unknown connection source: $value") }
 }
-enum class HarnessProtocolId(val wire: String) { OPENCODE_NATIVE("opencode-native"), DSH_TYPERT("dsh-typert");
+enum class HarnessProtocolId(val wire: String) { OPENCODE_NATIVE("opencode-native"), DSH_TYPERT("dsh-typert"), CODEX_APP_SERVER("codex-app-server");
   companion object { fun fromWire(value: String): HarnessProtocolId = entries.firstOrNull { it.wire == value }
     ?: throw IllegalArgumentException("Unknown harness protocol: $value") }
 }
@@ -284,6 +284,7 @@ object MigrationProjection {
     ?: throw IllegalArgumentException("Unknown legacy harness kind: $wire")
   fun protocol(kind: ServerKind): HarnessProtocolId = when (kind) {
     ServerKind.OPENCODE -> HarnessProtocolId.OPENCODE_NATIVE
+    ServerKind.CODEX -> HarnessProtocolId.CODEX_APP_SERVER
     ServerKind.DSH, ServerKind.DSH_REMOTE -> HarnessProtocolId.DSH_TYPERT
   }
   fun sourceType(profile: ServerProfile): ConnectionSourceType = when {

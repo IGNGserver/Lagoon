@@ -100,6 +100,7 @@ internal fun DraftDestinationSheet(
             insidePadding = PaddingValues(0.dp)
           ) {
             ChoiceRow("浏览服务器目录…", "添加为本机工作区", false) { controller.openDirectoryBrowser() }
+            CodexProjectRegistrationRow(state, controller)
           }
         }
       } else {

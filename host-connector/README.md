@@ -149,3 +149,41 @@ credentials through Remote RPC parameters. Each accepted, trusted connection own
 its own peer and handles; disconnect only cancels that peer's operations, never
 stops the externally running native service. See [the protocol](<../docs/NATIVE_SERVICE_PROTOCOL.md>)
 for the wire contract and limits.
+
+### Optional Codex interoperability smoke test
+
+This opt-in test runs Lagoon's Kotlin Noise carrier against the pinned bb33
+upstream Codex router and a local `codex app-server`. It creates a temporary,
+isolated `HOME`, `CODEX_HOME`, workspace, and dummy API key under
+`BUILD_SCRATCH_ROOT`, and cleans that temporary state after the test. It does
+not send a prompt or run a model. The relay and Android runtime are test doubles;
+this does not validate a deployed Host, physical device, real account, or inference.
+It is skipped unless both opt-in variables are set.
+
+Requirements: Node.js 20+, npm, curl, a `codex` executable (tested with 0.167.2),
+JDK and Android SDK. Run from a scratch copy, with 20 GiB free first; for example,
+from the repository worktree:
+
+```sh
+export BUILD_SCRATCH_ROOT="${BUILD_SCRATCH_ROOT:-$HOME/.build}"
+df -h "$BUILD_SCRATCH_ROOT"
+mkdir -p "$BUILD_SCRATCH_ROOT/Lagoon/codex-smoke/tools" "$BUILD_SCRATCH_ROOT/Lagoon/codex-smoke/source"
+rsync -a --exclude=.git --exclude=.gradle --exclude=build ./ "$BUILD_SCRATCH_ROOT/Lagoon/codex-smoke/source/"
+cd "$BUILD_SCRATCH_ROOT/Lagoon/codex-smoke/source"
+cp host-connector/toolchain/package*.json "$BUILD_SCRATCH_ROOT/Lagoon/codex-smoke/tools/"
+npm ci --prefix "$BUILD_SCRATCH_ROOT/Lagoon/codex-smoke/tools" --ignore-scripts --no-audit --no-fund
+curl -fL 'https://codeload.github.com/liguobao/ds-harness-remote/tar.gz/bb33f0a6eb676b61f40a9bbf7d365e8a5e93b81b' -o "$BUILD_SCRATCH_ROOT/Lagoon/codex-smoke/upstream.tar.gz"
+node host-connector/test/build-codex-smoke.mjs \
+  --archive "$BUILD_SCRATCH_ROOT/Lagoon/codex-smoke/upstream.tar.gz" \
+  --tools "$BUILD_SCRATCH_ROOT/Lagoon/codex-smoke/tools/node_modules" \
+  --out "$BUILD_SCRATCH_ROOT/Lagoon/codex-smoke/fixture"
+LAGOON_CODEX_E2E_ROOT="$BUILD_SCRATCH_ROOT/Lagoon/codex-smoke/fixture" \
+LAGOON_CODEX_E2E_BINARY="$(command -v codex)" \
+GRADLE_USER_HOME="$BUILD_SCRATCH_ROOT/gradle-user-home" \
+ANDROID_HOME="<your Android SDK>" \
+./gradlew :app:testDebugUnitTest --tests '*RemoteCodexOfficialSmokeTest'
+```
+
+The fixture builder checks the archive SHA-256 and refuses an existing output
+folder. Reuse the fixture for subsequent tests, or choose a new output folder.
+The CLI binary is executed locally: only use a trusted installation.

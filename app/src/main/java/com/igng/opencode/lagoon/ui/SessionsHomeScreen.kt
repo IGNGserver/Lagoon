@@ -63,7 +63,7 @@ internal fun HomeScreen(
   var searching by rememberSaveable { mutableStateOf(false) }
   var query by rememberSaveable(state.allServers, state.serverId, state.homeGroupId) { mutableStateOf("") }
   var renaming by remember { mutableStateOf<Session?>(null) }
-  var deleting by remember { mutableStateOf<Session?>(null) }
+  var deleting by remember { mutableStateOf<DeleteSessionTarget?>(null) }
   val hasUnread = state.homeUnseenSessions().isNotEmpty()
   val serverReadCount = state.homeReadSnapshots().values.sumOf { it.serverReadCandidates().size }
   val groupWorkspaces = remember(state.sessions, state.projects, state.homeGroupId) {
@@ -144,7 +144,9 @@ internal fun HomeScreen(
       Box(Modifier.weight(1f).fillMaxWidth()) {
         SessionList(
           state, controller, grouping, query.trim(), onOpen, onNewSession, onManageDevices,
-          onRename = { renaming = it }, onDelete = { deleting = it }
+          onRename = { renaming = it }, onDelete = { session ->
+            deleting = state.server?.let { DeleteSessionTarget(it, session.id, session.displayTitle()) }
+          }
         )
       }
     }
@@ -171,15 +173,15 @@ internal fun HomeScreen(
     ServerContentSearchPanel(state, controller, captured, onDismiss = { contentSearchTarget = null }, onOpen = onOpen)
   }
   renaming?.let { session -> RenameSessionDialog(state, controller, session) { renaming = null } }
-  deleting?.let { session ->
+  deleting?.let { target ->
     SuperDialog(title = "删除此会话？", show = true, onDismissRequest = { if (!state.pending("delete")) deleting = null }) {
       Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text("会话消息将从服务器永久删除。\n${session.displayTitle()}")
+        Text("${target.warning()}\n${target.title}")
         state.resource("action:delete").takeIf { it.state == ResourceState.ERROR }?.error?.let {
           HyperInlineNotice(message = it, type = MiuixToastType.ERROR)
         }
-        DialogActions("取消", { deleting = null }, if (state.pending("delete")) "删除中…" else "永久删除", !state.pending("delete"), danger = true) {
-          controller.deleteSession(session.id) { deleting = null }
+        DialogActions("取消", { deleting = null }, if (state.pending("delete")) "删除中…" else "永久删除", !state.pending("delete") && target.matches(state), danger = true) {
+          controller.deleteSession(target.sessionId, expected = target) { deleting = null }
         }
       }
     }
