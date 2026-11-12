@@ -164,7 +164,9 @@ data class ConnectionGraph(
     val binding = bindings.firstOrNull { it.id == bindingId } ?: return false
     val host = hosts.firstOrNull { it.id == binding.hostBindingId } ?: return false
     val source = sources.firstOrNull { it.id == host.sourceId } ?: return false
-    return source.enabled && host.enabled && binding.enabled
+    // An SSH source is one saved config and one device: the device switch carries its intent, so the
+    // source-level flag is never a second gate (see docs/DEVICE_MODEL.md).
+    return (source.enabled || source.type == ConnectionSourceType.SSH) && host.enabled && binding.enabled
   }
   fun compositionBindings(compositionId: String, enabledOnly: Boolean = false): List<HarnessBinding> {
     val members = compositions.firstOrNull { it.id == compositionId }?.bindingIds.orEmpty().distinct()

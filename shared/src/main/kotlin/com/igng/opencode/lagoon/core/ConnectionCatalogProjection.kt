@@ -75,10 +75,19 @@ internal object ConnectionCatalogProjection {
     val signedOutSources = remoteCatalogs.filter { it.signedOut }.mapTo(HashSet()) {
       MigrationProjection.hubSourceId(it.origin, it.account)
     }
+    // An SSH source is one config per device, so it never carries a second gate. A legacy disabled
+    // SSH source keeps its meaning by moving the denial down to the device, once.
+    val disabledSshSources = oldSources.values
+      .filter { it.type == ConnectionSourceType.SSH && !it.enabled }
+      .mapTo(HashSet()) { it.id }
     val mergedSources = sources.values.map { source ->
       val old = oldSources[source.id]?.takeIf { sameSourceScope(source, it) }
-      if (source.id in signedOutSources) source.copy(enabled = false)
-      else if (old == null) source else source.copy(enabled = old.enabled)
+      when {
+        source.type == ConnectionSourceType.SSH -> source.copy(enabled = true)
+        source.id in signedOutSources -> source.copy(enabled = false)
+        old == null -> source
+        else -> source.copy(enabled = old.enabled)
+      }
     }
     val mergedHosts = hosts.values.map { host ->
       val source = requireNotNull(sources[host.sourceId])
@@ -87,7 +96,11 @@ internal object ConnectionCatalogProjection {
         it.sourceId == host.sourceId && it.externalHostId == host.externalHostId &&
           oldSource != null && sameSourceScope(source, oldSource)
       }
-      if (old == null) host else host.copy(enabled = old.enabled)
+      when {
+        host.sourceId in disabledSshSources && host.enabled -> host.copy(enabled = false)
+        old == null -> host
+        else -> host.copy(enabled = old.enabled)
+      }
     }
     return ConnectionGraph(mergedSources, mergedHosts, projected.bindings, projected.compositions)
   }

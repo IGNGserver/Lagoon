@@ -43,8 +43,11 @@ object ConnectionRuntimeProjection {
       val boundSource = boundHost?.let { sources[it.sourceId] }
       val exactParentsMatch = boundHost != null && boundSource != null &&
         sameSourceScope(boundSource, expectedSource) && sameHostScope(boundHost, expectedHost, expectedSource.type)
-      val exactParentsEnabled = !exactParentsMatch || (boundSource!!.enabled && boundHost!!.enabled)
-      profile.copy(parentEnabled = source?.enabled != false && host?.enabled != false && exactParentsEnabled)
+      val exactParentsEnabled = !exactParentsMatch ||
+        ((boundSource!!.enabled || boundSource.type == ConnectionSourceType.SSH) && boundHost!!.enabled)
+      // SSH is one config per device: the device switch is the only gate, never the source flag.
+      val sourceEnabled = expectedSource.type == ConnectionSourceType.SSH || source?.enabled != false
+      profile.copy(parentEnabled = sourceEnabled && host?.enabled != false && exactParentsEnabled)
     }
   }
 
