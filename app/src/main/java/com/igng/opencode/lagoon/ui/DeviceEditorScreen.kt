@@ -74,7 +74,15 @@ internal fun DeviceEditorScreen(
       val existing = state.profiles.firstOrNull { it.id == profileId }
       // 设备在别处被删除：这一层已无内容，退回上一层，而不是留一张空白页在栈上。
       if (existing == null) LaunchedEffect(profileId) { onBack() }
-      else ProfileEditorPage(
+      else if (existing.kind == ServerKind.CODEX) Column(Modifier.fillMaxSize().background(HyperTheme.colors.canvas)) {
+        PageTopBar(title = "Codex 连接", onBack = onBack)
+        Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+          Text("${existing.name} · Codex", style = MiuixTheme.textStyles.body1)
+          Text("通过所属接入源管理此连接和主机配置。", style = MiuixTheme.textStyles.footnote2)
+          HyperButton(text = if (existing.sshHostId != null) "管理 SSH 主机" else "管理远程中枢",
+            onClick = { existing.sshHostId?.let(onEditSsh) ?: onManageHub() })
+        }
+      } else ProfileEditorPage(
         state = state,
         controller = controller,
         existing = existing,
@@ -263,6 +271,7 @@ private fun ProfileEditorPage(
   val title = when (existing.kind) {
     ServerKind.DSH_REMOTE -> "DSH 远程主机详情"
     ServerKind.OPENCODE -> "编辑 OpenCode 直连"
+    ServerKind.CODEX -> "Codex 连接详情"
     ServerKind.DSH -> if (existing.sshHostId != null) "编辑 SSH 直连设备" else "编辑 DeepSeek Harness"
   }
 
@@ -303,6 +312,7 @@ private fun ProfileEditorPage(
               }
               val label = when (actualProfile.kind) {
                 ServerKind.OPENCODE -> "OpenCode 直连"
+                ServerKind.CODEX -> "Codex"
                 ServerKind.DSH_REMOTE -> "DSH 远程中枢"
                 ServerKind.DSH -> if (actualProfile.sshHostId != null) "DSH SSH 直连" else "DeepSeek Harness"
               }

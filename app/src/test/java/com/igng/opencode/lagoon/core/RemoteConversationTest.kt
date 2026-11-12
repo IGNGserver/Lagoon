@@ -74,8 +74,8 @@ class RemoteConversationTest {
         assertTrue(runCatching { backend.client.terminals(owner) }.isFailure)
         assertTrue(runCatching { backend.client.createTerminal(owner) }.isFailure)
         assertTrue(runCatching { backend.client.attachTerminal(owner, "terminal") }.isFailure)
-        assertTrue(host.rpcCalls.none { it.optString("method").startsWith("terminal/") || it.toString().contains("terminal/attach") })
-        assertTrue(host.streamOpens.none { it.optString("endpoint").startsWith("terminal/") })
+        assertTrue(synchronized(host.rpcCalls) { host.rpcCalls.none { it.optString("method").startsWith("terminal/") || it.toString().contains("terminal/attach") } })
+        assertTrue(synchronized(host.streamOpens) { host.streamOpens.none { it.optString("endpoint").startsWith("terminal/") } })
       } finally { backend.close(); session.close() }
     }
   }
@@ -330,8 +330,8 @@ class RemoteConversationTest {
         assertTrue("hasMore 必须变成 older cursor", page.next != null)
         val older = backend.client.messagesPage(id, page.next, HarnessClient.HISTORY_PAGE)
         assertTrue(older.items.isEmpty())
-        val request = host.rpcCalls.last { it.getString("method") == "harness.remote.call" &&
-          it.getJSONObject("params").getString("endpoint") == "session/page" }
+        val request = synchronized(host.rpcCalls) { host.rpcCalls.last { it.getString("method") == "harness.remote.call" &&
+          it.getJSONObject("params").getString("endpoint") == "session/page" } }
           .getJSONObject("params").getJSONObject("payload").getJSONObject("args").getJSONObject("request")
         assertEquals(HarnessClient.HISTORY_PAGE, request.getInt("maxMessages"))
         assertEquals(50, request.getJSONObject("turnWindow").getInt("minMessages"))
@@ -400,7 +400,7 @@ class RemoteConversationTest {
       try {
         val page = backend.client.messagesPage(id)
         assertEquals(2, page.items.size)
-        assertTrue("应打开过独立 Relay 数据通道", host.requests.any { it.startsWith("GET /relay/v1") })
+        assertTrue("应打开过独立 Relay 数据通道", synchronized(host.requests) { host.requests.any { it.startsWith("GET /relay/v1") } })
       } finally { backend.close(); session.close() }
     }
   }
@@ -475,9 +475,9 @@ class RemoteConversationTest {
           .put("data", JSONObject().put("turn", 1).put("step", 9)
             .put("message", JSONObject().put("role", "assistant")
               .put("content", JSONArray().put(JSONObject().put("type", "text").put("text", "最新一步")))))))
-        fun pageCalls() = host.rpcCalls.filter {
+        fun pageCalls() = synchronized(host.rpcCalls) { host.rpcCalls.filter {
           it.optString("method") == "harness.remote.call" && it.optJSONObject("params")?.optString("endpoint") == "session/page"
-        }
+        } }
         withTimeout(5_000) { while (pageCalls().isEmpty()) delay(20) }
         val request = pageCalls().first()
           .getJSONObject("params").getJSONObject("payload").getJSONObject("args").getJSONObject("request")
@@ -520,7 +520,7 @@ class RemoteConversationTest {
         delay(500)
         backend.client.rootSessionsPage()
         delay(700)
-        val follows = host.streamOpens.filter { it.optString("endpoint") == "session/follow" }
+        val follows = synchronized(host.streamOpens) { host.streamOpens.filter { it.optString("endpoint") == "session/follow" } }
         println("REMOTE running-only follows=${follows.size} total=${host.streamOpens.size}")
         assertEquals("只为运行中的 3 个会话开 follow", 3, follows.size)
         collector.cancelAndJoin()
@@ -557,7 +557,7 @@ class RemoteConversationTest {
         delay(700)
         backend.client.rootSessionsPage()
         delay(500)
-        val opens = host.streamOpens.map { it.optString("endpoint") }
+        val opens = synchronized(host.streamOpens) { host.streamOpens.map { it.optString("endpoint") } }
         println("REMOTE saturation opens=$opens")
         assertTrue("核心事件流应能打开", "\$events" in opens)
         assertTrue("工作区流应能打开", "workspace/follow" in opens)

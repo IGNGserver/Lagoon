@@ -44,6 +44,7 @@ data class ServerProfile(
       require(remoteServiceId.matches(Regex("[A-Za-z0-9][A-Za-z0-9._:-]{0,255}"))) { "原生 Remote 服务标识无效" }
     }
     require(kind != ServerKind.OPENCODE || remoteHostId == null || remoteServiceId != null) { "Remote OpenCode 必须指定原生服务" }
+    require(kind != ServerKind.CODEX || (sshHostId != null) != (remoteHostId != null)) { "Codex 必须绑定 SSH 或 Remote Host" }
   }
   val effectiveEnabled: Boolean get() = enabled && parentEnabled
 }
@@ -163,7 +164,9 @@ data class PermissionRequest(
   val detail: String,
   val always: List<String> = emptyList(),
   val toolMessageId: String = "",
-  val toolCallId: String = ""
+  val toolCallId: String = "",
+  /** This grant requires opening the full request and an explicit decision for this request. */
+  val manualOnly: Boolean = false
 )
 data class QuestionOption(val label: String, val description: String, val value: String = label)
 data class QuestionPrompt(
@@ -514,7 +517,8 @@ internal fun JSONObject.toPermission(directory: String): PermissionRequest {
   val source = obj("source")
   return PermissionRequest(
     str("id"), str("sessionID"), directory, str("action"), detail,
-    arr("save").strings(), source.str("messageID"), source.str("id")
+    arr("save").strings(), source.str("messageID"), source.str("id"),
+    manualOnly = optBoolean("manualOnly", false)
   )
 }
 /**

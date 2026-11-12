@@ -1848,6 +1848,73 @@ class DshApiTest {
     }
   }
 
+  @Test fun followRepairsGapWhileSnapshotAttachmentIsStillLoading() = runBlocking {
+    val records = JSONArray().put(event("turn/start", 1, 1001, JSONObject().put("turn", 1)))
+      .put(event("user/message", 2, 1002, JSONObject().put("id", "u").put("source", JSONObject().put("kind", "user"))
+        .put("content", JSONArray().put(JSONObject().put("type", "image")
+          .put("attachment", JSONObject().put("attachmentId", "fixture-image").put("mediaType", "image/png"))))))
+    val missing = JSONArray().put(event("step/start", 3, 1003, JSONObject().put("turn", 1).put("step", 1)))
+      .put(event("tool/call", 4, 1004, JSONObject().put("turn", 1).put("step", 1).put("callId", "c")
+        .put("name", "bash").put("arguments", "{\"command\":\"pwd\"}")))
+    val attachmentRequested = CountDownLatch(1)
+    val repairRequested = CountDownLatch(1)
+    val releaseAttachment = CountDownLatch(1)
+    val requestSeen = kotlinx.coroutines.CompletableDeferred<JSONObject>()
+    MockWebServer().use { server ->
+      server.dispatcher = object : Dispatcher() {
+        override fun dispatch(request: RecordedRequest): MockResponse = when {
+          request.path.orEmpty().startsWith("/?token") || request.path == "/" -> rootOk()
+          request.path == "/api/session/list" -> envelope("{\"items\":[${sessionRow(running = true)}]}")
+          request.path == "/api/session/attachment" -> {
+            attachmentRequested.countDown()
+            releaseAttachment.await(4, TimeUnit.SECONDS)
+            envelope("{\"data\":\"eA==\"}")
+          }
+          request.path == "/api/session/page" -> {
+            requestSeen.complete(JSONObject(request.body.readUtf8()).obj("payload").obj("args").obj("request"))
+            repairRequested.countDown()
+            releaseAttachment.countDown()
+            envelope(JSONObject().put("records", missing).put("hasMore", false).toString())
+          }
+          request.path == "/api/remote.mux" -> MockResponse().withWebSocketUpgrade(object : WebSocketListener() {
+            override fun onMessage(webSocket: WebSocket, text: String) {
+              val open = JSONObject(text)
+              if (open.str("type") != "open") return
+              val stream = open.str("streamId")
+              fun send(value: JSONObject) { webSocket.send(JSONObject().put("type", "item").put("streamId", stream).put("value", value).toString()) }
+              when (open.str("endpoint")) {
+                "\$events" -> send(JSONObject().put("type", "ready").put("clientId", "fixture"))
+                "session/follow" -> {
+                  send(snapshotFrame(records, 2, false))
+                  // Force the live result to arrive while the page is still resolving the snapshot.
+                  if (attachmentRequested.await(3, TimeUnit.SECONDS))
+                    send(event("tool/result", 5, 1005, JSONObject().put("turn", 1).put("step", 1)
+                      .put("message", JSONObject().put("toolCallId", "c").put("content", JSONArray()
+                        .put(JSONObject().put("type", "text").put("text", "/repo"))))))
+                }
+              }
+            }
+          })
+          else -> MockResponse().setResponseCode(404)
+        }
+      }
+      server.start()
+      val client = api(server)
+      try {
+        client.rootSessionsPage("/repo")
+        val shown = withTimeout(6_000) { client.messagesPage("s1").items }
+        assertTrue("missing sequences must be requested before the attachment is released", repairRequested.await(1, TimeUnit.SECONDS))
+        val request = withTimeout(1_000) { requestSeen.await() }
+        assertEquals(4L, request.optLong("throughSeq"))
+        assertEquals(5L, request.optLong("beforeSeq"))
+        val events = withTimeout(5_000) { client.events().take(4).toList() }
+        assertEquals(listOf("session.step.started", "session.tool.input.started", "session.tool.called", "session.tool.success"), events.map { it.type })
+        val updated = events.fold(shown) { messages, item -> TranscriptProjection.apply(messages, item)?.messages ?: messages }
+        assertEquals("/repo", updated.last().parts.single().output)
+      } finally { releaseAttachment.countDown(); client.close() }
+    }
+  }
+
   @Test fun aGapRepairsToolHeadsBeforeProjectingTheCurrentResult() = runBlocking {
     val records = JSONArray().put(event("turn/start", 1, 1001, JSONObject().put("turn", 1)))
       .put(event("user/message", 2, 1002, JSONObject().put("id", "u").put("source", JSONObject().put("kind", "user"))

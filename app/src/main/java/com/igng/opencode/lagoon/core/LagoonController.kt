@@ -320,7 +320,7 @@ class LagoonController private constructor(private val appContext: Context) {
         RemoteSession(profile.url, profile.allowCleartext, hostId, manager,
           RemotePeerTrust(store.remotePins), account, appVersion())
       }
-      return RemoteBackend(session, profile.takeIf { it.kind == ServerKind.OPENCODE }) { RemoteConnectionRegistry.release(key) }
+      return RemoteBackend(session, profile.takeIf { it.kind == ServerKind.OPENCODE || it.kind == ServerKind.CODEX }) { RemoteConnectionRegistry.release(key) }
   }
 
   private fun remoteSlot(profileId: String) = "profile-${profileId.replace(Regex("[^A-Za-z0-9_-]"), "_")}"
@@ -420,6 +420,18 @@ class LagoonController private constructor(private val appContext: Context) {
     val catalog = remoteCatalog(origin, parent.username)?.takeUnless { it.signedOut } ?: error("中枢账号已退出登录")
     val observed = catalog.hosts.singleOrNull { it.hostId == host && it.fingerprint == parent.remoteHostFingerprint } ?: error("Host 目录已变化")
     val profile = remoteCatalogProfile(catalog, observed).copy(enabled = enabled)
+    saveServer(profile, null, credentialUsername = profile.username, connect = false)
+    return store.profiles().first { it.id == profile.id }
+  }
+
+  internal fun addRemoteCodexService(parent: ServerProfile, enabled: Boolean): ServerProfile {
+    val host = requireNotNull(parent.remoteHostId) { "尚未选择 Host" }
+    val origin = canonicalRemoteOrigin(parent.url)
+    store.profiles().firstOrNull { it.kind == ServerKind.CODEX && it.remoteHostId == host &&
+      it.username.trim() == parent.username.trim() && canonicalRemoteOrigin(it.url) == origin }?.let { return it }
+    val catalog = remoteCatalog(origin, parent.username)?.takeUnless { it.signedOut } ?: error("中枢账号已退出登录")
+    val observed = catalog.hosts.singleOrNull { it.hostId == host && it.fingerprint == parent.remoteHostFingerprint } ?: error("Host 目录已变化")
+    val profile = remoteCatalogProfile(catalog, observed).copy(id = java.util.UUID.randomUUID().toString(), kind = ServerKind.CODEX, enabled = enabled)
     saveServer(profile, null, credentialUsername = profile.username, connect = false)
     return store.profiles().first { it.id == profile.id }
   }
@@ -534,14 +546,78 @@ class LagoonController private constructor(private val appContext: Context) {
   /** Shared per-directory read health; a dead directory must not degrade every server's state. */
   private val directoryHealth = DirectoryHealth()
   private val allOverview = AllServersOverview(store, cache, scope, ::acceptAllSnapshot, { state.value.serverId },
-    { id, event -> if (id == state.value.serverId) handleEvent(event) },
-    { id ->
-      if (id == state.value.serverId) trace(generation, ConnectMilestone.STREAM)
-      if (id == state.value.serverId && api != null && connecting?.isActive != true) reconcileAfterStream()
+    { id, event ->
+      if (id == state.value.serverId) handleEvent(event)
+      else if (event.type == "session.deleted") forgetDeletedSession(id, event.properties.sessionEventId(event.type))
     },
+    ::handleOverviewConnected,
     directoryHealth, ::acceptSnapshotRemoved, remoteBackendFactory,
-    sshClientFactory = { profile, _ -> sshHostManager.client(profile) })
+    sshClientFactory = { profile, _ -> sshHostManager.client(profile) },
+    selectedSession = { state.value.sessionId })
   @Volatile private var api: HarnessClient? = null
+  private val codexSelectionCoordinator = CodexSelectionCoordinator()
+  private fun handleOverviewConnected(id: String) {
+    if (id == state.value.serverId) trace(generation, ConnectMilestone.STREAM)
+    if (id != state.value.serverId || api == null) return
+    val replacement = if (state.value.server?.kind == ServerKind.CODEX)
+      runCatching { allOverview.client(id) }.getOrNull() else null
+    if (replacement == null || replacement === api) {
+      if (connecting?.isActive != true) reconcileAfterStream()
+      return
+    }
+    // An old in-flight read must not publish into the replacement's conversation generation.
+    connecting?.cancel()
+    stream?.cancel()
+    generation += 1
+    api = replacement
+    val token = generation
+    val session = state.value.session
+    val revision = selectionRevision
+    scope.launch {
+      try {
+        // Reattach before the authoritative baseline read so events during the read are retained.
+        codexSelectionCoordinator.apply({ token == generation && revision == selectionRevision &&
+          state.value.serverId == id && state.value.sessionId == session?.id && api === replacement }) {
+          replacement.selectCodexSession(session)
+        }
+        if (token == generation && state.value.serverId == id && api === replacement && !replacement.isClosed)
+          reloadConversation(deep = false)
+      } catch (error: Exception) {
+        if (error is CancellationException) throw error
+        if (token == generation && state.value.serverId == id && api === replacement) {
+          updateState { it.copy(connected = false, error = null) }
+          scheduleReconnect(id, token, reason = "Codex 会话重新连接失败")
+        }
+      }
+    }
+  }
+  /** Selection and background-monitor ownership are separate from the server's read receipt. */
+  private fun synchronizeCodexSelection() {
+    val current = state.value
+    if (current.server?.kind != ServerKind.CODEX) return
+    val serverId = current.serverId ?: return
+    val client = api ?: return
+    val session = current.session
+    if (current.sessionId != null && session == null) return
+    val token = generation
+    val revision = selectionRevision
+    scope.launch {
+      try {
+        codexSelectionCoordinator.apply({ token == generation && revision == selectionRevision &&
+          state.value.serverId == serverId && api === client && state.value.sessionId == session?.id }) {
+          client.selectCodexSession(session)
+        }
+      }
+      catch (cancel: CancellationException) { throw cancel }
+      catch (error: Exception) {
+        if (token == generation && state.value.serverId == serverId && api === client) {
+          Diagnostics.warn("Codex", "会话实时订阅失败", error)
+          updateState { it.copy(degraded = true) }
+          allOverview.refresh(serverId)
+        }
+      }
+    }
+  }
   private var stream: Job? = null
   private var generation = 0
   private var refresh: Job? = null
@@ -1371,7 +1447,7 @@ class LagoonController private constructor(private val appContext: Context) {
     allOverview.policyChanged()
     state.value.serverSnapshots().values.forEach { snapshot ->
       snapshot.permissions.forEach { request ->
-        if (!policy.visible(request.id, snapshot.autoApprovalFailures)) notifications.cancel(snapshot.serverId, request.sessionId)
+        if (!policy.visible(request, snapshot.autoApprovalFailures)) notifications.cancel(snapshot.serverId, request.sessionId)
       }
     }
   }
@@ -1744,6 +1820,16 @@ class LagoonController private constructor(private val appContext: Context) {
     return sshHostManager.discover(clean, secrets, path)
   }
 
+  internal suspend fun discoverSshCodex(config: SshHostConfig, secrets: SshSecrets): com.igng.opencode.lagoon.core.ssh.SshCodexObservation {
+    val clean = cleanSshConfig(config)
+    validateSshSecrets(clean, secrets)
+    if (sshHostStore.load().any { it.id == clean.id }) {
+      val source = MigrationProjection.sshSourceId(clean.id)
+      store.requireParentRoute(source, MigrationProjection.hostId(source, clean.id))
+    }
+    return sshHostManager.discoverCodex(clean, secrets)
+  }
+
   /** Runs the real connect → host key → bootstrap → tunnel → login flow without saving. */
   suspend fun testSshHost(
     config: SshHostConfig,
@@ -1758,6 +1844,7 @@ class LagoonController private constructor(private val appContext: Context) {
       val source = MigrationProjection.sshSourceId(clean.id)
       store.requireParentRoute(source, MigrationProjection.hostId(source, clean.id))
     }
+    if (harnessKind == ServerKind.CODEX) return sshHostManager.testCodex(clean, secrets)
     val link = sshHostManager.testLink(clean, secrets, onStatus, harnessKind, registrationPath)
     return try {
       val client = link.awaitHarness()
@@ -2141,6 +2228,7 @@ class LagoonController private constructor(private val appContext: Context) {
       return
     }
     api?.setContentWatching(true)
+    synchronizeCodexSelection()
     synchronizeQuestionPresentation()
     observeWorkspaceEvents(id)
     observeTransport(id)
@@ -2215,6 +2303,7 @@ class LagoonController private constructor(private val appContext: Context) {
       return
     }
     api?.setContentWatching(true)
+    synchronizeCodexSelection()
     synchronizeQuestionPresentation()
     observeWorkspaceEvents(id)
     observeTransport(id)
@@ -2828,6 +2917,20 @@ class LagoonController private constructor(private val appContext: Context) {
     stream = reconcile
   }
 
+  /** A server deletion event is authoritative even when its device is not selected. */
+  private fun forgetDeletedSession(serverId: String, sessionId: String) {
+    if (sessionId.isBlank()) return
+    cache.deleteMessages(serverId, sessionId)
+    transcriptMemory.forget(serverId, sessionId)
+    sessionViews.forget(serverId, sessionId)
+    conversationPool.forget(serverId, sessionId)
+    forgetStoredTranscript(serverId, sessionId)
+    store.forgetSession(serverId, sessionId)
+    store.rememberPinnedSessions(serverId, store.pinnedSessions(serverId) - sessionId)
+    persistedTasks.remove("$serverId\u0000$sessionId")
+    attempt { notifications.cancel(serverId, sessionId) }
+  }
+
   /**
    * Applies one `/api/event` frame the way the official client does: targeted state updates and a
    * re-read of only the affected session, never a full catalog reload per event.
@@ -2949,17 +3052,11 @@ class LagoonController private constructor(private val appContext: Context) {
       "session.deleted" -> {
         attentionJobs.remove(sessionId)?.cancel()
         waitingEventSeqAt.remove(sessionId)
-        state.value.serverId?.let { server ->
-          transcriptMemory.forget(server, sessionId)
-          sessionViews.forget(server, sessionId)
-          conversationPool.forget(server, sessionId)
-          forgetStoredTranscript(server, sessionId)
-          store.forgetSession(server, sessionId)
-          attempt { notifications.cancel(server, sessionId) }
-        }
-        persistedTasks.remove("${state.value.serverId}\u0000$sessionId")
+        state.value.serverId?.let { server -> forgetDeletedSession(server, sessionId) }
         updateState { withSummary(it.copy(
           sessions = it.sessions.filterNot { session -> session.id == sessionId },
+          pinned = it.pinned - sessionId,
+          messages = if (it.sessionId == sessionId) emptyList() else it.messages,
           tasks = it.tasks - sessionId,
           knownParents = it.knownParents - sessionId,
           shells = it.shells.filterValues { shell -> shell.sessionId != sessionId },
@@ -3166,7 +3263,7 @@ class LagoonController private constructor(private val appContext: Context) {
       val snapshot = allSnapshots[server] ?: return@launch
       if (state.value.serverId == server) return@launch
       val session = snapshot.sessions.firstOrNull { it.id == sessionId } ?: return@launch
-      val permission = snapshot.permissions.firstOrNull { it.sessionId == sessionId && state.value.permissionPolicy.visible(it.id, snapshot.autoApprovalFailures) }
+      val permission = snapshot.permissions.firstOrNull { it.sessionId == sessionId && state.value.permissionPolicy.visible(it, snapshot.autoApprovalFailures) }
       val question = snapshot.questions.firstOrNull { it.sessionId == sessionId }
       if (permission == null && question == null) return@launch
       if (permission != null) {
@@ -3177,7 +3274,7 @@ class LagoonController private constructor(private val appContext: Context) {
         val sameClient = runCatching { allOverview.client(server) === client }.getOrDefault(false)
         if (store.profiles().none { it.id == server } || state.value.serverId == server || !sameClient) return@launch
         if (pending != null && pending.none { it.id == permission.id }) { allOverview.settled(server, permission.id); allOverview.refresh(server); return@launch }
-        if (!state.value.permissionPolicy.visible(permission.id, allSnapshots[server]?.autoApprovalFailures.orEmpty())) return@launch
+        if (!state.value.permissionPolicy.visible(permission, allSnapshots[server]?.autoApprovalFailures.orEmpty())) return@launch
       }
       notifications.show(snapshot.profile, session, TaskState(sessionId,
         if (permission != null) TaskPhase.WAITING_PERMISSION else TaskPhase.WAITING_QUESTION), permission,
@@ -3233,6 +3330,7 @@ class LagoonController private constructor(private val appContext: Context) {
       agentChanged = false, modelChanged = false, draft = "", references = emptyList(), resources = emptyMap(),
       changes = emptyList(), goal = null, todos = emptyList(), goalLoading = false, schedules = emptyList(), schedulesLoading = false,
       files = emptyList(), searchResults = emptyList(), fileText = null, fileBinary = false, filePreview = null, filePreviewMime = null) }
+    synchronizeCodexSelection()
     store.rememberLocation(id, null)
     val token = generation
     scope.launch { loadChoices(project.directory, token) }
@@ -3566,6 +3664,7 @@ class LagoonController private constructor(private val appContext: Context) {
       schedules = if (reselected) it.schedules else slot?.schedules.orEmpty(), schedulesLoading = false,
       files = emptyList(),
       searchResults = emptyList(), fileText = null, fileBinary = false, filePreview = null, filePreviewMime = null)) }
+    synchronizeCodexSelection()
     store.rememberLocation(project?.id, id)
     transcripts?.protectedSession = serverId to id
     restoreComposerInput(serverId, id, selectionRevision)
@@ -3637,7 +3736,8 @@ class LagoonController private constructor(private val appContext: Context) {
     val serverId = state.value.serverId ?: return
     val revision = selectionRevision
     val requestSequence = ++messageSequence
-    fun current() = token == generation && revision == selectionRevision && state.value.serverId == serverId && state.value.sessionId == session.id && requestSequence == messageSequence
+    fun current() = token == generation && revision == selectionRevision && state.value.serverId == serverId && state.value.sessionId == session.id &&
+      requestSequence == messageSequence && (state.value.server?.kind != ServerKind.CODEX || api === client)
     // Capture before any HTTP/cache suspension, not after the page returns. Live events replace
     // immutable Message values, letting us protect only the IDs that changed during this read.
     val readStart = state.value.messages.associateBy { it.id }
@@ -3663,6 +3763,9 @@ class LagoonController private constructor(private val appContext: Context) {
     // todo list and the durable goal projection, like the official client's syncs.
     val (result, composer) = coroutineScope {
       val page = async { attempt {
+        if (state.value.server?.kind == ServerKind.CODEX && !codexSelectionCoordinator.apply(::current) {
+            client.selectCodexSession(session)
+          }) throw CancellationException("Codex 会话选择已变化")
         // A cacheable conversation opens from its verified stored run plus only what is new on the server.
         if (sync != null && initialWindow) sync.open(client, serverId, session).also { opened = it; nextCursor = it.olderCursor }.messages
         else client.messageRecords(session.id).let { nextCursor = it.next; records = it.items; reachedStart = it.next == null; it.items.map(MessageRecord::message) }
@@ -4184,6 +4287,20 @@ class LagoonController private constructor(private val appContext: Context) {
   }
 
   // ---- Device-local projects ----
+  /** Explicitly registers an existing directory with a Remote Codex Host. */
+  fun createCodexProject(directory: String, expectedServer: ServerProfile): Job = act("project-add", directory) { op ->
+    val server = op.snapshot.server
+    check(server?.kind == ServerKind.CODEX && server.remoteHostId != null &&
+      ConnectionRouteAdmission.sameLeafRoute(expectedServer, server)) { "连接已变化或不支持 Codex Host 项目登记" }
+    val project = op.client.createCodexProject(directory) ?: throw ApiException(501, "此 Host 未提供 Codex 项目登记")
+    if (!op.isCurrent(this)) return@act
+    val resolved = project.copy(serverId = op.serverId)
+    val projects = store.addLocalProject(op.serverId, resolved)
+    op.commit { withSummary(it.copy(projects = projects, projectId = resolved.id)) }
+    store.rememberLocation(resolved.id, null)
+    loadChoices(resolved.directory, generation)
+  }
+
   /** Resolve [directory] on the server and register the canonical project on this device. */
   fun addProject(directory: String): Job = act("project-add", directory) { op ->
     val project = op.client.projectAt(directory) ?: error("服务器没有解析出这个目录对应的项目")
@@ -4341,6 +4458,7 @@ class LagoonController private constructor(private val appContext: Context) {
         provisionalMessageIds = emptySet(), transcriptLoadingSince = 0, changes = emptyList(),
         goal = null, todos = emptyList(), goalLoading = false, schedules = emptyList(), schedulesLoading = false))
     }
+    synchronizeCodexSelection()
     store.rememberLocation(project?.id, null)
     if (project != null) {
       val token = generation
@@ -4794,18 +4912,28 @@ class LagoonController private constructor(private val appContext: Context) {
     onReady(options)
   }
 
-  fun deleteSession(target: String? = null, onDeleted: (() -> Unit)? = null) = withSession("delete", target) { op, client, session ->
-    client.deleteSession(session)
+  internal fun deleteSession(target: String? = null, expected: DeleteSessionTarget? = null, onDeleted: (() -> Unit)? = null) = withSession("delete", target) { op, client, session ->
+    check(expected == null || (expected.sessionId == session.id && expected.matches(op.snapshot))) { "连接或会话已变化，请重新确认删除" }
+    try {
+      client.deleteSession(session)
+    } catch (error: java.io.IOException) {
+      if (op.snapshot.server?.kind == ServerKind.CODEX) {
+        if (error is ApiException) throw ApiException(error.status,
+          "${error.message.orEmpty()}；请刷新并核对会话状态后再操作", error.code, error.details)
+        throw java.io.IOException("删除结果未知，请重新连接并核对会话状态后再操作", error)
+      }
+      throw error
+    }
     if (!op.connectionCurrent(this)) return@withSession
-    cache.deleteMessages(op.serverId, session.id)
-    transcriptMemory.forget(op.serverId, session.id)
-    sessionViews.forget(op.serverId, session.id)
-    conversationPool.forget(op.serverId, session.id)
-    forgetStoredTranscript(op.serverId, session.id)
-    store.forgetSession(op.serverId, session.id)
-    if (op.isCurrent(this)) onDeleted?.invoke()
-    if (session.id == op.snapshot.sessionId) op.commit { it.copy(sessionId = null, messages = emptyList()) }
-    if (session.id in op.snapshot.pinned) store.rememberPinnedSessions(op.serverId, op.snapshot.pinned - session.id)
+    forgetDeletedSession(op.serverId, session.id)
+    // A deletion notification may remove the selected session before the RPC acknowledgement.
+    // Its disappearance changes executionDirectory, so the usual isCurrent() is too strict here.
+    val sameSelection = op.connectionCurrent(this) && op.revision == selectionRevision &&
+      state.value.projectId == op.snapshot.projectId && state.value.sessionId == op.snapshot.sessionId
+    if (sameSelection) {
+      if (session.id == op.snapshot.sessionId) updateState { it.copy(sessionId = null, messages = emptyList()) }
+      onDeleted?.invoke()
+    }
     op.commitConnection { withSummary(it.copy(sessions = it.sessions.filterNot { s -> s.id == session.id }, tasks = it.tasks - session.id, pinned = it.pinned - session.id)) }
     if (op.connectionCurrent(this)) reload()
   }

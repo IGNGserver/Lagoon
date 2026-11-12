@@ -84,7 +84,7 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
   var menu by remember { mutableStateOf(false) }
   var rename by rememberSaveable { mutableStateOf(false) }
   var permission by rememberSaveable { mutableStateOf(false) }
-  var delete by rememberSaveable { mutableStateOf(false) }
+  var deleteTarget by remember { mutableStateOf<DeleteSessionTarget?>(null) }
   var composerModal by remember { mutableStateOf(false) }
   var requestModal by remember { mutableStateOf(false) }
   var activityGroup by remember(state.serverId, state.sessionId) { mutableStateOf<TranscriptRow?>(null) }
@@ -117,7 +117,7 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
     menu = false
     sheet = ChatSheet.ACTIVITY
   }
-  val modal = sheet != null || menu || rename || delete || composerModal || requestModal || activityGroup != null || state.shellOutput != null || revertMessage != null || forkTarget != null || restoreTimeline || goalDialog
+  val modal = sheet != null || menu || rename || deleteTarget != null || composerModal || requestModal || activityGroup != null || state.shellOutput != null || revertMessage != null || forkTarget != null || restoreTimeline || goalDialog
   DisposableEffect(modal) { onModal(modal); onDispose { onModal(false) } }
   fun openFile(path: String) { sheet = ChatSheet.FILES; controller.readFile(path) }
   if (session == null) {
@@ -157,7 +157,9 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
         if (!session.archived) add(MenuAction("归档", ARCHIVE_ICON) { controller.setArchived(session.id, true, onBack) })
         else if (archive.restorable) add(MenuAction("取消归档", UNARCHIVE_ICON) { controller.setArchived(session.id, false) })
       }
-      if (state.capabilities.deleteSession) add(MenuAction("删除", MiuixIcons.Delete, danger = true) { delete = true })
+      if (state.capabilities.deleteSession) add(MenuAction("删除", MiuixIcons.Delete, danger = true) {
+        deleteTarget = state.server?.let { DeleteSessionTarget(it, session.id, state.title(session), requireSelected = true) }
+      })
     })
   )
   HyperLagoonTheme {
@@ -339,6 +341,7 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
       null -> when (captured.profile.kind) {
         ServerKind.DSH, ServerKind.DSH_REMOTE -> "复制最新已完成轮次前缀。"
         ServerKind.OPENCODE -> "复制当前完整历史。"
+        ServerKind.CODEX -> "复制当前会话历史。"
       }
     }
     SuperDialog(title = "确认分叉？", show = true, onDismissRequest = { if (!pending) forkTarget = null }) {
@@ -412,9 +415,14 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
   }
   if (rename) RenameSessionDialog(state, controller, session) { rename = false }
   if (permission) PermissionDialog(state, controller, session) { permission = false }
-  if (delete) SuperDialog(title = "删除此会话？", show = true, onDismissRequest = { if (!state.pending("delete")) delete = false }) {
-    Column { Text("会话消息将从服务器永久删除。\n${state.title(session)}"); ActionError(state, "delete")
-      DialogActions("取消", { delete = false }, if (state.pending("delete")) "删除中…" else "永久删除", !state.pending("delete"), danger = true) { controller.deleteSession { delete = false; onBack() } }
+  deleteTarget?.let { target ->
+    SuperDialog(title = "删除此会话？", show = true, onDismissRequest = { if (!state.pending("delete")) deleteTarget = null }) {
+      Column { Text("${target.warning()}\n${target.title}"); ActionError(state, "delete")
+        DialogActions("取消", { deleteTarget = null }, if (state.pending("delete")) "删除中…" else "永久删除",
+          !state.pending("delete") && target.matches(state), danger = true) {
+          controller.deleteSession(target.sessionId, expected = target) { deleteTarget = null; onBack() }
+        }
+      }
     }
   }
 }
@@ -988,7 +996,7 @@ fun MiuixPermissionCard(request: PermissionRequest, controller: LagoonController
     }
     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
       HyperButton(text = "拒绝", variant = HyperButtonVariant.SECONDARY, onClick = { controller.replyPermission(request, "reject") }, enabled = !pending, modifier = Modifier.weight(1f))
-      HyperButton(text = "允许一次", onClick = { controller.replyPermission(request, "once") }, enabled = !pending, loading = pending, modifier = Modifier.weight(1f))
+      HyperButton(text = if (request.manualOnly) "同意上述授权" else "允许一次", onClick = { controller.replyPermission(request, "once") }, enabled = !pending, loading = pending, modifier = Modifier.weight(1f))
     }
     if (request.always.isNotEmpty()) {
       HyperTextAction(text = "始终允许并保存规则…", enabled = !pending, onClick = { confirmSave = true }, modifier = Modifier.fillMaxWidth().padding(top = 8.dp))

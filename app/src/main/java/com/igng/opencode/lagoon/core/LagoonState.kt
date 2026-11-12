@@ -206,7 +206,7 @@ data class LagoonState(
   val parents: Map<String, String> by lazy(LazyThreadSafetyMode.PUBLICATION) { knownParents + sessions.mapNotNull { it.parentId?.let { parent -> it.id to parent } }.toMap() }
   /** Live (running / waiting) state of each session family, rolled up to its root. */
   val presentedTasks: Map<String, TaskState> by lazy(LazyThreadSafetyMode.PUBLICATION) { permissionPolicy.tasks(tasks, permissions, autoApprovalFailures) }
-  val visiblePermissions: List<PermissionRequest> by lazy(LazyThreadSafetyMode.PUBLICATION) { permissions.filter { permissionPolicy.visible(it.id, autoApprovalFailures) } }
+  val visiblePermissions: List<PermissionRequest> by lazy(LazyThreadSafetyMode.PUBLICATION) { permissions.filter { permissionPolicy.visible(it, autoApprovalFailures) } }
   val globalSummary: TaskSummary get() {
     val snapshots = serverSnapshots().values
     if (snapshots.isEmpty()) return if (server?.let { it.effectiveEnabled && it.notifications } == true) summary else TaskSummary.EMPTY

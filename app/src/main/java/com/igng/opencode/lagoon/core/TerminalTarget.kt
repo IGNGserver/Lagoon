@@ -4,7 +4,7 @@ package com.igng.opencode.lagoon.core
 internal data class TerminalTarget(val profile: ServerProfile, val sessionId: String, val directory: String) {
   val scope: TerminalScope get() = when (profile.kind) {
     ServerKind.DSH, ServerKind.DSH_REMOTE -> TerminalScope.Session(sessionId, directory)
-    ServerKind.OPENCODE -> TerminalScope.Location(directory)
+    ServerKind.OPENCODE, ServerKind.CODEX -> TerminalScope.Location(directory)
   }
 
   fun matches(state: LagoonState): Boolean = state.server?.let {

@@ -16,6 +16,7 @@ internal class GuardedHarnessClient(private val access: HarnessLeaseAccess) : Ha
   override suspend fun discoverCapabilities(): ApiCapabilities = access.useSuspending { it.discoverCapabilities() }
   override suspend fun health(): String = access.useSuspending { it.health() }
   override suspend fun projects(): List<Project> = access.useSuspending { it.projects() }
+  override suspend fun createCodexProject(path: String): Project? = access.useSuspending { it.createCodexProject(path) }
   override suspend fun openCodeProjects(): List<OpenCodeProjectInfo>? = access.useSuspending { it.openCodeProjects() }
   override suspend fun updateOpenCodeProject(expected: OpenCodeProjectInfo, edit: OpenCodeProjectEdit): OpenCodeProjectInfo? =
     access.useSuspending { it.updateOpenCodeProject(expected, edit) }
@@ -42,6 +43,9 @@ internal class GuardedHarnessClient(private val access: HarnessLeaseAccess) : Ha
   override suspend fun projectAt(directory: String): Project? = access.useSuspending { it.projectAt(directory) }
   override suspend fun rootSessionsPage(directory: String?, cursor: String?, size: Int): ApiPage<Session> =
     access.useSuspending { it.rootSessionsPage(directory, cursor, size) }
+  override suspend fun selectCodexSession(session: Session?): Unit = access.useSuspending { it.selectCodexSession(session) }
+  override suspend fun monitorCodexSessions(active: List<Session>, selectedId: () -> String?): Unit =
+    access.useSuspending { it.monitorCodexSessions(active, selectedId) }
   override suspend fun viewSession(session: Session, idle: Long): Unit = access.useSuspending { it.viewSession(session, idle) }
   override suspend fun messagesPage(id: String, cursor: String?, size: Int): ApiPage<Message> =
     access.useSuspending { it.messagesPage(id, cursor, size) }

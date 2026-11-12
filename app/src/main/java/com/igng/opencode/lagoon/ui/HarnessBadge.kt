@@ -19,10 +19,12 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
 internal fun HarnessBadge(kind: ServerKind, modifier: Modifier = Modifier) {
   val label = when (kind) {
     ServerKind.OPENCODE -> "OpenCode"
+    ServerKind.CODEX -> "Codex"
     ServerKind.DSH, ServerKind.DSH_REMOTE -> "DSH"
   }
   val color = when (kind) {
     ServerKind.OPENCODE -> HyperTheme.colors.textSecondary
+    ServerKind.CODEX -> HyperTheme.colors.textSecondary
     ServerKind.DSH, ServerKind.DSH_REMOTE -> HyperTheme.colors.primary
   }
   val shape = miuixSquircleShape(6.dp)

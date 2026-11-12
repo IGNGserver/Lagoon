@@ -37,7 +37,9 @@ internal class FakeRemoteHost(
   /** Optional real native connector bridge; DSH calls keep their existing fixture behavior. */
   private val nativeRpc: ((method: String, params: JSONObject, publish: (String, JSONObject) -> Unit) -> JSONObject)? = null,
   /** Actual upstream Harness bridge for encrypted terminal integration; never an application route. */
-  private val harnessRpc: ((method: String, params: JSONObject, publish: (String, JSONObject) -> Unit) -> JSONObject)? = null
+  private val harnessRpc: ((method: String, params: JSONObject, publish: (String, JSONObject) -> Unit) -> JSONObject)? = null,
+  /** Optional real Codex peer bridge; exists only in the opt-in interoperability fixture. */
+  private val codexRpc: ((method: String, params: JSONObject, publish: (String, JSONObject) -> Unit) -> JSONObject)? = null
 ) : AutoCloseable {
   val server = MockWebServer()
   val requests: MutableList<String> = Collections.synchronizedList(mutableListOf())
@@ -50,7 +52,7 @@ internal class FakeRemoteHost(
   // One gate covers the Noise sender nonce, fragment order and WebSocket enqueue order, including
   // callbacks from the stdio reader. Never hold it while waiting for an external RPC response.
   private val wireGate = Any()
-  private val nativeWorker = (nativeRpc ?: harnessRpc)?.let {
+  private val nativeWorker = (nativeRpc ?: harnessRpc ?: codexRpc)?.let {
     Executors.newSingleThreadExecutor { task -> Thread(task, "fake-remote-native-rpc").apply { isDaemon = true } }
   }
   @Volatile private var cipher: CipherStatePair? = null
@@ -126,7 +128,7 @@ internal class FakeRemoteHost(
 
   /** Safe from a bridge reader/executor thread, including before its open RPC has completed. */
   fun publishNativeEvent(event: String, data: JSONObject) {
-    require(event.startsWith("harness.services.") || event == "harness.remote.frame" || event == "harness.remote.stream.closed")
+    require(event.startsWith("harness.services.") || event.startsWith("codex.app.") || event == "harness.remote.frame" || event == "harness.remote.stream.closed")
     val socket = controlSocket ?: return
     publish(socket, event, data)
   }
@@ -320,11 +322,16 @@ internal class FakeRemoteHost(
         respond(JSONObject().put("closed", true))
       "harness.remote.transfer.open", "harness.remote.transfer.chunk", "harness.remote.transfer.commit" -> respond(JSONObject())
       else -> {
-        if (method.startsWith("harness.services.") && nativeRpc != null) {
+        val bridge = when {
+          method.startsWith("harness.services.") -> nativeRpc
+          method.startsWith("codex.app.") -> codexRpc
+          else -> null
+        }
+        if (bridge != null) {
           // Blocking stdio is isolated from OkHttp's receiver, so early native event publication
           // can take the wire gate and so a close/cancel frame cannot deadlock that receiver.
           nativeWorker!!.execute {
-            try { respond(nativeRpc.invoke(method, params, ::publishNativeEvent)) }
+            try { respond(bridge.invoke(method, params, ::publishNativeEvent)) }
             catch (error: Exception) {
               val code = (error as? RemoteRpcException)?.code ?: (error as? NativeRemoteException)?.code ?: "NATIVE_BRIDGE_FAILED"
               sendMessage(socket, JSONObject().put("v", 1).put("id", id).put("type", "rpc.error")

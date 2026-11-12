@@ -1,6 +1,9 @@
 package com.igng.opencode.lagoon.core.ssh
 
 import com.igng.opencode.lagoon.core.Diagnostics
+import com.igng.opencode.lagoon.core.CodexApi
+import com.igng.opencode.lagoon.core.GuardedHarnessClient
+import com.igng.opencode.lagoon.core.HarnessLeaseAccess
 import com.igng.opencode.lagoon.core.HarnessClient
 import com.igng.opencode.lagoon.core.PresentedSshHostKey
 import com.igng.opencode.lagoon.core.ServerKind
@@ -15,6 +18,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.collect
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -31,6 +35,8 @@ internal class SshHostManager(
 
   private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
   private val links = ConcurrentHashMap<String, SharedLink>()
+  private class SharedCodex(val hostId: String, val client: HarnessClient, var refs: Int = 0)
+  private val codexLinks = mutableMapOf<String, SharedCodex>()
   private val lock = Any()
   private val transports = SshTransportPool(transportFactory)
 
@@ -39,6 +45,41 @@ internal class SshHostManager(
     val config = store.load().firstOrNull { it.id == hostId }
       ?: throw SshFailure(SshFailureKind.OTHER, "SSH 主机配置已删除", retryable = false)
     require(profile.url == config.profileUrl() && profile.username == config.user) { "SSH 保存配置已变化，请重新保存绑定路由" }
+    if (profile.kind == ServerKind.CODEX) {
+      val entry = synchronized(lock) {
+        val current = codexLinks[profile.id]?.takeUnless { it.client.isClosed }
+        (current ?: SharedCodex(hostId, CodexApi(SshCodexTransport(config, store.secrets(hostId), transports)))
+          .also { codexLinks[profile.id] = it }).also { it.refs++ }
+      }
+      return GuardedHarnessClient(object : HarnessLeaseAccess {
+        private val released = java.util.concurrent.atomic.AtomicBoolean(false)
+        override val isClosed: Boolean get() = released.get() || entry.client.isClosed
+        private fun checkOpen() { check(!isClosed) { "Codex SSH 租约已关闭" } }
+        override fun <T> use(block: (HarnessClient) -> T): T { checkOpen(); return block(entry.client).also { checkOpen() } }
+        override suspend fun <T> useSuspending(block: suspend (HarnessClient) -> T): T {
+          checkOpen(); return block(entry.client).also { checkOpen() }
+        }
+        override fun <T> stream(block: (HarnessClient) -> kotlinx.coroutines.flow.Flow<T>): kotlinx.coroutines.flow.Flow<T> =
+          kotlinx.coroutines.flow.flow {
+            checkOpen()
+            block(entry.client).collect { value -> checkOpen(); emit(value) }
+          }
+        override suspend fun awaitClosed() { if (entry.client.isClosed) entry.client.awaitClosed() }
+        override fun setContentWatching(enabled: Boolean) = use { it.setContentWatching(enabled) }
+        override fun questionPresentation(sessionId: String?, foreground: Boolean) = use { it.questionPresentation(sessionId, foreground) }
+        override fun questionFocus(id: String, focused: Boolean) = use { it.questionFocus(id, focused) }
+        override fun questionEngage(id: String) = use { it.questionEngage(id) }
+        override fun questionTakeTime(id: String) = use { it.questionTakeTime(id) }
+        override fun close() {
+          if (!released.compareAndSet(false, true)) return
+          val last = synchronized(lock) {
+            entry.refs--
+            if (entry.refs == 0 && codexLinks[profile.id] === entry) { codexLinks.remove(profile.id); true } else false
+          }
+          if (last) entry.client.close()
+        }
+      })
+    }
     val entry = synchronized(lock) {
       val current = links[profile.id]?.takeUnless { it.link.isClosed }
       val active = current ?: SharedLink(hostId,
@@ -62,7 +103,9 @@ internal class SshHostManager(
 
   fun closeBinding(bindingId: String) {
     val entry = synchronized(lock) { links.remove(bindingId) }
+    val codex = synchronized(lock) { codexLinks.remove(bindingId) }
     entry?.link?.close()
+    codex?.client?.close()
   }
 
   fun close(hostId: String) {
@@ -72,6 +115,7 @@ internal class SshHostManager(
       }
     }
     active.forEach { it.link.close() }
+    closeCodexHost(hostId)
     transports.invalidate(hostId)
   }
 
@@ -87,11 +131,16 @@ internal class SshHostManager(
       }
     }
     active.forEach { it.link.close() }
+    closeCodexHost(hostId)
     transports.invalidate(hostId)
   }
 
   fun retry(hostId: String) {
     links.values.filter { it.hostId == hostId }.forEach { it.link.retry() }
+    val stale = synchronized(lock) {
+      codexLinks.filterValues { it.hostId == hostId && it.client.isClosed }.keys.toList().mapNotNull { codexLinks.remove(it) }
+    }
+    stale.forEach { it.client.close() }
   }
 
   fun closeAll() {
@@ -101,7 +150,18 @@ internal class SshHostManager(
       all
     }
     active.forEach { runCatching { it.link.close() } }
+    val codex = synchronized(lock) { codexLinks.values.toList().also { codexLinks.clear() } }
+    codex.forEach { runCatching { it.client.close() } }
     transports.close()
+  }
+
+  private fun closeCodexHost(hostId: String) {
+    val active = synchronized(lock) {
+      codexLinks.filterValues { it.hostId == hostId }.values.toList().also {
+        codexLinks.entries.removeAll { entry -> entry.value.hostId == hostId }
+      }
+    }
+    active.forEach { it.client.close() }
   }
 
   fun kickAll() {
@@ -133,6 +193,24 @@ internal class SshHostManager(
         if (key.fingerprint != pin) throw SshFailure(SshFailureKind.HOST_KEY_CHANGED, "SSH 主机指纹已变化", retryable = false, presentedKey = key)
         true
       }).use { SshHarnessProbe(it).discover(path) }
+    }
+
+  suspend fun discoverCodex(config: SshHostConfig, secrets: SshSecrets): SshCodexObservation =
+    kotlinx.coroutines.withContext(Dispatchers.IO) {
+      val pin = config.hostKeyFingerprint?.takeIf { it.isNotBlank() }
+        ?: throw SshFailure(SshFailureKind.HOST_KEY_UNKNOWN, "请先确认 SSH 主机指纹", retryable = false)
+      transports.connect(config, secrets, SshHostKeyVerifier { key ->
+        if (key.fingerprint != pin) throw SshFailure(SshFailureKind.HOST_KEY_CHANGED, "SSH 主机指纹已变化", retryable = false, presentedKey = key)
+        true
+      }).use { SshCodexProbe(it).discover() }
+    }
+
+  suspend fun testCodex(config: SshHostConfig, secrets: SshSecrets): String =
+    SshCodexTransport(config, secrets, transports).use { transport ->
+      val result = transport.call("account/read", org.json.JSONObject().put("refreshToken", false))
+      val requiresAuth = result.opt("requiresOpenaiAuth") as? Boolean ?: error("Codex 登录状态格式错误")
+      check(!requiresAuth || result.optJSONObject("account") != null) { "开发机上的 Codex 尚未登录，请先在开发机完成登录" }
+      if (result.optJSONObject("account") == null) "Codex 已连接 · 未检测到登录账户" else "Codex 已连接 · 已检测到账户"
     }
 
   /** Reads the presented host key without trusting it; used before pinning a new host. */
