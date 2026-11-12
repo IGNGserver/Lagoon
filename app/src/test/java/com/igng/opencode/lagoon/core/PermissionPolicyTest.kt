@@ -20,6 +20,33 @@ class PermissionPolicyTest {
     }
   }
 
+  @Test fun expandedGrantsRemainVisibleAndCannotBeAutomaticallyOrQuicklyApproved() = runBlocking {
+    val protected = request.copy(manualOnly = true)
+    val policy = PermissionPolicy(hide = true, autoApprove = true)
+    assertTrue(policy.visible(protected))
+    assertEquals(TaskPhase.WAITING_PERMISSION, policy.tasks(tasks, listOf(protected)).getValue("session").phase)
+    assertFalse(protected.canApproveFromNotification())
+    assertTrue(request.canApproveFromNotification())
+    var replies = 0
+    val approver = PermissionAutoApprover(this, { true }, { replies++ }, {})
+    repeat(3) { approver.consider(protected) }
+    yield()
+    assertEquals(0, replies)
+    assertEquals(listOf(protected), approver.pending(listOf(protected)))
+    approver.consider(request)
+    yield()
+    assertEquals(1, replies)
+    approver.dispose()
+  }
+
+  @Test fun manualOnlySurvivesServerEventProjection() {
+    val raw = org.json.JSONObject().put("id", "permission").put("sessionID", "session")
+      .put("action", "grant").put("message", "scope").put("manualOnly", true)
+    assertTrue(raw.toPermission("/repo").manualOnly)
+    raw.remove("manualOnly")
+    assertFalse(raw.toPermission("/repo").manualOnly)
+  }
+
   @Test fun hiddenPermissionIsNeutralButNotFalselyRunningOrFinished() {
     val policy = PermissionPolicy(hide = true)
     val projected = policy.tasks(tasks, listOf(request))

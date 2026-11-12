@@ -3,6 +3,7 @@ package com.igng.opencode.lagoon.system
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import com.igng.opencode.lagoon.core.canApproveFromNotification
 import com.igng.opencode.lagoon.core.ApiException
 import com.igng.opencode.lagoon.core.Diagnostics
 import com.igng.opencode.lagoon.core.LagoonController
@@ -84,6 +85,8 @@ class NotificationActionReceiver : BroadcastReceiver() {
             // Re-read the request from its session so a stale notification can never answer a different one.
             val pendingRequest = client.sessionPermissions(Session(sessionId, permissionDirectory, "", 0)).firstOrNull { it.id == requestId }
             if (pendingRequest != null) {
+              // Old notification PendingIntents may survive a policy/connection change.
+              if (action == "once" && !pendingRequest.canApproveFromNotification()) return false
               try {
                 client.replyPermission(pendingRequest, action)
               } catch (e: ApiException) {

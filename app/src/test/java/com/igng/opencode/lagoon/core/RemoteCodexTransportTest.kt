@@ -6,6 +6,7 @@ import java.util.concurrent.CopyOnWriteArrayList
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.async
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
@@ -96,6 +97,32 @@ class RemoteCodexTransportTest {
       assertEquals(1, calls.count { it == "codex.app.transfer.close" })
       assertFalse(calls.contains("codex.app.call"))
     } finally { registry.close() }
+  }
+
+  @Test fun lostOrCancelledTransferOpenStillClosesTheUniqueAllocation() = runBlocking {
+    for (cancel in listOf(false, true)) {
+      val calls = CopyOnWriteArrayList<Call>()
+      val allocated = CompletableDeferred<Unit>()
+      val neverReply = CompletableDeferred<Unit>()
+      val registry = RemoteCodexRegistry(true) { method, params ->
+        calls += Call(method, JSONObject(params.toString()))
+        if (method == "codex.app.transfer.open") {
+          allocated.complete(Unit)
+          if (cancel) neverReply.await() else throw IOException("open response lost")
+        }
+        JSONObject()
+      }
+      val carrier = registry.acquire()
+      try {
+        val request = async { runCatching { carrier.call("dsh/sessionHistory", JSONObject().put("threadId", "t")) } }
+        allocated.await()
+        if (cancel) request.cancelAndJoin() else assertTrue(request.await().isFailure)
+        val open = calls.single { it.method == "codex.app.transfer.open" }
+        val close = calls.single { it.method == "codex.app.transfer.close" }
+        assertEquals(open.params.getString("transferId"), close.params.getString("transferId"))
+        assertFalse(calls.any { it.method == "codex.app.transfer.chunk" || it.method == "codex.app.transfer.commit" || it.method == "codex.app.call" })
+      } finally { registry.close() }
+    }
   }
 
   @Test fun eventsAreBroadcastToEveryObserver() = runBlocking {

@@ -1447,7 +1447,7 @@ class LagoonController private constructor(private val appContext: Context) {
     allOverview.policyChanged()
     state.value.serverSnapshots().values.forEach { snapshot ->
       snapshot.permissions.forEach { request ->
-        if (!policy.visible(request.id, snapshot.autoApprovalFailures)) notifications.cancel(snapshot.serverId, request.sessionId)
+        if (!policy.visible(request, snapshot.autoApprovalFailures)) notifications.cancel(snapshot.serverId, request.sessionId)
       }
     }
   }
@@ -3263,7 +3263,7 @@ class LagoonController private constructor(private val appContext: Context) {
       val snapshot = allSnapshots[server] ?: return@launch
       if (state.value.serverId == server) return@launch
       val session = snapshot.sessions.firstOrNull { it.id == sessionId } ?: return@launch
-      val permission = snapshot.permissions.firstOrNull { it.sessionId == sessionId && state.value.permissionPolicy.visible(it.id, snapshot.autoApprovalFailures) }
+      val permission = snapshot.permissions.firstOrNull { it.sessionId == sessionId && state.value.permissionPolicy.visible(it, snapshot.autoApprovalFailures) }
       val question = snapshot.questions.firstOrNull { it.sessionId == sessionId }
       if (permission == null && question == null) return@launch
       if (permission != null) {
@@ -3274,7 +3274,7 @@ class LagoonController private constructor(private val appContext: Context) {
         val sameClient = runCatching { allOverview.client(server) === client }.getOrDefault(false)
         if (store.profiles().none { it.id == server } || state.value.serverId == server || !sameClient) return@launch
         if (pending != null && pending.none { it.id == permission.id }) { allOverview.settled(server, permission.id); allOverview.refresh(server); return@launch }
-        if (!state.value.permissionPolicy.visible(permission.id, allSnapshots[server]?.autoApprovalFailures.orEmpty())) return@launch
+        if (!state.value.permissionPolicy.visible(permission, allSnapshots[server]?.autoApprovalFailures.orEmpty())) return@launch
       }
       notifications.show(snapshot.profile, session, TaskState(sessionId,
         if (permission != null) TaskPhase.WAITING_PERMISSION else TaskPhase.WAITING_QUESTION), permission,

@@ -193,10 +193,11 @@ internal class RemoteCodexTransport(
     if (bytes.isEmpty() || bytes.size > CLIENT_LIMIT) throw IOException("Codex 请求超过设备处理上限")
     val transferId = UUID.randomUUID().toString()
     val count = (bytes.size + CHUNK - 1) / CHUNK
-    var opened = false
+    var openAttempted = false
     try {
+      // The Host may allocate this ID before its response is lost or the caller is cancelled.
+      openAttempted = true
       rpc("codex.app.transfer.open", JSONObject().put("transferId", transferId).put("totalBytes", bytes.size).put("totalChunks", count))
-      opened = true
       for (index in 0 until count) {
         ensureOpen()
         val start = index * CHUNK
@@ -211,7 +212,7 @@ internal class RemoteCodexTransport(
         else -> throw IOException("Codex 传输描述无效")
       }
     } finally {
-      if (opened) withContext(NonCancellable) {
+      if (openAttempted) withContext(NonCancellable) {
         try { withTimeout(5_000) { rpc("codex.app.transfer.close", JSONObject().put("transferId", transferId)) } }
         catch (_: Exception) { }
       }

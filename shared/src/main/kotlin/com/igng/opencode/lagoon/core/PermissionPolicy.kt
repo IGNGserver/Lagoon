@@ -11,13 +11,20 @@ data class PermissionPolicy(val hide: Boolean = false, val autoApprove: Boolean 
   fun visible(requestId: String, failed: Set<String> = emptySet()): Boolean =
     !hide && (!autoApprove || requestId in failed)
 
+  /** Some requests must remain visible even if generic permissions are hidden or auto-approved. */
+  fun visible(request: PermissionRequest, failed: Set<String> = emptySet()): Boolean =
+    request.manualOnly || visible(request.id, failed)
+
   fun tasks(tasks: Map<String, TaskState>, requests: List<PermissionRequest>, failed: Set<String> = emptySet()): Map<String, TaskState> =
     tasks.mapValues { (session, task) ->
-      if (task.phase == TaskPhase.WAITING_PERMISSION && requests.none { it.sessionId == session && visible(it.id, failed) })
+      if (task.phase == TaskPhase.WAITING_PERMISSION && requests.none { it.sessionId == session && visible(it, failed) })
         task.copy(phase = TaskPhase.WAITING_SERVER, detail = "等待服务器处理")
       else task
     }
 }
+
+/** A notification cannot show the complete grant or obtain the required informed decision. */
+internal fun PermissionRequest.canApproveFromNotification(): Boolean = !manualOnly
 
 /** One approver per server, shared by events, reconnect sweeps and setting changes. */
 internal class PermissionAutoApprover(
@@ -38,7 +45,7 @@ internal class PermissionAutoApprover(
   fun pending(requests: List<PermissionRequest>): List<PermissionRequest> = requests.filterNot { it.id in responded }
 
   fun consider(request: PermissionRequest) {
-    if (disposed || !enabled() || request.id in responded || request.id in jobs) return
+    if (disposed || !enabled() || request.manualOnly || request.id in responded || request.id in jobs) return
     if ((retryAt[request.id] ?: 0L) > System.currentTimeMillis()) return
     // Register before launch, including on Main.immediate / Unconfined dispatchers.
     val job = scope.launch(start = kotlinx.coroutines.CoroutineStart.LAZY) {

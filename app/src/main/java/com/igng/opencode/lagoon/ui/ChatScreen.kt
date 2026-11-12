@@ -996,7 +996,7 @@ fun MiuixPermissionCard(request: PermissionRequest, controller: LagoonController
     }
     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
       HyperButton(text = "拒绝", variant = HyperButtonVariant.SECONDARY, onClick = { controller.replyPermission(request, "reject") }, enabled = !pending, modifier = Modifier.weight(1f))
-      HyperButton(text = "允许一次", onClick = { controller.replyPermission(request, "once") }, enabled = !pending, loading = pending, modifier = Modifier.weight(1f))
+      HyperButton(text = if (request.manualOnly) "同意上述授权" else "允许一次", onClick = { controller.replyPermission(request, "once") }, enabled = !pending, loading = pending, modifier = Modifier.weight(1f))
     }
     if (request.always.isNotEmpty()) {
       HyperTextAction(text = "始终允许并保存规则…", enabled = !pending, onClick = { confirmSave = true }, modifier = Modifier.fillMaxWidth().padding(top = 8.dp))

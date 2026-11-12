@@ -1,5 +1,6 @@
 package com.igng.opencode.lagoon.system
 
+import com.igng.opencode.lagoon.core.canApproveFromNotification
 import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
@@ -103,7 +104,8 @@ class TaskNotifications(private val context: Context) {
     // island slot, otherwise every running session would compete for the status bar chip.
     if (state.phase == TaskPhase.WAITING_PERMISSION && permission != null && permission.action.isNotBlank() && permission.detail !in setOf("", "{}", "[]")) {
       builder.addAction(0, "拒绝", action("reject", profile, session, permission))
-      builder.addAction(0, "允许一次", action("once", profile, session, permission))
+      if (!permission.canApproveFromNotification()) builder.addAction(0, "查看授权范围", open(profile.id, session.id))
+      else builder.addAction(0, "允许一次", action("once", profile, session, permission))
 
     }
     if (state.phase == TaskPhase.WAITING_QUESTION) {

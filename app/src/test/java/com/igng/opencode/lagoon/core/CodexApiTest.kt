@@ -95,6 +95,7 @@ class CodexApiTest {
     val first = a.await()
     assertEquals(first.properties.str("id"), b.await().properties.str("id"))
     val request = api.sessionPermissions(session).single()
+    assertFalse(request.manualOnly)
     api.replyPermission(request, "once")
     assertEquals(42, transport.answer?.first)
     assertEquals("accept", transport.answer?.second?.getString("decision"))
@@ -112,6 +113,62 @@ class CodexApiTest {
     try { api.replyPermission(api.sessionPermissions(session).single(), "always"); fail("Remote cannot grant for session") }
     catch (e: ApiException) { assertEquals(501, e.status) }
     assertNull(transport.answer)
+    api.close()
+  }
+
+  @Test fun fileApprovalShowsGrantRootAndRespectsSessionDecision() = runBlocking {
+    for (remote in listOf(false, true)) {
+      val transport = Fake(remote); val api = CodexApi(transport)
+      api.selectCodexSession(session)
+      val asked = async(start = CoroutineStart.UNDISPATCHED) { withTimeout(3000) { api.events().first { it.type == "permission.asked" } } }
+      transport.frames.emit(JSONObject().put("id", 99).put("method", "item/fileChange/requestApproval")
+        .put("params", JSONObject().put("threadId", session.id).put("grantRoot", "/sensitive/root")))
+      val event = asked.await()
+      assertTrue(event.properties.str("message").contains("/sensitive/root"))
+      assertTrue(event.properties.getBoolean("manualOnly"))
+      val request = api.sessionPermissions(session).single()
+      assertTrue(request.manualOnly)
+      assertTrue(request.detail.contains("本会话剩余时间"))
+      assertTrue(request.detail.contains("允许一次"))
+      if (!remote) assertTrue(request.detail.contains("会话级批准（此处不可选择）"))
+      api.replyPermission(request, if (remote) "once" else "always")
+      assertEquals(if (remote) "accept" else "acceptForSession", transport.answer!!.second.getString("decision"))
+      api.close()
+    }
+  }
+
+  @Test fun additionalPermissionsExplainTurnScopeAndPreserveSessionScope() = runBlocking {
+    val transport = Fake(false); val api = CodexApi(transport)
+    api.selectCodexSession(session)
+    for ((id, reply) in listOf(101 to "once", 102 to "always")) {
+      val asked = async(start = CoroutineStart.UNDISPATCHED) { withTimeout(3000) { api.events().first { it.type == "permission.asked" } } }
+      transport.frames.emit(JSONObject().put("id", id).put("method", "item/permissions/requestApproval")
+        .put("params", JSONObject().put("threadId", session.id).put("permissions", JSONObject().put("network", JSONObject().put("enabled", true)))))
+      asked.await()
+      val request = api.sessionPermissions(session).single()
+      assertTrue(request.manualOnly)
+      assertTrue(request.detail.contains("授权本轮有效"))
+      api.replyPermission(request, reply)
+      val response = transport.answer!!.second
+      assertTrue(response.getJSONObject("permissions").getJSONObject("network").getBoolean("enabled"))
+      if (reply == "once") assertFalse(response.has("scope")) else assertEquals("session", response.getString("scope"))
+    }
+    api.close()
+  }
+
+  @Test fun malformedGrantRootCannotBeApproved() = runBlocking {
+    val transport = Fake(false); val api = CodexApi(transport)
+    api.selectCodexSession(session)
+    val asked = async(start = CoroutineStart.UNDISPATCHED) { withTimeout(3000) { api.events().first { it.type == "permission.asked" } } }
+    transport.frames.emit(JSONObject().put("id", 103).put("method", "item/fileChange/requestApproval")
+      .put("params", JSONObject().put("threadId", session.id).put("grantRoot", JSONObject())))
+    asked.await()
+    val request = api.sessionPermissions(session).single()
+    assertTrue(request.manualOnly)
+    try { api.replyPermission(request, "once"); fail("malformed root must not be approved") } catch (_: ApiException) {}
+    assertNull(transport.answer)
+    api.replyPermission(request, "reject")
+    assertEquals("decline", transport.answer!!.second.getString("decision"))
     api.close()
   }
   @Test fun projectAdmissionUsesHostConfirmedRootAndStableKeyAfterUncertainResult() = runBlocking {
@@ -413,6 +470,61 @@ class CodexApiTest {
     api.close()
   }
 
+  @Test fun delayedActiveHistoryDoesNotResurrectCompletedTurn() = runBlocking {
+    val transport = Fake()
+    val entered = CompletableDeferred<Unit>()
+    val release = CompletableDeferred<Unit>()
+    transport.response = { method, _ -> when (method) {
+      "dsh/sessionHistory" -> { entered.complete(Unit); release.await(); JSONObject("""{"records":[],"hasMore":false,"activeTurnId":"old"}""") }
+      "account/read" -> JSONObject().put("requiresOpenaiAuth", false)
+      else -> JSONObject()
+    } }
+    val api = CodexApi(transport)
+    val loading = async { api.messagesPage("thread-1", null, 20) }
+    entered.await()
+    val completed = async(start = CoroutineStart.UNDISPATCHED) { withTimeout(3000) { api.events().first { it.type == "session.execution.succeeded" } } }
+    transport.frames.emit(JSONObject().put("method", "turn/completed").put("params", JSONObject().put("threadId", "thread-1")
+      .put("turn", JSONObject().put("id", "old").put("status", "completed"))))
+    completed.await()
+    release.complete(Unit)
+    loading.await()
+    try { api.abort(session); fail("a completed turn cannot be interrupted") } catch (e: ApiException) { assertEquals(409, e.status) }
+    api.close()
+  }
+
+  @Test fun omittedRemoteActiveTurnClearsPriorSnapshotButNotNewerEvent() = runBlocking {
+    val transport = Fake()
+    var historyCalls = 0
+    val entered = CompletableDeferred<Unit>()
+    val release = CompletableDeferred<Unit>()
+    transport.response = { method, _ -> if (method == "dsh/sessionHistory") {
+      when (++historyCalls) {
+        1, 3, 5 -> JSONObject("""{"records":[],"hasMore":false,"activeTurnId":"old"}""")
+        4 -> { entered.complete(Unit); release.await(); JSONObject("""{"records":[],"hasMore":false}""") }
+        else -> JSONObject("""{"records":[],"hasMore":false}""")
+      }
+    } else if (method == "account/read") JSONObject().put("requiresOpenaiAuth", false) else JSONObject() }
+    val api = CodexApi(transport)
+    api.messagesPage("thread-1", null, 20)
+    api.messagesPage("thread-1", null, 20)
+    try { api.abort(session); fail("an idle snapshot clears prior active state") } catch (e: ApiException) { assertEquals(409, e.status) }
+    api.messagesPage("thread-1", null, 20)
+    val loading = async { api.messagesPage("thread-1", null, 20) }
+    entered.await()
+    val started = async(start = CoroutineStart.UNDISPATCHED) { withTimeout(3000) { api.events().first { it.type == "session.execution.started" } } }
+    transport.frames.emit(JSONObject().put("method", "turn/started").put("params", JSONObject().put("threadId", "thread-1")
+      .put("turn", JSONObject().put("id", "new"))))
+    started.await()
+    release.complete(Unit)
+    loading.await()
+    api.abort(session)
+    assertEquals("new", transport.calls.last().second.getString("turnId"))
+    api.messagesPage("thread-1", null, 20) // Host history may lag an already-observed new turn.
+    api.abort(session)
+    assertEquals("new", transport.calls.last().second.getString("turnId"))
+    api.close()
+  }
+
   @Test fun delayedCreationNeverChangesForegroundSelection() = runBlocking {
     val transport = Fake()
     val api = CodexApi(transport)
@@ -641,7 +753,7 @@ class CodexApiTest {
     val transport = Fake(false); val api = CodexApi(transport)
     api.selectCodexSession(session)
     transport.errorSignal = CompletableDeferred()
-    val notice = async(start = CoroutineStart.UNDISPATCHED) { withTimeout(3000) { api.events().first { it.type == "session.synthetic" } } }
+    val notice = async(start = CoroutineStart.UNDISPATCHED) { withTimeout(3000) { api.events().first { it.type == "session.synthetic" && it.properties.str("description").contains("future/request") } } }
     transport.frames.emit(JSONObject().put("id", 96).put("method", "future/request")
       .put("params", JSONObject().put("threadId", "thread-1")))
     assertTrue(notice.await().properties.str("description").contains("future/request"))
@@ -693,6 +805,35 @@ class CodexApiTest {
     val deleted = async(start = CoroutineStart.UNDISPATCHED) { withTimeout(3000) { api.events().first { it.type == "session.deleted" } } }
     transport.frames.emit(JSONObject().put("method", "thread/deleted").put("params", JSONObject().put("threadId", session.id)))
     assertEquals(session.id, deleted.await().properties.str("sessionID"))
+    api.close()
+  }
+
+  @Test fun sshSubAgentActivityDisplaysOnlyReportedFactsAndDeduplicatesHistory() = runBlocking {
+    val transport = Fake(false); val api = CodexApi(transport)
+    val activity = JSONObject().put("type", "subAgentActivity").put("id", "activity-1")
+      .put("agentPath", "worker/research").put("agentThreadId", "child-thread").put("kind", "started")
+      .put("model", "example-model").put("reasoningEffort", "high")
+    transport.response = { method, _ ->
+      if (method == "thread/turns/list") JSONObject().put("data", JSONArray().put(
+        JSONObject().put("id", "turn-1").put("status", "inProgress").put("items", JSONArray().put(activity))))
+      else if (method == "account/read") JSONObject().put("requiresOpenaiAuth", false) else JSONObject()
+    }
+    api.selectCodexSession(session)
+    val live = async(start = CoroutineStart.UNDISPATCHED) { withTimeout(3000) { api.events().first { it.type == "session.synthetic" } } }
+    transport.frames.emit(JSONObject().put("method", "item/started").put("params", JSONObject().put("threadId", session.id).put("item", activity)))
+    val event = live.await()
+    val notice = event.properties.str("description")
+    assertTrue(notice.contains("已开始"))
+    assertTrue(notice.contains("worker/research"))
+    assertTrue(notice.contains("child-thread"))
+    assertTrue(notice.contains("example-model"))
+    val history = api.messagesPage(session.id, null, 20).items.single()
+    assertEquals(event.id, history.id)
+    assertNull(history.notice?.target)
+    val projected = TranscriptProjection.apply(emptyList(), event)!!.messages.single()
+    assertEquals(history.id, projected.id)
+    assertNull(projected.notice?.target)
+    assertTrue(TranscriptProjection.apply(listOf(history), event)!!.messages.size == 1)
     api.close()
   }
 

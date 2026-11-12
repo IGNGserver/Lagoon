@@ -33,6 +33,12 @@ class CodexApi(private val transport: CodexTransport) : HarnessClient {
   private val eventBusy = ConcurrentHashMap.newKeySet<String>()
   private val loaded = ConcurrentHashMap.newKeySet<String>()
   private val stateGate = Any()
+  // Changes to a thread's observed state invalidate older in-flight history snapshots.
+  // Access these counters only while holding stateGate.
+  private val stateRevisions = mutableMapOf<String, Long>()
+  private fun bumpStateRevision(id: String) {
+    stateRevisions[id] = (stateRevisions[id] ?: 0L) + 1L
+  }
   private val completedTurns = LinkedHashSet<String>()
   private fun turnKey(sessionId: String, turnId: String) = "$sessionId\u0000$turnId"
   private val requests = ConcurrentHashMap<String, PendingRequest>()
@@ -240,6 +246,7 @@ class CodexApi(private val transport: CodexTransport) : HarnessClient {
     val created = codexTime(raw.optLong("createdAt"))
     val status = raw.optJSONObject("status")?.str("type").orEmpty()
     synchronized(stateGate) {
+      if (status in setOf("active", "idle", "notLoaded")) bumpStateRevision(id)
       if (status == "active") {
         busy.add(id)
         raw.optJSONObject("status")?.str("turnId")?.takeIf(String::isNotBlank)?.let { active[id] = it }
@@ -349,14 +356,25 @@ class CodexApi(private val transport: CodexTransport) : HarnessClient {
     if (transport.remote) {
       val params = JSONObject().put("threadId", id).put("maxMessages", size.coerceIn(1, 100))
       if (cursor != null) params.put("beforeSeq", cursor.toLongOrNull() ?: throw ApiException(400, "历史游标无效"))
+      val revision = synchronized(stateGate) { stateRevisions[id] ?: 0L }
       val value = rpc("dsh/sessionHistory", params)
       val records = value.optJSONArray("records") ?: throw ApiException(502, "Codex 历史响应缺少记录")
       val hasMore = value.opt("hasMore") as? Boolean ?: throw ApiException(502, "Codex 历史分页格式错误")
       if (value.has("activeTurnId") && !value.isNull("activeTurnId") && value.opt("activeTurnId") !is String)
         throw ApiException(502, "Codex 活动轮次格式错误")
       val activeTurn = value.str("activeTurnId")
-      if (activeTurn.isNotBlank()) { active[id] = activeTurn; busy.add(id) }
-      else if (value.has("activeTurnId") && id !in eventBusy) { active.remove(id); busy.remove(id) }
+      synchronized(stateGate) {
+        if ((stateRevisions[id] ?: 0L) == revision) {
+          if (activeTurn.isNotBlank() && turnKey(id, activeTurn) !in completedTurns &&
+            (id !in eventBusy || active[id] == null || active[id] == activeTurn)) {
+            active[id] = activeTurn; busy.add(id)
+          } else if (id !in eventBusy) {
+            // bb33 omits activeTurnId for an idle thread; absence is the idle snapshot.
+            active.remove(id); busy.remove(id)
+          }
+          bumpStateRevision(id)
+        }
+      }
       val messages = remoteRecords(id, records)
       val next = if (hasMore) {
         objects(records, "records").mapNotNull { it.optJSONObject("event")?.optLong("seq") }.minOrNull()?.toString()
@@ -419,7 +437,7 @@ class CodexApi(private val transport: CodexTransport) : HarnessClient {
     return synchronized(stateGate) {
       // A successful complete scan can retire old snapshot-derived busy state, but never a
       // newer live/locally-admitted turn whose terminal event has not yet been observed.
-      idleOnHost.filterNot(eventBusy::contains).forEach { id -> busy.remove(id); active.remove(id) }
+      idleOnHost.filterNot(eventBusy::contains).forEach { id -> bumpStateRevision(id); busy.remove(id); active.remove(id) }
       activeOnHost + eventBusy + active.keys
     }
   }
@@ -458,7 +476,7 @@ class CodexApi(private val transport: CodexTransport) : HarnessClient {
   }
   private fun forgetDeletedThread(id: String) {
     if (id.isBlank()) return
-    synchronized(stateGate) { active.remove(id); busy.remove(id); eventBusy.remove(id) }
+    synchronized(stateGate) { bumpStateRevision(id); active.remove(id); busy.remove(id); eventBusy.remove(id) }
     loaded.remove(id)
     sessions.remove(id)
     requests.entries.filter { it.value.sessionId == id }.forEach { requests.remove(it.key, it.value) }
@@ -516,6 +534,7 @@ class CodexApi(private val transport: CodexTransport) : HarnessClient {
       admittedTurn = response.optJSONObject("turn")?.str("id")?.takeIf(String::isNotBlank)
         ?: throw ApiException(502, "Codex 未确认轮次，发送结果未知；请刷新会话")
       synchronized(stateGate) {
+        bumpStateRevision(session.id)
         if (turnKey(session.id, admittedTurn!!) !in completedTurns) {
           active[session.id] = admittedTurn!!; busy.add(session.id); eventBusy.add(session.id)
         }
@@ -567,9 +586,23 @@ class CodexApi(private val transport: CodexTransport) : HarnessClient {
   }
   private fun permission(id: String, request: PendingRequest): PermissionRequest {
     val p = request.params
+    val scope = when (request.method) {
+      "item/fileChange/requestApproval" -> buildList {
+        val root = p.opt("grantRoot")
+        if (root is String && root.isNotBlank())
+          add("此请求还申请在本会话剩余时间内写入此目录及其下内容：$root。服务端是否会应用该授权尚不确定。")
+        else if (root != null && root != JSONObject.NULL && root !is String)
+          add("服务端返回的授权目录格式无法识别，请拒绝此请求。")
+        add(if (transport.remote) "允许一次：批准此次文件修改。" else "允许一次：批准此次文件修改。Codex 的会话级批准（此处不可选择）会对同一批文件的后续修改免于询问。")
+      }.joinToString("\n")
+      "item/permissions/requestApproval" -> if (transport.remote) "允许一次：授权本轮有效。" else "允许一次：授权本轮有效。Codex 的会话级授权（此处不可选择）在整个会话有效。"
+      else -> ""
+    }
     return PermissionRequest(id, request.sessionId, sessions[request.sessionId]?.directory.orEmpty(),
       when { request.method.contains("fileChange") -> "文件修改"; request.method.contains("permissions/") -> "额外权限"; p.optJSONObject("networkApprovalContext") != null -> "网络访问"; else -> "命令执行" },
-      listOf(p.str("reason"), p.str("command"), p.str("cwd"), p.optJSONObject("networkApprovalContext")?.toString().orEmpty(), p.optJSONObject("permissions")?.toString().orEmpty()).filter(String::isNotBlank).joinToString("\n"))
+      listOf(p.str("reason"), p.str("command"), p.str("cwd"), p.optJSONObject("networkApprovalContext")?.toString().orEmpty(), p.optJSONObject("permissions")?.toString().orEmpty(), scope).filter(String::isNotBlank).joinToString("\n"),
+      manualOnly = request.method == "item/permissions/requestApproval" ||
+        (request.method == "item/fileChange/requestApproval" && p.opt("grantRoot")?.let { it != JSONObject.NULL && (it !is String || it.isNotBlank()) } == true))
   }
   override suspend fun forms(directory: String): List<QuestionRequest> = requests.entries.mapNotNull { (key, item) ->
     if (!isQuestionMethod(item.method)) return@mapNotNull null
@@ -744,6 +777,11 @@ class CodexApi(private val transport: CodexTransport) : HarnessClient {
 
   override suspend fun replyPermission(request: PermissionRequest, reply: String) {
     val pending = requests[request.id] ?: throw ApiException(409, "审批请求已失效")
+    if (pending.method == "item/fileChange/requestApproval" && reply in setOf("once", "always")) {
+      val root = pending.params.opt("grantRoot")
+      if (root != null && root != JSONObject.NULL && root !is String)
+        throw ApiException(502, "服务端返回的授权目录格式无法识别，请拒绝此请求")
+    }
     val decision = when (reply) { "once" -> "accept"; "always" -> if (transport.remote) throw ApiException(501, "Remote 不支持本会话授权") else "acceptForSession"; else -> "decline" }
     val response = if (pending.method == "item/permissions/requestApproval") {
       val granted = if (decision == "accept" || decision == "acceptForSession") pending.params.optJSONObject("permissions") ?: JSONObject() else JSONObject()
@@ -869,6 +907,21 @@ class CodexApi(private val transport: CodexTransport) : HarnessClient {
     }
   }
 
+  private fun subAgentDescription(item: JSONObject): String {
+    val kind = when (val raw = item.str("kind")) {
+      "started" -> "已开始"
+      "interacted" -> "发生交互"
+      "interrupted" -> "已中断"
+      "completed" -> "已完成"
+      "" -> "活动类型未知"
+      else -> "活动：$raw"
+    }
+    return listOf("子代理$kind", item.str("agentPath").takeIf(String::isNotBlank)?.let { "路径：$it" },
+      item.str("agentThreadId").takeIf(String::isNotBlank)?.let { "线程：$it" },
+      item.str("model").takeIf(String::isNotBlank)?.let { "模型：$it" },
+      item.str("reasoningEffort").takeIf(String::isNotBlank)?.let { "推理强度：$it" }).filterNotNull().joinToString("\n")
+  }
+
   /** Translate authoritative native history without mixing different turns or treating errors as empty history. */
   private fun nativeTurns(turns: JSONArray): List<Message> {
     val messages = mutableListOf<Message>()
@@ -881,6 +934,9 @@ class CodexApi(private val transport: CodexTransport) : HarnessClient {
       for (item in turn.arr("items").objects()) {
         val id = item.str("id").ifBlank { "$turnId:${messages.size}" }
         when (item.str("type")) {
+          "subAgentActivity" -> messages += JSONObject().put("id", "codex:subagent:$id").put("type", "synthetic")
+            .put("description", subAgentDescription(item)).put("time", JSONObject().put("created", timestamp))
+            .toMessage().copy(turnId = turnId)
           "userMessage" -> {
             val parts = item.arr("content").objects().mapIndexedNotNull { index, content ->
               when (content.str("type")) {
@@ -987,7 +1043,7 @@ class CodexApi(private val transport: CodexTransport) : HarnessClient {
       requests[key] = pending
       val perm = permission(key, pending)
       return listOf(event("permission.asked", JSONObject().put("id", key).put("action", perm.action).put("message", perm.detail)
-        .put("resources", JSONArray().put(perm.detail)).put("save", JSONArray())))
+        .put("resources", JSONArray().put(perm.detail)).put("save", JSONArray()).put("manualOnly", perm.manualOnly)))
     }
     if (frame.has("id") && method == "item/tool/requestUserInput" && sessionId.isNotBlank()) {
       val wireId = frame.opt("id") ?: return emptyList()
@@ -1015,12 +1071,14 @@ class CodexApi(private val transport: CodexTransport) : HarnessClient {
     return when (method) {
       "turn/started" -> {
         if (sessionId.isNotBlank() && turnId.isNotBlank()) synchronized(stateGate) {
+          bumpStateRevision(sessionId)
           if (turnKey(sessionId, turnId) !in completedTurns) { active[sessionId] = turnId; busy.add(sessionId); eventBusy.add(sessionId) }
         }
         listOf(event("session.execution.started"), event("session.status", JSONObject().put("status", JSONObject().put("type", "busy"))))
       }
       "turn/completed" -> {
         val applies = synchronized(stateGate) {
+          if (sessionId.isNotBlank()) bumpStateRevision(sessionId)
           if (sessionId.isNotBlank() && turnId.isNotBlank()) {
             completedTurns.add(turnKey(sessionId, turnId))
             while (completedTurns.size > 512) completedTurns.remove(completedTurns.first())
@@ -1054,14 +1112,14 @@ class CodexApi(private val transport: CodexTransport) : HarnessClient {
       "thread/status/changed" -> {
         when (params.obj("status").str("type")) {
           "idle", "notLoaded" -> {
-            synchronized(stateGate) { active.remove(sessionId); busy.remove(sessionId); eventBusy.remove(sessionId) }
+            synchronized(stateGate) { bumpStateRevision(sessionId); active.remove(sessionId); busy.remove(sessionId); eventBusy.remove(sessionId) }
             releaseFinishedTask(sessionId)
             val expired = requests.entries.filter { it.value.sessionId == sessionId }
             expired.forEach { requests.remove(it.key, it.value) }
             expired.map { entry -> event(if (isQuestionMethod(entry.value.method)) "form.cancelled" else "permission.replied", JSONObject().put("id", entry.key).put("requestID", entry.key)) } +
               event("session.status", JSONObject().put("status", JSONObject().put("type", "idle")))
           }
-          "active" -> { if (sessionId.isNotBlank()) synchronized(stateGate) { busy.add(sessionId); eventBusy.add(sessionId) }; listOf(event("session.status", JSONObject().put("status", JSONObject().put("type", "busy")))) }
+          "active" -> { if (sessionId.isNotBlank()) synchronized(stateGate) { bumpStateRevision(sessionId); busy.add(sessionId); eventBusy.add(sessionId) }; listOf(event("session.status", JSONObject().put("status", JSONObject().put("type", "busy")))) }
           "systemError" -> listOf(event("session.error", JSONObject().put("error", "Codex 线程状态异常，请重新连接核对")))
           else -> emptyList()
         }
@@ -1069,6 +1127,8 @@ class CodexApi(private val transport: CodexTransport) : HarnessClient {
       "item/started" -> {
         val item = params.obj("item")
         when (item.str("type")) {
+          "subAgentActivity" -> if (item.str("id").isBlank()) emptyList() else listOf(
+            event("session.synthetic", JSONObject().put("description", subAgentDescription(item))).copy(id = "codex:subagent:${item.str("id")}"))
           "agentMessage" -> listOf(event("session.step.started", base().put("started", now)), event("session.text.started", base()))
           "reasoning" -> listOf(event("session.step.started", base().put("started", now)))
           "commandExecution", "fileChange", "mcpToolCall", "collabAgentToolCall", "webSearch" -> {
@@ -1090,6 +1150,9 @@ class CodexApi(private val transport: CodexTransport) : HarnessClient {
       "item/completed" -> {
         val item = params.obj("item")
         when (item.str("type")) {
+          "subAgentActivity" -> if (item.str("id").isBlank()) emptyList() else listOf(
+            event("session.synthetic", JSONObject().put("description", subAgentDescription(item))).copy(id = "codex:subagent:${item.str("id")}"),
+            event("session.transcript.invalidate"))
           "agentMessage" -> listOf(event("session.text.ended", base().put("text", item.str("text"))), event("session.step.ended", base()))
           "commandExecution", "fileChange", "mcpToolCall", "collabAgentToolCall", "webSearch" -> {
             val failed = item.str("status") in setOf("failed", "declined")
