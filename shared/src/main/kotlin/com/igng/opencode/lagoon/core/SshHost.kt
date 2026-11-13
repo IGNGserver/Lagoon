@@ -7,7 +7,11 @@ import java.util.Locale
 import java.util.UUID
 
 /** How one saved SSH host authenticates. Secrets live in the app's encrypted SSH store, never here. */
-enum class SshAuthMethod(val label: String) { PASSWORD("密码"), PRIVATE_KEY("私钥") }
+enum class SshAuthMethod(val label: String) {
+  PASSWORD("密码"),
+  PRIVATE_KEY("密钥"),
+  KEY_WITH_PASSWORD_FALLBACK("密钥优先")
+}
 
 const val SSH_DEFAULT_PORT = 22
 const val DEFAULT_DSH_LAUNCH_COMMAND = "dsh web"
@@ -95,7 +99,8 @@ data class SshHostConfig(
   val launchCommand: String = DEFAULT_DSH_LAUNCH_COMMAND,
   val workingDirectory: String? = null,
   val hostKeyType: String? = null,
-  val hostKeyFingerprint: String? = null
+  val hostKeyFingerprint: String? = null,
+  val keyId: String? = null
 ) {
   private val displayHost: String
     get() = if (host.contains(':') && !host.startsWith("[")) "[$host]" else host
@@ -110,7 +115,7 @@ data class SshHostConfig(
 
   /** Fields that need a fresh SSH session. Renaming and re-pinning the key do not move the link. */
   val connectionKey: String
-    get() = listOf(host.trim(), port, user.trim(), auth.name, launchCommand.trim(), workingDirectory.orEmpty())
+    get() = listOf(host.trim(), port, user.trim(), auth.name, keyId.orEmpty(), launchCommand.trim(), workingDirectory.orEmpty())
       .joinToString("\u0000")
 
   fun copyWith(
@@ -124,7 +129,9 @@ data class SshHostConfig(
     clearWorkingDirectory: Boolean = false,
     hostKeyType: String? = this.hostKeyType,
     hostKeyFingerprint: String? = this.hostKeyFingerprint,
-    clearHostKey: Boolean = false
+    clearHostKey: Boolean = false,
+    keyId: String? = this.keyId,
+    clearKeyId: Boolean = false
   ): SshHostConfig {
     val moved = (host != null && host != this.host) || (port != null && port != this.port)
     return copy(
@@ -140,7 +147,8 @@ data class SshHostConfig(
         else -> this.workingDirectory
       },
       hostKeyType = if (clearHostKey || moved) null else hostKeyType,
-      hostKeyFingerprint = if (clearHostKey || moved) null else hostKeyFingerprint
+      hostKeyFingerprint = if (clearHostKey || moved) null else hostKeyFingerprint,
+      keyId = if (clearKeyId) null else keyId
     )
   }
 
@@ -155,6 +163,7 @@ data class SshHostConfig(
     .putOpt("workingDirectory", workingDirectory)
     .putOpt("hostKeyType", hostKeyType)
     .putOpt("hostKeyFingerprint", hostKeyFingerprint)
+    .putOpt("keyId", keyId)
 
   companion object {
     fun newId(): String = "ssh-${UUID.randomUUID()}"
@@ -179,7 +188,8 @@ data class SshHostConfig(
         workingDirectory = raw.optString("workingDirectory").trim().takeIf { it.isNotBlank() && it.length <= 1024 },
         hostKeyType = raw.optString("hostKeyType").trim().takeIf { it.isNotBlank() && it.length <= 64 },
         hostKeyFingerprint = raw.optString("hostKeyFingerprint").trim()
-          .takeIf { it.isNotBlank() && it.length <= 128 }
+          .takeIf { it.isNotBlank() && it.length <= 128 },
+        keyId = raw.optString("keyId").trim().takeIf { it.isNotBlank() && it.length <= 128 }
       )
     }
   }
@@ -189,10 +199,11 @@ data class SshHostConfig(
 data class SshSecrets(
   val password: String? = null,
   val privateKey: String? = null,
-  val passphrase: String? = null
+  val passphrase: String? = null,
+  val certificate: String? = null
 ) {
   val isEmpty: Boolean
-    get() = password.isNullOrEmpty() && privateKey.isNullOrBlank()
+    get() = password.isNullOrEmpty() && privateKey.isNullOrBlank() && certificate.isNullOrBlank()
 }
 
 internal object SshHostCodec {
@@ -257,7 +268,8 @@ data class SshLinkStatus(
 
 enum class SshFailureKind {
   UNREACHABLE, AUTH, HOST_KEY_UNKNOWN, HOST_KEY_CHANGED, NO_SHELL, DSH_NOT_FOUND,
-  DSH_START, DSH_TIMEOUT, TUNNEL, LOGIN, DISCONNECTED, UNRESPONSIVE, BAD_KEY, OTHER
+  DSH_START, DSH_TIMEOUT, TUNNEL, LOGIN, DISCONNECTED, UNRESPONSIVE, BAD_KEY,
+  PASSPHRASE_REQUIRED, BIOMETRIC_REQUIRED, OTHER
 }
 
 /** A typed SSH failure. The message is safe to show; [detail] is an optional redacted log tail. */

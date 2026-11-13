@@ -24,6 +24,10 @@ data class LagoonState(
   val deviceRefreshInFlight: String? = null,
   /** Saved SSH host metadata; secrets stay in SshHostStore. */
   val sshHosts: List<SshHostConfig> = emptyList(),
+  /** Saved SSH key profiles in global keychain; secrets stay in SshKeyStore. */
+  val sshKeys: List<SshKeyProfile> = emptyList(),
+  /** Bumped on keychain save/delete/lock/unlock so Compose pages reflect runtime unlock state. */
+  val sshKeysRevision: Int = 0,
   /** Local, user-created device groups. Presentation only; never sent to a server. */
   val deviceGroups: List<DeviceGroup> = emptyList(),
   /** null = the home is not grouped; 全部 is the implicit aggregate. */

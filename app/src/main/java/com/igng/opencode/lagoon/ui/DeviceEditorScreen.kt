@@ -109,6 +109,7 @@ private fun AddDevicePage(
   onDeviceSaved: (String) -> Unit
 ) {
   var showAdvanced by rememberSaveable { mutableStateOf(false) }
+  var showKeychainSheet by rememberSaveable { mutableStateOf(false) }
   var directKind by rememberSaveable { mutableStateOf(ServerKind.OPENCODE) }
   val scope = rememberCoroutineScope()
   // 登录/接入会改写连接图；跟着它重组，目录和"已保存的 SSH 设备"才会即时更新。
@@ -156,9 +157,16 @@ private fun AddDevicePage(
         HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(vertical = 4.dp)) {
           HyperRow(
             title = "添加 SSH 设备",
-            summary = "地址、用户名与凭据；保存后刷新发现，逐个启用 Harness",
+            summary = "地址、用户名、验证方式（密码 / 密钥 / 密钥优先）；保存后刷新发现",
             showChevron = true,
             onClick = { onOpenSshEditor("") }
+          )
+          HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
+          HyperRow(
+            title = "SSH 密钥库",
+            summary = if (state.sshKeys.isEmpty()) "本机生成 Ed25519 / 硬件密钥，或导入已有私钥" else "已保存 ${state.sshKeys.size} 把密钥 · 支持多主机复用与一键部署公钥",
+            showChevron = true,
+            onClick = { showKeychainSheet = true }
           )
         }
         Text(
@@ -223,6 +231,13 @@ private fun AddDevicePage(
       }
     }
   }
+
+  SshKeychainManagerSheet(
+    show = showKeychainSheet,
+    state = state,
+    controller = controller,
+    onDismiss = { showKeychainSheet = false }
+  )
 }
 
 /** 兼容直连资料：一保存就是一台 1:1 的设备，直接进它的设备页。 */

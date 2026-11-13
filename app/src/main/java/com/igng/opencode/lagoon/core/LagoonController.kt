@@ -1,7 +1,10 @@
 package com.igng.opencode.lagoon.core
 
 import android.content.Context
+import com.igng.opencode.lagoon.core.ssh.AndroidKeystoreSshSigner
+import com.igng.opencode.lagoon.core.ssh.JschSshTransportFactory
 import com.igng.opencode.lagoon.core.ssh.SshHostManager
+import com.igng.opencode.lagoon.core.ssh.SshKeyCodec
 import com.igng.opencode.lagoon.system.BackgroundSyncWorker
 import com.igng.opencode.lagoon.system.TaskNotifications
 import com.igng.opencode.lagoon.system.TaskMonitorService
@@ -797,8 +800,14 @@ class LagoonController private constructor(private val appContext: Context) {
   // Writing operations that must survive the UI leaving the foreground (permission replies, aborts)
   // run here rather than in a composer-scoped coroutine.
   private val operationScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+  private val sshKeyStore = SshKeyStore(appContext)
+  private val hardwareSshSigner = AndroidKeystoreSshSigner()
   private val sshHostStore = SshHostStore(appContext)
-  private val sshHostManager = SshHostManager(sshHostStore)
+  private val sshHostManager = SshHostManager(
+    store = sshHostStore,
+    transportFactory = JschSshTransportFactory(sshKeyStore, hardwareSshSigner),
+    keyStore = sshKeyStore
+  )
   private val mutable = MutableStateFlow(
     run {
       val storedProfiles = store.profiles()
@@ -813,6 +822,7 @@ class LagoonController private constructor(private val appContext: Context) {
       val groupLoad = deviceGroupStore.load()
       val groups = groupLoad.state.sanitized(profiles.map { it.id }.toSet())
       val sshHosts = sshHostStore.load()
+      val sshKeys = sshKeyStore.load()
       val enabledIds = profiles.filter { it.effectiveEnabled }.mapTo(HashSet()) { it.id }
       val storedHome = store.homeServerId()?.takeIf { it in enabledIds }
       // Parent gates hide runtime members, never the user's saved composition selection. When
@@ -827,6 +837,7 @@ class LagoonController private constructor(private val appContext: Context) {
       LagoonState(
         profiles = profiles,
         sshHosts = sshHosts,
+        sshKeys = sshKeys,
         deviceGroups = groups.groups,
         homeGroupId = selectedGroup,
         deviceGroupReset = groupLoad.resetLegacy,
@@ -2128,6 +2139,279 @@ class LagoonController private constructor(private val appContext: Context) {
 
   fun sshHostSecrets(hostId: String): SshSecrets = sshHostStore.secrets(hostId)
 
+  fun sshKeys(): List<SshKeyProfile> = state.value.sshKeys
+
+  fun sshKey(id: String?): SshKeyProfile? = id?.let { keyId -> state.value.sshKeys.firstOrNull { it.id == keyId } }
+
+  fun sshKeySecrets(id: String): SshKeySecrets = sshKeyStore.secrets(id)
+
+  fun isSshKeyUnlocked(profile: SshKeyProfile): Boolean = sshKeyStore.isUnlocked(profile)
+
+  fun isBiometricSupported(): Boolean = BiometricKeyVault.isSupported(appContext)
+
+  fun hostsUsingSshKey(keyId: String): List<SshHostConfig> =
+    sshHostStore.load().filter { it.keyId == keyId }
+
+  /** Generates a new software SSH keypair (Ed25519 / ECDSA P-256 / RSA 4096) into the global keychain. */
+  suspend fun generateSoftwareSshKey(
+    name: String,
+    algorithm: SshKeyAlgorithm,
+    passphrase: String?,
+    policy: SshPassphrasePolicy,
+    biometricActivityContext: Context? = null,
+    comment: String = "lagoon"
+  ): SshKeyProfile {
+    val keyId = SshKeyProfile.newId()
+    val cleanName = name.trim().ifBlank { "${algorithm.label} 密钥" }.take(128)
+    val cleanPassphrase = passphrase?.takeIf { it.isNotEmpty() }
+    if (policy == SshPassphrasePolicy.SAVED || policy == SshPassphrasePolicy.PROMPT) {
+      require(!cleanPassphrase.isNullOrEmpty()) { "请输入私钥口令，或切换为「无口令」" }
+    }
+    val effectivePolicy = if (cleanPassphrase == null && policy != SshPassphrasePolicy.BIOMETRIC) {
+      SshPassphrasePolicy.NONE
+    } else {
+      policy
+    }
+    val generated = kotlinx.coroutines.withContext(Dispatchers.Default) {
+      SshKeyCodec.generateKeyPair(
+        algorithm = algorithm,
+        comment = comment,
+        passphrase = if (effectivePolicy == SshPassphrasePolicy.NONE || (effectivePolicy == SshPassphrasePolicy.BIOMETRIC && cleanPassphrase == null)) {
+          null
+        } else {
+          cleanPassphrase
+        }
+      )
+    }
+    val encrypted = !cleanPassphrase.isNullOrEmpty()
+    val secrets = when (effectivePolicy) {
+      SshPassphrasePolicy.BIOMETRIC -> {
+        val uiContext = biometricActivityContext ?: error("需要界面上下文以触发系统生物识别")
+        val payloadToSeal = cleanPassphrase ?: generated.privateKeyPem
+        val sealed = BiometricKeyVault.seal(
+          context = uiContext,
+          keyId = keyId,
+          plaintext = payloadToSeal,
+          title = "启用生物识别保护",
+          subtitle = "验证身份以保护 SSH 密钥「$cleanName」"
+        )
+        sshKeyStore.unlockRuntimeSecret(keyId, payloadToSeal)
+        SshKeySecrets(
+          privateKey = if (encrypted) generated.privateKeyPem else null,
+          passphrase = null,
+          biometricCiphertext = sealed.ciphertextBase64,
+          biometricIv = sealed.ivBase64
+        )
+      }
+      SshPassphrasePolicy.PROMPT -> {
+        if (cleanPassphrase != null) sshKeyStore.unlockRuntimeSecret(keyId, cleanPassphrase)
+        SshKeySecrets(privateKey = generated.privateKeyPem, passphrase = null)
+      }
+      SshPassphrasePolicy.SAVED, SshPassphrasePolicy.NONE -> {
+        SshKeySecrets(privateKey = generated.privateKeyPem, passphrase = cleanPassphrase)
+      }
+    }
+    val profile = SshKeyProfile(
+      id = keyId,
+      name = cleanName,
+      algorithm = generated.algorithm,
+      fingerprint = generated.fingerprint,
+      publicKeyOpenSsh = generated.publicKeyOpenSsh,
+      encrypted = encrypted,
+      passphrasePolicy = effectivePolicy,
+      source = SshKeySource.GENERATED,
+      biometricProtected = effectivePolicy == SshPassphrasePolicy.BIOMETRIC,
+      createdAt = System.currentTimeMillis()
+    )
+    sshKeyStore.save(profile, secrets)
+    refreshSshKeys(invalidateKeyId = keyId)
+    return profile
+  }
+
+  /** Creates a non-exportable ECDSA P-256 SSH key inside AndroidKeyStore hardware. */
+  fun generateHardwareSshKey(name: String, requireBiometric: Boolean): SshKeyProfile {
+    val keyId = SshKeyProfile.newId()
+    val cleanName = name.trim().ifBlank { "本机硬件密钥" }.take(128)
+    if (requireBiometric) require(isBiometricSupported()) { "当前设备未启用生物识别或系统锁屏" }
+    val profile = hardwareSshSigner.generateKey(keyId, cleanName, requireBiometric)
+    sshKeyStore.save(profile, SshKeySecrets())
+    refreshSshKeys(invalidateKeyId = keyId)
+    return profile
+  }
+
+  /** Parses, validates, and imports an existing private key (PEM / OpenSSH / PKCS#8 / PuTTY) into the keychain. */
+  suspend fun importSshKey(
+    name: String,
+    privateKeyText: String,
+    passphrase: String?,
+    policy: SshPassphrasePolicy,
+    certificateText: String? = null,
+    biometricActivityContext: Context? = null
+  ): SshKeyProfile {
+    val cleanKey = privateKeyText.trim()
+    val cleanPass = passphrase?.takeIf { it.isNotEmpty() }
+    val parsed = kotlinx.coroutines.withContext(Dispatchers.Default) {
+      SshKeyCodec.inspectPrivateKey(cleanKey, cleanPass)
+    }
+    if (parsed.encrypted && !parsed.decrypted) {
+      throw SshFailure(SshFailureKind.PASSPHRASE_REQUIRED, "此私钥已加密，请先填写私钥口令校验后再导入", retryable = false)
+    }
+    val cert = certificateText?.trim()?.takeIf { it.isNotEmpty() }?.let {
+      SshKeyCodec.parseCertificate(it).normalizedLine
+    }
+    val keyId = SshKeyProfile.newId()
+    val cleanName = name.trim().ifBlank { "${parsed.algorithm} 导入密钥" }.take(128)
+    val effectivePolicy = when {
+      policy == SshPassphrasePolicy.BIOMETRIC -> SshPassphrasePolicy.BIOMETRIC
+      !parsed.encrypted -> SshPassphrasePolicy.NONE
+      policy == SshPassphrasePolicy.NONE -> SshPassphrasePolicy.SAVED
+      else -> policy
+    }
+    val secrets = when (effectivePolicy) {
+      SshPassphrasePolicy.BIOMETRIC -> {
+        val uiContext = biometricActivityContext ?: error("需要界面上下文以触发系统生物识别")
+        val payloadToSeal = if (parsed.encrypted) cleanPass!! else cleanKey
+        val sealed = BiometricKeyVault.seal(
+          context = uiContext,
+          keyId = keyId,
+          plaintext = payloadToSeal,
+          title = "启用生物识别保护",
+          subtitle = "验证身份以保护 SSH 密钥「$cleanName」"
+        )
+        sshKeyStore.unlockRuntimeSecret(keyId, payloadToSeal)
+        SshKeySecrets(
+          privateKey = if (parsed.encrypted) cleanKey else null,
+          passphrase = null,
+          biometricCiphertext = sealed.ciphertextBase64,
+          biometricIv = sealed.ivBase64
+        )
+      }
+      SshPassphrasePolicy.PROMPT -> {
+        if (cleanPass != null) sshKeyStore.unlockRuntimeSecret(keyId, cleanPass)
+        SshKeySecrets(privateKey = cleanKey, passphrase = null)
+      }
+      SshPassphrasePolicy.SAVED, SshPassphrasePolicy.NONE -> {
+        SshKeySecrets(privateKey = cleanKey, passphrase = cleanPass)
+      }
+    }
+    val profile = SshKeyProfile(
+      id = keyId,
+      name = cleanName,
+      algorithm = parsed.algorithm,
+      fingerprint = parsed.fingerprint,
+      publicKeyOpenSsh = parsed.publicKeyOpenSsh,
+      certificateOpenSsh = cert,
+      encrypted = parsed.encrypted,
+      passphrasePolicy = effectivePolicy,
+      source = SshKeySource.IMPORTED,
+      biometricProtected = effectivePolicy == SshPassphrasePolicy.BIOMETRIC,
+      createdAt = System.currentTimeMillis()
+    )
+    sshKeyStore.save(profile, secrets)
+    refreshSshKeys(invalidateKeyId = keyId)
+    return profile
+  }
+
+  /** Attaches or clears an OpenSSH `-cert.pub` user certificate on a stored key profile. */
+  fun updateSshKeyCertificate(keyId: String, certificateText: String?): SshKeyProfile {
+    val existing = sshKeyStore.find(keyId) ?: error("SSH 密钥不存在")
+    val normalized = certificateText?.trim()?.takeIf { it.isNotEmpty() }?.let {
+      SshKeyCodec.parseCertificate(it).normalizedLine
+    }
+    val updated = existing.copy(certificateOpenSsh = normalized)
+    sshKeyStore.save(updated)
+    refreshSshKeys(invalidateKeyId = keyId)
+    return updated
+  }
+
+  fun renameSshKey(keyId: String, newName: String) {
+    val existing = sshKeyStore.find(keyId) ?: return
+    val clean = newName.trim().takeIf { it.isNotEmpty() }?.take(128) ?: return
+    sshKeyStore.save(existing.copy(name = clean))
+    refreshSshKeys(invalidateKeyId = null)
+  }
+
+  /** Unlocks a `PROMPT` policy encrypted key into process memory after verifying the passphrase. */
+  suspend fun unlockSshKeyWithPassphrase(keyId: String, passphrase: String) {
+    val profile = sshKeyStore.find(keyId) ?: error("SSH 密钥不存在")
+    val stored = sshKeyStore.secrets(keyId)
+    val privateKey = stored.privateKey ?: error("私钥内容缺失")
+    require(passphrase.isNotEmpty()) { "请输入私钥口令" }
+    val parsed = kotlinx.coroutines.withContext(Dispatchers.Default) {
+      SshKeyCodec.inspectPrivateKey(privateKey, passphrase)
+    }
+    require(!parsed.encrypted || parsed.decrypted) { "私钥口令不正确" }
+    sshKeyStore.unlockRuntimeSecret(keyId, passphrase)
+    refreshSshKeys(invalidateKeyId = keyId)
+  }
+
+  /** Unlocks a `BIOMETRIC` software or hardware SSH key using platform BiometricPrompt. */
+  suspend fun unlockSshKeyWithBiometric(keyId: String, activityContext: Context) {
+    val profile = sshKeyStore.find(keyId) ?: error("SSH 密钥不存在")
+    when (profile.source) {
+      SshKeySource.HARDWARE_KEYSTORE -> {
+        BiometricKeyVault.authenticateHardwareKey(
+          context = activityContext,
+          title = "解锁硬件 SSH 密钥",
+          subtitle = "验证身份以使用「${profile.name}」"
+        )
+        sshKeyStore.unlockRuntimeSecret(keyId, "hardware-unlocked")
+      }
+      SshKeySource.GENERATED, SshKeySource.IMPORTED -> {
+        val stored = sshKeyStore.secrets(keyId)
+        val cipher = stored.biometricCiphertext ?: error("生物识别密文缺失，请重新导入密钥")
+        val iv = stored.biometricIv ?: error("生物识别 IV 缺失，请重新导入密钥")
+        val plain = BiometricKeyVault.unseal(
+          context = activityContext,
+          keyId = keyId,
+          ciphertextBase64 = cipher,
+          ivBase64 = iv,
+          title = "解锁 SSH 密钥",
+          subtitle = "验证身份以使用「${profile.name}」"
+        )
+        sshKeyStore.unlockRuntimeSecret(keyId, plain)
+      }
+    }
+    refreshSshKeys(invalidateKeyId = keyId)
+  }
+
+  fun lockSshKey(keyId: String) {
+    sshKeyStore.lockRuntimeSecret(keyId)
+    refreshSshKeys(invalidateKeyId = keyId)
+  }
+
+  fun deleteSshKey(keyId: String) {
+    val existing = sshKeyStore.find(keyId)
+    if (existing?.source == SshKeySource.HARDWARE_KEYSTORE) {
+      hardwareSshSigner.deleteKey(keyId)
+    }
+    BiometricKeyVault.deleteKey(keyId)
+    sshKeyStore.delete(keyId)
+    refreshSshKeys(invalidateKeyId = keyId)
+  }
+
+  suspend fun deploySshPublicKey(config: SshHostConfig, secrets: SshSecrets, publicKeyOpenSsh: String) {
+    val clean = cleanSshConfig(config)
+    validateSshSecrets(clean, secrets)
+    sshHostManager.deployPublicKey(clean, secrets, publicKeyOpenSsh)
+  }
+
+  private fun refreshSshKeys(invalidateKeyId: String?) {
+    val keys = sshKeyStore.load()
+    updateState { it.copy(sshKeys = keys, sshKeysRevision = it.sshKeysRevision + 1) }
+    if (invalidateKeyId != null) {
+      val affected = sshHostStore.load().filter { it.keyId == invalidateKeyId }
+      val allProfiles = store.profiles()
+      affected.forEach { host ->
+        val hostProfiles = allProfiles.filter { it.sshHostId == host.id }
+        hostProfiles.forEach { allOverview.invalidate(it.id) }
+        sshHostManager.replace(host.id)
+        val restart = hostProfiles.filter { it.effectiveEnabled }.map { it.id }.toSet()
+        if (restart.isNotEmpty()) allOverview.start(allProfiles, include = restart)
+      }
+    }
+  }
+
   internal class NotificationClientLease(val client: HarnessClient, private val owned: Boolean) : AutoCloseable {
     private val closed = java.util.concurrent.atomic.AtomicBoolean(false)
     override fun close() {
@@ -2378,7 +2662,30 @@ class LagoonController private constructor(private val appContext: Context) {
   private fun validateSshSecrets(config: SshHostConfig, secrets: SshSecrets) {
     when (config.auth) {
       SshAuthMethod.PASSWORD -> require(!secrets.password.isNullOrEmpty()) { "填写 SSH 密码，或改用私钥" }
-      SshAuthMethod.PRIVATE_KEY -> require(!secrets.privateKey.isNullOrBlank()) { "粘贴 SSH 私钥" }
+      SshAuthMethod.PRIVATE_KEY, SshAuthMethod.KEY_WITH_PASSWORD_FALLBACK -> {
+        val hasInline = !secrets.privateKey.isNullOrBlank()
+        val keyId = config.keyId?.takeIf { it.isNotBlank() }
+        require(hasInline || (keyId != null && sshKeyStore.find(keyId) != null)) {
+          "请选择密钥库中的密钥，或粘贴 SSH 私钥"
+        }
+        if (hasInline) {
+          try {
+            SshKeyCodec.inspectPrivateKey(secrets.privateKey!!, secrets.passphrase)
+          } catch (error: SshFailure) {
+            throw IllegalArgumentException(error.message)
+          }
+        }
+        secrets.certificate?.trim()?.takeIf { it.isNotEmpty() }?.let { certText ->
+          try {
+            SshKeyCodec.parseCertificate(certText)
+          } catch (error: SshFailure) {
+            throw IllegalArgumentException(error.message)
+          }
+        }
+        if (config.auth == SshAuthMethod.KEY_WITH_PASSWORD_FALLBACK) {
+          require(!secrets.password.isNullOrEmpty()) { "填写备用 SSH 密码，或改用「仅密钥」模式" }
+        }
+      }
     }
   }
 

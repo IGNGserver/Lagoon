@@ -30,6 +30,8 @@ import com.igng.opencode.lagoon.core.LagoonController
 import com.igng.opencode.lagoon.core.LagoonState
 import com.igng.opencode.lagoon.core.ServerKind
 import com.igng.opencode.lagoon.core.ServerProfile
+import com.igng.opencode.lagoon.core.SshKeyProfile
+import com.igng.opencode.lagoon.core.SshPassphrasePolicy
 import com.igng.opencode.lagoon.core.connectionTypeLabel
 import com.igng.opencode.lagoon.core.endpointSummary
 import top.yukonga.miuix.kmp.basic.HorizontalDivider
@@ -63,6 +65,7 @@ internal fun DeviceManagementScreen(
   val sshDevices = devices.filter { it.access == DeviceAccess.SSH }
   val directDevices = devices.filter { it.access == DeviceAccess.DIRECT }
   val enabledHarnessCount = devices.sumOf { it.enabledCount }
+  var showKeychainSheet by remember { mutableStateOf(false) }
 
   Column(Modifier.fillMaxSize().background(HyperTheme.colors.canvas)) {
     PageTopBar("设备", onBack, actions = {
@@ -108,6 +111,13 @@ internal fun DeviceManagementScreen(
             showChevron = true,
             onClick = onAddDevice
           )
+          HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
+          HyperRow(
+            title = "SSH 密钥库",
+            summary = if (state.sshKeys.isEmpty()) "生成 / 导入并统一管理全局 SSH 密钥" else "已保存 ${state.sshKeys.size} 把 SSH 密钥（软件 / 硬件 / 证书）",
+            showChevron = true,
+            onClick = { showKeychainSheet = true }
+          )
         }
       }
       deviceSection("由中枢管理", hubDevices, state, controller, onOpenDevice)
@@ -144,6 +154,13 @@ internal fun DeviceManagementScreen(
       }
     }
   }
+
+  SshKeychainManagerSheet(
+    show = showKeychainSheet,
+    state = state,
+    controller = controller,
+    onDismiss = { showKeychainSheet = false }
+  )
 }
 
 private fun androidx.compose.foundation.lazy.LazyListScope.deviceSection(
@@ -227,7 +244,13 @@ internal fun DeviceDetailScreen(
     return
   }
   var confirmingDelete by remember(deviceId) { mutableStateOf(false) }
+  var unlockKeyTarget by remember(deviceId) { mutableStateOf<SshKeyProfile?>(null) }
+  var showDetailKeychain by remember(deviceId) { mutableStateOf(false) }
   val sshHostId = sshHostOfDevice(graph, device.id.value)
+  val sshHost = sshHostId?.let { id -> state.sshHosts.firstOrNull { it.id == id } }
+  val boundSshKey = remember(sshHost?.keyId, state.sshKeys, state.sshKeysRevision) {
+    controller.sshKey(sshHost?.keyId)
+  }
   val refreshing = state.deviceRefreshInFlight == deviceId
 
   Column(Modifier.fillMaxSize().background(HyperTheme.colors.canvas)) {
@@ -303,12 +326,29 @@ internal fun DeviceDetailScreen(
         HyperGroupTitle("设备设置")
         HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(vertical = 4.dp)) {
           when {
-            sshHostId != null -> HyperRow(
-              title = "编辑 SSH 连接",
-              summary = "地址、账号、凭据、启动命令与主机指纹",
-              trailing = { DropdownChevron() },
-              onClick = { onEditSsh(sshHostId) }
-            )
+            sshHostId != null -> {
+              HyperRow(
+                title = "编辑 SSH 连接",
+                summary = if (sshHost != null) "验证方式：${sshHost.auth.label} · 地址、凭据与主机指纹" else "地址、账号、凭据、启动命令与主机指纹",
+                trailing = { DropdownChevron() },
+                onClick = { onEditSsh(sshHostId) }
+              )
+              boundSshKey?.let { key ->
+                val unlocked = controller.isSshKeyUnlocked(key)
+                val gated = key.biometricProtected ||
+                  key.passphrasePolicy == SshPassphrasePolicy.BIOMETRIC ||
+                  (key.passphrasePolicy == SshPassphrasePolicy.PROMPT && key.encrypted)
+                HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
+                HyperRow(
+                  title = "SSH 密钥 · ${key.name}",
+                  summary = if (gated && !unlocked) "当前未解锁（点击解锁并重连） · ${key.summary}" else key.summary,
+                  trailing = { DropdownChevron() },
+                  onClick = {
+                    if (gated && !unlocked) unlockKeyTarget = key else showDetailKeychain = true
+                  }
+                )
+              }
+            }
             device.access == DeviceAccess.HUB -> HyperRow(
               title = "中枢与账号",
               summary = "查看账号、接入其他主机或退出中枢",
@@ -344,6 +384,26 @@ internal fun DeviceDetailScreen(
       }
     }
   }
+
+  unlockKeyTarget?.let { key ->
+    SshKeyUnlockDialog(
+      profile = key,
+      controller = controller,
+      onDismiss = { unlockKeyTarget = null },
+      onUnlocked = {
+        unlockKeyTarget = null
+        sshHostId?.let { controller.retrySshHost(it) }
+      }
+    )
+  }
+
+  SshKeychainManagerSheet(
+    show = showDetailKeychain,
+    state = state,
+    controller = controller,
+    onDismiss = { showDetailKeychain = false },
+    selectedKeyId = boundSshKey?.id
+  )
 }
 
 @Composable

@@ -7,6 +7,7 @@ import com.jcraft.jsch.ChannelExec
 import com.jcraft.jsch.ChannelSftp
 import com.jcraft.jsch.HostKey
 import com.jcraft.jsch.HostKeyRepository
+import com.jcraft.jsch.Identity
 import com.jcraft.jsch.JSch
 import com.jcraft.jsch.JSchChangedHostKeyException
 import com.jcraft.jsch.JSchUnknownHostKeyException
@@ -65,13 +66,20 @@ internal interface SshTransportFactory {
 }
 
 /** JSch-backed transport. JSch is BSD-licensed; the host key is verified by our own TOFU pin. */
-internal class JschSshTransportFactory : SshTransportFactory {
+internal class JschSshTransportFactory(
+  private val keyStore: SshKeyStore? = null,
+  private val hardwareSigner: HardwareSshSigner? = null
+) : SshTransportFactory {
   override fun connect(config: SshHostConfig, secrets: SshSecrets, verifier: SshHostKeyVerifier): SshTransport {
     val repository = VerifyingHostKeyRepository(verifier, config.hostKeyType?.trim()?.takeIf { it.isNotEmpty() })
     val session = try {
       openSession(config, secrets, repository)
     } catch (error: Throwable) {
-      throw describe(error, repository)
+      val failure = describe(error, repository)
+      if (failure.kind == SshFailureKind.BIOMETRIC_REQUIRED && !config.keyId.isNullOrBlank()) {
+        keyStore?.lockRuntimeSecret(config.keyId)
+      }
+      throw failure
     }
     return JschSshTransport(session)
   }
@@ -81,7 +89,11 @@ internal class JschSshTransportFactory : SshTransportFactory {
     val session = try {
       // The host key is presented before authentication; use a throwaway password auth so a
       // private-key-only config can still be probed without asking for the key again.
-      openSession(config.copyWith(auth = SshAuthMethod.PASSWORD), SshSecrets(password = "probe"), repository)
+      openSession(
+        config.copyWith(auth = SshAuthMethod.PASSWORD, clearKeyId = true),
+        SshSecrets(password = "probe"),
+        repository
+      )
     } catch (error: Throwable) {
       repository.presented?.let { return it }
       throw describe(error, repository)
@@ -95,28 +107,105 @@ internal class JschSshTransportFactory : SshTransportFactory {
 
   private fun openSession(config: SshHostConfig, secrets: SshSecrets, repository: HostKeyRepository): Session {
     val jsch = JSch()
-    if (config.auth == SshAuthMethod.PRIVATE_KEY) {
-      val key = secrets.privateKey?.trim().orEmpty()
-      if (key.isEmpty()) throw SshFailure(SshFailureKind.BAD_KEY, "请填写 SSH 私钥", retryable = false)
-      val passphrase = secrets.passphrase?.takeIf(String::isNotEmpty)?.toByteArray(Charsets.UTF_8)
-      try {
-        jsch.addIdentity("lagoon-${config.id}", key.toByteArray(Charsets.UTF_8), null, passphrase)
-      } catch (error: Exception) {
-        throw SshFailure(SshFailureKind.BAD_KEY, "SSH 私钥无法读取，请检查格式和私钥密码", error.message.orEmpty(), retryable = false)
+    var certAlgorithm: String? = null
+    var effectivePassphrase: String? = secrets.passphrase
+    val fallbackPassword = secrets.password?.takeIf(String::isNotEmpty)
+
+    when (config.auth) {
+      SshAuthMethod.PASSWORD -> {
+        if (secrets.password.isNullOrEmpty()) {
+          throw SshFailure(SshFailureKind.AUTH, "请填写 SSH 密码，或改用私钥", retryable = false)
+        }
       }
-    } else if (secrets.password.isNullOrEmpty()) {
-      throw SshFailure(SshFailureKind.AUTH, "请填写 SSH 密码，或改用私钥", retryable = false)
+      SshAuthMethod.PRIVATE_KEY, SshAuthMethod.KEY_WITH_PASSWORD_FALLBACK -> {
+        val inlineKey = secrets.privateKey?.trim().orEmpty()
+        if (inlineKey.isNotEmpty()) {
+          certAlgorithm = attachPrivateKeyIdentity(
+            jsch = jsch,
+            name = "lagoon-${config.id}",
+            privateKey = inlineKey,
+            passphrase = secrets.passphrase,
+            certificateText = secrets.certificate
+          )
+        } else if (!config.keyId.isNullOrBlank()) {
+          val store = keyStore ?: throw SshFailure(SshFailureKind.BAD_KEY, "未配置 SSH 密钥库", retryable = false)
+          val profile = store.find(config.keyId)
+            ?: throw SshFailure(SshFailureKind.BAD_KEY, "引用的 SSH 密钥已不存在，请重新选择或绑定", retryable = false)
+          val stored = store.secrets(profile.id)
+          val runtime = store.runtimeSecret(profile.id)
+          val certText = secrets.certificate?.trim()?.takeIf(String::isNotEmpty) ?: profile.certificateOpenSsh
+          when (profile.source) {
+            SshKeySource.HARDWARE_KEYSTORE -> {
+              if (profile.biometricProtected && runtime == null) {
+                throw SshFailure(
+                  SshFailureKind.BIOMETRIC_REQUIRED,
+                  "需要生物识别解锁硬件密钥「${profile.name}」",
+                  retryable = false
+                )
+              }
+              val signer = hardwareSigner
+                ?: throw SshFailure(SshFailureKind.BAD_KEY, "本机硬件密钥签名器不可用", retryable = false)
+              val hwIdentity = signer.createIdentity(profile)
+              if (certText != null) {
+                val cert = SshKeyCodec.parseCertificate(certText)
+                jsch.addIdentity(CertifiedSshIdentity(hwIdentity, cert.algorithm, cert.blob), null)
+                certAlgorithm = cert.algorithm
+              } else {
+                jsch.addIdentity(hwIdentity, null)
+              }
+            }
+            SshKeySource.GENERATED, SshKeySource.IMPORTED -> {
+              val (resolvedKey, resolvedPass) = resolveSoftwareKeyMaterial(profile, stored, runtime, secrets.passphrase)
+              effectivePassphrase = resolvedPass
+              certAlgorithm = attachPrivateKeyIdentity(
+                jsch = jsch,
+                name = "lagoon-${profile.id}",
+                privateKey = resolvedKey,
+                passphrase = resolvedPass,
+                certificateText = certText
+              )
+            }
+          }
+        } else {
+          throw SshFailure(SshFailureKind.BAD_KEY, "请选择或填写 SSH 私钥", retryable = false)
+        }
+      }
     }
+
     val session = jsch.getSession(config.user.trim(), config.host.trim(), config.port)
     session.setHostKeyRepository(repository)
     session.setConfig("StrictHostKeyChecking", "yes")
-    session.setConfig("PreferredAuthentications",
-      if (config.auth == SshAuthMethod.PRIVATE_KEY) "publickey" else "password,keyboard-interactive")
+    val preferredAuth = when {
+      config.auth == SshAuthMethod.PASSWORD -> "password,keyboard-interactive"
+      config.auth == SshAuthMethod.KEY_WITH_PASSWORD_FALLBACK && fallbackPassword != null ->
+        "publickey,keyboard-interactive,password"
+      else -> "publickey"
+    }
+    session.setConfig("PreferredAuthentications", preferredAuth)
+    if (certAlgorithm != null) {
+      val defaults = JSch.getConfig("PubkeyAcceptedAlgorithms").orEmpty()
+      val certAlgs = listOf(
+        certAlgorithm,
+        "ssh-ed25519-cert-v01@openssh.com",
+        "ecdsa-sha2-nistp256-cert-v01@openssh.com",
+        "ecdsa-sha2-nistp384-cert-v01@openssh.com",
+        "ecdsa-sha2-nistp521-cert-v01@openssh.com",
+        "rsa-sha2-512-cert-v01@openssh.com",
+        "rsa-sha2-256-cert-v01@openssh.com",
+        "ssh-rsa-cert-v01@openssh.com"
+      ).distinct().joinToString(",")
+      session.setConfig("PubkeyAcceptedAlgorithms", if (defaults.isBlank()) certAlgs else "$certAlgs,$defaults")
+    }
+    val sessionPassword = when (config.auth) {
+      SshAuthMethod.PASSWORD -> secrets.password
+      SshAuthMethod.KEY_WITH_PASSWORD_FALLBACK -> fallbackPassword
+      SshAuthMethod.PRIVATE_KEY -> null
+    }
     session.userInfo = object : UserInfo, UIKeyboardInteractive {
-      override fun getPassphrase(): String? = secrets.passphrase
-      override fun getPassword(): String? = secrets.password
-      override fun promptPassword(message: String?): Boolean = true
-      override fun promptPassphrase(message: String?): Boolean = true
+      override fun getPassphrase(): String? = effectivePassphrase
+      override fun getPassword(): String? = sessionPassword
+      override fun promptPassword(message: String?): Boolean = sessionPassword != null
+      override fun promptPassphrase(message: String?): Boolean = effectivePassphrase != null
       override fun promptYesNo(message: String?): Boolean = false
       override fun showMessage(message: String?) = Unit
       override fun promptKeyboardInteractive(
@@ -126,11 +215,11 @@ internal class JschSshTransportFactory : SshTransportFactory {
         prompt: Array<out String>?,
         echo: BooleanArray?
       ): Array<String> {
-        val answer = secrets.password ?: secrets.passphrase ?: ""
+        val answer = sessionPassword ?: effectivePassphrase ?: ""
         return Array(prompt?.size ?: 0) { answer }
       }
     }
-    if (config.auth == SshAuthMethod.PASSWORD) session.setPassword(secrets.password)
+    if (sessionPassword != null) session.setPassword(sessionPassword)
     // Do not set a socket read timeout: a bootstrap script can be silent for a minute while it
     // waits for dsh web's token. The link owns keepalive/probes and enforces command deadlines.
     session.setTimeout(0)
@@ -138,8 +227,79 @@ internal class JschSshTransportFactory : SshTransportFactory {
     return session
   }
 
+  private fun resolveSoftwareKeyMaterial(
+    profile: SshKeyProfile,
+    stored: SshKeySecrets,
+    runtime: String?,
+    overridePassphrase: String?
+  ): Pair<String, String?> {
+    if (profile.passphrasePolicy == SshPassphrasePolicy.BIOMETRIC && !profile.encrypted) {
+      val unlockedKey = runtime ?: throw SshFailure(
+        SshFailureKind.BIOMETRIC_REQUIRED,
+        "需要生物识别解锁私钥「${profile.name}」",
+        retryable = false
+      )
+      return unlockedKey to null
+    }
+    val key = stored.privateKey?.trim()?.takeIf(String::isNotEmpty) ?: throw SshFailure(
+      SshFailureKind.BAD_KEY,
+      "私钥内容缺失，请重新导入「${profile.name}」",
+      retryable = false
+    )
+    val passphrase = when {
+      !overridePassphrase.isNullOrEmpty() -> overridePassphrase
+      profile.passphrasePolicy == SshPassphrasePolicy.BIOMETRIC -> runtime ?: throw SshFailure(
+        SshFailureKind.BIOMETRIC_REQUIRED,
+        "需要生物识别解锁私钥「${profile.name}」",
+        retryable = false
+      )
+      profile.passphrasePolicy == SshPassphrasePolicy.PROMPT && profile.encrypted -> runtime ?: throw SshFailure(
+        SshFailureKind.PASSPHRASE_REQUIRED,
+        "需要输入私钥口令解锁「${profile.name}」",
+        retryable = false
+      )
+      else -> stored.passphrase
+    }
+    return key to passphrase
+  }
+
+  private fun attachPrivateKeyIdentity(
+    jsch: JSch,
+    name: String,
+    privateKey: String,
+    passphrase: String?,
+    certificateText: String?
+  ): String? {
+    val parsed = SshKeyCodec.inspectPrivateKey(privateKey, passphrase)
+    if (parsed.encrypted && !parsed.decrypted) {
+      throw SshFailure(SshFailureKind.PASSPHRASE_REQUIRED, "此私钥已加密，请输入私钥密码", retryable = false)
+    }
+    val keyBytes = privateKey.trim().toByteArray(Charsets.UTF_8)
+    val passBytes = passphrase?.takeIf(String::isNotEmpty)?.toByteArray(Charsets.UTF_8)
+    val cert = certificateText?.trim()?.takeIf(String::isNotEmpty)?.let(SshKeyCodec::parseCertificate)
+    try {
+      if (cert == null) {
+        jsch.addIdentity(name, keyBytes, null, passBytes)
+        return null
+      }
+      val temp = JSch()
+      temp.addIdentity(name, keyBytes, null, passBytes)
+      val delegate = temp.identityRepository.identities.firstElement() as Identity
+      jsch.addIdentity(CertifiedSshIdentity(delegate, cert.algorithm, cert.blob), passBytes)
+      return cert.algorithm
+    } catch (error: SshFailure) {
+      throw error
+    } catch (error: Exception) {
+      throw SshFailure(SshFailureKind.BAD_KEY, "SSH 私钥无法读取，请检查格式和私钥密码", error.message.orEmpty(), retryable = false)
+    }
+  }
+
   private fun describe(error: Throwable, repository: VerifyingHostKeyRepository): SshFailure {
-    if (error is SshFailure) return error
+    var cur: Throwable? = error
+    while (cur != null) {
+      if (cur is SshFailure) return cur
+      cur = cur.cause
+    }
     repository.failure?.let { return it }
     val text = error.message.orEmpty()
     // JSch exposes the server key before authentication. Do not let that diagnostic
@@ -149,6 +309,8 @@ internal class JschSshTransportFactory : SshTransportFactory {
         return SshFailure(SshFailureKind.HOST_KEY_UNKNOWN, "还没有确认主机指纹", retryable = false, presentedKey = repository.presented)
       error is JSchChangedHostKeyException ->
         return SshFailure(SshFailureKind.HOST_KEY_CHANGED, "主机指纹和上次不一致，已断开", retryable = false, presentedKey = repository.presented)
+      "User not authenticated" in text ->
+        return SshFailure(SshFailureKind.BIOMETRIC_REQUIRED, "需要生物识别解锁硬件密钥", text, retryable = false)
       "Auth fail" in text || "auth cancel" in text || "Auth cancel" in text ->
         return SshFailure(SshFailureKind.AUTH, "SSH 认证失败，请检查用户名、密码或私钥", retryable = false)
     }
