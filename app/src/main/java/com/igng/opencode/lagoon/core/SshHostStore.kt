@@ -62,7 +62,8 @@ internal class SshHostStore internal constructor(
   fun secrets(id: String): SshSecrets = SshSecrets(
     password = readSecret(passwordKey(id)),
     privateKey = readSecret(privateKeyKey(id)),
-    passphrase = readSecret(passphraseKey(id))
+    passphrase = readSecret(passphraseKey(id)),
+    certificate = readSecret(certificateKey(id))
   )
 
   /** Trust-on-first-use: remembers the key the person accepted. */
@@ -79,13 +80,25 @@ internal class SshHostStore internal constructor(
 
   private fun saveSecrets(config: SshHostConfig, secrets: SshSecrets) {
     val editor = secretPreferences.edit()
-    if (config.auth == SshAuthMethod.PASSWORD) {
-      writeSecret(editor, passwordKey(config.id), secrets.password)
-      editor.remove(privateKeyKey(config.id)).remove(passphraseKey(config.id))
-    } else {
-      writeSecret(editor, privateKeyKey(config.id), secrets.privateKey?.trim())
-      writeSecret(editor, passphraseKey(config.id), secrets.passphrase)
-      editor.remove(passwordKey(config.id))
+    when (config.auth) {
+      SshAuthMethod.PASSWORD -> {
+        writeSecret(editor, passwordKey(config.id), secrets.password)
+        editor.remove(privateKeyKey(config.id))
+          .remove(passphraseKey(config.id))
+          .remove(certificateKey(config.id))
+      }
+      SshAuthMethod.PRIVATE_KEY -> {
+        writeSecret(editor, privateKeyKey(config.id), secrets.privateKey?.trim())
+        writeSecret(editor, passphraseKey(config.id), secrets.passphrase)
+        writeSecret(editor, certificateKey(config.id), secrets.certificate?.trim())
+        editor.remove(passwordKey(config.id))
+      }
+      SshAuthMethod.KEY_WITH_PASSWORD_FALLBACK -> {
+        writeSecret(editor, passwordKey(config.id), secrets.password)
+        writeSecret(editor, privateKeyKey(config.id), secrets.privateKey?.trim())
+        writeSecret(editor, passphraseKey(config.id), secrets.passphrase)
+        writeSecret(editor, certificateKey(config.id), secrets.certificate?.trim())
+      }
     }
     if (!editor.commit()) throw IOException("SSH 凭据保存失败")
   }
@@ -101,10 +114,11 @@ internal class SshHostStore internal constructor(
     null
   }
 
-  private fun secretKeys(id: String) = listOf(passwordKey(id), privateKeyKey(id), passphraseKey(id))
+  private fun secretKeys(id: String) = listOf(passwordKey(id), privateKeyKey(id), passphraseKey(id), certificateKey(id))
   private fun passwordKey(id: String) = "ssh:$id:password"
   private fun privateKeyKey(id: String) = "ssh:$id:privateKey"
   private fun passphraseKey(id: String) = "ssh:$id:passphrase"
+  private fun certificateKey(id: String) = "ssh:$id:certificate"
 
   private companion object { const val KEY = "hosts" }
 }

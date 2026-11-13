@@ -16,6 +16,8 @@ import com.igng.opencode.lagoon.core.SshHostConfig
 import com.igng.opencode.lagoon.core.SshLinkStatus
 import com.igng.opencode.lagoon.core.SshSecrets
 import com.igng.opencode.lagoon.core.SshHostStore
+import com.igng.opencode.lagoon.core.SshKeyStore
+import com.igng.opencode.lagoon.core.SshPublicKeyFormat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -31,7 +33,8 @@ import java.util.concurrent.atomic.AtomicInteger
  */
 internal class SshHostManager(
   private val store: SshHostStore,
-  private val transportFactory: SshTransportFactory = JschSshTransportFactory()
+  private val transportFactory: SshTransportFactory = JschSshTransportFactory(),
+  private val keyStore: SshKeyStore? = null
 ) {
   private class SharedLink(val hostId: String, val link: SshHostLink, val refs: AtomicInteger = AtomicInteger(0))
 
@@ -40,7 +43,9 @@ internal class SshHostManager(
   private class SharedCodex(val hostId: String, val client: HarnessClient, var refs: Int = 0)
   private val codexLinks = mutableMapOf<String, SharedCodex>()
   private val lock = Any()
-  private val transports = SshTransportPool(transportFactory)
+  private val transports = SshTransportPool(transportFactory) { cfg ->
+    cfg.keyId?.let { keyStore?.credentialFingerprint(it) }.orEmpty()
+  }
 
   fun client(profile: ServerProfile): HarnessClient {
     val hostId = profile.sshHostId ?: throw SshFailure(SshFailureKind.OTHER, "不是 SSH 主机资料", retryable = false)
@@ -226,6 +231,23 @@ internal class SshHostManager(
       check(!requiresAuth || result.optJSONObject("account") != null) { "开发机上的 Codex 尚未登录，请先在开发机完成登录" }
       if (result.optJSONObject("account") == null) "Codex 已连接 · 未检测到登录账户" else "Codex 已连接 · 已检测到账户"
     }
+
+  /** Appends [publicKeyOpenSsh] idempotently to remote `~/.ssh/authorized_keys` (0700/0600). */
+  suspend fun deployPublicKey(config: SshHostConfig, secrets: SshSecrets, publicKeyOpenSsh: String) {
+    kotlinx.coroutines.withContext(Dispatchers.IO) {
+      val pin = config.hostKeyFingerprint?.takeIf { it.isNotBlank() }
+        ?: throw SshFailure(SshFailureKind.HOST_KEY_UNKNOWN, "请先确认 SSH 主机指纹", retryable = false)
+      val script = SshPublicKeyFormat.authorizedKeysInstallScript(publicKeyOpenSsh)
+      val result = transports.connect(config, secrets, SshHostKeyVerifier { key ->
+        if (key.fingerprint != pin) throw SshFailure(SshFailureKind.HOST_KEY_CHANGED, "SSH 主机指纹已变化", retryable = false, presentedKey = key)
+        true
+      }).use { it.exec(script, 15_000) }
+      if (result.exitCode != 0) {
+        val detail = result.stderr.ifBlank { result.stdout }.trim()
+        throw SshFailure(SshFailureKind.OTHER, "写入服务器 authorized_keys 失败", detail, retryable = false)
+      }
+    }
+  }
 
   /** Reads the presented host key without trusting it; used before pinning a new host. */
   suspend fun probeHostKey(config: SshHostConfig): PresentedSshHostKey =

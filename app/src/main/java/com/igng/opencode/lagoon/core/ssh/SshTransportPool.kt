@@ -13,7 +13,10 @@ import java.util.concurrent.atomic.AtomicBoolean
  * leases: closing an OpenCode forwarder must not disconnect DSH. The delegate owns host verification;
  * a changed key/configuration cannot reuse a previous connection. No command is retried here.
  */
-internal class SshTransportPool(private val delegate: SshTransportFactory) : SshTransportFactory, Closeable {
+internal class SshTransportPool(
+  private val delegate: SshTransportFactory,
+  private val keyRevisionProvider: ((SshHostConfig) -> String)? = null
+) : SshTransportFactory, Closeable {
   private data class ConfigKey(val id: String, val connection: String, val keyType: String?, val fingerprint: String?, val credentialDigest: String)
   private class Entry(val transport: SshTransport, var references: Int = 0) {
     private val closed = AtomicBoolean(false)
@@ -25,7 +28,13 @@ internal class SshTransportPool(private val delegate: SshTransportFactory) : Ssh
   override fun connect(config: SshHostConfig, secrets: SshSecrets, verifier: SshHostKeyVerifier): SshTransport {
     // Credential revision is memory-only: do not reuse an authenticated socket for a different
     // password/key during an unsaved discovery test. Never log this map or persist the digest.
-    val material = listOf(secrets.password, secrets.privateKey, secrets.passphrase).joinToString("") { value ->
+    val material = listOf(
+      secrets.password,
+      secrets.privateKey,
+      secrets.passphrase,
+      secrets.certificate,
+      keyRevisionProvider?.invoke(config)
+    ).joinToString("") { value ->
       if (value == null) "-1:" else "${value.length}:$value"
     }
     val digest = java.security.MessageDigest.getInstance("SHA-256").digest(material.toByteArray())

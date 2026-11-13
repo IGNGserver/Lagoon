@@ -26,7 +26,6 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
-import com.igng.opencode.lagoon.core.*
 import com.igng.opencode.lagoon.core.DEFAULT_DSH_LAUNCH_COMMAND
 import com.igng.opencode.lagoon.core.LagoonController
 import com.igng.opencode.lagoon.core.LagoonState
@@ -35,25 +34,29 @@ import com.igng.opencode.lagoon.core.SSH_DEFAULT_PORT
 import com.igng.opencode.lagoon.core.SshAddress
 import com.igng.opencode.lagoon.core.SshAuthMethod
 import com.igng.opencode.lagoon.core.SshFailure
+import com.igng.opencode.lagoon.core.SshFailureKind
 import com.igng.opencode.lagoon.core.SshHostConfig
+import com.igng.opencode.lagoon.core.SshKeyProfile
+import com.igng.opencode.lagoon.core.SshPassphrasePolicy
 import com.igng.opencode.lagoon.core.SshSecrets
+import com.igng.opencode.lagoon.core.ssh.ParsedSshPrivateKey
+import com.igng.opencode.lagoon.core.ssh.SshKeyCodec
 import com.igng.opencode.lagoon.core.userFacingError
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import top.yukonga.miuix.kmp.basic.Card
-import top.yukonga.miuix.kmp.basic.CardDefaults
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.basic.TextField
 import top.yukonga.miuix.kmp.extra.SuperDialog
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 
 /**
- * Add or edit one SSH host. The first screen is only address + user + secret; port, auth method,
- * private-key options, the remote `dsh web` command, the display name and the pinned host key live
- * under 「更多选项」. A saved host whose hidden values differ from their defaults opens that section
- * by itself, so a custom port or launch command can never hide from the person editing it.
+ * Add or edit one SSH host. The first screen covers address, user, auth mode (`密码` / `密钥` /
+ * `密钥优先`), and credentials/keychain selection; port, the remote `dsh web` command, the
+ * display name and the pinned host key live under 「更多选项」. A saved host whose hidden values
+ * differ from their defaults opens that section by itself, so a custom port or launch command can
+ * never hide from the person editing it.
  */
 @Composable
 internal fun SshHostForm(
@@ -72,6 +75,7 @@ internal fun SshHostForm(
   var user by rememberSaveable(initial?.id) { mutableStateOf(initial?.user.orEmpty()) }
   var port by rememberSaveable(initial?.id) { mutableStateOf((initial?.port ?: SSH_DEFAULT_PORT).toString()) }
   var auth by rememberSaveable(initial?.id) { mutableStateOf(initial?.auth ?: SshAuthMethod.PASSWORD) }
+  var selectedKeyId by rememberSaveable(initial?.id) { mutableStateOf(initial?.keyId) }
   var name by rememberSaveable(initial?.id) { mutableStateOf(initial?.name.orEmpty()) }
   var command by rememberSaveable(initial?.id) {
     mutableStateOf(initial?.launchCommand ?: DEFAULT_DSH_LAUNCH_COMMAND)
@@ -82,13 +86,15 @@ internal fun SshHostForm(
   var privateKey by remember(initial?.id) { mutableStateOf("") }
   var passphrase by remember(initial?.id) { mutableStateOf("") }
   var privateKeyVisible by remember { mutableStateOf(false) }
+  var showInlineKeyEditor by rememberSaveable(initial?.id) { mutableStateOf(false) }
   var clearedSecrets by remember { mutableStateOf(setOf<SshSecretField>()) }
+  var parsedInlineKey by remember { mutableStateOf<ParsedSshPrivateKey?>(null) }
+  var inlineInspectError by remember { mutableStateOf<String?>(null) }
   var hostKeyType by rememberSaveable(initial?.id) { mutableStateOf(initial?.hostKeyType.orEmpty()) }
   var hostKeyFingerprint by rememberSaveable(initial?.id) { mutableStateOf(initial?.hostKeyFingerprint.orEmpty()) }
   var showMore by rememberSaveable(initial?.id) {
     mutableStateOf(
       initial != null && moreOptionsSummary(
-        auth = initial.auth,
         port = initial.port.toString(),
         command = initial.launchCommand,
         workingDirectory = initial.workingDirectory.orEmpty(),
@@ -99,6 +105,7 @@ internal fun SshHostForm(
     )
   }
   var result by remember { mutableStateOf<String?>(null) }
+  var resultIsError by remember { mutableStateOf(false) }
   var working by remember { mutableStateOf(false) }
   var pendingKey by remember { mutableStateOf<PresentedSshHostKey?>(null) }
   var pendingAction by remember { mutableStateOf<((SshHostConfig) -> Unit)?>(null) }
@@ -107,6 +114,22 @@ internal fun SshHostForm(
   var confirmingDelete by remember { mutableStateOf(false) }
   var confirmingSecretClear by remember { mutableStateOf<SshSecretField?>(null) }
   var confirmingFingerprintReset by remember { mutableStateOf(false) }
+
+  // Keychain & Phase 2/3 modals
+  var showKeychainSheet by remember { mutableStateOf(false) }
+  var showGenerateDialog by remember { mutableStateOf(false) }
+  var showImportDialog by remember { mutableStateOf(false) }
+  var certificateTarget by remember { mutableStateOf<SshKeyProfile?>(null) }
+  var unlockTarget by remember { mutableStateOf<SshKeyProfile?>(null) }
+  var deployPublicKey by remember { mutableStateOf<String?>(null) }
+  var retryTestAfterUnlock by remember { mutableStateOf(false) }
+
+  val selectedKeyProfile = remember(selectedKeyId, state.sshKeys, state.sshKeysRevision) {
+    selectedKeyId?.let { id -> state.sshKeys.firstOrNull { it.id == id } }
+  }
+  val hasLegacyInlineKey = initialSecrets.privateKey != null &&
+    SshSecretField.PRIVATE_KEY !in clearedSecrets &&
+    selectedKeyProfile == null
 
   // A pinned key belongs to the address it was read from. Clear the display as soon as the user
   // edits host/port so an old fingerprint can never be sent to a different machine.
@@ -118,30 +141,47 @@ internal fun SshHostForm(
     }
   }
 
+  // Real JSch/BouncyCastle inspection for direct inline key edits.
+  LaunchedEffect(privateKey, passphrase) {
+    val trimmed = privateKey.trim()
+    if (trimmed.isEmpty()) {
+      parsedInlineKey = null
+      inlineInspectError = null
+      return@LaunchedEffect
+    }
+    try {
+      parsedInlineKey = withContext(Dispatchers.Default) {
+        SshKeyCodec.inspectPrivateKey(trimmed, passphrase.takeIf { it.isNotEmpty() })
+      }
+      inlineInspectError = null
+    } catch (cancel: CancellationException) {
+      throw cancel
+    } catch (failure: SshFailure) {
+      parsedInlineKey = null
+      inlineInspectError = failure.display()
+    } catch (error: Exception) {
+      parsedInlineKey = null
+      inlineInspectError = error.message ?: "私钥无法解析"
+    }
+  }
+
   val keyPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
     if (uri == null) return@rememberLauncherForActivityResult
     scope.launch {
       try {
-        val text = withContext(Dispatchers.IO) {
-          context.contentResolver.openInputStream(uri)?.use { input ->
-            val out = java.io.ByteArrayOutputStream()
-            val buffer = ByteArray(8 * 1024)
-            while (true) {
-              val read = input.read(buffer)
-              if (read < 0) break
-              out.write(buffer, 0, read)
-              if (out.size() > MAX_KEY_BYTES) throw IllegalArgumentException("私钥文件过大")
-            }
-            out.toString(Charsets.UTF_8.name())
-          } ?: throw IllegalArgumentException("无法读取文件")
-        }
-        if (!text.contains("PRIVATE KEY-----")) throw IllegalArgumentException("这不是 OpenSSH/PEM 私钥文件")
+        val text = readTextDocument(context, uri)
+        // Validate using real SSH key codec instead of substring matching.
+        withContext(Dispatchers.Default) { SshKeyCodec.inspectPrivateKey(text.trim(), passphrase.takeIf { it.isNotEmpty() }) }
+        selectedKeyId = null
+        showInlineKeyEditor = true
         privateKey = text.trim()
         clearedSecrets = clearedSecrets - SshSecretField.PRIVATE_KEY
         privateKeyVisible = false
         importError = null
       } catch (cancel: CancellationException) {
         throw cancel
+      } catch (failure: SshFailure) {
+        importError = failure.display()
       } catch (error: Exception) {
         importError = error.message ?: "读取私钥失败"
       }
@@ -149,42 +189,35 @@ internal fun SshHostForm(
   }
 
   fun secrets(): SshSecrets = SshSecrets(
-    password = resolveSshSecret(password, initialSecrets.password, SshSecretField.PASSWORD in clearedSecrets),
-    privateKey = resolveSshSecret(privateKey, initialSecrets.privateKey, SshSecretField.PRIVATE_KEY in clearedSecrets),
-    passphrase = resolveSshSecret(passphrase, initialSecrets.passphrase, SshSecretField.PASSPHRASE in clearedSecrets)
+    password = if (auth == SshAuthMethod.PRIVATE_KEY) null else resolveSshSecret(
+      password, initialSecrets.password, SshSecretField.PASSWORD in clearedSecrets
+    ),
+    privateKey = if (auth == SshAuthMethod.PASSWORD || selectedKeyProfile != null) null else resolveSshSecret(
+      privateKey, initialSecrets.privateKey, SshSecretField.PRIVATE_KEY in clearedSecrets
+    ),
+    passphrase = if (auth == SshAuthMethod.PASSWORD || selectedKeyProfile != null) null else resolveSshSecret(
+      passphrase, initialSecrets.passphrase, SshSecretField.PASSPHRASE in clearedSecrets
+    ),
+    certificate = if (auth == SshAuthMethod.PASSWORD || selectedKeyProfile != null) null else initialSecrets.certificate
   )
 
-  fun configOrNull(): SshHostConfig? {
-    // The address may still carry `user@` / `:port` if it was typed rather than pasted.
+  fun hostEndpointOrNull(): SshHostConfig? {
     val parts = SshAddress.parse(address)
     val host = parts.host.trim()
     val userName = (parts.user ?: user).trim()
     val portValue = parts.port ?: port.trim().toIntOrNull()
     if (host.isBlank()) {
-      result = "填写地址"
+      result = "填写地址"; resultIsError = true
       return null
     }
     if (userName.isBlank()) {
-      result = "填写用户名"
+      result = "填写用户名"; resultIsError = true
       return null
     }
     if (portValue == null || portValue !in 1..65535) {
-      result = "端口需在 1–65535"
+      result = "端口需在 1–65535"; resultIsError = true
       return null
     }
-    if (auth == SshAuthMethod.PASSWORD &&
-      !hasUsableSshSecret(password, initialSecrets.password, SshSecretField.PASSWORD in clearedSecrets)
-    ) {
-      result = "填写 SSH 密码，或保留已保存的密码"
-      return null
-    }
-    if (auth == SshAuthMethod.PRIVATE_KEY &&
-      !hasUsableSshSecret(privateKey, initialSecrets.privateKey, SshSecretField.PRIVATE_KEY in clearedSecrets)
-    ) {
-      result = "粘贴或导入 SSH 私钥，或保留已保存的私钥"
-      return null
-    }
-    // A pinned key belongs to one address; moving the host must force a fresh confirmation.
     val pinStillBelongs = initial == null || (host == initial.host && portValue == initial.port)
     return SshHostConfig(
       id = hostId,
@@ -193,11 +226,43 @@ internal fun SshHostForm(
       port = portValue,
       user = userName,
       auth = auth,
+      keyId = if (auth == SshAuthMethod.PASSWORD) null else selectedKeyId?.takeIf { selectedKeyProfile != null },
       launchCommand = command.trim().ifBlank { DEFAULT_DSH_LAUNCH_COMMAND },
       workingDirectory = workingDirectory.trim().takeIf { it.isNotEmpty() },
       hostKeyType = hostKeyType.takeIf { pinStillBelongs && it.isNotBlank() },
       hostKeyFingerprint = hostKeyFingerprint.takeIf { pinStillBelongs && it.isNotBlank() }
     )
+  }
+
+  fun configOrNull(): SshHostConfig? {
+    val base = hostEndpointOrNull() ?: return null
+    if (auth == SshAuthMethod.PASSWORD &&
+      !hasUsableSshSecret(password, initialSecrets.password, SshSecretField.PASSWORD in clearedSecrets)
+    ) {
+      result = "填写 SSH 密码，或保留已保存的密码"; resultIsError = true
+      return null
+    }
+    if (auth == SshAuthMethod.PRIVATE_KEY || auth == SshAuthMethod.KEY_WITH_PASSWORD_FALLBACK) {
+      val hasKeychainKey = selectedKeyProfile != null
+      val hasInlineKey = !hasKeychainKey && hasUsableSshSecret(
+        privateKey, initialSecrets.privateKey, SshSecretField.PRIVATE_KEY in clearedSecrets
+      )
+      if (!hasKeychainKey && !hasInlineKey) {
+        result = "请从密钥库生成 / 选择密钥，或粘贴 SSH 私钥"; resultIsError = true
+        return null
+      }
+      if (!hasKeychainKey && inlineInspectError != null) {
+        result = inlineInspectError; resultIsError = true
+        return null
+      }
+    }
+    if (auth == SshAuthMethod.KEY_WITH_PASSWORD_FALLBACK &&
+      !hasUsableSshSecret(password, initialSecrets.password, SshSecretField.PASSWORD in clearedSecrets)
+    ) {
+      result = "「密钥优先」模式需填写备用密码，或切换为「密钥」模式"; resultIsError = true
+      return null
+    }
+    return base
   }
 
   fun errorText(error: Throwable): String =
@@ -210,14 +275,17 @@ internal fun SshHostForm(
   fun commit(config: SshHostConfig, offline: Boolean = false) {
     working = true
     result = null
+    resultIsError = false
     try {
       controller.saveSshSourceOnly(config, secrets())
       result = if (offline) "已保存 SSH 设备；首次连接时会再核对主机指纹" else "已保存 SSH 设备"
+      resultIsError = false
       onSaved(hostId)
     } catch (cancel: CancellationException) {
       throw cancel
     } catch (error: Exception) {
       result = if (error is SshFailure) error.display() else userFacingError(error, "SSH 保存失败")
+      resultIsError = true
       working = false
     }
   }
@@ -228,7 +296,7 @@ internal fun SshHostForm(
       return
     }
     if (working) return
-    working = true; result = null; pendingKey = null
+    working = true; result = null; resultIsError = false; pendingKey = null
     scope.launch {
       try {
         val key = controller.probeSshHostKey(config)
@@ -239,6 +307,7 @@ internal fun SshHostForm(
         throw cancel
       } catch (error: Exception) {
         result = errorText(error)
+        resultIsError = true
       } finally {
         working = false
       }
@@ -252,7 +321,7 @@ internal fun SshHostForm(
   fun testConnection() {
     val config = configOrNull() ?: return
     withPinnedKey(config) { pinned ->
-      working = true; result = null
+      working = true; result = null; resultIsError = false
       scope.launch {
         try {
           val found = controller.discoverSshHarnesses(pinned, secrets(), null)
@@ -264,13 +333,22 @@ internal fun SshHostForm(
             append(" · Codex：${when (codex.installed) { true -> codex.version ?: "已安装"; false -> "未安装"; null -> "未知" }}")
             append("\n发现不会启动服务；在那台设备的页面启用 Harness 后才会连接。")
           }
+          resultIsError = false
           hostKeyType = pinned.hostKeyType.orEmpty()
           hostKeyFingerprint = pinned.hostKeyFingerprint.orEmpty()
         } catch (cancel: CancellationException) {
           throw cancel
         } catch (error: Exception) {
           result = errorText(error)
+          resultIsError = true
           (error as? SshFailure)?.presentedKey?.let { pendingKey = it }
+          if (error is SshFailure &&
+            (error.kind == SshFailureKind.PASSPHRASE_REQUIRED || error.kind == SshFailureKind.BIOMETRIC_REQUIRED) &&
+            selectedKeyProfile != null
+          ) {
+            retryTestAfterUnlock = true
+            unlockTarget = selectedKeyProfile
+          }
         } finally {
           working = false
         }
@@ -293,7 +371,7 @@ internal fun SshHostForm(
   val effectivePort = SshAddress.parse(address).port?.toString() ?: port.trim()
 
   LazyColumn(
-    Modifier.fillMaxWidth().heightIn(max = 720.dp),
+    Modifier.fillMaxWidth().heightIn(max = 760.dp),
     contentPadding = PaddingValues(horizontal = 20.dp, vertical = 8.dp),
     verticalArrangement = Arrangement.spacedBy(10.dp)
   ) {
@@ -334,7 +412,289 @@ internal fun SshHostForm(
         modifier = Modifier.fillMaxWidth()
       )
     }
-    if (auth == SshAuthMethod.PASSWORD) {
+    item {
+      Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text(
+          "验证方式",
+          style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary)
+        )
+        HyperSegmentedTabs(
+          tabs = SshAuthMethod.entries.map { it.label },
+          selectedIndex = SshAuthMethod.entries.indexOf(auth).coerceAtLeast(0),
+          onTabSelected = { index ->
+            auth = SshAuthMethod.entries[index]
+            result = null
+          }
+        )
+        Text(
+          when (auth) {
+            SshAuthMethod.PASSWORD -> "使用用户名和密码（含 keyboard-interactive）连接"
+            SshAuthMethod.PRIVATE_KEY -> "仅使用 SSH 密钥验证，不发送密码"
+            SshAuthMethod.KEY_WITH_PASSWORD_FALLBACK -> "优先尝试 SSH 密钥，未命中时自动回退到密码"
+          },
+          style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary)
+        )
+      }
+    }
+
+    if (auth == SshAuthMethod.PRIVATE_KEY || auth == SshAuthMethod.KEY_WITH_PASSWORD_FALLBACK) {
+      item {
+        HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(14.dp)) {
+          Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            if (selectedKeyProfile != null) {
+              val unlocked = controller.isSshKeyUnlocked(selectedKeyProfile)
+              val hasUnlockGate = selectedKeyProfile.biometricProtected ||
+                selectedKeyProfile.passphrasePolicy == SshPassphrasePolicy.BIOMETRIC ||
+                (selectedKeyProfile.passphrasePolicy == SshPassphrasePolicy.PROMPT && selectedKeyProfile.encrypted)
+              Text(
+                "已选密钥：${selectedKeyProfile.name}",
+                style = MiuixTheme.textStyles.body1
+              )
+              Text(
+                "${selectedKeyProfile.source.label} · ${selectedKeyProfile.summary}",
+                style = MiuixTheme.textStyles.footnote2.copy(
+                  color = HyperTheme.colors.textSecondary,
+                  fontFamily = FontFamily.Monospace
+                )
+              )
+              if (hasUnlockGate) {
+                Row(
+                  verticalAlignment = Alignment.CenterVertically,
+                  horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                  Text(
+                    if (unlocked) "当前会话已解锁" else "未解锁（连接前需验证）",
+                    style = MiuixTheme.textStyles.footnote2.copy(
+                      color = if (unlocked) MiuixColorTokens.Success else MiuixColorTokens.Warning
+                    )
+                  )
+                  HyperTextAction(
+                    text = if (unlocked) "锁定" else "立即解锁",
+                    onClick = {
+                      if (unlocked) controller.lockSshKey(selectedKeyProfile.id)
+                      else unlockTarget = selectedKeyProfile
+                    }
+                  )
+                }
+              }
+              Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                verticalAlignment = Alignment.CenterVertically
+              ) {
+                HyperTextAction(
+                  text = "更换密钥",
+                  onClick = { showKeychainSheet = true }
+                )
+                HyperTextAction(
+                  text = "复制公钥",
+                  onClick = {
+                    copyTextToClipboard(context, selectedKeyProfile.name, selectedKeyProfile.publicKeyOpenSsh)
+                    result = "已复制「${selectedKeyProfile.name}」的 OpenSSH 公钥"
+                    resultIsError = false
+                  }
+                )
+                HyperTextAction(
+                  text = if (selectedKeyProfile.hasCertificate) "证书" else "添加证书",
+                  onClick = { certificateTarget = selectedKeyProfile }
+                )
+              }
+              HyperButton(
+                text = "一键安装公钥到服务器",
+                variant = HyperButtonVariant.SECONDARY,
+                enabled = !working,
+                onClick = {
+                  if (hostEndpointOrNull() != null) {
+                    deployPublicKey = selectedKeyProfile.publicKeyOpenSsh
+                  }
+                },
+                modifier = Modifier.fillMaxWidth()
+              )
+            } else {
+              Text(
+                when {
+                  hasLegacyInlineKey -> "当前使用旧版独立私钥（已加密保存）"
+                  state.sshKeys.isNotEmpty() -> "请选择密钥库中的密钥，或新建 / 导入私钥"
+                  else -> "生成一把本机 SSH 密钥（推荐 Ed25519 或硬件密钥），或导入已有私钥"
+                },
+                style = MiuixTheme.textStyles.body2
+              )
+              Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                HyperButton(
+                  text = if (state.sshKeys.isNotEmpty()) "从密钥库选择 (${state.sshKeys.size})" else "生成新密钥",
+                  onClick = { if (state.sshKeys.isNotEmpty()) showKeychainSheet = true else showGenerateDialog = true },
+                  modifier = Modifier.weight(1f)
+                )
+                HyperButton(
+                  text = "导入私钥",
+                  variant = HyperButtonVariant.SECONDARY,
+                  onClick = { showImportDialog = true },
+                  modifier = Modifier.weight(1f)
+                )
+              }
+              Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                verticalAlignment = Alignment.CenterVertically
+              ) {
+                if (state.sshKeys.isNotEmpty()) {
+                  HyperTextAction(
+                    text = "生成新密钥",
+                    onClick = { showGenerateDialog = true }
+                  )
+                }
+                if (hasLegacyInlineKey) {
+                  HyperTextAction(
+                    text = "转为全局密钥库密钥",
+                    onClick = {
+                      val legacyKey = initialSecrets.privateKey ?: return@HyperTextAction
+                      val legacyPass = initialSecrets.passphrase
+                      val legacyCert = initialSecrets.certificate
+                      scope.launch {
+                        try {
+                          val imported = controller.importSshKey(
+                            name = name.ifBlank { address.ifBlank { "导入密钥" } },
+                            privateKeyText = legacyKey,
+                            passphrase = legacyPass,
+                            policy = if (legacyPass.isNullOrEmpty()) SshPassphrasePolicy.NONE else SshPassphrasePolicy.SAVED,
+                            certificateText = legacyCert,
+                            biometricActivityContext = context
+                          )
+                          selectedKeyId = imported.id
+                          privateKey = ""
+                          passphrase = ""
+                          clearedSecrets = clearedSecrets + SshSecretField.PRIVATE_KEY + SshSecretField.PASSPHRASE
+                          result = "已迁移到全局密钥库「${imported.name}」，点击保存即可生效"
+                          resultIsError = false
+                        } catch (cancel: CancellationException) {
+                          throw cancel
+                        } catch (error: Exception) {
+                          result = errorText(error)
+                          resultIsError = true
+                        }
+                      }
+                    }
+                  )
+                }
+                HyperTextAction(
+                  text = if (showInlineKeyEditor) "收起手动粘贴" else "直接粘贴到此主机",
+                  onClick = { showInlineKeyEditor = !showInlineKeyEditor }
+                )
+              }
+            }
+          }
+        }
+      }
+
+      if (selectedKeyProfile == null && (showInlineKeyEditor || hasLegacyInlineKey || privateKey.isNotEmpty())) {
+        item {
+          TextField(
+            value = privateKey,
+            onValueChange = {
+              privateKey = it
+              clearedSecrets = clearedSecrets - SshSecretField.PRIVATE_KEY
+            },
+            label = when {
+              SshSecretField.PRIVATE_KEY in clearedSecrets -> "新私钥（留空即清除已保存）"
+              initialSecrets.privateKey != null -> "新私钥（留空沿用已保存）"
+              else -> "私钥（OpenSSH / PEM / PKCS#8 / PuTTY .ppk）"
+            },
+            singleLine = false,
+            visualTransformation = if (privateKeyVisible) VisualTransformation.None else PasswordVisualTransformation(),
+            modifier = Modifier.fillMaxWidth()
+          )
+        }
+        item {
+          Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            parsedInlineKey?.let { info ->
+              Text(
+                buildString {
+                  append("已识别：${info.algorithm}")
+                  if (info.fingerprint.isNotBlank()) append(" · ${info.fingerprint}")
+                  if (info.encrypted && !info.decrypted) append("（已加密，请输入私钥密码）")
+                },
+                style = MiuixTheme.textStyles.footnote2.copy(
+                  color = if (info.encrypted && !info.decrypted) MiuixColorTokens.Warning else MiuixColorTokens.Success,
+                  fontFamily = FontFamily.Monospace
+                )
+              )
+            }
+            inlineInspectError?.let {
+              Text(it, style = MiuixTheme.textStyles.footnote2.copy(color = MiuixColorTokens.Error))
+            }
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+              HyperTextAction(
+                text = "导入私钥文件",
+                onClick = { keyPicker.launch(arrayOf("text/plain", "application/octet-stream", "*/*")) }
+              )
+              HyperTextAction(
+                text = if (privateKeyVisible) "隐藏新私钥" else "显示新私钥",
+                enabled = privateKey.isNotEmpty(),
+                onClick = { privateKeyVisible = !privateKeyVisible }
+              )
+              parsedInlineKey?.publicKeyOpenSsh?.takeIf { it.isNotBlank() }?.let { pubKey ->
+                HyperTextAction(
+                  text = "安装公钥",
+                  onClick = {
+                    if (hostEndpointOrNull() != null) deployPublicKey = pubKey
+                  }
+                )
+              }
+            }
+            if (initialSecrets.privateKey != null && SshSecretField.PRIVATE_KEY !in clearedSecrets) {
+              HyperTextAction(
+                text = "清除已保存私钥",
+                danger = true,
+                onClick = { confirmingSecretClear = SshSecretField.PRIVATE_KEY }
+              )
+            }
+            importError?.let {
+              Text(it, style = MiuixTheme.textStyles.footnote2.copy(color = MiuixColorTokens.Error))
+            }
+          }
+        }
+        val shouldShowInlinePassphrase = parsedInlineKey?.encrypted == true ||
+          passphrase.isNotEmpty() ||
+          initialSecrets.passphrase != null
+        if (shouldShowInlinePassphrase) {
+          item {
+            TextField(
+              value = passphrase,
+              onValueChange = {
+                passphrase = it
+                clearedSecrets = clearedSecrets - SshSecretField.PASSPHRASE
+              },
+              label = when {
+                SshSecretField.PASSPHRASE in clearedSecrets -> "新的私钥密码（留空即清除已保存）"
+                initialSecrets.passphrase != null -> "新的私钥密码（留空沿用已保存）"
+                else -> "私钥密码"
+              },
+              keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+              visualTransformation = PasswordVisualTransformation(),
+              modifier = Modifier.fillMaxWidth()
+            )
+          }
+          if (initialSecrets.passphrase != null) item {
+            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+              Text(
+                if (SshSecretField.PASSPHRASE in clearedSecrets) "保存后清除已保存的私钥密码" else "已保存私钥密码，不会显示原值",
+                style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary)
+              )
+              if (SshSecretField.PASSPHRASE !in clearedSecrets) {
+                HyperTextAction(
+                  text = "清除已保存的私钥密码",
+                  danger = true,
+                  onClick = { confirmingSecretClear = SshSecretField.PASSPHRASE }
+                )
+              }
+            }
+          }
+        }
+      }
+    }
+
+    if (auth == SshAuthMethod.PASSWORD || auth == SshAuthMethod.KEY_WITH_PASSWORD_FALLBACK) {
+      val passwordFieldTitle = if (auth == SshAuthMethod.KEY_WITH_PASSWORD_FALLBACK) "备用密码" else "密码"
       item {
         TextField(
           value = password,
@@ -343,9 +703,9 @@ internal fun SshHostForm(
             clearedSecrets = clearedSecrets - SshSecretField.PASSWORD
           },
           label = when {
-            SshSecretField.PASSWORD in clearedSecrets -> "新密码（留空即清除已保存）"
-            initialSecrets.password != null -> "新密码（留空沿用已保存）"
-            else -> "密码"
+            SshSecretField.PASSWORD in clearedSecrets -> "新${passwordFieldTitle}（留空即清除已保存）"
+            initialSecrets.password != null -> "新${passwordFieldTitle}（留空沿用已保存）"
+            else -> passwordFieldTitle
           },
           keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
           visualTransformation = PasswordVisualTransformation(),
@@ -367,90 +727,8 @@ internal fun SshHostForm(
           }
         }
       }
-    } else {
-      item {
-        TextField(
-          value = privateKey,
-          onValueChange = {
-            privateKey = it
-            clearedSecrets = clearedSecrets - SshSecretField.PRIVATE_KEY
-          },
-          label = when {
-            SshSecretField.PRIVATE_KEY in clearedSecrets -> "新私钥（留空即清除已保存）"
-            initialSecrets.privateKey != null -> "新私钥（留空沿用已保存）"
-            else -> "私钥（OpenSSH / PEM 全文）"
-          },
-          singleLine = false,
-          visualTransformation = if (privateKeyVisible) VisualTransformation.None else PasswordVisualTransformation(),
-          modifier = Modifier.fillMaxWidth()
-        )
-      }
-      item {
-        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-          Text(
-            when {
-              SshSecretField.PRIVATE_KEY in clearedSecrets -> "保存后清除已保存私钥"
-              initialSecrets.privateKey != null -> "已保存私钥，不会显示原值"
-              else -> "私钥只保存在本机加密存储中"
-            },
-            style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary)
-          )
-          Row(verticalAlignment = Alignment.CenterVertically) {
-            HyperTextAction(
-              text = "导入私钥文件",
-              onClick = { keyPicker.launch(arrayOf("text/plain", "application/octet-stream", "*/*")) }
-            )
-            HyperTextAction(
-              text = if (privateKeyVisible) "隐藏新私钥" else "显示新私钥",
-              enabled = privateKey.isNotEmpty(),
-              onClick = { privateKeyVisible = !privateKeyVisible }
-            )
-          }
-          if (initialSecrets.privateKey != null && SshSecretField.PRIVATE_KEY !in clearedSecrets) {
-            HyperTextAction(
-              text = "清除已保存私钥",
-              danger = true,
-              onClick = { confirmingSecretClear = SshSecretField.PRIVATE_KEY }
-            )
-          }
-          importError?.let {
-            Text(it, style = MiuixTheme.textStyles.footnote2.copy(color = MiuixColorTokens.Error))
-          }
-        }
-      }
-      item {
-        TextField(
-          value = passphrase,
-          onValueChange = {
-            passphrase = it
-            clearedSecrets = clearedSecrets - SshSecretField.PASSPHRASE
-          },
-          label = when {
-            SshSecretField.PASSPHRASE in clearedSecrets -> "新的私钥密码（留空即清除已保存）"
-            initialSecrets.passphrase != null -> "新的私钥密码（留空沿用已保存）"
-            else -> "私钥密码（可选）"
-          },
-          keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
-          visualTransformation = PasswordVisualTransformation(),
-          modifier = Modifier.fillMaxWidth()
-        )
-      }
-      if (initialSecrets.passphrase != null) item {
-        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-          Text(
-            if (SshSecretField.PASSPHRASE in clearedSecrets) "保存后清除已保存的私钥密码" else "已保存私钥密码，不会显示原值",
-            style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary)
-          )
-          if (SshSecretField.PASSPHRASE !in clearedSecrets) {
-            HyperTextAction(
-              text = "清除已保存的私钥密码",
-              danger = true,
-              onClick = { confirmingSecretClear = SshSecretField.PASSPHRASE }
-            )
-          }
-        }
-      }
     }
+
     item {
       Text(
         "保存后这台主机会作为一台设备出现在「设备」里；到那台设备的页面刷新发现，再逐个启用 DSH / OpenCode / Codex。",
@@ -460,28 +738,19 @@ internal fun SshHostForm(
     item {
       HyperActionRow(
         title = "更多选项",
-        summary = if (showMore) "端口、认证方式、启动命令与主机指纹" else moreOptionsSummary(
-          auth = auth,
+        summary = if (showMore) "端口、启动命令、工作目录与主机指纹" else moreOptionsSummary(
           port = effectivePort,
           command = command,
           workingDirectory = workingDirectory,
           name = name,
           host = address,
           fingerprint = hostKeyFingerprint
-        ) ?: "端口 $port · 密码登录",
+        ) ?: "端口 $port · 启动命令与主机指纹",
         trailing = { ExpandChevron(showMore) },
         onClick = { showMore = !showMore }
       )
     }
     if (showMore) {
-      item {
-        HyperDropdownRow(
-          title = "认证方式",
-          items = SshAuthMethod.entries.map { it.label },
-          selectedIndex = SshAuthMethod.entries.indexOf(auth),
-          onSelectedIndexChange = { auth = SshAuthMethod.entries[it] }
-        )
-      }
       item {
         TextField(
           // A hand-typed ":2222" stays in the address field, so show the effective value here.
@@ -567,7 +836,7 @@ internal fun SshHostForm(
         Text(
           text,
           style = MiuixTheme.textStyles.footnote1.copy(
-            color = if (text.startsWith("已连接")) MiuixColorTokens.Success else MiuixColorTokens.Error
+            color = if (!resultIsError) MiuixColorTokens.Success else MiuixColorTokens.Error
           )
         )
       }
@@ -595,6 +864,103 @@ internal fun SshHostForm(
         enabled = !working,
         onClick = { save(offline = true) },
         modifier = Modifier.fillMaxWidth()
+      )
+    }
+  }
+
+  SshKeychainManagerSheet(
+    show = showKeychainSheet,
+    state = state,
+    controller = controller,
+    onDismiss = { showKeychainSheet = false },
+    selectedKeyId = selectedKeyId,
+    onSelectKey = { picked ->
+      selectedKeyId = picked.id
+      showInlineKeyEditor = false
+      privateKey = ""
+      passphrase = ""
+      result = null
+    }
+  )
+
+  SshKeyGenerateDialog(
+    show = showGenerateDialog,
+    controller = controller,
+    onDismiss = { showGenerateDialog = false },
+    onCreated = { created ->
+      showGenerateDialog = false
+      selectedKeyId = created.id
+      showInlineKeyEditor = false
+      privateKey = ""
+      passphrase = ""
+      result = "已生成密钥「${created.name}」(${created.algorithm})，可复制或直接安装公钥到服务器"
+      resultIsError = false
+    }
+  )
+
+  SshKeyImportDialog(
+    show = showImportDialog,
+    controller = controller,
+    onDismiss = { showImportDialog = false },
+    onImported = { imported ->
+      showImportDialog = false
+      selectedKeyId = imported.id
+      showInlineKeyEditor = false
+      privateKey = ""
+      passphrase = ""
+      result = "已导入密钥「${imported.name}」(${imported.algorithm})"
+      resultIsError = false
+    }
+  )
+
+  certificateTarget?.let { target ->
+    SshKeyCertificateDialog(
+      profile = target,
+      controller = controller,
+      onDismiss = { certificateTarget = null },
+      onSaved = { updated ->
+        certificateTarget = null
+        result = if (updated.hasCertificate) "已附加证书到「${updated.name}」" else "已清除「${updated.name}」的证书"
+        resultIsError = false
+      }
+    )
+  }
+
+  unlockTarget?.let { target ->
+    SshKeyUnlockDialog(
+      profile = target,
+      controller = controller,
+      onDismiss = { unlockTarget = null; retryTestAfterUnlock = false },
+      onUnlocked = {
+        val shouldRetry = retryTestAfterUnlock
+        unlockTarget = null
+        retryTestAfterUnlock = false
+        result = "已解锁密钥「${target.name}」"
+        resultIsError = false
+        if (shouldRetry) testConnection()
+      }
+    )
+  }
+
+  deployPublicKey?.let { pubKey ->
+    val endpoint = hostEndpointOrNull()
+    if (endpoint != null) {
+      DeploySshPublicKeyDialog(
+        show = true,
+        config = endpoint,
+        initialPassword = password.ifEmpty { initialSecrets.password },
+        publicKeyOpenSsh = pubKey,
+        controller = controller,
+        onPinnedHostKey = { key ->
+          hostKeyType = key.type
+          hostKeyFingerprint = key.fingerprint
+        },
+        onDismiss = { deployPublicKey = null },
+        onSuccess = {
+          deployPublicKey = null
+          result = "公钥已安装到 ${endpoint.user}@${endpoint.host} 的 ~/.ssh/authorized_keys"
+          resultIsError = false
+        }
       )
     }
   }
@@ -676,7 +1042,6 @@ internal fun SshHostForm(
 
 /** One-line summary of the values under 「更多选项」; null when every one of them is still default. */
 private fun moreOptionsSummary(
-  auth: SshAuthMethod,
   port: String,
   command: String,
   workingDirectory: String,
@@ -686,7 +1051,6 @@ private fun moreOptionsSummary(
 ): String? {
   val portValue = port.trim().toIntOrNull() ?: SSH_DEFAULT_PORT
   val parts = buildList {
-    if (auth != SshAuthMethod.PASSWORD) add("私钥登录")
     if (portValue != SSH_DEFAULT_PORT) add("端口 $portValue")
     if (command.trim() != DEFAULT_DSH_LAUNCH_COMMAND) add("自定义启动命令")
     if (workingDirectory.isNotBlank()) add("工作目录")
@@ -732,5 +1096,3 @@ private fun SshHostKeyDialog(
     }
   }
 }
-
-private const val MAX_KEY_BYTES = 64 * 1024
