@@ -17,7 +17,12 @@ class RemoteBackend internal constructor(
   private val release: () -> Unit = { session.close() }
 ) : AutoCloseable {
   private val closed = java.util.concurrent.atomic.AtomicBoolean(false)
-  private val harness: HarnessClient = if (nativeProfile?.kind == ServerKind.CODEX) {
+  private val harness: HarnessClient = if (nativeProfile?.protocol == HarnessProtocolId.ANTIGRAVITY_ACP) {
+    require(nativeProfile.remoteHostId != null)
+    AgyApi(LazyRemoteAgyTransport(load = { session.agyTransport() }, release = {
+      if (closed.compareAndSet(false, true)) release()
+    }))
+  } else if (nativeProfile?.protocol == HarnessProtocolId.CODEX_APP_SERVER) {
     require(nativeProfile.remoteHostId != null)
     // The event collector may fail during construction; never dereference the not-yet-assigned
     // harness from its callback. Codex has no Remote terminal handles owned by this wrapper.
@@ -99,7 +104,8 @@ class RemoteBackend internal constructor(
   internal suspend fun hostServices(): RemoteHostServices = RemoteHostServices(
     dshAvailable = session.capabilities().sessionFormat != null,
     native = session.nativeServiceCatalog(),
-    codexAvailable = session.capabilities().supportsWorkspace("codex", "codex.appserver.v1")
+    codexAvailable = session.capabilities().supportsWorkspace("codex", "codex.appserver.v1"),
+    agyAvailable = session.capabilities().hasAgy
   )
 
   internal suspend fun probe(): RemoteProbe {
@@ -137,7 +143,7 @@ class RemoteBackend internal constructor(
     }
   }
 
-  private class StreamSocket(
+  internal class StreamSocket(
     private val stream: RemoteGatewayStream,
     onItem: (JSONObject) -> Unit,
     private val onClosed: (Throwable?) -> Unit

@@ -3,8 +3,10 @@
 An opt-in source overlay for `ds-harness-remote` revision
 `bb33f0a6eb676b61f40a9bbf7d365e8a5e93b81b`. It adds native OpenCode
 HTTP, binary-transfer, SSE and WebSocket RPCs to the existing authenticated
-Remote connection. It is not an ACP adapter, a separate public proxy, or a
-mechanism to attach to a running Desktop DSH agent.
+Remote connection. It also replaces that revision's legacy AGY stream-json
+adapter with `agy acp` and advertises `lagoon.antigravity.native-acp.v1`;
+the capability requires the Host's AGY backend to be enabled and ready. It is
+not a separate public proxy or a mechanism to attach to a running Desktop DSH agent.
 
 ## Build in scratch only
 
@@ -24,11 +26,11 @@ under any ancestor containing `.git` (including worktrees), or overlapping the
 upstream/tooling directories. It copies only source/build inputs into a new
 scratch directory, calls [the checksum-gated overlay](<apply-upstream.mjs>), and
 bundles the actual upstream router, Host runtime and plugin entry. The overlay
-checks the pinned SHA-256 of its five upstream input files before changing the
+checks the pinned SHA-256 of its eight upstream input files before changing the
 copy; obtain the complete pinned source from a trusted checkout/archive.
 
 Default outputs are `artifacts/patched-router.mjs`, `artifacts/host-runtime.mjs`,
-`artifacts/index.mjs`, their source maps/metafiles, and `build-manifest.json`
+`artifacts/index.mjs`, the AGY test entry `artifacts/agy-gateway.mjs`, their source maps/metafiles, and `build-manifest.json`
 with revision, tool versions, byte counts and bundle SHA-256. The upstream MIT
 license is retained as `artifacts/UPSTREAM-LICENSE.txt` alongside the generated bundles. Runtime dependencies
 are bundled, except the official shared `@deepseek-ai/dsh-client-connection`
@@ -71,6 +73,51 @@ v1 Remote messages and actual loopback HTTP/SSE/WebSocket fixtures to check:
 This validates the patched router/connection seam, not a physical Android-to-
 production-Host end-to-end connection. [Peer-focused tests](<test/native-services.test.mjs>)
 cover additional registration, allowlist, expiry and resource-limit cases.
+
+The native AGY ACP gateway and its owner-bound approval/form, cancellation and
+active-session load behavior are checked separately:
+
+```sh
+LAGOON_AGY_GATEWAY="$HOME/.build/Lagoon/unified-harness-connections/connector-verified-NEW/artifacts/agy-gateway.mjs" \
+  node --test host-connector/test/agy-gateway.test.mjs
+```
+
+These tests use a fixture ACP process and the patched upstream gateway. They do
+not establish an authenticated AGY session or deploy the built plugin. The AGY
+backend must run as the Host user that has already signed in with `agy acp --login`.
+The pinned default legacy arguments are translated to `acp`; any explicitly
+configured custom arguments must start with `acp`. See [Lagoon's AGY guide](<../docs/AGY.md>).
+
+An explicit live smoke test is also available. It uses the current Host user's
+existing AGY login, creates a new session in a newly created scratch workspace,
+sends one fixed text prompt, and cancels any unexpected tool authorization.
+The session and workspace are retained for inspection. It does not deploy the
+connector or exercise an Android device/Noise relay. The optional model must be
+advertised by AGY; if the account is quota-limited the test verifies that the
+warning is delivered and reports that normal generation was not tested.
+
+```sh
+BUILD_SCRATCH_ROOT="$HOME/.build" \
+LAGOON_OFFICIAL_AGY_ROOT="$HOME/.build/Lagoon/agy-live" \
+LAGOON_OFFICIAL_AGY_BINARY="$(command -v agy)" \
+LAGOON_AGY_GATEWAY="$HOME/.build/Lagoon/unified-harness-connections/connector-verified-NEW/artifacts/agy-gateway.mjs" \
+  node --test host-connector/test/official-agy-smoke.test.mjs
+```
+
+Create the specified scratch root first. `LAGOON_AGY_TEST_MODEL` optionally selects
+an advertised model for the test; otherwise AGY's current choice is used.
+
+For the Android JVM Noise interoperability test, run the repository from a
+scratch source snapshot and set the same three AGY variables plus
+`LAGOON_AGY_STDIO_HOST=<scratch-source>/host-connector/test/stdio-agy-host.mjs`,
+then run `./gradlew :app:testDebugUnitTest --tests '*RemoteAgyOfficialSmokeTest'`.
+It carries the actual gateway and AGY process through a local fake Relay/Host
+using the real Noise client; it does not exercise a deployed Hub or Android device.
+The SSH JVM smoke test is separately opted in with `LAGOON_AGY_SSH_FIXTURE`:
+that scratch directory must contain the caller's isolated loopback SSH server
+port, a test-only `client` private key and `host.pub`, with a sibling `workspace`
+directory. The test pins that host key, creates its own workspace and leaves its
+real AGY session available for inspection.
 
 ## Official cold-search runtime verification
 

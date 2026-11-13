@@ -140,6 +140,8 @@ internal class GuardedHarnessClient(private val access: HarnessLeaseAccess) : Ha
   override suspend fun agents(directory: String): List<AgentChoice> = access.useSuspending { it.agents(directory) }
   override suspend fun commands(directory: String): List<CommandChoice> = access.useSuspending { it.commands(directory) }
   override suspend fun modelCatalog(directory: String): List<ModelInfo> = access.useSuspending { it.modelCatalog(directory) }
+  override suspend fun modelCatalogForSession(directory: String, session: Session?): List<ModelInfo> =
+    access.useSuspending { it.modelCatalogForSession(directory, session) }
   override suspend fun permissionPresets(directory: String): List<PermissionPresetChoice> =
     access.useSuspending { it.permissionPresets(directory) }
   override suspend fun setPermission(session: Session, value: String): Boolean =

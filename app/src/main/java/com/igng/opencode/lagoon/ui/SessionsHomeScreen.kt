@@ -425,7 +425,7 @@ private fun SessionList(
               liveDetail = liveTask?.detail?.takeIf { it.isNotBlank() && it != TaskState.RUNNING_DETAIL },
               relativeTime = formatRelative(session.updated, now),
               serverName = if (state.multiServerView) session.serverId?.let { id -> state.profiles.firstOrNull { it.id == id }?.name } else null,
-              harness = if (state.multiServerView) session.serverId?.let { id -> state.profiles.firstOrNull { it.id == id }?.kind } else null,
+              harness = if (state.multiServerView) session.serverId?.let { id -> state.profiles.firstOrNull { it.id == id } } else null,
               workspace = workspace?.name?.takeIf { showWorkspace },
               onClick = { (session.target ?: state.serverId?.let { SessionTarget(it, session.id) })?.let(onOpen) },
               actions = {
@@ -564,7 +564,7 @@ internal fun HomeSessionRow(
   liveDetail: String? = null,
   relativeTime: String = "",
   serverName: String? = null,
-  harness: ServerKind? = null,
+  harness: com.igng.opencode.lagoon.core.ServerProfile? = null,
   workspace: String? = null,
   onClick: () -> Unit,
   actions: () -> List<MenuAction>

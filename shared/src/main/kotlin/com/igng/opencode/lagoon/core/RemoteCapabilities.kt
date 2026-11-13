@@ -9,6 +9,8 @@ internal data class RemoteWorkspaceType(val id: String, val name: String, val ca
 internal data class RemoteCapabilities(val capabilities: Set<String>, val workspaceTypes: List<RemoteWorkspaceType>?) {
   val supportsWorkspaceUpload: Boolean get() = "workspace.upload.v1" in capabilities
   val hasNativeServices: Boolean get() = "harness.services.v1" in capabilities
+  val hasAgy: Boolean get() = "agent.acp.v1" in capabilities && "lagoon.antigravity.native-acp.v1" in capabilities &&
+    workspaceTypes != null && supportsWorkspace("antigravity", "agent.acp.antigravity.v1")
   val hasChanges: Boolean get() = "harness.changes.v1" in capabilities && sessionFormat != null
   /** Independently advertised Host switch; a session wire version is not terminal permission. */
   val hasTerminal: Boolean get() = "harness.terminal.v1" in capabilities && sessionFormat != null

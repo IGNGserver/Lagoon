@@ -59,6 +59,9 @@ internal class SshTransportPool(private val delegate: SshTransportFactory) : Ssh
     private fun active(): SshTransport { check(!isClosed) { "SSH transport lease closed" }; return entry.transport }
     override fun exec(script: String, timeoutMillis: Long) = active().exec(script, timeoutMillis)
     override fun openExecChannel(script: String) = active().openExecChannel(script)
+    override fun verifyWorkspace(root: String) = active().verifyWorkspace(root)
+    override fun listWorkspace(root: String, path: String) = active().listWorkspace(root, path)
+    override fun readWorkspace(root: String, path: String) = active().readWorkspace(root, path)
     override fun openTunnel(host: String, port: Int, input: InputStream, output: OutputStream) =
       active().openTunnel(host, port, input, output)
     override fun probeTunnel(host: String, port: Int, timeoutMillis: Long) = active().probeTunnel(host, port, timeoutMillis)

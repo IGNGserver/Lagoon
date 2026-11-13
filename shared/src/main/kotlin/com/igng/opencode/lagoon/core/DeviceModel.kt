@@ -162,7 +162,7 @@ object DeviceProjection {
   /** leaf 在设备页上的槽位键：协议 + locator。 */
   fun slotKey(protocol: HarnessProtocolId, locator: String?): String = "${protocol.wire}|${locator.orEmpty()}"
 
-  fun slotKey(profile: ServerProfile): String = slotKey(MigrationProjection.protocol(profile.kind), locatorOf(profile))
+  fun slotKey(profile: ServerProfile): String = slotKey(profile.protocol, locatorOf(profile))
 
   /** 中枢 OpenCode 用 serviceId，SSH OpenCode 用注册路径；其余协议没有 locator。 */
   fun locatorOf(profile: ServerProfile): String? = when {
@@ -171,7 +171,7 @@ object DeviceProjection {
     else -> null
   }
 
-  fun protocolOf(profile: ServerProfile): HarnessProtocolId = MigrationProjection.protocol(profile.kind)
+  fun protocolOf(profile: ServerProfile): HarnessProtocolId = profile.protocol
 
   private fun slots(
     access: DeviceAccess,
@@ -244,7 +244,8 @@ object DeviceProjection {
    */
   private fun attachable(access: DeviceAccess, status: HarnessDiscoveryStatus, nowMs: Long): Boolean =
     if (access == DeviceAccess.SSH) {
-      status.installed != DiscoveryValue.NO && status.configured != DiscoveryValue.NO && status.available != DiscoveryValue.NO
+      status.installed != DiscoveryValue.NO && status.configured != DiscoveryValue.NO &&
+        status.compatible != DiscoveryValue.NO && status.available != DiscoveryValue.NO
     } else {
       status.availableNow(nowMs)
     }
@@ -253,6 +254,7 @@ object DeviceProjection {
     HarnessProtocolId.DSH_TYPERT -> 0
     HarnessProtocolId.OPENCODE_NATIVE -> 1
     HarnessProtocolId.CODEX_APP_SERVER -> 2
+    HarnessProtocolId.ANTIGRAVITY_ACP -> 3
   }
 
   private fun harnessName(protocol: HarnessProtocolId, fallback: String): String {
@@ -261,6 +263,7 @@ object DeviceProjection {
       HarnessProtocolId.DSH_TYPERT -> "DeepSeek Harness"
       HarnessProtocolId.OPENCODE_NATIVE -> "OpenCode"
       HarnessProtocolId.CODEX_APP_SERVER -> "Codex"
+      HarnessProtocolId.ANTIGRAVITY_ACP -> "Antigravity"
     }
   }
 

@@ -36,7 +36,7 @@ internal fun RemoteNativeServicesSheet(
     val savedDsh = state.profiles.firstOrNull { it.remoteServiceId == null && it.kind in setOf(ServerKind.DSH, ServerKind.DSH_REMOTE) &&
       it.remoteHostId == profile.remoteHostId && it.username.trim() == profile.username.trim() &&
       runCatching { canonicalRemoteOrigin(it.url) == canonicalRemoteOrigin(profile.url) }.getOrDefault(false) }
-    val savedCodex = state.profiles.firstOrNull { it.kind == ServerKind.CODEX && it.remoteHostId == profile.remoteHostId &&
+    val savedCodex = state.profiles.firstOrNull { it.protocol == HarnessProtocolId.CODEX_APP_SERVER && it.remoteHostId == profile.remoteHostId &&
       it.username.trim() == profile.username.trim() &&
       runCatching { canonicalRemoteOrigin(it.url) == canonicalRemoteOrigin(profile.url) }.getOrDefault(false) }
 

@@ -130,7 +130,7 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
     MenuSection(buildList {
       add(MenuAction(conversationActivityLabel(activity), MiuixIcons.MindMap) { showActivitySheet() })
       if (state.capabilities.diff) add(MenuAction("改动（${state.changes.size}）", MiuixIcons.Merge) { sheet = ChatSheet.CHANGES })
-      add(MenuAction("文件", MiuixIcons.Folder) { sheet = ChatSheet.FILES; controller.listFiles() })
+      if (state.capabilities.fileBrowser) add(MenuAction("文件", MiuixIcons.Folder) { sheet = ChatSheet.FILES; controller.listFiles() })
       if (state.capabilities.terminal) add(MenuAction("文本终端", MiuixIcons.Info) { sheet = ChatSheet.TERMINAL })
       if (state.server?.kind == ServerKind.DSH || state.server?.kind == ServerKind.DSH_REMOTE) {
         add(MenuAction("定时任务", MiuixIcons.Info) { sheet = ChatSheet.SCHEDULES; controller.loadSchedules() })
@@ -206,7 +206,7 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
           // 状态轨只承载 DSH 的会话级目标与 todo 投影；OpenCode 没有这两项，组件自身不占位。
           if (goalSupported) ConversationStatusRail(state, controller)
           HyperPendingActionDock(state, controller) { requestModal = it }
-          ChatComposer(state, controller, interactive, onModal = { composerModal = it }, onServerFile = { sheet = ChatSheet.FILES; controller.listFiles() })
+          ChatComposer(state, controller, interactive, onModal = { composerModal = it }, onServerFile = if (state.capabilities.fileBrowser) ({ sheet = ChatSheet.FILES; controller.listFiles() }) else null)
         }
       }
       // The last group stays composed while the overlay animates out.
@@ -853,7 +853,7 @@ fun DraftScreen(
         Icon(MiuixIcons.Folder, null, Modifier.size(14.dp), tint = HyperTheme.colors.textSecondary)
         Spacer(Modifier.width(4.dp))
         state.server?.let {
-          HarnessBadge(it.kind)
+          HarnessBadge(it)
           Spacer(Modifier.width(4.dp))
         }
         Text(
@@ -907,7 +907,7 @@ private fun SessionSubtitle(state: LagoonState, session: Session) {
     else -> {}
   }
   val profile = session.serverId?.let { id -> state.profiles.firstOrNull { it.id == id } } ?: state.server
-  if (state.multiServerView) profile?.let { HarnessBadge(it.kind); Spacer(Modifier.width(4.dp)) }
+  if (state.multiServerView) profile?.let { HarnessBadge(it); Spacer(Modifier.width(4.dp)) }
   // 与首页行使用同一套解析，切进会话后工作区名不会变。
   val workspace = resolveSessionWorkspace(session, state.projects, state.workspaceCatalogFor(session))?.name
   Text(listOfNotNull(profile?.name, workspace).joinToString(" · "), maxLines = 1, overflow = TextOverflow.Ellipsis,
@@ -1342,7 +1342,7 @@ private fun SchedulesPanel(state: LagoonState, controller: LagoonController) {
 @Composable
 private fun FilesPanel(state: LagoonState, controller: LagoonController, onReference: (String) -> Unit) {
   var query by rememberSaveable { mutableStateOf("") }
-  val searching = query.trim().length >= 2
+  val searching = state.capabilities.fileSearch && query.trim().length >= 2
   val path = state.filePath
   val previewBytes = state.filePreview.takeUnless { searching }
   val previewMime = state.filePreviewMime
@@ -1353,7 +1353,7 @@ private fun FilesPanel(state: LagoonState, controller: LagoonController, onRefer
       .sortedWith(compareBy({ it.type != "directory" }, { it.path.lowercase() }))
   }
   Column(Modifier.fillMaxSize()) {
-    TextField(query, { query = it; controller.searchFiles(it) }, label = "搜索工程文件", useLabelAsPlaceholder = true, modifier = Modifier.fillMaxWidth())
+    if (state.capabilities.fileSearch) TextField(query, { query = it; controller.searchFiles(it) }, label = "搜索工程文件", useLabelAsPlaceholder = true, modifier = Modifier.fillMaxWidth())
     Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
       if (viewingFile) {
         Text("← 返回列表", Modifier.heightIn(min = 48.dp).clickable {
@@ -1371,13 +1371,13 @@ private fun FilesPanel(state: LagoonState, controller: LagoonController, onRefer
     }
     ResourceHint(state.resource(if (searching) "search" else "files"), "此目录没有文件", retry = { if (searching) controller.searchFiles(query) else controller.listFiles() })
     if (previewBytes != null) {
-      HyperButton(text = "引用到消息", onClick = { onReference(state.filePath) })
+      if (state.capabilities.fileReferences) HyperButton(text = "引用到消息", onClick = { onReference(state.filePath) })
       FilePreviewView(previewMime, previewBytes, Modifier.weight(1f))
     } else if (state.fileBinary && !searching) {
       Text("当前无法预览此二进制文件")
-      HyperButton(text = "引用到消息", enabled = !state.pending("send"), onClick = { onReference(state.filePath) })
+      if (state.capabilities.fileReferences) HyperButton(text = "引用到消息", enabled = !state.pending("send"), onClick = { onReference(state.filePath) })
     } else if (state.fileText?.takeUnless { searching } != null) {
-      HyperButton(text = "引用到消息", onClick = { onReference(state.filePath) })
+      if (state.capabilities.fileReferences) HyperButton(text = "引用到消息", onClick = { onReference(state.filePath) })
       VirtualText(state.fileText!!, Modifier.weight(1f), highlight = false)
     } else if (!state.fileBinary || searching) {
       val nodeKeys = uniqueListKeys(nodes) { it.path }

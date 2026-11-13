@@ -271,7 +271,7 @@ private fun DirectProfilePage(
   var remoteModelKey by remember { mutableStateOf(false) }
   var remoteProvider by remember { mutableStateOf(false) }
   val scope = rememberCoroutineScope()
-  val title = when (existing.kind) {
+  val title = if (existing.protocol == com.igng.opencode.lagoon.core.HarnessProtocolId.ANTIGRAVITY_ACP) "Antigravity 连接详情" else when (existing.kind) {
     ServerKind.DSH_REMOTE -> "DSH 远程主机详情"
     ServerKind.OPENCODE -> "编辑 OpenCode 直连"
     ServerKind.CODEX -> "Codex 连接详情"

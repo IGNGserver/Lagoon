@@ -11,7 +11,7 @@ enum class ConnectionSourceType(val wire: String) { HUB("hub"), SSH("ssh"), DIRE
   companion object { fun fromWire(value: String): ConnectionSourceType = entries.firstOrNull { it.wire == value }
     ?: throw IllegalArgumentException("Unknown connection source: $value") }
 }
-enum class HarnessProtocolId(val wire: String) { OPENCODE_NATIVE("opencode-native"), DSH_TYPERT("dsh-typert"), CODEX_APP_SERVER("codex-app-server");
+enum class HarnessProtocolId(val wire: String) { OPENCODE_NATIVE("opencode-native"), DSH_TYPERT("dsh-typert"), CODEX_APP_SERVER("codex-app-server"), ANTIGRAVITY_ACP("antigravity-acp");
   companion object { fun fromWire(value: String): HarnessProtocolId = entries.firstOrNull { it.wire == value }
     ?: throw IllegalArgumentException("Unknown harness protocol: $value") }
 }
@@ -196,7 +196,7 @@ object ConnectionGraphInvariants {
       require(binding.credentials.remoteIdentity == null || source.type == ConnectionSourceType.HUB)
       require(binding.credentials.sshSecrets.isEmpty() || source.type == ConnectionSourceType.SSH)
       binding.legacyProfile?.let { profile ->
-        require(MigrationProjection.protocol(profile.kind) == binding.protocolId) { "Legacy protocol changed" }
+        require(profile.protocol == binding.protocolId) { "Legacy protocol changed" }
         require(MigrationProjection.sourceType(profile) == source.type) { "Legacy source changed" }
       }
     }
@@ -266,7 +266,8 @@ object ConnectionGraphCodec {
       RemoteIdentitySlotRefs(remote.graphObjects("candidates").map(::readSlot), remote.graphOptionalObject("selected")?.let(::readSlot)) })
 
   private fun profileJson(profile: ServerProfile): JSONObject = JSONObject().put("id", profile.id).put("name", profile.name).put("url", profile.url).put("username", profile.username)
-    .put("autoConnect", profile.autoConnect).put("notifications", profile.notifications).put("allowCleartext", profile.allowCleartext).put("kind", profile.kind.wire)
+    .put("autoConnect", profile.autoConnect).put("notifications", profile.notifications).put("allowCleartext", profile.allowCleartext).put("kind", MigrationProjection.kindWire(profile))
+    .put("protocolId", profile.protocol.wire)
     .put("dshAuth", profile.dshAuth.wire).putOpt("remoteHostId", profile.remoteHostId).putOpt("remoteHostFingerprint", profile.remoteHostFingerprint)
     .putOpt("sshHostId", profile.sshHostId).put("enabled", profile.enabled).putOpt("sshServicePath", profile.sshServicePath)
     .putOpt("remoteServiceId", profile.remoteServiceId)
@@ -274,14 +275,29 @@ object ConnectionGraphCodec {
     value.graphBoolean("autoConnect"), value.graphBoolean("notifications"), value.graphBoolean("allowCleartext"), MigrationProjection.legacyKind(value.graphString("kind")),
     DshAuthMode.entries.firstOrNull { it.wire == value.graphString("dshAuth") } ?: error("Unknown legacy DSH auth mode"),
     value.graphOptionalString("remoteHostId"), value.graphOptionalString("remoteHostFingerprint"), value.graphOptionalString("sshHostId"), value.graphBoolean("enabled"), value.graphOptionalString("sshServicePath"),
-    parentEnabled = true, remoteServiceId = value.graphOptionalString("remoteServiceId"))
+    parentEnabled = true, remoteServiceId = value.graphOptionalString("remoteServiceId"),
+    protocolId = MigrationProjection.storedProtocol(value.graphString("kind"), value.graphOptionalString("protocolId")))
 }
 
 /** Pure/idempotent compatibility projection only. Durable migration/transactions belong to a later store integration. */
 object MigrationProjection {
   /** Do not use ServerKind.fromWire: it defaults unknown strings to OpenCode. */
-  fun legacyKind(wire: String): ServerKind = ServerKind.entries.firstOrNull { it.wire == wire }
-    ?: throw IllegalArgumentException("Unknown legacy harness kind: $wire")
+  private const val AGY_KIND = "antigravity-acp"
+  fun legacyKind(wire: String): ServerKind = if (wire == AGY_KIND) ServerKind.CODEX else
+    ServerKind.entries.firstOrNull { it.wire == wire }
+      ?: throw IllegalArgumentException("Unknown legacy harness kind: $wire")
+
+  /** New kinds use an unknown legacy marker so older clients fail closed instead of dialing Codex. */
+  fun kindWire(profile: ServerProfile): String = if (profile.protocol == HarnessProtocolId.ANTIGRAVITY_ACP) AGY_KIND else profile.kind.wire
+  fun storedProtocol(kindWire: String, protocolWire: String?): HarnessProtocolId? {
+    val explicit = protocolWire?.let(HarnessProtocolId::fromWire)
+    if (kindWire == AGY_KIND) {
+      require(explicit == null || explicit == HarnessProtocolId.ANTIGRAVITY_ACP) { "Conflicting AGY protocol" }
+      return HarnessProtocolId.ANTIGRAVITY_ACP
+    }
+    require(explicit == null || explicit == protocol(legacyKind(kindWire))) { "Conflicting stored harness protocol" }
+    return null // Legacy profiles continue deriving protocol when callers copy their kind.
+  }
   fun protocol(kind: ServerKind): HarnessProtocolId = when (kind) {
     ServerKind.OPENCODE -> HarnessProtocolId.OPENCODE_NATIVE
     ServerKind.CODEX -> HarnessProtocolId.CODEX_APP_SERVER
@@ -338,7 +354,7 @@ object MigrationProjection {
           ConnectionSlotRef(ConnectionSlotStore.SSH_SECRETS, "ssh:${profile.sshHostId}:$it") })
         ConnectionSourceType.DIRECT -> ConnectionCredentialRefs(profileSecret = ConnectionSlotRef(ConnectionSlotStore.SERVER_SECRETS, profile.id))
       }
-      HarnessBinding(profile.id, hostId, profile.name, protocol(profile.kind), carrier, serviceId = profile.remoteServiceId, enabled = profile.enabled,
+      HarnessBinding(profile.id, hostId, profile.name, profile.protocol, carrier, serviceId = profile.remoteServiceId, enabled = profile.enabled,
         autoConnect = profile.autoConnect, notifications = profile.notifications, credentials = refs, legacyProfile = profile)
     }
     return ConnectionGraph(sources.values.toList(), hosts.values.toList(), bindings, compositions)

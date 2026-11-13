@@ -37,7 +37,7 @@ internal data class RemoteCatalog(
 }
 
 /** Authenticated protocol readiness, not guessed from Host name or advertised app version. */
-internal data class RemoteHostServices(val dshAvailable: Boolean, val native: NativeServiceCatalog?, val codexAvailable: Boolean = false)
+internal data class RemoteHostServices(val dshAvailable: Boolean, val native: NativeServiceCatalog?, val codexAvailable: Boolean = false, val agyAvailable: Boolean = false)
 
 /** One local record per origin+account. Implementations must replace atomically. */
 internal interface RemoteCatalogStore {

@@ -2,6 +2,8 @@ package com.igng.opencode.lagoon.core.ssh
 
 import com.igng.opencode.lagoon.core.Diagnostics
 import com.igng.opencode.lagoon.core.CodexApi
+import com.igng.opencode.lagoon.core.AgyApi
+import com.igng.opencode.lagoon.core.HarnessProtocolId
 import com.igng.opencode.lagoon.core.GuardedHarnessClient
 import com.igng.opencode.lagoon.core.HarnessLeaseAccess
 import com.igng.opencode.lagoon.core.HarnessClient
@@ -45,16 +47,18 @@ internal class SshHostManager(
     val config = store.load().firstOrNull { it.id == hostId }
       ?: throw SshFailure(SshFailureKind.OTHER, "SSH 主机配置已删除", retryable = false)
     require(profile.url == config.profileUrl() && profile.username == config.user) { "SSH 保存配置已变化，请重新保存绑定路由" }
-    if (profile.kind == ServerKind.CODEX) {
+    if (profile.protocol in setOf(HarnessProtocolId.CODEX_APP_SERVER, HarnessProtocolId.ANTIGRAVITY_ACP)) {
       val entry = synchronized(lock) {
         val current = codexLinks[profile.id]?.takeUnless { it.client.isClosed }
-        (current ?: SharedCodex(hostId, CodexApi(SshCodexTransport(config, store.secrets(hostId), transports)))
+        (current ?: SharedCodex(hostId, if (profile.protocol == HarnessProtocolId.ANTIGRAVITY_ACP)
+          AgyApi(SshAgyTransport(config, store.secrets(hostId), transports))
+        else CodexApi(SshCodexTransport(config, store.secrets(hostId), transports)))
           .also { codexLinks[profile.id] = it }).also { it.refs++ }
       }
       return GuardedHarnessClient(object : HarnessLeaseAccess {
         private val released = java.util.concurrent.atomic.AtomicBoolean(false)
         override val isClosed: Boolean get() = released.get() || entry.client.isClosed
-        private fun checkOpen() { check(!isClosed) { "Codex SSH 租约已关闭" } }
+        private fun checkOpen() { check(!isClosed) { "SSH Harness 租约已关闭" } }
         override fun <T> use(block: (HarnessClient) -> T): T { checkOpen(); return block(entry.client).also { checkOpen() } }
         override suspend fun <T> useSuspending(block: suspend (HarnessClient) -> T): T {
           checkOpen(); return block(entry.client).also { checkOpen() }
@@ -203,6 +207,16 @@ internal class SshHostManager(
         if (key.fingerprint != pin) throw SshFailure(SshFailureKind.HOST_KEY_CHANGED, "SSH 主机指纹已变化", retryable = false, presentedKey = key)
         true
       }).use { SshCodexProbe(it).discover() }
+    }
+
+  suspend fun discoverAgy(config: SshHostConfig, secrets: SshSecrets): SshAgyObservation =
+    kotlinx.coroutines.withContext(Dispatchers.IO) {
+      val pin = config.hostKeyFingerprint?.takeIf { it.isNotBlank() }
+        ?: throw SshFailure(SshFailureKind.HOST_KEY_UNKNOWN, "请先确认 SSH 主机指纹", retryable = false)
+      transports.connect(config, secrets, SshHostKeyVerifier { key ->
+        if (key.fingerprint != pin) throw SshFailure(SshFailureKind.HOST_KEY_CHANGED, "SSH 主机指纹已变化", retryable = false, presentedKey = key)
+        true
+      }).use { SshAgyProbe(it).discover() }
     }
 
   suspend fun testCodex(config: SshHostConfig, secrets: SshSecrets): String =

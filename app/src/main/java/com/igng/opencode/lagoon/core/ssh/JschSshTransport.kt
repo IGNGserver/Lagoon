@@ -4,6 +4,7 @@ import com.igng.opencode.lagoon.core.*
 
 import com.jcraft.jsch.ChannelDirectTCPIP
 import com.jcraft.jsch.ChannelExec
+import com.jcraft.jsch.ChannelSftp
 import com.jcraft.jsch.HostKey
 import com.jcraft.jsch.HostKeyRepository
 import com.jcraft.jsch.JSch
@@ -34,6 +35,9 @@ internal interface SshTransport : Closeable {
   fun exec(script: String, timeoutMillis: Long): RemoteExecResult
   /** Open a long-lived, non-PTY exec channel. stdout and stderr remain separate. */
   fun openExecChannel(script: String): SshExecChannel = throw UnsupportedOperationException("SSH streaming exec unavailable")
+  fun verifyWorkspace(root: String): String = throw UnsupportedOperationException("SSH SFTP unavailable")
+  fun listWorkspace(root: String, path: String): List<FileNode> = throw UnsupportedOperationException("SSH SFTP unavailable")
+  fun readWorkspace(root: String, path: String): FileContent = throw UnsupportedOperationException("SSH SFTP unavailable")
   fun openTunnel(host: String, port: Int, input: InputStream, output: OutputStream): TunnelConnection
   fun probeTunnel(host: String, port: Int, timeoutMillis: Long): Boolean
   fun ping(timeoutMillis: Long): Boolean
@@ -219,6 +223,49 @@ private class VerifyingHostKeyRepository(
 
 private class JschSshTransport(private val session: Session) : SshTransport {
   override val isClosed: Boolean get() = !session.isConnected
+
+  private fun <T> withWorkspaceFile(root: String, path: String, block: (ChannelSftp, String) -> T): T {
+    require(root.isNotBlank() && root.none(Char::isISOControl) && path.none(Char::isISOControl)) { "工作区路径无效" }
+    val relative = path.trim().ifBlank { "." }
+    require(!relative.startsWith('/') && !relative.startsWith('\\') && !Regex("^[A-Za-z]:").containsMatchIn(relative)) { "文件路径必须位于工作区内" }
+    val channel = session.openChannel("sftp") as ChannelSftp
+    return try {
+      channel.connect(15_000)
+      val canonicalRoot = channel.realpath(root).trimEnd('/').ifBlank { "/" }
+      val target = channel.realpath(if (relative == ".") canonicalRoot else "${canonicalRoot.trimEnd('/')}/$relative")
+      require(target == canonicalRoot || target.startsWith(if (canonicalRoot == "/") "/" else "$canonicalRoot/")) { "文件路径超出工作区" }
+      block(channel, target)
+    } finally { channel.disconnect() }
+  }
+  override fun verifyWorkspace(root: String): String = withWorkspaceFile(root, ".") { channel, target ->
+    require(channel.stat(target).isDir) { "路径不是目录" }
+    target
+  }
+  override fun listWorkspace(root: String, path: String): List<FileNode> = withWorkspaceFile(root, path) { channel, target ->
+    val relative = path.trim().trim('/').takeUnless { it.isEmpty() || it == "." }.orEmpty()
+    @Suppress("UNCHECKED_CAST")
+    val entries = channel.ls(target) as java.util.Vector<ChannelSftp.LsEntry>
+    if (entries.size > 10_000) throw java.io.IOException("目录条目超过上限")
+    entries.asSequence().filter { it.filename !in setOf(".", "..") && it.filename.isNotBlank() && '/' !in it.filename }
+      .map { item -> FileNode(if (relative.isBlank()) item.filename else "$relative/${item.filename}", if (item.attrs.isDir) "directory" else "file") }.toList()
+  }
+  override fun readWorkspace(root: String, path: String): FileContent = withWorkspaceFile(root, path) { channel, target ->
+    val limit = 2 * 1024 * 1024
+    val bytes = ByteArrayOutputStream()
+    channel.get(target).use { input ->
+      val buffer = ByteArray(8192)
+      while (true) {
+        val count = input.read(buffer); if (count < 0) break
+        if (bytes.size() + count > limit) throw java.io.IOException("文件超过 2 MiB 预览上限")
+        bytes.write(buffer, 0, count)
+      }
+    }
+    val data = bytes.toByteArray()
+    val text = try { Charsets.UTF_8.newDecoder().onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
+      .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT).decode(java.nio.ByteBuffer.wrap(data)).toString() }
+      catch (_: Exception) { return@withWorkspaceFile FileContent("binary", "") }
+    if ('\u0000' in text) FileContent("binary", "") else FileContent("text", text)
+  }
 
   override fun openExecChannel(script: String): SshExecChannel {
     val channel = session.openChannel("exec") as ChannelExec

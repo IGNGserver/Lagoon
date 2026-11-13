@@ -382,9 +382,9 @@ internal class AllServersOverview(
               val stream = launch(start = CoroutineStart.LAZY) {
                 client.events(onOpen = {
                   scope.launch {
-                    if (clients[id] !== client || profile.kind == ServerKind.CODEX && client.isClosed) return@launch
+                    if (clients[id] !== client || profile.protocol == HarnessProtocolId.CODEX_APP_SERVER && client.isClosed) return@launch
                     snapshot = snapshot.copy(streamConnected = true)
-                    if (profile.kind == ServerKind.CODEX) codexRetryDelays.remove(id)
+                    if (profile.protocol == HarnessProtocolId.CODEX_APP_SERVER) codexRetryDelays.remove(id)
                     emit(snapshot)
                     refresh(id)
                     onConnected(id)
@@ -543,7 +543,7 @@ internal class AllServersOverview(
           liveStreams.remove(id, streamJob)
           snapshot = snapshot.copy(streamConnected = false)
           emit(snapshot)
-          if (profile.kind == ServerKind.CODEX && client.isClosed) {
+          if (profile.protocol == HarnessProtocolId.CODEX_APP_SERVER && client.isClosed) {
             // Retire the failed owner outside its own monitor job. The identity fence prevents a
             // delayed failure from closing a replacement after profile edits, removal or reconnect.
             val owner = ownerTokens[id]
@@ -605,7 +605,7 @@ internal class AllServersOverview(
     }
     // Remote Codex emits thread-specific events. Restore bounded subscriptions for active tasks;
     // the client protects the currently selected conversation while retiring expired watches.
-    val codexMonitoring = if (profile.kind == ServerKind.CODEX && profile.remoteHostId != null && active != null)
+    val codexMonitoring = if (profile.protocol == HarnessProtocolId.CODEX_APP_SERVER && profile.remoteHostId != null && active != null)
       attempt {
         val activeSessions = active.mapNotNull(identityMap::get)
         if (activeSessions.size != active.size) throw java.io.IOException("Codex 活动会话目录不完整，保留现有监听")

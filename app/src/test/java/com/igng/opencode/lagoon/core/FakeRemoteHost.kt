@@ -39,7 +39,9 @@ internal class FakeRemoteHost(
   /** Actual upstream Harness bridge for encrypted terminal integration; never an application route. */
   private val harnessRpc: ((method: String, params: JSONObject, publish: (String, JSONObject) -> Unit) -> JSONObject)? = null,
   /** Optional real Codex peer bridge; exists only in the opt-in interoperability fixture. */
-  private val codexRpc: ((method: String, params: JSONObject, publish: (String, JSONObject) -> Unit) -> JSONObject)? = null
+  private val codexRpc: ((method: String, params: JSONObject, publish: (String, JSONObject) -> Unit) -> JSONObject)? = null,
+  /** Opt-in AGY bridge returns the actual ACP gateway result, including arrays and null. */
+  private val agyRpc: ((method: String, params: JSONObject, publish: (String, JSONObject) -> Unit) -> Any?)? = null
 ) : AutoCloseable {
   val server = MockWebServer()
   val requests: MutableList<String> = Collections.synchronizedList(mutableListOf())
@@ -52,7 +54,7 @@ internal class FakeRemoteHost(
   // One gate covers the Noise sender nonce, fragment order and WebSocket enqueue order, including
   // callbacks from the stdio reader. Never hold it while waiting for an external RPC response.
   private val wireGate = Any()
-  private val nativeWorker = (nativeRpc ?: harnessRpc ?: codexRpc)?.let {
+  private val nativeWorker = (nativeRpc ?: harnessRpc ?: codexRpc ?: agyRpc)?.let {
     Executors.newSingleThreadExecutor { task -> Thread(task, "fake-remote-native-rpc").apply { isDaemon = true } }
   }
   @Volatile private var cipher: CipherStatePair? = null
@@ -128,7 +130,7 @@ internal class FakeRemoteHost(
 
   /** Safe from a bridge reader/executor thread, including before its open RPC has completed. */
   fun publishNativeEvent(event: String, data: JSONObject) {
-    require(event.startsWith("harness.services.") || event.startsWith("codex.app.") || event == "harness.remote.frame" || event == "harness.remote.stream.closed")
+    require(event.startsWith("harness.services.") || event.startsWith("codex.app.") || event.startsWith("agent.acp.") || event == "harness.remote.frame" || event == "harness.remote.stream.closed")
     val socket = controlSocket ?: return
     publish(socket, event, data)
   }
@@ -246,10 +248,10 @@ internal class FakeRemoteHost(
     val method = payload.getString("method")
     val params = payload.optJSONObject("params") ?: JSONObject()
     rpcCalls += JSONObject().put("method", method).put("params", params)
-    fun respond(result: JSONObject) {
+    fun respond(result: Any?) {
       sendMessage(socket, JSONObject().put("v", 1).put("id", id).put("type", "rpc.response")
         .put("timestamp", System.currentTimeMillis())
-        .put("payload", JSONObject().put("requestId", id).put("result", result)))
+        .put("payload", JSONObject().put("requestId", id).put("result", result ?: JSONObject.NULL)))
     }
     fun contractFailure(endpoint: String, rpcPayload: JSONObject): String? {
       if (!strictOfficialContracts) return null
@@ -276,7 +278,10 @@ internal class FakeRemoteHost(
     }
     when (method) {
       "harness.transport.describe" -> respond(JSONObject().put("capabilities", JSONArray(
-        capabilities + if (nativeRpc != null) listOf("harness.services.v1") else emptyList())))
+        capabilities + if (nativeRpc != null) listOf("harness.services.v1") else emptyList())).also { description ->
+          if (agyRpc != null) description.put("workspaceTypes", JSONArray().put(JSONObject().put("id", "antigravity")
+            .put("name", "Antigravity").put("capability", "agent.acp.antigravity.v1").put("available", true)))
+        })
       "harness.remote.call" -> {
         val endpoint = params.getString("endpoint")
         val rpcPayload = params.optJSONObject("payload") ?: JSONObject()
@@ -325,6 +330,7 @@ internal class FakeRemoteHost(
         val bridge = when {
           method.startsWith("harness.services.") -> nativeRpc
           method.startsWith("codex.app.") -> codexRpc
+          method.startsWith("agent.acp.") -> agyRpc
           else -> null
         }
         if (bridge != null) {

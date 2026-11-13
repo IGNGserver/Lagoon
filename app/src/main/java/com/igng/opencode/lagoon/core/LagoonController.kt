@@ -310,6 +310,8 @@ class LagoonController private constructor(private val appContext: Context) {
         hostedStatus(services.dshAvailable, now, "Host 未声明 DSH 通道")))
       add(DiscoveredHarness(HarnessProtocolId.CODEX_APP_SERVER, null, "Codex",
         hostedStatus(services.codexAvailable, now, "Host 未声明 Codex 能力")))
+      add(DiscoveredHarness(HarnessProtocolId.ANTIGRAVITY_ACP, null, "Antigravity",
+        hostedStatus(services.agyAvailable, now, "Host 未启用原生 AGY ACP，请升级连接器")))
       services.native?.services.orEmpty().filter { it.supported }.forEach { service ->
         add(DiscoveredHarness(HarnessProtocolId.OPENCODE_NATIVE, service.id,
           service.name.ifBlank { "OpenCode" }, hostedStatus(service.available, now, "Host 报告该服务尚未就绪")))
@@ -323,6 +325,7 @@ class LagoonController private constructor(private val appContext: Context) {
     val secrets = sshHostStore.secrets(config.id)
     val found = discoverSshHarnesses(config, secrets, null)
     val codex = discoverSshCodex(config, secrets)
+    val agy = sshHostManager.discoverAgy(config, secrets)
     val path = found.openCode.registrationPath
     return buildList {
       add(DiscoveredHarness(HarnessProtocolId.OPENCODE_NATIVE, path, "OpenCode",
@@ -335,6 +338,13 @@ class LagoonController private constructor(private val appContext: Context) {
           available = DiscoveryValue.UNKNOWN, observedAtMs = now,
           freshUntilMs = now + DeviceDiscovery.DEFAULT_TTL_MS, completeness = found.completeness,
           reason = "连接时启动或复用配置的 dsh web"), ""))
+      add(DiscoveredHarness(HarnessProtocolId.ANTIGRAVITY_ACP, null, "Antigravity",
+        HarnessDiscoveryStatus(
+          installed = when (agy.installed) { true -> DiscoveryValue.YES; false -> DiscoveryValue.NO; null -> DiscoveryValue.UNKNOWN },
+          compatible = when (agy.compatible) { true -> DiscoveryValue.YES; false -> DiscoveryValue.NO; null -> DiscoveryValue.UNKNOWN },
+          available = DiscoveryValue.UNKNOWN, observedAtMs = now,
+          freshUntilMs = now + DeviceDiscovery.DEFAULT_TTL_MS, completeness = found.completeness,
+          reason = agy.issue ?: agy.version), agy.version.orEmpty()))
       add(DiscoveredHarness(HarnessProtocolId.CODEX_APP_SERVER, null, "Codex",
         HarnessDiscoveryStatus(
           installed = when (codex.installed) {
@@ -376,6 +386,11 @@ class LagoonController private constructor(private val appContext: Context) {
         val parent = remoteCatalogProfile(catalog, meta)
         when (protocol) {
           HarnessProtocolId.DSH_TYPERT -> addRemoteDshService(parent, enabled = true)
+          HarnessProtocolId.ANTIGRAVITY_ACP -> {
+            val services = remoteHostServices(catalog, meta)
+            check(services.agyAvailable) { "Host 未启用原生 AGY ACP，请升级连接器" }
+            addRemoteAgyService(parent, enabled = true)
+          }
           HarnessProtocolId.CODEX_APP_SERVER -> {
             val services = remoteHostServices(catalog, meta)
             check(services.codexAvailable) { "Host 未声明 Codex 可用" }
@@ -395,11 +410,12 @@ class LagoonController private constructor(private val appContext: Context) {
         val kind = when (protocol) {
           HarnessProtocolId.DSH_TYPERT -> ServerKind.DSH
           HarnessProtocolId.OPENCODE_NATIVE -> ServerKind.OPENCODE
-          HarnessProtocolId.CODEX_APP_SERVER -> ServerKind.CODEX
+          HarnessProtocolId.CODEX_APP_SERVER, HarnessProtocolId.ANTIGRAVITY_ACP -> ServerKind.CODEX
         }
         saveSshHost(
           config = config, secrets = sshHostStore.secrets(config.id), harnessKind = kind,
           registrationPath = locator.takeIf { kind == ServerKind.OPENCODE },
+          harnessProtocol = protocol.takeIf { it == HarnessProtocolId.ANTIGRAVITY_ACP },
           bindingEnabled = true, connect = false
         )
       }
@@ -589,7 +605,7 @@ class LagoonController private constructor(private val appContext: Context) {
         RemoteSession(profile.url, profile.allowCleartext, hostId, manager,
           RemotePeerTrust(store.remotePins), account, appVersion())
       }
-      return RemoteBackend(session, profile.takeIf { it.kind == ServerKind.OPENCODE || it.kind == ServerKind.CODEX }) { RemoteConnectionRegistry.release(key) }
+      return RemoteBackend(session, profile.takeIf { it.kind == ServerKind.OPENCODE || it.protocol in setOf(HarnessProtocolId.CODEX_APP_SERVER, HarnessProtocolId.ANTIGRAVITY_ACP) }) { RemoteConnectionRegistry.release(key) }
   }
 
   private fun remoteSlot(profileId: String) = "profile-${profileId.replace(Regex("[^A-Za-z0-9_-]"), "_")}"
@@ -696,11 +712,25 @@ class LagoonController private constructor(private val appContext: Context) {
   internal fun addRemoteCodexService(parent: ServerProfile, enabled: Boolean): ServerProfile {
     val host = requireNotNull(parent.remoteHostId) { "尚未选择 Host" }
     val origin = canonicalRemoteOrigin(parent.url)
-    store.profiles().firstOrNull { it.kind == ServerKind.CODEX && it.remoteHostId == host &&
+    store.profiles().firstOrNull { it.protocol == HarnessProtocolId.CODEX_APP_SERVER && it.remoteHostId == host &&
       it.username.trim() == parent.username.trim() && canonicalRemoteOrigin(it.url) == origin }?.let { return it }
     val catalog = remoteCatalog(origin, parent.username)?.takeUnless { it.signedOut } ?: error("中枢账号已退出登录")
     val observed = catalog.hosts.singleOrNull { it.hostId == host && it.fingerprint == parent.remoteHostFingerprint } ?: error("Host 目录已变化")
     val profile = remoteCatalogProfile(catalog, observed).copy(id = java.util.UUID.randomUUID().toString(), kind = ServerKind.CODEX, enabled = enabled)
+    saveServer(profile, null, credentialUsername = profile.username, connect = false)
+    return store.profiles().first { it.id == profile.id }
+  }
+
+  internal fun addRemoteAgyService(parent: ServerProfile, enabled: Boolean): ServerProfile {
+    val host = requireNotNull(parent.remoteHostId) { "尚未选择 Host" }
+    val origin = canonicalRemoteOrigin(parent.url)
+    store.profiles().firstOrNull { it.protocol == HarnessProtocolId.ANTIGRAVITY_ACP && it.remoteHostId == host &&
+      it.username.trim() == parent.username.trim() && canonicalRemoteOrigin(it.url) == origin }?.let { return it }
+    val catalog = remoteCatalog(origin, parent.username)?.takeUnless { it.signedOut } ?: error("中枢账号已退出登录")
+    val observed = catalog.hosts.singleOrNull { it.hostId == host && it.fingerprint == parent.remoteHostFingerprint } ?: error("Host 目录已变化")
+    val id = java.util.UUID.nameUUIDFromBytes("$origin:${parent.username.trim()}:$host:antigravity".toByteArray(Charsets.UTF_8)).toString()
+    val profile = remoteCatalogProfile(catalog, observed).copy(id = id, kind = ServerKind.CODEX,
+      protocolId = HarnessProtocolId.ANTIGRAVITY_ACP, enabled = enabled)
     saveServer(profile, null, credentialUsername = profile.username, connect = false)
     return store.profiles().first { it.id == profile.id }
   }
@@ -828,7 +858,7 @@ class LagoonController private constructor(private val appContext: Context) {
   private fun handleOverviewConnected(id: String) {
     if (id == state.value.serverId) trace(generation, ConnectMilestone.STREAM)
     if (id != state.value.serverId || api == null) return
-    val replacement = if (state.value.server?.kind == ServerKind.CODEX)
+    val replacement = if (state.value.server?.protocol == HarnessProtocolId.CODEX_APP_SERVER)
       runCatching { allOverview.client(id) }.getOrNull() else null
     if (replacement == null || replacement === api) {
       if (connecting?.isActive != true) reconcileAfterStream()
@@ -863,7 +893,7 @@ class LagoonController private constructor(private val appContext: Context) {
   /** Selection and background-monitor ownership are separate from the server's read receipt. */
   private fun synchronizeCodexSelection() {
     val current = state.value
-    if (current.server?.kind != ServerKind.CODEX) return
+    if (current.server?.protocol != HarnessProtocolId.CODEX_APP_SERVER) return
     val serverId = current.serverId ?: return
     val client = api ?: return
     val session = current.session
@@ -2232,7 +2262,8 @@ class LagoonController private constructor(private val appContext: Context) {
     connect: Boolean = true,
     harnessKind: ServerKind = ServerKind.DSH,
     registrationPath: String? = null,
-    bindingEnabled: Boolean? = null
+    bindingEnabled: Boolean? = null,
+    harnessProtocol: HarnessProtocolId? = null
   ): ServerProfile {
     require(harnessKind != ServerKind.DSH_REMOTE) { "SSH source 不使用 Remote carrier" }
     val clean = cleanSshConfig(config)
@@ -2241,10 +2272,14 @@ class LagoonController private constructor(private val appContext: Context) {
       "OpenCode 注册路径必须是远端绝对路径"
     }
     val savedProfiles = store.readProfiles()
+    val desiredProtocol = harnessProtocol ?: MigrationProjection.protocol(harnessKind)
+    require(harnessProtocol == null || harnessProtocol == HarnessProtocolId.ANTIGRAVITY_ACP && harnessKind == ServerKind.CODEX)
     val existing = savedProfiles.firstOrNull {
-      it.sshHostId == clean.id && it.kind == harnessKind && it.sshServicePath == registrationPath
+      it.sshHostId == clean.id && it.protocol == desiredProtocol && it.sshServicePath == registrationPath
     }
-    val fallbackId = clean.id.takeUnless { candidate -> savedProfiles.any { it.id == candidate } }
+    val fallbackId = if (desiredProtocol == HarnessProtocolId.ANTIGRAVITY_ACP)
+      java.util.UUID.nameUUIDFromBytes("${clean.id}:${desiredProtocol.wire}".toByteArray(Charsets.UTF_8)).toString()
+    else clean.id.takeUnless { candidate -> savedProfiles.any { it.id == candidate } }
       ?: java.util.UUID.randomUUID().toString()
     val profileId = existing?.id ?: fallbackId
     val previousHost = sshHostStore.load().firstOrNull { it.id == clean.id }
@@ -2261,6 +2296,7 @@ class LagoonController private constructor(private val appContext: Context) {
       notifications = notifications,
       allowCleartext = true,
       kind = harnessKind,
+      protocolId = harnessProtocol,
       dshAuth = DshAuthMode.TOKEN,
       remoteHostId = null,
       remoteHostFingerprint = null,
@@ -3710,9 +3746,11 @@ class LagoonController private constructor(private val appContext: Context) {
     return info.choice.copy(variant = selected)
   }
   private suspend fun loadChoices(directory: String, token: Int = generation, force: Boolean = false) {
-    val serverId = state.value.serverId ?: return
+    val snapshot = state.value
+    val serverId = snapshot.serverId ?: return
+    val sessionScopedModels = snapshot.server?.protocol == HarnessProtocolId.ANTIGRAVITY_ACP
     val revision = selectionRevision
-    val cached = if (force) null else choicesCache.get(serverId, directory)
+    val cached = if (force || sessionScopedModels) null else choicesCache.get(serverId, directory)
     if (cached != null) {
       applyChoiceResults(token, revision, directory,
         Result.success(cached.agents), Result.success(cached.models), Result.success(cached.commands))
@@ -3723,12 +3761,12 @@ class LagoonController private constructor(private val appContext: Context) {
     // Agents, models and commands are independent; one parallel round instead of three.
     val (agents, models, commands) = coroutineScope {
       val agentsTask = async { attempt { client.agents(directory) } }
-      val modelsTask = async { attempt { client.modelCatalog(directory) } }
+      val modelsTask = async { attempt { client.modelCatalogForSession(directory, snapshot.session) } }
       val commandsTask = async { attempt { client.commands(directory) } }
       Triple(agentsTask.await(), modelsTask.await(), commandsTask.await())
     }
     applyChoiceResults(token, revision, directory, agents, models, commands)
-    if (agents.isSuccess && models.isSuccess && commands.isSuccess) {
+    if (!sessionScopedModels && agents.isSuccess && models.isSuccess && commands.isSuccess) {
       choicesCache.put(serverId, CachedChoices(directory,
         agents.getOrDefault(emptyList()), models.getOrDefault(emptyList()), commands.getOrDefault(emptyList()),
         System.currentTimeMillis(), complete = true))
@@ -3747,7 +3785,9 @@ class LagoonController private constructor(private val appContext: Context) {
     if (token != generation || revision != selectionRevision || (expectedDirectory != null && expectedDirectory != directory)) return
     updateState { current ->
       val agentList = agents.getOrDefault(current.agents)
-      val catalog = models.getOrDefault(current.modelCatalog)
+      val catalog = models.getOrElse {
+        if (current.server?.protocol == HarnessProtocolId.ANTIGRAVITY_ACP) emptyList() else current.modelCatalog
+      }
       val serverId = current.serverId
       val variants = serverId?.let(store::modelVariants) ?: current.modelVariants
       // A blank page carries the phone's defaults (or the reader's override). Validate that
@@ -4086,7 +4126,7 @@ class LagoonController private constructor(private val appContext: Context) {
     val revision = selectionRevision
     val requestSequence = ++messageSequence
     fun current() = token == generation && revision == selectionRevision && state.value.serverId == serverId && state.value.sessionId == session.id &&
-      requestSequence == messageSequence && (state.value.server?.kind != ServerKind.CODEX || api === client)
+      requestSequence == messageSequence && (state.value.server?.protocol != HarnessProtocolId.CODEX_APP_SERVER || api === client)
     // Capture before any HTTP/cache suspension, not after the page returns. Live events replace
     // immutable Message values, letting us protect only the IDs that changed during this read.
     val readStart = state.value.messages.associateBy { it.id }
@@ -4112,7 +4152,7 @@ class LagoonController private constructor(private val appContext: Context) {
     // todo list and the durable goal projection, like the official client's syncs.
     val (result, composer) = coroutineScope {
       val page = async { attempt {
-        if (state.value.server?.kind == ServerKind.CODEX && !codexSelectionCoordinator.apply(::current) {
+        if (state.value.server?.protocol == HarnessProtocolId.CODEX_APP_SERVER && !codexSelectionCoordinator.apply(::current) {
             client.selectCodexSession(session)
           }) throw CancellationException("Codex 会话选择已变化")
         // A cacheable conversation opens from its verified stored run plus only what is new on the server.
@@ -4639,7 +4679,7 @@ class LagoonController private constructor(private val appContext: Context) {
   /** Explicitly registers an existing directory with a Remote Codex Host. */
   fun createCodexProject(directory: String, expectedServer: ServerProfile): Job = act("project-add", directory) { op ->
     val server = op.snapshot.server
-    check(server?.kind == ServerKind.CODEX && server.remoteHostId != null &&
+    check(server?.protocol == HarnessProtocolId.CODEX_APP_SERVER && server.remoteHostId != null &&
       ConnectionRouteAdmission.sameLeafRoute(expectedServer, server)) { "连接已变化或不支持 Codex Host 项目登记" }
     val project = op.client.createCodexProject(directory) ?: throw ApiException(501, "此 Host 未提供 Codex 项目登记")
     if (!op.isCurrent(this)) return@act
@@ -5225,7 +5265,10 @@ class LagoonController private constructor(private val appContext: Context) {
   fun abort() = withSession("abort") { op, client, session ->
     client.abort(session)
     workRevision++
-    op.commitConnection { withSummary(it.copy(tasks = it.tasks + (session.id to TaskState(session.id, TaskPhase.ABORTED, "任务已停止", it.tasks[session.id]?.since ?: System.currentTimeMillis(), System.currentTimeMillis())))) }
+    // ACP cancellation is a notification, not confirmation that the turn has ended.
+    // The eventual prompt result supplies the authoritative terminal state.
+    if (op.snapshot.server?.protocol != HarnessProtocolId.ANTIGRAVITY_ACP)
+      op.commitConnection { withSummary(it.copy(tasks = it.tasks + (session.id to TaskState(session.id, TaskPhase.ABORTED, "任务已停止", it.tasks[session.id]?.since ?: System.currentTimeMillis(), System.currentTimeMillis())))) }
   }
   /** Renames [target] (a session id from the home list) or, by default, the open session. */
   fun rename(title: String, target: String? = null, onRenamed: (() -> Unit)? = null) = withSession("rename", target) { op, client, session ->
@@ -5266,7 +5309,7 @@ class LagoonController private constructor(private val appContext: Context) {
     try {
       client.deleteSession(session)
     } catch (error: java.io.IOException) {
-      if (op.snapshot.server?.kind == ServerKind.CODEX) {
+      if (op.snapshot.server?.protocol == HarnessProtocolId.CODEX_APP_SERVER) {
         if (error is ApiException) throw ApiException(error.status,
           "${error.message.orEmpty()}；请刷新并核对会话状态后再操作", error.code, error.details)
         throw java.io.IOException("删除结果未知，请重新连接并核对会话状态后再操作", error)

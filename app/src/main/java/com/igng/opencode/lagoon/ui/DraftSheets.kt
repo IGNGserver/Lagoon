@@ -101,6 +101,7 @@ internal fun DraftDestinationSheet(
           ) {
             ChoiceRow("浏览服务器目录…", "添加为本机工作区", false) { controller.openDirectoryBrowser() }
             CodexProjectRegistrationRow(state, controller)
+            AgyProjectRegistrationRow(state, controller)
           }
         }
       } else {
@@ -151,7 +152,7 @@ private fun DraftServerRow(server: DraftServer, current: Boolean, onClick: () ->
           style = MiuixTheme.textStyles.body1.copy(fontWeight = if (current) FontWeight.SemiBold else FontWeight.Medium)
         )
         Spacer(Modifier.width(6.dp))
-        HarnessBadge(server.profile.kind)
+        HarnessBadge(server.profile)
         if (current) {
           Spacer(Modifier.width(6.dp))
           Text("当前", style = MiuixTheme.textStyles.footnote2.copy(fontWeight = FontWeight.SemiBold, color = HyperTheme.colors.primary))

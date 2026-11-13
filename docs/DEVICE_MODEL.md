@@ -34,11 +34,14 @@ HTTP 直连(兼容)  ─┘       HostBinding + ConnectionSource        ServerPr
 | 中枢 DSH leaf | `nameUUID(origin, account, hostId)` | 既有值，不得改公式 |
 | 中枢 OpenCode leaf | `nameUUID(origin, account, hostId, serviceId)` | 同上 |
 | 中枢 Codex leaf | `nameUUID(origin, account, hostId, "codex")` | 2026-11 起替换随机 UUID；旧资料保留原 id |
+| 中枢 AGY leaf | `nameUUID(origin, account, hostId, "antigravity")` | 一台 Host 的 AGY 槽位；与已有 leaf 分离 |
 | SSH 新 leaf | `nameUUID(configId, protocol.wire, registrationPath)` | 首个 leaf 历史上等于 `configId`，属迁移期巧合，新代码不得依赖 |
 | Harness 槽位 | `(protocolId, locator)`，locator 为 `serviceId` 或 SSH 注册路径 | 一个槽位最多一个 leaf；重复添加必须复用 |
 
 `ServerKind` 是兼容值，冻结：新代码判断传输只看 `remoteHostId` / `sshHostId` / 连接图的 `carrierId` 与
 `HarnessProtocolId`，**不得再往 `ServerKind` 加值**，也不得因新增 Harness 加传输分支。
+AGY 使用 `antigravity-acp` 协议标识，leaf 显式持久化协议；旧记录没有该字段时由旧 `kind`
+映射，保留原有 leaf ID 和全部偏好。未知协议与未来版本读取失败时保留原记录并停止连接。
 
 ## 3. 开关语义
 

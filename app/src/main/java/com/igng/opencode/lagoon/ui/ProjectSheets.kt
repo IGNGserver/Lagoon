@@ -211,6 +211,7 @@ private fun ProjectScopeSection(
     HyperCard(Modifier.fillMaxWidth().padding(horizontal = 8.dp), insidePadding = PaddingValues(vertical = 2.dp)) {
       ChoiceRow("添加服务器目录…", "浏览服务器目录并添加为项目", false) { controller.openDirectoryBrowser() }
       CodexProjectRegistrationRow(state, controller)
+            AgyProjectRegistrationRow(state, controller)
       if (state.canManageServerWorkspaces()) {
         HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
         ChoiceRow("管理 Host 工作区", "管理此 Host 的共享登记；不会自动保存到本机", false, onManageWorkspaces)
