@@ -13,6 +13,7 @@ import androidx.compose.ui.unit.dp
 import com.igng.opencode.lagoon.core.LagoonController
 import com.igng.opencode.lagoon.core.LagoonState
 import com.igng.opencode.lagoon.core.ServerKind
+import com.igng.opencode.lagoon.core.HarnessProtocolId
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.basic.TextField
 import top.yukonga.miuix.kmp.extra.SuperDialog
@@ -22,7 +23,7 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
 @Composable
 internal fun CodexProjectRegistrationRow(state: LagoonState, controller: LagoonController) {
   val server = state.server ?: return
-  if (!state.connected || server.kind != ServerKind.CODEX || server.remoteHostId == null) return
+  if (!state.connected || server.protocol != HarnessProtocolId.CODEX_APP_SERVER || server.remoteHostId == null) return
   var visible by remember(server.id) { mutableStateOf(false) }
   var path by remember(server.id) { mutableStateOf("") }
   ChoiceRow("登记 Codex 项目目录…", "在 Host 上登记已有目录", false) { visible = true }
@@ -33,6 +34,26 @@ internal fun CodexProjectRegistrationRow(state: LagoonState, controller: LagoonC
       TextField(value = path, onValueChange = { path = it }, label = "Host 绝对目录", modifier = Modifier.fillMaxWidth())
       DialogActions("取消", { visible = false }, "登记", enabled = path.isNotBlank()) {
         controller.createCodexProject(path.trim(), server)
+        visible = false
+      }
+    }
+  }
+}
+
+/** AGY can create a session in an existing Host directory without inventing a server project. */
+@Composable
+internal fun AgyProjectRegistrationRow(state: LagoonState, controller: LagoonController) {
+  val server = state.server ?: return
+  if (!state.connected || server.protocol != HarnessProtocolId.ANTIGRAVITY_ACP) return
+  var visible by remember(server.id) { mutableStateOf(false) }
+  var path by remember(server.id) { mutableStateOf("") }
+  ChoiceRow("添加 Antigravity 工作目录…", "选择开发机上已存在的目录", false) { visible = true }
+  if (visible) SuperDialog(title = "添加 Antigravity 工作目录", show = true, onDismissRequest = { visible = false }) {
+    Column(Modifier.fillMaxWidth().padding(top = 8.dp)) {
+      Text("填写开发机上的绝对目录。Lagoon 会验证目录存在，并将它保存到本机。", style = MiuixTheme.textStyles.footnote2)
+      TextField(value = path, onValueChange = { path = it }, label = "开发机绝对目录", modifier = Modifier.fillMaxWidth())
+      DialogActions("取消", { visible = false }, "添加", enabled = path.isNotBlank()) {
+        controller.addProject(path.trim())
         visible = false
       }
     }

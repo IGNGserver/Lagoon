@@ -96,6 +96,13 @@ export async function buildVerified({ upstream, out, tools, routerOnly = false }
   if (!routerOnly) {
     entries.push({ name: 'host-runtime', outfile: join(artifacts, 'host-runtime.mjs'), entryPoints: [join(sourceRoot, 'packages/plugin/src/service.ts')] });
     entries.push({ name: 'plugin', outfile: join(artifacts, 'index.mjs'), entryPoints: [join(sourceRoot, 'packages/plugin/src/index.ts')] });
+    entries.push({ name: 'agy-gateway', outfile: join(artifacts, 'agy-gateway.mjs'), stdin: {
+      contents: [
+        "export { AcpRemoteGateway } from './packages/plugin/src/acp/gateway.ts';",
+        "export { CursorAcpClient } from './packages/plugin/src/acp/adapters/cursor-process.ts';",
+        "export { parseAgyElicitation, validateAgyElicitationResult, cancelAgyRequest } from './packages/plugin/src/acp/lagoon-agy-elicitation.mjs';",
+      ].join('\n'), resolveDir: sourceRoot, sourcefile: 'agy-verification-entry.ts', loader: 'ts',
+    } });
   }
   const bundles = [];
   for (const { name, ...entry } of entries) {

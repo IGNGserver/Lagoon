@@ -125,13 +125,15 @@ class ServerStore internal constructor(private val preferences: SharedPreference
       val profiles = (0 until array.length()).map { index ->
         val item = array.getJSONObject(index)
         val id = item.getString("id").also { check(it.isNotBlank() && it.length <= 512 && '\u0000' !in it) }
+        val kindWire = if (!item.has("kind")) ServerKind.OPENCODE.wire else item.getString("kind")
         ServerProfile(id, item.str("name"), item.str("url"), item.str("username"),
           item.optBoolean("autoConnect", true), item.optBoolean("notifications", true), item.optBoolean("allowCleartext", false),
-          if (!item.has("kind")) ServerKind.OPENCODE else MigrationProjection.legacyKind(item.getString("kind")),
+          MigrationProjection.legacyKind(kindWire),
           DshAuthMode.fromWire(item.str("dshAuth")), item.str("remoteHostId").takeIf(String::isNotBlank),
           item.str("remoteHostFingerprint").takeIf(String::isNotBlank), item.str("sshHostId").takeIf(String::isNotBlank),
           item.optBoolean("enabled", true), item.str("sshServicePath").takeIf(String::isNotBlank),
-          parentEnabled = true, remoteServiceId = item.str("remoteServiceId").takeIf(String::isNotBlank))
+          parentEnabled = true, remoteServiceId = item.str("remoteServiceId").takeIf(String::isNotBlank),
+          protocolId = MigrationProjection.storedProtocol(kindWire, item.str("protocolId").takeIf(String::isNotBlank)))
       }
       check(profiles.distinctBy { it.id }.size == profiles.size) { "连接资料身份重复" }
       return profiles
@@ -652,7 +654,7 @@ class ServerStore internal constructor(private val preferences: SharedPreference
       put(JSONObject()
         .put("id", item.id).put("name", item.name).put("url", item.url).put("username", item.username)
         .put("autoConnect", item.autoConnect).put("notifications", item.notifications)
-        .put("allowCleartext", item.allowCleartext).put("kind", item.kind.wire).put("dshAuth", item.dshAuth.wire)
+        .put("allowCleartext", item.allowCleartext).put("kind", MigrationProjection.kindWire(item)).put("protocolId", item.protocol.wire).put("dshAuth", item.dshAuth.wire)
         .put("enabled", item.enabled)
         .putOpt("remoteHostId", item.remoteHostId).putOpt("remoteHostFingerprint", item.remoteHostFingerprint)
         .putOpt("sshHostId", item.sshHostId).putOpt("sshServicePath", item.sshServicePath)

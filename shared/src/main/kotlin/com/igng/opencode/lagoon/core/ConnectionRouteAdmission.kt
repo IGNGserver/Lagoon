@@ -26,9 +26,9 @@ data class ConnectionRouteSnapshot internal constructor(
     id = bindingId, url = endpoint, allowCleartext = allowCleartext, username = username,
     kind = when (protocolId) {
       HarnessProtocolId.OPENCODE_NATIVE -> ServerKind.OPENCODE
-      HarnessProtocolId.CODEX_APP_SERVER -> ServerKind.CODEX
+      HarnessProtocolId.CODEX_APP_SERVER, HarnessProtocolId.ANTIGRAVITY_ACP -> ServerKind.CODEX
       HarnessProtocolId.DSH_TYPERT -> if (carrierId == ConnectionCarrierId.REMOTE_NOISE) ServerKind.DSH_REMOTE else ServerKind.DSH
-    }, dshAuth = dshAuth, sshHostId = sshHostId, sshServicePath = sshServicePath,
+    }, protocolId = protocolId.takeIf { it == HarnessProtocolId.ANTIGRAVITY_ACP }, dshAuth = dshAuth, sshHostId = sshHostId, sshServicePath = sshServicePath,
     remoteHostId = remoteHostId, remoteHostFingerprint = fingerprint, remoteServiceId = remoteServiceId
   )
 }
@@ -53,7 +53,7 @@ internal object ConnectionRouteAdmission {
     val binding = currentGraph.bindings.singleOrNull { it.id == profile.id } ?: stale("binding")
     val legacy = binding.legacyProfile ?: stale("legacy route fingerprint")
     if (!sameLeafRoute(legacy, profile)) stale("leaf")
-    if (binding.protocolId != MigrationProjection.protocol(profile.kind) ||
+    if (binding.protocolId != profile.protocol ||
       binding.carrierId != expectedCarrier(profile) || binding.serviceId != profile.remoteServiceId) stale("protocol/carrier/service")
     val host = currentGraph.hosts.singleOrNull { it.id == binding.hostBindingId } ?: stale("host")
     val source = currentGraph.sources.singleOrNull { it.id == host.sourceId } ?: stale("source")
@@ -83,7 +83,7 @@ internal object ConnectionRouteAdmission {
       runCatching { canonicalRemoteOrigin(saved.url) == canonicalRemoteOrigin(current.url) }.getOrDefault(false)
     } else saved.url == current.url
     return saved.id == current.id && MigrationProjection.sourceType(saved) == MigrationProjection.sourceType(current) &&
-      MigrationProjection.protocol(saved.kind) == MigrationProjection.protocol(current.kind) && sameEndpoint &&
+      saved.protocol == current.protocol && sameEndpoint &&
       saved.username.trim() == current.username.trim() && saved.allowCleartext == current.allowCleartext &&
       saved.dshAuth == current.dshAuth && saved.remoteHostId == current.remoteHostId &&
       saved.remoteHostFingerprint == current.remoteHostFingerprint && saved.sshHostId == current.sshHostId &&
@@ -114,7 +114,7 @@ internal fun createRoutedHarnessClient(
     ConnectionCarrierId.SSH_FORWARD -> (sshFactory ?: error("SSH carrier 尚未配置"))(profile, credentials)
     ConnectionCarrierId.DIRECT_HTTP -> when (route.protocolId) {
       HarnessProtocolId.OPENCODE_NATIVE -> OpenCodeApi(profile, credentials, callTimeoutSeconds)
-      HarnessProtocolId.CODEX_APP_SERVER -> error("Codex 需要 SSH 或 Remote 连接")
+      HarnessProtocolId.CODEX_APP_SERVER, HarnessProtocolId.ANTIGRAVITY_ACP -> error("此 Harness 需要 SSH 或 Remote 连接")
       HarnessProtocolId.DSH_TYPERT -> dshRegistry?.acquire(profile, credentials, callTimeoutSeconds, onCookie)
          ?: DshApi(profile, credentials, callTimeoutSeconds, onCookie)
     }

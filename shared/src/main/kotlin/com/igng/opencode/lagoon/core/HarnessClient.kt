@@ -289,6 +289,9 @@ interface HarnessClient {
 
   suspend fun modelCatalog(directory: String): List<ModelInfo>
 
+  /** Some protocols negotiate their model choices per session rather than per directory. */
+  suspend fun modelCatalogForSession(directory: String, session: Session?): List<ModelInfo> = modelCatalog(directory)
+
   /**
    * 可选的权限模式目录（DSH：`permissionPresets/catalog`）。空列表＝该 harness 没有这个概念，
    * 界面不显示选择器。
@@ -403,7 +406,7 @@ fun createHarnessClient(
   sshClientFactory: ((ServerProfile, ServerCredentials) -> HarnessClient)? = null,
   /** Explicit caller-isolated direct DSH sharing. Raw constructors/default acquisition stay independent. */
   dshRegistry: DshClientRegistry? = null
-): HarnessClient = if (profile.remoteHostId != null && profile.kind in setOf(ServerKind.OPENCODE, ServerKind.CODEX)) {
+): HarnessClient = if (profile.remoteHostId != null && profile.protocol in setOf(HarnessProtocolId.OPENCODE_NATIVE, HarnessProtocolId.CODEX_APP_SERVER, HarnessProtocolId.ANTIGRAVITY_ACP)) {
   require(profile.sshHostId == null) { "同一个绑定不能混合 SSH 与 Remote carrier" }
   (remoteBackend ?: throw IllegalStateException("Host 原生服务 backend 尚未配置")).client
 } else if (profile.sshHostId != null) {

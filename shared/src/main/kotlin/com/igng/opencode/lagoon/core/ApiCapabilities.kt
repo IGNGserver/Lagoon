@@ -50,7 +50,11 @@ data class ApiCapabilities(
   /** Native OpenCode metadata writes, only with this instance's compatible documented schema. */
   val openCodeProjectManagement: Boolean = false,
   /** All native inventory/create/delete/reconcile contracts must be documented together. */
-  val openCodeWorktreeManagement: Boolean = false
+  val openCodeWorktreeManagement: Boolean = false,
+  /** File browsing is separate from the agent's ability to use files itself. */
+  val fileBrowser: Boolean = true,
+  val fileSearch: Boolean = true,
+  val fileReferences: Boolean = true
 ) {
   fun supports(action: SessionAction) = action in actions
   companion object {

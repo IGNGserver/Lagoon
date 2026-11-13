@@ -13,7 +13,7 @@ internal data class DeleteSessionTarget(
       (!requireSelected || state.sessionId == sessionId) && state.sessions.any { it.id == sessionId }
   } == true
 
-  fun warning(): String = if (profile.kind == ServerKind.CODEX) {
+  fun warning(): String = if (profile.protocol == HarnessProtocolId.CODEX_APP_SERVER) {
     "此会话及其启动的子代理会话将从服务器永久删除，无法恢复。已有分叉可能阻止删除。"
   } else "会话消息将从服务器永久删除。"
 }

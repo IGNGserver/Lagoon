@@ -9,6 +9,8 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.igng.opencode.lagoon.core.ServerKind
+import com.igng.opencode.lagoon.core.ServerProfile
+import com.igng.opencode.lagoon.core.HarnessProtocolId
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 
@@ -16,8 +18,9 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
  * A compact harness marker for a session row, styled with HyperOS 4 continuous squircle and subtle border.
  */
 @Composable
-internal fun HarnessBadge(kind: ServerKind, modifier: Modifier = Modifier) {
-  val label = when (kind) {
+internal fun HarnessBadge(profile: ServerProfile, modifier: Modifier = Modifier) {
+  val kind = profile.kind
+  val label = if (profile.protocol == HarnessProtocolId.ANTIGRAVITY_ACP) "Antigravity" else when (kind) {
     ServerKind.OPENCODE -> "OpenCode"
     ServerKind.CODEX -> "Codex"
     ServerKind.DSH, ServerKind.DSH_REMOTE -> "DSH"

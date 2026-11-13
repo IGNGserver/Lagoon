@@ -36,7 +36,9 @@ data class ServerProfile(
   /** Ephemeral source/Host gate, applied only to runtime reads; never a saved leaf preference. */
   val parentEnabled: Boolean = true,
   /** Opaque Host-local native service locator. Generation is negotiated, never persisted as identity. */
-  val remoteServiceId: String? = null
+  val remoteServiceId: String? = null,
+  /** Explicit protocol for new harnesses; old profiles derive it from their compatibility kind. */
+  val protocolId: HarnessProtocolId? = null
 ) {
   init {
     if (remoteServiceId != null) {
@@ -44,8 +46,12 @@ data class ServerProfile(
       require(remoteServiceId.matches(Regex("[A-Za-z0-9][A-Za-z0-9._:-]{0,255}"))) { "原生 Remote 服务标识无效" }
     }
     require(kind != ServerKind.OPENCODE || remoteHostId == null || remoteServiceId != null) { "Remote OpenCode 必须指定原生服务" }
-    require(kind != ServerKind.CODEX || (sshHostId != null) != (remoteHostId != null)) { "Codex 必须绑定 SSH 或 Remote Host" }
+    require(protocol !in setOf(HarnessProtocolId.CODEX_APP_SERVER, HarnessProtocolId.ANTIGRAVITY_ACP) ||
+      (sshHostId != null) != (remoteHostId != null)) { "此 Harness 必须绑定 SSH 或 Remote Host" }
+    require(protocolId == null || protocolId == MigrationProjection.protocol(kind) ||
+      protocolId == HarnessProtocolId.ANTIGRAVITY_ACP && kind == ServerKind.CODEX) { "Harness 协议与兼容类型不一致" }
   }
+  val protocol: HarnessProtocolId get() = protocolId ?: MigrationProjection.protocol(kind)
   val effectiveEnabled: Boolean get() = enabled && parentEnabled
 }
 
