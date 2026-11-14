@@ -12,6 +12,13 @@ internal data class RemoteOAuthProvider(
   val qrStartUrl: String?
 )
 
+/** Capabilities + browser/QR providers discovered from `GET /api/v1/auth/oauth/providers`. */
+internal data class RemoteAuthCapabilities(
+  val providers: List<RemoteOAuthProvider>,
+  val devicePairing: Boolean = false,
+  val fragmentTicketQr: Boolean = false
+)
+
 /** A browser/QR sign-in attempt. The URL must be opened outside the app. */
 internal data class RemoteBrowserLogin(
   val qrId: String,

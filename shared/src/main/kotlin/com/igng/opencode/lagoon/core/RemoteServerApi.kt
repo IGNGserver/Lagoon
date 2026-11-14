@@ -41,29 +41,41 @@ internal class RemoteServerApi(address: String, allowCleartext: Boolean = false)
       if (error.status == 401) throw IOException("账号或密码不正确；请使用 DSH 远程中枢配置的账号与密码", error)
       throw error
     }
-    return RemoteAccount(requiredText(body, "account", 254), token(body, "token"), positiveLong(body, "expiresAt"))
+    return RemoteAccount(requiredText(body, "account", 320), token(body, "token"), positiveLong(body, "expiresAt"))
+  }
+
+  /** Browser/QR sign-in providers + server capabilities. A 404 means legacy email/password only. */
+  suspend fun authCapabilities(): RemoteAuthCapabilities {
+    val body = try { request("GET", "api/v1/auth/oauth/providers") }
+    catch (error: RemoteServerException) {
+      if (error.status == 404) return RemoteAuthCapabilities(emptyList(), devicePairing = false, fragmentTicketQr = false)
+      throw error
+    }
+    val caps = body.optJSONObject("capabilities")
+    val devicePairing = caps?.opt("devicePairing") == "dsh-pairing-v1"
+    val fragmentTicketQr = devicePairing && caps?.opt("devicePairingQr") == "fragment-ticket-v1"
+    val items = body.optJSONArray("items")
+    val providers = if (items == null) emptyList() else {
+      if (items.length() > 64) throw IOException("DSH Remote 登录方式过多")
+      val ids = HashSet<String>()
+      (0 until items.length()).mapNotNull { index ->
+        val item = items.optJSONObject(index) ?: return@mapNotNull null
+        val id = (item.opt("id") as? String)?.takeIf { it.matches(Regex("[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}")) } ?: return@mapNotNull null
+        val label = (item.opt("displayName") as? String)?.trim()?.takeIf { it.isNotEmpty() && it.length <= 128 } ?: return@mapNotNull null
+        val startRaw = (item.opt("startUrl") as? String) ?: return@mapNotNull null
+        val start = try { requireAuthEntryPath(startRaw) } catch (_: IOException) { return@mapNotNull null }
+        val qr = (item.opt("qrStartUrl") as? String)?.takeIf { it.isNotBlank() }?.let {
+          try { requireAuthEntryPath(it) } catch (_: IOException) { null }
+        }
+        if (!ids.add(id)) return@mapNotNull null
+        RemoteOAuthProvider(id, label, start, qr)
+      }
+    }
+    return RemoteAuthCapabilities(providers, devicePairing, fragmentTicketQr)
   }
 
   /** Browser/QR sign-in providers. A 404 means this Server only supports email/password. */
-  suspend fun oauthProviders(): List<RemoteOAuthProvider> {
-    val body = try { request("GET", "api/v1/auth/oauth/providers") }
-    catch (error: RemoteServerException) { if (error.status == 404) return emptyList() else throw error }
-    val items = body.optJSONArray("items") ?: return emptyList()
-    if (items.length() > 64) throw IOException("DSH Remote 登录方式过多")
-    val ids = HashSet<String>()
-    return (0 until items.length()).mapNotNull { index ->
-      val item = items.optJSONObject(index) ?: return@mapNotNull null
-      val id = (item.opt("id") as? String)?.takeIf { it.matches(Regex("[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}")) } ?: return@mapNotNull null
-      val label = (item.opt("displayName") as? String)?.trim()?.takeIf { it.isNotEmpty() && it.length <= 128 } ?: return@mapNotNull null
-      val startRaw = (item.opt("startUrl") as? String) ?: return@mapNotNull null
-      val start = try { requireAuthEntryPath(startRaw) } catch (_: IOException) { return@mapNotNull null }
-      val qr = (item.opt("qrStartUrl") as? String)?.takeIf { it.isNotBlank() }?.let {
-        try { requireAuthEntryPath(it) } catch (_: IOException) { null }
-      }
-      if (!ids.add(id)) return@mapNotNull null
-      RemoteOAuthProvider(id, label, start, qr)
-    }
-  }
+  suspend fun oauthProviders(): List<RemoteOAuthProvider> = authCapabilities().providers
 
   suspend fun startQrLogin(provider: RemoteOAuthProvider): RemoteBrowserLogin {
     val path = requireAuthEntryPath(provider.qrStartUrl ?: throw IOException("这个登录方式不支持浏览器登录"))
@@ -94,7 +106,7 @@ internal class RemoteServerApi(address: String, allowCleartext: Boolean = false)
   suspend fun accountMe(accountToken: String): String {
     if (!validToken(accountToken)) throw IOException("DSH Remote 账号凭据无效")
     val body = requestAt("GET", entryUrl("/api/v1/auth/me"), null, accountToken)
-    return requiredText(body, "account", 254)
+    return requiredText(body, "account", 320)
   }
 
   /** Revoke this device on the Server. A missing/expired token is not a local failure. */
@@ -180,6 +192,50 @@ internal class RemoteServerApi(address: String, allowCleartext: Boolean = false)
     return result
   }
 
+  /** Authoritative live presence check; returns null when an older Server does not expose `/presence`. */
+  suspend fun hostPresence(accessToken: String, deviceId: String): Boolean? {
+    require(validDeviceId(deviceId)) { "DSH Hub 设备 ID 无效" }
+    return try {
+      val body = request("GET", "api/v1/devices/$deviceId/presence", bearer = accessToken)
+      if (body.has("online")) body.optBoolean("online") else null
+    } catch (error: RemoteServerException) {
+      if (error.status == 404) null else throw error
+    }
+  }
+
+  /** Revoke only the pairing membership between this phone and [peerDeviceId]. */
+  suspend fun deleteMembership(accessToken: String, peerDeviceId: String) {
+    require(validToken(accessToken)) { "Remote 设备凭据无效" }
+    require(validDeviceId(peerDeviceId)) { "DSH Hub 设备 ID 无效" }
+    try {
+      request("DELETE", "api/v1/device-memberships/$peerDeviceId", bearer = accessToken)
+    } catch (error: RemoteServerException) {
+      if (error.status != 404) throw error
+    }
+  }
+
+  /**
+   * Sends exact caller-serialized UTF-8 JSON bytes (for `X-DSH-Pairing-Proof`, where SHA-256 must
+   * cover the exact transmitted octets rather than a re-serialized representation).
+   */
+  suspend fun postRawJson(
+    path: String,
+    rawJson: String,
+    headers: Map<String, String> = emptyMap()
+  ): JSONObject = withContext(Dispatchers.IO) {
+    val cleanPath = if (path.startsWith("/")) path else "/$path"
+    val url = sameOriginUrl(cleanPath)
+    val bytes = rawJson.toByteArray(Charsets.UTF_8)
+    require(bytes.size <= MAX_PAIRING_REQUEST_BYTES) { "配对请求体超过协议上限" }
+    val request = Request.Builder().url(url)
+      .header("Accept", "application/json")
+      .header("Cache-Control", "no-store")
+      .apply { headers.forEach { (k, v) -> header(k, v) } }
+      .post(bytes.toRequestBody("application/json; charset=utf-8".toMediaType()))
+      .build()
+    executeJson(request)
+  }
+
   private fun host(body: JSONObject, includeKey: Boolean): RemoteHost {
     val id = hostId(body)
     val key = if (includeKey) requiredText(body, "identityKey", 43).also {
@@ -221,6 +277,10 @@ internal class RemoteServerApi(address: String, allowCleartext: Boolean = false)
     val request = Request.Builder().url(url)
       .header("Accept", "application/json").apply { if (bearer != null) header("Authorization", "Bearer $bearer") }
       .method(method, body?.toString()?.toRequestBody("application/json; charset=utf-8".toMediaType())).build()
+    executeJson(request)
+  }
+
+  private fun executeJson(request: Request): JSONObject =
     http.newCall(request).execute().use { response ->
       val source = response.body?.source() ?: throw IOException("DSH Hub 返回空响应")
       if (source.request(MAX_RESPONSE_BYTES + 1)) throw IOException("DSH Hub 响应超过上限")
@@ -229,17 +289,15 @@ internal class RemoteServerApi(address: String, allowCleartext: Boolean = false)
         val error = runCatching { JSONObject(text).optJSONObject("error") }.getOrNull()
         val rawCode = (error?.opt("code") as? String)?.takeIf { it.matches(Regex("[A-Z0-9_]{1,80}")) }
         val validError = rawCode != null && error?.opt("message") is String && error.opt("retryable") is Boolean &&
-          (!error.has("details") || error.opt("details") is JSONObject)
+          (!error.has("details") || error.isNull("details") || error.opt("details") is JSONObject)
         throw RemoteServerException(response.code, rawCode.takeIf { validError },
           if (validError) error!!.optBoolean("retryable") else response.code in setOf(401, 403, 429) || response.code >= 500)
       }
-      try { JSONObject(text) } catch (_: Exception) { throw IOException("DSH Hub 返回无效 JSON") }
+      if (text.isBlank()) JSONObject()
+      else try { JSONObject(text) } catch (_: Exception) { throw IOException("DSH Hub 返回无效 JSON") }
     }
-  }
 
-  private fun tokenPair(body: JSONObject): RemoteTokenPair {
-    if (body.keys().asSequence().toSet() != setOf("accessToken", "accessTokenExpiresAt", "refreshToken", "refreshTokenExpiresAt"))
-      throw IOException("DSH Hub 设备凭据格式无效")
+  internal fun tokenPair(body: JSONObject): RemoteTokenPair {
     return RemoteTokenPair(token(body, "accessToken"), positiveLong(body, "accessTokenExpiresAt"),
       token(body, "refreshToken"), positiveLong(body, "refreshTokenExpiresAt"))
   }
@@ -264,6 +322,7 @@ internal class RemoteServerApi(address: String, allowCleartext: Boolean = false)
 
   companion object {
     private const val MAX_RESPONSE_BYTES = 2L * 1024 * 1024
+    private const val MAX_PAIRING_REQUEST_BYTES = 8192
     internal fun validToken(value: String): Boolean = value.toByteArray(Charsets.UTF_8).size in 16..8192 && value.all { it.code in 33..126 }
     internal fun validDeviceId(value: String): Boolean =
       value.matches(Regex("(?i)[0-9a-hjkmnp-tv-z]{26}")) ||
@@ -297,5 +356,8 @@ internal data class RemoteHost(val deviceId: String, val name: String, val platf
   val online: Boolean, val publicKey: String?, val clientVersion: String?, val harnessVersion: String?, val fingerprint: String? = null)
 internal class RemoteServerException(val status: Int, val code: String?, val retryable: Boolean) : IOException("DSH Hub 请求失败（HTTP $status${code?.let { ", $it" }.orEmpty()}）") {
   val isCredentialRejected: Boolean get() = status in setOf(401, 403) && code in setOf(
-    "AUTH_REQUIRED", "AUTH_INVALID", "TOKEN_EXPIRED", "DEVICE_REVOKED", "ACCOUNT_AUTH_REQUIRED")
+    "AUTH_REQUIRED", "AUTH_INVALID", "TOKEN_EXPIRED", "TOKEN_REUSED", "DEVICE_REVOKED", "ACCOUNT_AUTH_REQUIRED")
+  val isRecoverableTokenRejection: Boolean get() = status == 401 && code in setOf(
+    "TOKEN_EXPIRED", "AUTH_INVALID", "AUTH_REQUIRED")
+  val isDeviceRevoked: Boolean get() = status in setOf(401, 403) && code == "DEVICE_REVOKED"
 }

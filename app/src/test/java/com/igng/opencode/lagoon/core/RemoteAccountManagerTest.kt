@@ -151,4 +151,148 @@ class RemoteAccountManagerTest {
       assertEquals("Bearer $access", detail.getHeader("Authorization"))
     }
   }
+
+  @Test fun refreshPropagatesTransientErrorInsteadOfMaskingAsExpiredLogin() = runBlocking {
+    MockWebServer().use { mock ->
+      mock.start()
+      mock.enqueue(MockResponse().setBody(loginBody()))
+      mock.enqueue(MockResponse().setBody(accountDirectory()))
+      mock.enqueue(MockResponse().setBody(pair().toString()))
+      mock.enqueue(MockResponse().setResponseCode(502).setBody("""{"error":{"code":"UPSTREAM_DOWN","message":"bad gateway","retryable":true}}"""))
+
+      val manager = RemoteAccountManager(mock.url("/").toString(), true, "Lagoon · Pixel", "android", "1.0",
+        Devices(), Pins(), Catalog())
+      val host = manager.loginWithPassword("user@example.org", "pw").single()
+      assertTrue(manager.enroll(listOf(host), mapOf(hostId to host.meta.fingerprint!!)).failures.isEmpty())
+
+      val failure = runCatching { manager.refresh() }.exceptionOrNull()
+      assertTrue("Expected transient RemoteServerException, got $failure", failure is RemoteServerException)
+      assertFalse(failure?.message.orEmpty().contains("登录已失效"))
+    }
+  }
+
+  @Test fun refreshRecoversOn401TokenExpiredViaSingleRefreshAndRetry() = runBlocking {
+    MockWebServer().use { mock ->
+      mock.start()
+      val futureAccess = System.currentTimeMillis() + 3_600_000L
+      val futureRefresh = System.currentTimeMillis() + 86_400_000L
+      val initialPair = JSONObject().put("accessToken", access).put("accessTokenExpiresAt", futureAccess)
+        .put("refreshToken", refresh).put("refreshTokenExpiresAt", futureRefresh).toString()
+      val rotatedAccess = "rotated-access-token-456"
+      val rotatedRefresh = "rotated-refresh-token-456"
+      val rotatedPair = JSONObject().put("accessToken", rotatedAccess).put("accessTokenExpiresAt", futureAccess + 3_600_000L)
+        .put("refreshToken", rotatedRefresh).put("refreshTokenExpiresAt", futureRefresh).toString()
+
+      mock.enqueue(MockResponse().setBody(loginBody()))
+      mock.enqueue(MockResponse().setBody(accountDirectory()))
+      mock.enqueue(MockResponse().setBody(initialPair))
+      // 1) Initial /api/v1/devices rejects apparently-unexpired token with 401 TOKEN_EXPIRED
+      mock.enqueue(MockResponse().setResponseCode(401)
+        .setBody("""{"error":{"code":"TOKEN_EXPIRED","message":"expired","retryable":true,"details":null}}"""))
+      // 2) Reactive singleflight refresh succeeds
+      mock.enqueue(MockResponse().setBody(rotatedPair))
+      // 3) Retry succeeds with rotated bearer
+      mock.enqueue(MockResponse().setBody("""{"items":[{"deviceId":"$hostId","name":"Mac","platform":"darwin","role":"host","membershipId":"member","online":true}],"nextCursor":null}"""))
+      mock.enqueue(MockResponse().setBody("""{"deviceId":"$hostId","name":"Mac","platform":"darwin","role":"host","membershipId":"member","online":true,"identityKey":"$key"}"""))
+
+      val manager = RemoteAccountManager(mock.url("/").toString(), true, "Lagoon · Pixel", "android", "1.0",
+        Devices(), Pins(), Catalog())
+      val host = manager.loginWithPassword("user@example.org", "pw").single()
+      assertTrue(manager.enroll(listOf(host), mapOf(hostId to host.meta.fingerprint!!)).failures.isEmpty())
+
+      val refreshed = manager.refresh()
+      assertEquals(hostId, refreshed.hosts.single().hostId)
+
+      mock.takeRequest() // login
+      mock.takeRequest() // account/devices
+      mock.takeRequest() // register
+      assertEquals("/api/v1/devices", mock.takeRequest().path)
+      assertEquals("/api/v1/auth/refresh", mock.takeRequest().path)
+      val retriedList = mock.takeRequest()
+      assertEquals("/api/v1/devices", retriedList.path)
+      assertEquals("Bearer $rotatedAccess", retriedList.getHeader("Authorization"))
+    }
+  }
+
+  @Test fun reEnrollRetainsPinnedTrustAndRepairsInvalidatedHostSlot() = runBlocking {
+    MockWebServer().use { mock ->
+      mock.start()
+      val host2Id = "b1c2d3e4-f5a6-47b8-89c0-1d2e3f4a5b6c"
+      val key2 = Base64.getUrlEncoder().withoutPadding().encodeToString(ByteArray(32) { (it + 21).toByte() })
+      val twoHostDir = """{"items":[
+        {"deviceId":"$hostId","name":"Mac1","platform":"darwin","role":"host","membershipId":"m1","online":true,"identityKey":"$key"},
+        {"deviceId":"$host2Id","name":"Mac2","platform":"linux","role":"host","membershipId":"m2","online":true,"identityKey":"$key2"}
+      ]}"""
+      val origin = mock.url("/").toString()
+      val futureAccess = System.currentTimeMillis() + 3_600_000L
+      val futureRefresh = System.currentTimeMillis() + 30L * 86_400_000L
+      val validPairJson = JSONObject().put("accessToken", access).put("accessTokenExpiresAt", futureAccess)
+        .put("refreshToken", refresh).put("refreshTokenExpiresAt", futureRefresh).toString()
+      val devices = Devices()
+      val pins = Pins()
+      val catalogs = Catalog()
+      val manager = RemoteAccountManager(origin, true, "Lagoon · Pixel", "android", "1.0", devices, pins, catalogs)
+
+      // Initial enroll of both hosts
+      mock.enqueue(MockResponse().setBody(loginBody()))
+      mock.enqueue(MockResponse().setBody(twoHostDir))
+      mock.enqueue(MockResponse().setBody(validPairJson))
+      mock.enqueue(MockResponse().setBody(validPairJson))
+      val initialCandidates = manager.loginWithPassword("user@example.org", "pw")
+      val initialEnroll = manager.enroll(
+        initialCandidates,
+        initialCandidates.associate { it.hostId to it.meta.fingerprint!! },
+      )
+      assertTrue(initialEnroll.failures.isEmpty())
+
+      // Mark host2's device slot as invalidated
+      val slot2 = scopedRemoteDeviceSlot(origin, "user@example.org", host2Id)
+      val broken2 = devices.load(slot2)!!
+      devices.save(slot2, RemoteDeviceRecord(origin, "user@example.org", broken2.identity, broken2.tokens, invalidated = true))
+
+      // Re-login and explicitly enroll ONLY host1 -> host2 remains PINNED and gets silently repaired!
+      val repairedAccess = "repaired-access-token-789"
+      val repairedPairJson = JSONObject().put("accessToken", repairedAccess).put("accessTokenExpiresAt", futureAccess)
+        .put("refreshToken", "repaired-refresh-789").put("refreshTokenExpiresAt", futureRefresh).toString()
+      mock.enqueue(MockResponse().setBody(loginBody()))
+      mock.enqueue(MockResponse().setBody(twoHostDir))
+      mock.enqueue(MockResponse().setBody(validPairJson))
+      mock.enqueue(MockResponse().setBody(repairedPairJson))
+
+      val secondCandidates = manager.loginWithPassword("user@example.org", "pw")
+      val onlyHost1 = secondCandidates.filter { it.hostId == hostId }
+      val secondEnroll = manager.enroll(onlyHost1, mapOf(hostId to onlyHost1.single().meta.fingerprint!!))
+      assertTrue(secondEnroll.failures.isEmpty())
+      assertEquals(2, secondEnroll.catalog.hosts.size)
+      assertTrue(secondEnroll.catalog.hosts.all { it.trust == RemoteTrustState.PINNED })
+
+      val restored2 = devices.load(slot2)!!
+      assertFalse(restored2.invalidated)
+      assertEquals(repairedAccess, restored2.tokens?.accessToken)
+    }
+  }
+
+  @Test fun adoptPairingPinsHostSavesDeviceCredentialsAndSetsPairingProvider() = runBlocking {
+    val origin = "https://dsh.r2049.cn/"
+    val pairingAccount = "dsh-device:019a0000-0000-7000-8000-000000000099"
+    val devices = Devices()
+    val pins = Pins()
+    val catalogs = Catalog()
+    val manager = RemoteAccountManager(origin, false, "Lagoon · Pixel", "android", "1.0", devices, pins, catalogs)
+    val host = RemoteHost(hostId, "Desk", "linux", "pairing", online = true, publicKey = key, clientVersion = null, harnessVersion = "0.6.4")
+    val mobileIdentity = RemoteIdentity.generate()
+    val tokens = RemoteTokenPair(access, 1_900_000_000_000L, refresh, 1_900_000_001_000L)
+
+    val catalog = manager.adoptPairing(host, pairingAccount, mobileIdentity, tokens)
+    assertEquals("pairing", catalog.provider)
+    assertEquals(pairingAccount, catalog.account)
+    assertFalse(catalog.signedOut)
+    assertEquals(RemoteTrustState.PINNED, catalog.hosts.single().trust)
+    assertEquals(key, pins.pinned(RemotePeerScope(origin, pairingAccount, hostId)))
+
+    val saved = devices.load(scopedRemoteDeviceSlot(origin, pairingAccount, hostId))!!
+    assertFalse(saved.invalidated)
+    assertEquals(mobileIdentity.deviceId, saved.identity.deviceId)
+    assertEquals(access, saved.tokens?.accessToken)
+  }
 }

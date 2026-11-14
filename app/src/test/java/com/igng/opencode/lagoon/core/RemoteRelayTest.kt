@@ -4,7 +4,11 @@ import com.southernstorm.noise.protocol.HandshakeState
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.Protocol
+import okhttp3.Request
 import okhttp3.Response
+import okhttp3.ResponseBody.Companion.toResponseBody
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import okhttp3.mockwebserver.MockResponse
@@ -13,6 +17,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.*
 import org.junit.Test
+import java.io.IOException
 import java.util.Base64
 import java.util.UUID
 
@@ -132,5 +137,54 @@ class RemoteRelayTest {
         assertFalse(hostFailure.isCompleted)
       } finally { relay.close(); responder.destroy() }
     }
+  }
+
+  @Test fun wsCloseAndUpgradeClassifiersMapUpstreamCodes() {
+    val replaced = classifyRemoteWsClose(4003, "") as RemoteControlException
+    assertEquals("CONNECTION_REPLACED", replaced.code)
+    assertFalse(replaced.retryable)
+
+    val consumer = classifyRemoteWsClose(4008, "too slow") as RemoteControlException
+    assertEquals("SLOW_CONSUMER", consumer.code)
+    assertTrue(consumer.retryable)
+
+    val shutdown = classifyRemoteWsClose(1012, "Service restart") as RemoteControlException
+    assertEquals("SERVER_SHUTDOWN", shutdown.code)
+    assertTrue(shutdown.retryable)
+
+    val heartbeat = classifyRemoteWsClose(1006, "heartbeat timeout") as RemoteControlException
+    assertEquals("HEARTBEAT_TIMEOUT", heartbeat.code)
+    assertTrue(heartbeat.retryable)
+
+    val revoked = classifyRemoteWsClose(4001, "DEVICE_REVOKED") as RemoteControlException
+    assertEquals("DEVICE_REVOKED", revoked.code)
+    assertFalse(revoked.retryable)
+
+    val expired = classifyRemoteWsClose(4001, "TOKEN_EXPIRED") as RemoteControlException
+    assertEquals("TOKEN_EXPIRED", expired.code)
+    assertFalse(expired.retryable)
+
+    val req = Request.Builder().url("https://hub.example/ws").build()
+    val json401 = Response.Builder().request(req).protocol(Protocol.HTTP_1_1).code(401).message("Unauthorized")
+      .body("""{"error":{"code":"TOKEN_EXPIRED","message":"expired"}}""".toResponseBody("application/json".toMediaType()))
+      .build()
+    val classifiedJson401 = classifyRemoteWsUpgradeFailure(json401, IOException("upgrade")) as RemoteControlException
+    assertEquals("TOKEN_EXPIRED", classifiedJson401.code)
+
+    val plain401 = Response.Builder().request(req).protocol(Protocol.HTTP_1_1).code(401).message("Unauthorized")
+      .body("Unauthorized".toResponseBody("text/plain".toMediaType()))
+      .build()
+    val classifiedPlain401 = classifyRemoteWsUpgradeFailure(plain401, IOException("upgrade")) as RemoteControlException
+    assertEquals("AUTH_INVALID", classifiedPlain401.code)
+
+    val json403Revoked = Response.Builder().request(req).protocol(Protocol.HTTP_1_1).code(403).message("Forbidden")
+      .body("""{"error":{"code":"DEVICE_REVOKED","message":"revoked"}}""".toResponseBody("application/json".toMediaType()))
+      .build()
+    val classified403 = classifyRemoteWsUpgradeFailure(json403Revoked, IOException("upgrade")) as RemoteControlException
+    assertEquals("DEVICE_REVOKED", classified403.code)
+
+    val plain502 = Response.Builder().request(req).protocol(Protocol.HTTP_1_1).code(502).message("Bad Gateway").build()
+    val classified502 = classifyRemoteWsUpgradeFailure(plain502, IOException("bad gateway"))
+    assertFalse(classified502 is RemoteControlException)
   }
 }

@@ -69,7 +69,7 @@ internal object RemoteCatalogCodec {
       if (json.optInt("version") != 1) throw IOException("Remote 主机目录版本无效")
       val origin = canonicalRemoteOrigin(json.getString("origin"))
       val account = json.getString("account").also {
-        if (it.isBlank() || it.length > 254 || '\u0000' in it) throw IOException("Remote 主机目录账号无效")
+        if (it.isBlank() || it.length > 320 || '\u0000' in it) throw IOException("Remote 主机目录账号无效")
       }
       val provider = (json.opt("provider") as? String)?.takeIf { it.length <= 64 }
       val label = json.getString("deviceLabel").also { if (it.isBlank() || it.length > 128) throw IOException("Remote 设备名称无效") }

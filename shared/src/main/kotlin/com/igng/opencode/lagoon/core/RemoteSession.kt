@@ -119,7 +119,26 @@ internal class RemoteSession(
 
   private suspend fun ensure(): Active = mutex.withLock {
     if (closed) { publishClosed(); throw IOException("Remote 会话已关闭") }
-    active?.takeUnless { it.connection.isClosed }?.let { return@withLock it }
+    active?.takeUnless { it.connection.isClosed }?.let { current ->
+      val idleMillis = System.currentTimeMillis() - current.connection.lastTrafficAt
+      if (idleMillis <= IDLE_PROBE_AFTER_MILLIS) return@withLock current
+      val healthy = try {
+        kotlinx.coroutines.withTimeout(IDLE_PROBE_TIMEOUT_MILLIS) {
+          current.connection.call("harness.transport.describe", JSONObject(), IDLE_PROBE_TIMEOUT_MILLIS)
+        }
+        true
+      } catch (cancel: kotlinx.coroutines.CancellationException) {
+        throw cancel
+      } catch (_: Exception) {
+        false
+      }
+      if (healthy && !closed && !current.connection.isClosed) return@withLock current
+      current.agy.close()
+      current.codex.close()
+      current.nativeServices.close()
+      current.gateway.close()
+      current.connection.close()
+    }
     active?.nativeServices?.close()
     active?.codex?.close()
     active?.agy?.close()
@@ -141,9 +160,33 @@ internal class RemoteSession(
     }
   }
 
+  private suspend fun refreshRejectedOrThrow(
+    api: RemoteServerApi,
+    rejectedToken: String,
+    originalError: Throwable
+  ): RemoteDeviceRecord {
+    return try {
+      devices.refreshAfterRejected(rejectedToken) { id, refresh -> api.refresh(id, refresh) }
+    } catch (cancel: kotlinx.coroutines.CancellationException) {
+      throw cancel
+    } catch (refreshError: RemoteServerException) {
+      throw remoteServerFailure(refreshError)
+    } catch (refreshError: Exception) {
+      val message = refreshError.message?.takeIf { it.isNotBlank() }
+        ?: originalError.message?.takeIf { it.isNotBlank() }
+        ?: "DSH Remote 登录已失效，请重新登录"
+      val requiresLogin = message.contains("重新登录") || message.contains("尚未注册") ||
+        message.contains("已过期") || message.contains("设备资料损坏")
+      throw RemoteFailureException(
+        if (requiresLogin) RemoteFailureKind.AUTH_REQUIRED else RemoteFailureKind.NETWORK,
+        message, retryable = !requiresLogin, cause = refreshError
+      )
+    }
+  }
+
   private suspend fun connectLocked(attempt: Int): Active {
     val api = RemoteServerApi(address, allowCleartext)
-    val device = try { devices.access { id, token -> api.refresh(id, token) } }
+    var device = try { devices.access { id, token -> api.refresh(id, token) } }
     catch (error: RemoteFailureException) { throw error }
     catch (error: RemoteServerException) { throw remoteServerFailure(error) }
     catch (error: Exception) {
@@ -155,11 +198,23 @@ internal class RemoteSession(
         if (requiresLogin) RemoteFailureKind.AUTH_REQUIRED else RemoteFailureKind.NETWORK,
         message, retryable = !requiresLogin, cause = error)
     }
-    val token = device.tokens?.accessToken ?: throw RemoteFailureException(RemoteFailureKind.AUTH_REQUIRED, "Remote 设备尚未注册", retryable = false)
+    var token = device.tokens?.accessToken ?: throw RemoteFailureException(RemoteFailureKind.AUTH_REQUIRED, "Remote 设备尚未注册", retryable = false)
+    var reactiveRefreshUsed = false
     statusFlow.value = statusFlow.value.copy(phase = RemotePhase.CONNECTING)
-    val host = try { api.host(token, hostId) }
-    catch (error: RemoteServerException) { throw remoteServerFailure(error) }
-    if (!host.online) throw RemoteFailureException(RemoteFailureKind.OFFLINE, "主机现在不在线", retryable = true)
+    val host = try {
+      api.host(token, hostId)
+    } catch (error: RemoteServerException) {
+      if (!error.isRecoverableTokenRejection) throw remoteServerFailure(error)
+      reactiveRefreshUsed = true
+      device = refreshRejectedOrThrow(api, token, error)
+      token = device.tokens?.accessToken ?: throw RemoteFailureException(RemoteFailureKind.AUTH_REQUIRED, "Remote 设备尚未注册", retryable = false)
+      try { api.host(token, hostId) }
+      catch (retryError: RemoteServerException) { throw remoteServerFailure(retryError) }
+    }
+    val hostOnline = if (host.online) true else {
+      runCatching { api.hostPresence(token, hostId) }.getOrNull() ?: false
+    }
+    if (!hostOnline) throw RemoteFailureException(RemoteFailureKind.OFFLINE, "主机现在不在线", retryable = true)
     val scope = RemotePeerScope(canonicalRemoteOrigin(address), account, hostId)
     val key = try { trust.verify(scope, host) }
     catch (error: RemoteTrustException) {
@@ -170,19 +225,33 @@ internal class RemoteSession(
     var nativeServices: RemoteNativeServices? = null
     var codex: RemoteCodexRegistry? = null
     var agy: RemoteAgyRegistry? = null
+    val dispatchEvent: (JSONObject) -> Unit = {
+      if (it.optString("event").startsWith("codex.app.")) {
+        (codex ?: throw IOException("Codex 事件早于能力协商")).event(it)
+      } else if (it.optString("event").startsWith("agent.acp.")) {
+        (agy ?: throw IOException("AGY 事件早于能力协商")).event(it)
+      } else if (it.optString("event") == "harness.services.frame") {
+        (nativeServices ?: throw IOException("原生服务事件早于能力协商")).event(it)
+      } else (gateway ?: throw IOException("Remote 事件早于能力协商")).event(it)
+    }
     statusFlow.value = statusFlow.value.copy(phase = RemotePhase.HANDSHAKING)
+    var activeToken = token
     val connection = try {
-      RemoteConnection.connect(address, device.identity, token, host, key, allowCleartext, clientVersion) {
-        if (it.optString("event").startsWith("codex.app.")) {
-          (codex ?: throw IOException("Codex 事件早于能力协商")).event(it)
-        } else if (it.optString("event").startsWith("agent.acp.")) {
-          (agy ?: throw IOException("AGY 事件早于能力协商")).event(it)
-        } else if (it.optString("event") == "harness.services.frame") {
-          (nativeServices ?: throw IOException("原生服务事件早于能力协商")).event(it)
-        } else (gateway ?: throw IOException("Remote 事件早于能力协商")).event(it)
-      }
+      RemoteConnection.connect(address, device.identity, activeToken, host, key, allowCleartext, clientVersion, dispatchEvent)
     } catch (error: RemoteControlException) {
-      throw remoteControlFailure(error)
+      if (reactiveRefreshUsed || error.code !in setOf("TOKEN_EXPIRED", "AUTH_INVALID")) {
+        throw remoteControlFailure(error)
+      }
+      reactiveRefreshUsed = true
+      device = refreshRejectedOrThrow(api, activeToken, error)
+      activeToken = device.tokens?.accessToken ?: throw RemoteFailureException(RemoteFailureKind.AUTH_REQUIRED, "Remote 设备尚未注册", retryable = false)
+      try {
+        RemoteConnection.connect(address, device.identity, activeToken, host, key, allowCleartext, clientVersion, dispatchEvent)
+      } catch (retryError: RemoteControlException) {
+        throw remoteControlFailure(retryError)
+      } catch (retryError: Exception) {
+        throw RemoteFailureException(RemoteFailureKind.NETWORK, "没能建立加密中继：${detail(retryError)}", retryable = true, cause = retryError)
+      }
     } catch (error: Exception) {
       throw RemoteFailureException(RemoteFailureKind.NETWORK, "没能建立加密中继：${detail(error)}", retryable = true, cause = error)
     }
@@ -214,14 +283,30 @@ internal class RemoteSession(
           relayAssignment = connection.relayAttached, capabilities = capabilities.capabilities,
           lastError = null)
         SharedHttp.ioScope.launch {
-          connection.awaitClosed()
+          val closeCause = connection.awaitClosed()
           nextAgy.close()
           nextCodex.close()
           nextNative.close()
           nextGateway.close()
           if (!closed && active?.connection === connection) {
-            statusFlow.value = statusFlow.value.copy(phase = RemotePhase.FAILED, readyAt = 0,
-              lastError = RemoteFailureSnapshot(RemoteFailureKind.NETWORK, "加密中继已断开", retryable = true))
+            val snapshot = when {
+              closeCause is RemoteControlException && closeCause.code in setOf("TOKEN_EXPIRED", "AUTH_INVALID") -> {
+                val refreshed = runCatching {
+                  devices.refreshAfterRejected(activeToken) { id, rt -> api.refresh(id, rt) }
+                }.isSuccess
+                if (refreshed) {
+                  RemoteFailureSnapshot(RemoteFailureKind.NETWORK, "访问令牌已自动续期，正在重连", retryable = true, closeCause.code)
+                } else {
+                  RemoteFailureSnapshot(RemoteFailureKind.AUTH_REQUIRED, "DSH Remote 凭据已失效，请重新登录", retryable = false, closeCause.code)
+                }
+              }
+              closeCause is RemoteControlException -> {
+                val mapped = remoteControlFailure(closeCause)
+                RemoteFailureSnapshot(mapped.kind, mapped.message ?: "加密中继已断开", mapped.retryable, closeCause.code)
+              }
+              else -> RemoteFailureSnapshot(RemoteFailureKind.NETWORK, "加密中继已断开", retryable = true)
+            }
+            statusFlow.value = statusFlow.value.copy(phase = RemotePhase.FAILED, readyAt = 0, lastError = snapshot)
           }
         }
       }
@@ -247,6 +332,8 @@ internal class RemoteSession(
   private companion object {
     /** Reuse one failed connect for this long instead of starting another handshake per caller. */
     const val FAILURE_REUSE_MILLIS = 2_000L
+    const val IDLE_PROBE_AFTER_MILLIS = 45_000L
+    const val IDLE_PROBE_TIMEOUT_MILLIS = 5_000L
   }
 
   private fun publishClosed() {

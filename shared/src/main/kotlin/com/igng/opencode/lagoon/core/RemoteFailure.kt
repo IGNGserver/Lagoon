@@ -53,11 +53,15 @@ internal fun remoteFailure(error: Throwable): RemoteFailureException? =
 internal fun remoteControlFailure(error: RemoteControlException): RemoteFailureException = when (error.code) {
   "CONNECTION_REPLACED" -> RemoteFailureException(RemoteFailureKind.CONNECTION_REPLACED, "另一实例正在使用这台设备身份", retryable = false, cause = error)
   "SLOW_CONSUMER" -> RemoteFailureException(RemoteFailureKind.SLOW_CONSUMER, "Relay 消费过慢，正在降低流量并重连", retryable = true, cause = error)
-  "TOKEN_EXPIRED", "AUTH_INVALID", "DEVICE_REVOKED" -> RemoteFailureException(RemoteFailureKind.AUTH_REQUIRED, "DSH Remote 凭据已失效，请重新登录", retryable = false, cause = error)
+  "DEVICE_REVOKED" -> RemoteFailureException(RemoteFailureKind.DEVICE_REVOKED, "此手机的远程设备授权已被撤销，请重新登录或重新配对", retryable = false, cause = error)
+  "SERVER_SHUTDOWN" -> RemoteFailureException(RemoteFailureKind.NETWORK, "DSH 远程中枢正在重启，正在重连", retryable = true, cause = error)
+  "HEARTBEAT_TIMEOUT" -> RemoteFailureException(RemoteFailureKind.NETWORK, "DSH 远程中枢心跳超时，正在重连", retryable = true, cause = error)
+  "TOKEN_EXPIRED", "AUTH_INVALID" -> RemoteFailureException(RemoteFailureKind.AUTH_REQUIRED, "DSH Remote 凭据已失效，请重新登录", retryable = false, cause = error)
   else -> RemoteFailureException(RemoteFailureKind.NETWORK, error.message ?: "DSH Remote 连接失败", retryable = error.retryable, cause = error)
 }
 
 internal fun remoteServerFailure(error: RemoteServerException): RemoteFailureException = when {
+  error.isDeviceRevoked -> RemoteFailureException(RemoteFailureKind.DEVICE_REVOKED, "此手机的远程设备授权已被撤销，请重新登录或重新配对", retryable = false, cause = error)
   error.isCredentialRejected -> RemoteFailureException(RemoteFailureKind.AUTH_REQUIRED, "DSH Remote 登录已失效", retryable = false, cause = error)
   error.status == 401 || (error.status == 403 && error.code == null) -> RemoteFailureException(RemoteFailureKind.NETWORK, "DSH Remote 授权服务暂时不可用，已保留凭据", retryable = true, cause = error)
   error.status == 403 -> RemoteFailureException(RemoteFailureKind.REJECTED, "主机拒绝了这台手机", retryable = false, cause = error)

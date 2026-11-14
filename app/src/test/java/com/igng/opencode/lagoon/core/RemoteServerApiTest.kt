@@ -96,11 +96,42 @@ class RemoteServerApiTest {
 
   @Test fun malformedTokenAndWrongHostFailClosed() = server { mock, api ->
     mock.enqueue(MockResponse().setBody(pair().put("unexpected", true).toString()))
+    val tolerated = api.refresh(id, refresh)
+    assertEquals(access, tolerated.accessToken)
+    val missingRequired = pair().apply { remove("refreshToken") }
+    mock.enqueue(MockResponse().setBody(missingRequired.toString()))
     try { api.refresh(id, refresh); fail("expected failure") } catch (_: IOException) { }
     mock.enqueue(MockResponse().setBody("""{"deviceId":"$id","name":"Host","platform":"linux","role":"host","membershipId":"member","identityKey":"$key"}"""))
     try { api.host(access, hostId); fail("expected failure") } catch (_: IOException) { }
     mock.enqueue(MockResponse().setBody("""{"deviceId":"$hostId","name":"Host","platform":"linux","role":"host","membershipId":"member","identityKey":"${key.dropLast(1)}!"}"""))
     try { api.host(access, hostId); fail("expected failure") } catch (_: IOException) { }
+  }
+
+  @Test fun errorDetailsNullPreservesCodeAndAuthCapabilitiesParsesPairingFlags() = server { mock, api ->
+    mock.enqueue(MockResponse().setResponseCode(401)
+      .setBody("""{"error":{"code":"TOKEN_EXPIRED","message":"expired","retryable":true,"details":null}}"""))
+    val err = try {
+      api.host(access, hostId)
+      throw AssertionError("expected 401")
+    } catch (e: RemoteServerException) {
+      e
+    }
+    assertEquals(401, err.status)
+    assertEquals("TOKEN_EXPIRED", err.code)
+    assertTrue(err.isRecoverableTokenRejection)
+    assertTrue(err.isCredentialRejected)
+
+    mock.enqueue(MockResponse().setBody(
+      """{"capabilities":{"devicePairing":"dsh-pairing-v1","devicePairingQr":"fragment-ticket-v1"},"items":[]}""",
+    ))
+    val caps = api.authCapabilities()
+    assertTrue(caps.devicePairing)
+    assertTrue(caps.fragmentTicketQr)
+
+    mock.enqueue(MockResponse().setResponseCode(404))
+    val missingCaps = api.authCapabilities()
+    assertFalse(missingCaps.devicePairing)
+    assertFalse(missingCaps.fragmentTicketQr)
   }
 
   @Test fun rejectsCredentialLeakAndUnapprovedCleartextTargets() {

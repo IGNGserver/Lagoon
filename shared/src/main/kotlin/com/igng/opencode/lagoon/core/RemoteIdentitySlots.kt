@@ -13,7 +13,7 @@ internal object RemoteIdentitySlots {
   fun scoped(origin: String, account: String, hostId: String): String {
     val canonicalOrigin = canonicalRemoteOrigin(origin)
     val normalizedAccount = account.trim().also {
-      require(it.isNotBlank() && it.length <= 254 && '\u0000' !in it) { "Remote 账号无效" }
+      require(it.isNotBlank() && it.length <= 320 && '\u0000' !in it) { "Remote 账号无效" }
     }
     require(RemoteServerApi.validDeviceId(hostId)) { "Remote Host ID 无效" }
     val input = "$canonicalOrigin\u0000$normalizedAccount\u0000$hostId".toByteArray(Charsets.UTF_8)

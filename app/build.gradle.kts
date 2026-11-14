@@ -102,6 +102,12 @@ dependencies {
   implementation("io.github.kyant0:shapes-android:1.2.0")
   implementation("top.yukonga.miuix.kmp:miuix-android:0.8.8")
   implementation("top.yukonga.miuix.kmp:miuix-icons-android:0.8.8")
+  // CameraX + ZXing pure-Kotlin QR decode for DSH Remote Scan-to-Pair v1.
+  implementation("androidx.camera:camera-core:1.4.1")
+  implementation("androidx.camera:camera-camera2:1.4.1")
+  implementation("androidx.camera:camera-lifecycle:1.4.1")
+  implementation("androidx.camera:camera-view:1.4.1")
+  implementation("com.google.zxing:core:3.5.3")
   testImplementation("junit:junit:4.13.2")
   testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
   testImplementation("org.json:json:20240303")

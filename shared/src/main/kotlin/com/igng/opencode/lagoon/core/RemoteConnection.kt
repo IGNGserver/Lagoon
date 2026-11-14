@@ -18,14 +18,15 @@ internal class RemoteConnection private constructor(
     onMessage = { bytes ->
       try { rpc.receive(JSONObject(String(bytes, Charsets.UTF_8))) }
       catch (_: Exception) { close() }
-    }, onClose = { rpc.close(); closed.complete(Unit) }, clientVersion = clientVersion)
+    }, onClose = { error -> rpc.close(); closed.complete(error) }, clientVersion = clientVersion)
   private val rpc: RemoteRpc = RemoteRpc(relay, onEvent = onEvent)
-  private val closed = kotlinx.coroutines.CompletableDeferred<Unit>()
+  private val closed = kotlinx.coroutines.CompletableDeferred<IOException>()
   val isClosed: Boolean get() = closed.isCompleted
   internal val serverVersion: String? get() = relay.serverVersion
   internal val negotiatedCapabilities: Set<String> get() = relay.negotiatedCapabilities
   internal val transport: String get() = relay.transport
   internal val relayAttached: Boolean get() = relay.relayAttached
+  internal val lastTrafficAt: Long get() = relay.lastTrafficAt
 
   suspend fun call(method: String, params: JSONObject, timeoutMillis: Long = 30_000): Any? = rpc.call(method, params, timeoutMillis)
 
@@ -36,7 +37,7 @@ internal class RemoteConnection private constructor(
   }
 
   override fun close() = rpc.close()
-  suspend fun awaitClosed() = closed.await()
+  suspend fun awaitClosed(): IOException = closed.await()
 
   companion object {
     suspend fun connect(address: String, identity: RemoteIdentity, token: String, host: RemoteHost,

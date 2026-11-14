@@ -4,7 +4,7 @@
 
 ## 现状
 
-- Lagoon 的 DSH Remote 固定走 Host 的 Relay：`/api/v1/remote/connect` + Control WebSocket，传输帧由 Relay 转发。
+- Lagoon 的 DSH Remote 当前固定走 Host 的 Relay：`/api/v1/remote/connect` + Control WebSocket（含握手期/关闭帧结构化错误分类与 45s 加密空闲探活），传输帧由 Relay 转发。
 - 协议里没有 ICE/STUN/TURN 候选、SDP、DTLS 指纹或 WebRTC 信令端点；客户端无法自行把 Relay 连接“升级”为 P2P。
 - Host 端是 `dsh-remote` 插件（`ds-harness-remote`），需要同时增加：
   1. 能力标记（例如 `remote.transport.webrtc.v1`）；
