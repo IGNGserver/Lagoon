@@ -290,9 +290,10 @@ internal class RemoteGateway(private val transferFrames: Boolean = false, privat
 
   private companion object {
     /**
-     * 单条 Host 连接允许同时存在的逻辑流上限。它是兜底而不是配额：正常预算应为
-     * 1 条 `$events` + 1 条 `workspace/follow` + 最多 [DshApi.WATCH_LIMIT] 条 `session/follow`
-     * + 1 条 `job/follow` + 少量 `job/list`。16 太贴近上限，首页刷新或快照重试就会越界。
+     * 单条 Host 连接允许同时存在的逻辑流上限，对齐官方 `ds-harness-remote` v0.6.5+ Host 每对等方
+     * 16 条流的硬限制；正常预算为 1 条 `$events` + 1 条 `workspace/follow` + 最多
+     * [DshApi.REMOTE_WATCH_LIMIT]（8）条 `session/follow` + 最多 [DshApi.JOB_FOLLOW_CONCURRENCY]（2）条
+     * `job/follow` + 最多 2 条 `oneShotStreams` = 14 <= 16。
      */
     const val MAX_STREAMS = 16
     const val DIRECT_LIMIT = 2 * 1024 * 1024

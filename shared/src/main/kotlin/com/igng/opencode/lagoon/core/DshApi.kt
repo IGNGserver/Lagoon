@@ -275,6 +275,9 @@ class DshApi(
    * 每条 `job/list` 都是一条流；不限流会和 `$events`/`session/follow` 抢预算。
    */
   private val oneShotStreams = Semaphore(2)
+  /** 后台 `job/follow` 并发闸门，避免多条作业输出流占满 Remote 16 条流预算而饿死核心流。 */
+  private val jobFollowStreams = Semaphore(JOB_FOLLOW_CONCURRENCY)
+  private val watchLimit: Int get() = if (remoteBackend != null) REMOTE_WATCH_LIMIT else WATCH_LIMIT
   /**
    * 实时事件不是耐久日志，没有可供跨流去重的稳定 ID。每次实际发射都使用单调序号；
    * 时间戳只能当消息时间，不能当身份（同毫秒可能有多个 chunk，重试的 reset 也必须重新投递）。
@@ -2029,7 +2032,9 @@ class DshApi(
           return@collect
         }
         contentJob = launch {
-          val workspace = launch { runWorkspaceLoop { ended.get() || isClosed } }
+          val workspace = launch(start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) {
+            runWorkspaceLoop { ended.get() || isClosed }
+          }
           try {
             synchronized(watched) { watched.toList() }.forEach(::startFollow)
             awaitCancellation()
@@ -2127,6 +2132,11 @@ class DshApi(
           Diagnostics.warn("DshApi", "\$events 不被当前主机支持，停止重试：${eventsError}")
           break
         }
+        if (isStreamLimitOrRateLimited(cause) && releaseFollowForRetry("")) {
+          backoff = EVENTS_RETRY_MIN_MILLIS
+          delay(STREAM_LIMIT_RETRY_DELAY_MILLIS)
+          continue
+        }
         Diagnostics.warn("DshApi", "\$events 断开，准备重连：${eventsError}")
       } catch (cancel: CancellationException) {
         throw cancel
@@ -2140,6 +2150,11 @@ class DshApi(
         if (isNonRetryableEventsError(error)) {
           Diagnostics.warn("DshApi", "\$events 建立失败且不可重试，停止重试", error)
           break
+        }
+        if (isStreamLimitOrRateLimited(error) && releaseFollowForRetry("")) {
+          backoff = EVENTS_RETRY_MIN_MILLIS
+          delay(STREAM_LIMIT_RETRY_DELAY_MILLIS)
+          continue
         }
         Diagnostics.warn("DshApi", "\$events 建立失败", error)
       } finally {
@@ -2177,6 +2192,11 @@ class DshApi(
           Diagnostics.info("DshApi", "workspace/follow 参数代际切换为 $workspaceArgsStyle")
           continue
         }
+        if (isStreamLimitOrRateLimited(cause) && releaseFollowForRetry("")) {
+          backoff = WORKSPACE_RETRY_MIN_MILLIS
+          delay(STREAM_LIMIT_RETRY_DELAY_MILLIS)
+          continue
+        }
         if (cause != null) Diagnostics.warn("DshApi", "workspace/follow 断开", cause)
       } catch (cancel: CancellationException) {
         throw cancel
@@ -2185,6 +2205,11 @@ class DshApi(
         if (isGatewayArgumentsInvalid(error)) {
           flipWorkspaceStyle()
           backoff = WORKSPACE_RETRY_MIN_MILLIS
+          continue
+        }
+        if (isStreamLimitOrRateLimited(error) && releaseFollowForRetry("")) {
+          backoff = WORKSPACE_RETRY_MIN_MILLIS
+          delay(STREAM_LIMIT_RETRY_DELAY_MILLIS)
           continue
         }
         Diagnostics.warn("DshApi", "workspace/follow 建立失败", error)
@@ -2687,11 +2712,7 @@ class DshApi(
         // The local gateway or Host stream pool is full (`RemoteStreamLimitException` / `RATE_LIMITED`).
         // Do not cancel the in-flight open RPC; evict a different live follow, which releases its
         // slot synchronously via `StreamSocket.closeNow()`, then retry once.
-        val streamOrRateLimit = error is RemoteStreamLimitException ||
-          (error as? RemoteGatewayException)?.code == "RATE_LIMITED" ||
-          (error as? RemoteRpcException)?.code == "RATE_LIMITED" ||
-          (error as? ApiException)?.code == "RATE_LIMITED"
-        if (streamOrRateLimit && !retriedLimit && !state.closed && releaseFollowForRetry(session.id)) {
+        if (isStreamLimitOrRateLimited(error) && !retriedLimit && !state.closed && releaseFollowForRetry(session.id)) {
           retriedLimit = true
           delay(STREAM_LIMIT_RETRY_DELAY_MILLIS)
           if (!state.closed) continue
@@ -2701,6 +2722,12 @@ class DshApi(
       }
     }
   }
+
+  private fun isStreamLimitOrRateLimited(error: Throwable?): Boolean =
+    error is RemoteStreamLimitException ||
+      (error as? RemoteGatewayException)?.code == "RATE_LIMITED" ||
+      (error as? RemoteRpcException)?.code == "RATE_LIMITED" ||
+      (error as? ApiException)?.code == "RATE_LIMITED"
 
   private fun failFollow(session: Session, state: FollowState, error: Exception) {
     state.opening = false
@@ -2931,7 +2958,8 @@ class DshApi(
         watched.remove(session.id)
         watched.add(session.id)
       }
-      while (watched.size > WATCH_LIMIT) {
+      val limit = watchLimit
+      while (watched.size > limit) {
         val oldest = watched.firstOrNull { it != activeSessionId && (!leaseManaged || it !in leaseSnapshot.reading) } ?: break
         watched.remove(oldest)
         evicted += oldest
@@ -3614,7 +3642,7 @@ class DshApi(
     sessionId: String,
     jobId: String,
     onUpdate: (text: String, running: Boolean, finished: Boolean) -> Unit
-  ): Boolean {
+  ): Boolean = jobFollowStreams.withPermit {
     val closed = CompletableDeferred<Unit>()
     var sawFrame = false
     var runningState = false
@@ -3656,7 +3684,7 @@ class DshApi(
         })
     } catch (cancel: CancellationException) { throw cancel }
     catch (error: Exception) { throw error }
-    return try {
+    try {
       closed.await()
       if (sawFrame && !terminalSeen) throw IOException("后台任务输出流中断，状态待核实")
       if (lossy && sawFrame) onUpdate("\n…（主机裁剪了早先输出，缺失部分无法回读）", runningState, true)
@@ -4355,6 +4383,8 @@ class DshApi(
     const val MUX_STREAM_BUFFER = 256
     const val MAX_RPC_RESPONSE_BYTES = 64L * 1024 * 1024
     const val WATCH_LIMIT = 12
+    const val REMOTE_WATCH_LIMIT = 8
+    const val JOB_FOLLOW_CONCURRENCY = 2
 
     /** 首帧等待上限；只覆盖“流被打开到第一帧到达”，不含后续分片/transfer 读取。 */
     const val STREAM_FIRST_FRAME_TIMEOUT_MILLIS = 20_000L
