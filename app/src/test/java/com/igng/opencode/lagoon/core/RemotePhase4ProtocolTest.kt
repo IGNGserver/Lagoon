@@ -462,4 +462,76 @@ class RemotePhase4ProtocolTest {
       assertFalse(caps501.devicePairing)
     }
   }
+
+  @Test fun coreStreamsEvictWatchedFollowsAndBoundJobFollowUnder16StreamCap() = runBlocking {
+    val ids = (1..20).map { "s%02d".format(it) }
+    FakeRemoteHost().use { host ->
+      host.call = { endpoint, _ ->
+        when (endpoint) {
+          "session/list" -> host.ok(JSONObject().put("items", JSONArray().apply {
+            ids.forEach { id ->
+              put(JSONObject().put("sessionId", id).put("updatedAt", 100)
+                .put("running", true).put("cwd", "/repo"))
+            }
+          }))
+          "session/page" -> host.ok(JSONObject().put("records", JSONArray()).put("hasMore", false))
+          else -> host.ok(JSONObject())
+        }
+      }
+      host.streamFrames = { endpoint, payload ->
+        when (endpoint) {
+          "session/follow" -> {
+            val sid = payload.optJSONObject("args")?.optJSONObject("address")?.optString("sessionId").orEmpty().ifBlank { "s01" }
+            listOf(JSONObject().put("type", "snapshot")
+              .put("header", JSONObject().put("version", 4).put("id", sid).put("createdAt", 1).put("cwd", "/repo").put("agentPreset", "standard"))
+              .put("cursor", 0).put("records", JSONArray()).put("hasMore", false)
+              .put("projections", JSONObject().put("asOfSeq", 0).put("values", JSONObject())))
+          }
+          else -> emptyList()
+        }
+      }
+      host.start()
+      val session = newSession(host, "stream-cap")
+      val backend = RemoteBackend(session)
+      val jobFollows = mutableListOf<kotlinx.coroutines.Job>()
+      try {
+        repeat(12) { idx ->
+          jobFollows += launch { runCatching { backend.client.followJobOutput("s01", "job-$idx") { _, _, _ -> } } }
+        }
+        delay(350)
+        val initialJobOpens = synchronized(host.streamOpens) { host.streamOpens.count { it.optString("endpoint") == "job/follow" } }
+        assertTrue("Expected concurrent job/follow opens bounded to <= ${DshApi.JOB_FOLLOW_CONCURRENCY}, got $initialJobOpens",
+          initialJobOpens in 1..DshApi.JOB_FOLLOW_CONCURRENCY)
+
+        backend.client.rootSessionsPage()
+        val collector = launch { backend.client.events {}.collect { } }
+        withTimeout(5_000) {
+          while (true) {
+            val opens = synchronized(host.streamOpens) { host.streamOpens.map { it.optString("endpoint") } }
+            if ("\$events" in opens && "workspace/follow" in opens) break
+            delay(50)
+          }
+        }
+        backend.client.rootSessionsPage()
+        delay(400)
+        val stats = backend.streamStats()
+        assertNotNull(stats)
+        assertEquals(16, stats!!.limit)
+        assertTrue("Active streams (${stats.active}) exceeded cap ${stats.limit}", stats.active <= stats.limit)
+        assertTrue("Active job/follow streams (${stats.byEndpoint["job/follow"] ?: 0}) exceeded ${DshApi.JOB_FOLLOW_CONCURRENCY}",
+          (stats.byEndpoint["job/follow"] ?: 0) <= DshApi.JOB_FOLLOW_CONCURRENCY)
+        val follows = (backend.client as DshApi).followDiagnostics()
+        assertTrue("Remote watched follows (${follows.size}) exceeded ${DshApi.REMOTE_WATCH_LIMIT}",
+          follows.size <= DshApi.REMOTE_WATCH_LIMIT)
+        assertNull("Opening last session must succeed under 16-stream cap",
+          runCatching { backend.client.messagesPage(ids.last()) }.exceptionOrNull())
+        collector.cancel()
+        collector.join()
+      } finally {
+        jobFollows.forEach { it.cancel() }
+        backend.close()
+        session.close()
+      }
+    }
+  }
 }
