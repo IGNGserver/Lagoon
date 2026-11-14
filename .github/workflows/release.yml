@@ -30,7 +30,7 @@ jobs:
   release:
     name: 构建并发布
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 35
     env:
       RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
       RELEASE_TYPE: ${{ inputs.release_type || 'pre-release' }}
@@ -72,7 +72,7 @@ jobs:
           echo "LAGOON_KEYSTORE_FILE=$RUNNER_TEMP/lagoon-release.jks" >> "$GITHUB_ENV"
 
       - name: 构建并验证 Android
-        timeout-minutes: 25
+        timeout-minutes: 30
         env:
           LAGOON_KEYSTORE_PASSWORD: ${{ secrets.LAGOON_KEYSTORE_PASSWORD || secrets.OPENCODE_LAGOON_KEYSTORE_PASSWORD }}
           LAGOON_KEY_ALIAS: ${{ secrets.LAGOON_KEY_ALIAS || secrets.OPENCODE_LAGOON_KEY_ALIAS }}
@@ -84,7 +84,14 @@ jobs:
           export LAGOON_VERSION_NAME="${RELEASE_TAG#v}"
           echo "LAGOON_VERSION_CODE=$LAGOON_VERSION_CODE" >> "$GITHUB_ENV"
           echo "LAGOON_VERSION_NAME=$LAGOON_VERSION_NAME" >> "$GITHUB_ENV"
-          ANDROID_HOME="$ANDROID_SDK_ROOT" ./gradlew :app:testDebugUnitTest :app:assembleRelease
+          mkdir -p "${GRADLE_USER_HOME:-$HOME/.gradle}"
+          printf '%s\n' \
+            'org.gradle.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=1024m -Dfile.encoding=UTF-8' \
+            'kotlin.daemon.jvmargs=-Xmx3072m -XX:MaxMetaspaceSize=1024m' \
+            'org.gradle.parallel=false' \
+            > "${GRADLE_USER_HOME:-$HOME/.gradle}/gradle.properties"
+          ANDROID_HOME="$ANDROID_SDK_ROOT" ./gradlew :app:testDebugUnitTest --console=plain
+          ANDROID_HOME="$ANDROID_SDK_ROOT" ./gradlew :app:assembleRelease --console=plain
 
       - name: 定位构建产物
         id: apk
