@@ -21,11 +21,12 @@ Lagoon 中枢与网页端已停止维护并从仓库移除，不再注册 Remote
 
 | 项目 | 状态 | 说明 |
 | --- | --- | --- |
-| Server 健康、账号密码登录、注册、刷新、Host 列表与授权详情 | 开发中 | `RemoteServerApi`；MockWebServer 测试及本机自部署 Server REST 冒烟，已接入 Android 配置流程；不含 OAuth。 |
+| 账号密码登录、浏览器 OAuth、注册、单飞刷新、Host 列表与授权详情 | 已接入 | `RemoteServerApi`、`RemoteDeviceStore`、`RemoteAccountManager`；支持进程级单飞与取消安全刷新、401 `TOKEN_EXPIRED`/`AUTH_INVALID` 反应式刷新重试、`DELETE /api/v1/devices/self` 注销与重新登录自动修复。 |
+| 扫码设备配对（`dsh-pairing-v1` + `fragment-ticket-v1`） | 已实现（待真机联调） | `RemoteDevicePairing` + `RemotePairingSheet`；支持 CameraX 扫码/相册/链接粘贴、X25519+HKDF-SHA256+HMAC-SHA256 (`X-DSH-Pairing-Proof`)、`FLAG_SECURE` 8 位验证码防截屏展示、前台轮询与自动连接。 |
 | 安全消息分片 | 开发中 | `RemoteSecureFragments`；本地单元测试，尚未与真实 Host 联调。 |
-| Host pin 校验 | 开发中 | Android 独立持久化并显示，要求人工确认上游 Host 指纹；尚无真 Host 验收。 |
-| 设备私钥、原子 token 保存 | 开发中 | Android 加密持久化；注册/刷新记录不确定状态避免重放，已接入连接生命周期。 |
-| Noise、Control WebSocket、Relay | 开发中 | JVM 测试通过上游 Noise 固定向量及模拟 Host 的加密往返；控制通道 Relay 尚未与真实 Host 联调，独立 Relay 端点不支持；Android 仅编译，尚无真机验证。 |
+| Host pin 校验 | 已接入 | Android 独立持久化并显示，要求人工确认上游 Host 指纹；登录配对显示 12 位缩写，扫码配对显示完整 64 位 SHA-256 指纹。 |
+| 设备私钥、原子 token 保存 | 已接入 | Android 加密持久化；进程级单飞 + 单调 epoch + `invalidated` 标记，防止并发重放一次性 `refreshToken` 或覆盖已注销槽位。 |
+| Noise、Control WebSocket、Relay | 已接入 | JVM 测试通过上游 Noise 固定向量、WS 401/关闭码分类及 45s 加密空闲探测（`harness.transport.describe`）；真机弱网仍建议配合真实 Host 验收。 |
 | WebRTC/TURN | 未实现 | 不能假定自部署 Server 支持。 |
 | RPC 与 capability | 开发中 | `RemoteConnection` 已接入 `DshApi` 投影，严格按能力选择 Typert；不支持历史 `harness.api.*` 回退。 |
 | stream、transfer | 开发中 | 已实现基础流、512 KiB transfer 及大流帧接收。只读调用在 `RESPONSE_TOO_LARGE` 时只改走一次分块；写入、权限和提问不重放。尚无真实 Host 验证。 |

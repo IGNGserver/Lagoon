@@ -72,15 +72,72 @@ internal class RemoteAccountManager(
     return adoptAccount(login.account, login.token, "password", accountScoped = true)
   }
 
+  /** Checks server auth and native device pairing capabilities. */
+  suspend fun authCapabilities(): RemoteAuthCapabilities = api.authCapabilities()
+
   suspend fun refresh(): RemoteCatalog {
     val current = catalogs.load().firstOrNull { it.origin == origin && it.account == account }
       ?: throw IOException("请先登录 DSH Remote")
     check(!current.signedOut) { "中枢账号已退出登录，请重新登录" }
-    val token = deviceToken(current) ?: throw IOException("DSH Remote 登录已失效，请重新登录")
-    val hosts = loadHosts(token, current.account)
-    val updated = current.copy(hosts = hosts, updatedAt = System.currentTimeMillis())
-    catalogs.save(updated)
-    return updated
+    if (current.hosts.isEmpty()) throw IOException("当前账号尚未接入远程主机，请先添加主机")
+    val previousById = current.hosts.associateBy { it.hostId }
+    var lastTransientError: Exception? = null
+    for (host in current.hosts) {
+      val slot = deviceSlot(host.hostId, current.account)
+      val record = runCatching { devices.load(slot) }.getOrNull() ?: continue
+      if (record.account != current.account || record.origin != origin || record.invalidated) continue
+      val manager = RemoteDeviceManager(
+        devices,
+        slot,
+        origin,
+        current.account,
+        refresher = { id, refresh -> api.refresh(id, refresh) },
+      )
+      try {
+        val hosts = loadHostsWithReactiveRefresh(manager, current.account)
+        val mergedHosts = hosts.map { next ->
+          if (next.trust == RemoteTrustState.PINNED) return@map next
+          val prev = previousById[next.hostId]
+          val matchesPrev = prev?.trust == RemoteTrustState.PINNED &&
+            prev.fingerprint != null &&
+            next.fingerprint != null &&
+            equalFingerprint(prev.fingerprint, next.fingerprint)
+          if (matchesPrev) next.copy(trust = RemoteTrustState.PINNED) else next
+        }
+        val updated = current.copy(hosts = mergedHosts, updatedAt = System.currentTimeMillis())
+        catalogs.save(updated)
+        return updated
+      } catch (cancel: kotlinx.coroutines.CancellationException) {
+        throw cancel
+      } catch (error: RemoteServerException) {
+        if (!error.isCredentialRejected && !error.isDeviceRevoked) {
+          lastTransientError = error
+        }
+      } catch (error: IOException) {
+        if (!isDefinitiveSlotFailure(error)) {
+          lastTransientError = error
+        }
+      }
+    }
+    lastTransientError?.let { throw it }
+    throw IOException("DSH Remote 登录已失效，请重新登录")
+  }
+
+  private suspend fun loadHostsWithReactiveRefresh(manager: RemoteDeviceManager, accountName: String): List<RemoteHostMeta> {
+    val token = manager.access().tokens?.accessToken ?: throw IOException("DSH Remote 登录已失效，请重新登录")
+    return try {
+      loadHosts(token, accountName)
+    } catch (error: RemoteServerException) {
+      if (!error.isRecoverableTokenRejection) throw error
+      val refreshed = manager.refreshAfterRejected(token).tokens?.accessToken
+        ?: throw IOException("DSH Remote 登录已失效，请重新登录")
+      loadHosts(refreshed, accountName)
+    }
+  }
+
+  private fun isDefinitiveSlotFailure(error: IOException): Boolean {
+    val msg = error.message.orEmpty()
+    return msg.contains("失效") || msg.contains("未注册") || msg.contains("未登录")
   }
 
   /** Registers one client identity per selected Host and pins the confirmed fingerprints. */
@@ -88,10 +145,20 @@ internal class RemoteAccountManager(
     val (name, token) = requirePending()
     if (selected.isEmpty()) throw IOException("至少选择一台主机")
     if (selected.size > 16) throw IOException("一次最多接入 16 台主机")
+    val previousCatalog = catalogs.load().firstOrNull { it.origin == origin && it.account == name }
+    val previousById = previousCatalog?.hosts?.associateBy { it.hostId }.orEmpty()
     val registered = LinkedHashMap<String, String>()
     val failures = LinkedHashMap<String, String>()
     val byId = candidates.associateBy { it.hostId }
-    val catalogHosts = candidates.map { it.meta }.toMutableList()
+    val catalogHosts = candidates.map { next ->
+      if (next.meta.trust == RemoteTrustState.PINNED) return@map next.meta
+      val prev = previousById[next.meta.hostId]
+      val matchesPrev = prev?.trust == RemoteTrustState.PINNED &&
+        prev.fingerprint != null &&
+        next.meta.fingerprint != null &&
+        equalFingerprint(prev.fingerprint, next.meta.fingerprint)
+      if (matchesPrev) next.meta.copy(trust = RemoteTrustState.PINNED) else next.meta
+    }.toMutableList()
     for (candidate in selected) {
       try {
         val host = byId[candidate.hostId]?.host ?: throw IOException("主机信息已过期，请刷新")
@@ -117,11 +184,111 @@ internal class RemoteAccountManager(
         failures[candidate.hostId] = userFacingError(error, "接入主机失败")
       }
     }
+    repairPinnedHostsIfNeeded(name, token, byId, previousById, registered)
     val catalog = RemoteCatalog(origin, name, provider, deviceLabel, catalogHosts, System.currentTimeMillis(), allowCleartext)
     catalogs.save(catalog)
     accountToken = null
     this.account = name
     return RemoteEnrollment(catalog, registered, failures)
+  }
+
+  private suspend fun repairPinnedHostsIfNeeded(
+    accountName: String,
+    accountAccessToken: String,
+    byId: Map<String, RemoteHostCandidate>,
+    previousById: Map<String, RemoteHostMeta>,
+    alreadyRegistered: Map<String, String>,
+  ) {
+    val now = System.currentTimeMillis()
+    val refreshMarginMs = 7L * 86_400_000L
+    for ((hostId, prev) in previousById) {
+      if (hostId in alreadyRegistered) continue
+      if (prev.trust != RemoteTrustState.PINNED) continue
+      val candidate = byId[hostId] ?: continue
+      val currentFingerprint = candidate.meta.fingerprint ?: continue
+      val prevFingerprint = prev.fingerprint ?: continue
+      if (!equalFingerprint(prevFingerprint, currentFingerprint)) continue
+      val slot = deviceSlot(hostId, accountName)
+      val existing = runCatching { devices.load(slot) }.getOrNull()
+      val tokens = existing?.tokens
+      val needsRepair = existing == null ||
+        existing.invalidated ||
+        tokens == null ||
+        tokens.refreshTokenExpiresAt <= now + refreshMarginMs ||
+        tokens.accessTokenExpiresAt <= now + 60_000L
+      if (!needsRepair) continue
+      try {
+        val manager = RemoteDeviceManager(
+          devices,
+          slot,
+          origin,
+          accountName,
+          registerer = { descriptor, acctToken -> api.register(descriptor, acctToken) },
+          refresher = { id, refresh -> api.refresh(id, refresh) },
+        )
+        manager.register(deviceName(candidate.host), platform, clientVersion, accountAccessToken)
+      } catch (cancel: kotlinx.coroutines.CancellationException) {
+        throw cancel
+      } catch (_: Exception) {
+        // Silent background credential repair for non-selected hosts must not abort primary enrollment.
+      }
+    }
+  }
+
+  /** Adopts a device-only QR pairing grant into pinned trust, device slot store, and catalog. */
+  suspend fun adoptPairing(
+    host: RemoteHost,
+    accountName: String,
+    mobileIdentity: RemoteIdentity,
+    tokens: RemoteTokenPair,
+    label: String = deviceLabel,
+  ): RemoteCatalog {
+    val key = host.publicKey?.trim().orEmpty()
+    require(key.isNotEmpty()) { "主机缺少身份公钥" }
+    val scope = RemotePeerScope(origin, accountName, host.deviceId)
+    val trust = RemotePeerTrust(pins)
+    val existingPin = pins.pinned(scope)
+    if (existingPin != null && !sameKey(existingPin, key)) {
+      trust.replaceAfterConfirmation(scope, host, existingPin)
+    } else {
+      trust.pinAfterConfirmation(scope, host)
+    }
+    val slot = deviceSlot(host.deviceId, accountName)
+    RemoteDeviceManager(devices, slot, origin, accountName).savePaired(mobileIdentity, tokens)
+
+    val fingerprint = runCatching { RemoteSetup.fingerprint(key) }.getOrNull()
+    val newMeta = RemoteHostMeta(
+      hostId = host.deviceId,
+      name = host.name,
+      platform = host.platform,
+      online = host.online,
+      lastSeenAt = null,
+      harnessVersion = host.harnessVersion,
+      pluginVersion = null,
+      fingerprint = fingerprint,
+      trust = RemoteTrustState.PINNED,
+    )
+    val existingCatalog = catalogs.load().firstOrNull { it.origin == origin && it.account == accountName }
+    val mergedHosts = existingCatalog?.hosts
+      ?.filterNot { it.hostId == newMeta.hostId }
+      .orEmpty() + newMeta
+    val updated = (existingCatalog ?: RemoteCatalog(
+      origin = origin,
+      account = accountName,
+      provider = "pairing",
+      deviceLabel = label,
+      hosts = mergedHosts,
+      updatedAt = System.currentTimeMillis(),
+      allowCleartext = allowCleartext,
+    )).copy(
+      hosts = mergedHosts,
+      updatedAt = System.currentTimeMillis(),
+      allowCleartext = allowCleartext,
+      signedOut = false,
+    )
+    catalogs.save(updated)
+    this.account = accountName
+    return updated
   }
 
   suspend fun signOut(catalog: RemoteCatalog) {
@@ -134,12 +301,22 @@ internal class RemoteAccountManager(
     for (host in catalog.hosts) {
       val slot = deviceSlot(host.hostId, catalog.account)
       val record = runCatching { devices.load(slot) }.getOrNull() ?: continue
-      val token = try {
-        RemoteDeviceManager(devices, slot, origin, name,
-          refresher = { id, refresh -> api.refresh(id, refresh) }).access().tokens?.accessToken
+      RemoteDeviceManager.invalidateSlot(slot)
+      val now = System.currentTimeMillis()
+      val cachedToken = record.tokens?.takeIf { !record.invalidated && it.accessTokenExpiresAt > now + 10_000L }?.accessToken
+      val token = cachedToken ?: try {
+        RemoteDeviceManager(
+          devices,
+          slot,
+          origin,
+          name,
+          refresher = { id, refresh -> api.refresh(id, refresh) },
+        ).access().tokens?.accessToken
       } catch (cancel: kotlinx.coroutines.CancellationException) {
         throw cancel
-      } catch (_: Exception) { null }
+      } catch (_: Exception) {
+        null
+      }
       if (token != null) try { api.revokeSelf(token) } catch (cancel: kotlinx.coroutines.CancellationException) { throw cancel } catch (_: Exception) { }
       runCatching { devices.delete(slot) }
     }
@@ -196,22 +373,6 @@ internal class RemoteAccountManager(
 
   private suspend fun loadHosts(token: String, name: String): List<RemoteHostMeta> =
     loadCandidates(token, name, accountScoped = false).map { it.meta }
-
-  private suspend fun deviceToken(catalog: RemoteCatalog): String? {
-    for (host in catalog.hosts) {
-      val slot = deviceSlot(host.hostId, catalog.account)
-      val record = runCatching { devices.load(slot) }.getOrNull() ?: continue
-      if (record.account != catalog.account || record.origin != origin) continue
-      val token = try {
-        RemoteDeviceManager(devices, slot, origin, catalog.account,
-          refresher = { id, refresh -> api.refresh(id, refresh) }).access().tokens?.accessToken
-      } catch (cancel: kotlinx.coroutines.CancellationException) {
-        throw cancel
-      } catch (_: Exception) { null }
-      if (token != null) return token
-    }
-    return null
-  }
 
   private fun deviceSlot(hostId: String, account: String): String =
     resolveRemoteDeviceSlot(devices, origin, account, hostId)

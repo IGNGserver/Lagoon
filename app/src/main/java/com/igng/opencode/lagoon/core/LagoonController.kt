@@ -442,11 +442,34 @@ class LagoonController private constructor(private val appContext: Context) {
           .onFailure { showNotice(userFacingError(it, "删除 SSH 配置失败"), FeedbackTone.WARNING) }
       }
       ConnectionSourceType.HUB -> host.externalHostId?.let { external ->
+        val canonicalOrigin = runCatching { canonicalRemoteOrigin(source.endpoint) }.getOrElse { source.endpoint }
+        val acct = source.account.orEmpty()
+        val catalogBefore = runCatching { remoteCatalog(canonicalOrigin, acct) }.getOrNull()
+        val allowCleartext = catalogBefore?.allowCleartext == true
         runCatching {
-          val slot = resolveRemoteDeviceSlot(store.remoteDevices, source.endpoint, source.account.orEmpty(), external)
+          val slot = resolveRemoteDeviceSlot(store.remoteDevices, canonicalOrigin, acct, external)
+          val record = runCatching { store.remoteDevices.load(slot) }.getOrNull()
+          RemoteDeviceManager.invalidateSlot(slot)
+          if (record?.tokens != null && !record.invalidated) {
+            scope.launch(Dispatchers.IO) {
+              try {
+                val api = RemoteServerApi(canonicalOrigin, allowCleartext)
+                val tokens = record.tokens
+                val token = if (tokens.accessTokenExpiresAt > System.currentTimeMillis() + 10_000L) {
+                  tokens.accessToken
+                } else {
+                  api.refresh(record.identity.deviceId, tokens.refreshToken).accessToken
+                }
+                api.revokeSelf(token)
+              } catch (cancel: CancellationException) {
+                throw cancel
+              } catch (_: Exception) {
+              }
+            }
+          }
           store.remoteDevices.delete(slot)
         }
-        remoteCatalog(source.endpoint, source.account.orEmpty())?.let { catalog ->
+        catalogBefore?.let { catalog ->
           runCatching {
             store.saveRemoteCatalog(catalog.copy(
               hosts = catalog.hosts.filterNot { it.hostId == external },
@@ -633,10 +656,58 @@ class LagoonController private constructor(private val appContext: Context) {
   internal suspend fun confirmRemoteHost(profile: ServerProfile, account: String, hostId: String, fingerprint: String): RemoteHost {
     require(profile.kind == ServerKind.DSH_REMOTE)
     val origin = canonicalRemoteOrigin(profile.url)
+    val slot = resolveRemoteDeviceSlot(store.remoteDevices, origin, account, hostId,
+      legacyProfileSlots = listOf(remoteSlot(profile.id)))
     val setup = RemoteSetup(RemoteServerApi(profile.url, profile.allowCleartext), store.remoteDevices, store.remotePins,
-      remoteSlot(profile.id), origin, profile.name.ifBlank { "Lagoon Android" }, "android", appVersion())
+      slot, origin, profile.name.ifBlank { "Lagoon Android" }, "android", appVersion())
     val host = setup.confirmHost(account, hostId, fingerprint)
     return host
+  }
+
+  /** Persists a Scan-to-Pair v1 grant, pins Host trust, projects the connection graph, and dials the Host. */
+  internal suspend fun completeRemotePairing(
+    offer: RemotePairingOffer,
+    credentials: RemotePairingCredentials,
+    mobileIdentity: RemoteIdentity,
+    allowCleartext: Boolean,
+  ): ServerProfile {
+    val host = RemoteHost(
+      deviceId = offer.host.deviceId,
+      name = offer.host.name,
+      platform = offer.host.platform,
+      membershipId = "pairing",
+      online = true,
+      publicKey = offer.host.identityKey,
+      clientVersion = offer.host.clientVersion,
+      harnessVersion = offer.host.harnessVersion,
+      fingerprint = runCatching { RemoteSetup.fingerprint(offer.host.identityKey) }.getOrNull(),
+    )
+    val catalog = remoteAccountManager(offer.origin, allowCleartext).adoptPairing(
+      host = host,
+      accountName = credentials.account,
+      mobileIdentity = mobileIdentity,
+      tokens = credentials.tokens,
+    )
+    val meta = catalog.hosts.first { it.hostId == host.deviceId }
+    val parent = remoteCatalogProfile(catalog, meta)
+    return kotlinx.coroutines.withContext(Dispatchers.Main.immediate) {
+      val profile = addRemoteDshService(parent, enabled = true)
+      persistConnectionGraph()
+      connect(profile.id)
+      profile
+    }
+  }
+
+  internal fun cancelRemotePairingAsync(
+    offer: RemotePairingOffer,
+    mobileIdentity: RemoteIdentity,
+    allowCleartext: Boolean,
+  ) {
+    scope.launch(Dispatchers.IO) {
+      runCatching {
+        RemotePairingClient(RemoteServerApi(offer.origin, allowCleartext)).cancel(offer, mobileIdentity)
+      }
+    }
   }
 
   /** One manager per login flow; the in-memory account token lives only as long as the UI keeps it. */
@@ -1511,9 +1582,17 @@ class LagoonController private constructor(private val appContext: Context) {
   }
 
   /** Set by the composition root; the connection strip asks it to open the Remote recovery sheet. */
-  @Volatile var remoteRecoveryHandler: (() -> Unit)? = null
+  @Volatile var remoteRecoveryHandler: ((RemoteRecoveryKind) -> Unit)? = null
 
-  fun openRemoteRecovery() { remoteRecoveryHandler?.invoke() }
+  fun openRemoteRecovery() {
+    val kind = state.value.remoteRecovery ?: RemoteRecoveryKind.LOGIN
+    if (kind == RemoteRecoveryKind.RECONNECT) {
+      val id = state.value.serverId ?: return
+      connect(id)
+      return
+    }
+    remoteRecoveryHandler?.invoke(kind)
+  }
 
   /** Full connection report for the diagnostic dialog; only DSH Remote connections implement it. */
   internal suspend fun remoteDoctor(serverId: String? = state.value.serverId): RemoteDoctor? {
@@ -2915,7 +2994,8 @@ class LagoonController private constructor(private val appContext: Context) {
       if (error is CancellationException) throw error
       val reason = userFacingError(error, "连接失败")
       connectTrace.fail(token.toLong(), reason)
-      updateState { it.copy(loading = false, connected = false, error = reason) }
+      updateState { it.copy(loading = false, connected = false, error = reason,
+        remoteRecovery = remoteFailure(error)?.kind?.recovery()) }
       scheduleReconnect(id, token, if (error.isAuthFailure) AUTH_RETRY_ATTEMPT else 0, reason)
       return
     }
@@ -2990,6 +3070,7 @@ class LagoonController private constructor(private val appContext: Context) {
       if (token == generation) {
         connectTrace.fail(token.toLong(), reason)
         showOffline(id, token, reason)
+        updateState { it.copy(remoteRecovery = remoteFailure(error)?.kind?.recovery()) }
         scheduleReconnect(id, token, if (error.isAuthFailure) AUTH_RETRY_ATTEMPT else attempt + 1, reason)
       }
       return
@@ -3008,6 +3089,7 @@ class LagoonController private constructor(private val appContext: Context) {
       val reason = userFacingError(error, "连接失败")
       if (token == generation) connectTrace.fail(token.toLong(), reason)
       if (token == generation) showOffline(id, token, reason)
+      if (token == generation) updateState { it.copy(remoteRecovery = remoteFailure(error)?.kind?.recovery()) }
       scheduleReconnect(id, token, if (error.isAuthFailure) AUTH_RETRY_ATTEMPT else attempt + 1, reason)
     }
   }

@@ -46,4 +46,25 @@ class RemoteFailureTest {
     assertTrue(offline.retryable)
     assertEquals("重试", offline.actionLabel)
   }
+
+  @Test fun deviceRevokedAndControlShutdownOrHeartbeatMapAccurately() {
+    val revoked = remoteServerFailure(RemoteServerException(403, "DEVICE_REVOKED", false))
+    assertEquals(RemoteFailureKind.DEVICE_REVOKED, revoked.kind)
+    assertFalse(revoked.retryable)
+    assertEquals(RemoteRecoveryKind.LOGIN, revoked.kind.recovery())
+
+    val shutdown = remoteControlFailure(RemoteControlException("SERVER_SHUTDOWN", "shutting down", true))
+    assertEquals(RemoteFailureKind.NETWORK, shutdown.kind)
+    assertTrue(shutdown.retryable)
+    assertNull(shutdown.kind.recovery())
+
+    val heartbeat = remoteControlFailure(RemoteControlException("HEARTBEAT_TIMEOUT", "heartbeat timeout", true))
+    assertEquals(RemoteFailureKind.NETWORK, heartbeat.kind)
+    assertTrue(heartbeat.retryable)
+    assertNull(heartbeat.kind.recovery())
+
+    val expired = remoteControlFailure(RemoteControlException("TOKEN_EXPIRED", "expired", false))
+    assertEquals(RemoteFailureKind.AUTH_REQUIRED, expired.kind)
+    assertEquals(RemoteRecoveryKind.LOGIN, expired.kind.recovery())
+  }
 }

@@ -73,6 +73,8 @@ internal class RemoteRelay(
     private set
   @Volatile internal var relayAttached: Boolean = false
     private set
+  @Volatile internal var lastTrafficAt: Long = System.currentTimeMillis()
+    private set
   /** 中枢通过 `connect.accepted` 下发的独立 Relay 数据通道（`relayEndpoint` + `relayTicket`）。 */
   private var dataSocket: WebSocket? = null
   private var dataReady = false
@@ -133,13 +135,21 @@ internal class RemoteRelay(
       } catch (error: Exception) { fail(IOException("Remote 认证失败", error)) }
     }
     override fun onMessage(webSocket: WebSocket, text: String) {
+      lastTrafficAt = System.currentTimeMillis()
       try { handle(text) } catch (error: RemoteControlException) { fail(error) }
         catch (error: Exception) { fail(IOException("Remote 协议失败", error)) }
     }
     override fun onMessage(webSocket: WebSocket, bytes: ByteString) { fail(IOException("Remote 不接受二进制控制帧")) }
-    override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) { fail(IOException("Remote WebSocket 失败", t)) }
-    override fun onClosed(webSocket: WebSocket, code: Int, reason: String) { fail(IOException("Remote WebSocket 已关闭")) }
-    override fun onClosing(webSocket: WebSocket, code: Int, reason: String) { webSocket.close(code, null); fail(IOException("Remote WebSocket 正在关闭")) }
+    override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+      fail(classifyRemoteWsUpgradeFailure(response, t))
+    }
+    override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+      fail(classifyRemoteWsClose(code, reason))
+    }
+    override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+      webSocket.close(code, null)
+      fail(classifyRemoteWsClose(code, reason))
+    }
   }
 
   private fun handle(text: String) {
@@ -334,6 +344,7 @@ internal class RemoteRelay(
       .put("timestamp", System.currentTimeMillis()).put("payload", payload).toString()
     val max = if (type == "relay") relayLimit else limit
     if (text.toByteArray(Charsets.UTF_8).size > max || target?.send(text) != true) throw IOException("Remote 帧发送失败")
+    lastTrafficAt = System.currentTimeMillis()
   }
 
   private fun fail(error: IOException) {
@@ -371,4 +382,46 @@ internal class RemoteRelay(
     /** 与参考实现一致：数据通道附加超时 15 秒。 */
     const val RELAY_ATTACH_TIMEOUT_MILLIS = 15_000L
   }
+}
+
+/**
+ * Classifies WebSocket handshake upgrade failures (`401`/`403`) so expired/invalid access tokens
+ * surface as structured [RemoteControlException] rather than an opaque IO failure.
+ */
+internal fun classifyRemoteWsUpgradeFailure(response: Response?, t: Throwable): IOException {
+  if (response != null && (response.code == 401 || response.code == 403)) {
+    val rawBody = runCatching { response.body?.string() }.getOrNull()
+    val error = rawBody?.let { runCatching { JSONObject(it).optJSONObject("error") }.getOrNull() }
+    val rawCode = (error?.opt("code") as? String)?.takeIf { it.matches(Regex("[A-Z0-9_]{1,80}")) }
+    if (rawCode != null) {
+      return RemoteControlException(rawCode, "Remote WebSocket 鉴权被拒绝（HTTP ${response.code}, $rawCode）", retryable = false)
+    }
+    if (response.code == 401) {
+      return RemoteControlException("AUTH_INVALID", "Remote WebSocket 鉴权失败（HTTP 401）", retryable = false)
+    }
+  }
+  return IOException("Remote WebSocket 失败", t)
+}
+
+/**
+ * Aligns WebSocket close frame classification with upstream `@dsh-remote/protocol/close-semantics.ts`
+ * so hosted/self-hosted shutdowns and heartbeat timeouts trigger reconnects, whereas credential or
+ * duplicate-connection closures surface structured recovery codes.
+ */
+internal fun classifyRemoteWsClose(code: Int, reason: String): IOException = when {
+  code == 4003 || reason.contains("CONNECTION_REPLACED", ignoreCase = true) ->
+    RemoteControlException("CONNECTION_REPLACED", "另一实例正在使用这台设备身份", retryable = false)
+  reason.contains("DEVICE_REVOKED", ignoreCase = true) ->
+    RemoteControlException("DEVICE_REVOKED", "设备授权已被撤销", retryable = false)
+  reason.contains("TOKEN_EXPIRED", ignoreCase = true) ->
+    RemoteControlException("TOKEN_EXPIRED", "访问令牌已过期", retryable = false)
+  reason.contains("AUTH_INVALID", ignoreCase = true) ->
+    RemoteControlException("AUTH_INVALID", "访问令牌无效", retryable = false)
+  code == 4008 || reason.contains("SLOW_CONSUMER", ignoreCase = true) ->
+    RemoteControlException("SLOW_CONSUMER", "Relay 消费过慢", retryable = true)
+  code == 1012 || reason.contains("server shutdown", ignoreCase = true) ->
+    RemoteControlException("SERVER_SHUTDOWN", "DSH 远程中枢正在重启", retryable = true)
+  reason.contains("heartbeat timeout", ignoreCase = true) ->
+    RemoteControlException("HEARTBEAT_TIMEOUT", "DSH 远程中枢心跳超时", retryable = true)
+  else -> IOException("Remote WebSocket 已关闭（$code）")
 }

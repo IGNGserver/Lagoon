@@ -23,7 +23,8 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
 internal fun RemoteHostsSheet(
   controller: LagoonController,
   onDismiss: () -> Unit,
-  onEnroll: () -> Unit
+  onEnroll: () -> Unit,
+  onOpenPairing: (() -> Unit)? = null,
 ) {
   val scope = rememberCoroutineScope()
   var catalogState by remember { mutableStateOf(controller.activeRemoteCatalog()) }
@@ -88,8 +89,16 @@ internal fun RemoteHostsSheet(
         if (catalog == null) {
           item {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-              Text("还没有登录 DSH 远程中枢。登录后选择要接入的电脑。", style = MiuixTheme.textStyles.footnote1)
+              Text("还没有登录 DSH 远程中枢。登录后选择要接入的电脑，或直接扫描电脑上的配对二维码。", style = MiuixTheme.textStyles.footnote1)
               HyperButton(text = "登录并接入主机", onClick = onEnroll, modifier = Modifier.fillMaxWidth())
+              if (onOpenPairing != null) {
+                HyperButton(
+                  text = "扫码配对主机",
+                  variant = HyperButtonVariant.SECONDARY,
+                  onClick = onOpenPairing,
+                  modifier = Modifier.fillMaxWidth(),
+                )
+              }
             }
           }
         } else {
@@ -152,10 +161,20 @@ internal fun RemoteHostsSheet(
             }
           }
           item {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-              HyperButton(text = "接入更多主机", onClick = onEnroll, modifier = Modifier.weight(1f))
-              HyperButton(text = if (signedOut) "已退出登录" else "退出登录", enabled = !signedOut,
-                 variant = HyperButtonVariant.DESTRUCTIVE, onClick = { confirmSignOut = true }, modifier = Modifier.weight(1f))
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+              Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                HyperButton(text = "接入更多主机", onClick = onEnroll, modifier = Modifier.weight(1f))
+                HyperButton(text = if (signedOut) "已退出登录" else "退出登录", enabled = !signedOut,
+                   variant = HyperButtonVariant.DESTRUCTIVE, onClick = { confirmSignOut = true }, modifier = Modifier.weight(1f))
+              }
+              if (onOpenPairing != null) {
+                HyperButton(
+                  text = "扫码配对新主机",
+                  variant = HyperButtonVariant.SECONDARY,
+                  onClick = onOpenPairing,
+                  modifier = Modifier.fillMaxWidth(),
+                )
+              }
             }
           }
         }
@@ -170,5 +189,6 @@ private fun providerLabel(value: String): String = when (value) {
   "zhihu" -> "知乎"
   "google" -> "Google"
   "password" -> "邮箱"
+  "pairing" -> "扫码配对"
   else -> value
 }

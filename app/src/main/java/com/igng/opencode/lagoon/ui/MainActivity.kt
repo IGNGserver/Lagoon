@@ -104,8 +104,21 @@ class MainActivity : ComponentActivity() {
        var showingModelManagement by rememberSaveable { mutableStateOf(false) }
        var showingRemoteEnroll by rememberSaveable { mutableStateOf(false) }
        var showingRemoteHosts by rememberSaveable { mutableStateOf(false) }
+       var showingRemotePairing by rememberSaveable { mutableStateOf(false) }
        LaunchedEffect(controller) {
-         controller.remoteRecoveryHandler = { showingRemoteHosts = false; showingRemoteEnroll = true }
+         controller.remoteRecoveryHandler = { kind ->
+           when (kind) {
+             RemoteRecoveryKind.LOGIN -> {
+               showingRemoteHosts = false
+               showingRemoteEnroll = true
+             }
+             RemoteRecoveryKind.HOST, RemoteRecoveryKind.TRUST -> {
+               showingRemoteEnroll = false
+               showingRemoteHosts = true
+             }
+             RemoteRecoveryKind.RECONNECT -> Unit
+           }
+         }
        }
        var showingDeviceGroups by rememberSaveable { mutableStateOf(false) }
        var editingGroupId by rememberSaveable { mutableStateOf<String?>(null) }
@@ -509,6 +522,8 @@ class MainActivity : ComponentActivity() {
             if (showingModelManagement) ModelManagementSheet(state, controller) { showingModelManagement = false }
             if (showingRemoteHosts) RemoteHostsSheet(controller, onDismiss = { showingRemoteHosts = false }, onEnroll = {
               showingRemoteHosts = false; showingRemoteEnroll = true
+            }, onOpenPairing = {
+              showingRemoteHosts = false; showingRemotePairing = true
             })
             if (showingRemoteEnroll) RemoteEnrollSheet(controller, onDismiss = { showingRemoteEnroll = false }, onDone = { added ->
               showingRemoteEnroll = false
@@ -516,7 +531,18 @@ class MainActivity : ComponentActivity() {
                  globalMessage = "已保存 $added 台远程主机，请逐个选择 Harness"; globalMessageType = MiuixToastType.SUCCESS
                  showingRemoteHosts = true
                }
+            }, onOpenPairing = {
+              showingRemoteEnroll = false; showingRemotePairing = true
             })
+            if (showingRemotePairing) RemotePairingSheet(
+              controller = controller,
+              onDismiss = { showingRemotePairing = false },
+              onPaired = { hostName ->
+                showingRemotePairing = false
+                globalMessage = "已配对并连接 $hostName"
+                globalMessageType = MiuixToastType.SUCCESS
+              },
+            )
           }
         }
       }

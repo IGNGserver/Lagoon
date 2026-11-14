@@ -54,7 +54,8 @@ private fun openLoginUrl(context: android.content.Context, url: String): Boolean
 internal fun RemoteEnrollSheet(
   controller: LagoonController,
   onDismiss: () -> Unit,
-  onDone: (added: Int) -> Unit
+  onDone: (added: Int) -> Unit,
+  onOpenPairing: (() -> Unit)? = null,
 ) {
   val scope = rememberCoroutineScope()
   val context = LocalContext.current
@@ -64,6 +65,7 @@ internal fun RemoteEnrollSheet(
   val managerResult = remember(origin, allowHttp) { runCatching { controller.remoteAccountManager(origin.trim(), allowHttp) } }
   val manager = managerResult.getOrNull()
   var providers by remember { mutableStateOf(emptyList<RemoteOAuthProvider>()) }
+  var supportsPairing by remember { mutableStateOf(false) }
   var providersLoading by remember { mutableStateOf(false) }
   var error by remember { mutableStateOf<String?>(null) }
   var busy by remember { mutableStateOf(false) }
@@ -79,6 +81,7 @@ internal fun RemoteEnrollSheet(
 
   LaunchedEffect(manager) {
     providers = emptyList()
+    supportsPairing = false
     pending = null
     busy = false
     candidates = emptyList()
@@ -91,7 +94,11 @@ internal fun RemoteEnrollSheet(
       return@LaunchedEffect
     }
     providersLoading = true
-    try { providers = manager.providers() }
+    try {
+      val caps = manager.authCapabilities()
+      providers = caps.providers
+      supportsPairing = caps.devicePairing
+    }
     catch (cancel: CancellationException) { throw cancel }
     catch (e: Exception) { error = userFacingError(e, "没能读取登录方式") }
     finally { providersLoading = false }
@@ -179,6 +186,17 @@ internal fun RemoteEnrollSheet(
           item {
             HyperButton(text = if (showSelfHosted) "收起自建中枢登录" else "自建中枢 · 邮箱登录", variant = HyperButtonVariant.SECONDARY,
               onClick = { showSelfHosted = !showSelfHosted }, modifier = Modifier.fillMaxWidth())
+          }
+          if (onOpenPairing != null) {
+            item {
+              HyperButton(
+                text = "扫码配对电脑（免账号）",
+                variant = if (supportsPairing) HyperButtonVariant.PRIMARY else HyperButtonVariant.SECONDARY,
+                enabled = !busy && pending == null,
+                onClick = onOpenPairing,
+                modifier = Modifier.fillMaxWidth(),
+              )
+            }
           }
           if (showSelfHosted) {
             item { TextField(value = account, onValueChange = { account = it }, label = "邮箱 / 账号") }
