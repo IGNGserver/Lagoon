@@ -172,7 +172,7 @@ internal class JschSshTransportFactory(
       }
     }
 
-    val session = jsch.getSession(config.user.trim(), config.host.trim(), config.port)
+    val session = jsch.getSession(config.user.trim(), com.igng.opencode.lagoon.core.normalizeSshHost(config.host), config.port)
     session.setHostKeyRepository(repository)
     session.setConfig("StrictHostKeyChecking", "yes")
     val preferredAuth = when {

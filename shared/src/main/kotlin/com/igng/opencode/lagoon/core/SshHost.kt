@@ -103,13 +103,13 @@ data class SshHostConfig(
   val keyId: String? = null
 ) {
   private val displayHost: String
-    get() = if (host.contains(':') && !host.startsWith("[")) "[$host]" else host
+    get() = host.trim().let { if (it.contains(':') && !it.startsWith("[")) "[$it]" else it }
 
   val address: String
-    get() = if (port == SSH_DEFAULT_PORT) "$user@$displayHost" else "$user@$displayHost:$port"
+    get() = if (port == SSH_DEFAULT_PORT) "${user.trim()}@$displayHost" else "${user.trim()}@$displayHost:$port"
 
   /** Stable display identity stored in the ServerProfile URL; never used as an HTTP origin. */
-  fun profileUrl(): String = "ssh://${user}@$displayHost:$port"
+  fun profileUrl(): String = "ssh://${user.trim()}@$displayHost:$port"
 
   val usesDefaultCommand: Boolean get() = launchCommand.trim() == DEFAULT_DSH_LAUNCH_COMMAND
 

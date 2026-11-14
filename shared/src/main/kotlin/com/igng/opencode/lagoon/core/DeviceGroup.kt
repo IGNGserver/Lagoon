@@ -42,9 +42,9 @@ val ServerProfile.deviceMemberRole: DeviceMemberRole
 /** 统一连接类型展示标签（OpenCode 直连、DSH 远程中枢、DSH SSH 直连、旧版直连 DSH） */
 val ServerProfile.connectionTypeLabel: String
   get() = when {
-    sshHostId != null -> "${when (protocol) { HarnessProtocolId.ANTIGRAVITY_ACP -> "Antigravity"; HarnessProtocolId.CODEX_APP_SERVER -> "Codex"; HarnessProtocolId.OPENCODE_NATIVE -> "OpenCode"; else -> "DSH" }} SSH 直连"
+    sshHostId != null -> "${when (protocol) { HarnessProtocolId.ANTIGRAVITY_ACP -> "Antigravity"; HarnessProtocolId.OPENCODE_ACP -> "OpenCode ACP"; HarnessProtocolId.CODEX_APP_SERVER -> "Codex"; HarnessProtocolId.OPENCODE_NATIVE -> "OpenCode"; else -> "DSH" }} SSH 直连"
     kind == ServerKind.DSH_REMOTE -> "DSH 远程中枢"
-    remoteHostId != null -> when (protocol) { HarnessProtocolId.ANTIGRAVITY_ACP -> "Antigravity · Remote"; HarnessProtocolId.CODEX_APP_SERVER -> "Codex · Remote"; else -> "OpenCode 原生 · Remote" }
+    remoteHostId != null -> when (protocol) { HarnessProtocolId.ANTIGRAVITY_ACP -> "Antigravity · Remote"; HarnessProtocolId.OPENCODE_ACP -> "OpenCode ACP · Remote"; HarnessProtocolId.CODEX_APP_SERVER -> "Codex · Remote"; else -> "OpenCode 原生 · Remote" }
     kind == ServerKind.OPENCODE -> "OpenCode 直连"
     else -> "旧版直连 DSH"
   }

@@ -27,7 +27,8 @@ internal fun RemoteHostsSheet(
   onOpenPairing: (() -> Unit)? = null,
 ) {
   val scope = rememberCoroutineScope()
-  var catalogState by remember { mutableStateOf(controller.activeRemoteCatalog()) }
+  var catalogState by remember { mutableStateOf(controller.activeHubCatalog()) }
+  var pairedState by remember { mutableStateOf(controller.pairedRemoteCatalogs()) }
   val catalog = catalogState
   val managerResult = remember(catalog?.origin, catalog?.account, catalog?.signedOut) {
     catalog?.let { saved ->
@@ -44,14 +45,17 @@ internal fun RemoteHostsSheet(
   var confirmSignOut by remember { mutableStateOf(false) }
   val runtime by controller.state.collectAsState()
   val profiles = runtime.profiles
-  var choosingHost by remember { mutableStateOf<RemoteHostMeta?>(null) }
+  var choosingTarget by remember { mutableStateOf<Pair<RemoteCatalog, RemoteHostMeta>?>(null) }
 
-  fun added(hostId: String): Boolean = profiles.any {
-    it.remoteHostId == hostId && it.username.trim() == catalog?.account?.trim() &&
-      runCatching { canonicalRemoteOrigin(it.url) == catalog?.origin }.getOrDefault(false)
+  fun addedHost(targetCatalog: RemoteCatalog, hostId: String): Boolean = profiles.any {
+    it.remoteHostId == hostId && it.username.trim() == targetCatalog.account.trim() &&
+      runCatching { canonicalRemoteOrigin(it.url) == targetCatalog.origin }.getOrDefault(false)
   }
 
-  fun reload() { catalogState = controller.activeRemoteCatalog() }
+  fun reload() {
+    catalogState = controller.activeHubCatalog()
+    pairedState = controller.pairedRemoteCatalogs()
+  }
 
   if (confirmSignOut && catalog != null) {
     SuperDialog(title = "退出 DSH 远程中枢？", show = true, onDismissRequest = { confirmSignOut = false }) {
@@ -75,14 +79,15 @@ internal fun RemoteHostsSheet(
     }
   }
 
-  val selectedHost = choosingHost
-  if (selectedHost != null && catalog != null) {
-    val parent = runCatching { controller.remoteCatalogProfile(catalog, selectedHost) }.getOrNull()
-    if (parent != null) RemoteNativeServicesSheet(controller, parent, catalog, selectedHost) { choosingHost = null }
-    else LaunchedEffect(selectedHost.hostId) { choosingHost = null; error = "主机目录已变化，请刷新" }
+  val selectedTarget = choosingTarget
+  if (selectedTarget != null) {
+    val (targetCatalog, selectedHost) = selectedTarget
+    val parent = runCatching { controller.remoteCatalogProfile(targetCatalog, selectedHost) }.getOrNull()
+    if (parent != null) RemoteNativeServicesSheet(controller, parent, targetCatalog, selectedHost) { choosingTarget = null }
+    else LaunchedEffect(selectedTarget) { choosingTarget = null; error = "主机目录已变化，请刷新" }
   }
 
-  HyperBottomSheet(title = "远程中枢与主机", show = selectedHost == null, onDismissRequest = onDismiss) {
+  HyperBottomSheet(title = "远程中枢与主机", show = selectedTarget == null, onDismissRequest = onDismiss) {
     Column(Modifier.fillMaxWidth().fillMaxHeight(0.78f)) {
       LazyColumn(Modifier.weight(1f).fillMaxWidth(), contentPadding = PaddingValues(horizontal = 20.dp, vertical = 8.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -145,7 +150,7 @@ internal fun RemoteHostsSheet(
                   Text(if (host.online) "在线" else "离线", style = MiuixTheme.textStyles.footnote2.copy(
                     color = if (host.online) MiuixColorTokens.Success else MiuixTheme.colorScheme.onSurfaceVariantSummary))
                 }
-                Text(listOfNotNull(host.platform.ifBlank { null }, host.harnessVersion?.let { "Harness $it" }, if (added(host.hostId)) "已接入" else "未接入").joinToString(" · "),
+                Text(listOfNotNull(host.platform.ifBlank { null }, host.harnessVersion?.let { "Harness $it" }, if (addedHost(catalog, host.hostId)) "已接入" else "未接入").joinToString(" · "),
                   style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary), maxLines = 1)
                 Text(host.fingerprint?.let { formatFingerprint(it) } ?: "指纹待确认",
                   style = MiuixTheme.textStyles.footnote2.copy(fontFamily = FontFamily.Monospace),
@@ -156,7 +161,7 @@ internal fun RemoteHostsSheet(
                   })
               }
               if (signedOut) HyperTextAction(text = "重新登录", onClick = onEnroll)
-              else if (host.trust == RemoteTrustState.PINNED) HyperTextAction(text = "选择 Harness", onClick = { choosingHost = host })
+              else if (host.trust == RemoteTrustState.PINNED) HyperTextAction(text = "选择 Harness", onClick = { choosingTarget = catalog to host })
               else HyperTextAction(text = "核对并接入", onClick = onEnroll)
             }
           }
@@ -175,6 +180,39 @@ internal fun RemoteHostsSheet(
                   modifier = Modifier.fillMaxWidth(),
                 )
               }
+            }
+          }
+        }
+        if (pairedState.isNotEmpty()) {
+          val pairedEntries = pairedState.flatMap { paired -> paired.hosts.map { host -> paired to host } }
+          item {
+            Text(
+              "扫码直配设备 · ${pairedEntries.size}",
+              modifier = Modifier.padding(top = 8.dp),
+              style = MiuixTheme.textStyles.footnote1.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary),
+            )
+          }
+          items(pairedEntries, key = { (paired, host) -> "${paired.key}:${host.hostId}" }) { (paired, host) ->
+            Row(Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+              Column(Modifier.weight(1f)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                  Text(host.name, style = MiuixTheme.textStyles.body1, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                  Spacer(Modifier.width(6.dp))
+                  Text(if (host.online) "在线" else "离线", style = MiuixTheme.textStyles.footnote2.copy(
+                    color = if (host.online) MiuixColorTokens.Success else MiuixTheme.colorScheme.onSurfaceVariantSummary))
+                }
+                Text(
+                  listOfNotNull(host.platform.ifBlank { null }, paired.origin, if (addedHost(paired, host.hostId)) "已接入" else "未接入").joinToString(" · "),
+                  style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary),
+                  maxLines = 1,
+                )
+                Text(
+                  host.fingerprint?.let { formatFingerprint(it) } ?: "指纹已固定",
+                  style = MiuixTheme.textStyles.footnote2.copy(fontFamily = FontFamily.Monospace),
+                  color = if (host.trust == RemoteTrustState.CHANGED) MiuixColorTokens.Error else MiuixColorTokens.Success,
+                )
+              }
+              HyperTextAction(text = "选择 Harness", onClick = { choosingTarget = paired to host })
             }
           }
         }

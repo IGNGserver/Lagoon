@@ -1,5 +1,7 @@
 package com.igng.opencode.lagoon.ui
 
+import com.igng.opencode.lagoon.core.extractFlexibleHttpOriginParts
+
 import com.igng.opencode.lagoon.core.ModelInfo
 
 internal const val HYPER_TOUCH_TARGET_DP = 48
@@ -52,7 +54,7 @@ internal fun attachmentCanOpen(url: String): Boolean {
   val value = url.trim()
   if (value.isEmpty() || value.startsWith("data:", true)) return false
   if (value.startsWith("http://", true) || value.startsWith("https://", true)) {
-    return runCatching { !java.net.URI(value).host.isNullOrBlank() }.getOrDefault(false)
+    return extractFlexibleHttpOriginParts(value)?.second?.isNotBlank() == true
   }
   val scheme = Regex("^[A-Za-z][A-Za-z0-9+.-]*:").find(value)?.value
   if (scheme == null) return true

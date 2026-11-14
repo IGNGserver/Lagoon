@@ -95,6 +95,7 @@ internal fun RemotePairingSheet(
   var claim by remember { mutableStateOf<RemotePairingClaim?>(null) }
   var statusState by remember { mutableStateOf(RemotePairingState.CREATED) }
   var terminalFailure by remember { mutableStateOf<String?>(null) }
+  var customOriginConfirmed by remember { mutableStateOf(false) }
 
   fun resetToScan(clearInput: Boolean = false) {
     offer = null
@@ -104,6 +105,7 @@ internal fun RemotePairingSheet(
     claim = null
     statusState = RemotePairingState.CREATED
     terminalFailure = null
+    customOriginConfirmed = false
     error = null
     busy = false
     if (clearInput) {
@@ -146,6 +148,7 @@ internal fun RemotePairingSheet(
         claim = null
         statusState = RemotePairingState.CREATED
         terminalFailure = null
+        customOriginConfirmed = false
         cameraActive = false
       } catch (cancel: CancellationException) {
         throw cancel
@@ -266,7 +269,9 @@ internal fun RemotePairingSheet(
     onDismissRequest = {
       val currentOffer = offer
       val currentIdentity = sessionIdentity
-      if (currentOffer != null && currentIdentity != null && !statusState.isTerminal) {
+      if (currentOffer != null && currentIdentity != null && !statusState.isTerminal &&
+        statusState != RemotePairingState.APPROVED
+      ) {
         controller.cancelRemotePairingAsync(currentOffer, currentIdentity, allowHttp)
       }
       onDismiss()
@@ -367,6 +372,7 @@ internal fun RemotePairingSheet(
           }
 
           activeClaim == null -> {
+            val isCustomOrigin = activeOffer.origin.removeSuffix("/") != "https://dsh.r2049.cn"
             item {
               HyperInlineNotice(
                 message = if (scannedIsTicket) {
@@ -376,6 +382,16 @@ internal fun RemotePairingSheet(
                 },
                 type = MiuixToastType.WARNING,
               )
+            }
+            if (isCustomOrigin) {
+              item {
+                HyperSwitchRow(
+                  title = "确认连接自定义中枢地址",
+                  summary = "该配对码指向非默认中枢 (${activeOffer.origin})，确认受信任后再继续",
+                  checked = customOriginConfirmed,
+                  onCheckedChange = { customOriginConfirmed = it },
+                )
+              }
             }
             item {
               Card(Modifier.fillMaxWidth(), insideMargin = PaddingValues(14.dp)) {
@@ -401,6 +417,7 @@ internal fun RemotePairingSheet(
               HyperButton(
                 text = "确认主机并获取 8 位验证码",
                 loading = busy,
+                enabled = !busy && (!isCustomOrigin || customOriginConfirmed),
                 onClick = {
                   if (busy) return@HyperButton
                   scope.launch {
@@ -499,7 +516,9 @@ internal fun RemotePairingSheet(
                 HyperButton(
                   text = "取消配对",
                   variant = HyperButtonVariant.DESTRUCTIVE,
+                  enabled = !busy && statusState != RemotePairingState.APPROVED,
                   onClick = {
+                    if (statusState == RemotePairingState.APPROVED) return@HyperButton
                     val identity = sessionIdentity
                     if (identity != null && !statusState.isTerminal) {
                       controller.cancelRemotePairingAsync(activeOffer, identity, allowHttp)

@@ -46,10 +46,10 @@ data class ServerProfile(
       require(remoteServiceId.matches(Regex("[A-Za-z0-9][A-Za-z0-9._:-]{0,255}"))) { "原生 Remote 服务标识无效" }
     }
     require(kind != ServerKind.OPENCODE || remoteHostId == null || remoteServiceId != null) { "Remote OpenCode 必须指定原生服务" }
-    require(protocol !in setOf(HarnessProtocolId.CODEX_APP_SERVER, HarnessProtocolId.ANTIGRAVITY_ACP) ||
+    require(protocol !in setOf(HarnessProtocolId.CODEX_APP_SERVER, HarnessProtocolId.ANTIGRAVITY_ACP, HarnessProtocolId.OPENCODE_ACP) ||
       (sshHostId != null) != (remoteHostId != null)) { "此 Harness 必须绑定 SSH 或 Remote Host" }
     require(protocolId == null || protocolId == MigrationProjection.protocol(kind) ||
-      protocolId == HarnessProtocolId.ANTIGRAVITY_ACP && kind == ServerKind.CODEX) { "Harness 协议与兼容类型不一致" }
+      protocolId in setOf(HarnessProtocolId.ANTIGRAVITY_ACP, HarnessProtocolId.OPENCODE_ACP) && kind == ServerKind.CODEX) { "Harness 协议与兼容类型不一致" }
   }
   val protocol: HarnessProtocolId get() = protocolId ?: MigrationProjection.protocol(kind)
   val effectiveEnabled: Boolean get() = enabled && parentEnabled

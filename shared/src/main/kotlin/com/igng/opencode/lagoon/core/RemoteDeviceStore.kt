@@ -32,11 +32,80 @@ internal class RemoteDeviceRecord(
   override fun toString(): String = "RemoteDeviceRecord(origin=$origin, account=$account, identity=$identity, tokens=<redacted>, transition=$transition, invalidated=$invalidated)"
 }
 
+internal data class PendingRemoteRevocation(
+  val id: String,
+  val origin: String,
+  val account: String,
+  val peerHostId: String,
+  val clientDeviceId: String,
+  val accessToken: String,
+  val refreshToken: String,
+  val allowCleartext: Boolean = false,
+  val createdAt: Long = System.currentTimeMillis(),
+  val attempts: Int = 0,
+  val lastAttemptAt: Long = 0L
+) {
+  override fun toString(): String =
+    "PendingRemoteRevocation(id=$id, origin=$origin, account=$account, peerHostId=$peerHostId, clientDeviceId=$clientDeviceId, attempts=$attempts)"
+}
+
+internal object PendingRemoteRevocationCodec {
+  fun encodeList(items: List<PendingRemoteRevocation>): String = org.json.JSONArray().apply {
+    items.forEach { item ->
+      put(JSONObject()
+        .put("id", item.id)
+        .put("origin", item.origin)
+        .put("account", item.account)
+        .put("peerHostId", item.peerHostId)
+        .put("clientDeviceId", item.clientDeviceId)
+        .put("accessToken", item.accessToken)
+        .put("refreshToken", item.refreshToken)
+        .put("allowCleartext", item.allowCleartext)
+        .put("createdAt", item.createdAt)
+        .put("attempts", item.attempts)
+        .put("lastAttemptAt", item.lastAttemptAt))
+    }
+  }.toString()
+
+  fun decodeList(text: String): List<PendingRemoteRevocation> {
+    if (text.isBlank()) return emptyList()
+    val array = org.json.JSONArray(text)
+    return (0 until array.length()).mapNotNull { i ->
+      val obj = array.optJSONObject(i) ?: return@mapNotNull null
+      val id = obj.optString("id").takeIf(String::isNotBlank) ?: return@mapNotNull null
+      val origin = runCatching { canonicalRemoteOrigin(obj.optString("origin")) }.getOrNull() ?: return@mapNotNull null
+      val account = obj.optString("account").takeIf(String::isNotBlank) ?: return@mapNotNull null
+      val peerHostId = obj.optString("peerHostId").takeIf(String::isNotBlank) ?: return@mapNotNull null
+      val clientDeviceId = obj.optString("clientDeviceId").takeIf(RemoteServerApi::validDeviceId) ?: return@mapNotNull null
+      val accessToken = obj.optString("accessToken").takeIf(RemoteServerApi::validToken) ?: return@mapNotNull null
+      val refreshToken = obj.optString("refreshToken").takeIf(RemoteServerApi::validToken) ?: return@mapNotNull null
+      PendingRemoteRevocation(
+        id = id,
+        origin = origin,
+        account = account,
+        peerHostId = peerHostId,
+        clientDeviceId = clientDeviceId,
+        accessToken = accessToken,
+        refreshToken = refreshToken,
+        allowCleartext = obj.optBoolean("allowCleartext", false),
+        createdAt = obj.optLong("createdAt", 0L),
+        attempts = obj.optInt("attempts", 0).coerceAtLeast(0),
+        lastAttemptAt = obj.optLong("lastAttemptAt", 0L).coerceAtLeast(0L)
+      )
+    }
+  }
+}
+
 /** Implementations must durably replace the whole record before returning, and fail on corruption. */
 internal interface RemoteDeviceStore {
   fun load(slot: String): RemoteDeviceRecord?
   fun save(slot: String, record: RemoteDeviceRecord)
   fun delete(slot: String)
+  fun listSlots(): Set<String> = emptySet()
+  fun pendingRevocations(): List<PendingRemoteRevocation> = emptyList()
+  fun enqueueRevocation(item: PendingRemoteRevocation) {}
+  fun updateRevocation(item: PendingRemoteRevocation) {}
+  fun removeRevocation(id: String) {}
 }
 
 internal object RemoteDeviceCodec {
@@ -75,9 +144,18 @@ internal object RemoteDeviceCodec {
 }
 
 internal fun canonicalRemoteOrigin(address: String): String {
-  val url = requireNotNull(address.trim().toHttpUrlOrNull()) { "DSH Hub 地址无效" }
-  require(url.username.isEmpty() && url.password.isEmpty() && url.encodedPath == "/" && url.query == null && url.fragment == null)
-  return url.toString()
+  val trimmed = address.trim()
+  val url = parseFlexibleHttpUrl(trimmed)
+  if (url != null) {
+    require(url.username.isEmpty() && url.password.isEmpty() && url.encodedPath == "/" && url.query == null && url.fragment == null)
+    return url.toString()
+  }
+  val match = Regex("^(https?)://([^/?#]+)(/)?$", RegexOption.IGNORE_CASE).matchEntire(trimmed)
+    ?: throw IllegalArgumentException("DSH Hub 地址无效")
+  val origin = canonicalizeFlexibleHttpOrigin(trimmed)
+    ?: throw IllegalArgumentException("DSH Hub 地址无效")
+  require(!match.groupValues[2].contains('@')) { "DSH Hub 地址无效" }
+  return "$origin/"
 }
 
 /**

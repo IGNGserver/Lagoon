@@ -253,8 +253,9 @@ object DeviceProjection {
   private fun protocolOrder(protocol: HarnessProtocolId): Int = when (protocol) {
     HarnessProtocolId.DSH_TYPERT -> 0
     HarnessProtocolId.OPENCODE_NATIVE -> 1
-    HarnessProtocolId.CODEX_APP_SERVER -> 2
-    HarnessProtocolId.ANTIGRAVITY_ACP -> 3
+    HarnessProtocolId.OPENCODE_ACP -> 2
+    HarnessProtocolId.CODEX_APP_SERVER -> 3
+    HarnessProtocolId.ANTIGRAVITY_ACP -> 4
   }
 
   private fun harnessName(protocol: HarnessProtocolId, fallback: String): String {
@@ -262,6 +263,7 @@ object DeviceProjection {
     return when (protocol) {
       HarnessProtocolId.DSH_TYPERT -> "DeepSeek Harness"
       HarnessProtocolId.OPENCODE_NATIVE -> "OpenCode"
+      HarnessProtocolId.OPENCODE_ACP -> "OpenCode ACP"
       HarnessProtocolId.CODEX_APP_SERVER -> "Codex"
       HarnessProtocolId.ANTIGRAVITY_ACP -> "Antigravity"
     }

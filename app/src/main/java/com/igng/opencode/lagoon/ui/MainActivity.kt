@@ -240,7 +240,11 @@ class MainActivity : ComponentActivity() {
         lifecycle.addObserver(observer); visible(lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED))
         onDispose { lifecycle.removeObserver(observer); visible(false) }
       }
-      LaunchedEffect(state.profiles.isEmpty()) { if (state.profiles.isEmpty()) addDevice() }
+      LaunchedEffect(state.profiles.isEmpty()) {
+        if (state.profiles.isEmpty() && navigator.navigation.editors.isEmpty()) {
+          navigator.navigate(SessionNavigation(editors = listOf(DeviceEditorRoute(access = AddDeviceAccess.HUB))))
+        }
+      }
       LaunchedEffect(state.error) { state.error?.let { globalMessage = it; globalMessageType = MiuixToastType.ERROR; controller.clearError() } }
       LaunchedEffect(state.message, state.messageTone) {
         state.message?.let {
@@ -382,13 +386,15 @@ class MainActivity : ComponentActivity() {
                    controller.state.value.serverId?.let { server -> openSession(SessionTarget(server, child), child = true) }
                  }, onModal = {}, interactive = active)
                   target.page == RootPage.DEVICES && target.harness != null -> HarnessDetailScreen(
-                    state = state, controller = controller, leafId = target.harness, onBack = { goBack() },
+                    state = state, controller = controller, leafId = target.harness,
+                    onBack = { if (navigator.navigation.editors.isEmpty()) goBack() },
                     onEditProfile = { profile -> editDirectProfile(profile) },
                     onManageHub = { showingRemoteHosts = true },
                     onManageModels = { showingModelManagement = true }
                   )
                   target.page == RootPage.DEVICES && target.device != null -> DeviceDetailScreen(
-                    state = state, controller = controller, deviceId = target.device, onBack = { goBack() },
+                    state = state, controller = controller, deviceId = target.device,
+                    onBack = { if (navigator.navigation.editors.isEmpty()) goBack() },
                     onOpenHarness = { leafId -> openHarness(leafId) },
                     onAddHarness = { device, slot ->
                       scope.launch {
@@ -528,8 +534,7 @@ class MainActivity : ComponentActivity() {
             if (showingRemoteEnroll) RemoteEnrollSheet(controller, onDismiss = { showingRemoteEnroll = false }, onDone = { added ->
               showingRemoteEnroll = false
               if (added > 0) {
-                 globalMessage = "已保存 $added 台远程主机，请逐个选择 Harness"; globalMessageType = MiuixToastType.SUCCESS
-                 showingRemoteHosts = true
+                 globalMessage = "已接入 $added 台远程主机，正在连接就绪的 Harness"; globalMessageType = MiuixToastType.SUCCESS
                }
             }, onOpenPairing = {
               showingRemoteEnroll = false; showingRemotePairing = true

@@ -30,6 +30,8 @@ internal fun RemoteNativeServicesSheet(
     var unsupported by remember { mutableStateOf(false) }
     var dshAvailable by remember { mutableStateOf(false) }
     var codexAvailable by remember { mutableStateOf(false) }
+    var agyAvailable by remember { mutableStateOf(false) }
+    var openCodeAcpAvailable by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     var refresh by remember { mutableIntStateOf(0) }
     val savedProfiles = state.profiles.filter { it.matchesNativeServiceHost(profile) }
@@ -39,6 +41,12 @@ internal fun RemoteNativeServicesSheet(
     val savedCodex = state.profiles.firstOrNull { it.protocol == HarnessProtocolId.CODEX_APP_SERVER && it.remoteHostId == profile.remoteHostId &&
       it.username.trim() == profile.username.trim() &&
       runCatching { canonicalRemoteOrigin(it.url) == canonicalRemoteOrigin(profile.url) }.getOrDefault(false) }
+    val savedAgy = state.profiles.firstOrNull { it.protocol == HarnessProtocolId.ANTIGRAVITY_ACP && it.remoteHostId == profile.remoteHostId &&
+      it.username.trim() == profile.username.trim() &&
+      runCatching { canonicalRemoteOrigin(it.url) == canonicalRemoteOrigin(profile.url) }.getOrDefault(false) }
+    val savedOpenCodeAcp = state.profiles.firstOrNull { it.protocol == HarnessProtocolId.OPENCODE_ACP && it.remoteHostId == profile.remoteHostId &&
+      it.username.trim() == profile.username.trim() &&
+      runCatching { canonicalRemoteOrigin(it.url) == canonicalRemoteOrigin(profile.url) }.getOrDefault(false) }
 
     LaunchedEffect(refresh) {
       busy = true
@@ -46,6 +54,8 @@ internal fun RemoteNativeServicesSheet(
       unsupported = false
       dshAvailable = false
       codexAvailable = false
+      agyAvailable = false
+      openCodeAcpAvailable = false
       // A failed refresh must not leave an old descriptor selectable.
       catalog = null
       try {
@@ -55,6 +65,8 @@ internal fun RemoteNativeServicesSheet(
         catalog = services.native
         dshAvailable = services.dshAvailable
         codexAvailable = services.codexAvailable
+        agyAvailable = services.agyAvailable
+        openCodeAcpAvailable = services.openCodeAcpAvailable
         unsupported = catalog == null
       } catch (cancel: CancellationException) { throw cancel }
       catch (failure: Exception) { error = userFacingError(failure, "读取 Host 原生服务失败") }
@@ -149,6 +161,48 @@ internal fun RemoteNativeServicesSheet(
                 variant = HyperButtonVariant.SECONDARY, onClick = { saveDsh(false) })
               HyperButton(text = "加入并启用", enabled = !busy && dshAvailable, modifier = Modifier.weight(1f),
                 onClick = { saveDsh(true) })
+            }
+          }
+        }
+        item {
+          HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(vertical = 4.dp)) {
+            HyperRow(title = "Antigravity · ACP", summary = "通过官方 ACP 接入 Antigravity；会话按工作区独立加载",
+              value = if (agyAvailable) "可用" else if (busy) "检测中" else "未声明")
+            val existingAgy = savedAgy
+            if (existingAgy != null) HyperSwitchRow(title = "启用 Antigravity", checked = existingAgy.enabled,
+              enabled = !busy && (agyAvailable || existingAgy.enabled),
+              summary = "停用不会删除远端会话", onCheckedChange = { setEnabled(existingAgy, it) })
+            else Row(Modifier.fillMaxWidth().padding(12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+              fun saveAgy(enabled: Boolean) {
+                try { controller.addRemoteAgyService(profile, enabled) }
+                catch (cancel: CancellationException) { throw cancel }
+                catch (failure: Exception) { error = userFacingError(failure, "保存 Antigravity 连接失败") }
+              }
+              HyperButton(text = "加入（停用）", enabled = !busy && agyAvailable, modifier = Modifier.weight(1f),
+                variant = HyperButtonVariant.SECONDARY, onClick = { saveAgy(false) })
+              HyperButton(text = "加入并启用", enabled = !busy && agyAvailable, modifier = Modifier.weight(1f),
+                onClick = { saveAgy(true) })
+            }
+          }
+        }
+        item {
+          HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(vertical = 4.dp)) {
+            HyperRow(title = "OpenCode · ACP", summary = "通过 Host ACP 接入 OpenCode；无需本地端口映射",
+              value = if (openCodeAcpAvailable) "可用" else if (busy) "检测中" else "未声明")
+            val existingOpenCodeAcp = savedOpenCodeAcp
+            if (existingOpenCodeAcp != null) HyperSwitchRow(title = "启用 OpenCode ACP", checked = existingOpenCodeAcp.enabled,
+              enabled = !busy && (openCodeAcpAvailable || existingOpenCodeAcp.enabled),
+              summary = "停用不会删除远端会话", onCheckedChange = { setEnabled(existingOpenCodeAcp, it) })
+            else Row(Modifier.fillMaxWidth().padding(12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+              fun saveOpenCodeAcp(enabled: Boolean) {
+                try { controller.addRemoteOpenCodeAcpService(profile, enabled) }
+                catch (cancel: CancellationException) { throw cancel }
+                catch (failure: Exception) { error = userFacingError(failure, "保存 OpenCode ACP 连接失败") }
+              }
+              HyperButton(text = "加入（停用）", enabled = !busy && openCodeAcpAvailable, modifier = Modifier.weight(1f),
+                variant = HyperButtonVariant.SECONDARY, onClick = { saveOpenCodeAcp(false) })
+              HyperButton(text = "加入并启用", enabled = !busy && openCodeAcpAvailable, modifier = Modifier.weight(1f),
+                onClick = { saveOpenCodeAcp(true) })
             }
           }
         }

@@ -8,8 +8,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import org.json.JSONObject
 import java.io.IOException
 import java.util.Base64
@@ -21,7 +21,7 @@ internal class RemoteGateway(private val transferFrames: Boolean = false, privat
   private data class StreamState(val endpoint: String, val output: Channel<Any>, val frames: Channel<JSONObject>,
     var worker: Job? = null, var failure: IOException? = null)
   private val streams = ConcurrentHashMap<String, StreamState>()
-  private val transfers = Mutex()
+  private val transfers = Semaphore(2)
   @Volatile private var closed = false
   /** 最近一次流级失败的原因，供连接详情/日志定位；不参与控制流。 */
   @Volatile internal var lastError: String? = null
@@ -97,7 +97,7 @@ internal class RemoteGateway(private val transferFrames: Boolean = false, privat
     return RemoteGatewayException(code, message, details)
   }
 
-  private suspend fun transfer(encoded: ByteArray): Any? = transfers.withLock {
+  private suspend fun transfer(encoded: ByteArray): Any? = transfers.withPermit {
     if (encoded.size > MAX_TRANSFER) throw IOException("Remote 传输请求超过上限")
     val id = UUID.randomUUID().toString()
     val total = (encoded.size + CHUNK - 1) / CHUNK
@@ -294,7 +294,7 @@ internal class RemoteGateway(private val transferFrames: Boolean = false, privat
      * 1 条 `$events` + 1 条 `workspace/follow` + 最多 [DshApi.WATCH_LIMIT] 条 `session/follow`
      * + 1 条 `job/follow` + 少量 `job/list`。16 太贴近上限，首页刷新或快照重试就会越界。
      */
-    const val MAX_STREAMS = 32
+    const val MAX_STREAMS = 16
     const val DIRECT_LIMIT = 2 * 1024 * 1024
     const val MAX_TRANSFER = 288 * 1024 * 1024
     /** Host 允许 288 MiB 的分块响应；设备侧仍留出内存余量，超过就明确报错而不是装作“描述无效”。 */
@@ -313,14 +313,39 @@ internal class RemoteGateway(private val transferFrames: Boolean = false, privat
       "directoryPicker/list",
       "fileReferences/list",
       "job/list",
+      "llm/listConfigurableProviders",
+      "llm/listProviders",
+      "messageFeedback/list",
+      "officeToPdf/generation",
       "permissionPresets/catalog",
+      "pluginInventory/list",
+      "pluginManager/listBundles",
+      "pluginManager/listPlugins",
+      "pluginManager/listVersions",
+      "pluginManager/readBundleDetail",
+      "schedule/catalog",
+      "schedule/deliveryLimits",
+      "schedule/history",
+      "schedule/list",
+      "session/attachment",
+      "session/canOpenWorkspacePath",
+      "session/events",
       "session/list",
       "session/modelCatalog",
       "session/page",
       "session/projections",
+      "session/search",
+      "session/workspacePathApplications",
+      "sessionReferenceResolver/candidates",
+      "settings/describe",
+      "skills/list",
+      "subagents/list",
+      "workspaceFiles/changes",
       "workspaceFiles/list",
       "workspaceFiles/read",
+      "workspaceFiles/readAll",
       "workspaceFiles/readBytes",
+      "workspaceFiles/readRelated",
       "workspaceFiles/stat"
     )
   }

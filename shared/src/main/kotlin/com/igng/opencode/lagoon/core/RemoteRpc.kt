@@ -35,21 +35,48 @@ internal class RemoteRpc(
     require(method.matches(Regex("[a-z][a-zA-Z0-9.]{0,127}"))) { "Remote RPC 方法无效" }
     require(timeoutMillis in 1..2_147_483_647L) { "Remote RPC 超时无效" }
     val id = UUID.randomUUID().toString()
+    val envelope = JSONObject().put("v", 1).put("id", id).put("type", "rpc.request")
+      .put("timestamp", clock()).put("payload", JSONObject().put("method", method).put("params", params))
+      .toString().toByteArray(Charsets.UTF_8)
+    return executeRpcFrame(id, envelope, timeoutMillis)
+  }
+
+  /** Sends a binary chunk RPC frame using the DSHUP\x01\x00\x00 wire prefix. */
+  suspend fun callBinaryUploadChunk(params: JSONObject, chunk: ByteArray, timeoutMillis: Long = 60_000): Any? {
+    require(timeoutMillis in 1..2_147_483_647L) { "Remote RPC 超时无效" }
+    require(chunk.size in 1..MAX_BINARY_UPLOAD_CHUNK_BYTES) { "二进制上传块大小无效" }
+    require(!params.has("data")) { "二进制上传头不能包含 data 字段" }
+    val id = UUID.randomUUID().toString()
+    val header = JSONObject().put("v", 1).put("id", id).put("type", "rpc.request")
+      .put("timestamp", clock())
+      .put("payload", JSONObject().put("method", "workspace.upload.chunk.binary").put("params", params))
+      .toString().toByteArray(Charsets.UTF_8)
+    require(header.size in 1..MAX_BINARY_UPLOAD_HEADER_BYTES) { "二进制上传头大小超限" }
+    val frame = ByteArray(BINARY_UPLOAD_PREFIX_BYTES + header.size + chunk.size)
+    BINARY_UPLOAD_MAGIC.copyInto(frame, destinationOffset = 0)
+    val headerLen = header.size
+    frame[8] = ((headerLen ushr 24) and 0xFF).toByte()
+    frame[9] = ((headerLen ushr 16) and 0xFF).toByte()
+    frame[10] = ((headerLen ushr 8) and 0xFF).toByte()
+    frame[11] = (headerLen and 0xFF).toByte()
+    header.copyInto(frame, destinationOffset = BINARY_UPLOAD_PREFIX_BYTES)
+    chunk.copyInto(frame, destinationOffset = BINARY_UPLOAD_PREFIX_BYTES + header.size)
+    return executeRpcFrame(id, frame, timeoutMillis)
+  }
+
+  private suspend fun executeRpcFrame(id: String, frame: ByteArray, timeoutMillis: Long): Any? {
     val result = CompletableDeferred<Any?>()
     synchronized(lock) {
       if (closed) throw RemoteRpcException("TRANSPORT_CLOSED")
       if (pending.size >= MAX_PENDING) throw RemoteRpcException("TOO_MANY_PENDING")
       pending[id] = result
     }
-    val envelope = JSONObject().put("v", 1).put("id", id).put("type", "rpc.request")
-      .put("timestamp", clock()).put("payload", JSONObject().put("method", method).put("params", params))
-      .toString().toByteArray(Charsets.UTF_8)
     try {
-      if (envelope.size > RemoteSecureFragments.MAX_MESSAGE_BYTES) throw RemoteRpcException("FRAME_TOO_LARGE")
+      if (frame.size > RemoteSecureFragments.MAX_MESSAGE_BYTES) throw RemoteRpcException("FRAME_TOO_LARGE")
       return withTimeout(timeoutMillis) {
         writeLock.withLock {
           synchronized(lock) { if (closed) throw RemoteRpcException("TRANSPORT_CLOSED") }
-          channel.send(envelope)
+          channel.send(frame)
         }
         result.await()
       }
@@ -108,5 +135,11 @@ internal class RemoteRpc(
   private fun requestId(payload: JSONObject): String = (payload.opt("requestId") as? String)
     ?.takeIf { it.isNotBlank() && it.length <= 128 } ?: throw IOException("Remote 响应关联 ID 无效")
 
-  private companion object { const val MAX_PENDING = 128 }
+  private companion object {
+    const val MAX_PENDING = 128
+    val BINARY_UPLOAD_MAGIC = byteArrayOf(0x44, 0x53, 0x48, 0x55, 0x50, 1, 0, 0)
+    const val BINARY_UPLOAD_PREFIX_BYTES = 12
+    const val MAX_BINARY_UPLOAD_HEADER_BYTES = 4096
+    const val MAX_BINARY_UPLOAD_CHUNK_BYTES = 256 * 1024
+  }
 }

@@ -41,7 +41,8 @@ internal class FakeRemoteHost(
   /** Optional real Codex peer bridge; exists only in the opt-in interoperability fixture. */
   private val codexRpc: ((method: String, params: JSONObject, publish: (String, JSONObject) -> Unit) -> JSONObject)? = null,
   /** Opt-in AGY bridge returns the actual ACP gateway result, including arrays and null. */
-  private val agyRpc: ((method: String, params: JSONObject, publish: (String, JSONObject) -> Unit) -> Any?)? = null
+  private val agyRpc: ((method: String, params: JSONObject, publish: (String, JSONObject) -> Unit) -> Any?)? = null,
+  private val workspaceTypes: JSONArray? = null
 ) : AutoCloseable {
   val server = MockWebServer()
   val requests: MutableList<String> = Collections.synchronizedList(mutableListOf())
@@ -76,6 +77,8 @@ internal class FakeRemoteHost(
   var streamFailure: String? = null
   /** 返回非空错误码时，`stream.open` 直接以 rpc.error 拒绝（模拟参数形状/网关校验失败）。 */
   var streamOpenError: (endpoint: String, payload: JSONObject) -> String? = { _, _ -> null }
+  /** 顶层 RPC 处理器（可选），接收 method、params 与二进制分块。 */
+  var topLevelRpc: ((method: String, params: JSONObject, binaryChunk: ByteArray?) -> Any?)? = null
 
   private val connectionId = UUID.randomUUID().toString()
 
@@ -178,7 +181,7 @@ internal class FakeRemoteHost(
             val plaintext = ByteArray(input.size)
             val count = pair.receiver.decryptWithAd(null, input, 0, plaintext, 0, input.size)
             val assembled = incomingFragments.decode(plaintext.copyOf(count)) ?: return
-            handleMessage(webSocket, JSONObject(String(assembled, Charsets.UTF_8)))
+            handleAssembled(webSocket, assembled)
           }
           "ping" -> send(webSocket, "pong", JSONObject().put("nonce", payload.opt("nonce") ?: ""))
           else -> Unit
@@ -214,7 +217,7 @@ internal class FakeRemoteHost(
           val plaintext = ByteArray(input.size)
           val count = pair.receiver.decryptWithAd(null, input, 0, plaintext, 0, input.size)
           val assembled = incomingFragments.decode(plaintext.copyOf(count)) ?: return
-          handleMessage(webSocket, JSONObject(String(assembled, Charsets.UTF_8)))
+          handleAssembled(webSocket, assembled)
         }
         "ping" -> sendOn(webSocket, "pong", payload)
         else -> Unit
@@ -241,7 +244,23 @@ internal class FakeRemoteHost(
       .put("data", Base64.getUrlEncoder().withoutPadding().encodeToString(output.copyOf(length))))
   }
 
-  private fun handleMessage(socket: WebSocket, message: JSONObject) {
+  private fun handleAssembled(socket: WebSocket, assembled: ByteArray) {
+    val magic = byteArrayOf(0x44, 0x53, 0x48, 0x55, 0x50, 1, 0, 0)
+    if (assembled.size >= 12 && magic.indices.all { assembled[it] == magic[it] }) {
+      val headerLen = ((assembled[8].toInt() and 0xFF) shl 24) or
+        ((assembled[9].toInt() and 0xFF) shl 16) or
+        ((assembled[10].toInt() and 0xFF) shl 8) or
+        (assembled[11].toInt() and 0xFF)
+      require(headerLen in 1..4096 && 12 + headerLen < assembled.size) { "Invalid DSHUP header length: $headerLen" }
+      val header = JSONObject(String(assembled, 12, headerLen, Charsets.UTF_8))
+      val chunk = assembled.copyOfRange(12 + headerLen, assembled.size)
+      handleMessage(socket, header, chunk)
+      return
+    }
+    handleMessage(socket, JSONObject(String(assembled, Charsets.UTF_8)))
+  }
+
+  private fun handleMessage(socket: WebSocket, message: JSONObject, binaryChunk: ByteArray? = null) {
     if (message.optString("type") != "rpc.request") return
     val id = message.getString("id")
     val payload = message.getJSONObject("payload")
@@ -279,7 +298,8 @@ internal class FakeRemoteHost(
     when (method) {
       "harness.transport.describe" -> respond(JSONObject().put("capabilities", JSONArray(
         capabilities + if (nativeRpc != null) listOf("harness.services.v1") else emptyList())).also { description ->
-          if (agyRpc != null) description.put("workspaceTypes", JSONArray().put(JSONObject().put("id", "antigravity")
+          if (workspaceTypes != null) description.put("workspaceTypes", workspaceTypes)
+          else if (agyRpc != null) description.put("workspaceTypes", JSONArray().put(JSONObject().put("id", "antigravity")
             .put("name", "Antigravity").put("capability", "agent.acp.antigravity.v1").put("available", true)))
         })
       "harness.remote.call" -> {
@@ -333,6 +353,7 @@ internal class FakeRemoteHost(
           method.startsWith("agent.acp.") -> agyRpc
           else -> null
         }
+        val topLevel = topLevelRpc
         if (bridge != null) {
           // Blocking stdio is isolated from OkHttp's receiver, so early native event publication
           // can take the wire gate and so a close/cancel frame cannot deadlock that receiver.
@@ -344,6 +365,14 @@ internal class FakeRemoteHost(
                 .put("timestamp", System.currentTimeMillis())
                 .put("payload", JSONObject().put("requestId", id).put("code", code).put("message", code)))
             }
+          }
+        } else if (topLevel != null) {
+          try { respond(topLevel.invoke(method, params, binaryChunk)) }
+          catch (error: Exception) {
+            val code = (error as? RemoteRpcException)?.code ?: "TOP_LEVEL_RPC_FAILED"
+            sendMessage(socket, JSONObject().put("v", 1).put("id", id).put("type", "rpc.error")
+              .put("timestamp", System.currentTimeMillis())
+              .put("payload", JSONObject().put("requestId", id).put("code", code).put("message", error.message ?: code)))
           }
         } else respond(JSONObject().put("ok", true))
       }

@@ -30,6 +30,9 @@ internal class RemoteConnection private constructor(
 
   suspend fun call(method: String, params: JSONObject, timeoutMillis: Long = 30_000): Any? = rpc.call(method, params, timeoutMillis)
 
+  suspend fun callBinaryUploadChunk(params: JSONObject, chunk: ByteArray, timeoutMillis: Long = 60_000): Any? =
+    rpc.callBinaryUploadChunk(params, chunk, timeoutMillis)
+
   suspend fun capabilities(): RemoteCapabilities {
     val description = call("harness.transport.describe", JSONObject()) as? JSONObject
       ?: throw IOException("Host 返回无效能力描述")

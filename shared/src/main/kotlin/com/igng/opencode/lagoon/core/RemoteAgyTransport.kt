@@ -25,12 +25,12 @@ import org.json.JSONObject
 
 /** Children belong to one authenticated Noise generation; never silently retarget a request. */
 internal class RemoteAgyRegistry(private val transfer: Boolean, private val files: Boolean, private val terminal: Boolean = false,
-  private val rpc: suspend (String, JSONObject) -> Any?) : Closeable {
+  private val backendId: String = "antigravity", private val rpc: suspend (String, JSONObject) -> Any?) : Closeable {
   private val children = ConcurrentHashMap.newKeySet<RemoteAgyTransport>()
   @Volatile private var closed = false
   fun acquire(): AgyTransport {
     check(!closed) { "Remote AGY 连接已关闭" }
-    val child = RemoteAgyTransport(transfer, files, rpc, terminal) { children.remove(it) }
+    val child = RemoteAgyTransport(transfer, files, rpc, terminal, backendId) { children.remove(it) }
     children.add(child)
     if (closed) { child.connectionClosed(); throw IOException("Remote AGY 连接已关闭") }
     return child
@@ -53,8 +53,10 @@ internal class RemoteAgyTransport(
   override val filesAvailable: Boolean,
   private val rpc: suspend (String, JSONObject) -> Any?,
   override val terminalAvailable: Boolean = false,
+  private val backendId: String = "antigravity",
   private val release: (RemoteAgyTransport) -> Unit = {}
 ) : AgyTransport {
+  private val scopePrefix: String get() = if (backendId == "opencode") "opencode" else "acp"
   override val remote = true
   override val promptCompletesOnResponse = false
   private val output = Channel<JSONObject>(256)
@@ -82,8 +84,8 @@ internal class RemoteAgyTransport(
     val id = agent.ifBlank { session }
     if (!validId(id) || agent.isNotBlank() && session.isNotBlank() && agent != session) throw IOException("AGY 终端会话无效")
     val scoped = JSONObject(args.toString())
-    if (agent.isNotBlank()) scoped.put("agentId", "acp:$id")
-    if (session.isNotBlank()) scoped.put("sessionId", "acp:$id")
+    if (agent.isNotBlank()) scoped.put("agentId", "$scopePrefix:$id")
+    if (session.isNotBlank()) scoped.put("sessionId", "$scopePrefix:$id")
     return when (method) {
       "harness.remote.call" -> {
         if (endpoint !in setOf("terminal/environment", "terminal/shells", "terminal/list", "terminal/create", "terminal/write", "terminal/resize", "terminal/rename", "terminal/close"))
@@ -94,7 +96,7 @@ internal class RemoteAgyTransport(
       "harness.remote.stream.open" -> {
         if (endpoint !in setOf("terminal/follow", "terminal/retain")) throw IOException("AGY 终端流无效")
         val result = rpc("agent.acp.stream.open", JSONObject().put("streamId", params.getString("streamId")).put("sessionId", id)
-          .put("tool", JSONObject().put("backend", "antigravity").put("endpoint", endpoint).put("args", scoped))) as? JSONObject
+          .put("tool", JSONObject().put("backend", backendId).put("endpoint", endpoint).put("args", scoped))) as? JSONObject
           ?: throw IOException("AGY 终端流响应无效")
         if (!result.optBoolean("opened")) throw IOException("AGY 终端流未打开")
         result
@@ -125,7 +127,7 @@ internal class RemoteAgyTransport(
     checkOpen()
     val arguments = JSONObject(params.toString())
     // session/cancel has a strict envelope without backend; session ownership supplies it.
-    if (method != "session/cancel") arguments.put("backend", "antigravity")
+    if (method != "session/cancel") arguments.put("backend", backendId)
     val value = rpc("agent.acp.call", JSONObject().put("method", method).put("params", arguments))
     checkOpen()
     return value
@@ -133,7 +135,7 @@ internal class RemoteAgyTransport(
   override suspend fun health() {
     val result = hostCall("initialize", JSONObject().put("protocolVersion", 1)) as? JSONObject
       ?: throw IOException("Remote AGY 健康检查响应无效")
-    if (result.optInt("protocolVersion", -1) != 1 || result.optString("backend") != "antigravity")
+    if (result.optInt("protocolVersion", -1) != 1 || result.optString("backend") != backendId)
       throw IOException("Remote AGY 健康检查身份无效")
   }
   override suspend fun call(method: String, params: JSONObject): JSONObject = when (method) {
@@ -157,23 +159,29 @@ internal class RemoteAgyTransport(
   private suspend fun listSessions(params: JSONObject): JSONObject {
     if (params.has("cursor") && !params.isNull("cursor")) throw ApiException(501, "当前 Remote Host 不支持 AGY 会话分页")
     val cwd = params.optString("cwd")
-    val paths = if (cwd.isNotBlank()) listOf(cwd) else {
-      val value = hostCall("dsh/workspaceList", JSONObject()) as? JSONArray ?: throw IOException("Remote AGY 工作区目录无效")
-      if (value.length() > 1000) throw IOException("Remote AGY 工作区目录超过上限")
-      (0 until value.length()).map { index -> value.optJSONObject(index)?.optString("path")?.takeIf(String::isNotBlank)
-        ?: throw IOException("Remote AGY 工作区路径无效") }
+    val paths = when {
+      cwd.isNotBlank() -> listOf(cwd)
+      backendId == "opencode" -> listOf("")
+      else -> {
+        val value = hostCall("dsh/workspaceList", JSONObject()) as? JSONArray ?: throw IOException("Remote AGY 工作区目录无效")
+        if (value.length() > 1000) throw IOException("Remote AGY 工作区目录超过上限")
+        (0 until value.length()).map { index -> value.optJSONObject(index)?.optString("path")?.takeIf(String::isNotBlank)
+          ?: throw IOException("Remote AGY 工作区路径无效") }
+      }
     }
     val sessions = JSONArray()
     for (path in paths.distinct()) {
-      val result = hostCall("dsh/sessionList", JSONObject().put("path", path).put("limit", 100).put("prewarm", false)) as? JSONObject
+      val result = hostCall("dsh/sessionList", JSONObject().put("path", path).put("limit", 500).put("prewarm", false)) as? JSONObject
         ?: throw IOException("Remote AGY 会话列表无效")
       val rows = result.optJSONArray("items") ?: throw IOException("Remote AGY 会话列表缺少内容")
-      if (rows.length() >= 100) throw IOException("Remote Host 只返回每个工作区最多 100 个 AGY 会话，无法确认列表完整")
+      if (rows.length() > 5_000) throw IOException("Remote ACP 会话列表超过上限")
       for (index in 0 until rows.length()) {
         val row = rows.optJSONObject(index) ?: throw IOException("Remote AGY 会话条目无效")
         val id = row.optString("conversationId")
         if (!validId(id)) throw IOException("Remote AGY 会话身份无效")
-        val item = JSONObject().put("sessionId", id).put("cwd", path).put("title", row.optString("title"))
+        val itemCwd = row.optString("cwd").takeIf(String::isNotBlank) ?: path
+        if (itemCwd.isBlank()) continue
+        val item = JSONObject().put("sessionId", id).put("cwd", itemCwd).put("title", row.optString("title"))
         val updated = row.optLong("updatedAt", 0)
         if (updated > 0) item.put("updatedAt", java.time.Instant.ofEpochMilli(updated).toString())
         sessions.put(item)
@@ -185,7 +193,7 @@ internal class RemoteAgyTransport(
     val sessionId = params.optString("sessionId")
     if (!validId(sessionId)) throw IOException("AGY 会话身份无效")
     val result = transferred(JSONObject().put("method", "dsh/sessionHistory")
-      .put("params", JSONObject().put("backend", "antigravity").put("sessionId", "acp:$sessionId"))) as? JSONObject
+      .put("params", JSONObject().put("backend", backendId).put("sessionId", "$scopePrefix:$sessionId"))) as? JSONObject
       ?: throw IOException("Remote AGY 历史响应无效")
     val events = result.optJSONArray("events") ?: throw IOException("Remote AGY 历史缺少事件")
     if (events.length() > 10_000) throw IOException("Remote AGY 历史超过上限")
@@ -227,7 +235,7 @@ internal class RemoteAgyTransport(
     if (!filesAvailable) throw ApiException(501, "Remote Host 未声明 AGY 文件浏览能力")
     val relative = path.trim().ifBlank { "." }
     val result = hostCall("dsh/toolCall", JSONObject().put("sessionId", session.id).put("endpoint", "workspaceFiles/list")
-      .put("args", JSONObject().put("workspaceFileScopeId", "acp:${session.id}").put("path", relative))) as? JSONObject
+      .put("args", JSONObject().put("workspaceFileScopeId", "$scopePrefix:${session.id}").put("path", relative))) as? JSONObject
       ?: throw IOException("Remote AGY 文件列表无效")
     val listed = result.optString("path").trim('/')
     val entries = result.optJSONArray("entries") ?: throw IOException("Remote AGY 文件列表缺少条目")
@@ -243,7 +251,7 @@ internal class RemoteAgyTransport(
     if (!filesAvailable) throw ApiException(501, "Remote Host 未声明 AGY 文件浏览能力")
     val limit = 2 * 1024 * 1024
     val result = hostCall("dsh/toolCall", JSONObject().put("sessionId", session.id).put("endpoint", "workspaceFiles/readBytes")
-      .put("args", JSONObject().put("workspaceFileScopeId", "acp:${session.id}").put("path", path)
+      .put("args", JSONObject().put("workspaceFileScopeId", "$scopePrefix:${session.id}").put("path", path)
         .put("range", JSONObject().put("offset", 0).put("length", limit)))) as? JSONObject
       ?: throw IOException("Remote AGY 文件内容无效")
     val size = result.optLong("bytes", -1)
@@ -313,7 +321,7 @@ internal class RemoteAgyTransport(
     val id = params.optString("sessionId")
     if (!validId(id)) throw IOException("AGY 会话身份无效")
     ensureLiveLoaded(id)
-    val request = JSONObject(params.toString()).put("backend", "antigravity")
+    val request = JSONObject(params.toString()).put("backend", backendId)
     val prompt = request.optJSONArray("prompt") ?: JSONArray()
     val images = (0 until prompt.length()).count { prompt.optJSONObject(it)?.optString("type") == "image" }
     if (images > 4) throw ApiException(400, "Remote AGY 每条消息最多支持 4 张图片")
@@ -369,6 +377,8 @@ internal class RemoteAgyTransport(
   }
   internal fun event(name: String, data: JSONObject) {
     if (closed) return
+    val frameBackend = data.optString("backend").ifBlank { data.optJSONObject("frame")?.optJSONObject("params")?.optString("backend").orEmpty() }
+    if (frameBackend.isNotBlank() && frameBackend != backendId) return
     val stream = data.optString("streamId")
     if (terminalGateway.isInitialized()) {
       if (name == "agent.acp.stream.closed") terminalGateway.value.event(JSONObject().put("event", "harness.remote.stream.closed").put("data", data))

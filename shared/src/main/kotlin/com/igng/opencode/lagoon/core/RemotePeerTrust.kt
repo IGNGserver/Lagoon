@@ -3,7 +3,6 @@ package com.igng.opencode.lagoon.core
 import java.io.IOException
 import java.security.MessageDigest
 import java.util.Base64
-import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 
 /** Trust belongs to one Server origin, account and Host ID; persist only after authenticated lookup. */
 internal data class RemotePeerScope(val origin: String, val account: String, val hostId: String)
@@ -14,6 +13,8 @@ internal interface RemotePeerTrustStore {
   fun pinIfAbsent(scope: RemotePeerScope, publicKey: String): String
   /** Atomically replace [expectedPublicKey] with [replacementPublicKey]. */
   fun replaceIfMatches(scope: RemotePeerScope, expectedPublicKey: String, replacementPublicKey: String): Boolean = false
+  fun remove(scope: RemotePeerScope) {}
+  fun removeAllForAccount(origin: String, account: String) {}
 }
 
 internal class RemoteTrustException(message: String, val changed: Boolean) : IOException(message)
@@ -55,6 +56,31 @@ internal class RemotePeerTrust(private val store: RemotePeerTrustStore) {
     return replacement
   }
 
+  fun pinOrReplaceAfterConfirmation(scope: RemotePeerScope, host: RemoteHost): String {
+    validateScope(scope, host)
+    val key = host.publicKey?.takeIf(RemoteServerApi::validPublicKey) ?: throw IOException("Host 身份公钥无效")
+    val existing = store.pinned(scope)
+    return when {
+      existing == null -> pinAfterConfirmation(scope, host)
+      sameKey(existing, key) -> key
+      else -> replaceAfterConfirmation(scope, host, existing)
+    }
+  }
+
+  fun forget(scope: RemotePeerScope) {
+    store.remove(scope)
+    val normalizedOrigin = runCatching { canonicalRemoteOrigin(scope.origin) }.getOrNull()
+    if (normalizedOrigin != null) {
+      val normalized = scope.copy(origin = normalizedOrigin, account = scope.account.trim())
+      if (normalized != scope) store.remove(normalized)
+    }
+  }
+
+  fun forgetAccount(origin: String, account: String) {
+    val canonical = runCatching { canonicalRemoteOrigin(origin) }.getOrElse { origin.trim() }
+    store.removeAllForAccount(canonical, account.trim())
+  }
+
   fun verify(scope: RemotePeerScope, host: RemoteHost): String {
     validateScope(scope, host)
     val key = host.publicKey?.takeIf(RemoteServerApi::validPublicKey) ?: throw IOException("Host 身份公钥无效")
@@ -64,9 +90,10 @@ internal class RemotePeerTrust(private val store: RemotePeerTrustStore) {
   }
 
   private fun validateScope(scope: RemotePeerScope, host: RemoteHost) {
-    val origin = scope.origin.toHttpUrlOrNull()
-    if (scope.account.isBlank() || '\u0000' in scope.account || origin == null || origin.username.isNotEmpty() || origin.password.isNotEmpty() ||
-      origin.encodedPath != "/" || origin.query != null || origin.fragment != null ||
+    val validOrigin = runCatching { canonicalRemoteOrigin(scope.origin) == scope.origin.trim() }.getOrDefault(false) ||
+      runCatching { canonicalRemoteOrigin(scope.origin) }.isSuccess
+    val originParts = extractFlexibleHttpOriginParts(scope.origin)
+    if (scope.account.isBlank() || '\u0000' in scope.account || !validOrigin || originParts == null ||
       scope.hostId != host.deviceId || !RemoteServerApi.validDeviceId(scope.hostId))
       throw IOException("Host 身份与所选目标不一致")
   }

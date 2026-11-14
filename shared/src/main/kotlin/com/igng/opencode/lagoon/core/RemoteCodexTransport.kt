@@ -73,8 +73,13 @@ internal class RemoteCodexTransport(
     val large = method == "dsh/sessionHistory" || method == "dsh/sessionAttachment" ||
       method == "thread/read" && params.optBoolean("includeTurns", false) || hasImageInput(params)
     if (hasImageInput(params) && !transferSupported) throw IOException("Remote Host 未声明 Codex 图片传输能力")
-    val response = try { if (large && transferSupported) transferred(request) else rpc("codex.app.call", request) }
-    catch (error: RemoteRpcException) {
+    val response = try {
+      try { if (large && transferSupported) transferred(request) else rpc("codex.app.call", request) }
+      catch (error: RemoteRpcException) {
+        if (error.code == "RESPONSE_TOO_LARGE" && !large && transferSupported && method in READS) transferred(request)
+        else throw error
+      }
+    } catch (error: RemoteRpcException) {
       if (error.code == "METHOD_NOT_ALLOWED" || error.code == "METHOD_NOT_FOUND")
         throw ApiException(501, "Remote Host 不支持该 Codex 操作", error.code)
       if (method == "project/list" && error.code == "CODEX_UPSTREAM_ERROR")
@@ -254,8 +259,9 @@ internal class RemoteCodexTransport(
     const val CHUNK = 512 * 1024
     // Lower than the 288 MiB wire ceiling to bound peak memory on Android.
     const val CLIENT_LIMIT = 64 * 1024 * 1024
-    val ALLOWED = setOf("account/read", "model/list", "project/list", "project/create", "thread/list", "thread/read",
-      "dsh/sessionHistory", "dsh/sessionAttachment", "dsh/directoryList", "thread/start", "thread/resume", "thread/fork",
+    val READS = setOf("account/read", "model/list", "project/list", "thread/list", "thread/read",
+      "dsh/sessionHistory", "dsh/sessionAttachment", "dsh/directoryList")
+    val ALLOWED = READS + setOf("project/create", "thread/start", "thread/resume", "thread/fork",
       "thread/name/set", "thread/archive", "thread/unarchive", "thread/unsubscribe", "turn/start", "turn/steer", "turn/interrupt")
   }
 }
