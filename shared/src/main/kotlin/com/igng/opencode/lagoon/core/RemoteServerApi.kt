@@ -15,7 +15,7 @@ import java.util.concurrent.TimeUnit
 
 /** The control-plane API, not the encrypted Host business channel. */
 internal class RemoteServerApi(address: String, allowCleartext: Boolean = false) {
-  private val base = requireNotNull(address.trim().toHttpUrlOrNull()) { "DSH Hub 地址无效" }
+  private val base = requireNotNull(parseFlexibleHttpUrl(address)) { "DSH Hub 地址无效" }
   private val http = OkHttpClient.Builder()
     .connectTimeout(10, TimeUnit.SECONDS).readTimeout(15, TimeUnit.SECONDS)
     .callTimeout(30, TimeUnit.SECONDS).followRedirects(false).followSslRedirects(false)
@@ -48,7 +48,7 @@ internal class RemoteServerApi(address: String, allowCleartext: Boolean = false)
   suspend fun authCapabilities(): RemoteAuthCapabilities {
     val body = try { request("GET", "api/v1/auth/oauth/providers") }
     catch (error: RemoteServerException) {
-      if (error.status == 404) return RemoteAuthCapabilities(emptyList(), devicePairing = false, fragmentTicketQr = false)
+      if (error.status in setOf(404, 405, 501)) return RemoteAuthCapabilities(emptyList(), devicePairing = false, fragmentTicketQr = false)
       throw error
     }
     val caps = body.optJSONObject("capabilities")
@@ -167,21 +167,38 @@ internal class RemoteServerApi(address: String, allowCleartext: Boolean = false)
    */
   suspend fun accountHosts(accountToken: String): List<RemoteHost> {
     if (!validToken(accountToken)) throw IOException("DSH Remote 账号凭据无效")
-    val body = try {
-      requestAt("GET", sameOriginUrl("/api/v1/account/devices"), null, accountToken)
-    } catch (error: RemoteServerException) {
-      if (error.status == 401) throw IOException("DSH 远程中枢登录已失效，请重新登录", error)
-      if (error.status == 404) throw IOException("服务端不支持账号设备目录，请升级 DSH 远程中枢", error)
-      throw error
+    val hosts = linkedMapOf<String, RemoteHost>()
+    val seen = mutableSetOf<String>()
+    var cursor: String? = null
+    while (true) {
+      val url = if (cursor == null) {
+        sameOriginUrl("/api/v1/account/devices")
+      } else {
+        sameOriginUrl("/api/v1/account/devices").newBuilder()
+          .addQueryParameter("limit", "50")
+          .addQueryParameter("cursor", cursor)
+          .build()
+      }
+      val body = try {
+        requestAt("GET", url, null, accountToken)
+      } catch (error: RemoteServerException) {
+        if (error.status == 401) throw IOException("DSH 远程中枢登录已失效，请重新登录", error)
+        if (error.status == 404) throw IOException("服务端不支持账号设备目录，请升级 DSH 远程中枢", error)
+        throw error
+      }
+      val items = body.optJSONArray("items") ?: throw IOException("DSH Hub 设备列表无效")
+      for (index in 0 until items.length()) {
+        val item = items.optJSONObject(index) ?: throw IOException("DSH Hub 设备信息无效")
+        if (item.optString("role") != "host") continue
+        val host = accountHost(item)
+        hosts[host.deviceId] = host
+        if (hosts.size > 5000) throw IOException("DSH Hub 设备列表超过上限")
+      }
+      val next = (body.opt("nextCursor") as? String)?.takeIf(String::isNotBlank) ?: break
+      if (!seen.add(next)) throw IOException("DSH Hub 返回重复分页游标，未使用不完整列表")
+      cursor = next
     }
-    val items = body.optJSONArray("items") ?: throw IOException("DSH Hub 设备列表无效")
-    if (body.has("nextCursor") && !body.isNull("nextCursor") && body.opt("nextCursor") != "")
-      throw IOException("DSH Hub 账号目录需要分页，未使用不完整列表")
-    if (items.length() > 5000) throw IOException("DSH Hub 设备列表超过上限")
-    return (0 until items.length()).mapNotNull { index ->
-      val item = items.optJSONObject(index) ?: throw IOException("DSH Hub 设备信息无效")
-      if (item.optString("role") != "host") null else accountHost(item)
-    }
+    return hosts.values.toList()
   }
 
   /** Fetch separately: list results intentionally do not contain the Host identity key. */
@@ -255,7 +272,8 @@ internal class RemoteServerApi(address: String, allowCleartext: Boolean = false)
   }
 
   private fun remoteHost(body: JSONObject, id: String, key: String?): RemoteHost =
-    RemoteHost(id, requiredText(body, "name", 128), requiredText(body, "platform", 64),
+    RemoteHost(id, sanitizeRemoteDisplayName(requiredText(body, "name", 512), fallback = id, maxChars = 128),
+      requiredText(body, "platform", 64),
       requiredText(body, "membershipId", 256), body.optBoolean("online", false), key,
       body.optString("clientVersion").takeIf(String::isNotBlank), body.optString("harnessVersion").takeIf(String::isNotBlank),
       body.optString("fingerprint").takeIf(String::isNotBlank))
@@ -288,10 +306,12 @@ internal class RemoteServerApi(address: String, allowCleartext: Boolean = false)
       if (!response.isSuccessful) {
         val error = runCatching { JSONObject(text).optJSONObject("error") }.getOrNull()
         val rawCode = (error?.opt("code") as? String)?.takeIf { it.matches(Regex("[A-Z0-9_]{1,80}")) }
-        val validError = rawCode != null && error?.opt("message") is String && error.opt("retryable") is Boolean &&
-          (!error.has("details") || error.isNull("details") || error.opt("details") is JSONObject)
-        throw RemoteServerException(response.code, rawCode.takeIf { validError },
-          if (validError) error!!.optBoolean("retryable") else response.code in setOf(401, 403, 429) || response.code >= 500)
+        val validError = rawCode != null && error?.opt("message") is String
+        val retryable = when {
+          validError && error?.opt("retryable") is Boolean -> error.optBoolean("retryable")
+          else -> response.code in setOf(401, 403, 429) || response.code >= 500
+        }
+        throw RemoteServerException(response.code, rawCode.takeIf { validError }, retryable)
       }
       if (text.isBlank()) JSONObject()
       else try { JSONObject(text) } catch (_: Exception) { throw IOException("DSH Hub 返回无效 JSON") }

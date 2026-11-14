@@ -218,8 +218,15 @@ internal fun parseRemotePairingScan(
       ?: throw RemotePairingException("PAIRING_SCAN_INVALID", "配对码缺少服务器地址")
     val origin = runCatching { canonicalRemoteOrigin(serverUrl) }.getOrNull()
       ?: throw RemotePairingException("PAIRING_SCAN_INVALID", "配对码中的服务器地址无效")
-    if (origin.removeSuffix("/") != serverUrl) {
-      throw RemotePairingException("PAIRING_SCAN_INVALID", "配对码中的服务器地址不规范")
+    if (serverUrl.endsWith("/") || origin.removeSuffix("/") != serverUrl) {
+      val canonicalWithoutSlash = origin.removeSuffix("/")
+      val punycodeMatches = !serverUrl.endsWith("/") &&
+        runCatching { canonicalRemoteOrigin(serverUrl).removeSuffix("/") }.getOrNull() == canonicalWithoutSlash &&
+        serverUrl == serverUrl.trim() &&
+        !serverUrl.contains('?') && !serverUrl.contains('#') && !serverUrl.contains('@')
+      if (!punycodeMatches) {
+        throw RemotePairingException("PAIRING_SCAN_INVALID", "配对码中的服务器地址不规范")
+      }
     }
     val isCleartext = origin.startsWith("http://")
     if (isCleartext && !allowCleartext) {
@@ -229,19 +236,23 @@ internal fun parseRemotePairingScan(
     return RemotePairingScan.Legacy(origin, offer, isCleartext)
   }
 
-  val uri = runCatching { URI(value) }.getOrNull()
-    ?: throw RemotePairingException("PAIRING_SCAN_INVALID", "这不是 DSH 配对链接或二维码")
-  val scheme = uri.scheme?.lowercase()
-  val authority = uri.rawAuthority
-  val fragmentMatch = uri.rawFragment?.let { TICKET_FRAGMENT_REGEX.matchEntire(it) }
+  val match = Regex("^(https?)://([^/?#]+)(/pair)#(.*)$", RegexOption.IGNORE_CASE).matchEntire(value)
+  val authorityMatch = match?.groupValues?.getOrNull(2)
+  val schemeMatch = match?.groupValues?.getOrNull(1)?.lowercase()
+  val fragmentMatchRaw = match?.groupValues?.getOrNull(4)
+  val uri = runCatching { parseFlexibleHttpUrl(value)?.toUri() ?: URI(value) }.getOrNull()
+  val scheme = uri?.scheme?.lowercase() ?: schemeMatch
+  val authority = uri?.rawAuthority ?: authorityMatch
+  val rawFragment = uri?.rawFragment ?: fragmentMatchRaw
+  val rawPath = uri?.rawPath ?: match?.groupValues?.getOrNull(3)
+  val fragmentMatch = rawFragment?.let { TICKET_FRAGMENT_REGEX.matchEntire(it) }
   val ticket = fragmentMatch?.groupValues?.getOrNull(1)
   if (
     (scheme != "https" && scheme != "http") ||
     authority.isNullOrEmpty() ||
-    uri.host.isNullOrEmpty() ||
-    uri.rawUserInfo != null ||
-    uri.rawQuery != null ||
-    uri.rawPath != "/pair" ||
+    authority.contains('@') ||
+    (uri != null && (uri.rawUserInfo != null || uri.rawQuery != null)) ||
+    rawPath != "/pair" ||
     ticket == null ||
     !RemoteServerApi.validPublicKey(ticket)
   ) {

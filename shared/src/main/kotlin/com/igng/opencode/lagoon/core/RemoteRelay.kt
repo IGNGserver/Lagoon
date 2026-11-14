@@ -135,8 +135,7 @@ internal class RemoteRelay(
       } catch (error: Exception) { fail(IOException("Remote 认证失败", error)) }
     }
     override fun onMessage(webSocket: WebSocket, text: String) {
-      lastTrafficAt = System.currentTimeMillis()
-      try { handle(text) } catch (error: RemoteControlException) { fail(error) }
+      try { handle(text, webSocket) } catch (error: RemoteControlException) { fail(error) }
         catch (error: Exception) { fail(IOException("Remote 协议失败", error)) }
     }
     override fun onMessage(webSocket: WebSocket, bytes: ByteString) { fail(IOException("Remote 不接受二进制控制帧")) }
@@ -152,7 +151,7 @@ internal class RemoteRelay(
     }
   }
 
-  private fun handle(text: String) {
+  private fun handle(text: String, source: WebSocket) {
     var message: ByteArray? = null
     synchronized(this) {
       if (state == State.CLOSED) return
@@ -169,7 +168,8 @@ internal class RemoteRelay(
       if (frameBytes > relayLimit) throw IOException("Remote 帧超过中继上限")
       val payload = frame.optJSONObject("payload") ?: throw IOException("Remote 帧内容无效")
       when (type) {
-        "ping" -> sendFrame("pong", JSONObject().put("nonce", textField(payload, "nonce")), controlLimit)
+        "ping" -> sendFrameOn(source, "pong", JSONObject().put("nonce", textField(payload, "nonce")), controlLimit)
+        "pong" -> Unit
         "error", "connect.rejected" -> {
           val code = (payload.opt("code") as? String)?.takeIf { it.matches(Regex("[A-Z0-9_]{1,80}")) } ?: "REMOTE_REJECTED"
           val retryable = payload.optBoolean("retryable", code in setOf("CONNECTION_FAILED", "SLOW_CONSUMER"))
@@ -182,12 +182,14 @@ internal class RemoteRelay(
           serverVersion = (payload.opt("serverVersion") as? String)?.take(128)?.takeIf { it.isNotBlank() }
           negotiatedCapabilities = negotiateCapabilities(payload.optJSONArray("capabilities"))
           if ("transport.relay" !in negotiatedCapabilities) throw IOException("DSH Hub 没有协商 Relay 传输")
+          lastTrafficAt = System.currentTimeMillis()
           state = State.CONNECT
           sendFrame("connect.request", JSONObject().put("hostDeviceId", hostId).put("preferredTransports", JSONArray().put("relay")), controlLimit)
         }
         "connect.accepted" -> {
           if (state != State.CONNECT) throw IOException("Remote 握手顺序无效")
           val id = textField(payload, "connectionId")
+          lastTrafficAt = System.currentTimeMillis()
           connectionId = id
           val session = RemoteNoise(identity, hostId, pinnedHostKey, id)
           noise = session
@@ -209,6 +211,7 @@ internal class RemoteRelay(
           if (state != State.HANDSHAKE || payload.opt("step") != 2 || incomingHandshakeStep != 0) throw IOException("Remote 握手顺序无效")
           checkTarget(payload)
           noise!!.readHandshake(decode(textField(payload, "data")))
+          lastTrafficAt = System.currentTimeMillis()
           incomingHandshakeStep = 2
           state = State.READY
           ready.complete(Unit)
@@ -222,6 +225,7 @@ internal class RemoteRelay(
           if (n == incomingCounter + 1) {
             incomingCounter = n
             message = incoming.decode(noise!!.decrypt(decode(textField(payload, "ciphertext"))))
+            lastTrafficAt = System.currentTimeMillis()
           } else if (n > incomingCounter + 1) throw IOException("Remote 计数器跳号")
         }
         // 未知控制帧（新版本中枢的扩展）忽略并计数，不影响已建立的其他流程。
@@ -293,12 +297,13 @@ internal class RemoteRelay(
             if (relayEpoch != null && epoch != relayEpoch) throw IOException("Relay 数据通道代次不一致")
             dataReady = true
             relayAttached = true
+            lastTrafficAt = System.currentTimeMillis()
             attachSignal?.complete(Unit)
           }
           return
         }
         if (probe.optString("type") == "relay.detach") throw IOException("Relay 数据通道被对端断开")
-        handle(text)
+        handle(text, webSocket)
       } catch (error: Exception) { fail(IOException("Relay 数据通道失败", error)) }
     }
 
@@ -344,7 +349,7 @@ internal class RemoteRelay(
       .put("timestamp", System.currentTimeMillis()).put("payload", payload).toString()
     val max = if (type == "relay") relayLimit else limit
     if (text.toByteArray(Charsets.UTF_8).size > max || target?.send(text) != true) throw IOException("Remote 帧发送失败")
-    lastTrafficAt = System.currentTimeMillis()
+    if (type != "pong" && type != "ping") lastTrafficAt = System.currentTimeMillis()
   }
 
   private fun fail(error: IOException) {
@@ -376,7 +381,7 @@ internal class RemoteRelay(
     return decoded
   }
   private companion object {
-    val CLIENT_CAPABILITIES = setOf("transport.relay", "transport.relay.attach")
+    val CLIENT_CAPABILITIES = setOf("transport.relay", "transport.relay.attach", "harness.api.v1")
     const val MAX_CAPABILITIES = 128
     const val MAX_COUNTER = 9007199254740991L
     /** 与参考实现一致：数据通道附加超时 15 秒。 */
@@ -408,20 +413,27 @@ internal fun classifyRemoteWsUpgradeFailure(response: Response?, t: Throwable): 
  * so hosted/self-hosted shutdowns and heartbeat timeouts trigger reconnects, whereas credential or
  * duplicate-connection closures surface structured recovery codes.
  */
-internal fun classifyRemoteWsClose(code: Int, reason: String): IOException = when {
-  code == 4003 || reason.contains("CONNECTION_REPLACED", ignoreCase = true) ->
-    RemoteControlException("CONNECTION_REPLACED", "另一实例正在使用这台设备身份", retryable = false)
-  reason.contains("DEVICE_REVOKED", ignoreCase = true) ->
-    RemoteControlException("DEVICE_REVOKED", "设备授权已被撤销", retryable = false)
-  reason.contains("TOKEN_EXPIRED", ignoreCase = true) ->
-    RemoteControlException("TOKEN_EXPIRED", "访问令牌已过期", retryable = false)
-  reason.contains("AUTH_INVALID", ignoreCase = true) ->
-    RemoteControlException("AUTH_INVALID", "访问令牌无效", retryable = false)
-  code == 4008 || reason.contains("SLOW_CONSUMER", ignoreCase = true) ->
-    RemoteControlException("SLOW_CONSUMER", "Relay 消费过慢", retryable = true)
-  code == 1012 || reason.contains("server shutdown", ignoreCase = true) ->
-    RemoteControlException("SERVER_SHUTDOWN", "DSH 远程中枢正在重启", retryable = true)
-  reason.contains("heartbeat timeout", ignoreCase = true) ->
-    RemoteControlException("HEARTBEAT_TIMEOUT", "DSH 远程中枢心跳超时", retryable = true)
-  else -> IOException("Remote WebSocket 已关闭（$code）")
+internal fun classifyRemoteWsClose(code: Int, reason: String): IOException {
+  val trimmed = reason.trim()
+  return when {
+    code == 4003 || reason.contains("CONNECTION_REPLACED", ignoreCase = true) ->
+      RemoteControlException("CONNECTION_REPLACED", "另一实例正在使用这台设备身份", retryable = false)
+    code == 4004 || reason.contains("DEVICE_REVOKED", ignoreCase = true) ->
+      RemoteControlException("DEVICE_REVOKED", "设备授权已被撤销", retryable = false)
+    reason.contains("TOKEN_EXPIRED", ignoreCase = true) ->
+      RemoteControlException("TOKEN_EXPIRED", "访问令牌已过期", retryable = false)
+    reason.contains("AUTH_INVALID", ignoreCase = true) ->
+      RemoteControlException("AUTH_INVALID", "访问令牌无效", retryable = false)
+    code == 4008 || reason.contains("SLOW_CONSUMER", ignoreCase = true) ->
+      RemoteControlException("SLOW_CONSUMER", "Relay 消费过慢", retryable = true)
+    code == 4001 && trimmed == "CONNECTION_FAILED" ->
+      RemoteControlException("CONNECTION_FAILED", "DSH 远程中枢连接保活超时", retryable = true)
+    code == 1012 || ((code in setOf(4009, 4001, 1013) || code == 1012) && trimmed.equals("server shutdown", ignoreCase = true)) ||
+      reason.contains("server shutdown", ignoreCase = true) ->
+      RemoteControlException("SERVER_SHUTDOWN", "DSH 远程中枢正在重启", retryable = true)
+    (code == 4009 && trimmed.equals("heartbeat timeout", ignoreCase = true)) ||
+      reason.contains("heartbeat timeout", ignoreCase = true) ->
+      RemoteControlException("HEARTBEAT_TIMEOUT", "DSH 远程中枢心跳超时", retryable = true)
+    else -> IOException("Remote WebSocket 已关闭（$code）")
+  }
 }

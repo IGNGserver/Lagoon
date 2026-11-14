@@ -24,7 +24,11 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 /** Google Antigravity ACP projection. Remote carriers translate their restricted Host methods. */
-class AgyApi(private val transport: AgyTransport) : HarnessClient {
+class AgyApi(
+  private val transport: AgyTransport,
+  private val providerId: String = "antigravity",
+  private val healthLabel: String = "Antigravity ACP"
+) : HarnessClient {
   private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
   private val started = AtomicBoolean(false)
   private val sequence = AtomicLong()
@@ -109,11 +113,13 @@ class AgyApi(private val transport: AgyTransport) : HarnessClient {
     startCollector()
     try { transport.health() }
     catch (error: ApiException) {
-      if (error.status == -32000 && error.message.orEmpty().contains("auth", ignoreCase = true))
-        throw ApiException(401, "开发机上的 Antigravity 尚未登录，请在开发机运行 agy acp --login")
+      if (error.status == -32000 && error.message.orEmpty().let { it.contains("auth", ignoreCase = true) || it.contains("login", ignoreCase = true) }) {
+        if (providerId == "antigravity") throw ApiException(401, "开发机上的 Antigravity 尚未登录，请在开发机运行 agy acp --login")
+        throw ApiException(401, "开发机上的 $healthLabel 尚未登录或未就绪")
+      }
       throw error
     }
-    return "Antigravity ACP"
+    return healthLabel
   }
   private fun objects(value: JSONObject, key: String): List<JSONObject> {
     val array = value.optJSONArray(key) ?: throw ApiException(502, "AGY 响应缺少 $key")
@@ -403,12 +409,12 @@ class AgyApi(private val transport: AgyTransport) : HarnessClient {
     }
     return options(model).mapNotNull { row ->
       val value = row.str("value").takeIf(String::isNotBlank) ?: return@mapNotNull null
-      ModelInfo(ModelChoice("antigravity", value, row.str("name").ifBlank { value }),
+      ModelInfo(ModelChoice(providerId, value, row.str("name").ifBlank { value }),
         variants = if (value == model.str("currentValue")) variants else emptyList())
     }
   }
   private suspend fun selectModel(sessionId: String, selection: ModelChoice) {
-    require(selection.providerId == "antigravity") { "模型不属于 Antigravity" }
+    require(selection.providerId == providerId) { "模型不属于 $healthLabel" }
     var option = configOption(sessionId, "model") ?: throw ApiException(501, "AGY 未声明模型选择")
     if (options(option).none { it.str("value") == selection.modelId }) throw ApiException(400, "AGY 模型不可用，请刷新目录")
     suspend fun set(optionId: String, value: String) {

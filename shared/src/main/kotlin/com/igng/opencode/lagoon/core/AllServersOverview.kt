@@ -316,6 +316,17 @@ internal class AllServersOverview(
       emit(snapshot)
     })
     approvers[id] = approver
+    val parkedNonRetryable = java.util.concurrent.atomic.AtomicBoolean(false)
+    fun isNonRetryableRemoteFailure(error: Throwable): Boolean {
+      var current: Throwable? = error
+      val seen = HashSet<Throwable>()
+      while (current != null && seen.add(current)) {
+        if (current is RemoteFailureException && !current.retryable) return true
+        if (current is RemoteControlException && !current.retryable) return true
+        current = current.cause
+      }
+      return false
+    }
 
     suspend fun refresh() {
       val waiters = refreshWaiters.remove(id)?.toList().orEmpty()
@@ -332,10 +343,13 @@ internal class AllServersOverview(
           val previous = snapshot
           try {
             val first = firstReads.remove(id)
-            readInternal(profile, client, previous, light = !first) { revision == waitingRevision }
+            readInternal(profile, client, previous, light = !first) { revision == waitingRevision }.also {
+              parkedNonRetryable.set(false)
+            }
           } catch (cancel: CancellationException) {
             throw cancel
           } catch (error: Exception) {
+            if (isNonRetryableRemoteFailure(error)) parkedNonRetryable.set(true)
             previous.copy(connected = false, loading = false, cached = previous.cached || cachedCatalog != null,
               degraded = true, error = userFacingError(error, "连接失败"))
           }
@@ -368,7 +382,12 @@ internal class AllServersOverview(
         while (isActive) {
           // Control state is event-driven now. This is only a safety net for a dropped frame; a
           // background host must not issue a full catalog/child/shell read every few seconds.
-          kotlinx.coroutines.withTimeoutOrNull(SAFETY_REFRESH_MILLIS) { wakes[id]?.receive() }
+          if (parkedNonRetryable.get()) {
+            wakes[id]?.receive()
+            parkedNonRetryable.set(false)
+          } else {
+            kotlinx.coroutines.withTimeoutOrNull(SAFETY_REFRESH_MILLIS) { wakes[id]?.receive() }
+          }
           refresh()
         }
       }
@@ -382,9 +401,9 @@ internal class AllServersOverview(
               val stream = launch(start = CoroutineStart.LAZY) {
                 client.events(onOpen = {
                   scope.launch {
-                    if (clients[id] !== client || profile.protocol == HarnessProtocolId.CODEX_APP_SERVER && client.isClosed) return@launch
+                    if (clients[id] !== client || profile.protocol in setOf(HarnessProtocolId.CODEX_APP_SERVER, HarnessProtocolId.ANTIGRAVITY_ACP, HarnessProtocolId.OPENCODE_ACP) && client.isClosed) return@launch
                     snapshot = snapshot.copy(streamConnected = true)
-                    if (profile.protocol == HarnessProtocolId.CODEX_APP_SERVER) codexRetryDelays.remove(id)
+                    if (profile.protocol in setOf(HarnessProtocolId.CODEX_APP_SERVER, HarnessProtocolId.ANTIGRAVITY_ACP, HarnessProtocolId.OPENCODE_ACP)) codexRetryDelays.remove(id)
                     emit(snapshot)
                     refresh(id)
                     onConnected(id)
@@ -537,13 +556,20 @@ internal class AllServersOverview(
           } catch (cancel: CancellationException) {
             throw cancel
           } catch (error: Exception) {
+            if (isNonRetryableRemoteFailure(error)) parkedNonRetryable.set(true)
             Diagnostics.warn("AllServers", "服务器 ${profile.name} 实时连接断开", error)
           }
           // A cancelled monitor from an older client must not unregister its replacement's stream.
           liveStreams.remove(id, streamJob)
           snapshot = snapshot.copy(streamConnected = false)
           emit(snapshot)
-          if (profile.protocol == HarnessProtocolId.CODEX_APP_SERVER && client.isClosed) {
+          if (parkedNonRetryable.get()) {
+            reconnectHints[id]?.receive()
+            parkedNonRetryable.set(false)
+            retry = 1_000L
+            continue
+          }
+          if (profile.protocol in setOf(HarnessProtocolId.CODEX_APP_SERVER, HarnessProtocolId.ANTIGRAVITY_ACP, HarnessProtocolId.OPENCODE_ACP) && client.isClosed) {
             // Retire the failed owner outside its own monitor job. The identity fence prevents a
             // delayed failure from closing a replacement after profile edits, removal or reconnect.
             val owner = ownerTokens[id]

@@ -2,7 +2,7 @@ package com.igng.opencode.lagoon.core
 
 /** Keep backend ownership explicit: a DSH Session must never be inferred from its directory. */
 internal data class TerminalTarget(val profile: ServerProfile, val sessionId: String, val directory: String) {
-  val scope: TerminalScope get() = if (profile.protocol == HarnessProtocolId.ANTIGRAVITY_ACP) TerminalScope.Session(sessionId, directory) else when (profile.kind) {
+  val scope: TerminalScope get() = if (profile.protocol in setOf(HarnessProtocolId.ANTIGRAVITY_ACP, HarnessProtocolId.OPENCODE_ACP)) TerminalScope.Session(sessionId, directory) else when (profile.kind) {
     ServerKind.DSH, ServerKind.DSH_REMOTE -> TerminalScope.Session(sessionId, directory)
     ServerKind.OPENCODE, ServerKind.CODEX -> TerminalScope.Location(directory)
   }

@@ -406,7 +406,7 @@ fun createHarnessClient(
   sshClientFactory: ((ServerProfile, ServerCredentials) -> HarnessClient)? = null,
   /** Explicit caller-isolated direct DSH sharing. Raw constructors/default acquisition stay independent. */
   dshRegistry: DshClientRegistry? = null
-): HarnessClient = if (profile.remoteHostId != null && profile.protocol in setOf(HarnessProtocolId.OPENCODE_NATIVE, HarnessProtocolId.CODEX_APP_SERVER, HarnessProtocolId.ANTIGRAVITY_ACP)) {
+): HarnessClient = if (profile.remoteHostId != null && profile.protocol in setOf(HarnessProtocolId.OPENCODE_NATIVE, HarnessProtocolId.CODEX_APP_SERVER, HarnessProtocolId.ANTIGRAVITY_ACP, HarnessProtocolId.OPENCODE_ACP)) {
   require(profile.sshHostId == null) { "同一个绑定不能混合 SSH 与 Remote carrier" }
   (remoteBackend ?: throw IllegalStateException("Host 原生服务 backend 尚未配置")).client
 } else if (profile.sshHostId != null) {

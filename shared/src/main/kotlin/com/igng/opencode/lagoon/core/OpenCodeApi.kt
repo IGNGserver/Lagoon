@@ -58,7 +58,7 @@ class OpenCodeApi internal constructor(
 
   constructor(profile: ServerProfile, password: String) : this(profile, ServerCredentials(profile.username, password), 60, SharedHttp.STREAM_IDLE_SECONDS, null)
 
-  private val base: HttpUrl = requireNotNull(profile.url.trimEnd('/').toHttpUrlOrNull()) { "服务器地址无效" }
+  private val base: HttpUrl = requireNotNull(parseFlexibleHttpUrl(profile.url.trim().trimEnd('/'))) { "服务器地址无效" }
   private val nativeEndpoint = NativeHttpEndpoint(base.toString())
   private val nativeTransport: NativeHttpTransport = transport ?: NativeOkHttpTransport(nativeEndpoint, callTimeoutSeconds, streamIdleSeconds)
   @Volatile private var closed = false
@@ -100,19 +100,19 @@ class OpenCodeApi internal constructor(
   init {
     require(base.scheme == "https" || base.scheme == "http" && profile.allowCleartext) { "HTTP 明文连接未获授权，请在服务器资料中明确开启" }
     require(base.username.isEmpty() && base.password.isEmpty() && base.query == null && base.fragment == null) { "请使用不含凭据或参数的服务器地址" }
-    require(nativeTransport.endpoint.origin == NativeHttpOrigin.from(java.net.URI(base.toString()))) { "原生传输必须使用配置的固定 origin" }
+    require(nativeTransport.endpoint.origin == HttpOrigin.parse(base.toString())?.let { NativeHttpOrigin(it.scheme, it.host, it.port) }) { "原生传输必须使用配置的固定 origin" }
   }
 
   private fun requestHeaders(accept: String = "application/json"): Map<String, String> = buildMap {
     put("Accept", accept)
     if (credentials.password.isNotEmpty()) {
-      put("Authorization", Credentials.basic(credentials.username.ifBlank { profile.username.ifBlank { "opencode" } }, credentials.password))
+      put("Authorization", Credentials.basic(credentials.username.ifBlank { profile.username.ifBlank { "opencode" } }, credentials.password, Charsets.UTF_8))
     }
     if (credentials.cookie.isNotBlank()) put("Cookie", credentials.cookie)
   }
 
   private fun requestPath(path: String, query: Map<String, String>): String {
-    val encoded = path.trimStart('/').split('/').joinToString("/") { it }
+    val encoded = encodeUrlPathPreservingEscapes(path)
     if (query.isEmpty()) return encoded
     return encoded + "?" + query.entries.joinToString("&") { (key, value) ->
       "${java.net.URLEncoder.encode(key, "UTF-8").replace("+", "%20") }=${java.net.URLEncoder.encode(value, "UTF-8").replace("+", "%20") }"

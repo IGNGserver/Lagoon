@@ -28,6 +28,23 @@ internal object RemoteConnectionRegistry {
     entry.session.close()
   }
 
+  fun evictHost(origin: String, account: String, hostId: String) {
+    val canonical = runCatching { canonicalRemoteOrigin(origin) }.getOrElse { origin.trim() }
+    val key = "remote|$canonical|${account.trim()}|$hostId"
+    val removed = synchronized(this) { entries.remove(key)?.session }
+    removed?.close()
+  }
+
+  fun evictAccount(origin: String, account: String) {
+    val canonical = runCatching { canonicalRemoteOrigin(origin) }.getOrElse { origin.trim() }
+    val prefix = "remote|$canonical|${account.trim()}|"
+    val removed = synchronized(this) {
+      val keys = entries.keys.filter { it.startsWith(prefix) }
+      keys.mapNotNull { entries.remove(it)?.session }
+    }
+    removed.forEach { it.close() }
+  }
+
   /** 测试用：当前存活的连接数。 */
   @Synchronized internal fun size(): Int = entries.size
 

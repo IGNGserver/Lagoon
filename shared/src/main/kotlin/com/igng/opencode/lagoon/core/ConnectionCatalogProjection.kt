@@ -50,7 +50,8 @@ internal object ConnectionCatalogProjection {
       )
       savedSources.putIfAbsent(source.id, source)
       sources.putIfAbsent(source.id, source)
-      catalog.hosts.forEach { observed ->
+      val adopted = catalog.adoptedHostIds
+      catalog.hosts.filter { adopted == null || it.hostId in adopted }.forEach { observed ->
         val hostId = MigrationProjection.hostId(source.id, observed.hostId)
         hosts.putIfAbsent(
           hostId,
@@ -61,13 +62,19 @@ internal object ConnectionCatalogProjection {
 
     val oldSources = previous?.sources.orEmpty().associateBy { it.id }
     val oldHosts = previous?.hosts.orEmpty().associateBy { it.id }
+    val adoptedBySource = remoteCatalogs.associate { catalog ->
+      MigrationProjection.hubSourceId(catalog.origin, catalog.account) to catalog.adoptedHostIds
+    }
     // An omitted Host can be a partial catalog, not a deletion. Only a still-saved source keeps it;
     // projected profiles alone must not resurrect other old parents after explicit source removal.
     previous?.hosts.orEmpty().forEach { oldHost ->
       val saved = savedSources[oldHost.sourceId] ?: return@forEach
       val current = sources[oldHost.sourceId] ?: return@forEach
       val oldSource = oldSources[oldHost.sourceId] ?: return@forEach
-      if (sameSourceScope(saved, current) && sameSourceScope(current, oldSource)) {
+      val adopted = adoptedBySource[oldHost.sourceId]
+      if (sameSourceScope(saved, current) && sameSourceScope(current, oldSource) &&
+        (adopted == null || oldHost.externalHostId in adopted)
+      ) {
         hosts.putIfAbsent(oldHost.id, oldHost)
       }
     }

@@ -114,7 +114,7 @@ private fun AddDevicePage(
   val scope = rememberCoroutineScope()
   // 登录/接入会改写连接图；跟着它重组，目录和"已保存的 SSH 设备"才会即时更新。
   val graph by controller.connectionGraph.collectAsState()
-  val catalog = remember(graph) { controller.activeRemoteCatalog() }
+  val catalog = remember(graph) { controller.activeHubCatalog() }
   val directFormHeight = (LocalConfiguration.current.screenHeightDp * 0.8f).dp.coerceAtLeast(480.dp)
 
   Column(Modifier.fillMaxSize().background(HyperTheme.colors.canvas)) {
@@ -286,7 +286,7 @@ private fun DirectProfilePage(
   var remoteModelKey by remember { mutableStateOf(false) }
   var remoteProvider by remember { mutableStateOf(false) }
   val scope = rememberCoroutineScope()
-  val title = if (existing.protocol == com.igng.opencode.lagoon.core.HarnessProtocolId.ANTIGRAVITY_ACP) "Antigravity 连接详情" else when (existing.kind) {
+  val title = if (existing.protocol == com.igng.opencode.lagoon.core.HarnessProtocolId.ANTIGRAVITY_ACP) "Antigravity 连接详情" else if (existing.protocol == com.igng.opencode.lagoon.core.HarnessProtocolId.OPENCODE_ACP) "OpenCode ACP 连接详情" else when (existing.kind) {
     ServerKind.DSH_REMOTE -> "DSH 远程主机详情"
     ServerKind.OPENCODE -> "编辑 OpenCode 直连"
     ServerKind.CODEX -> "Codex 连接详情"

@@ -147,12 +147,13 @@ internal class RemoteAccountManager(
     if (selected.size > 16) throw IOException("一次最多接入 16 台主机")
     val previousCatalog = catalogs.load().firstOrNull { it.origin == origin && it.account == name }
     val previousById = previousCatalog?.hosts?.associateBy { it.hostId }.orEmpty()
+    val previousAdopted = previousCatalog?.effectiveAdoptedHostIds()
     val registered = LinkedHashMap<String, String>()
     val failures = LinkedHashMap<String, String>()
     val byId = candidates.associateBy { it.hostId }
     val catalogHosts = candidates.map { next ->
       if (next.meta.trust == RemoteTrustState.PINNED) return@map next.meta
-      val prev = previousById[next.meta.hostId]
+      val prev = previousById[next.meta.hostId]?.takeIf { previousAdopted == null || next.meta.hostId in previousAdopted }
       val matchesPrev = prev?.trust == RemoteTrustState.PINNED &&
         prev.fingerprint != null &&
         next.meta.fingerprint != null &&
@@ -169,12 +170,12 @@ internal class RemoteAccountManager(
         val actual = candidate.meta.fingerprint ?: throw IOException("主机没有提供身份指纹")
         if (!equalFingerprint(actual, expected)) throw IOException("主机指纹与确认值不匹配")
         val scope = RemotePeerScope(origin, name, host.deviceId)
-        RemotePeerTrust(pins).pinAfterConfirmation(scope, host)
         val slot = deviceSlot(host.deviceId, name)
         val manager = RemoteDeviceManager(devices, slot, origin, name,
           registerer = { descriptor, accountToken -> api.register(descriptor, accountToken) },
           refresher = { id, refresh -> api.refresh(id, refresh) })
         val device = manager.register(deviceName(host), platform, clientVersion, token)
+        RemotePeerTrust(pins).pinOrReplaceAfterConfirmation(scope, host)
         registered[host.deviceId] = device.identity.deviceId
         val index = catalogHosts.indexOfFirst { it.hostId == host.deviceId }
         if (index >= 0) catalogHosts[index] = catalogHosts[index].copy(trust = RemoteTrustState.PINNED)
@@ -184,10 +185,20 @@ internal class RemoteAccountManager(
         failures[candidate.hostId] = userFacingError(error, "接入主机失败")
       }
     }
-    repairPinnedHostsIfNeeded(name, token, byId, previousById, registered)
-    val catalog = RemoteCatalog(origin, name, provider, deviceLabel, catalogHosts, System.currentTimeMillis(), allowCleartext)
+    repairPinnedHostsIfNeeded(name, token, byId, previousById, previousAdopted, registered)
+    val adopted = (previousAdopted.orEmpty() + registered.keys).toSet()
+    val catalog = RemoteCatalog(
+      origin = origin,
+      account = name,
+      provider = provider,
+      deviceLabel = deviceLabel,
+      hosts = catalogHosts,
+      updatedAt = System.currentTimeMillis(),
+      allowCleartext = allowCleartext,
+      adoptedHostIds = adopted,
+    )
     catalogs.save(catalog)
-    accountToken = null
+    if (registered.isNotEmpty()) accountToken = null
     this.account = name
     return RemoteEnrollment(catalog, registered, failures)
   }
@@ -197,12 +208,14 @@ internal class RemoteAccountManager(
     accountAccessToken: String,
     byId: Map<String, RemoteHostCandidate>,
     previousById: Map<String, RemoteHostMeta>,
+    previousAdopted: Set<String>?,
     alreadyRegistered: Map<String, String>,
   ) {
     val now = System.currentTimeMillis()
     val refreshMarginMs = 7L * 86_400_000L
     for ((hostId, prev) in previousById) {
       if (hostId in alreadyRegistered) continue
+      if (previousAdopted != null && hostId !in previousAdopted) continue
       if (prev.trust != RemoteTrustState.PINNED) continue
       val candidate = byId[hostId] ?: continue
       val currentFingerprint = candidate.meta.fingerprint ?: continue
@@ -272,6 +285,7 @@ internal class RemoteAccountManager(
     val mergedHosts = existingCatalog?.hosts
       ?.filterNot { it.hostId == newMeta.hostId }
       .orEmpty() + newMeta
+    val adopted = (existingCatalog?.effectiveAdoptedHostIds().orEmpty() + newMeta.hostId).toSet()
     val updated = (existingCatalog ?: RemoteCatalog(
       origin = origin,
       account = accountName,
@@ -280,11 +294,13 @@ internal class RemoteAccountManager(
       hosts = mergedHosts,
       updatedAt = System.currentTimeMillis(),
       allowCleartext = allowCleartext,
+      adoptedHostIds = adopted,
     )).copy(
       hosts = mergedHosts,
       updatedAt = System.currentTimeMillis(),
       allowCleartext = allowCleartext,
       signedOut = false,
+      adoptedHostIds = adopted,
     )
     catalogs.save(updated)
     this.account = accountName
@@ -378,12 +394,11 @@ internal class RemoteAccountManager(
     resolveRemoteDeviceSlot(devices, origin, account, hostId)
 
   private fun deviceName(host: RemoteHost): String {
-    val raw = "$deviceLabel · ${host.name}".replace(Regex("[\\u0000-\\u001f\\u007f]"), " ").trim()
-    val bytes = raw.toByteArray(Charsets.UTF_8)
-    if (bytes.size <= 128) return raw
-    var end = raw.length
-    while (end > 0 && raw.substring(0, end).toByteArray(Charsets.UTF_8).size > 128) end--
-    return raw.substring(0, end).trim().ifBlank { deviceLabel }
+    val label = sanitizeRemoteDisplayName(deviceLabel, fallback = "Lagoon", maxChars = 64)
+    val hostName = sanitizeRemoteDisplayName(host.name, fallback = "", maxChars = 64)
+    val raw = if (hostName.isBlank()) label else "$label · $hostName"
+    val truncated = truncateByCodePointsSafe(truncateUtf8Bytes(raw, 128), 128).trim()
+    return truncated.ifBlank { truncateUtf8Bytes(label, 128).ifBlank { "Lagoon" } }
   }
 
   private fun equalFingerprint(left: String, right: String): Boolean = MessageDigest.isEqual(

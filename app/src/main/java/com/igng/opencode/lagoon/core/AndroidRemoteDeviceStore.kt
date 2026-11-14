@@ -28,8 +28,44 @@ internal class AndroidRemoteDeviceStore internal constructor(
   }
 
   override fun delete(slot: String) = synchronized(lock) {
+    RemoteDeviceManager.invalidateSlot(slot)
     if (!preferences.edit().remove(slot).commit()) throw IOException("Remote 设备资料删除失败")
   }
 
-  private companion object { val lock = Any() }
+  override fun listSlots(): Set<String> = synchronized(lock) {
+    preferences.all.keys.filter { it != REVOCATION_QUEUE_KEY }.toSet()
+  }
+
+  override fun pendingRevocations(): List<PendingRemoteRevocation> = synchronized(lock) {
+    val sealed = preferences.getString(REVOCATION_QUEUE_KEY, null) ?: return emptyList()
+    runCatching { PendingRemoteRevocationCodec.decodeList(open(sealed)) }.getOrDefault(emptyList())
+  }
+
+  override fun enqueueRevocation(item: PendingRemoteRevocation) = synchronized(lock) {
+    val current = pendingRevocations().filterNot { it.id == item.id }
+    saveRevocations((current + item).takeLast(64))
+  }
+
+  override fun updateRevocation(item: PendingRemoteRevocation) = synchronized(lock) {
+    val current = pendingRevocations()
+    if (current.none { it.id == item.id }) return
+    saveRevocations(current.map { if (it.id == item.id) item else it })
+  }
+
+  override fun removeRevocation(id: String) = synchronized(lock) {
+    val next = pendingRevocations().filterNot { it.id == id }
+    saveRevocations(next)
+  }
+
+  private fun saveRevocations(items: List<PendingRemoteRevocation>) {
+    val editor = preferences.edit()
+    if (items.isEmpty()) editor.remove(REVOCATION_QUEUE_KEY)
+    else editor.putString(REVOCATION_QUEUE_KEY, seal(PendingRemoteRevocationCodec.encodeList(items)))
+    editor.commit()
+  }
+
+  private companion object {
+    val lock = Any()
+    const val REVOCATION_QUEUE_KEY = "__pending_remote_revocations_v1__"
+  }
 }

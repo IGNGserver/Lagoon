@@ -334,7 +334,7 @@ internal class SshHostLink(
     val api = OpenCodeApi(runtime, ServerCredentials("opencode", registration.password.orEmpty()), transport = native)
     try {
       withTimeout(45_000) {
-        val headers = registration.password?.let { mapOf("Authorization" to Credentials.basic("opencode", it)) }.orEmpty()
+        val headers = registration.password?.let { mapOf("Authorization" to Credentials.basic("opencode", it, Charsets.UTF_8)) }.orEmpty()
         val response = native.request("GET", "api/info", headers)
         val info = runCatching { JSONObject(response.body.toString(Charsets.UTF_8)) }.getOrNull()
         val status = registration.validateInfo(response.statusCode, info)

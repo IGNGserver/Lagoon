@@ -700,7 +700,7 @@ class ServerStore internal constructor(private val preferences: SharedPreference
       .remove("directories:$id").remove("sessionNotices:$id").remove("collapsedSections:$id").remove("collapsedProjects:$id").remove("pinned:$id").remove("remoteMigration:$id")
       .remove("backgroundRunning:$id")
       .remove("modelVisibility:$id").remove("modelVisibilityConfigured:$id").remove("modelVariants:$id").remove("recentModels:$id").remove("scope:$id")
-      .remove("newSessionDefaults:$id")
+      .remove("newSessionDefaults:$id").remove("taskLedgerVersion:$id")
     val prefixes = listOf("location", "preview", "configuration", "taskRead", "taskState", "taskParent", "taskTime", "notification", "taskLedgerVersion").map { "$it:$id:" }
     preferences.all.keys.filter { key -> prefixes.any(key::startsWith) }.forEach(editor::remove)
     check(editor.commit()) { "服务器资料删除未确认，已保留凭据和草稿，请刷新核对" }

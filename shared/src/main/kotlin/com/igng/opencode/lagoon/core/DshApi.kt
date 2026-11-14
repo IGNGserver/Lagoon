@@ -2119,9 +2119,14 @@ class DshApi(
         }
         val cause = try { ended.await() } finally { socket?.cancel() }
         if (isClosed()) break
+        val terminalCause = isNonRetryableEventsError(cause)
         eventsError = cause?.message?.takeIf { it.isNotBlank() } ?: "事件流已关闭"
         eventsReconnects++
         if (wasReady) connectionEvent(false, eventsError)?.let(push)
+        if (terminalCause) {
+          Diagnostics.warn("DshApi", "\$events 不被当前主机支持，停止重试：${eventsError}")
+          break
+        }
         Diagnostics.warn("DshApi", "\$events 断开，准备重连：${eventsError}")
       } catch (cancel: CancellationException) {
         throw cancel
@@ -2132,6 +2137,10 @@ class DshApi(
         eventsReconnects++
         if (wasReady) connectionEvent(false, eventsError)?.let(push)
         socket?.cancel()
+        if (isNonRetryableEventsError(error)) {
+          Diagnostics.warn("DshApi", "\$events 建立失败且不可重试，停止重试", error)
+          break
+        }
         Diagnostics.warn("DshApi", "\$events 建立失败", error)
       } finally {
         // Cancellation may happen in the first-ready wait, before ended.await's own finally.
@@ -2674,18 +2683,19 @@ class DshApi(
         state.opening = false
         if (!state.snapshot.isCompleted) state.snapshot.completeExceptionally(cancel)
         throw cancel
-      } catch (limit: RemoteStreamLimitException) {
-        // The local gateway is full. Do not cancel the in-flight open RPC (RemoteRpc treats that as
-        // an unknown-delivery failure and closes the whole relay); evict a different live follow,
-        // which releases its slot synchronously via StreamSocket.closeNow(), then retry once.
-        if (!retriedLimit && !state.closed && releaseFollowForRetry(session.id)) {
+      } catch (error: Exception) {
+        // The local gateway or Host stream pool is full (`RemoteStreamLimitException` / `RATE_LIMITED`).
+        // Do not cancel the in-flight open RPC; evict a different live follow, which releases its
+        // slot synchronously via `StreamSocket.closeNow()`, then retry once.
+        val streamOrRateLimit = error is RemoteStreamLimitException ||
+          (error as? RemoteGatewayException)?.code == "RATE_LIMITED" ||
+          (error as? RemoteRpcException)?.code == "RATE_LIMITED" ||
+          (error as? ApiException)?.code == "RATE_LIMITED"
+        if (streamOrRateLimit && !retriedLimit && !state.closed && releaseFollowForRetry(session.id)) {
           retriedLimit = true
           delay(STREAM_LIMIT_RETRY_DELAY_MILLIS)
           if (!state.closed) continue
         }
-        failFollow(session, state, limit)
-        return
-      } catch (error: Exception) {
         failFollow(session, state, error)
         return
       }
@@ -3848,8 +3858,14 @@ class DshApi(
   }
 
   override suspend fun compact(session: Session) {
-    // DSH 的手动压缩是 `/compact` 命令，不是独立 RPC。
-    executeCommand(session, "/compact")
+    // 优先走 `remote.compaction.async.v1` 异步提交+轮询，避免慢后端压缩触及单条 RPC 超时；
+    // 未声明该能力或直连 DSH 时退回 `/compact` 命令。
+    val remote = remoteBackend
+    if (remote != null && remote.supportsAsyncCompaction()) {
+      remote.compactSessionAsync(session.id)
+    } else {
+      executeCommand(session, "/compact")
+    }
   }
 
   override suspend fun revert(session: Session, messageId: String) {
@@ -3875,16 +3891,45 @@ class DshApi(
     val content = JSONArray()
     val remote = remoteBackend
     val uploadLines = mutableListOf<String>()
-    // Remote has no fileUploads receipt; publish arbitrary files into the current workspace and
-    // reference the returned path. Images keep the existing multimodal image block.
-    if (remote != null) {
-      for (file in inline) {
-        val mime = file.mime.substringBefore(';').trim().lowercase()
-        if (AttachmentPolicy.kind(mime, file.name) == AttachmentPolicy.Kind.IMAGE) continue
-        val bytes = readInlineBytes(file) ?: throw ApiException(400, "附件无法读取：${file.name}")
-        val uploaded = remote.uploadWorkspaceFile(session.id, bytes, file.name)
-        uploadLines += "已上传文件：${uploaded.path}"
+    val mediaBlocks = mutableListOf<JSONObject>()
+    for (file in inline) {
+      val mime = file.mime.substringBefore(';').trim().lowercase()
+      val kind = AttachmentPolicy.kind(mime, file.name)
+      if (kind == AttachmentPolicy.Kind.IMAGE) {
+        inlineContent(file)?.let { mediaBlocks += it }
+        continue
       }
+      val bytes = readInlineBytes(file) ?: throw ApiException(400, "附件无法读取：${file.name}")
+      if (remote != null) {
+        val uploadedViaReceipt = if (bytes.size <= REMOTE_FILE_RECEIPT_LIMIT_BYTES) {
+          try {
+            val receipt = uploadFileAttachment(session.id, bytes, file.name)
+            mediaBlocks += JSONObject().put("type", "file").put("receiptId", receipt)
+            true
+          } catch (error: Exception) {
+            if (error is CancellationException || !isRemoteFileReceiptUnsupported(error)) throw error
+            false
+          }
+        } else {
+          false
+        }
+        if (!uploadedViaReceipt) {
+          val uploaded = remote.uploadWorkspaceFile(session.id, bytes, file.name)
+          uploadLines += "已上传文件：${uploaded.path}"
+        }
+        continue
+      }
+      // 非图片附件走 `fileUploads/upload` 换 receipt，再以 `{type:"file", receiptId}` 发送：
+      // 这样 Host 保留文件本身（字节、文件名、可读路径），而不是把正文拼进模型上下文。
+      val receipt = try {
+        uploadFileAttachment(session.id, bytes, file.name)
+      } catch (error: ApiException) {
+        // 旧实例/未装附件插件时才退回「文本内联」，二进制文件仍然明确失败。
+        if (kind != AttachmentPolicy.Kind.TEXT || !error.isDshMethodUnavailable) throw error
+        inlineContent(file)?.let { mediaBlocks += it }
+        continue
+      }
+      mediaBlocks += JSONObject().put("type", "file").put("receiptId", receipt)
     }
     // DSH 的 prompt 没有「文件引用」块；引用的服务器文件折算成 `@路径` 文本，与官方 Web 的提及写法一致。
     val body = buildString {
@@ -3899,28 +3944,7 @@ class DshApi(
       }
     }.trim()
     if (body.isNotBlank()) content.put(JSONObject().put("type", "text").put("text", body))
-    for (file in inline) {
-      val mime = file.mime.substringBefore(';').trim().lowercase()
-      val kind = AttachmentPolicy.kind(mime, file.name)
-      if (kind == AttachmentPolicy.Kind.IMAGE) {
-        inlineContent(file)?.let { content.put(it) }
-        continue
-      }
-      // Remote 中继没有附件回执路由：上面已经折算成 `@路径` 文本。
-      if (remote != null) continue
-      val bytes = readInlineBytes(file) ?: throw ApiException(400, "附件无法读取：${file.name}")
-      // 非图片附件走 `fileUploads/upload` 换 receipt，再以 `{type:"file", receiptId}` 发送：
-      // 这样 Host 保留文件本身（字节、文件名、可读路径），而不是把正文拼进模型上下文。
-      val receipt = try {
-        uploadFileAttachment(session.id, bytes, file.name)
-      } catch (error: ApiException) {
-        // 旧实例/未装附件插件时才退回「文本内联」，二进制文件仍然明确失败。
-        if (kind != AttachmentPolicy.Kind.TEXT || !error.isDshMethodUnavailable) throw error
-        inlineContent(file)?.let { content.put(it) }
-        continue
-      }
-      content.put(JSONObject().put("type", "file").put("receiptId", receipt))
-    }
+    mediaBlocks.forEach { content.put(it) }
     if (content.length() == 0) throw ApiException(400, "消息内容为空：附件无法读取或格式不受支持")
     val request = JSONObject()
       .put("requestId", id)
@@ -4398,8 +4422,35 @@ class DshApi(
 
     /** 一条消息里最多回填多少附件字节（base64 后的长度）；超出的只在时间线里显示文件名。 */
     const val ATTACHMENT_BUDGET_BYTES = 12 * 1024 * 1024
+    /** 远程小附件优先尝试 `fileUploads/upload` 的裸字节上限（base64 后适配 Gateway 20 MiB 传输限制）。 */
+    const val REMOTE_FILE_RECEIPT_LIMIT_BYTES = 15 * 1024 * 1024
     /** 附件 data URI 的在内存缓存条数上限。 */
     const val ATTACHMENT_CACHE_LIMIT = 64
+
+    private fun isNonRetryableEventsError(error: Throwable?): Boolean {
+      var current = error
+      val seen = HashSet<Throwable>()
+      while (current != null && seen.add(current)) {
+        when (current) {
+          is RemoteGatewayException -> if (current.code in setOf("METHOD_NOT_ALLOWED", "METHOD_NOT_FOUND")) return true
+          is RemoteRpcException -> if (current.code in setOf("METHOD_NOT_ALLOWED", "METHOD_NOT_FOUND")) return true
+          is ApiException -> if (current.status in setOf(404, 405, 501) ||
+            current.code in setOf("METHOD_NOT_ALLOWED", "METHOD_NOT_FOUND")) return true
+        }
+        current = current.cause
+      }
+      return false
+    }
+
+    private fun isRemoteFileReceiptUnsupported(error: Throwable): Boolean = when (error) {
+      is ApiException -> error.isDshMethodUnavailable ||
+        error.code in setOf("METHOD_NOT_ALLOWED", "METHOD_NOT_FOUND") ||
+        error.status in setOf(404, 405, 501)
+      is RemoteGatewayException -> error.code in setOf("METHOD_NOT_ALLOWED", "METHOD_NOT_FOUND")
+      is RemoteRpcException -> error.code in setOf("METHOD_NOT_ALLOWED", "METHOD_NOT_FOUND")
+      is RemoteFailureException -> error.kind == RemoteFailureKind.INCOMPATIBLE
+      else -> false
+    }
 
     /** 作业清单缓存的有效期：把同一轮对账里的重复读取收敛掉。 */
     const val JOB_CACHE_MILLIS = 20_000L

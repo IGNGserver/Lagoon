@@ -36,7 +36,7 @@ internal class RemoteSetup(
     val token = device.tokens?.accessToken ?: throw IOException("DSH Hub 设备尚未注册")
     val host = api.host(token, hostId)
     val actual = fingerprint(host.publicKey ?: throw IOException("Host 未提供身份公钥"))
-    if (!MessageDigest.isEqual(actual.lowercase().toByteArray(), expectedFingerprint.lowercase().toByteArray()))
+    if (!MessageDigest.isEqual(actual.lowercase().toByteArray(Charsets.UTF_8), expectedFingerprint.lowercase().toByteArray(Charsets.UTF_8)))
       throw IOException("Host 指纹与确认值不匹配")
     val scope = RemotePeerScope(origin, account.trim(), host.deviceId)
     RemotePeerTrust(pins).pinAfterConfirmation(scope, host)

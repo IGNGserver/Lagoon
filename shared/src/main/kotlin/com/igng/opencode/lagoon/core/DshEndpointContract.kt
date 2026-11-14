@@ -40,6 +40,7 @@ internal object DshEndpointContract {
     "credentials/unset",
     "directoryPicker/list",
     "fileReferences/list",
+    "fileUploads/upload",
     "goals/clear",
     "goals/complete",
     "goals/create",

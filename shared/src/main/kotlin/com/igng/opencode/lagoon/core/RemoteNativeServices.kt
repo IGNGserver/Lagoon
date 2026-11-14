@@ -552,7 +552,7 @@ internal class RemoteNativeServices(
     private const val MAX_STREAMS = 16
     private const val STREAM_QUEUE = 32
     private const val SEND_QUEUE = 32
-    private val LOCATOR = Regex("[A-Za-z0-9][A-Za-z0-9._:-]{0,255}")
+    private val LOCATOR = Regex("[A-Za-z0-9\\u0080-\\uFFFF][A-Za-z0-9._:\\-\\u0080-\\uFFFF]{0,255}")
     private val CODE = Regex("[A-Za-z0-9_./-]{1,128}")
     private val REQUEST_HEADERS = setOf("accept", "content-type", "last-event-id", "sec-websocket-protocol", "x-opencode-ticket")
     private val SENSITIVE_HEADERS = setOf("authorization", "proxy-authorization", "cookie", "cookie2", "set-cookie", "set-cookie2")

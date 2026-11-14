@@ -26,9 +26,9 @@ data class ConnectionRouteSnapshot internal constructor(
     id = bindingId, url = endpoint, allowCleartext = allowCleartext, username = username,
     kind = when (protocolId) {
       HarnessProtocolId.OPENCODE_NATIVE -> ServerKind.OPENCODE
-      HarnessProtocolId.CODEX_APP_SERVER, HarnessProtocolId.ANTIGRAVITY_ACP -> ServerKind.CODEX
+      HarnessProtocolId.CODEX_APP_SERVER, HarnessProtocolId.ANTIGRAVITY_ACP, HarnessProtocolId.OPENCODE_ACP -> ServerKind.CODEX
       HarnessProtocolId.DSH_TYPERT -> if (carrierId == ConnectionCarrierId.REMOTE_NOISE) ServerKind.DSH_REMOTE else ServerKind.DSH
-    }, protocolId = protocolId.takeIf { it == HarnessProtocolId.ANTIGRAVITY_ACP }, dshAuth = dshAuth, sshHostId = sshHostId, sshServicePath = sshServicePath,
+    }, protocolId = protocolId.takeIf { it in setOf(HarnessProtocolId.ANTIGRAVITY_ACP, HarnessProtocolId.OPENCODE_ACP) }, dshAuth = dshAuth, sshHostId = sshHostId, sshServicePath = sshServicePath,
     remoteHostId = remoteHostId, remoteHostFingerprint = fingerprint, remoteServiceId = remoteServiceId
   )
 }
@@ -114,7 +114,7 @@ internal fun createRoutedHarnessClient(
     ConnectionCarrierId.SSH_FORWARD -> (sshFactory ?: error("SSH carrier 尚未配置"))(profile, credentials)
     ConnectionCarrierId.DIRECT_HTTP -> when (route.protocolId) {
       HarnessProtocolId.OPENCODE_NATIVE -> OpenCodeApi(profile, credentials, callTimeoutSeconds)
-      HarnessProtocolId.CODEX_APP_SERVER, HarnessProtocolId.ANTIGRAVITY_ACP -> error("此 Harness 需要 SSH 或 Remote 连接")
+      HarnessProtocolId.CODEX_APP_SERVER, HarnessProtocolId.ANTIGRAVITY_ACP, HarnessProtocolId.OPENCODE_ACP -> error("此 Harness 需要 SSH 或 Remote 连接")
       HarnessProtocolId.DSH_TYPERT -> dshRegistry?.acquire(profile, credentials, callTimeoutSeconds, onCookie)
          ?: DshApi(profile, credentials, callTimeoutSeconds, onCookie)
     }

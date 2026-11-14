@@ -60,7 +60,7 @@ internal fun DeviceManagementScreen(
 ) {
   val graph by controller.connectionGraph.collectAsState()
   val devices = rememberDevices(state, controller, graph)
-  val catalog = controller.activeRemoteCatalog()
+  val catalog = controller.activeHubCatalog()
   val hubDevices = devices.filter { it.access == DeviceAccess.HUB }
   val sshDevices = devices.filter { it.access == DeviceAccess.SSH }
   val directDevices = devices.filter { it.access == DeviceAccess.DIRECT }

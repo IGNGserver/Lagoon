@@ -21,7 +21,12 @@ class RemoteBackend internal constructor(
     require(nativeProfile.remoteHostId != null)
     AgyApi(LazyRemoteAgyTransport(load = { session.agyTransport() }, release = {
       if (closed.compareAndSet(false, true)) release()
-    }))
+    }), providerId = "antigravity", healthLabel = "Antigravity ACP")
+  } else if (nativeProfile?.protocol == HarnessProtocolId.OPENCODE_ACP) {
+    require(nativeProfile.remoteHostId != null)
+    AgyApi(LazyRemoteAgyTransport(load = { session.openCodeAcpTransport() }, release = {
+      if (closed.compareAndSet(false, true)) release()
+    }), providerId = "opencode", healthLabel = "OpenCode ACP")
   } else if (nativeProfile?.protocol == HarnessProtocolId.CODEX_APP_SERVER) {
     require(nativeProfile.remoteHostId != null)
     // The event collector may fail during construction; never dereference the not-yet-assigned
@@ -66,13 +71,15 @@ class RemoteBackend internal constructor(
   @Volatile private var pinnedTerminalGateway: RemoteGateway? = null
   private val terminalSockets = java.util.concurrent.ConcurrentHashMap.newKeySet<WebSocket>()
 
-  /** Terminal inputs never migrate to a replacement encrypted connection. Reopen the owner first. */
+  /** Terminal inputs never migrate to a replacement encrypted connection while active sockets exist. */
   private suspend fun terminalGateway(): RemoteGateway {
     check(!isClosed) { "Remote 终端连接已关闭" }
     val current = session.terminalGateway()
     synchronized(terminalLock) {
       val previous = pinnedTerminalGateway
-      check(previous == null || previous === current) { "Remote 终端连接代次已变化，请重新连接并打开终端；没有重放输入" }
+      if (previous != null && previous !== current && terminalSockets.isNotEmpty()) {
+        error("Remote 终端连接代次已变化，请重新连接并打开终端；没有重放输入")
+      }
       check(session.isCurrentGateway(current)) { "Remote 终端连接已失效" }
       pinnedTerminalGateway = current
     }
@@ -105,8 +112,13 @@ class RemoteBackend internal constructor(
     dshAvailable = session.capabilities().sessionFormat != null,
     native = session.nativeServiceCatalog(),
     codexAvailable = session.capabilities().supportsWorkspace("codex", "codex.appserver.v1"),
-    agyAvailable = session.capabilities().hasAgy
+    agyAvailable = session.capabilities().hasAgy,
+    openCodeAcpAvailable = session.capabilities().hasOpenCodeAcp
   )
+
+  internal suspend fun supportsSessionEvents(): Boolean = session.supportsSessionEvents()
+  internal suspend fun supportsAsyncCompaction(): Boolean = session.supportsAsyncCompaction()
+  internal suspend fun compactSessionAsync(sessionId: String) = session.compactSessionAsync(sessionId)
 
   internal suspend fun probe(): RemoteProbe {
     val started = System.nanoTime()

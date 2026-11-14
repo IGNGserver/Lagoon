@@ -73,7 +73,7 @@ internal class NativeHttpEndpoint(
   private val base: URI = parseBase(baseUrl)
   private val basePath: String = base.rawPath.orEmpty().ifBlank { "/" }.trimEnd('/').ifBlank { "/" }
 
-  val origin: NativeHttpOrigin = NativeHttpOrigin.from(base)
+  val origin: NativeHttpOrigin = originOf(base)
   val baseUrl: String = base.toASCIIString()
 
   /** Resolves an API route under the configured origin and path prefix. */
@@ -90,7 +90,7 @@ internal class NativeHttpEndpoint(
   /** Rejects a response URL that escaped the configured scheme/host/port. */
   fun requireSameOrigin(url: String) {
     val candidate = parseAbsolute(url)
-    if (NativeHttpOrigin.from(candidate) != origin) {
+    if (originOf(candidate) != origin) {
       throw NativeHttpOriginViolationException(url, origin)
     }
   }
@@ -117,11 +117,20 @@ internal class NativeHttpEndpoint(
     return value
   }
 
+  private fun originOf(uri: URI): NativeHttpOrigin {
+    if (uri.host != null) return NativeHttpOrigin.from(uri)
+    val parts = extractFlexibleHttpOriginParts(uri.toASCIIString())
+      ?: throw IllegalArgumentException("原生 HTTP 地址缺少主机名")
+    return NativeHttpOrigin(parts.first, parts.second, parts.third)
+  }
+
   private fun parseAbsolute(raw: String): URI {
-    val value = try { URI(raw) } catch (error: Exception) {
+    val normalized = punycodeUrlAuthorityPreservingPath(raw)
+    val value = try { URI(normalized) } catch (error: Exception) {
       throw IllegalArgumentException("原生 HTTP 地址无效", error)
     }
-    require(value.isAbsolute && value.host != null && value.rawAuthority != null) {
+    val hasValidHost = !value.host.isNullOrEmpty() || extractFlexibleHttpOriginParts(normalized) != null
+    require(value.isAbsolute && hasValidHost && value.rawAuthority != null) {
       "原生 HTTP 地址必须包含固定 origin"
     }
     require(value.rawUserInfo == null && value.rawFragment == null) { "原生 HTTP 地址不能包含凭据或片段" }

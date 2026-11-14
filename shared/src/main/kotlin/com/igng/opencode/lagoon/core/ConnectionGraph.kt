@@ -11,7 +11,7 @@ enum class ConnectionSourceType(val wire: String) { HUB("hub"), SSH("ssh"), DIRE
   companion object { fun fromWire(value: String): ConnectionSourceType = entries.firstOrNull { it.wire == value }
     ?: throw IllegalArgumentException("Unknown connection source: $value") }
 }
-enum class HarnessProtocolId(val wire: String) { OPENCODE_NATIVE("opencode-native"), DSH_TYPERT("dsh-typert"), CODEX_APP_SERVER("codex-app-server"), ANTIGRAVITY_ACP("antigravity-acp");
+enum class HarnessProtocolId(val wire: String) { OPENCODE_NATIVE("opencode-native"), DSH_TYPERT("dsh-typert"), CODEX_APP_SERVER("codex-app-server"), ANTIGRAVITY_ACP("antigravity-acp"), OPENCODE_ACP("opencode-acp");
   companion object { fun fromWire(value: String): HarnessProtocolId = entries.firstOrNull { it.wire == value }
     ?: throw IllegalArgumentException("Unknown harness protocol: $value") }
 }
@@ -283,17 +283,28 @@ object ConnectionGraphCodec {
 object MigrationProjection {
   /** Do not use ServerKind.fromWire: it defaults unknown strings to OpenCode. */
   private const val AGY_KIND = "antigravity-acp"
-  fun legacyKind(wire: String): ServerKind = if (wire == AGY_KIND) ServerKind.CODEX else
-    ServerKind.entries.firstOrNull { it.wire == wire }
+  private const val OPENCODE_ACP_KIND = "opencode-acp"
+  fun legacyKind(wire: String): ServerKind = when (wire) {
+    AGY_KIND, OPENCODE_ACP_KIND -> ServerKind.CODEX
+    else -> ServerKind.entries.firstOrNull { it.wire == wire }
       ?: throw IllegalArgumentException("Unknown legacy harness kind: $wire")
+  }
 
   /** New kinds use an unknown legacy marker so older clients fail closed instead of dialing Codex. */
-  fun kindWire(profile: ServerProfile): String = if (profile.protocol == HarnessProtocolId.ANTIGRAVITY_ACP) AGY_KIND else profile.kind.wire
+  fun kindWire(profile: ServerProfile): String = when (profile.protocol) {
+    HarnessProtocolId.ANTIGRAVITY_ACP -> AGY_KIND
+    HarnessProtocolId.OPENCODE_ACP -> OPENCODE_ACP_KIND
+    else -> profile.kind.wire
+  }
   fun storedProtocol(kindWire: String, protocolWire: String?): HarnessProtocolId? {
     val explicit = protocolWire?.let(HarnessProtocolId::fromWire)
     if (kindWire == AGY_KIND) {
       require(explicit == null || explicit == HarnessProtocolId.ANTIGRAVITY_ACP) { "Conflicting AGY protocol" }
       return HarnessProtocolId.ANTIGRAVITY_ACP
+    }
+    if (kindWire == OPENCODE_ACP_KIND) {
+      require(explicit == null || explicit == HarnessProtocolId.OPENCODE_ACP) { "Conflicting OpenCode ACP protocol" }
+      return HarnessProtocolId.OPENCODE_ACP
     }
     require(explicit == null || explicit == protocol(legacyKind(kindWire))) { "Conflicting stored harness protocol" }
     return null // Legacy profiles continue deriving protocol when callers copy their kind.

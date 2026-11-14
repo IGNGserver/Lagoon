@@ -62,7 +62,8 @@ internal fun RemoteEnrollSheet(
   val clipboard = LocalClipboardManager.current
   var origin by rememberSaveable { mutableStateOf(DEFAULT_REMOTE_ORIGIN) }
   var allowHttp by rememberSaveable { mutableStateOf(false) }
-  val managerResult = remember(origin, allowHttp) { runCatching { controller.remoteAccountManager(origin.trim(), allowHttp) } }
+  val normalizedOrigin = remember(origin) { normalizeRemoteHubAddressInput(origin) }
+  val managerResult = remember(normalizedOrigin, allowHttp) { runCatching { controller.remoteAccountManager(normalizedOrigin, allowHttp) } }
   val manager = managerResult.getOrNull()
   var providers by remember { mutableStateOf(emptyList<RemoteOAuthProvider>()) }
   var supportsPairing by remember { mutableStateOf(false) }
@@ -152,8 +153,20 @@ internal fun RemoteEnrollSheet(
             Text("登录后选择要接入的电脑。每台主机会在本机注册一个独立设备身份，用于同时保持连接。",
               style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
           }
-          item { TextField(value = origin, onValueChange = { origin = it; allowHttp = cleartextConsentAfterUrlEdit(origin, it, allowHttp); error = null }, label = "中枢服务器地址") }
-          if (origin.startsWith("http://", true)) item {
+          item {
+            TextField(
+              value = origin,
+              onValueChange = { next ->
+                val prevNormalized = normalizeRemoteHubAddressInput(origin)
+                val nextNormalized = normalizeRemoteHubAddressInput(next)
+                allowHttp = cleartextConsentAfterUrlEdit(prevNormalized, nextNormalized, allowHttp)
+                origin = next
+                error = null
+              },
+              label = "中枢服务器地址",
+            )
+          }
+          if (normalizedOrigin.startsWith("http://", true)) item {
             HyperSwitchRow(title = "允许此地址使用 HTTP", summary = "只在你信任的网络中开启", checked = allowHttp, onCheckedChange = { allowHttp = it })
           }
           if (providersLoading) item { Text("正在读取登录方式…", style = MiuixTheme.textStyles.footnote2) }
@@ -297,11 +310,15 @@ internal fun RemoteEnrollSheet(
                 busy = true; error = null
                 try {
                   val enrollment = manager!!.enroll(chosen, chosen.associate { it.hostId to it.meta.fingerprint!! })
-                  controller.saveRemoteHosts(enrollment.catalog)
-                  val registered = enrollment.registered.size
-                  resultText = if (enrollment.failures.isEmpty()) "已保存 $registered 台主机；请在主机中逐个选择 Harness，尚未自动连接"
-                    else "已保存 $registered 台；${enrollment.failures.size} 台失败：${enrollment.failures.values.first()}"
-                  onDone(registered)
+                  if (enrollment.registered.isEmpty()) {
+                    error = enrollment.failures.values.firstOrNull() ?: "所选主机均未完成接入，请重试"
+                  } else {
+                    controller.autoAttachEnrolledHosts(enrollment.catalog, enrollment.registered.keys)
+                    val registered = enrollment.registered.size
+                    resultText = if (enrollment.failures.isEmpty()) "已接入并启用 $registered 台主机"
+                      else "已接入 $registered 台；${enrollment.failures.size} 台失败：${enrollment.failures.values.first()}"
+                    onDone(registered)
+                  }
                 } catch (cancel: CancellationException) { throw cancel }
                 catch (e: Exception) { error = userFacingError(e, "接入远程主机失败") }
                 finally { busy = false }

@@ -27,8 +27,18 @@ internal class RemoteSession(
   @Volatile private var failedAt = 0L
   @Volatile private var lastFailure: RemoteFailureException? = null
   private val statusFlow = MutableStateFlow(RemoteConnectionStatus(hostId = hostId))
-  private data class Active(val connection: RemoteConnection, val gateway: RemoteGateway, val capabilities: RemoteCapabilities,
-    val nativeServices: RemoteNativeServices, val codex: RemoteCodexRegistry, val agy: RemoteAgyRegistry)
+  private data class Active(
+    val connection: RemoteConnection,
+    val gateway: RemoteGateway,
+    val capabilities: RemoteCapabilities,
+    val nativeServices: RemoteNativeServices,
+    val codex: RemoteCodexRegistry,
+    val agy: RemoteAgyRegistry,
+    val openCodeAcp: RemoteAgyRegistry
+  ) {
+    @Volatile var idleProbeRunning: Boolean = false
+    val idleProbeStrikes = java.util.concurrent.atomic.AtomicInteger(0)
+  }
 
   /** Observable connection state; UI and the doctor report read this instead of inferring from data. */
   internal val status: StateFlow<RemoteConnectionStatus> = statusFlow.asStateFlow()
@@ -58,6 +68,66 @@ internal class RemoteSession(
     if (!current.capabilities.hasAgy) throw RemoteFailureException(RemoteFailureKind.INCOMPATIBLE,
       "Host 未启用支持原生 ACP 审批的 Antigravity，请升级并启用 Host 连接器", retryable = false)
     return current.agy.acquire()
+  }
+
+  internal suspend fun openCodeAcpTransport(): AgyTransport {
+    val current = ensure()
+    if (!current.capabilities.hasOpenCodeAcp) throw RemoteFailureException(RemoteFailureKind.INCOMPATIBLE,
+      "Host 未启用 OpenCode ACP 连接器", retryable = false)
+    return current.openCodeAcp.acquire()
+  }
+
+  suspend fun supportsSessionEvents(): Boolean = ensure().capabilities.hasSessionEvents
+
+  suspend fun supportsAsyncCompaction(): Boolean = ensure().capabilities.hasAsyncCompaction
+
+  suspend fun compactSessionAsync(sessionId: String) {
+    if (sessionId.isBlank()) throw RemoteFailureException(RemoteFailureKind.REJECTED, "会话无效")
+    val current = ensure()
+    if (!current.capabilities.hasAsyncCompaction) {
+      throw RemoteFailureException(RemoteFailureKind.INCOMPATIBLE, "此主机不支持异步压缩", retryable = false)
+    }
+    val requestId = java.util.UUID.randomUUID().toString()
+    val submitted = current.connection.call(
+      "harness.remote.compaction.submit",
+      JSONObject().put("sessionId", sessionId).put("requestId", requestId),
+      30_000
+    ) as? JSONObject ?: throw RemoteFailureException(RemoteFailureKind.NETWORK, "异步压缩提交响应无效")
+    val operationId = submitted.optString("operationId").takeIf { it.isNotBlank() }
+      ?: throw RemoteFailureException(RemoteFailureKind.NETWORK, "异步压缩缺少操作 ID")
+    try {
+      var state = submitted.optString("state")
+      var message = submitted.optString("message")
+      while (true) {
+        when (state) {
+          "succeeded", "unconfirmed" -> return
+          "failed", "cancelled", "interrupted" -> {
+            throw RemoteFailureException(RemoteFailureKind.REJECTED, message.ifBlank { "会话压缩未完成（$state）" }, retryable = false)
+          }
+          "accepted", "running", "cancelling" -> Unit
+          else -> throw RemoteFailureException(RemoteFailureKind.NETWORK, "异步压缩状态未知：$state")
+        }
+        kotlinx.coroutines.delay(COMPACTION_POLL_INTERVAL_MILLIS)
+        val status = current.connection.call(
+          "harness.remote.compaction.status",
+          JSONObject().put("sessionId", sessionId).put("operationId", operationId),
+          30_000
+        ) as? JSONObject ?: throw RemoteFailureException(RemoteFailureKind.NETWORK, "异步压缩状态响应无效")
+        state = status.optString("state")
+        message = status.optString("message")
+      }
+    } catch (cancel: kotlinx.coroutines.CancellationException) {
+      kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable) {
+        runCatching {
+          current.connection.call(
+            "harness.remote.compaction.cancel",
+            JSONObject().put("sessionId", sessionId).put("operationId", operationId),
+            5_000
+          )
+        }
+      }
+      throw cancel
+    }
   }
   /** Synchronous UI projection only; actual terminal requests recheck their pinned carrier. */
   internal fun terminalAvailable(): Boolean = active?.let { !closed && !it.connection.isClosed && it.capabilities.hasTerminal } == true
@@ -117,32 +187,50 @@ internal class RemoteSession(
   suspend fun transportCall(method: String, params: JSONObject = JSONObject()): Any? =
     ensure().connection.call(method, params)
 
+  private fun closeActiveBundle(bundle: Active) {
+    bundle.openCodeAcp.close()
+    bundle.agy.close()
+    bundle.codex.close()
+    bundle.nativeServices.close()
+    bundle.gateway.close()
+    bundle.connection.close()
+  }
+
   private suspend fun ensure(): Active = mutex.withLock {
     if (closed) { publishClosed(); throw IOException("Remote 会话已关闭") }
-    active?.takeUnless { it.connection.isClosed }?.let { current ->
+    active?.takeUnless { it.connection.isClosed || it.idleProbeStrikes.get() >= 2 }?.let { current ->
       val idleMillis = System.currentTimeMillis() - current.connection.lastTrafficAt
-      if (idleMillis <= IDLE_PROBE_AFTER_MILLIS) return@withLock current
-      val healthy = try {
-        kotlinx.coroutines.withTimeout(IDLE_PROBE_TIMEOUT_MILLIS) {
-          current.connection.call("harness.transport.describe", JSONObject(), IDLE_PROBE_TIMEOUT_MILLIS)
-        }
-        true
-      } catch (cancel: kotlinx.coroutines.CancellationException) {
-        throw cancel
-      } catch (_: Exception) {
-        false
+      if (idleMillis <= IDLE_PROBE_AFTER_MILLIS) {
+        current.idleProbeStrikes.set(0)
+        return@withLock current
       }
-      if (healthy && !closed && !current.connection.isClosed) return@withLock current
-      current.agy.close()
-      current.codex.close()
-      current.nativeServices.close()
-      current.gateway.close()
-      current.connection.close()
+      if (!current.idleProbeRunning && !closed && !current.connection.isClosed) {
+        current.idleProbeRunning = true
+        SharedHttp.ioScope.launch {
+          try {
+            val healthy = try {
+              kotlinx.coroutines.withTimeout(IDLE_PROBE_TIMEOUT_MILLIS) {
+                current.connection.call("harness.transport.describe", JSONObject(), IDLE_PROBE_TIMEOUT_MILLIS)
+              }
+              true
+            } catch (cancel: kotlinx.coroutines.CancellationException) {
+              throw cancel
+            } catch (_: Exception) {
+              false
+            }
+            if (healthy) {
+              current.idleProbeStrikes.set(0)
+            } else if (current.idleProbeStrikes.incrementAndGet() >= 2) {
+              closeActiveBundle(current)
+            }
+          } finally {
+            current.idleProbeRunning = false
+          }
+        }
+      }
+      return@withLock current
     }
-    active?.nativeServices?.close()
-    active?.codex?.close()
-    active?.agy?.close()
-    active?.gateway?.close()
+    active?.let(::closeActiveBundle)
     active = null
     val recent = lastFailure
     if (recent != null && System.currentTimeMillis() - failedAt < FAILURE_REUSE_MILLIS) throw recent
@@ -225,11 +313,16 @@ internal class RemoteSession(
     var nativeServices: RemoteNativeServices? = null
     var codex: RemoteCodexRegistry? = null
     var agy: RemoteAgyRegistry? = null
+    var openCodeAcp: RemoteAgyRegistry? = null
     val dispatchEvent: (JSONObject) -> Unit = {
       if (it.optString("event").startsWith("codex.app.")) {
         (codex ?: throw IOException("Codex 事件早于能力协商")).event(it)
       } else if (it.optString("event").startsWith("agent.acp.")) {
-        (agy ?: throw IOException("AGY 事件早于能力协商")).event(it)
+        val currentAgy = agy
+        val currentOpenCodeAcp = openCodeAcp
+        if (currentAgy == null && currentOpenCodeAcp == null) throw IOException("ACP 事件早于能力协商")
+        currentAgy?.event(it)
+        currentOpenCodeAcp?.event(it)
       } else if (it.optString("event") == "harness.services.frame") {
         (nativeServices ?: throw IOException("原生服务事件早于能力协商")).event(it)
       } else (gateway ?: throw IOException("Remote 事件早于能力协商")).event(it)
@@ -267,12 +360,22 @@ internal class RemoteSession(
       nativeServices = nextNative
       val nextCodex = RemoteCodexRegistry("codex.appserver.transfer.v1" in capabilities.capabilities) { method, params -> connection.call(method, params) }
       codex = nextCodex
-      val nextAgy = RemoteAgyRegistry("agent.acp.transfer.v1" in capabilities.capabilities,
+      val nextAgy = RemoteAgyRegistry(
+        "agent.acp.transfer.v1" in capabilities.capabilities,
         "agent.acp.workspace-files.v1" in capabilities.capabilities,
-        "agent.acp.terminal.v1" in capabilities.capabilities) { method, params -> connection.call(method, params) }
+        "agent.acp.terminal.v1" in capabilities.capabilities,
+        backendId = "antigravity"
+      ) { method, params -> connection.call(method, params) }
+      val nextOpenCodeAcp = RemoteAgyRegistry(
+        "agent.acp.transfer.v1" in capabilities.capabilities,
+        "agent.acp.workspace-files.v1" in capabilities.capabilities,
+        "agent.acp.terminal.v1" in capabilities.capabilities,
+        backendId = "opencode"
+      ) { method, params -> connection.call(method, params) }
       agy = nextAgy
-      Active(connection, nextGateway, capabilities, nextNative, nextCodex, nextAgy).also { current ->
-        if (closed) { nextAgy.close(); nextCodex.close(); nextNative.close(); nextGateway.close(); connection.close(); throw IOException("Remote 会话已关闭") }
+      openCodeAcp = nextOpenCodeAcp
+      Active(connection, nextGateway, capabilities, nextNative, nextCodex, nextAgy, nextOpenCodeAcp).also { current ->
+        if (closed) { closeActiveBundle(current); throw IOException("Remote 会话已关闭") }
         active = current
         lastFailure = null
         failedAt = 0L
@@ -284,6 +387,7 @@ internal class RemoteSession(
           lastError = null)
         SharedHttp.ioScope.launch {
           val closeCause = connection.awaitClosed()
+          nextOpenCodeAcp.close()
           nextAgy.close()
           nextCodex.close()
           nextNative.close()
@@ -334,6 +438,10 @@ internal class RemoteSession(
     const val FAILURE_REUSE_MILLIS = 2_000L
     const val IDLE_PROBE_AFTER_MILLIS = 45_000L
     const val IDLE_PROBE_TIMEOUT_MILLIS = 5_000L
+    const val COMPACTION_POLL_INTERVAL_MILLIS = 1_000L
+    const val RELAY_WORKSPACE_UPLOAD_LIMIT_BYTES = 20 * 1024 * 1024
+    const val LEGACY_UPLOAD_CHUNK_BYTES = 65_536
+    const val BINARY_UPLOAD_CHUNK_BYTES = 256 * 1024
   }
 
   private fun publishClosed() {
@@ -356,23 +464,41 @@ internal class RemoteSession(
     val current = ensure()
     if (!current.capabilities.supportsWorkspaceUpload)
       throw RemoteFailureException(RemoteFailureKind.INCOMPATIBLE, "此主机的远程插件不支持上传文件")
+    if (current.connection.transport.lowercase() !in setOf("lan", "p2p") && bytes.size > RELAY_WORKSPACE_UPLOAD_LIMIT_BYTES)
+      throw RemoteFailureException(RemoteFailureKind.REJECTED, "经由 Relay 中继单次最多上传 20 MiB 文件")
+    val binary = current.capabilities.supportsBinaryWorkspaceUpload
     val uploadId = java.util.UUID.randomUUID().toString()
     val scope = JSONObject().put("sessionId", sessionId).put("uploadId", uploadId)
     var committed = false
     try {
-      val opened = current.connection.call("workspace.upload.open",
-        JSONObject(scope.toString()).put("name", name).put("totalBytes", bytes.size), 60_000) as? JSONObject
+      val openParams = JSONObject(scope.toString()).put("name", name).put("totalBytes", bytes.size)
+      if (binary) openParams.put("encoding", "binary-v1")
+      val opened = current.connection.call("workspace.upload.open", openParams, 60_000) as? JSONObject
         ?: throw RemoteFailureException(RemoteFailureKind.NETWORK, "上传打开响应无效")
       if (opened.optString("uploadId") != uploadId) throw RemoteFailureException(RemoteFailureKind.NETWORK, "上传打开响应无效")
+      if (binary && opened.optString("encoding") != "binary-v1")
+        throw RemoteFailureException(RemoteFailureKind.NETWORK, "二进制上传协商失败")
+      val maxChunkBytes = if (binary) BINARY_UPLOAD_CHUNK_BYTES else LEGACY_UPLOAD_CHUNK_BYTES
       val chunkBytes = opened.optInt("chunkBytes", 0)
-      if (chunkBytes !in 1..65536) throw RemoteFailureException(RemoteFailureKind.NETWORK, "上传块大小无效")
+      if (chunkBytes !in 1..maxChunkBytes) throw RemoteFailureException(RemoteFailureKind.NETWORK, "上传块大小无效")
       var offset = 0
       while (offset < bytes.size) {
         val end = minOf(offset + chunkBytes, bytes.size)
-        val data = java.util.Base64.getEncoder().encodeToString(bytes.copyOfRange(offset, end))
-        val ack = current.connection.call("workspace.upload.chunk",
-          JSONObject(scope.toString()).put("offset", offset).put("data", data), 60_000) as? JSONObject
-          ?: throw RemoteFailureException(RemoteFailureKind.NETWORK, "上传响应无效")
+        val chunk = bytes.copyOfRange(offset, end)
+        val ack = if (binary) {
+          current.connection.callBinaryUploadChunk(
+            JSONObject(scope.toString()).put("offset", offset),
+            chunk,
+            60_000
+          ) as? JSONObject
+        } else {
+          val data = java.util.Base64.getEncoder().encodeToString(chunk)
+          current.connection.call(
+            "workspace.upload.chunk",
+            JSONObject(scope.toString()).put("offset", offset).put("data", data),
+            60_000
+          ) as? JSONObject
+        } ?: throw RemoteFailureException(RemoteFailureKind.NETWORK, "上传响应无效")
         if (ack.optString("uploadId") != uploadId || ack.optInt("receivedBytes", -1) != end)
           throw RemoteFailureException(RemoteFailureKind.NETWORK, "上传确认不一致")
         offset = end
@@ -398,11 +524,7 @@ internal class RemoteSession(
   override fun close() {
     closed = true
     publishClosed()
-    active?.nativeServices?.close()
-    active?.codex?.close()
-    active?.agy?.close()
-    active?.gateway?.close()
-    active?.connection?.close()
+    active?.let(::closeActiveBundle)
     active = null
   }
 }

@@ -44,7 +44,7 @@ internal fun CodexProjectRegistrationRow(state: LagoonState, controller: LagoonC
 @Composable
 internal fun AgyProjectRegistrationRow(state: LagoonState, controller: LagoonController) {
   val server = state.server ?: return
-  if (!state.connected || server.protocol != HarnessProtocolId.ANTIGRAVITY_ACP) return
+  if (!state.connected || server.protocol !in setOf(HarnessProtocolId.ANTIGRAVITY_ACP, HarnessProtocolId.OPENCODE_ACP)) return
   var visible by remember(server.id) { mutableStateOf(false) }
   var path by remember(server.id) { mutableStateOf("") }
   ChoiceRow("添加 Antigravity 工作目录…", "选择开发机上已存在的目录", false) { visible = true }

@@ -20,7 +20,7 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
 @Composable
 internal fun HarnessBadge(profile: ServerProfile, modifier: Modifier = Modifier) {
   val kind = profile.kind
-  val label = if (profile.protocol == HarnessProtocolId.ANTIGRAVITY_ACP) "Antigravity" else when (kind) {
+  val label = if (profile.protocol == HarnessProtocolId.ANTIGRAVITY_ACP) "Antigravity" else if (profile.protocol == HarnessProtocolId.OPENCODE_ACP) "OpenCode ACP" else when (kind) {
     ServerKind.OPENCODE -> "OpenCode"
     ServerKind.CODEX -> "Codex"
     ServerKind.DSH, ServerKind.DSH_REMOTE -> "DSH"
