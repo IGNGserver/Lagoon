@@ -67,6 +67,17 @@ internal class DshQuestionCoordinator(
     emit(); claimVisible()
   }
 
+  /** Remove only after an authoritative session deletion; detach claims via the normal lifecycle. */
+  fun removeSession(sessionId: String) = synchronized(lock) {
+    if (closed) return@synchronized
+    val ids = registry.snapshots(clock()).filter { it.sessionId == sessionId }.map { it.id }
+    knownInbox -= sessionId
+    completed.removeAll(ids.toSet())
+    if (session == sessionId) session = null
+    dispatch(registry.removeSession(sessionId))
+    emit()
+  }
+
   fun presentation(sessionId: String?, foreground: Boolean) = synchronized(lock) {
     if (closed) return@synchronized
     session = sessionId; this.foreground = foreground

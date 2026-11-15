@@ -17,7 +17,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 
 /** A record is local to one installation. It must never be included in server-profile exports. */
-internal class RemoteDeviceRecord(
+internal data class RemoteDeviceRecord(
   val origin: String,
   val account: String,
   val identity: RemoteIdentity,
@@ -26,7 +26,11 @@ internal class RemoteDeviceRecord(
   /** 进入当前 transition 的时间；用来区分“正在进行的刷新”和“进程被杀留下的残局”。 */
   val transitionAt: Long = 0,
   /** Marked true once `/auth/refresh` returns a definitive server credential rejection so reconnect loops stop hammering the Hub. */
-  val invalidated: Boolean = false
+  val invalidated: Boolean = false,
+  /** Null means a legacy record whose authorization scope was never recorded. */
+  val accountKind: String? = null,
+  val pairingRestricted: Boolean? = null,
+  val enrollmentMethod: String? = null
 ) {
   enum class Transition { NONE, REGISTERING, REFRESHING }
   override fun toString(): String = "RemoteDeviceRecord(origin=$origin, account=$account, identity=$identity, tokens=<redacted>, transition=$transition, invalidated=$invalidated)"
@@ -43,7 +47,11 @@ internal data class PendingRemoteRevocation(
   val allowCleartext: Boolean = false,
   val createdAt: Long = System.currentTimeMillis(),
   val attempts: Int = 0,
-  val lastAttemptAt: Long = 0L
+  val lastAttemptAt: Long = 0L,
+  /** Sanitized classification only, never a server message or credential. */
+  val lastError: String? = null,
+  /** Shared legacy identities must revoke only this Host relationship, not the whole phone. */
+  val membershipOnly: Boolean = false
 ) {
   override fun toString(): String =
     "PendingRemoteRevocation(id=$id, origin=$origin, account=$account, peerHostId=$peerHostId, clientDeviceId=$clientDeviceId, attempts=$attempts)"
@@ -63,22 +71,24 @@ internal object PendingRemoteRevocationCodec {
         .put("allowCleartext", item.allowCleartext)
         .put("createdAt", item.createdAt)
         .put("attempts", item.attempts)
-        .put("lastAttemptAt", item.lastAttemptAt))
+        .put("lastAttemptAt", item.lastAttemptAt)
+        .put("lastError", item.lastError ?: JSONObject.NULL)
+        .put("membershipOnly", item.membershipOnly))
     }
   }.toString()
 
   fun decodeList(text: String): List<PendingRemoteRevocation> {
-    if (text.isBlank()) return emptyList()
+    if (text.isBlank()) throw IOException("待撤销授权格式无效")
     val array = org.json.JSONArray(text)
-    return (0 until array.length()).mapNotNull { i ->
-      val obj = array.optJSONObject(i) ?: return@mapNotNull null
-      val id = obj.optString("id").takeIf(String::isNotBlank) ?: return@mapNotNull null
-      val origin = runCatching { canonicalRemoteOrigin(obj.optString("origin")) }.getOrNull() ?: return@mapNotNull null
-      val account = obj.optString("account").takeIf(String::isNotBlank) ?: return@mapNotNull null
-      val peerHostId = obj.optString("peerHostId").takeIf(String::isNotBlank) ?: return@mapNotNull null
-      val clientDeviceId = obj.optString("clientDeviceId").takeIf(RemoteServerApi::validDeviceId) ?: return@mapNotNull null
-      val accessToken = obj.optString("accessToken").takeIf(RemoteServerApi::validToken) ?: return@mapNotNull null
-      val refreshToken = obj.optString("refreshToken").takeIf(RemoteServerApi::validToken) ?: return@mapNotNull null
+    return (0 until array.length()).map { i ->
+      val obj = array.optJSONObject(i) ?: throw IOException("待撤销授权格式无效")
+      val id = obj.optString("id").takeIf(String::isNotBlank) ?: throw IOException("待撤销授权标识无效")
+      val origin = runCatching { canonicalRemoteOrigin(obj.optString("origin")) }.getOrNull() ?: throw IOException("待撤销授权地址无效")
+      val account = obj.optString("account").takeIf(String::isNotBlank) ?: throw IOException("待撤销授权账号无效")
+      val peerHostId = obj.optString("peerHostId").takeIf(String::isNotBlank) ?: throw IOException("待撤销授权主机无效")
+      val clientDeviceId = obj.optString("clientDeviceId").takeIf(RemoteServerApi::validDeviceId) ?: throw IOException("待撤销授权设备无效")
+      val accessToken = obj.optString("accessToken").takeIf(RemoteServerApi::validToken) ?: throw IOException("待撤销授权凭据无效")
+      val refreshToken = obj.optString("refreshToken").takeIf(RemoteServerApi::validToken) ?: throw IOException("待撤销授权凭据无效")
       PendingRemoteRevocation(
         id = id,
         origin = origin,
@@ -90,7 +100,9 @@ internal object PendingRemoteRevocationCodec {
         allowCleartext = obj.optBoolean("allowCleartext", false),
         createdAt = obj.optLong("createdAt", 0L),
         attempts = obj.optInt("attempts", 0).coerceAtLeast(0),
-        lastAttemptAt = obj.optLong("lastAttemptAt", 0L).coerceAtLeast(0L)
+        lastAttemptAt = obj.optLong("lastAttemptAt", 0L).coerceAtLeast(0L),
+        lastError = (obj.opt("lastError") as? String)?.takeIf { it.matches(Regex("[A-Z0-9_]{1,80}")) },
+        membershipOnly = obj.optBoolean("membershipOnly", false)
       )
     }
   }
@@ -103,7 +115,7 @@ internal interface RemoteDeviceStore {
   fun delete(slot: String)
   fun listSlots(): Set<String> = emptySet()
   fun pendingRevocations(): List<PendingRemoteRevocation> = emptyList()
-  fun enqueueRevocation(item: PendingRemoteRevocation) {}
+  fun enqueueRevocation(item: PendingRemoteRevocation) { throw IOException("此设备存储不支持保留待撤销授权") }
   fun updateRevocation(item: PendingRemoteRevocation) {}
   fun removeRevocation(id: String) {}
 }
@@ -115,6 +127,9 @@ internal object RemoteDeviceCodec {
     .put("privateKey", record.identity.privateKey).put("transition", record.transition.name)
     .put("transitionAt", record.transitionAt)
     .put("invalidated", record.invalidated)
+    .put("accountKind", record.accountKind ?: JSONObject.NULL)
+    .put("pairingRestricted", record.pairingRestricted ?: JSONObject.NULL)
+    .put("enrollmentMethod", record.enrollmentMethod ?: JSONObject.NULL)
     .put("tokens", record.tokens?.let { JSONObject().put("accessToken", it.accessToken).put("accessTokenExpiresAt", it.accessTokenExpiresAt)
       .put("refreshToken", it.refreshToken).put("refreshTokenExpiresAt", it.refreshTokenExpiresAt) } ?: JSONObject.NULL).toString()
 
@@ -130,6 +145,21 @@ internal object RemoteDeviceCodec {
       val transition = RemoteDeviceRecord.Transition.valueOf(json.getString("transition"))
       val transitionAt = if (json.has("transitionAt")) json.optLong("transitionAt", 0L) else 0L
       val invalidated = json.optBoolean("invalidated", false)
+      val accountKind = when (val value = json.opt("accountKind")) {
+        null, JSONObject.NULL -> null
+        "standard", "device_only" -> value as String
+        else -> throw IOException("Remote 账号类型无效")
+      }
+      val restricted = when (val value = json.opt("pairingRestricted")) {
+        null, JSONObject.NULL -> null
+        is Boolean -> value
+        else -> throw IOException("Remote 配对授权范围无效")
+      }
+      val enrollmentMethod = when (val value = json.opt("enrollmentMethod")) {
+        null, JSONObject.NULL -> null
+        "account", "pairing" -> value as String
+        else -> throw IOException("Remote 接入方式无效")
+      }
       val tokens = if (json.isNull("tokens")) null else json.getJSONObject("tokens").let {
         val access = it.getString("accessToken").also { value -> require(RemoteServerApi.validToken(value)) }
         val refresh = it.getString("refreshToken").also { value -> require(RemoteServerApi.validToken(value)) }
@@ -138,7 +168,8 @@ internal object RemoteDeviceCodec {
         RemoteTokenPair(access, accessExpiry, refresh, refreshExpiry)
       }
       require(transition != RemoteDeviceRecord.Transition.REFRESHING || tokens != null)
-      return RemoteDeviceRecord(origin, account, RemoteIdentity(id, publicKey, privateKey), tokens, transition, transitionAt, invalidated)
+      return RemoteDeviceRecord(origin, account, RemoteIdentity(id, publicKey, privateKey), tokens, transition, transitionAt,
+        invalidated, accountKind, restricted, enrollmentMethod)
     } catch (error: Exception) { throw IOException("Remote 设备资料损坏，未自动重建身份", error) }
   }
 }
@@ -170,7 +201,10 @@ internal class RemoteDeviceManager(
   address: String,
   account: String,
   private val registerer: suspend (RemoteClientDescriptor, String) -> RemoteTokenPair = { _, _ -> throw IOException("Remote 设备未注册") },
-  private val refresher: suspend (String, String) -> RemoteTokenPair = { _, _ -> throw IOException("Remote refresh 未配置") }
+  private val refresher: suspend (String, String) -> RemoteTokenPair = { _, _ -> throw IOException("Remote refresh 未配置") },
+  private val beforeIdentityReplacement: (RemoteDeviceRecord) -> Unit = { previous ->
+    if (previous.tokens != null && !previous.invalidated) throw IOException("旧设备授权尚未保留，无法安全更换身份")
+  }
 ) {
   private val origin = canonicalRemoteOrigin(address)
   private val account = account.trim().also { require(it.isNotBlank() && it.length <= 320 && '\u0000' !in it) }
@@ -195,9 +229,9 @@ internal class RemoteDeviceManager(
       val initialRecord = existing ?: RemoteDeviceRecord(origin, account, initialIdentity, null)
       val descriptor = RemoteClientDescriptor(initialIdentity.deviceId, name, platform, initialIdentity.publicKey, version)
       descriptor.validate()
-      val pending = RemoteDeviceRecord(origin, account, initialIdentity, initialRecord.tokens,
-        RemoteDeviceRecord.Transition.REGISTERING, System.currentTimeMillis(), invalidated = false)
-      store.save(slot, pending)
+      val pending = initialRecord.copy(transition = RemoteDeviceRecord.Transition.REGISTERING,
+        transitionAt = System.currentTimeMillis(), invalidated = false)
+      if (!saveIfEpoch(epoch, pending)) throw IOException("Remote 设备身份已变更，请重新连接")
       try {
         val pair = try {
           register(descriptor, accountToken)
@@ -207,40 +241,66 @@ internal class RemoteDeviceManager(
               (error.status == 409 && error.code in setOf("PEER_IDENTITY_MISMATCH", "DEVICE_CONFLICT"))
             )
           if (!canRotateIdentity) throw error
+          if (epochOf(slot).get() != epoch) throw IOException("Remote 设备身份已变更，请重新连接")
+          // A conflict is not evidence that the previous authorization was revoked. Journal it
+          // before changing the stored identity, including the shared-identity membership case.
+          if (error.code != "DEVICE_REVOKED") beforeIdentityReplacement(existing!!)
           val freshIdentity = RemoteIdentity.generate()
           val freshDescriptor = RemoteClientDescriptor(freshIdentity.deviceId, name, platform, freshIdentity.publicKey, version)
           freshDescriptor.validate()
-          store.save(slot, RemoteDeviceRecord(origin, account, freshIdentity, null,
-            RemoteDeviceRecord.Transition.REGISTERING, System.currentTimeMillis(), invalidated = false))
+          if (!saveIfEpoch(epoch, RemoteDeviceRecord(origin, account, freshIdentity, null,
+            RemoteDeviceRecord.Transition.REGISTERING, System.currentTimeMillis(), invalidated = false)))
+            throw IOException("Remote 设备身份已变更，请重新连接")
           val rotatedPair = register(freshDescriptor, accountToken)
-          val record = RemoteDeviceRecord(origin, account, freshIdentity, rotatedPair, invalidated = false)
-          if (epochOf(slot).get() == epoch) store.save(slot, record)
+          val record = RemoteDeviceRecord(origin, account, freshIdentity, rotatedPair, invalidated = false,
+            accountKind = "standard", pairingRestricted = false, enrollmentMethod = "account")
+          if (!saveIfEpoch(epoch, record)) throw IOException("Remote 设备身份已变更，请重新连接")
           return@withLock record
         }
-        val record = RemoteDeviceRecord(origin, account, initialIdentity, pair, invalidated = false)
-        if (epochOf(slot).get() == epoch) store.save(slot, record)
+        val record = initialRecord.copy(tokens = pair, transition = RemoteDeviceRecord.Transition.NONE,
+          transitionAt = 0, invalidated = false, accountKind = initialRecord.accountKind ?: "standard",
+          pairingRestricted = initialRecord.pairingRestricted ?: false,
+          enrollmentMethod = "account")
+        if (!saveIfEpoch(epoch, record)) throw IOException("Remote 设备身份已变更，请重新连接")
         record
       } catch (cancel: CancellationException) {
         // Restore prior recoverable state if registration was interrupted before receiving tokens.
         withContext(NonCancellable) {
-          if (epochOf(slot).get() == epoch) store.save(slot, initialRecord)
+          saveIfEpoch(epoch, initialRecord)
         }
         throw cancel
       } catch (error: Exception) {
         // 注册失败必须把记录恢复成可重试状态；同一 identity 重新注册是幂等的，不能把人锁死在 REGISTERING。
-        store.save(slot, initialRecord)
+        saveIfEpoch(epoch, initialRecord)
         throw error
       }
     }
   }
 
-  /** Persist credentials minted via Scan-to-Pair v1 atomically, advancing slot epoch first. */
-  suspend fun savePaired(identity: RemoteIdentity, tokens: RemoteTokenPair): RemoteDeviceRecord {
+  /** Preserve a rotated grant on pairing-result recovery, and journal an old identity before replacement. */
+  suspend fun savePaired(identity: RemoteIdentity, tokens: RemoteTokenPair,
+    accountKind: String? = null, pairingRestricted: Boolean? = null,
+    beforeReplace: (RemoteDeviceRecord) -> Unit = {}): RemoteDeviceRecord {
+    require(accountKind == null || accountKind == "standard" || accountKind == "device_only")
     invalidateSlot(slot)
     return lock.withLock {
-      epochOf(slot).incrementAndGet()
-      val record = RemoteDeviceRecord(origin, account, identity, tokens, invalidated = false)
-      store.save(slot, record)
+      val epoch = epochOf(slot).incrementAndGet()
+      val existing = loadBound()
+      val sameIdentity = existing?.identity?.deviceId == identity.deviceId
+      if (sameIdentity && existing != null &&
+        (existing.identity.publicKey != identity.publicKey || existing.identity.privateKey != identity.privateKey))
+        throw IOException("配对设备身份冲突，未覆盖原凭据")
+      if (sameIdentity && existing?.invalidated == true) throw IOException("配对设备授权已撤销，请重新扫码")
+      if (sameIdentity && existing?.transition != RemoteDeviceRecord.Transition.NONE)
+        throw IOException("配对设备凭据正在处理，请稍后重试")
+      if (existing != null && !sameIdentity && existing.tokens != null) beforeReplace(existing)
+      val record = if (sameIdentity && existing?.tokens != null) {
+        // A recovered pairing result contains the original tokens, which may already have rotated.
+        existing.copy(accountKind = accountKind ?: existing.accountKind,
+          pairingRestricted = pairingRestricted ?: existing.pairingRestricted, enrollmentMethod = "pairing")
+      } else RemoteDeviceRecord(origin, account, identity, tokens, invalidated = false,
+        accountKind = accountKind, pairingRestricted = pairingRestricted, enrollmentMethod = "pairing")
+      if (!saveIfEpoch(epoch, record)) throw IOException("Remote 设备身份已变更，请重新连接")
       record
     }
   }
@@ -282,11 +342,13 @@ internal class RemoteDeviceManager(
         joinedFlight = existing
         return@withLock null
       }
+      val epoch = epochOf(slot).get()
       val current = loadBound() ?: throw IOException("Remote 设备尚未注册")
       if (current.invalidated) throw IOException("Remote 登录已失效，请重新登录")
       val pair = current.tokens ?: run {
         if (current.transition == RemoteDeviceRecord.Transition.REGISTERING && stale(current, now)) {
-          store.save(slot, RemoteDeviceRecord(origin, account, current.identity, null))
+          if (!saveIfEpoch(epoch, current.copy(tokens = null, transition = RemoteDeviceRecord.Transition.NONE, transitionAt = 0)))
+            throw IOException("Remote 设备身份已变更，请重新连接")
           throw IOException("Remote 设备注册尚未完成，请重新登录")
         }
         throw IOException("Remote 设备尚未注册")
@@ -310,7 +372,6 @@ internal class RemoteDeviceManager(
       if (pair.refreshTokenExpiresAt <= now) {
         throw IOException("Remote 30 天设备授权已到期，请重新登录")
       }
-      val epoch = epochOf(slot).get()
       val deferred = launchSingleflightRefresh(current, pair, now, epoch, refresh)
       inFlightRefreshes[slot] = deferred
       deferred to null
@@ -334,12 +395,14 @@ internal class RemoteDeviceManager(
     epoch: Long,
     refresh: suspend (String, String) -> RemoteTokenPair
   ): Deferred<RemoteDeviceRecord> {
-    store.save(slot, RemoteDeviceRecord(origin, account, current.identity, pair,
-      RemoteDeviceRecord.Transition.REFRESHING, now, invalidated = false))
+    if (!saveIfEpoch(epoch, current.copy(tokens = pair, transition = RemoteDeviceRecord.Transition.REFRESHING,
+      transitionAt = now, invalidated = false))) throw IOException("Remote 设备身份已变更，请重新连接")
     return refreshScope.async {
+      var latestPair = pair
       try {
         var next = refresh(current.identity.deviceId, pair.refreshToken)
-        var persisted = RemoteDeviceRecord(origin, account, current.identity, next, invalidated = false)
+        var persisted = current.copy(tokens = next, transition = RemoteDeviceRecord.Transition.NONE,
+          transitionAt = 0, invalidated = false)
         var abortedByEpoch = false
         withContext(NonCancellable) {
           lock.withLock {
@@ -347,10 +410,11 @@ internal class RemoteDeviceManager(
               abortedByEpoch = true
               return@withLock
             }
-            store.save(slot, persisted)
+            if (!saveIfEpoch(epoch, persisted)) abortedByEpoch = true
           }
         }
         if (abortedByEpoch) throw IOException("Remote 设备身份已变更，请重新连接")
+        latestPair = next
         // Self-hosted Server recovery (PR #340) can return the direct successor with its original
         // (already expired) accessTokenExpiresAt while its refreshToken is still valid. Rotate once
         // more immediately so callers never receive an already-expired accessToken.
@@ -365,23 +429,25 @@ internal class RemoteDeviceManager(
                 abortedByEpoch = true
                 return@withLock
               }
-              store.save(slot, RemoteDeviceRecord(origin, account, current.identity, next,
-                RemoteDeviceRecord.Transition.REFRESHING, afterFirst, invalidated = false))
+              if (!saveIfEpoch(epoch, current.copy(tokens = next, transition = RemoteDeviceRecord.Transition.REFRESHING,
+                transitionAt = afterFirst, invalidated = false))) abortedByEpoch = true
             }
           }
           if (abortedByEpoch) throw IOException("Remote 设备身份已变更，请重新连接")
           next = refresh(current.identity.deviceId, next.refreshToken)
-          persisted = RemoteDeviceRecord(origin, account, current.identity, next, invalidated = false)
+          persisted = current.copy(tokens = next, transition = RemoteDeviceRecord.Transition.NONE,
+            transitionAt = 0, invalidated = false)
           withContext(NonCancellable) {
             lock.withLock {
               if (!canCommit(epoch, current.identity.deviceId)) {
                 abortedByEpoch = true
                 return@withLock
               }
-              store.save(slot, persisted)
+              if (!saveIfEpoch(epoch, persisted)) abortedByEpoch = true
             }
           }
           if (abortedByEpoch) throw IOException("Remote 设备身份已变更，请重新连接")
+          latestPair = next
         }
         persisted
       } catch (cancel: CancellationException) {
@@ -393,8 +459,8 @@ internal class RemoteDeviceManager(
           withContext(NonCancellable) {
             lock.withLock {
               if (canCommit(epoch, current.identity.deviceId)) {
-                store.save(slot, RemoteDeviceRecord(origin, account, current.identity, pair,
-                  transition = RemoteDeviceRecord.Transition.NONE, transitionAt = 0, invalidated = true))
+                saveIfEpoch(epoch, current.copy(tokens = latestPair, transition = RemoteDeviceRecord.Transition.NONE,
+                  transitionAt = 0, invalidated = true))
               }
             }
           }
@@ -416,6 +482,13 @@ internal class RemoteDeviceManager(
     if (epochOf(slot).get() != expectedEpoch) return false
     val disk = runCatching { store.load(slot) }.getOrNull() ?: return false
     return disk.origin == origin && disk.account == account && disk.identity.deviceId == expectedDeviceId
+  }
+
+  private fun saveIfEpoch(expectedEpoch: Long, record: RemoteDeviceRecord): Boolean {
+    val epoch = epochOf(slot)
+    return synchronized(epoch) {
+      if (epoch.get() != expectedEpoch) false else { store.save(slot, record); true }
+    }
   }
 
   private fun stale(record: RemoteDeviceRecord, now: Long): Boolean =
@@ -459,7 +532,8 @@ internal class RemoteDeviceManager(
 
     /** Advances [slot]'s generation and detaches any running refresh so sign-out/delete cannot race. */
     fun invalidateSlot(slot: String) {
-      epochOf(slot).incrementAndGet()
+      val epoch = epochOf(slot)
+      synchronized(epoch) { epoch.incrementAndGet() }
       inFlightRefreshes.remove(slot)?.cancel()
     }
   }

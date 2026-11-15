@@ -119,6 +119,7 @@ class RemoteBackend internal constructor(
   internal suspend fun supportsSessionEvents(): Boolean = session.supportsSessionEvents()
   internal suspend fun supportsAsyncCompaction(): Boolean = session.supportsAsyncCompaction()
   internal suspend fun compactSessionAsync(sessionId: String) = session.compactSessionAsync(sessionId)
+  internal suspend fun cancelCompaction(sessionId: String): Boolean = session.cancelCompaction(sessionId)
 
   internal suspend fun probe(): RemoteProbe {
     val started = System.nanoTime()

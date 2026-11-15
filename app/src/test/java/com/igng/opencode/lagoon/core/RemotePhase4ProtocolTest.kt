@@ -321,7 +321,7 @@ class RemotePhase4ProtocolTest {
     }
   }
 
-  @Test fun asyncCompactionSubmitsPollsAcceptsUnconfirmedAndCancelsOnCoroutineCancel() = runBlocking {
+  @Test fun asyncCompactionDistinguishesUnknownAndKeepsRunningWhenObservationIsCancelled() = runBlocking {
     val calls = CopyOnWriteArrayList<String>()
     var nextTerminal = "succeeded"
     var pollsRemaining = 1
@@ -357,9 +357,13 @@ class RemotePhase4ProtocolTest {
         calls.clear()
         nextTerminal = "unconfirmed"
         pollsRemaining = 0
-        dsh.compact(target)
+        val unknown = runCatching { dsh.compact(target) }.exceptionOrNull()
+        assertTrue(unknown is RemoteFailureException)
+        assertTrue(unknown?.message.orEmpty().contains("无法确认"))
         assertEquals(listOf("harness.remote.compaction.submit", "harness.remote.compaction.status"), calls.toList())
 
+        // An explicit subsequent action acknowledges the previous unknown outcome before a new run.
+        assertTrue(runCatching { dsh.compact(target) }.exceptionOrNull() is RemoteFailureException)
         calls.clear()
         pollsRemaining = 100
         val job = launch {
@@ -368,7 +372,7 @@ class RemotePhase4ProtocolTest {
         while (!calls.contains("harness.remote.compaction.submit")) delay(20)
         job.cancel()
         job.join()
-        assertTrue(calls.contains("harness.remote.compaction.cancel"))
+        assertFalse(calls.contains("harness.remote.compaction.cancel"))
       } finally {
         backend.close()
       }

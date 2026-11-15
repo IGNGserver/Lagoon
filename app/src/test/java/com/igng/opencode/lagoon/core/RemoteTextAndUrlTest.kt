@@ -154,7 +154,7 @@ class RemoteTextAndUrlTest {
 
       val req1 = server.takeRequest()
       val req2 = server.takeRequest()
-      assertEquals("/api/v1/account/devices", req1.path)
+      assertEquals("/api/v1/account/devices?limit=50", req1.path)
       assertEquals("/api/v1/account/devices?limit=50&cursor=cur_2", req2.path)
     }
   }

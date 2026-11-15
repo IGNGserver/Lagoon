@@ -84,6 +84,7 @@ internal class AllServersOverview(
   private val configurations = mutableMapOf<String, Pair<ServerProfile, ServerCredentials>>()
   private val wakes = mutableMapOf<String, Channel<Unit>>()
   private val refreshWaiters = mutableMapOf<String, MutableList<CompletableDeferred<Unit>>>()
+  private val refreshWaitersLock = Any()
   private val reconnectHints = mutableMapOf<String, Channel<Unit>>()
   private val approvers = mutableMapOf<String, PermissionAutoApprover>()
   private val snapshots = mutableMapOf<String, ServerOverviewSnapshot>()
@@ -191,13 +192,24 @@ internal class AllServersOverview(
    */
   suspend fun refreshAllAndAwait() {
     val activeIds = jobs.filterValues { it.isActive }.keys.filter { it != selectedServer() }
-    val pending = activeIds.map { id ->
-      CompletableDeferred<Unit>().also { deferred ->
-        refreshWaiters.getOrPut(id) { mutableListOf() }.add(deferred)
+    val pending = synchronized(refreshWaitersLock) {
+      activeIds.associateWith { id ->
+        CompletableDeferred<Unit>().also { deferred -> refreshWaiters.getOrPut(id) { mutableListOf() }.add(deferred) }
       }
     }
-    refreshAll()
-    pending.awaitAll()
+    try {
+      refreshAll()
+      pending.values.awaitAll()
+    } finally {
+      synchronized(refreshWaitersLock) {
+        pending.forEach { (id, deferred) ->
+          refreshWaiters[id]?.let { waiters ->
+            waiters.remove(deferred)
+            if (waiters.isEmpty()) refreshWaiters.remove(id)
+          }
+        }
+      }
+    }
   }
 
   /** Stop (`false`) or resume content streams for every client; used when the app leaves the foreground. */
@@ -240,7 +252,7 @@ internal class AllServersOverview(
   }
   private fun remove(id: String, preserveCodexRetry: Boolean = false) {
     jobs.remove(id)?.cancel(); wakes.remove(id)?.close(); approvers.remove(id)?.dispose()
-    refreshWaiters.remove(id)?.forEach { it.complete(Unit) }
+    synchronized(refreshWaitersLock) { refreshWaiters.remove(id) }?.forEach { it.complete(Unit) }
     reconnectHints.remove(id)?.close()
     ownerTokens.remove(id)
     clients.remove(id)?.close(); configurations.remove(id); locks.remove(id); snapshots.remove(id)
@@ -295,6 +307,8 @@ internal class AllServersOverview(
     store.migrateTaskLedger(id)
     var waitingRevision = 0L
     var lastReadAt = 0L
+    var nextDeepReadAt = 0L
+    var deepRetryDelay = 1_000L
     val resolvedSessions = linkedSetOf<String>()
     val resolvedFormSessions = linkedSetOf<String>()
     val seenEvents = linkedSetOf<String>()
@@ -333,7 +347,9 @@ internal class AllServersOverview(
     }
 
     suspend fun refresh() {
-      val waiters = refreshWaiters.remove(id)?.toList().orEmpty()
+      // Only requests present when this pass begins belong to this pass. A request arriving during
+      // the read must wait for its own wake and the next pass, not be completed by stale results.
+      val waiters = synchronized(refreshWaitersLock) { refreshWaiters.remove(id)?.toList().orEmpty() }
       try {
         handoffs.remove(id)?.let { snapshot = it.copy(streamConnected = snapshot.streamConnected) }
         // Conflate streaming bursts without issuing a full control-plane read for every token. The
@@ -345,14 +361,26 @@ internal class AllServersOverview(
         val revision = waitingRevision
         val next = lock.withLock {
           val previous = snapshot
+          val deep = id in firstReads && (now() >= nextDeepReadAt || waiters.isNotEmpty())
           try {
-            val first = firstReads.remove(id)
-            readInternal(profile, client, previous, light = !first) { revision == waitingRevision }.also {
+            var deepComplete = false
+            readInternal(profile, client, previous, light = !deep, onDeepComplete = { deepComplete = it }) { revision == waitingRevision }.also {
+              if (deep && deepComplete) {
+                firstReads.remove(id)
+                deepRetryDelay = 1_000L
+              } else if (deep) {
+                nextDeepReadAt = now() + deepRetryDelay
+                deepRetryDelay = (deepRetryDelay * 2).coerceAtMost(60_000L)
+              }
               parkedNonRetryable.set(false)
             }
           } catch (cancel: CancellationException) {
             throw cancel
           } catch (error: Exception) {
+            if (deep) {
+              nextDeepReadAt = now() + deepRetryDelay
+              deepRetryDelay = (deepRetryDelay * 2).coerceAtMost(60_000L)
+            }
             if (isNonRetryableRemoteFailure(error)) parkedNonRetryable.set(true)
             previous.copy(connected = false, loading = false, cached = previous.cached || cachedCatalog != null,
               degraded = true, error = userFacingError(error, "连接失败"),
@@ -377,7 +405,6 @@ internal class AllServersOverview(
         consider(id, snapshot.permissions)
       } finally {
         waiters.forEach { it.complete(Unit) }
-        refreshWaiters.remove(id)?.forEach { it.complete(Unit) }
       }
     }
 
@@ -612,15 +639,16 @@ internal class AllServersOverview(
     readInternal(profile, client, previous, light = false, unchanged = unchanged)
 
   private suspend fun readInternal(profile: ServerProfile, client: HarnessClient, previous: ServerOverviewSnapshot,
-    light: Boolean, unchanged: () -> Boolean): ServerOverviewSnapshot {
+    light: Boolean, onDeepComplete: (Boolean) -> Unit = {}, unchanged: () -> Boolean): ServerOverviewSnapshot {
     val id = profile.id
     LoadMetrics.record(if (light) "overview-control" else "overview-deep")
     val version = client.health()
     val projects = store.localProjects(id).map { it.copy(serverId = id) }
     // Row labels only. The selected server's catalog is owned by the controller (this read is
     // discarded for it), so do not spend a request here; a failure keeps the last published titles.
-    val workspaceCatalog = if (light || selectedServer() == id) previous.workspaceCatalog
-      else attempt { client.projectsForDisplay() }.getOrElse { previous.workspaceCatalog }.map { it.copy(serverId = id) }
+    val workspaceResult = if (light || selectedServer() == id) null else attempt { client.projectsForDisplay() }
+    val workspaceCatalog = workspaceResult?.getOrElse { previous.workspaceCatalog }
+      ?.map { it.copy(serverId = id) } ?: previous.workspaceCatalog
     val page = client.rootSessionsPage()
     val activeResult = attempt { client.activeSessions() }
     val active = activeResult.getOrNull()
@@ -770,6 +798,8 @@ internal class AllServersOverview(
     // A newer event invalidated this read. The writable server's conversation reducer still owns
     // the open transcript; this snapshot is only the device-list connection state.
     if (!unchanged()) return previous
+    if (!light) onDeepComplete(workspaceResult?.isFailure != true && childRead.incompleteRoots.isEmpty() &&
+      shellResults.none { it.second.isFailure } && activeResult.isSuccess && codexMonitoring.isSuccess)
     deletedSessions.forEach { store.forgetTask(id, it) }
     val notices = (store.sessionNotices(id) + newlyFinished.filterNot { (session, since) -> store.sessionNotices(id).coversRun(session.id, since) }
       .mapNotNull { (session, since) -> session.transitionNotice(since) }).distinctBy { it.id }

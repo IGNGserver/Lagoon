@@ -77,7 +77,7 @@ class RemoteAccountManagerTest {
 
       assertEquals("/api/v1/auth/login", mock.takeRequest().path)
       val directory = mock.takeRequest()
-      assertEquals("/api/v1/account/devices", directory.path)
+      assertEquals("/api/v1/account/devices?limit=50", directory.path)
       assertEquals("Bearer $accountToken", directory.getHeader("Authorization"))
       val registration = mock.takeRequest()
       assertEquals("/api/v1/devices/register", registration.path)
@@ -103,6 +103,27 @@ class RemoteAccountManagerTest {
     }
   }
 
+  @Test fun failedSelectedHostIsNotSilentlyRegisteredAgainByBackgroundRepair() = runBlocking {
+    MockWebServer().use { mock ->
+      mock.start()
+      val origin = canonicalRemoteOrigin(mock.url("/").toString())
+      val account = "user@example.org"
+      val pins = Pins().apply { pinIfAbsent(RemotePeerScope(origin, account, hostId), key) }
+      val catalogs = Catalog().apply { save(RemoteCatalog(origin, account, "password", "Phone",
+        listOf(RemoteHostMeta(hostId, "Mac", "linux", true, null, null, null, RemoteSetup.fingerprint(key), RemoteTrustState.PINNED)),
+        1, allowCleartext = true, adoptedHostIds = setOf(hostId))) }
+      mock.enqueue(MockResponse().setBody(loginBody()))
+      mock.enqueue(MockResponse().setBody(accountDirectory()))
+      mock.enqueue(MockResponse().setResponseCode(503).setBody("{}"))
+      mock.enqueue(MockResponse().setBody(pair().toString()))
+      val manager = RemoteAccountManager(origin, true, "Lagoon", "android", "1.0", Devices(), pins, catalogs)
+      val selected = manager.loginWithPassword(account, "pw").single()
+      val result = manager.enroll(listOf(selected), mapOf(hostId to selected.meta.fingerprint!!))
+      assertTrue(result.failures.containsKey(hostId))
+      assertEquals(3, mock.requestCount)
+    }
+  }
+
   @Test fun detailFailureDoesNotPublishPartialCandidateCatalog() = runBlocking {
     MockWebServer().use { mock ->
       mock.start()
@@ -117,8 +138,10 @@ class RemoteAccountManagerTest {
       val initial = manager.loginWithPassword("user@example.org", "pw")
       assertEquals(hostId, initial.single().hostId)
       assertTrue(manager.enroll(initial, mapOf(hostId to initial.single().meta.fingerprint!!)).failures.isEmpty())
-      val failure = runCatching { manager.refresh() }.exceptionOrNull()
-      assertNotNull(failure)
+      val partial = manager.refresh()
+      assertTrue(partial.directoryPartial)
+      assertNotNull(partial.directoryIssue)
+      assertEquals(hostId, partial.hosts.single().hostId)
       assertEquals(hostId, manager.cachedCandidates().single().hostId)
     }
   }
@@ -144,7 +167,7 @@ class RemoteAccountManagerTest {
       mock.takeRequest() // account directory
       mock.takeRequest() // per-Host device registration
       val list = mock.takeRequest()
-      assertEquals("/api/v1/devices", list.path)
+      assertEquals("/api/v1/devices?limit=50", list.path)
       assertEquals("Bearer $access", list.getHeader("Authorization"))
       val detail = mock.takeRequest()
       assertEquals("/api/v1/devices/$hostId", detail.path)
@@ -206,10 +229,10 @@ class RemoteAccountManagerTest {
       mock.takeRequest() // login
       mock.takeRequest() // account/devices
       mock.takeRequest() // register
-      assertEquals("/api/v1/devices", mock.takeRequest().path)
+      assertEquals("/api/v1/devices?limit=50", mock.takeRequest().path)
       assertEquals("/api/v1/auth/refresh", mock.takeRequest().path)
       val retriedList = mock.takeRequest()
-      assertEquals("/api/v1/devices", retriedList.path)
+      assertEquals("/api/v1/devices?limit=50", retriedList.path)
       assertEquals("Bearer $rotatedAccess", retriedList.getHeader("Authorization"))
     }
   }

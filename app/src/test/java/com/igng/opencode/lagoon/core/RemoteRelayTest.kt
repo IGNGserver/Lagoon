@@ -23,6 +23,42 @@ import java.util.UUID
 
 class RemoteRelayTest {
 
+  @Test fun stalledControlAndHandshakeHaveSeparateDeadlinesAndCloseTheConnection() = runBlocking {
+    suspend fun checkStage(acceptConnection: Boolean, expected: String) {
+      val client = RemoteIdentity.generate()
+      val host = RemoteIdentity.generate()
+      val closed = CompletableDeferred<IOException>()
+      MockWebServer().use { server ->
+        server.enqueue(MockResponse().withWebSocketUpgrade(object : WebSocketListener() {
+          override fun onMessage(webSocket: WebSocket, text: String) {
+            fun reply(type: String, payload: JSONObject) {
+              webSocket.send(JSONObject().put("v", 1).put("id", UUID.randomUUID().toString()).put("type", type)
+                .put("timestamp", System.currentTimeMillis()).put("payload", payload).toString())
+            }
+            when (JSONObject(text).getString("type")) {
+              "hello" -> reply("hello.ack", JSONObject().put("protocol", 1)
+                .put("capabilities", JSONArray().put("transport.relay"))
+                .put("maxControlFrameBytes", 65536).put("maxRelayFrameBytes", 1048576))
+              "connect.request" -> if (acceptConnection) reply("connect.accepted", JSONObject().put("connectionId", "connection-1"))
+            }
+          }
+        }))
+        server.start()
+        val relay = RemoteRelay(server.url("/").toString(), client, "device-access-token-123", host.deviceId, host.publicKey,
+          true, {}, { closed.complete(it) }, phaseTimeouts = RemoteRelayTimeouts(3_000, 150, 3_000, 150))
+        try {
+          val error = runCatching { relay.connect(5_000) }.exceptionOrNull()
+          assertTrue(error is RemoteControlException)
+          assertTrue((error as RemoteControlException).retryable)
+          assertTrue(error.message.orEmpty().contains(expected))
+          assertSame(error, withTimeout(2_000) { closed.await() })
+        } finally { relay.close() }
+      }
+    }
+    checkStage(false, "主机连接")
+    checkStage(true, "安全握手")
+  }
+
   @Test fun longLivedSocketsUseTheStreamingDispatcherAndWebSocketHeartbeat() {
     val client = RemoteIdentity.generate()
     val host = RemoteIdentity.generate()

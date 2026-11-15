@@ -26,6 +26,13 @@ class RemoteCatalogTest {
     assertFalse(RemoteCatalogCodec.encode(catalog).contains("token", ignoreCase = true))
   }
 
+  @Test fun paginatedDirectoryWithMoreThan64HostsCanBeReloaded() {
+    val hosts = (1..120).map { index -> RemoteHostMeta(java.util.UUID.randomUUID().toString(),
+      "Host $index", "linux", true, null, null, null, null, presenceObservedAt = 1234L) }
+    val catalog = RemoteCatalog("https://remote.example/", "user@example.org", "github", "Phone", hosts, 1234L)
+    assertEquals(hosts, RemoteCatalogCodec.decode(RemoteCatalogCodec.encode(catalog)).hosts)
+  }
+
   @Test fun rejectsDuplicatesAndBadFingerprints() {
     val base = RemoteCatalog("https://remote.example/", "user@example.org", null, "Lagoon", listOf(
       RemoteHostMeta(hostA, "Mac", "darwin", false, null, null, null, null)

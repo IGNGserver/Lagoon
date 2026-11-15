@@ -224,6 +224,73 @@ class OverviewReconciliationTest {
     }
   }
 
+  @Test fun failedFirstReadStillFetchesDeepDataAfterConnectionRecovers() = runBlocking {
+    MockWebServer().use { server ->
+      val healthReads = java.util.concurrent.atomic.AtomicInteger()
+      val projectReads = java.util.concurrent.atomic.AtomicInteger()
+      val base = dispatcher()
+      server.dispatcher = object : Dispatcher() {
+        override fun dispatch(request: RecordedRequest): MockResponse {
+          val path = request.requestUrl!!.encodedPath
+          if (path == "/api/info" && healthReads.incrementAndGet() == 1) return MockResponse().setResponseCode(503)
+          if (path == "/api/project") projectReads.incrementAndGet()
+          return base.dispatch(request)
+        }
+      }
+      val store = ServerStore(memoryPreferences(), memoryPreferences(), { it }, { it })
+      val profile = ServerProfile("a", "A", server.url("/").toString(), allowCleartext = true)
+      store.save(profile, password = "secret")
+      val scope = CoroutineScope(coroutineContext + SupervisorJob())
+      val snapshots = java.util.concurrent.ConcurrentHashMap<String, ServerOverviewSnapshot>()
+      val overview = AllServersOverview(store, OfflineCache(memoryPreferences(), { it }, { it }), scope, { snapshots[it.serverId] = it })
+      try {
+        overview.start(listOf(profile))
+        withTimeout(5_000) { while (snapshots["a"]?.error == null) delay(20) }
+        overview.refreshAllAndAwait()
+        assertTrue("a failed initial health read must not discard the deep refresh", projectReads.get() > 0)
+        assertTrue(snapshots["a"]?.connected == true)
+      } finally { overview.stop(); scope.cancel() }
+    }
+  }
+
+  @Test fun refreshRequestedDuringReadWaitsForTheFollowingPass() = runBlocking {
+    MockWebServer().use { server ->
+      val firstStarted = java.util.concurrent.CountDownLatch(1)
+      val secondStarted = java.util.concurrent.CountDownLatch(1)
+      val releaseFirst = java.util.concurrent.CountDownLatch(1)
+      val releaseSecond = java.util.concurrent.CountDownLatch(1)
+      val reads = java.util.concurrent.atomic.AtomicInteger()
+      val base = dispatcher()
+      server.dispatcher = object : Dispatcher() {
+        override fun dispatch(request: RecordedRequest): MockResponse {
+          if (request.requestUrl!!.encodedPath == "/api/session") when (reads.incrementAndGet()) {
+            1 -> { firstStarted.countDown(); releaseFirst.await(5, java.util.concurrent.TimeUnit.SECONDS) }
+            2 -> { secondStarted.countDown(); releaseSecond.await(5, java.util.concurrent.TimeUnit.SECONDS) }
+          }
+          return base.dispatch(request)
+        }
+      }
+      val store = ServerStore(memoryPreferences(), memoryPreferences(), { it }, { it })
+      val profile = ServerProfile("a", "A", server.url("/").toString(), allowCleartext = true)
+      store.save(profile, password = "secret")
+      val scope = CoroutineScope(coroutineContext + SupervisorJob())
+      val overview = AllServersOverview(store, OfflineCache(memoryPreferences(), { it }, { it }), scope, {})
+      try {
+        overview.start(listOf(profile))
+        assertTrue(withContext(Dispatchers.IO) { firstStarted.await(5, java.util.concurrent.TimeUnit.SECONDS) })
+        val requested = async(start = CoroutineStart.UNDISPATCHED) { overview.refreshAllAndAwait() }
+        releaseFirst.countDown()
+        assertTrue(withContext(Dispatchers.IO) { secondStarted.await(5, java.util.concurrent.TimeUnit.SECONDS) })
+        assertFalse("the previous read cannot complete a newer refresh request", requested.isCompleted)
+        releaseSecond.countDown()
+        withTimeout(5_000) { requested.await() }
+      } finally {
+        releaseFirst.countDown(); releaseSecond.countDown()
+        overview.stop(); scope.cancel()
+      }
+    }
+  }
+
   @Test fun staleCollectorCleanupCannotUnregisterTheReplacementMonitor() = runBlocking {
     val store = ServerStore(memoryPreferences(), memoryPreferences(), { it }, { it })
     val profile = ServerProfile("a", "A", "http://127.0.0.1", allowCleartext = true, kind = ServerKind.DSH, sshHostId = "ssh")

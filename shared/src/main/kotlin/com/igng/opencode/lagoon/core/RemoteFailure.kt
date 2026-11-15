@@ -5,6 +5,7 @@ import java.io.IOException
 /** UI-level recovery affordance; safe to expose in state. */
 enum class RemoteRecoveryKind(val label: String) {
   LOGIN("重新登录"),
+  PAIR("重新扫码配对"),
   TRUST("核对指纹"),
   HOST("刷新主机"),
   RECONNECT("重新连接")

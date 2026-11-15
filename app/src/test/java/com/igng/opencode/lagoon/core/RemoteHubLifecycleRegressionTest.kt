@@ -135,6 +135,7 @@ class RemoteHubLifecycleRegressionTest {
       putField(this, "sshHostStore", sshHostStore)
       putField(this, "sshHostManager", sshHostManager)
       putField(this, "revocationDrainMutex", Mutex())
+      putField(this, "remoteCompactions\$delegate", lazyOf(MemoryRemoteCompactionStore()))
       putField(this, "conversationPoolStorage", ConversationStorePool())
       putField(this, "transcriptMemory", TranscriptMemory())
       putField(this, "sessionViewsStorage", SessionViewCache())
@@ -298,7 +299,7 @@ class RemoteHubLifecycleRegressionTest {
       assertEquals(setOf(hostId1), renewed!!.registered.keys)
       assertTrue(renewed.failures.isEmpty())
       assertFalse(renewed.catalog.signedOut)
-      assertEquals(false, renewed.catalog.userPaused)
+      assertEquals(true, renewed.catalog.userPaused)
       assertNotNull(devices.load(scopedRemoteDeviceSlot(origin, account, hostId1)))
       assertNull(devices.load(scopedRemoteDeviceSlot(origin, account, hostId2)))
       assertNull(devices.load(scopedRemoteDeviceSlot(origin, account, hostId3)))
@@ -308,6 +309,7 @@ class RemoteHubLifecycleRegressionTest {
       val host2 = candidates.first { it.hostId == hostId2 }
       val manualEnroll = manager.enroll(listOf(host2), mapOf(hostId2 to host2.meta.fingerprint!!))
       assertEquals(setOf(hostId2), manualEnroll.registered.keys)
+      assertEquals(true, manualEnroll.catalog.userPaused)
       assertEquals(4, mock.requestCount)
     }
   }
@@ -608,6 +610,62 @@ class RemoteHubLifecycleRegressionTest {
     assertNotNull(fixture.sshHostStore.load().firstOrNull { it.id == sshConfig.id })
   }
 
+  @Test fun standardAccountCanContainBothPairingAndAccountEnrollments() {
+    val fixture = newFixture()
+    val origin = canonicalRemoteOrigin("https://hub.example.invalid/")
+    val account = "owner@example.org"
+    val first = RemoteHostMeta(hostId1, "One", "linux", false, null, null, null, null)
+    val second = first.copy(hostId = hostId2, name = "Two")
+    val pairedOnly = RemoteCatalog(origin, account, "pairing", "Phone", listOf(first), 123,
+      adoptedHostIds = setOf(hostId1))
+    fixture.store.saveRemoteCatalog(pairedOnly)
+    fixture.remoteDevices.save(scopedRemoteDeviceSlot(origin, account, hostId1),
+      deviceRecord(origin, account, 4_000_000_000_000L).copy(accountKind = "standard", pairingRestricted = true, enrollmentMethod = "pairing"))
+    assertTrue(fixture.controller.isPairedRemoteCatalog(pairedOnly))
+    val mixed = pairedOnly.copy(hosts = listOf(first, second), adoptedHostIds = setOf(hostId1, hostId2))
+    fixture.store.saveRemoteCatalog(mixed)
+    fixture.remoteDevices.save(scopedRemoteDeviceSlot(origin, account, hostId2),
+      deviceRecord(origin, account, 4_000_000_000_000L).copy(accountKind = "standard", pairingRestricted = false, enrollmentMethod = "account"))
+    assertFalse(fixture.controller.isPairedRemoteCatalog(mixed))
+    assertTrue(fixture.controller.remoteHostUsesPairing(origin, account, hostId1))
+    assertFalse(fixture.controller.remoteHostUsesPairing(origin, account, hostId2))
+  }
+
+  @Test fun removingOnePairedHostPreservesItsSiblingAndSharedIdentity() {
+    val fixture = newFixture()
+    val origin = canonicalRemoteOrigin("https://hub.example.invalid/")
+    val account = "dsh-device:shared"
+    val first = RemoteHostMeta(hostId1, "Workstation", "linux", true, null, null, null,
+      RemoteSetup.fingerprint(key1), RemoteTrustState.PINNED)
+    val second = RemoteHostMeta(hostId2, "Laptop", "linux", true, null, null, null,
+      RemoteSetup.fingerprint(key2), RemoteTrustState.PINNED)
+    fixture.store.saveRemoteCatalog(RemoteCatalog(origin, account, "pairing", "Phone", listOf(first, second),
+      System.currentTimeMillis(), adoptedHostIds = setOf(hostId1, hostId2)))
+    val firstScope = RemotePeerScope(origin, account, hostId1)
+    val secondScope = RemotePeerScope(origin, account, hostId2)
+    fixture.store.remotePins.pinIfAbsent(firstScope, key1)
+    fixture.store.remotePins.pinIfAbsent(secondScope, key2)
+    val shared = deviceRecord(origin, account, refreshExpiresAt = 4_000_000_000_000L)
+    val firstSlot = scopedRemoteDeviceSlot(origin, account, hostId1)
+    val secondSlot = scopedRemoteDeviceSlot(origin, account, hostId2)
+    fixture.remoteDevices.save(firstSlot, shared)
+    fixture.remoteDevices.save(secondSlot, shared)
+    invokeInitializeConnectionGraph(fixture.controller)
+    val sourceId = MigrationProjection.hubSourceId(origin, account)
+    fixture.controller.deleteDevice(MigrationProjection.hostId(sourceId, hostId1))
+
+    assertNull(fixture.remoteDevices.load(firstSlot))
+    assertEquals(shared.identity.deviceId, fixture.remoteDevices.load(secondSlot)?.identity?.deviceId)
+    assertEquals(shared.tokens, fixture.remoteDevices.load(secondSlot)?.tokens)
+    assertNull(fixture.store.remotePins.pinned(firstScope))
+    assertEquals(key2, fixture.store.remotePins.pinned(secondScope))
+    assertEquals(listOf(hostId2), fixture.store.remoteCatalogs().single().hosts.map { it.hostId })
+    assertTrue(fixture.controller.connectionGraph.value!!.hosts.any { it.sourceId == sourceId && it.externalHostId == hostId2 })
+    val pending = fixture.remoteDevices.pendingRevocations().single()
+    assertEquals(hostId1, pending.peerHostId)
+    assertTrue(pending.membershipOnly)
+  }
+
   @Test fun hubAndDeviceAuthStatusDetectsActiveSignedOutAndAllExpiredConditions() {
     val fixture = newFixture()
     val origin = canonicalRemoteOrigin("https://hub.example.invalid/")
@@ -662,6 +720,7 @@ class RemoteHubLifecycleRegressionTest {
 
     // 3. Invalidated record -> EXPIRED
     fixture.remoteDevices.save(slot, deviceRecord(origin, account, refreshExpiresAt = nowMs + 60_000L, invalidated = true))
+    fixture.remoteDevices.save("profile-${profile.id}", deviceRecord(origin, account, refreshExpiresAt = nowMs + 60_000L))
     assertTrue(fixture.controller.hostAuthExpired(origin, account, hostId1, fixture.controller.state.value, nowMs))
     assertEquals(HubAuthStatus.EXPIRED, fixture.controller.hubAuthStatus(activeCatalog, fixture.controller.state.value, nowMs))
     assertEquals(HubAuthStatus.EXPIRED, fixture.controller.deviceAuthStatus(deviceView, fixture.controller.state.value, nowMs))
@@ -682,6 +741,16 @@ class RemoteHubLifecycleRegressionTest {
     assertTrue(fixture.controller.hostAuthExpired(origin, account, hostId1, loginState, nowMs))
     assertEquals(HubAuthStatus.EXPIRED, fixture.controller.hubAuthStatus(activeCatalog, loginState, nowMs))
     assertEquals(HubAuthStatus.EXPIRED, fixture.controller.deviceAuthStatus(deviceView, loginState, nowMs))
+
+    // One expired per-Host credential must not disable another usable Host in the same account.
+    val secondMeta = meta.copy(hostId = hostId2, name = "Laptop")
+    val mixedCatalog = activeCatalog.copy(hosts = listOf(meta, secondMeta), adoptedHostIds = setOf(hostId1, hostId2))
+    fixture.store.saveRemoteCatalog(mixedCatalog)
+    fixture.remoteDevices.save(scopedRemoteDeviceSlot(origin, account, hostId2),
+      deviceRecord(origin, account, refreshExpiresAt = nowMs + 60_000L, invalidated = false))
+    assertTrue(fixture.controller.hostAuthExpired(origin, account, hostId1, loginState, nowMs))
+    assertFalse(fixture.controller.hostAuthExpired(origin, account, hostId2, loginState, nowMs))
+    assertEquals(HubAuthStatus.ACTIVE, fixture.controller.hubAuthStatus(mixedCatalog, loginState, nowMs))
 
     // 6. Explicitly signed out catalog -> SIGNED_OUT
     val signedOutCatalog = activeCatalog.copy(signedOut = true)

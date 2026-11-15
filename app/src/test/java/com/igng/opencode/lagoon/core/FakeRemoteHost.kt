@@ -79,6 +79,8 @@ internal class FakeRemoteHost(
   var streamOpenError: (endpoint: String, payload: JSONObject) -> String? = { _, _ -> null }
   /** 顶层 RPC 处理器（可选），接收 method、params 与二进制分块。 */
   var topLevelRpc: ((method: String, params: JSONObject, binaryChunk: ByteArray?) -> Any?)? = null
+  /** Optional per-request REST override for exercising control-plane failures and presence. */
+  @Volatile var httpOverride: ((RecordedRequest) -> MockResponse?)? = null
 
   private val connectionId = UUID.randomUUID().toString()
 
@@ -91,7 +93,7 @@ internal class FakeRemoteHost(
       override fun dispatch(request: RecordedRequest): MockResponse {
         requests += "${request.method} ${request.path}"
         val path = request.path.orEmpty()
-        return when {
+        return httpOverride?.invoke(request) ?: when {
           path.startsWith("/api/v1/devices/") -> MockResponse().setBody(JSONObject()
             .put("deviceId", hostId).put("name", "fake-host").put("platform", "linux").put("role", "host")
             .put("membershipId", "account:test").put("online", true)
@@ -109,6 +111,12 @@ internal class FakeRemoteHost(
   val url: String get() = server.url("/").toString().trimEnd('/')
 
   private fun send(socket: WebSocket?, type: String, payload: JSONObject) = sendOn(socket, type, payload)
+
+  /** Deliver a Server control-plane error after the encrypted session is ready. */
+  fun failControlConnection(code: String) {
+    val current = checkNotNull(controlSocket) { "fake control socket is not connected" }
+    send(current, "error", JSONObject().put("code", code).put("message", code).put("retryable", false))
+  }
 
   private fun sendOn(socket: WebSocket?, type: String, payload: JSONObject) {
     synchronized(wireGate) {
