@@ -232,8 +232,10 @@ def eligible(root, snapshot, descendants):
     if not descendants: return [root] if root in snapshot else []
     return [pid for pid in snapshot if chain(pid, root, snapshot, True)]
 def verify_linux(pids, host, server_port, client_port):
-    endpoint='00000000000000000000000001000000' if host=='::1' else '0100007F'
-    table='/proc/net/tcp6' if host=='::1' else '/proc/net/tcp'
+    # Linux can report an IPv4 connection accepted by a dual-stack listener as an
+    # IPv4-mapped IPv6 socket. Both addresses and ports must still match exactly.
+    tables=([('/proc/net/tcp6','00000000000000000000000001000000')] if host=='::1' else
+        [('/proc/net/tcp','0100007F'),('/proc/net/tcp6','0000000000000000FFFF00000100007F')])
     inodes={}
     for pid in pids:
         try:
@@ -245,17 +247,20 @@ def verify_linux(pids, host, server_port, client_port):
                     if match: inodes.setdefault(match.group(1),set()).add(pid)
                 except OSError: continue
         except OSError: continue
-    with open(table,'r',encoding='ascii') as f: rows=f.read(4*1024*1024+1)
-    require(len(rows)<=4*1024*1024)
-    for line in rows.splitlines()[1:]:
-        fields=line.split()
-        if len(fields)<10 or fields[3]!='01': continue
-        local=fields[1].split(':'); remote=fields[2].split(':')
-        if len(local)!=2 or len(remote)!=2: continue
+    for table,endpoint in tables:
         try:
-            if (local[0]==endpoint and remote[0]==endpoint and int(local[1],16)==server_port and
-                int(remote[1],16)==client_port and fields[9] in inodes): return next(iter(inodes[fields[9]]))
-        except ValueError: continue
+            with open(table,'r',encoding='ascii') as f: rows=f.read(4*1024*1024+1)
+        except FileNotFoundError: continue
+        require(len(rows)<=4*1024*1024)
+        for line in rows.splitlines()[1:]:
+            fields=line.split()
+            if len(fields)<10 or fields[3]!='01': continue
+            local=fields[1].split(':'); remote=fields[2].split(':')
+            if len(local)!=2 or len(remote)!=2: continue
+            try:
+                if (local[0]==endpoint and remote[0]==endpoint and int(local[1],16)==server_port and
+                    int(remote[1],16)==client_port and fields[9] in inodes): return next(iter(inodes[fields[9]]))
+            except ValueError: continue
     raise Denied()
 def verify_darwin(pids, host, server_port, client_port):
     require(len(pids)<=256)

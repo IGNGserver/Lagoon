@@ -78,6 +78,46 @@ class SshVerifiedTunnelTest {
     } finally { home.deleteRecursively() }
   }
 
+  @Test fun linuxIpv4MappedSocketIsVerifiedAgainstItsActualOwner() {
+    assumeTrue(System.getProperty("os.name").lowercase().contains("linux"))
+    val fixture = """
+      import os, socket, sys
+      try:
+          listener=socket.socket(socket.AF_INET6,socket.SOCK_STREAM)
+          listener.setsockopt(socket.IPPROTO_IPV6,socket.IPV6_V6ONLY,0)
+          listener.bind(('::ffff:127.0.0.1',0)); listener.listen(1)
+      except OSError as error:
+          print('SKIP:'+str(error),flush=True); sys.exit(0)
+      print(str(os.getpid())+' '+str(listener.getsockname()[1]),flush=True)
+      client,_=listener.accept()
+      for _ in range(2):
+          request=b''
+          while b'\r\n\r\n' not in request:
+              block=client.recv(4096)
+              if not block: sys.exit(0)
+              request+=block
+          client.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n')
+    """.trimIndent()
+    val server = ProcessBuilder("python3", "-u", "-c", fixture).redirectErrorStream(true).start()
+    try {
+      val greeting = server.inputStream.bufferedReader().readLine().orEmpty()
+      assumeTrue("IPv4-mapped loopback is unavailable: $greeting", !greeting.startsWith("SKIP:"))
+      val values = greeting.split(' ')
+      require(values.size == 2) { "Cannot start mapped socket fixture: $greeting" }
+      val target = registration(values[1].toInt(), values[0].toInt())
+      val helper = ProcessBuilder("sh", "-c", SshVerifiedTunnel.command(target)).start()
+      try {
+        assertEquals("LAGOON_SOCKET_READY_V1", line(helper.inputStream))
+        helper.outputStream.write("GET /protected HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic fixture\r\n\r\n".toByteArray())
+        helper.outputStream.flush()
+        assertEquals("HTTP/1.1 200 OK", line(helper.inputStream))
+      } finally {
+        helper.destroyForcibly(); helper.waitFor(5, TimeUnit.SECONDS)
+        target.registrationPath?.let { File(it).parentFile?.deleteRecursively() }
+      }
+    } finally { server.destroyForcibly(); server.waitFor(5, TimeUnit.SECONDS) }
+  }
+
   @Test fun stalePidNeverReceivesCredentialsEvenWhenBytesAreAlreadyQueued() {
     assumeSupportedHost()
     val unrelated = ProcessBuilder("sh", "-c", "echo \$\$; exec sleep 20").start()
