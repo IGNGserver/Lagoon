@@ -17,8 +17,33 @@ internal data class RemoteHostMeta(
   val harnessVersion: String?,
   val pluginVersion: String?,
   val fingerprint: String?,
-  val trust: RemoteTrustState = RemoteTrustState.UNKNOWN
-)
+  val trust: RemoteTrustState = RemoteTrustState.UNKNOWN,
+  /** 手机本地显示名；只影响本机 UI，不回写中枢，也不参与主机身份。 */
+  val alias: String? = null
+) {
+  /** Host 自报名不可用（空或全问号）时仍保留原始字段供诊断，但界面不应直接展示。 */
+  val nameUnavailable: Boolean get() = name.isBlank() || name.all { it == '?' }
+
+  val displayName: String
+    get() = alias?.takeIf { it.isNotBlank() }
+      ?: name.takeUnless { it.isBlank() || it.all { c -> c == '?' } }
+      ?: "未命名主机"
+}
+
+/** 保留本地可读名称和别名：一次坏上报（例如 Windows 的 `???`）不应把已显示的设备名改坏。 */
+internal fun RemoteHostMeta.withPreviousDisplay(previous: RemoteHostMeta?): RemoteHostMeta {
+  if (previous == null) return this
+  return copy(
+    name = if (nameUnavailable && !previous.nameUnavailable) previous.name else name,
+    alias = alias ?: previous.alias,
+  )
+}
+
+/** 本地显示名清理：去控制字符、折叠空白、限长；空串表示恢复 Host 自报名。 */
+internal fun sanitizeRemoteAlias(value: String?): String? {
+  val cleaned = sanitizeRemoteDisplayName(value.orEmpty(), fallback = "", maxChars = 128)
+  return cleaned.takeIf { it.isNotBlank() }
+}
 
 internal data class RemoteCatalog(
   val origin: String,
@@ -72,7 +97,7 @@ internal object RemoteCatalogCodec {
           .put("harnessVersion", host.harnessVersion ?: JSONObject.NULL)
           .put("pluginVersion", host.pluginVersion ?: JSONObject.NULL)
           .put("fingerprint", host.fingerprint ?: JSONObject.NULL)
-          .put("trust", host.trust.name))
+          .put("trust", host.trust.name).putOpt("alias", host.alias))
       }
     }).toString()
 
@@ -105,7 +130,8 @@ internal object RemoteCatalogCodec {
           harnessVersion = (item.opt("harnessVersion") as? String)?.let { truncateByCodePointsSafe(it, 64) },
           pluginVersion = (item.opt("pluginVersion") as? String)?.let { truncateByCodePointsSafe(it, 64) },
           fingerprint = fingerprint,
-          trust = runCatching { RemoteTrustState.valueOf(item.optString("trust")) }.getOrDefault(RemoteTrustState.UNKNOWN)
+          trust = runCatching { RemoteTrustState.valueOf(item.optString("trust")) }.getOrDefault(RemoteTrustState.UNKNOWN),
+          alias = sanitizeRemoteAlias(item.opt("alias") as? String)
         )
       }
       if (hosts.distinctBy { it.hostId }.size != hosts.size) throw IOException("Remote 主机目录重复")

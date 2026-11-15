@@ -366,10 +366,24 @@ private fun SessionList(
   }
   val muted = HyperTheme.colors.textSecondary
 
-  PullToRefresh(
+  fun refreshFromTop() {
+    if (refreshing) return
+    refreshing = true
+    refreshScope.launch {
+      if (list.layoutInfo.totalItemsCount > 0) list.scrollToItem(0)
+      try {
+        controller.reload().join()
+      } finally {
+        if (list.layoutInfo.totalItemsCount > 0) list.scrollToItem(0)
+        refreshing = false
+      }
+    }
+  }
+
+  LagoonPullToRefresh(
     isRefreshing = refreshing,
-    onRefresh = { refreshing = true; refreshScope.launch { controller.reload().join(); refreshing = false } },
-    refreshTexts = listOf("下拉刷新", "松开刷新", "正在刷新…", "已刷新")
+    onRefresh = ::refreshFromTop,
+    listState = list
   ) {
     LazyColumn(
       Modifier
@@ -391,7 +405,7 @@ private fun SessionList(
             message = notice,
             type = MiuixToastType.WARNING,
             action = "重试",
-            onAction = { controller.reload() },
+            onAction = { refreshFromTop() },
             modifier = Modifier.padding(horizontal = 14.dp, vertical = 4.dp)
           )
         }
@@ -476,7 +490,7 @@ private fun SessionList(
                   when {
                     state.connected || state.enabledProfiles.isNotEmpty() -> onNewSession()
                     allDisabled || state.profiles.isEmpty() -> onManageDevices()
-                    else -> controller.reload()
+                    else -> refreshFromTop()
                   }
                 }
               )

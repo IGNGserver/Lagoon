@@ -333,7 +333,7 @@ internal fun RemoteEnrollSheet(
               }
               Spacer(Modifier.width(8.dp))
               Column(Modifier.weight(1f)) {
-                Text(candidate.meta.name, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MiuixTheme.textStyles.body1)
+                Text(candidate.meta.displayName, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MiuixTheme.textStyles.body1)
                 Text(listOfNotNull(
                   candidate.meta.platform.ifBlank { null },
                   candidate.meta.harnessVersion?.let { "Harness $it" },
@@ -370,7 +370,7 @@ internal fun RemoteEnrollSheet(
               }
               Spacer(Modifier.width(8.dp))
               Column(Modifier.weight(1f)) {
-                Text(candidate.meta.name, style = MiuixTheme.textStyles.body1)
+                Text(candidate.meta.displayName, style = MiuixTheme.textStyles.body1)
                 Text(formatFingerprint(candidate.meta.fingerprint), style = MiuixTheme.textStyles.body2.copy(fontFamily = FontFamily.Monospace))
               }
             }

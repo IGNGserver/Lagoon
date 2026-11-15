@@ -54,6 +54,19 @@ Harness 详情（路由一层，id = leafId）
 - 不要再用 `detailId` / `showingAddDevice` 这类页面内布尔量切换整页：根过渡只认 `NavRoute` 的变化。
 - `device` 只装 `HostBinding.id`，`harness` 只装 `ServerProfile.id`。恢复旧状态时允许把历史 profile id 解析一次。
 
+## 1.2 Remote Host 的显示名
+
+Host 名称是中枢里的**自报字段**，不参与设备身份。Windows 等平台的 DSH Host 在异常编码下可能自报
+`???`；界面不直接展示这种不可用名称。
+
+- 自报名为空或全是 `?` 时，设备列表显示「未命名主机」；主机行仍可看到原始自报名并提示
+  “Host 名称不可用”。
+- 「管理中枢与主机」的主机行提供**本地显示名**（`RemoteHostMeta.alias`）。它只写入本机
+  catalog，不回写中枢，也不改变指纹、凭据、路由或会话身份。
+- 刷新时如果 Host 新报的名称为空/全 `?`，而本地仍有可读名称，保留可读名称；
+  用户设置的 alias 始终优先。
+- 名称只用于展示和派生 `ServerProfile.name`；设备/leaf 的稳定 id 仍按 `hostId` 计算。
+
 ## 2. 添加设备
 
 顶部只有一个入口，页内分两个接入分支，产物都是同一种设备：

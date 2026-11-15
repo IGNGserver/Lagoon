@@ -53,10 +53,15 @@ internal object ConnectionCatalogProjection {
       val adopted = catalog.adoptedHostIds
       catalog.hosts.filter { adopted == null || it.hostId in adopted }.forEach { observed ->
         val hostId = MigrationProjection.hostId(source.id, observed.hostId)
-        hosts.putIfAbsent(
-          hostId,
-          HostBinding(hostId, source.id, observed.name, observed.hostId, observed.fingerprint)
-        )
+        val savedHost = HostBinding(hostId, source.id, observed.displayName, observed.hostId, observed.fingerprint)
+        val existing = hosts[hostId]
+        // A projected leaf/host name stays authoritative unless the catalog carries an explicit
+        // local alias, or the projected name is unusable (`???`). Fingerprint and external ID also
+        // remain projected metadata: the catalog is observation, not a route rewrite.
+        hosts[hostId] = if (existing == null) savedHost
+        else if (observed.alias != null || existing.name.isBlank() || existing.name.all { it == '?' })
+          existing.copy(name = observed.displayName)
+        else existing
       }
     }
 
