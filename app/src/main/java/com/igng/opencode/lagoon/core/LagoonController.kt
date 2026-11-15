@@ -188,8 +188,20 @@ class LagoonController private constructor(private val appContext: Context) {
       source.enabled && host.enabled && leafEnabled)
   }
 
-  fun setConnectionSourceEnabled(sourceId: String, enabled: Boolean) = setConnectionParentEnabled {
-    connectionGraphStore.setSourceEnabled(sourceId, enabled)
+  fun setConnectionSourceEnabled(sourceId: String, enabled: Boolean) {
+    setConnectionParentEnabled {
+      connectionGraphStore.setSourceEnabled(sourceId, enabled)
+    }
+    val committed = currentGraphOrNull()?.sources?.firstOrNull { it.id == sourceId && it.enabled == enabled }
+    if (committed != null && committed.type == ConnectionSourceType.HUB && !committed.account.isNullOrBlank()) {
+      runCatching {
+        remoteCatalog(committed.endpoint, committed.account!!)?.let { catalog ->
+          if (!catalog.signedOut && catalog.userPaused != !enabled) {
+            store.saveRemoteCatalog(catalog.copy(userPaused = !enabled, updatedAt = System.currentTimeMillis()))
+          }
+        }
+      }
+    }
   }
   fun setConnectionHostEnabled(hostId: String, enabled: Boolean) = setConnectionParentEnabled {
     connectionGraphStore.setHostEnabled(hostId, enabled)
@@ -422,15 +434,15 @@ class LagoonController private constructor(private val appContext: Context) {
         }
         withContext(Dispatchers.Main.immediate) {
           val attached = when (protocol) {
-            HarnessProtocolId.DSH_TYPERT -> addRemoteDshService(parent, enabled = true)
-            HarnessProtocolId.ANTIGRAVITY_ACP -> addRemoteAgyService(parent, enabled = true)
-            HarnessProtocolId.OPENCODE_ACP -> addRemoteOpenCodeAcpService(parent, enabled = true)
-            HarnessProtocolId.CODEX_APP_SERVER -> addRemoteCodexService(parent, enabled = true)
+            HarnessProtocolId.DSH_TYPERT -> addRemoteDshService(parent, enabled = true, reenableExisting = true)
+            HarnessProtocolId.ANTIGRAVITY_ACP -> addRemoteAgyService(parent, enabled = true, reenableExisting = true)
+            HarnessProtocolId.OPENCODE_ACP -> addRemoteOpenCodeAcpService(parent, enabled = true, reenableExisting = true)
+            HarnessProtocolId.CODEX_APP_SERVER -> addRemoteCodexService(parent, enabled = true, reenableExisting = true)
             HarnessProtocolId.OPENCODE_NATIVE -> {
               val service = services!!.native?.services?.firstOrNull { it.id == locator && it.supported }
                 ?: error("原生服务已变化，请刷新发现后重试")
               val existingOrAdded = saveRemoteNativeService(parent, service, enabled = true)
-              reuseOrReenableRemoteProfile(existingOrAdded, enabled = true)
+              reuseOrReenableRemoteProfile(existingOrAdded, parent, reenableExisting = true)
             }
           }
           if (attached.effectiveEnabled) {
@@ -487,23 +499,9 @@ class LagoonController private constructor(private val appContext: Context) {
       val allowCleartext = catalogBefore?.allowCleartext == true || source.allowCleartext
       runCatching {
         val records = RemoteIdentitySlots.wipeHostSlotsReturningTokens(
-          store.remoteDevices, canonicalOrigin, acct, external, profileIdsToDelete
+          store.remoteDevices, canonicalOrigin, acct, external, profileIdsToDelete.map { remoteSlot(it) }
         )
-        records.forEach { rec ->
-          val tokens = rec.tokens ?: return@forEach
-          store.remoteDevices.enqueueRevocation(
-            PendingRemoteRevocation(
-              id = java.util.UUID.randomUUID().toString(),
-              origin = canonicalOrigin,
-              account = acct,
-              peerHostId = external,
-              clientDeviceId = rec.identity.deviceId,
-              accessToken = tokens.accessToken,
-              refreshToken = tokens.refreshToken,
-              allowCleartext = allowCleartext
-            )
-          )
-        }
+        enqueueRemoteRevocations(canonicalOrigin, acct, external, allowCleartext, records)
       }
       RemoteConnectionRegistry.evictHost(canonicalOrigin, acct, external)
       if (acct.startsWith("dsh-device:")) {
@@ -521,12 +519,16 @@ class LagoonController private constructor(private val appContext: Context) {
       } else if (catalogBefore != null) {
         val nextHosts = catalogBefore.hosts.filterNot { it.hostId == external }
         val nextAdopted = (catalogBefore.adoptedHostIds ?: catalogBefore.hosts.map { it.hostId }.toSet()) - external
-        runCatching {
-          store.saveRemoteCatalog(catalogBefore.copy(
-            hosts = nextHosts,
-            adoptedHostIds = nextAdopted,
-            updatedAt = System.currentTimeMillis()
-          ))
+        if (catalogBefore.signedOut && nextAdopted.isEmpty()) {
+          runCatching { store.clearRemoteCatalog(canonicalOrigin, acct) }
+        } else {
+          runCatching {
+            store.saveRemoteCatalog(catalogBefore.copy(
+              hosts = nextHosts,
+              adoptedHostIds = nextAdopted,
+              updatedAt = System.currentTimeMillis()
+            ))
+          }
         }
       }
       triggerPendingRemoteRevocationsDrain()
@@ -542,14 +544,151 @@ class LagoonController private constructor(private val appContext: Context) {
       }
     }
 
+    val emptySignedOutHub = source.type == ConnectionSourceType.HUB &&
+      canonicalOrigin != null &&
+      acct.isNotEmpty() &&
+      runCatching { remoteCatalog(canonicalOrigin, acct) }.getOrNull() == null
     val removeSource = source.type == ConnectionSourceType.SSH ||
       source.type == ConnectionSourceType.DIRECT ||
-      (source.type == ConnectionSourceType.HUB && acct.startsWith("dsh-device:"))
+      (source.type == ConnectionSourceType.HUB && (acct.startsWith("dsh-device:") || emptySignedOutHub))
     pruneConnectionGraph(removeHostIds = setOf(deviceId), removeSourceIds = if (removeSource) setOf(source.id) else emptySet())
     clearDeviceDiscovery(deviceId)
     persistConnectionGraph()
     syncGroupLeaves()
     updateState { it.copy(profiles = store.profiles(), sshHosts = sshHostStore.load()) }
+  }
+
+  private fun enqueueRemoteRevocations(
+    canonicalOrigin: String,
+    account: String,
+    peerHostId: String,
+    allowCleartext: Boolean,
+    records: List<RemoteDeviceRecord>
+  ) {
+    val cleanAccount = account.ifBlank { "unknown" }
+    val safePeerHostId = peerHostId.ifBlank { "unknown" }
+    records.forEach { rec ->
+      val tokens = rec.tokens ?: return@forEach
+      store.remoteDevices.enqueueRevocation(
+        PendingRemoteRevocation(
+          id = java.util.UUID.randomUUID().toString(),
+          origin = canonicalOrigin,
+          account = cleanAccount,
+          peerHostId = safePeerHostId,
+          clientDeviceId = rec.identity.deviceId,
+          accessToken = tokens.accessToken,
+          refreshToken = tokens.refreshToken,
+          allowCleartext = allowCleartext
+        )
+      )
+    }
+  }
+
+  /**
+   * 彻底删除一个远程中枢（或扫码直连）来源及其在本地的所有设备、Harness、公钥指纹、
+   * 发现缓存、离线会话缓存与设备令牌，并将有效令牌入队后台服务端吊销。只影响本机，
+   * 不删除远端主机上的工作区或进程。
+   */
+  fun deleteRemoteSource(origin: String, account: String) {
+    val canonical = runCatching { canonicalRemoteOrigin(origin) }.getOrNull() ?: return
+    val acct = account.trim()
+    val graph = currentGraphOrNull()
+    val matchingSources = graph?.sources.orEmpty().filter { source ->
+      source.type == ConnectionSourceType.HUB &&
+        runCatching { canonicalRemoteOrigin(source.endpoint) == canonical }.getOrDefault(false) &&
+        (acct.isEmpty() || source.account.orEmpty().trim() == acct)
+    }
+    val explicitSourceId = if (acct.isNotEmpty()) MigrationProjection.hubSourceId(canonical, acct) else null
+    val sourceIdsToRemove = (matchingSources.map { it.id } + listOfNotNull(explicitSourceId)).toSet()
+    val hostsUnderSource = graph?.hosts.orEmpty().filter { it.sourceId in sourceIdsToRemove }
+    val hostBindingIdsToRemove = hostsUnderSource.map { it.id }.toSet()
+    val externalHostIds = hostsUnderSource.mapNotNull { it.externalHostId }.toMutableSet()
+
+    val bindingIdsUnderSource = graph?.bindings.orEmpty()
+      .filter { it.hostBindingId in hostBindingIdsToRemove }
+      .mapTo(HashSet()) { it.id }
+    val allProfiles = store.readProfiles()
+    val profilesToDelete = allProfiles.filter { profile ->
+      profile.id in bindingIdsUnderSource ||
+        (profile.usesRemoteTransport &&
+          runCatching { canonicalRemoteOrigin(profile.url) == canonical }.getOrDefault(false) &&
+          (acct.isEmpty() || profile.username.trim() == acct))
+    }
+    profilesToDelete.mapNotNullTo(externalHostIds) { it.remoteHostId }
+
+    val matchingCatalogs = store.remoteCatalogs().filter { cat ->
+      runCatching { canonicalRemoteOrigin(cat.origin) == canonical }.getOrDefault(false) &&
+        (acct.isEmpty() || cat.account.trim() == acct)
+    }
+    val allowCleartext = matchingCatalogs.any { it.allowCleartext } || matchingSources.any { it.allowCleartext }
+    matchingCatalogs.forEach { cat -> cat.hosts.mapTo(externalHostIds) { it.hostId } }
+
+    val legacyProfileSlots = profilesToDelete.map { remoteSlot(it.id) }
+    val accountsForWipe = buildSet {
+      if (acct.isNotEmpty()) add(acct)
+      matchingCatalogs.mapTo(this) { it.account.trim() }
+      profilesToDelete.mapTo(this) { it.username.trim() }
+    }.filter { it.isNotEmpty() }
+
+    for (targetAccount in accountsForWipe) {
+      for (extHostId in externalHostIds) {
+        runCatching {
+          val records = RemoteIdentitySlots.wipeHostSlotsReturningTokens(
+            store.remoteDevices, canonical, targetAccount, extHostId, legacyProfileSlots
+          )
+          enqueueRemoteRevocations(canonical, targetAccount, extHostId, allowCleartext, records)
+        }
+      }
+    }
+
+    // 兜底扫一遍所有残留槽位（含老版本命名），确保同源同账号的设备身份与令牌零残留。
+    runCatching {
+      store.remoteDevices.listSlots().forEach { slot ->
+        val record = runCatching { store.remoteDevices.load(slot) }.getOrNull() ?: return@forEach
+        val sameOrigin = runCatching { canonicalRemoteOrigin(record.origin) == canonical }.getOrDefault(false)
+        val sameAccount = acct.isEmpty() || record.account.trim() == acct
+        if (sameOrigin && sameAccount) {
+          if (record.tokens != null && !record.invalidated) {
+            enqueueRemoteRevocations(canonical, record.account.trim(), "unknown", allowCleartext, listOf(record))
+          }
+          RemoteDeviceManager.invalidateSlot(slot)
+          runCatching { store.remoteDevices.delete(slot) }
+        }
+      }
+    }
+
+    for (targetAccount in accountsForWipe) {
+      RemoteConnectionRegistry.evictAccount(canonical, targetAccount)
+      runCatching { RemotePeerTrust(store.remotePins).forgetAccount(canonical, targetAccount) }
+      externalHostIds.forEach { extHostId ->
+        runCatching { RemotePeerTrust(store.remotePins).forget(RemotePeerScope(canonical, targetAccount, extHostId)) }
+      }
+      runCatching { store.clearRemoteCatalog(canonical, targetAccount) }
+    }
+
+    val computedHostIds = sourceIdsToRemove.flatMap { sid ->
+      externalHostIds.map { ext -> MigrationProjection.hostId(sid, ext) }
+    }.toSet()
+    profilesToDelete.forEach { deleteServer(it.id) }
+    (hostBindingIdsToRemove + computedHostIds).forEach { clearDeviceDiscovery(it) }
+    pruneConnectionGraph(removeHostIds = hostBindingIdsToRemove, removeSourceIds = sourceIdsToRemove)
+    persistConnectionGraph()
+    saveDeviceGroups(state.value.deviceGroups, state.value.homeGroupId)
+    syncGroupLeaves()
+    updateState { current ->
+      val updatedProfiles = store.profiles()
+      val clearingPreset = current.remoteEnrollPreset?.let { preset ->
+        runCatching { canonicalRemoteOrigin(preset.origin) == canonical }.getOrDefault(false) &&
+          (acct.isEmpty() || preset.account.trim() == acct)
+      } == true
+      current.copy(
+        profiles = updatedProfiles,
+        sshHosts = sshHostStore.load(),
+        remoteEnrollPreset = if (clearingPreset) null else current.remoteEnrollPreset
+      )
+    }
+    triggerPendingRemoteRevocationsDrain()
+    showNotice("已彻底删除中枢及本地关联数据", FeedbackTone.SUCCESS)
   }
 
   private fun pruneConnectionGraph(removeHostIds: Set<String>, removeSourceIds: Set<String>) {
@@ -829,10 +968,169 @@ class LagoonController private constructor(private val appContext: Context) {
   internal fun remoteCatalog(origin: String, account: String): RemoteCatalog? =
     store.remoteCatalogs().firstOrNull { it.origin == canonicalRemoteOrigin(origin) && it.account == account }
 
+  private fun syncRemoteProfilesWithCatalog(catalog: RemoteCatalog, refreshState: Boolean = true) {
+    val canonical = runCatching { canonicalRemoteOrigin(catalog.origin) }.getOrNull() ?: return
+    val acct = catalog.account.trim()
+    val pinnedHosts = catalog.hosts.filter {
+      it.trust == RemoteTrustState.PINNED && !it.fingerprint.isNullOrBlank()
+    }.associateBy { it.hostId }
+    if (pinnedHosts.isEmpty()) return
+    val rawProfiles = runCatching { store.readProfiles() }.getOrNull() ?: return
+    var changed = false
+    rawProfiles.forEach { profile ->
+      val hostId = profile.remoteHostId ?: return@forEach
+      val host = pinnedHosts[hostId] ?: return@forEach
+      val sameOrigin = runCatching { canonicalRemoteOrigin(profile.url) == canonical }.getOrDefault(false)
+      if (!sameOrigin || profile.username.trim() != acct) return@forEach
+      if (profile.remoteHostFingerprint != host.fingerprint || profile.allowCleartext != catalog.allowCleartext) {
+        runCatching {
+          store.save(
+            profile.copy(
+              remoteHostFingerprint = host.fingerprint,
+              allowCleartext = catalog.allowCleartext
+            ),
+            password = null
+          )
+          changed = true
+        }.onFailure { Diagnostics.warn("RemoteCatalog", "同步 Remote Profile 指纹失败: ${profile.id}", it) }
+      }
+    }
+    if (changed && refreshState) {
+      updateState { it.copy(profiles = store.profiles()) }
+    }
+  }
+
   internal fun saveRemoteCatalog(catalog: RemoteCatalog) {
     store.saveRemoteCatalog(catalog)
+    syncRemoteProfilesWithCatalog(catalog, refreshState = false)
     persistConnectionGraph()
+    val updatedProfiles = store.profiles()
+    updateState { it.copy(profiles = updatedProfiles) }
+    allOverview.start(updatedProfiles, include = setOfNotNull(state.value.serverId))
   }
+
+  internal fun hostAuthExpired(
+    origin: String,
+    account: String,
+    hostId: String,
+    state: LagoonState = _stateSnapshot(),
+    nowMs: Long = System.currentTimeMillis()
+  ): Boolean {
+    val canonical = runCatching { canonicalRemoteOrigin(origin) }.getOrNull() ?: return false
+    val acct = account.trim()
+    val matchingProfiles = store.readProfiles().filter { profile ->
+      profile.usesRemoteTransport &&
+        profile.remoteHostId == hostId &&
+        profile.username.trim() == acct &&
+        runCatching { canonicalRemoteOrigin(profile.url) == canonical }.getOrDefault(false)
+    }
+    val runtimeLoginRequired = (state.serverId != null &&
+      state.remoteRecovery == RemoteRecoveryKind.LOGIN &&
+      matchingProfiles.any { it.id == state.serverId }) ||
+      matchingProfiles.any { p ->
+        state.allServerSnapshots[p.id]?.remoteRecovery == RemoteRecoveryKind.LOGIN
+      }
+    if (runtimeLoginRequired) return true
+
+    val catalog = runCatching { remoteCatalog(canonical, acct) }.getOrNull()
+    val isAdopted = matchingProfiles.isNotEmpty() ||
+      (catalog != null && !catalog.signedOut && hostId in catalog.effectiveAdoptedHostIds())
+    if (!isAdopted) return false
+
+    val legacySlots = matchingProfiles.map { remoteSlot(it.id) }
+    val candidateSlots = RemoteIdentitySlots.candidateSlots(canonical, acct, hostId, legacySlots)
+    val loadedRecords = candidateSlots.mapNotNull { slot ->
+      runCatching { store.remoteDevices.load(slot) }.getOrNull()
+        ?.takeIf { runCatching { canonicalRemoteOrigin(it.origin) == canonical }.getOrDefault(false) && it.account.trim() == acct }
+    }
+    if (loadedRecords.isEmpty()) return true
+    return loadedRecords.none { rec ->
+      val tokens = rec.tokens ?: return@none false
+      !rec.invalidated && tokens.refreshTokenExpiresAt > nowMs
+    }
+  }
+
+  internal fun hubAuthStatus(
+    catalog: RemoteCatalog,
+    state: LagoonState = _stateSnapshot(),
+    nowMs: Long = System.currentTimeMillis()
+  ): HubAuthStatus {
+    if (catalog.signedOut) return HubAuthStatus.SIGNED_OUT
+    val adopted = catalog.effectiveAdoptedHostIds()
+    if (adopted.any { hostAuthExpired(catalog.origin, catalog.account, it, state, nowMs) }) {
+      return HubAuthStatus.EXPIRED
+    }
+    return HubAuthStatus.ACTIVE
+  }
+
+  fun deviceAuthStatus(
+    device: DeviceView,
+    state: LagoonState = _stateSnapshot(),
+    nowMs: Long = System.currentTimeMillis()
+  ): HubAuthStatus {
+    if (device.access != DeviceAccess.HUB) return HubAuthStatus.ACTIVE
+    val canonical = runCatching { canonicalRemoteOrigin(device.endpoint) }.getOrNull() ?: return HubAuthStatus.ACTIVE
+    val graphHost = currentGraphOrNull()?.hosts?.firstOrNull { it.id == device.id.value }
+    val graphSource = graphHost?.let { h -> currentGraphOrNull()?.sources?.firstOrNull { it.id == h.sourceId } }
+    val acct = graphSource?.account?.trim() ?: device.sourceName.orEmpty().trim()
+    val catalog = runCatching { remoteCatalog(canonical, acct) }.getOrNull()
+    if (catalog?.signedOut == true) return HubAuthStatus.SIGNED_OUT
+    val extHostId = graphHost?.externalHostId ?: return HubAuthStatus.ACTIVE
+    return if (hostAuthExpired(canonical, acct, extHostId, state, nowMs)) HubAuthStatus.EXPIRED else HubAuthStatus.ACTIVE
+  }
+
+  fun prepareRemoteRelogin(origin: String? = null, allowCleartext: Boolean? = null, account: String? = null) {
+    val canonical = origin?.let { runCatching { canonicalRemoteOrigin(it) }.getOrNull() }
+    if (canonical == null && account.isNullOrBlank()) {
+      updateState { it.copy(remoteEnrollPreset = null) }
+      return
+    }
+    val savedCatalog = canonical?.let { orig ->
+      store.remoteCatalogs().firstOrNull {
+        it.origin == orig && (account.isNullOrBlank() || it.account.trim() == account.trim())
+      }
+    }
+    val resolvedOrigin = savedCatalog?.origin ?: canonical.orEmpty()
+    val resolvedAllowCleartext = allowCleartext ?: savedCatalog?.allowCleartext
+      ?: resolvedOrigin.startsWith("http://", ignoreCase = true)
+    val resolvedAccount = account?.trim()?.takeIf(String::isNotBlank) ?: savedCatalog?.account.orEmpty()
+    updateState {
+      it.copy(remoteEnrollPreset = RemoteEnrollPreset(resolvedOrigin, resolvedAllowCleartext, resolvedAccount))
+    }
+  }
+
+  fun clearRemoteEnrollPreset() {
+    if (state.value.remoteEnrollPreset != null) {
+      updateState { it.copy(remoteEnrollPreset = null) }
+    }
+  }
+
+  fun openRemoteReloginForServer(serverId: String, onOpenEnroll: () -> Unit) {
+    val profile = store.profiles().firstOrNull { it.id == serverId }
+    if (profile != null && profile.usesRemoteTransport) {
+      prepareRemoteRelogin(profile.url, profile.allowCleartext, profile.username)
+    }
+    onOpenEnroll()
+  }
+
+  fun openRemoteRelogin(origin: String? = null, allowCleartext: Boolean? = null, account: String? = null) {
+    prepareRemoteRelogin(origin, allowCleartext, account)
+    remoteRecoveryHandler?.invoke(RemoteRecoveryKind.LOGIN)
+  }
+
+  fun openRemoteRecoveryFor(serverId: String, kind: RemoteRecoveryKind = RemoteRecoveryKind.LOGIN) {
+    if (kind == RemoteRecoveryKind.RECONNECT) {
+      connect(serverId)
+      return
+    }
+    val profile = store.profiles().firstOrNull { it.id == serverId }
+    if (kind == RemoteRecoveryKind.LOGIN && profile != null && profile.usesRemoteTransport) {
+      prepareRemoteRelogin(profile.url, profile.allowCleartext, profile.username)
+    }
+    remoteRecoveryHandler?.invoke(kind)
+  }
+
+  private fun _stateSnapshot(): LagoonState = state.value
 
   /** Saves authenticated source/Host metadata; callers follow with auto-attach or user selection. */
   internal fun saveRemoteHosts(catalog: RemoteCatalog) = saveRemoteCatalog(catalog)
@@ -880,18 +1178,29 @@ class LagoonController private constructor(private val appContext: Context) {
     }
     val parent = remoteCatalogProfile(catalog, host)
     val now = System.currentTimeMillis()
+    var partialReason: String? = null
     val services = if (host.online) {
-      withTimeoutOrNull(12_000L) {
+      var probeThrew = false
+      val result = withTimeoutOrNull(12_000L) {
         try {
           remoteHostServices(catalog, host)
         } catch (cancel: CancellationException) {
           throw cancel
         } catch (error: Exception) {
+          probeThrew = true
           Diagnostics.warn("RemoteAutoAttach", "自动探测主机服务失败，将回退到 DSH: ${host.hostId}", error)
           null
         }
       }
-    } else null
+      if (result == null) {
+        partialReason = if (probeThrew) "实时探测主机服务失败，当前仅挂载默认 DSH；进入设备详情可重试刷新"
+        else "实时探测主机服务超时，当前仅挂载默认 DSH；进入设备详情可重试刷新"
+      }
+      result
+    } else {
+      partialReason = "主机当前离线，尚未完成实时探测；上线后进入设备详情将自动刷新"
+      null
+    }
 
     val deviceId = MigrationProjection.hostId(
       MigrationProjection.hubSourceId(catalog.origin, catalog.account),
@@ -900,6 +1209,21 @@ class LagoonController private constructor(private val appContext: Context) {
     if (services != null) {
       withContext(Dispatchers.Main.immediate) {
         recordDeviceDiscovery(DeviceDiscovery(deviceId, now, buildHubDiscovery(services, now), DiscoveryCompleteness.COMPLETE))
+      }
+    } else if (partialReason != null) {
+      withContext(Dispatchers.Main.immediate) {
+        val previous = deviceDiscovery(deviceId)
+        val fallbackObservedAt = previous?.observedAtMs?.takeIf { it > 0L }
+          ?: (now - DeviceDiscovery.DEFAULT_TTL_MS - 1L).coerceAtLeast(1L)
+        recordDeviceDiscovery(
+          DeviceDiscovery(
+            deviceId = deviceId,
+            observedAtMs = fallbackObservedAt,
+            harnesses = previous?.harnesses.orEmpty(),
+            completeness = DiscoveryCompleteness.PARTIAL,
+            note = partialReason
+          )
+        )
       }
     }
 
@@ -941,10 +1265,27 @@ class LagoonController private constructor(private val appContext: Context) {
       kind = ServerKind.DSH_REMOTE, remoteHostId = observed.hostId, remoteHostFingerprint = observed.fingerprint)
   }
 
-  private fun reuseOrReenableRemoteProfile(existing: ServerProfile, enabled: Boolean): ServerProfile {
-    if (enabled && !existing.enabled) {
-      setProfileEnabled(existing.id, true)
-      return store.profiles().firstOrNull { it.id == existing.id } ?: existing.copy(enabled = true)
+  private fun reuseOrReenableRemoteProfile(
+    existing: ServerProfile,
+    parent: ServerProfile,
+    reenableExisting: Boolean = false
+  ): ServerProfile {
+    val nextFingerprint = parent.remoteHostFingerprint ?: existing.remoteHostFingerprint
+    val needsSync = existing.remoteHostFingerprint != nextFingerprint || existing.allowCleartext != parent.allowCleartext
+    val needsEnable = reenableExisting && !existing.enabled
+    if (needsSync || needsEnable) {
+      val updated = existing.copy(
+        remoteHostFingerprint = nextFingerprint,
+        allowCleartext = parent.allowCleartext,
+        enabled = if (needsEnable) true else existing.enabled
+      )
+      @Suppress("SENSELESS_COMPARISON")
+      if (state != null) {
+        saveServer(updated, password = null, credentialUsername = updated.username, connect = false)
+      } else {
+        store.save(updated, password = null, credentialUsername = updated.username)
+      }
+      return store.profiles().firstOrNull { it.id == existing.id } ?: updated
     }
     return existing
   }
@@ -969,12 +1310,16 @@ class LagoonController private constructor(private val appContext: Context) {
     return try { backend.hostServices() } finally { backend.close() }
   }
 
-  internal fun addRemoteDshService(parent: ServerProfile, enabled: Boolean): ServerProfile {
+  internal fun addRemoteDshService(
+    parent: ServerProfile,
+    enabled: Boolean,
+    reenableExisting: Boolean = false
+  ): ServerProfile {
     val host = requireNotNull(parent.remoteHostId) { "尚未选择 Host" }
     val origin = canonicalRemoteOrigin(parent.url)
     store.profiles().firstOrNull { it.remoteServiceId == null && it.kind in setOf(ServerKind.DSH, ServerKind.DSH_REMOTE) &&
       it.remoteHostId == host && it.username.trim() == parent.username.trim() && canonicalRemoteOrigin(it.url) == origin }
-      ?.let { return reuseOrReenableRemoteProfile(it, enabled) }
+      ?.let { return reuseOrReenableRemoteProfile(it, parent, reenableExisting) }
     val catalog = remoteCatalog(origin, parent.username)?.takeUnless { it.signedOut } ?: error("中枢账号已退出登录")
     val observed = findHostInCatalog(catalog, host, parent.remoteHostFingerprint) ?: error("Host 目录已变化")
     val profile = remoteCatalogProfile(catalog, observed).copy(enabled = enabled)
@@ -982,12 +1327,16 @@ class LagoonController private constructor(private val appContext: Context) {
     return store.profiles().first { it.id == profile.id }
   }
 
-  internal fun addRemoteCodexService(parent: ServerProfile, enabled: Boolean): ServerProfile {
+  internal fun addRemoteCodexService(
+    parent: ServerProfile,
+    enabled: Boolean,
+    reenableExisting: Boolean = false
+  ): ServerProfile {
     val host = requireNotNull(parent.remoteHostId) { "尚未选择 Host" }
     val origin = canonicalRemoteOrigin(parent.url)
     store.profiles().firstOrNull { it.protocol == HarnessProtocolId.CODEX_APP_SERVER && it.remoteHostId == host &&
       it.username.trim() == parent.username.trim() && canonicalRemoteOrigin(it.url) == origin }
-      ?.let { return reuseOrReenableRemoteProfile(it, enabled) }
+      ?.let { return reuseOrReenableRemoteProfile(it, parent, reenableExisting) }
     val catalog = remoteCatalog(origin, parent.username)?.takeUnless { it.signedOut } ?: error("中枢账号已退出登录")
     val observed = findHostInCatalog(catalog, host, parent.remoteHostFingerprint) ?: error("Host 目录已变化")
     val id = java.util.UUID.nameUUIDFromBytes("$origin:${parent.username.trim()}:$host:codex".toByteArray(Charsets.UTF_8)).toString()
@@ -996,12 +1345,16 @@ class LagoonController private constructor(private val appContext: Context) {
     return store.profiles().first { it.id == profile.id }
   }
 
-  internal fun addRemoteAgyService(parent: ServerProfile, enabled: Boolean): ServerProfile {
+  internal fun addRemoteAgyService(
+    parent: ServerProfile,
+    enabled: Boolean,
+    reenableExisting: Boolean = false
+  ): ServerProfile {
     val host = requireNotNull(parent.remoteHostId) { "尚未选择 Host" }
     val origin = canonicalRemoteOrigin(parent.url)
     store.profiles().firstOrNull { it.protocol == HarnessProtocolId.ANTIGRAVITY_ACP && it.remoteHostId == host &&
       it.username.trim() == parent.username.trim() && canonicalRemoteOrigin(it.url) == origin }
-      ?.let { return reuseOrReenableRemoteProfile(it, enabled) }
+      ?.let { return reuseOrReenableRemoteProfile(it, parent, reenableExisting) }
     val catalog = remoteCatalog(origin, parent.username)?.takeUnless { it.signedOut } ?: error("中枢账号已退出登录")
     val observed = findHostInCatalog(catalog, host, parent.remoteHostFingerprint) ?: error("Host 目录已变化")
     val id = java.util.UUID.nameUUIDFromBytes("$origin:${parent.username.trim()}:$host:antigravity".toByteArray(Charsets.UTF_8)).toString()
@@ -1011,12 +1364,16 @@ class LagoonController private constructor(private val appContext: Context) {
     return store.profiles().first { it.id == profile.id }
   }
 
-  internal fun addRemoteOpenCodeAcpService(parent: ServerProfile, enabled: Boolean): ServerProfile {
+  internal fun addRemoteOpenCodeAcpService(
+    parent: ServerProfile,
+    enabled: Boolean,
+    reenableExisting: Boolean = false
+  ): ServerProfile {
     val host = requireNotNull(parent.remoteHostId) { "尚未选择 Host" }
     val origin = canonicalRemoteOrigin(parent.url)
     store.profiles().firstOrNull { it.protocol == HarnessProtocolId.OPENCODE_ACP && it.remoteHostId == host &&
       it.username.trim() == parent.username.trim() && canonicalRemoteOrigin(it.url) == origin }
-      ?.let { return reuseOrReenableRemoteProfile(it, enabled) }
+      ?.let { return reuseOrReenableRemoteProfile(it, parent, reenableExisting) }
     val catalog = remoteCatalog(origin, parent.username)?.takeUnless { it.signedOut } ?: error("中枢账号已退出登录")
     val observed = findHostInCatalog(catalog, host, parent.remoteHostFingerprint) ?: error("Host 目录已变化")
     val id = java.util.UUID.nameUUIDFromBytes("$origin:${parent.username.trim()}:$host:opencode-acp".toByteArray(Charsets.UTF_8)).toString()
@@ -1051,7 +1408,7 @@ class LagoonController private constructor(private val appContext: Context) {
     val origin = canonicalRemoteOrigin(parent.url)
     profiles.firstOrNull { it.kind == ServerKind.OPENCODE && it.remoteServiceId == service.id &&
       it.remoteHostId == parent.remoteHostId && it.username.trim() == parent.username.trim() &&
-      canonicalRemoteOrigin(it.url) == origin }?.let { return it }
+      canonicalRemoteOrigin(it.url) == origin }?.let { return reuseOrReenableRemoteProfile(it, parent, reenableExisting = false) }
     val locator = org.json.JSONArray(listOf(origin, parent.username.trim(), parent.remoteHostId, service.id)).toString()
     val profile = ServerProfile(java.util.UUID.nameUUIDFromBytes(locator.toByteArray(Charsets.UTF_8)).toString(),
       ProfileNames.uniqueDeviceName("${parent.name} · ${service.name}", profiles), origin, username = parent.username,
@@ -1331,6 +1688,14 @@ class LagoonController private constructor(private val appContext: Context) {
   private val queuedSends = mutableListOf<QueuedPrompt>()
 
   private fun initializeConnectionGraph() {
+    runCatching {
+      store.remoteCatalogs().forEach { catalog ->
+        val activeCatalog = if (!catalog.signedOut && catalog.userPaused == null) {
+          catalog.copy(userPaused = false).also { store.saveRemoteCatalog(it) }
+        } else catalog
+        syncRemoteProfilesWithCatalog(activeCatalog, refreshState = false)
+      }
+    }.onFailure { Diagnostics.warn("RemoteCatalog", "启动时自愈远程中枢目录状态失败", it) }
     try {
       when (val result = connectionGraphStore.loadOrMigrate()) {
         is ConnectionGraphStore.LoadResult.Loaded -> {
@@ -1807,6 +2172,12 @@ class LagoonController private constructor(private val appContext: Context) {
       val id = state.value.serverId ?: return
       connect(id)
       return
+    }
+    if (kind == RemoteRecoveryKind.LOGIN) {
+      val profile = state.value.serverId?.let { id -> store.profiles().firstOrNull { it.id == id } }
+      if (profile != null && profile.usesRemoteTransport) {
+        prepareRemoteRelogin(profile.url, profile.allowCleartext, profile.username)
+      }
     }
     remoteRecoveryHandler?.invoke(kind)
   }

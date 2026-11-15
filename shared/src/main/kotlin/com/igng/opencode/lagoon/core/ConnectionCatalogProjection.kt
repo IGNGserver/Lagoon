@@ -79,13 +79,18 @@ internal object ConnectionCatalogProjection {
       }
     }
 
-    val signedOutSources = remoteCatalogs.filter { it.signedOut }.mapTo(HashSet()) {
+    val catalogBySource = remoteCatalogs.associateBy {
       MigrationProjection.hubSourceId(it.origin, it.account)
     }
     val mergedSourcesRaw = sources.values.map { source ->
       val old = oldSources[source.id]?.takeIf { sameSourceScope(source, it) }
-      if (source.id in signedOutSources) source.copy(enabled = false)
-      else if (old == null) source else source.copy(enabled = old.enabled)
+      val catalog = catalogBySource[source.id]
+      val enabled = when {
+        catalog?.signedOut == true -> false
+        catalog?.userPaused != null -> !catalog.userPaused
+        else -> old?.enabled ?: source.enabled
+      }
+      source.copy(enabled = enabled)
     }
     val mergedHostsRaw = hosts.values.map { host ->
       val source = requireNotNull(sources[host.sourceId])

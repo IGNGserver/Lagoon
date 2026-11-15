@@ -189,6 +189,19 @@ object DeviceProjection {
     attached.forEach { profile ->
       val protocol = protocolOf(profile)
       val locator = locatorOf(profile)
+      val matched = discovery?.harness(protocol, locator)
+      val fresh = discovery?.isFresh(nowMs) == true
+      val attachedReason = when {
+        discovery == null -> ""
+        matched != null && !attachable(access, matched.status, nowMs) ->
+          if (!fresh) "上次发现已过期"
+          else matched.detail.ifBlank { unavailableReason(matched.status, true) }
+        matched == null && access == DeviceAccess.HUB &&
+          protocol != HarnessProtocolId.DSH_TYPERT &&
+          fresh && discovery.completeness == DiscoveryCompleteness.COMPLETE ->
+          "远端最近一次探测未发现此服务（可能已停止或移除）"
+        else -> ""
+      }
       put(HarnessSlot(
         key = slotKey(protocol, locator),
         protocol = protocol,
@@ -198,8 +211,9 @@ object DeviceProjection {
         leafId = LeafId(profile.id),
         attached = true,
         enabled = profile.enabled,
-        availability = discovery?.harness(protocol, locator)?.status ?: HarnessDiscoveryStatus(),
-        attachable = true
+        availability = matched?.status ?: HarnessDiscoveryStatus(),
+        attachable = true,
+        reason = attachedReason
       ))
     }
     discovery?.harnesses.orEmpty().forEach { observed ->
@@ -276,7 +290,7 @@ object DeviceProjection {
     status.listening == DiscoveryValue.NO -> "未运行"
     status.authenticated == DiscoveryValue.NO -> "未认证"
     status.compatible == DiscoveryValue.NO -> "版本不兼容"
-    status.available == DiscoveryValue.NO -> "不可用"
+    status.available == DiscoveryValue.NO -> status.reason?.takeIf { it.isNotBlank() } ?: "不可用"
     else -> status.reason.orEmpty()
   }
 }

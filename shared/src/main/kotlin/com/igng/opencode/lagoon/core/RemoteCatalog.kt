@@ -30,7 +30,9 @@ internal data class RemoteCatalog(
   val allowCleartext: Boolean = false,
   /** Source/Host metadata remains available for local hierarchy when account credentials are signed out. */
   val signedOut: Boolean = false,
-  val adoptedHostIds: Set<String>? = null
+  val adoptedHostIds: Set<String>? = null,
+  /** Explicit user pause toggle for HUB ConnectionSource; null preserves legacy projection fallback. */
+  val userPaused: Boolean? = null
 ) {
   val key: String get() = "$origin\u0000$account"
   val requiresCleartextConsent: Boolean
@@ -58,6 +60,9 @@ internal object RemoteCatalogCodec {
     .apply {
       if (catalog.adoptedHostIds != null) {
         put("adoptedHostIds", JSONArray(catalog.adoptedHostIds.toList()))
+      }
+      if (catalog.userPaused != null) {
+        put("userPaused", catalog.userPaused)
       }
     }
     .put("hosts", JSONArray().apply {
@@ -107,7 +112,16 @@ internal object RemoteCatalogCodec {
       val adoptedHostIds = json.optJSONArray("adoptedHostIds")?.let { arr ->
         (0 until arr.length()).mapNotNull { i -> (arr.opt(i) as? String)?.takeIf(RemoteServerApi::validDeviceId) }.toSet()
       }
-      return RemoteCatalog(origin, account, provider, label, hosts, updated, json.optBoolean("allowCleartext", false), json.optBoolean("signedOut", false), adoptedHostIds)
+      val userPaused = if (json.has("userPaused") && !json.isNull("userPaused")) {
+        json.optBoolean("userPaused")
+      } else null
+      return RemoteCatalog(
+        origin, account, provider, label, hosts, updated,
+        json.optBoolean("allowCleartext", false),
+        json.optBoolean("signedOut", false),
+        adoptedHostIds,
+        userPaused
+      )
     } catch (error: IOException) { throw error }
     catch (error: Exception) { throw IOException("Remote 主机目录损坏", error) }
   }

@@ -25,7 +25,9 @@ import androidx.compose.ui.unit.dp
 import com.igng.opencode.lagoon.core.ConnectionGraph
 import com.igng.opencode.lagoon.core.DeviceAccess
 import com.igng.opencode.lagoon.core.DeviceView
+import com.igng.opencode.lagoon.core.DiscoveryCompleteness
 import com.igng.opencode.lagoon.core.HarnessSlot
+import com.igng.opencode.lagoon.core.HubAuthStatus
 import com.igng.opencode.lagoon.core.LagoonController
 import com.igng.opencode.lagoon.core.LagoonState
 import com.igng.opencode.lagoon.core.ServerKind
@@ -34,6 +36,8 @@ import com.igng.opencode.lagoon.core.SshKeyProfile
 import com.igng.opencode.lagoon.core.SshPassphrasePolicy
 import com.igng.opencode.lagoon.core.connectionTypeLabel
 import com.igng.opencode.lagoon.core.endpointSummary
+import com.igng.opencode.lagoon.core.userFacingError
+import kotlinx.coroutines.CancellationException
 import top.yukonga.miuix.kmp.basic.HorizontalDivider
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.extra.SuperDialog
@@ -61,6 +65,7 @@ internal fun DeviceManagementScreen(
   val graph by controller.connectionGraph.collectAsState()
   val devices = rememberDevices(state, controller, graph)
   val catalog = controller.activeHubCatalog()
+  val hubStatus = catalog?.let { controller.hubAuthStatus(it, state) }
   val hubDevices = devices.filter { it.access == DeviceAccess.HUB }
   val sshDevices = devices.filter { it.access == DeviceAccess.SSH }
   val directDevices = devices.filter { it.access == DeviceAccess.DIRECT }
@@ -98,7 +103,9 @@ internal fun DeviceManagementScreen(
             title = catalog?.account ?: "登录 Remote Hub",
             summary = when {
               catalog == null -> "登录后可以接入这个账号下的开发机；Host 与 Harness 分开选择"
-              catalog.signedOut -> "${catalog.origin} · 已退出登录，${catalog.hosts.size} 台主机保留"
+              hubStatus == HubAuthStatus.SIGNED_OUT -> "${catalog.origin} · 已退出登录，${catalog.hosts.size} 台主机缓存保留"
+              hubStatus == HubAuthStatus.EXPIRED -> "${catalog.origin} · 登录态已失效，点击管理或重新登录"
+              catalog.userPaused == true -> "${catalog.origin} · 中枢连接已暂停 · ${catalog.hosts.size} 台主机"
               else -> "${catalog.origin} · ${catalog.hosts.size} 台可接入主机"
             },
             showChevron = true,
@@ -176,14 +183,15 @@ private fun androidx.compose.foundation.lazy.LazyListScope.deviceSection(
     HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(vertical = 4.dp)) {
       devices.forEachIndexed { index, device ->
         if (index > 0) HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
-        DeviceRow(device, controller, onOpenDevice)
+        DeviceRow(device, state, controller, onOpenDevice)
       }
     }
   }
 }
 
 @Composable
-private fun DeviceRow(device: DeviceView, controller: LagoonController, onOpenDevice: (String) -> Unit) {
+private fun DeviceRow(device: DeviceView, state: LagoonState, controller: LagoonController, onOpenDevice: (String) -> Unit) {
+  val authStatus = controller.deviceAuthStatus(device, state)
   HyperRow(
     title = device.name,
     summary = buildString {
@@ -192,6 +200,8 @@ private fun DeviceRow(device: DeviceView, controller: LagoonController, onOpenDe
       append(if (device.attachedCount == 0) "未添加 Harness" else "${device.attachedCount} 个 Harness · ${device.enabledCount} 启用")
       val reason = device.blockedReason
       when {
+        authStatus == HubAuthStatus.SIGNED_OUT -> append(" · 已退出登录")
+        authStatus == HubAuthStatus.EXPIRED -> append(" · 登录态已失效")
         reason.isNotBlank() -> append(" · $reason")
         device.attachedCount == 0 -> append(" · 不占用连接")
         device.online -> append(" · 在线")
@@ -201,7 +211,7 @@ private fun DeviceRow(device: DeviceView, controller: LagoonController, onOpenDe
     leading = {
       StatusDot(
         when {
-          !device.effectiveEnabled -> HyperTheme.colors.textTertiary
+          !device.effectiveEnabled || authStatus != HubAuthStatus.ACTIVE -> HyperTheme.colors.textTertiary
           device.online -> HyperTheme.colors.success
           else -> HyperTheme.colors.textTertiary
         }
@@ -252,12 +262,32 @@ internal fun DeviceDetailScreen(
     controller.sshKey(sshHost?.keyId)
   }
   val refreshing = state.deviceRefreshInFlight == deviceId
+  val authStatus = controller.deviceAuthStatus(device, state)
+  var autoDiscoveryError by remember(deviceId) { mutableStateOf<String?>(null) }
+
+  LaunchedEffect(device.id.value, device.effectiveEnabled, authStatus) {
+    val discovery = device.discovery
+    if (device.effectiveEnabled && authStatus == HubAuthStatus.ACTIVE &&
+      (discovery == null || !discovery.isFresh(System.currentTimeMillis()) || discovery.completeness != DiscoveryCompleteness.COMPLETE)
+    ) {
+      autoDiscoveryError = null
+      try {
+        controller.refreshDeviceDiscovery(device.id.value)
+      } catch (cancel: CancellationException) {
+        throw cancel
+      } catch (e: Exception) {
+        autoDiscoveryError = userFacingError(e, "自动刷新发现失败")
+      }
+    }
+  }
 
   Column(Modifier.fillMaxSize().background(HyperTheme.colors.canvas)) {
     PageTopBar(device.name, onBack, subtitle = {
-      StatusDot(if (device.online) HyperTheme.colors.success else HyperTheme.colors.textTertiary)
+      StatusDot(if (device.online && authStatus == HubAuthStatus.ACTIVE) HyperTheme.colors.success else HyperTheme.colors.textTertiary)
       Text(
         when {
+          authStatus == HubAuthStatus.SIGNED_OUT -> "已退出登录"
+          authStatus == HubAuthStatus.EXPIRED -> "登录态已失效"
           !device.effectiveEnabled -> device.blockedReason
           device.attachedCount == 0 -> "已启用 · 未添加 Harness"
           device.online -> "在线"
@@ -271,6 +301,45 @@ internal fun DeviceDetailScreen(
       contentPadding = PaddingValues(start = 14.dp, end = 14.dp, top = 6.dp, bottom = 48.dp),
       verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
+      when {
+        authStatus == HubAuthStatus.EXPIRED -> item {
+          HyperInlineNotice(
+            message = "中枢登录态或设备令牌已失效，当前显示本地缓存记录。",
+            type = MiuixToastType.WARNING,
+            action = "重新登录",
+            onAction = { controller.openRemoteRelogin(device.endpoint, null, device.sourceName) }
+          )
+        }
+        authStatus == HubAuthStatus.SIGNED_OUT -> item {
+          HyperInlineNotice(
+            message = "所属中枢账号已退出登录，当前显示本地缓存记录。",
+            type = MiuixToastType.WARNING,
+            action = "重新登录",
+            onAction = { controller.openRemoteRelogin(device.endpoint, null, device.sourceName) }
+          )
+        }
+        device.access == DeviceAccess.HUB && !device.sourceEnabled -> item {
+          HyperInlineNotice(
+            message = "所属中枢连接已暂停，此设备当前不会联网。",
+            type = MiuixToastType.WARNING,
+            action = "恢复连接",
+            onAction = { controller.setConnectionSourceEnabled(device.sourceId, true) }
+          )
+        }
+      }
+      autoDiscoveryError?.let { errMsg ->
+        item {
+          HyperInlineNotice(
+            message = "实时发现未完成：$errMsg（当前展示本地缓存结果）",
+            type = MiuixToastType.WARNING,
+            action = "重试",
+            onAction = {
+              autoDiscoveryError = null
+              onRefreshDiscovery(device.id.value)
+            }
+          )
+        }
+      }
       item {
         HyperGroupTitle("设备")
         HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(vertical = 4.dp)) {
@@ -304,6 +373,7 @@ internal fun DeviceDetailScreen(
         })
         Text(
           discoverySummary(device) + when {
+            authStatus != HubAuthStatus.ACTIVE -> "；中枢登录失效期间仅展示本地缓存"
             !device.effectiveEnabled -> "；设备停用时只用上次结果，不会连接"
             device.attachedCount == 0 -> "；没有启用的 Harness 就不占用连接与流量"
             else -> ""
@@ -311,6 +381,13 @@ internal fun DeviceDetailScreen(
           Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
           style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary)
         )
+        device.discovery?.note?.takeIf { it.isNotBlank() }?.let { note ->
+          Text(
+            note,
+            Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+            style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.warning)
+          )
+        }
         HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(vertical = 4.dp)) {
           if (device.harnesses.isEmpty()) {
             HyperRow(title = "没有可用的 Harness", summary = "刷新发现，或检查这台设备上的服务是否已运行")
@@ -421,7 +498,7 @@ private fun HarnessRow(
       summary = buildString {
         append(if (slot.enabled) "已启用" else "已停用")
         if (!device.effectiveEnabled) append(" · 设备已停用")
-        if (slot.reason.isNotBlank() && !slot.enabled) append(" · ${slot.reason}")
+        if (slot.reason.isNotBlank()) append(" · ${slot.reason}")
       },
       showChevron = true,
       onClick = { onOpenHarness(leafId) },
@@ -671,7 +748,9 @@ private fun sshHostOfDevice(graph: ConnectionGraph?, deviceId: String): String? 
 
 private fun discoverySummary(device: DeviceView): String {
   val discovery = device.discovery ?: return "尚未发现；点「刷新发现」后才会连接一次"
-  val age = System.currentTimeMillis() - discovery.observedAtMs
+  val partial = if (discovery.completeness != DiscoveryCompleteness.COMPLETE) " · 部分结果" else ""
+  if (discovery.observedAtMs <= 0L) return "尚未完成完整发现$partial"
+  val age = (System.currentTimeMillis() - discovery.observedAtMs).coerceAtLeast(0L)
   val whenText = when {
     age < 60_000 -> "刚刚"
     age < 3_600_000 -> "${age / 60_000} 分钟前"
@@ -679,5 +758,5 @@ private fun discoverySummary(device: DeviceView): String {
     else -> "${age / 86_400_000} 天前"
   }
   val stale = if (discovery.isFresh(System.currentTimeMillis())) "" else " · 已过期"
-  return "$whenText · ${discovery.harnesses.size} 个结果$stale"
+  return "$whenText · ${discovery.harnesses.size} 个结果$partial$stale"
 }

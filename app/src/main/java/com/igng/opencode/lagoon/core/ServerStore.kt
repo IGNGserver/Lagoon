@@ -10,7 +10,8 @@ import java.util.concurrent.ConcurrentHashMap
 class ServerStore internal constructor(private val preferences: SharedPreferences, private val secrets: SharedPreferences,
   private val encryptValue: (String) -> String, private val decryptValue: (String) -> String,
   private val appContext: Context? = null,
-  private val readConnectionGraph: (() -> ConnectionGraph?)? = null) : OverviewStore, ConnectionRouteStore {
+  private val readConnectionGraph: (() -> ConnectionGraph?)? = null,
+  remoteDevicesOverride: RemoteDeviceStore? = null) : OverviewStore, ConnectionRouteStore {
   init {
     if (preferences.getInt(PREVIEW_FORMAT_VERSION_KEY, 0) != PREVIEW_FORMAT_VERSION) {
       val plain = preferences.edit()
@@ -25,7 +26,7 @@ class ServerStore internal constructor(private val preferences: SharedPreference
       .onFailure { Diagnostics.warn("ServerStore", "配置保存日志无法恢复，保留原资料并暂停认证") }
   }
   internal val remoteDevices: RemoteDeviceStore by lazy {
-    AndroidRemoteDeviceStore(requireNotNull(appContext) { "Remote device storage needs Android Context" })
+    remoteDevicesOverride ?: AndroidRemoteDeviceStore(requireNotNull(appContext) { "Remote device storage needs Android Context" })
   }
   internal val remotePins: RemotePeerTrustStore by lazy {
     AndroidRemotePeerTrustStore(requireNotNull(appContext) { "Remote Host pins need Android Context" }

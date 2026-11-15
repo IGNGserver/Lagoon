@@ -27,7 +27,7 @@ internal fun LagoonState.serverSnapshots(): Map<String, ServerOverviewSnapshot> 
     streamConnected = streamConnected, projects = projects, sessions = sessions, parents = parents, tasks = tasks,
     notices = notices, permissions = permissions, questions = questions, backgroundRunning = backgroundRunning,
     summary = summary, autoApprovalFailures = autoApprovalFailures, shells = shells,
-    workspaceCatalog = workspaceCatalog))
+    workspaceCatalog = workspaceCatalog, remoteRecovery = remoteRecovery))
 }
 
 /**
