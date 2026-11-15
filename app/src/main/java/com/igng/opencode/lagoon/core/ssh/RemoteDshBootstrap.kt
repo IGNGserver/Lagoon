@@ -206,21 +206,27 @@ internal class RemoteDshBootstrap(
       [ -n "§OWNER" ] && [ "§OWNER" = "§(id -u)" ] || { printf 'LAGOON nodir\n'; exit 70; }
       chmod 700 "§D" 2>/dev/null || { printf 'LAGOON nodir\n'; exit 70; }
       LOCK="§D/.bootstrap.lock"
-      i=0
-      while ! mkdir "§LOCK" 2>/dev/null; do
-        [ -d "§LOCK" ] && [ ! -L "§LOCK" ] || { printf 'LAGOON lockbusy\n'; exit 73; }
-        [ "§i" -lt 100 ] || { printf 'LAGOON lockbusy\n'; exit 73; }
-        sleep 0.1; i=§((i+1))
-      done
-      printf '%s\n' "§§" > "§LOCK/owner"
-      _unlock() {
-        if [ "§(cat "§LOCK/owner" 2>/dev/null)" = "§§" ]; then
-          rm -f "§LOCK/owner" 2>/dev/null
-          rmdir "§LOCK" 2>/dev/null
-        fi
-      }
-      trap '_unlock' 0
-      trap 'exit 130' 1 2 3 15
+      command -v python3 >/dev/null 2>&1 || { printf 'LAGOON nopython\n'; exit 127; }
+      [ ! -L "§LOCK" ] && { [ ! -e "§LOCK" ] || [ -f "§LOCK" ]; } || { printf 'LAGOON lockbusy\n'; exit 73; }
+      # Keep an OS advisory lock on the shell's open file description. Unlike an existence lock,
+      # it is automatically released even if SSH or the bootstrap process is killed abruptly.
+      # The persistent file is never removed: unlinking it would split concurrent clients across
+      # different inodes. Python is also required for the verified SSH tunnel.
+      exec 9>>"§LOCK"
+      python3 -c '
+import fcntl, os, stat, sys, time
+info = os.fstat(9)
+if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
+    sys.exit(1)
+deadline = time.monotonic() + 10
+while True:
+    try:
+        fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        break
+    except BlockingIOError:
+        if time.monotonic() >= deadline: sys.exit(1)
+        time.sleep(0.1)
+' 2>/dev/null || { printf 'LAGOON lockbusy\n'; exit 73; }
       _existing; STATE=§?
       if [ "§STATE" -eq 0 ]; then exit 0; fi
       if [ "§STATE" -eq 2 ]; then printf 'LAGOON conflict\n'; exit 73; fi
@@ -266,7 +272,7 @@ internal class RemoteDshBootstrap(
     """))
     val launch = "$command --host 127.0.0.1 --port 0 --no-open"
     appendLine("LAUNCH=${SshShell.quote(launch)}")
-    appendLine("\$N sh -c 'eval \"\$1\" >>\"\$D/web.log\" 2>&1 & echo \$! >\"\$D/web.pid\"; wait' sh \"\$LAUNCH\" >/dev/null 2>&1 &")
+    appendLine("\$N sh -c 'eval \"\$1\" >>\"\$D/web.log\" 2>&1 & echo \$! >\"\$D/web.pid\"; wait' sh \"\$LAUNCH\" >/dev/null 2>&1 9>&- &")
     append(shell("""
       i=0
       while [ ! -s "§D/web.pid" ] && [ "§i" -lt 20 ]; do sleep 0.1; i=§((i+1)); done
@@ -329,6 +335,7 @@ internal class RemoteDshBootstrap(
     var pid: Int? = null
     var url: String? = null
     var noDsh = false
+    var noPython = false
     var noCwd = false
     var exited = false
     var timedOut = false
@@ -353,6 +360,7 @@ internal class RemoteDshBootstrap(
         }
         "url" -> url = value.trim()
         "nodsh" -> noDsh = true
+        "nopython" -> noPython = true
         "nocwd" -> noCwd = true
         "exited" -> exited = true
         "timeout" -> timedOut = true
@@ -365,6 +373,10 @@ internal class RemoteDshBootstrap(
       }
     }
     if (conflict || busy) throw existingInstanceFailure()
+    if (noPython) throw SshFailure(
+      SshFailureKind.DSH_START, "电脑缺少 Python 3",
+      "SSH 模式需要 Python 3 才能安全启动和连接 DSH。请安装后重试。", retryable = true
+    )
     if (lockBusy) throw SshFailure(
       SshFailureKind.DSH_START, "另一台设备正在检查或启动 DSH",
       "请稍后重试；若一直出现，请在电脑上检查 Lagoon 的启动锁。", retryable = true

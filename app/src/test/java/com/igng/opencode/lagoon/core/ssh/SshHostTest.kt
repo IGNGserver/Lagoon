@@ -324,8 +324,14 @@ class SshHostTest {
     val fixtureHome = File(root, "home").apply { mkdirs() }
     val bin = File(root, "bin").apply { mkdirs() }
     File(bin, "pgrep").apply { writeText("#!/bin/sh\nexit 1\n"); setExecutable(true) }
+    // Model mkdir implementations that report success for both racing creators. A correct lock
+    // must still admit only one client; the delayed fixture keeps the attempts concurrent.
+    File(bin, "mkdir").apply {
+      writeText("#!/bin/sh\ncase \"\$*\" in *'.bootstrap.lock'*) exec /bin/mkdir -p \"\$@\";; *) exec /bin/mkdir \"\$@\";; esac\n")
+      setExecutable(true)
+    }
     File(bin, "dsh").apply {
-      writeText("#!/bin/sh\nprintf 'launch\\n' >> \"\$HOME/launches\"\necho 'dsh web: http://127.0.0.1:45684/?token=fixture-token'\nexec sleep 60\n")
+      writeText("#!/bin/sh\nprintf 'launch\\n' >> \"\$HOME/launches\"\nprintf '%s\\n' \"\$\$\" >> \"\$HOME/fixture-pids\"\nsleep 1\necho 'dsh web: http://127.0.0.1:45684/?token=fixture-token'\nexec sleep 60\n")
       setExecutable(true)
     }
     val executor = java.util.concurrent.Executors.newFixedThreadPool(2)
@@ -345,7 +351,51 @@ class SshHostTest {
       assertEquals(listOf("launch"), File(fixtureHome, "launches").readLines())
     } finally {
       launched?.let(::stopFixturePid)
+      File(fixtureHome, "fixture-pids").takeIf(File::isFile)?.readLines().orEmpty()
+        .mapNotNull(String::toIntOrNull).forEach { pid -> runCatching { stopFixturePid(captureFixturePid(pid)) } }
       executor.shutdownNow()
+      root.deleteRecursively()
+    }
+  }
+
+  @Test fun interruptedBootstrapReleasesLockWithoutStoppingService() {
+    assumeTrue(File("/bin/sh").exists())
+    val root = Files.createTempDirectory("lagoon-dsh-interrupted").toFile()
+    val fixtureHome = File(root, "home").apply { mkdirs() }
+    val bin = File(root, "bin").apply { mkdirs() }
+    File(bin, "pgrep").apply { writeText("#!/bin/sh\nexit 1\n"); setExecutable(true) }
+    File(bin, "dsh").apply {
+      writeText("#!/bin/sh\nsleep 3\necho 'dsh web: http://127.0.0.1:45685/?token=fixture-token'\nexec sleep 60\n")
+      setExecutable(true)
+    }
+    val path = "${bin.absolutePath}:/usr/bin:/bin"
+    val bootstrap = RemoteDshBootstrap(LocalShellTransport(fixtureHome, path), startTimeoutSeconds = 8)
+    val state = File(fixtureHome, ".lagoon-ssh-dsh")
+    val process = ProcessBuilder("/bin/sh", "-c", bootstrap.startScript()).apply {
+      environment()["HOME"] = fixtureHome.absolutePath
+      environment()["PATH"] = path
+      redirectErrorStream(true)
+    }.start()
+    var launched: FixturePid? = null
+    try {
+      val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
+      while ((!File(state, "web.st").isFile || !File(state, "web.st").readText().isNotBlank()) && System.nanoTime() < deadline) {
+        assertTrue("bootstrap exited before recording the process", process.isAlive)
+        Thread.sleep(50)
+      }
+      assertTrue("bootstrap did not record process identity", File(state, "web.st").isFile)
+      val pid = File(state, "web.pid").readText().trim().toInt()
+      launched = captureFixturePid(pid)
+      process.destroyForcibly()
+      assertTrue(process.waitFor(5, TimeUnit.SECONDS))
+      while (!File(state, "web.log").readText().contains("token=") && System.nanoTime() < deadline) Thread.sleep(50)
+      val resumed = bootstrap.ensureRunning()
+      assertTrue(resumed.reused)
+      assertEquals(pid, resumed.pid)
+      assertTrue(fixturePidAlive(launched))
+    } finally {
+      if (process.isAlive) { process.destroyForcibly(); process.waitFor(5, TimeUnit.SECONDS) }
+      launched?.let(::stopFixturePid)
       root.deleteRecursively()
     }
   }
