@@ -43,8 +43,8 @@ class RemoteAccountManagerTest {
   private fun loginBody() = JSONObject().put("account", "user@example.org").put("token", accountToken)
     .put("expiresAt", 1900000000000L).toString()
 
-  private fun accountDirectory() = """{"items":[
-    {"deviceId":"$hostId","name":"Mac","platform":"darwin","role":"host","membershipId":"member","online":true,"identityKey":"$key","harnessVersion":"0.2.1"},
+  private fun accountDirectory(name: String = "Mac") = """{"items":[
+    {"deviceId":"$hostId","name":"$name","platform":"win32","role":"host","membershipId":"member","online":true,"identityKey":"$key","harnessVersion":"0.2.2-rc.3"},
     {"deviceId":"$clientId","name":"Phone","platform":"android","role":"client","membershipId":"member","online":false,"identityKey":"$key"}
   ]}"""
 
@@ -295,4 +295,32 @@ class RemoteAccountManagerTest {
     assertEquals(mobileIdentity.deviceId, saved.identity.deviceId)
     assertEquals(access, saved.tokens?.accessToken)
   }
+
+  @Test fun refreshKeepsLocalAliasAndReadableNameWhenHostReportsQuestionMarks() = runBlocking {
+    MockWebServer().use { mock ->
+      mock.start()
+      mock.enqueue(MockResponse().setBody(loginBody()))
+      mock.enqueue(MockResponse().setBody(accountDirectory(name = "工作站")))
+      mock.enqueue(MockResponse().setBody(pair().toString()))
+      mock.enqueue(MockResponse().setBody("""{"items":[{"deviceId":"$hostId","name":"???","platform":"win32","role":"host","membershipId":"member","online":true}],"nextCursor":null}"""))
+      mock.enqueue(MockResponse().setBody("""{"deviceId":"$hostId","name":"???","platform":"win32","role":"host","membershipId":"member","online":true,"identityKey":"$key"}"""))
+
+      val catalogs = Catalog()
+      val manager = RemoteAccountManager(mock.url("/").toString(), true, "Lagoon · Pixel", "android", "1.0",
+        Devices(), Pins(), catalogs)
+      val host = manager.loginWithPassword("user@example.org", "pw").single()
+      assertEquals("工作站", host.meta.displayName)
+      assertTrue(manager.enroll(listOf(host), mapOf(hostId to host.meta.fingerprint!!)).failures.isEmpty())
+
+      catalogs.value = catalogs.value!!.copy(
+        hosts = catalogs.value!!.hosts.map { it.copy(alias = "我的工作站") },
+      )
+      val refreshed = manager.refresh()
+      assertEquals("工作站", refreshed.hosts.single().name)
+      assertEquals("我的工作站", refreshed.hosts.single().alias)
+      assertEquals("我的工作站", refreshed.hosts.single().displayName)
+    }
+  }
+
+
 }

@@ -96,13 +96,14 @@ internal class RemoteAccountManager(
       try {
         val hosts = loadHostsWithReactiveRefresh(manager, current.account)
         val mergedHosts = hosts.map { next ->
-          if (next.trust == RemoteTrustState.PINNED) return@map next
-          val prev = previousById[next.hostId]
-          val matchesPrev = prev?.trust == RemoteTrustState.PINNED &&
-            prev.fingerprint != null &&
-            next.fingerprint != null &&
-            equalFingerprint(prev.fingerprint, next.fingerprint)
-          if (matchesPrev) next.copy(trust = RemoteTrustState.PINNED) else next
+          val previous = previousById[next.hostId]
+          val base = next.withPreviousDisplay(previous)
+          if (base.trust == RemoteTrustState.PINNED) return@map base
+          val matchesPrev = previous?.trust == RemoteTrustState.PINNED &&
+            previous.fingerprint != null &&
+            base.fingerprint != null &&
+            equalFingerprint(previous.fingerprint, base.fingerprint)
+          if (matchesPrev) base.copy(trust = RemoteTrustState.PINNED) else base
         }
         val updated = current.copy(hosts = mergedHosts, updatedAt = System.currentTimeMillis())
         catalogs.save(updated)
@@ -152,13 +153,14 @@ internal class RemoteAccountManager(
     val failures = LinkedHashMap<String, String>()
     val byId = candidates.associateBy { it.hostId }
     val catalogHosts = candidates.map { next ->
-      if (next.meta.trust == RemoteTrustState.PINNED) return@map next.meta
+      val base = next.meta.withPreviousDisplay(previousById[next.meta.hostId])
+      if (base.trust == RemoteTrustState.PINNED) return@map base
       val prev = previousById[next.meta.hostId]?.takeIf { previousAdopted == null || next.meta.hostId in previousAdopted }
       val matchesPrev = prev?.trust == RemoteTrustState.PINNED &&
         prev.fingerprint != null &&
-        next.meta.fingerprint != null &&
-        equalFingerprint(prev.fingerprint, next.meta.fingerprint)
-      if (matchesPrev) next.meta.copy(trust = RemoteTrustState.PINNED) else next.meta
+        base.fingerprint != null &&
+        equalFingerprint(prev.fingerprint, base.fingerprint)
+      if (matchesPrev) base.copy(trust = RemoteTrustState.PINNED) else base
     }.toMutableList()
     for (candidate in selected) {
       try {
@@ -174,7 +176,8 @@ internal class RemoteAccountManager(
         val manager = RemoteDeviceManager(devices, slot, origin, name,
           registerer = { descriptor, accountToken -> api.register(descriptor, accountToken) },
           refresher = { id, refresh -> api.refresh(id, refresh) })
-        val device = manager.register(deviceName(host), platform, clientVersion, token)
+        val displayName = catalogHosts.firstOrNull { it.hostId == host.deviceId }?.displayName ?: candidate.meta.displayName
+        val device = manager.register(deviceName(displayName), platform, clientVersion, token)
         RemotePeerTrust(pins).pinOrReplaceAfterConfirmation(scope, host)
         registered[host.deviceId] = device.identity.deviceId
         val index = catalogHosts.indexOfFirst { it.hostId == host.deviceId }
@@ -225,13 +228,14 @@ internal class RemoteAccountManager(
     val registered = LinkedHashMap<String, String>()
     val failures = LinkedHashMap<String, String>()
     val catalogHosts = candidates.map { next ->
-      if (next.meta.trust == RemoteTrustState.PINNED) return@map next.meta
+      val base = next.meta.withPreviousDisplay(previousById[next.meta.hostId])
+      if (base.trust == RemoteTrustState.PINNED) return@map base
       val prev = previousById[next.meta.hostId]?.takeIf { next.meta.hostId in previousAdopted }
       val matchesPrev = prev?.trust == RemoteTrustState.PINNED &&
         prev.fingerprint != null &&
-        next.meta.fingerprint != null &&
-        equalFingerprint(prev.fingerprint, next.meta.fingerprint)
-      if (matchesPrev) next.meta.copy(trust = RemoteTrustState.PINNED) else next.meta
+        base.fingerprint != null &&
+        equalFingerprint(prev.fingerprint, base.fingerprint)
+      if (matchesPrev) base.copy(trust = RemoteTrustState.PINNED) else base
     }.toMutableList()
     for (candidate in targets) {
       try {
@@ -242,7 +246,8 @@ internal class RemoteAccountManager(
         val manager = RemoteDeviceManager(devices, slot, origin, name,
           registerer = { descriptor, acctToken -> api.register(descriptor, acctToken) },
           refresher = { id, refresh -> api.refresh(id, refresh) })
-        val device = manager.register(deviceName(host), platform, clientVersion, token)
+        val displayName = catalogHosts.firstOrNull { it.hostId == host.deviceId }?.displayName ?: candidate.meta.displayName
+        val device = manager.register(deviceName(displayName), platform, clientVersion, token)
         RemotePeerTrust(pins).pinOrReplaceAfterConfirmation(scope, host)
         if (existingRecord != null &&
           existingRecord.identity.deviceId != device.identity.deviceId &&
@@ -326,7 +331,7 @@ internal class RemoteAccountManager(
           registerer = { descriptor, acctToken -> api.register(descriptor, acctToken) },
           refresher = { id, refresh -> api.refresh(id, refresh) },
         )
-        manager.register(deviceName(candidate.host), platform, clientVersion, accountAccessToken)
+        manager.register(deviceName(candidate.meta.withPreviousDisplay(prev).displayName), platform, clientVersion, accountAccessToken)
       } catch (cancel: kotlinx.coroutines.CancellationException) {
         throw cancel
       } catch (_: Exception) {
@@ -369,10 +374,13 @@ internal class RemoteAccountManager(
       trust = RemoteTrustState.PINNED,
     )
     val existingCatalog = catalogs.load().firstOrNull { it.origin == origin && it.account == accountName }
+    val effectiveMeta = newMeta.withPreviousDisplay(
+      existingCatalog?.hosts?.firstOrNull { it.hostId == newMeta.hostId },
+    )
     val mergedHosts = existingCatalog?.hosts
-      ?.filterNot { it.hostId == newMeta.hostId }
-      .orEmpty() + newMeta
-    val adopted = (existingCatalog?.effectiveAdoptedHostIds().orEmpty() + newMeta.hostId).toSet()
+      ?.filterNot { it.hostId == effectiveMeta.hostId }
+      .orEmpty() + effectiveMeta
+    val adopted = (existingCatalog?.effectiveAdoptedHostIds().orEmpty() + effectiveMeta.hostId).toSet()
     val updated = (existingCatalog ?: RemoteCatalog(
       origin = origin,
       account = accountName,
@@ -486,9 +494,9 @@ internal class RemoteAccountManager(
   private fun deviceSlot(hostId: String, account: String): String =
     resolveRemoteDeviceSlot(devices, origin, account, hostId)
 
-  private fun deviceName(host: RemoteHost): String {
+  private fun deviceName(displayName: String): String {
     val label = sanitizeRemoteDisplayName(deviceLabel, fallback = "Lagoon", maxChars = 64)
-    val hostName = sanitizeRemoteDisplayName(host.name, fallback = "", maxChars = 64)
+    val hostName = sanitizeRemoteDisplayName(displayName, fallback = "", maxChars = 64)
     val raw = if (hostName.isBlank()) label else "$label · $hostName"
     val truncated = truncateByCodePointsSafe(truncateUtf8Bytes(raw, 128), 128).trim()
     return truncated.ifBlank { truncateUtf8Bytes(label, 128).ifBlank { "Lagoon" } }

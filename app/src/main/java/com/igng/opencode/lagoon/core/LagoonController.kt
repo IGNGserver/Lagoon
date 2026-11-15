@@ -994,6 +994,12 @@ class LagoonController private constructor(private val appContext: Context) {
           changed = true
         }.onFailure { Diagnostics.warn("RemoteCatalog", "同步 Remote Profile 指纹失败: ${profile.id}", it) }
       }
+      // The parent DSH Remote leaf is what the session list shows as the device; keep it aligned
+      // with the catalog's local display name without touching native-service leaves.
+      if (profile.kind == ServerKind.DSH_REMOTE && profile.remoteServiceId == null && profile.name != host.displayName) {
+        runCatching { store.rename(profile.id, host.displayName); changed = true }
+          .onFailure { Diagnostics.warn("RemoteCatalog", "同步 Remote Profile 显示名失败: ${profile.id}", it) }
+      }
     }
     if (changed && refreshState) {
       updateState { it.copy(profiles = store.profiles()) }
@@ -1007,6 +1013,17 @@ class LagoonController private constructor(private val appContext: Context) {
     val updatedProfiles = store.profiles()
     updateState { it.copy(profiles = updatedProfiles) }
     allOverview.start(updatedProfiles, include = setOfNotNull(state.value.serverId))
+  }
+
+  /** 只改本机显示名；不触碰中枢目录、指纹、凭据或连接身份。 */
+  internal fun renameRemoteHost(origin: String, account: String, hostId: String, alias: String?) {
+    val current = remoteCatalog(origin, account) ?: error("中枢账号已退出登录，请重新登录")
+    require(current.hosts.any { it.hostId == hostId }) { "主机已不在目录中，请刷新后重试" }
+    val updated = current.copy(
+      hosts = current.hosts.map { if (it.hostId == hostId) it.copy(alias = sanitizeRemoteAlias(alias)) else it },
+      updatedAt = System.currentTimeMillis(),
+    )
+    saveRemoteCatalog(updated)
   }
 
   internal fun hostAuthExpired(
@@ -1261,7 +1278,7 @@ class LagoonController private constructor(private val appContext: Context) {
       ?: error("主机目录已变化，请刷新")
     val origin = canonicalRemoteOrigin(current.origin)
     val id = java.util.UUID.nameUUIDFromBytes(org.json.JSONArray(listOf(origin, current.account, observed.hostId)).toString().toByteArray()).toString()
-    return ServerProfile(id, observed.name, origin, current.account, allowCleartext = current.allowCleartext,
+    return ServerProfile(id, observed.displayName, origin, current.account, allowCleartext = current.allowCleartext,
       kind = ServerKind.DSH_REMOTE, remoteHostId = observed.hostId, remoteHostFingerprint = observed.fingerprint)
   }
 

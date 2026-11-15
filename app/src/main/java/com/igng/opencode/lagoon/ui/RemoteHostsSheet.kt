@@ -49,6 +49,7 @@ internal fun RemoteHostsSheet(
   val graph by controller.connectionGraph.collectAsState()
   val profiles = runtime.profiles
   var choosingTarget by remember { mutableStateOf<Pair<RemoteCatalog, RemoteHostMeta>?>(null) }
+  var renamingTarget by remember { mutableStateOf<Pair<RemoteCatalog, RemoteHostMeta>?>(null) }
 
   val authStatus = catalog?.let { controller.hubAuthStatus(it, runtime) } ?: HubAuthStatus.ACTIVE
   val hubSource = catalog?.let { cat ->
@@ -122,6 +123,52 @@ internal fun RemoteHostsSheet(
           if (controller.activeHubCatalog() == null && controller.pairedRemoteCatalogs().isEmpty()) {
             onDismiss()
           }
+        }
+      }
+    }
+  }
+
+  renamingTarget?.let { (targetCatalog, host) ->
+    var value by remember(targetCatalog.key, host.hostId) { mutableStateOf(host.alias.orEmpty()) }
+    SuperDialog(title = "设置显示名称", show = true, onDismissRequest = { renamingTarget = null }) {
+      Column(Modifier.padding(top = 8.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Text(
+          "只改这台手机上的显示名，不改变中枢里的 Host 名称、指纹或连接身份。留空恢复 Host 自报名。",
+          style = MiuixTheme.textStyles.footnote1.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+        )
+        TextField(
+          value = value,
+          onValueChange = { value = it.take(128) },
+          label = "显示名称",
+          modifier = Modifier.fillMaxWidth()
+        )
+        if (host.nameUnavailable) {
+          Text(
+            "Host 当前自报名称是「${host.name}」，可直接在本地命名，例如“工作站”。",
+            style = MiuixTheme.textStyles.footnote2.copy(color = MiuixColorTokens.Warning)
+          )
+        }
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+          HyperButton(
+            text = "取消",
+            variant = HyperButtonVariant.SECONDARY,
+            onClick = { renamingTarget = null },
+            modifier = Modifier.weight(1f)
+          )
+          HyperButton(
+            text = "保存",
+            enabled = !busy,
+            onClick = {
+              try {
+                controller.renameRemoteHost(targetCatalog.origin, targetCatalog.account, host.hostId, value)
+                renamingTarget = null
+                reload()
+              } catch (e: Exception) {
+                error = userFacingError(e, "保存显示名失败")
+              }
+            },
+            modifier = Modifier.weight(1f)
+          )
         }
       }
     }
@@ -222,11 +269,11 @@ internal fun RemoteHostsSheet(
             Row(Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
               Column(Modifier.weight(1f)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                  Text(host.name, style = MiuixTheme.textStyles.body1, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                  Text(host.displayName, style = MiuixTheme.textStyles.body1, maxLines = 1, overflow = TextOverflow.Ellipsis)
                   Spacer(Modifier.width(6.dp))
                   Text(statusLabel, style = MiuixTheme.textStyles.footnote2.copy(color = statusColor))
                 }
-                Text(listOfNotNull(host.platform.ifBlank { null }, host.harnessVersion?.let { "Harness $it" }, if (addedHost(catalog, host.hostId)) "已接入" else "未接入").joinToString(" · "),
+                Text(listOfNotNull(host.platform.ifBlank { null }, host.harnessVersion?.let { "Harness $it" }, if (host.nameUnavailable) "Host 名称不可用" else null, if (addedHost(catalog, host.hostId)) "已接入" else "未接入").joinToString(" · "),
                   style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary), maxLines = 1)
                 Text(host.fingerprint?.let { formatFingerprint(it) } ?: "指纹待确认",
                   style = MiuixTheme.textStyles.footnote2.copy(fontFamily = FontFamily.Monospace),
@@ -236,9 +283,12 @@ internal fun RemoteHostsSheet(
                     RemoteTrustState.UNKNOWN -> MiuixTheme.colorScheme.onSurfaceVariantSummary
                   })
               }
-              if (signedOut || hostExpired) HyperTextAction(text = "重新登录", onClick = { triggerRelogin(catalog) })
-              else if (host.trust == RemoteTrustState.PINNED) HyperTextAction(text = "选择 Harness", onClick = { choosingTarget = catalog to host })
-              else HyperTextAction(text = "核对并接入", onClick = { triggerRelogin(catalog) })
+              Column(horizontalAlignment = Alignment.End) {
+                if (signedOut || hostExpired) HyperTextAction(text = "重新登录", onClick = { triggerRelogin(catalog) })
+                else if (host.trust == RemoteTrustState.PINNED) HyperTextAction(text = "选择 Harness", onClick = { choosingTarget = catalog to host })
+                else HyperTextAction(text = "核对并接入", onClick = { triggerRelogin(catalog) })
+                HyperTextAction(text = "命名", onClick = { renamingTarget = catalog to host })
+              }
             }
           }
           item {
@@ -288,7 +338,7 @@ internal fun RemoteHostsSheet(
             Row(Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
               Column(Modifier.weight(1f)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                  Text(host.name, style = MiuixTheme.textStyles.body1, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                  Text(host.displayName, style = MiuixTheme.textStyles.body1, maxLines = 1, overflow = TextOverflow.Ellipsis)
                   Spacer(Modifier.width(6.dp))
                   Text(
                     when {
@@ -306,7 +356,7 @@ internal fun RemoteHostsSheet(
                   )
                 }
                 Text(
-                  listOfNotNull(host.platform.ifBlank { null }, paired.origin, if (addedHost(paired, host.hostId)) "已接入" else "未接入").joinToString(" · "),
+                  listOfNotNull(host.platform.ifBlank { null }, paired.origin, if (host.nameUnavailable) "Host 名称不可用" else null, if (addedHost(paired, host.hostId)) "已接入" else "未接入").joinToString(" · "),
                   style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary),
                   maxLines = 1,
                 )
@@ -317,6 +367,7 @@ internal fun RemoteHostsSheet(
                 )
               }
               Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                HyperTextAction(text = "命名", onClick = { renamingTarget = paired to host })
                 if (!pairedExpired) {
                   HyperTextAction(text = "选择 Harness", onClick = { choosingTarget = paired to host })
                 }

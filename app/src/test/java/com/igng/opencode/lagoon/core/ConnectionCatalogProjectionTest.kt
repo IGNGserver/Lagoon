@@ -235,6 +235,27 @@ class ConnectionCatalogProjectionTest {
     assertTrue(merged.sources.all { it.enabled })
   }
 
+
+  @Test fun localAliasOverridesProjectedHostNameWithoutRewritingRouteMetadata() {
+    val catalog = catalog(hosts = listOf(remoteHost().copy(alias = "办公室工作站")))
+    val profile = hubProfile("alias-leaf", catalog)
+    val projected = MigrationProjection.fromProfiles(listOf(profile))
+    val graph = merge(projected, catalogs = listOf(catalog))
+    val source = graph.sources.single { it.type == ConnectionSourceType.HUB }
+    val host = graph.hosts.single { it.sourceId == source.id }
+    assertEquals("办公室工作站", host.name)
+    assertEquals("012345abcdef", host.fingerprint)
+    assertEquals(profile.remoteHostId, host.externalHostId)
+  }
+
+  @Test fun unusableProjectedHostNameFallsBackToCatalogDisplayName() {
+    val catalog = catalog(hosts = listOf(remoteHost().copy(name = "工作站")))
+    val projected = MigrationProjection.fromProfiles(listOf(hubProfile("bad-name-leaf", catalog).copy(name = "???")))
+    val graph = merge(projected, catalogs = listOf(catalog))
+    val source = graph.sources.single { it.type == ConnectionSourceType.HUB }
+    assertEquals("工作站", graph.hosts.single { it.sourceId == source.id }.name)
+  }
+
   private fun merge(
     projected: ConnectionGraph,
     previous: ConnectionGraph? = null,

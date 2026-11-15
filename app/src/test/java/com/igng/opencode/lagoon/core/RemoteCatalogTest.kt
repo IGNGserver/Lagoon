@@ -82,4 +82,42 @@ class RemoteCatalogTest {
     RemoteServerApi("http://localhost:4321", allowCleartext = true)
     RemoteServerApi("https://localhost:4321", allowCleartext = false)
   }
+
+  @Test fun chineseHostNameAndLocalAliasSurviveCodec() {
+    val catalog = RemoteCatalog(
+      origin = "https://remote.example/",
+      account = "user@example.org",
+      provider = null,
+      deviceLabel = "Lagoon · 2410DPN6CC",
+      hosts = listOf(
+        RemoteHostMeta(hostA, "工作站", "win32", true, null, "0.2.2-rc.3", "0.6.0", "abcdef012345",
+          RemoteTrustState.PINNED, alias = "办公室工作站"),
+        RemoteHostMeta(hostB, "???", "win32", true, null, null, null, null),
+      ),
+      updatedAt = 1_900_000_000_000,
+    )
+    val decoded = RemoteCatalogCodec.decode(RemoteCatalogCodec.encode(catalog))
+    assertEquals("办公室工作站", decoded.hosts[0].displayName)
+    assertEquals("办公室工作站", decoded.hosts[0].alias)
+    assertEquals("工作站", decoded.hosts[0].name)
+    assertTrue(decoded.hosts[1].nameUnavailable)
+    assertEquals("未命名主机", decoded.hosts[1].displayName)
+  }
+
+  @Test fun badReportDoesNotOverwriteAReadableLocalNameOrAlias() {
+    val previous = RemoteHostMeta(hostA, "工作站", "win32", true, null, null, null, null,
+      RemoteTrustState.PINNED, alias = "我的工作站")
+    val next = RemoteHostMeta(hostA, "???", "win32", true, null, null, null, null)
+    val merged = next.withPreviousDisplay(previous)
+    assertEquals("工作站", merged.name)
+    assertEquals("我的工作站", merged.alias)
+    assertEquals("我的工作站", merged.displayName)
+  }
+
+  @Test fun aliasIsBoundedAndStripsControls() {
+    assertEquals("工作站", sanitizeRemoteAlias("  工作站\u0000  "))
+    assertNull(sanitizeRemoteAlias("   "))
+    assertEquals(128, sanitizeRemoteAlias("名".repeat(200))!!.length)
+  }
+
 }
