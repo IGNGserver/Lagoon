@@ -374,7 +374,9 @@ class OpenCodeApi internal constructor(
    */
   override suspend fun activeSessions(): Set<String> {
     val json = withContext(Dispatchers.IO) { jsonObject(request("GET", "api/session/active")) }
-    return json.optJSONObject("data")?.keys()?.asSequence()?.toSet().orEmpty()
+    val data = json.optJSONObject("data")
+      ?: throw ApiException(502, "OpenCode 活动会话响应格式错误，保留上次已知状态")
+    return data.keys().asSequence().toSet()
   }
 
   /**

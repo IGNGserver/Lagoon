@@ -38,6 +38,13 @@ HTTP 直连(兼容)  ─┘       HostBinding + ConnectionSource        ServerPr
 | SSH 新 leaf | `nameUUID(configId, protocol.wire, registrationPath)` | 首个 leaf 历史上等于 `configId`，属迁移期巧合，新代码不得依赖 |
 | Harness 槽位 | `(protocolId, locator)`，locator 为 `serviceId` 或 SSH 注册路径 | 一个槽位最多一个 leaf；重复添加必须复用 |
 
+SSH OpenCode 的**默认注册文件**是一个稳定的逻辑槽位，locator 可为 `null`；发现时读出的
+`XDG_STATE_HOME` 绝对路径只是这次观测，不能因此与旧的 `null` leaf 形成第二个槽位。对于旧版本
+已经保存了绝对路径的 leaf，只有本次确认该路径正是远端当前默认注册文件时才能将它与默认槽位
+对齐，并保留原 leaf ID、草稿和偏好。其他绝对注册路径仍代表独立槽位；已有重复 leaf 不得自动
+删除、合并或重编号。SSH 只读发现同时检查官方开发通道 `service-local.json`；它以独立注册
+路径标识，不得与默认通道合并。仅在用户明确操作后才连接或启动服务。
+
 `ServerKind` 是兼容值，冻结：新代码判断传输只看 `remoteHostId` / `sshHostId` / 连接图的 `carrierId` 与
 `HarnessProtocolId`，**不得再往 `ServerKind` 加值**，也不得因新增 Harness 加传输分支。
 AGY 使用 `antigravity-acp` 协议标识，leaf 显式持久化协议；旧记录没有该字段时由旧 `kind`
@@ -70,6 +77,8 @@ AGY 使用 `antigravity-acp` 协议标识，leaf 显式持久化协议；旧记�
 - 同一设备的多条 Harness **共用一条设备链路**：中枢按 `(hub, 账号, hostId)` 共享 Noise，SSH 按配置共享
   一条已认证连接；关掉一个 Harness 不关闭兄弟的链路，关掉最后一个才关闭。
 - 发现是**用户显式触发的临时连接**，不常驻、不在打开页面时自动跑。设备停用时点刷新直接拒绝。
+- 添加 SSH 时的“连接并检测”也是一次明确的用户触发：先核对指纹并验证 SSH，再只读发现；
+  离线保存可以留待用户稍后手动连接。普通打开设备页只显示已有缓存。
 - `host -> 中枢` 的上行链路不归本应用管，本应用的契约只覆盖"中枢/SSH -> 手机"。
 
 ## 5. 什么算"一台设备"
@@ -132,6 +141,8 @@ Harness 详情（harness = leafId）
   `core/ConnectionGraph.kt` 的定义；只有 `available == YES` 且未过期才算"可用"。
 - 结果落在 `DeviceDiscoveryStore`（按 `deviceId`），带 TTL；打开页面先显示缓存，刷新是显式动作。
 - 未检测到 / 不支持 / 离线 / 未认证必须区分，不得显示成"可用"或"空列表"。
+- SSH 各项探测失败时保留对应的未知状态与原因；总结果的完整度按各项结果汇总，不能把部分
+  结果标记成完整。用户可以明确选择尝试未验证的项，但界面必须先说明它尚未验证。
 
 ## 8. 存储落点
 

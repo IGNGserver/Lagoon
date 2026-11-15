@@ -5,6 +5,7 @@ import com.igng.opencode.lagoon.core.ssh.AndroidKeystoreSshSigner
 import com.igng.opencode.lagoon.core.ssh.JschSshTransportFactory
 import com.igng.opencode.lagoon.core.ssh.SshHostManager
 import com.igng.opencode.lagoon.core.ssh.SshKeyCodec
+import com.igng.opencode.lagoon.core.ssh.SshKeyboardInteractiveBroker
 import com.igng.opencode.lagoon.system.BackgroundSyncWorker
 import com.igng.opencode.lagoon.system.TaskNotifications
 import com.igng.opencode.lagoon.system.TaskMonitorService
@@ -210,6 +211,7 @@ class LagoonController private constructor(private val appContext: Context) {
   // —— 设备模型（docs/DEVICE_MODEL.md）：界面只认「设备」与「Harness」两级 ——
 
   private val deviceDiscoveryStore = DeviceDiscoveryStore(appContext)
+  private val deviceDiscoveryInFlight = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
 
   /** 最近一次发现观测；null 表示从未发现过。观测不是连接许可。 */
   fun deviceDiscovery(deviceId: String): DeviceDiscovery? = deviceDiscoveryStore.get(deviceId)
@@ -312,17 +314,27 @@ class LagoonController private constructor(private val appContext: Context) {
     val source = graph.sources.firstOrNull { it.id == host.sourceId } ?: error("接入源已移除")
     check(host.enabled) { "此设备已停用：先启用再发现" }
     check(source.enabled) { "接入源已暂停，先恢复接入源再发现" }
-    updateState { it.copy(deviceRefreshInFlight = deviceId) }
+    check(deviceDiscoveryInFlight.add(deviceId)) { "此设备正在检测，请稍候" }
+    updateState { it.copy(deviceRefreshInFlight = it.deviceRefreshInFlight + deviceId) }
     try {
       val now = System.currentTimeMillis()
-      val harnesses = when (source.type) {
-        ConnectionSourceType.HUB -> hubDiscovery(source, host, now)
-        ConnectionSourceType.SSH -> sshDiscovery(source, now)
-        ConnectionSourceType.DIRECT -> emptyList()
+      val expectedConfig = source.sshHostConfigId?.let { id -> sshHostStore.load().firstOrNull { it.id == id } }
+      val expectedSecrets = expectedConfig?.let { sshHostStore.secrets(it.id) }
+      val discovery = when (source.type) {
+        ConnectionSourceType.HUB -> DeviceDiscovery(deviceId, now, hubDiscovery(source, host, now))
+        ConnectionSourceType.SSH -> sshDiscovery(deviceId, expectedConfig ?: error("SSH 配置已移除"), expectedSecrets!!, now)
+        ConnectionSourceType.DIRECT -> DeviceDiscovery(deviceId, now, emptyList())
       }
-      recordDeviceDiscovery(DeviceDiscovery(deviceId, now, harnesses, DiscoveryCompleteness.COMPLETE))
+      // A slow result from a deleted, disabled or edited device must not recreate its cache.
+      val latest = currentGraphOrNull() ?: error("设备配置已变化，请重新检测")
+      check(latest.hosts.firstOrNull { it.id == deviceId } == host &&
+        latest.sources.firstOrNull { it.id == source.id } == source) { "设备配置已变化，请重新检测" }
+      if (expectedConfig != null) check(sshHostStore.load().firstOrNull { it.id == expectedConfig.id } == expectedConfig &&
+        sshHostStore.secrets(expectedConfig.id) == expectedSecrets) { "SSH 配置已变化，请重新检测" }
+      recordDeviceDiscovery(discovery)
     } finally {
-      updateState { it.copy(deviceRefreshInFlight = null) }
+      deviceDiscoveryInFlight.remove(deviceId)
+      updateState { it.copy(deviceRefreshInFlight = it.deviceRefreshInFlight - deviceId) }
     }
   }
 
@@ -354,43 +366,72 @@ class LagoonController private constructor(private val appContext: Context) {
       }
     }
 
-  private suspend fun sshDiscovery(source: ConnectionSource, now: Long): List<DiscoveredHarness> {
-    val config = source.sshHostConfigId?.let { id -> sshHostStore.load().firstOrNull { it.id == id } }
-      ?: error("SSH 配置已移除")
-    val secrets = sshHostStore.secrets(config.id)
-    val found = discoverSshHarnesses(config, secrets, null)
-    val codex = discoverSshCodex(config, secrets)
-    val agy = sshHostManager.discoverAgy(config, secrets)
-    val path = found.openCode.registrationPath
-    return buildList {
-      add(DiscoveredHarness(HarnessProtocolId.OPENCODE_NATIVE, path, "OpenCode",
-        found.openCodeStatus(DeviceDiscovery.DEFAULT_TTL_MS),
-        if (found.openCode.state == SshDiscoveryState.PRESENT) "" else "未找到正在运行的 OpenCode 官方服务注册"))
-      // DSH over SSH 由配置的启动命令承载，标记文件只是旧接入线索，不作为可用性前提。
-      add(DiscoveredHarness(HarnessProtocolId.DSH_TYPERT, null, "DeepSeek Harness",
-        HarnessDiscoveryStatus(
-          installed = if (found.dshLegacy.state == SshDiscoveryState.PRESENT) DiscoveryValue.YES else DiscoveryValue.UNKNOWN,
-          available = DiscoveryValue.UNKNOWN, observedAtMs = now,
-          freshUntilMs = now + DeviceDiscovery.DEFAULT_TTL_MS, completeness = found.completeness,
-          reason = "连接时启动或复用配置的 dsh web"), ""))
-      add(DiscoveredHarness(HarnessProtocolId.ANTIGRAVITY_ACP, null, "Antigravity",
-        HarnessDiscoveryStatus(
-          installed = when (agy.installed) { true -> DiscoveryValue.YES; false -> DiscoveryValue.NO; null -> DiscoveryValue.UNKNOWN },
-          compatible = when (agy.compatible) { true -> DiscoveryValue.YES; false -> DiscoveryValue.NO; null -> DiscoveryValue.UNKNOWN },
-          available = DiscoveryValue.UNKNOWN, observedAtMs = now,
-          freshUntilMs = now + DeviceDiscovery.DEFAULT_TTL_MS, completeness = found.completeness,
-          reason = agy.issue ?: agy.version), agy.version.orEmpty()))
-      add(DiscoveredHarness(HarnessProtocolId.CODEX_APP_SERVER, null, "Codex",
-        HarnessDiscoveryStatus(
-          installed = when (codex.installed) {
-            true -> DiscoveryValue.YES
-            false -> DiscoveryValue.NO
-            null -> DiscoveryValue.UNKNOWN
-          },
-          available = DiscoveryValue.UNKNOWN, observedAtMs = now,
-          freshUntilMs = now + DeviceDiscovery.DEFAULT_TTL_MS, completeness = found.completeness,
-          reason = codex.issue ?: codex.version), codex.version.orEmpty()))
+  private suspend fun sshDiscovery(deviceId: String, config: SshHostConfig, secrets: SshSecrets, now: Long): DeviceDiscovery {
+    val found = sshHostManager.discoverDevice(config, secrets)
+    val files = found.files
+    val codex = found.codex
+    val agy = found.agy
+    val dsh = found.dsh
+    val observedPath = files.openCode.registrationPath
+    val existing = store.profiles().filter { it.sshHostId == config.id && it.protocol == HarnessProtocolId.OPENCODE_NATIVE }
+    // Prefer the historic default leaf. An explicit path is equivalent only after this probe has
+    // established that it is the current default, and must retain its existing leaf identity.
+    val locator = if (existing.any { it.sshServicePath == null }) null
+      else observedPath?.takeIf { path -> existing.any { it.sshServicePath == path } }
+    fun value(v: Boolean?): DiscoveryValue = when (v) {
+      true -> DiscoveryValue.YES
+      false -> DiscoveryValue.NO
+      null -> DiscoveryValue.UNKNOWN
     }
+    fun explanation(issue: String?): String? = when (issue) {
+      null -> null
+      "probe_failed", "invalid_output" -> "检测未完成，请重试"
+      "version_unavailable" -> "已找到程序，但无法确认版本"
+      "acp_unavailable" -> "此版本不支持 ACP，请更新后重试"
+      "acp_probe_failed" -> "无法确认 ACP 是否可用，请检查设备上的 Antigravity"
+      "unsupported_system" -> "当前 SSH 模式支持 Linux 和 macOS；Windows 请使用 WSL"
+      "system_detection_failed" -> "无法识别远端系统，请检查 SSH 的 shell 设置"
+      "custom_command_unverified" -> "自定义启动命令尚未验证；启用后再连接"
+      else -> issue
+    }
+    val openCodeDetail = when (files.openCode.issue) {
+      SshDiscoveryIssue.PYTHON_UNAVAILABLE -> "需要在设备上安装 Python 3 才能检测 OpenCode"
+      SshDiscoveryIssue.UNREADABLE -> "无法读取 OpenCode 服务注册文件，请检查权限"
+      SshDiscoveryIssue.TOO_LARGE, SshDiscoveryIssue.INVALID_DATA -> "OpenCode 服务注册文件无效，请在设备上检查服务"
+      SshDiscoveryIssue.EXEC_FAILED, SshDiscoveryIssue.INVALID_OUTPUT -> "OpenCode 检测未完成，请重试"
+      else -> if (files.openCode.state == SshDiscoveryState.ABSENT) "请先在电脑运行 opencode service start，然后刷新检测" else ""
+    }
+    val harnesses = mutableListOf(
+      DiscoveredHarness(HarnessProtocolId.OPENCODE_NATIVE, locator, "OpenCode",
+        files.openCodeStatus(DeviceDiscovery.DEFAULT_TTL_MS).copy(reason = openCodeDetail.takeIf(String::isNotBlank)), openCodeDetail),
+      DiscoveredHarness(HarnessProtocolId.DSH_TYPERT, null, "DeepSeek Harness",
+        HarnessDiscoveryStatus(installed = value(dsh.installed), available = DiscoveryValue.UNKNOWN,
+          observedAtMs = now, freshUntilMs = now + DeviceDiscovery.DEFAULT_TTL_MS,
+          completeness = if (dsh.issue == null) DiscoveryCompleteness.COMPLETE else DiscoveryCompleteness.PARTIAL,
+          reason = explanation(dsh.issue) ?: if (dsh.installed == false)
+            "未发现 DSH，请先在电脑安装或配置自定义启动命令" else "连接时启动或复用 DSH")),
+      DiscoveredHarness(HarnessProtocolId.ANTIGRAVITY_ACP, null, "Antigravity",
+        HarnessDiscoveryStatus(installed = value(agy.installed), compatible = value(agy.compatible),
+          available = DiscoveryValue.UNKNOWN, observedAtMs = now, freshUntilMs = now + DeviceDiscovery.DEFAULT_TTL_MS,
+          completeness = if (agy.installed != null && (agy.issue == null || agy.issue == "acp_unavailable")) DiscoveryCompleteness.COMPLETE else DiscoveryCompleteness.PARTIAL,
+          reason = explanation(agy.issue)), agy.version.orEmpty()),
+      DiscoveredHarness(HarnessProtocolId.CODEX_APP_SERVER, null, "Codex",
+        HarnessDiscoveryStatus(installed = value(codex.installed), available = DiscoveryValue.UNKNOWN,
+          observedAtMs = now, freshUntilMs = now + DeviceDiscovery.DEFAULT_TTL_MS,
+          completeness = if (codex.installed != null && codex.issue == null) DiscoveryCompleteness.COMPLETE else DiscoveryCompleteness.PARTIAL,
+          reason = explanation(codex.issue)), codex.version.orEmpty())
+    )
+    found.localOpenCode?.takeIf { it.openCode.state == SshDiscoveryState.PRESENT }?.let { local ->
+      harnesses += DiscoveredHarness(HarnessProtocolId.OPENCODE_NATIVE, local.openCode.registrationPath,
+        "OpenCode（开发版）", local.openCodeStatus(DeviceDiscovery.DEFAULT_TTL_MS))
+    }
+    val environmentNote = when (found.environmentIssue) {
+      "python_unavailable" -> "设备缺少 Python 3，部分服务无法检测或安全连接"
+      "unsupported_system" -> "当前 SSH 模式支持 Linux 和 macOS；Windows 请使用 WSL"
+      "system_detection_failed" -> "无法识别远端系统，请检查 SSH 的 shell 设置"
+      else -> null
+    }
+    return DeviceDiscovery(deviceId, found.observedAtMs, harnesses, found.completeness, environmentNote)
   }
 
   private fun hostedStatus(available: Boolean, now: Long, reason: String): HarnessDiscoveryStatus =
@@ -1465,9 +1506,10 @@ class LagoonController private constructor(private val appContext: Context) {
   private val sshKeyStore = SshKeyStore(appContext)
   private val hardwareSshSigner = AndroidKeystoreSshSigner()
   private val sshHostStore = SshHostStore(appContext)
+  private val sshKeyboardBroker = SshKeyboardInteractiveBroker()
   private val sshHostManager = SshHostManager(
     store = sshHostStore,
-    transportFactory = JschSshTransportFactory(sshKeyStore, hardwareSshSigner),
+    transportFactory = JschSshTransportFactory(sshKeyStore, hardwareSshSigner, sshKeyboardBroker),
     keyStore = sshKeyStore
   )
   private val mutable = MutableStateFlow(
@@ -1682,6 +1724,8 @@ class LagoonController private constructor(private val appContext: Context) {
     get() = sessionViewsStorage ?: SessionViewCache().also { sessionViewsStorage = it }
   /** Agent/model/command catalogs are directory-scoped and stable for minutes. */
   private var choicesCacheStorage: ChoicesCache? = null
+  private var choicesEpoch = 0L
+  private var modelCatalogRefreshJob: Job? = null
   private val choicesCache: ChoicesCache
     get() = choicesCacheStorage ?: ChoicesCache().also { choicesCacheStorage = it }
   /** One cancellable job per session/choice load; a switch aborts the previous network read. */
@@ -3129,6 +3173,19 @@ class LagoonController private constructor(private val appContext: Context) {
 
   fun sshLinkStatus(hostId: String) = sshHostManager.status(hostId)
 
+  /** Interactive SSH answers live only in the broker until the current handshake consumes them. */
+  internal val sshKeyboardChallenges get() = sshKeyboardBroker.challenges
+  internal fun setSshInteractiveForeground(active: Boolean) = sshKeyboardBroker.setForeground(active)
+  internal fun answerSshKeyboardChallenge(id: String, answers: List<String>?) = sshKeyboardBroker.respond(id, answers)
+
+  /** Resolve a device to its actual SSH config; a leaf id is never accepted as a device id. */
+  internal fun sshHostForDevice(deviceId: String): SshHostConfig? {
+    val graph = currentGraphOrNull() ?: return null
+    val host = graph.hosts.firstOrNull { it.id == deviceId } ?: return null
+    val source = graph.sources.firstOrNull { it.id == host.sourceId && it.type == ConnectionSourceType.SSH } ?: return null
+    return sshHostStore.load().firstOrNull { it.id == source.sshHostConfigId }
+  }
+
   fun dismissDeviceGroupReset() {
     if (state.value.deviceGroupReset) updateState { it.copy(deviceGroupReset = false) }
   }
@@ -3139,6 +3196,25 @@ class LagoonController private constructor(private val appContext: Context) {
   fun pinSshHostKey(hostId: String, key: PresentedSshHostKey) {
     sshHostManager.pinHostKey(hostId, key)
     updateState { it.copy(sshHosts = sshHostStore.load()) }
+  }
+
+  /** Pin only the exact still-enabled device whose endpoint was shown in the confirmation. */
+  internal fun confirmSshDeviceHostKey(deviceId: String, expected: SshHostConfig, key: PresentedSshHostKey) {
+    val current = sshHostForDevice(deviceId) ?: error("设备已移除，请重新打开设备")
+    check(current == expected) { "设备设置已变化，请重新核对主机指纹" }
+    val graph = currentGraphOrNull() ?: error("连接图暂不可用，请重试")
+    val host = graph.hosts.firstOrNull { it.id == deviceId } ?: error("设备已移除")
+    val source = graph.sources.firstOrNull { it.id == host.sourceId } ?: error("接入源已移除")
+    check(host.enabled && source.enabled) { "此设备已停用，请先启用" }
+    check(sshHostStore.pinHostKeyIfUnchanged(expected, key)) { "设备设置已变化，请重新核对主机指纹" }
+    val saved = sshHostStore.load().firstOrNull { it.id == current.id }
+    check(saved?.hostKeyType == key.type && saved.hostKeyFingerprint == key.fingerprint) { "主机指纹未能保存，请重试" }
+    val profiles = store.profiles()
+    profiles.filter { it.sshHostId == current.id }.forEach { allOverview.invalidate(it.id) }
+    sshHostManager.replace(current.id)
+    updateState { it.copy(sshHosts = sshHostStore.load()) }
+    val enabled = profiles.filter { it.sshHostId == current.id && it.effectiveEnabled }.map { it.id }.toSet()
+    if (enabled.isNotEmpty()) allOverview.start(profiles, include = enabled)
   }
 
   /** Read-only discovery after host pin confirmation. Passwords stay in the returned runtime-only descriptor. */
@@ -3324,7 +3400,18 @@ class LagoonController private constructor(private val appContext: Context) {
     updateState { it.copy(sshHosts = sshHostStore.load()) }
   }
 
-  fun retrySshHost(hostId: String) = sshHostManager.retry(hostId)
+  fun retrySshHost(hostId: String) {
+    val graph = currentGraphOrNull() ?: return
+    val source = graph.sources.firstOrNull { it.sshHostConfigId == hostId && it.enabled } ?: return
+    if (graph.hosts.none { it.sourceId == source.id && it.enabled }) return
+    val profiles = store.profiles()
+    val retryIds = profiles.filter { it.sshHostId == hostId && it.effectiveEnabled }.map { it.id }.toSet()
+    if (retryIds.isEmpty()) return
+    sshHostManager.retry(hostId)
+    allOverview.start(profiles, include = retryIds + setOfNotNull(state.value.serverId))
+    retryIds.forEach(allOverview::refresh)
+    if (state.value.serverId in retryIds) retryNow()
+  }
 
   private fun cleanSshConfig(config: SshHostConfig): SshHostConfig {
     val host = config.host.trim()
@@ -3755,7 +3842,9 @@ class LagoonController private constructor(private val appContext: Context) {
     val serverId = state.value.serverId ?: return
     // Probe, contract, catalog, activity and display titles are independent reads: one round trip
     // instead of five. The probe is awaited first so a wrong address or old server reports its own error.
-    val firstRound = withTimeoutOrNull(FIRST_ROUND_TIMEOUT_MILLIS) {
+    // A first SSH request also waits for authentication and, for DSH, a bounded remote startup.
+    val firstRoundBudget = if (state.value.server?.sshHostId != null) 260_000L else FIRST_ROUND_TIMEOUT_MILLIS
+    val firstRound = withTimeoutOrNull(firstRoundBudget) {
       coroutineScope {
       val versionTask = async { client.health() }
       val capabilitiesTask = async { client.discoverCapabilities() }
@@ -4358,6 +4447,14 @@ class LagoonController private constructor(private val appContext: Context) {
       }
     }
     when (event.type) {
+      "model.catalog.changed" -> {
+        choicesEpoch++
+        state.value.serverId?.let(choicesCache::invalidateServer)
+        modelCatalogRefreshJob?.cancel()
+        val token = generation
+        val directory = state.value.executionDirectory ?: state.value.homeDirectory
+        modelCatalogRefreshJob = scope.launch { delay(150); loadChoices(directory.orEmpty(), token, force = true) }
+      }
       "permission.asked" -> {
         val request = props.toPermission(directory)
         if (request.id in resolvedPermissions) return
@@ -4751,6 +4848,7 @@ class LagoonController private constructor(private val appContext: Context) {
     val serverId = snapshot.serverId ?: return
     val sessionScopedModels = snapshot.server?.protocol in setOf(HarnessProtocolId.ANTIGRAVITY_ACP, HarnessProtocolId.OPENCODE_ACP)
     val revision = selectionRevision
+    val choiceEpoch = choicesEpoch
     val cached = if (force || sessionScopedModels) null else choicesCache.get(serverId, directory)
     if (cached != null) {
       applyChoiceResults(token, revision, directory,
@@ -4766,6 +4864,7 @@ class LagoonController private constructor(private val appContext: Context) {
       val commandsTask = async { attempt { client.commands(directory) } }
       Triple(agentsTask.await(), modelsTask.await(), commandsTask.await())
     }
+    if (choiceEpoch != choicesEpoch) return
     applyChoiceResults(token, revision, directory, agents, models, commands)
     if (!sessionScopedModels && agents.isSuccess && models.isSuccess && commands.isSuccess) {
       choicesCache.put(serverId, CachedChoices(directory,
@@ -6181,7 +6280,7 @@ class LagoonController private constructor(private val appContext: Context) {
     return act("send", onError = { error ->
       // Content must never disappear before admission. Report whether a transport/parse/cancellation
       // failure leaves the outcome unknown; callbacks restore a manual draft, never an automatic replay.
-      if (!admitted) onFailed?.invoke(admissionStarted && error !is ApiException)
+      if (!admitted) onFailed?.invoke(admissionStarted && (error !is ApiException || error.code == "delivery/unknown"))
     }) { op ->
     val attachments = op.snapshot.attachments
     check(text.isNotBlank() || op.snapshot.references.isNotEmpty() || attachments.isNotEmpty()) { "请输入任务" }

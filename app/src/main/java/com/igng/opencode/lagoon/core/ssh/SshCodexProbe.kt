@@ -29,7 +29,7 @@ internal class SshCodexProbe(private val transport: SshTransport) {
 
   companion object {
     private const val PREFIX = "LAGOON_CODEX_DISCOVERY "
-    internal const val SCRIPT = """
+    internal val SCRIPT = SshExecutableSearch.prologue + "\n" + """
       if ! command -v codex >/dev/null 2>&1; then
         printf '%s\n' 'LAGOON_CODEX_DISCOVERY absent'
       else

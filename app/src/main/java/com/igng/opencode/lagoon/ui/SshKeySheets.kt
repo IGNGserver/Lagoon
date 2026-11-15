@@ -928,17 +928,21 @@ internal fun DeploySshPublicKeyDialog(
   }
 
   pendingHostKey?.let { key ->
-    SuperDialog(title = "信任主机指纹并安装公钥？", show = true, onDismissRequest = { pendingHostKey = null }) {
-      Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text("${key.shortType}\n${key.fingerprint}", style = MiuixTheme.textStyles.body2.copy(fontFamily = FontFamily.Monospace))
-        DialogActions("取消", { pendingHostKey = null }, "信任并继续") {
+    val previous = config.hostKeyFingerprint?.takeIf(String::isNotBlank)
+    SshHostKeyDialog(
+      presented = key,
+      saved = previous,
+      savedType = config.hostKeyType,
+      destination = config.address,
+      acceptLabel = if (previous != null) "重新信任并安装" else "信任并安装",
+      onDismiss = { pendingHostKey = null },
+      onAccept = {
           pendingHostKey = null
           onPinnedHostKey(key)
           scope.launch {
             runInstall(config.copyWith(hostKeyType = key.type, hostKeyFingerprint = key.fingerprint))
           }
-        }
       }
-    }
+    )
   }
 }

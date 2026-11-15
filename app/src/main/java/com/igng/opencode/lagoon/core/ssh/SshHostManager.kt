@@ -193,9 +193,54 @@ internal class SshHostManager(
     return SshHostLink(scope, profile, config, secrets, transportFactory, onStatus)
   }
 
+  /** All probes share one verified lease; individual failures remain explicitly unknown. */
+  suspend fun discoverDevice(config: SshHostConfig, secrets: SshSecrets, path: String? = null): SshDeviceDiscovery =
+    kotlinx.coroutines.runInterruptible(Dispatchers.IO) {
+      val now = System.currentTimeMillis()
+      val pin = config.hostKeyFingerprint?.takeIf(String::isNotBlank)
+        ?: throw SshFailure(SshFailureKind.HOST_KEY_UNKNOWN, "请先确认 SSH 主机指纹", retryable = false)
+      transports.connect(config, secrets, SshHostKeyVerifier { key ->
+        if (key.fingerprint != pin || (!config.hostKeyType.isNullOrBlank() && !key.type.equals(config.hostKeyType, ignoreCase = true)))
+          throw SshFailure(SshFailureKind.HOST_KEY_CHANGED, "SSH 主机指纹或密钥类型已变化", retryable = false, presentedKey = key)
+        true
+      }).use { connection ->
+        val environment = try {
+          val result = connection.exec("printf 'LAGOON_OS %s\\n' \"$(uname -s 2>/dev/null)\"", 10_000)
+          val tagged = result.stdout.lineSequence().filter { it.startsWith("LAGOON_OS ") }.toList()
+          when {
+            result.exitCode != 0 || tagged.size != 1 -> "system_detection_failed"
+            tagged.single().removePrefix("LAGOON_OS ") !in setOf("Linux", "Darwin") -> "unsupported_system"
+            else -> null
+          }
+        } catch (error: InterruptedException) { throw error }
+        catch (_: Exception) { "system_detection_failed" }
+        if (environment != null) {
+          SshDeviceDiscovery(SshHarnessProbe.unknown(now, com.igng.opencode.lagoon.core.SshDiscoveryIssue.EXEC_FAILED),
+            SshDshObservation(null, environment, !config.usesDefaultCommand), SshCodexObservation(null, issue = environment),
+            SshAgyObservation(null, issue = environment), now, com.igng.opencode.lagoon.core.DiscoveryCompleteness.PARTIAL, environment)
+        } else {
+          val files = SshHarnessProbe(connection).discover(path)
+          val defaultPath = files.openCode.registrationPath
+          val localPath = if (path == null && defaultPath?.endsWith("/service.json") == true)
+            defaultPath.removeSuffix("service.json") + "service-local.json" else null
+          val local = localPath?.let { SshHarnessProbe(connection).discover(it) }
+          val dsh = SshDshProbe(connection).discover(!config.usesDefaultCommand)
+          val codex = SshCodexProbe(connection).discover()
+          val agy = SshAgyProbe(connection).discover()
+          val partial = files.completeness != com.igng.opencode.lagoon.core.DiscoveryCompleteness.COMPLETE ||
+            (local != null && local.completeness != com.igng.opencode.lagoon.core.DiscoveryCompleteness.COMPLETE) ||
+            dsh.issue != null || codex.issue != null || agy.issue != null
+          SshDeviceDiscovery(files, dsh, codex, agy, now,
+            if (partial) com.igng.opencode.lagoon.core.DiscoveryCompleteness.PARTIAL else com.igng.opencode.lagoon.core.DiscoveryCompleteness.COMPLETE,
+            if (files.openCode.issue == com.igng.opencode.lagoon.core.SshDiscoveryIssue.PYTHON_UNAVAILABLE) "python_unavailable" else null,
+            local)
+        }
+      }
+    }
+
   /** A discovery scan only authenticates SSH and reads known registration files. Never bootstraps DSH. */
   suspend fun discover(config: SshHostConfig, secrets: SshSecrets, path: String? = null): com.igng.opencode.lagoon.core.SshHarnessDiscoveryResult =
-    kotlinx.coroutines.withContext(Dispatchers.IO) {
+    kotlinx.coroutines.runInterruptible(Dispatchers.IO) {
       val pin = config.hostKeyFingerprint?.takeIf { it.isNotBlank() }
         ?: throw SshFailure(SshFailureKind.HOST_KEY_UNKNOWN, "请先确认 SSH 主机指纹", retryable = false)
       transports.connect(config, secrets, SshHostKeyVerifier { key ->
@@ -205,7 +250,7 @@ internal class SshHostManager(
     }
 
   suspend fun discoverCodex(config: SshHostConfig, secrets: SshSecrets): SshCodexObservation =
-    kotlinx.coroutines.withContext(Dispatchers.IO) {
+    kotlinx.coroutines.runInterruptible(Dispatchers.IO) {
       val pin = config.hostKeyFingerprint?.takeIf { it.isNotBlank() }
         ?: throw SshFailure(SshFailureKind.HOST_KEY_UNKNOWN, "请先确认 SSH 主机指纹", retryable = false)
       transports.connect(config, secrets, SshHostKeyVerifier { key ->
@@ -215,7 +260,7 @@ internal class SshHostManager(
     }
 
   suspend fun discoverAgy(config: SshHostConfig, secrets: SshSecrets): SshAgyObservation =
-    kotlinx.coroutines.withContext(Dispatchers.IO) {
+    kotlinx.coroutines.runInterruptible(Dispatchers.IO) {
       val pin = config.hostKeyFingerprint?.takeIf { it.isNotBlank() }
         ?: throw SshFailure(SshFailureKind.HOST_KEY_UNKNOWN, "请先确认 SSH 主机指纹", retryable = false)
       transports.connect(config, secrets, SshHostKeyVerifier { key ->
@@ -234,7 +279,7 @@ internal class SshHostManager(
 
   /** Appends [publicKeyOpenSsh] idempotently to remote `~/.ssh/authorized_keys` (0700/0600). */
   suspend fun deployPublicKey(config: SshHostConfig, secrets: SshSecrets, publicKeyOpenSsh: String) {
-    kotlinx.coroutines.withContext(Dispatchers.IO) {
+    kotlinx.coroutines.runInterruptible(Dispatchers.IO) {
       val pin = config.hostKeyFingerprint?.takeIf { it.isNotBlank() }
         ?: throw SshFailure(SshFailureKind.HOST_KEY_UNKNOWN, "请先确认 SSH 主机指纹", retryable = false)
       val script = SshPublicKeyFormat.authorizedKeysInstallScript(publicKeyOpenSsh)
@@ -251,7 +296,7 @@ internal class SshHostManager(
 
   /** Reads the presented host key without trusting it; used before pinning a new host. */
   suspend fun probeHostKey(config: SshHostConfig): PresentedSshHostKey =
-    kotlinx.coroutines.withContext(Dispatchers.IO) { transportFactory.probeHostKey(config) }
+    kotlinx.coroutines.runInterruptible(Dispatchers.IO) { transportFactory.probeHostKey(config) }
 
   fun pinHostKey(hostId: String, key: PresentedSshHostKey) {
     try {
@@ -262,3 +307,14 @@ internal class SshHostManager(
     }
   }
 }
+
+internal data class SshDeviceDiscovery(
+  val files: com.igng.opencode.lagoon.core.SshHarnessDiscoveryResult,
+  val dsh: SshDshObservation,
+  val codex: SshCodexObservation,
+  val agy: SshAgyObservation,
+  val observedAtMs: Long,
+  val completeness: com.igng.opencode.lagoon.core.DiscoveryCompleteness,
+  val environmentIssue: String? = null,
+  val localOpenCode: com.igng.opencode.lagoon.core.SshHarnessDiscoveryResult? = null
+)

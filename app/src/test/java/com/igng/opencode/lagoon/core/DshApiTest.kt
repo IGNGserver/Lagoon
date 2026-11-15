@@ -575,6 +575,43 @@ class DshApiTest {
     }
   }
 
+  @Test fun failedApprovalReplyKeepsPendingAndDoesNotReplayWithoutRedelivery() = runBlocking {
+    val server = MockWebServer().also { it.start() }
+    val replies = java.util.concurrent.atomic.AtomicInteger()
+    val received = kotlinx.coroutines.CompletableDeferred<ServerEvent>()
+    server.dispatcher = object : Dispatcher() {
+      override fun dispatch(request: RecordedRequest): MockResponse = when {
+        request.path!!.startsWith("/?token") || request.path == "/" -> rootOk()
+        request.path == "/api/remote.mux" -> MockResponse().withWebSocketUpgrade(object : WebSocketListener() {
+          override fun onMessage(webSocket: WebSocket, text: String) {
+            val frame = JSONObject(text)
+            if (frame.optString("type") != "open" || frame.optString("endpoint") != "\$events") return
+            val id = frame.getString("streamId")
+            webSocket.send("""{"type":"item","streamId":"$id","value":{"type":"ready","clientId":"c1","host":{"home":"/home"}}}""")
+            webSocket.send("""{"type":"item","streamId":"$id","value":{"type":"waterfall","event":"approval/request","eventId":"wf-pending","agentId":"s1","request":{"toolName":"bash"}}}""")
+          }
+        })
+        request.path == "/api/\$events/result" -> { replies.incrementAndGet(); MockResponse().setResponseCode(503) }
+        else -> MockResponse().setResponseCode(404)
+      }
+    }
+    val client = api(server)
+    val collector = launch { client.events {}.collect { if (it.type == "permission.asked") received.complete(it) } }
+    try {
+      val event = withTimeout(10_000) { received.await() }
+      val permission = event.properties.toPermission("/repo")
+      assertTrue(runCatching { client.replyPermission(permission, "once") }.isFailure)
+      assertEquals(listOf("wf-pending"), client.pendingPermissions("").map { it.id })
+      val second = runCatching { client.replyPermission(permission, "once") }.exceptionOrNull()
+      assertTrue(second is ApiException && second.message.orEmpty().contains("尚未确认"))
+      assertEquals("An unknown outcome must not be replayed", 1, replies.get())
+    } finally {
+      collector.cancel()
+      client.close()
+      server.shutdown()
+    }
+  }
+
   @Test fun cancelledWaterfallRemovesPendingPermission() = runBlocking {
     val server = MockWebServer().also { it.start() }
     try {
@@ -1602,14 +1639,57 @@ class DshApiTest {
     }
   }
 
-  /** 已经跑过至少一轮的会话不再发 `agentPresets/select`：那只会让本地药丸和主机真实组合不一致。 */
-  @Test fun startedSessionDoesNotSwitchPreset() = runBlocking {
+  @Test fun startedSessionRejectsPresetChangeBeforeSending() = runBlocking {
+    MockWebServer().use { server ->
+      val error = runCatching {
+        api(server).send(Session("s1", "/repo", "T", 1, agent = "standard", blank = false), "先规划", "plan", null)
+      }.exceptionOrNull()
+      assertTrue(error is ApiException)
+      assertTrue(error?.message.orEmpty().contains("无法切换"))
+      assertEquals(0, server.requestCount)
+    }
+  }
+
+  @Test fun promptIsNotAutomaticallyRepeatedAfterAmbiguousHttpFailure() = runBlocking {
     MockWebServer().use { server ->
       server.enqueue(rootOk())
+      server.enqueue(MockResponse().setResponseCode(503).addHeader("Retry-After", "0"))
       server.enqueue(envelope("""{"accepted":true}"""))
-      api(server).send(Session("s1", "/repo", "T", 1, agent = "standard", blank = false), "先规划", "plan", null)
+      val client = api(server)
+      try {
+        val failure = runCatching { client.send(Session("s1", "/repo", "T", 1), "只发送一次", null, null) }.exceptionOrNull()
+        assertTrue(failure is ApiException && failure.code == "delivery/unknown")
+        assertEquals(2, server.requestCount)
+        server.takeRequest()
+        assertEquals("/api/session/prompt", server.takeRequest().requestUrl!!.encodedPath)
+      } finally { client.close() }
+    }
+  }
+
+  @Test fun rejectedPresetNeverSendsPrompt() = runBlocking {
+    MockWebServer().use { server ->
+      server.enqueue(rootOk())
+      server.enqueue(failure("preset/not-found"))
+      val error = runCatching {
+        api(server).send(Session("s1", "/repo", "T", 1, agent = "standard", blank = true), "先规划", "plan", null)
+      }.exceptionOrNull()
+      assertTrue(error is ApiException)
+      assertEquals(2, server.requestCount)
       server.takeRequest()
-      assertEquals("/api/session/prompt", server.takeRequest().requestUrl!!.encodedPath)
+      assertEquals("/api/agentPresets/select", server.takeRequest().requestUrl!!.encodedPath)
+    }
+  }
+
+  @Test fun unreadableAttachmentStopsBeforeSendingOrUploadingAnything() = runBlocking {
+    MockWebServer().use { server ->
+      val valid = InlineFile("ok.txt", "text/plain", AttachmentPolicy.dataUri("text/plain", "hello".toByteArray()))
+      val invalid = InlineFile("bad.png", "image/png", "data:image/png;base64,!!")
+      val error = runCatching {
+        api(server).send(Session("s1", "/repo", "T", 1), "请看附件", null, null, inline = listOf(valid, invalid))
+      }.exceptionOrNull()
+      assertTrue(error is ApiException)
+      assertTrue(error?.message.orEmpty().contains("bad.png"))
+      assertEquals(0, server.requestCount)
     }
   }
 
@@ -2089,6 +2169,22 @@ class DshApiTest {
       // efforts 是允许的枚举，不是偏好顺序；默认档位取 reasoning.defaultEffort。
       assertEquals("medium", model.choice.variant)
       assertEquals(listOf("minimal", "medium"), model.variants.map { it.id })
+    }
+  }
+
+  @Test fun changingCredentialsInvalidatesTheModelCatalog() = runBlocking {
+    MockWebServer().use { server ->
+      fun catalog(id: String) = envelope("""{"groups":[{"id":"p","name":"P","models":[{"id":"$id","name":"M"}]}]}""")
+      server.enqueue(rootOk())
+      server.enqueue(catalog("before"))
+      server.enqueue(envelope("{}"))
+      server.enqueue(catalog("after"))
+      val client = api(server)
+      assertEquals("before", client.modelCatalog("/repo").single().choice.modelId)
+      assertTrue(client.setCredential("example", "secret"))
+      assertEquals("after", client.modelCatalog("/repo").single().choice.modelId)
+      assertEquals(4, server.requestCount)
+      client.close()
     }
   }
 

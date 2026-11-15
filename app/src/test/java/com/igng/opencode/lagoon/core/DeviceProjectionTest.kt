@@ -38,6 +38,42 @@ class DeviceProjectionTest {
     observedAtMs = observedAt, freshUntilMs = observedAt + 600_000, completeness = DiscoveryCompleteness.COMPLETE
   )
 
+  @Test fun oldDefaultPathObservationReusesTheExistingDefaultLeaf() {
+    val profile = sshLeaf("old-default", "ssh-config", ServerKind.OPENCODE)
+    val graph = graphOf(listOf(profile))
+    val discovery = DeviceDiscovery(graph.hosts.single().id, now, listOf(DiscoveredHarness(
+      HarnessProtocolId.OPENCODE_NATIVE, "/home/me/.local/state/opencode/service.json", "OpenCode", available())))
+    val slots = DeviceProjection.devices(graph, listOf(profile), discovery = { discovery }, nowMs = now)
+      .single().harnesses.filter { it.protocol == HarnessProtocolId.OPENCODE_NATIVE }
+    assertEquals(1, slots.size)
+    assertEquals("old-default", slots.single().leafId?.value)
+  }
+
+  @Test fun existingDistinctRegistrationPathsRemainSeparate() {
+    val default = sshLeaf("old-default", "ssh-config", ServerKind.OPENCODE)
+    val explicit = default.copy(id = "explicit", sshServicePath = "/custom/service.json")
+    val profiles = listOf(default, explicit)
+    val graph = graphOf(profiles)
+    val discovery = DeviceDiscovery(graph.hosts.single().id, now, listOf(DiscoveredHarness(
+      HarnessProtocolId.OPENCODE_NATIVE, "/custom/service.json", "OpenCode", available())))
+    val slots = DeviceProjection.devices(graph, profiles, discovery = { discovery }, nowMs = now)
+      .single().harnesses.filter { it.protocol == HarnessProtocolId.OPENCODE_NATIVE }
+    assertEquals(setOf("old-default", "explicit"), slots.mapNotNull { it.leafId?.value }.toSet())
+  }
+
+  @Test fun expiredSshNegativeIsUnknownAndCanBeRetried() {
+    val profile = sshLeaf("ssh-leaf", "ssh-config")
+    val graph = graphOf(listOf(profile))
+    val stale = HarnessDiscoveryStatus(installed = DiscoveryValue.NO, observedAtMs = now - 700_000,
+      freshUntilMs = now - 100_000, completeness = DiscoveryCompleteness.COMPLETE)
+    val discovery = DeviceDiscovery(graph.hosts.single().id, now - 700_000,
+      listOf(DiscoveredHarness(HarnessProtocolId.CODEX_APP_SERVER, null, "Codex", stale)))
+    val slot = DeviceProjection.devices(graph, listOf(profile), discovery = { discovery }, nowMs = now)
+      .single().harnesses.first { it.protocol == HarnessProtocolId.CODEX_APP_SERVER }
+    assertTrue(slot.attachable)
+    assertEquals("上次发现已过期", slot.reason)
+  }
+
   @Test fun oneDeviceCarriesEveryHarnessOfTheSameHost() {
     val profiles = listOf(hubDsh("leaf-dsh"), hubCodex("leaf-codex"))
     val graph = graphOf(profiles)

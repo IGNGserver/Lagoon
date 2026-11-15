@@ -241,6 +241,7 @@ internal fun DeviceDetailScreen(
   onOpenHarness: (String) -> Unit,
   onAddHarness: (DeviceView, HarnessSlot) -> Unit,
   onRefreshDiscovery: (String) -> Unit,
+  discoveryError: String?,
   onEditSsh: (String) -> Unit,
   onManageHub: () -> Unit,
   onDeleteDevice: (String) -> Unit
@@ -261,25 +262,8 @@ internal fun DeviceDetailScreen(
   val boundSshKey = remember(sshHost?.keyId, state.sshKeys, state.sshKeysRevision) {
     controller.sshKey(sshHost?.keyId)
   }
-  val refreshing = state.deviceRefreshInFlight == deviceId
+  val refreshing = deviceId in state.deviceRefreshInFlight
   val authStatus = controller.deviceAuthStatus(device, state)
-  var autoDiscoveryError by remember(deviceId) { mutableStateOf<String?>(null) }
-
-  LaunchedEffect(device.id.value, device.effectiveEnabled, authStatus) {
-    val discovery = device.discovery
-    if (device.effectiveEnabled && authStatus == HubAuthStatus.ACTIVE &&
-      (discovery == null || !discovery.isFresh(System.currentTimeMillis()) || discovery.completeness != DiscoveryCompleteness.COMPLETE)
-    ) {
-      autoDiscoveryError = null
-      try {
-        controller.refreshDeviceDiscovery(device.id.value)
-      } catch (cancel: CancellationException) {
-        throw cancel
-      } catch (e: Exception) {
-        autoDiscoveryError = userFacingError(e, "自动刷新发现失败")
-      }
-    }
-  }
 
   Column(Modifier.fillMaxSize().background(HyperTheme.colors.canvas)) {
     PageTopBar(device.name, onBack, subtitle = {
@@ -327,19 +311,6 @@ internal fun DeviceDetailScreen(
           )
         }
       }
-      autoDiscoveryError?.let { errMsg ->
-        item {
-          HyperInlineNotice(
-            message = "实时发现未完成：$errMsg（当前展示本地缓存结果）",
-            type = MiuixToastType.WARNING,
-            action = "重试",
-            onAction = {
-              autoDiscoveryError = null
-              onRefreshDiscovery(device.id.value)
-            }
-          )
-        }
-      }
       item {
         HyperGroupTitle("设备")
         HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(vertical = 4.dp)) {
@@ -381,6 +352,10 @@ internal fun DeviceDetailScreen(
           Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
           style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary)
         )
+        discoveryError?.let { message ->
+          HyperInlineNotice(message = message, type = MiuixToastType.WARNING,
+            action = "重试检测", onAction = { onRefreshDiscovery(device.id.value) })
+        }
         device.discovery?.note?.takeIf { it.isNotBlank() }?.let { note ->
           Text(
             note,
@@ -404,6 +379,11 @@ internal fun DeviceDetailScreen(
         HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(vertical = 4.dp)) {
           when {
             sshHostId != null -> {
+              if (device.effectiveEnabled && device.attachedCount > 0) {
+                HyperRow(title = "重试连接", summary = "重新连接此设备上已启用的 Harness",
+                  trailing = { DropdownChevron() }, onClick = { controller.retrySshHost(sshHostId) })
+                HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
+              }
               HyperRow(
                 title = "编辑 SSH 连接",
                 summary = if (sshHost != null) "验证方式：${sshHost.auth.label} · 地址、凭据与主机指纹" else "地址、账号、凭据、启动命令与主机指纹",

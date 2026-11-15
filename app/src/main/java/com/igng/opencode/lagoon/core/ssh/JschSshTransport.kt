@@ -68,13 +68,17 @@ internal interface SshTransportFactory {
 /** JSch-backed transport. JSch is BSD-licensed; the host key is verified by our own TOFU pin. */
 internal class JschSshTransportFactory(
   private val keyStore: SshKeyStore? = null,
-  private val hardwareSigner: HardwareSshSigner? = null
+  private val hardwareSigner: HardwareSshSigner? = null,
+  private val keyboardInteractive: SshKeyboardInteractiveBroker? = null
 ) : SshTransportFactory {
   override fun connect(config: SshHostConfig, secrets: SshSecrets, verifier: SshHostKeyVerifier): SshTransport {
     val repository = VerifyingHostKeyRepository(verifier, config.hostKeyType?.trim()?.takeIf { it.isNotEmpty() })
     val session = try {
       openSession(config, secrets, repository)
     } catch (error: Throwable) {
+      if (Thread.currentThread().isInterrupted || generateSequence(error) { it.cause }.any {
+          it is java.util.concurrent.CancellationException || it is InterruptedException
+        }) throw java.util.concurrent.CancellationException("SSH 连接已取消").apply { initCause(error) }
       val failure = describe(error, repository)
       if (failure.kind == SshFailureKind.BIOMETRIC_REQUIRED && !config.keyId.isNullOrBlank()) {
         keyStore?.lockRuntimeSecret(config.keyId)
@@ -105,7 +109,7 @@ internal class JschSshTransportFactory(
       ?: throw SshFailure(SshFailureKind.HOST_KEY_UNKNOWN, "服务器没有提供主机指纹")
   }
 
-  private fun openSession(config: SshHostConfig, secrets: SshSecrets, repository: HostKeyRepository): Session {
+  private fun openSession(config: SshHostConfig, secrets: SshSecrets, repository: VerifyingHostKeyRepository): Session {
     val jsch = JSch()
     var certAlgorithm: String? = null
     var effectivePassphrase: String? = secrets.passphrase
@@ -179,7 +183,7 @@ internal class JschSshTransportFactory(
       config.auth == SshAuthMethod.PASSWORD -> "password,keyboard-interactive"
       config.auth == SshAuthMethod.KEY_WITH_PASSWORD_FALLBACK && fallbackPassword != null ->
         "publickey,keyboard-interactive,password"
-      else -> "publickey"
+      else -> "publickey,keyboard-interactive"
     }
     session.setConfig("PreferredAuthentications", preferredAuth)
     if (certAlgorithm != null) {
@@ -215,11 +219,21 @@ internal class JschSshTransportFactory(
         prompt: Array<out String>?,
         echo: BooleanArray?
       ): Array<String> {
-        val answer = sessionPassword ?: effectivePassphrase ?: ""
-        return Array(prompt?.size ?: 0) { answer }
+        if (prompt.isNullOrEmpty()) return emptyArray()
+        return try {
+          val broker = keyboardInteractive ?: throw SshFailure(
+            SshFailureKind.AUTH_INTERACTION_REQUIRED,
+            "SSH 需要额外验证，请回到应用后重试",
+            retryable = false
+          )
+          broker.request(config, name, instruction, prompt, echo)
+        } catch (failure: SshFailure) { repository.interactiveFailure = failure; throw failure }
       }
     }
-    if (sessionPassword != null) session.setPassword(sessionPassword)
+    // Do not call Session.setPassword: JSch's keyboard-interactive implementation automatically
+    // sends that value for any single hidden prompt containing "password:", including an OTP.
+    // UserAuthPassword obtains the SSH password from UserInfo instead; interactive answers are
+    // supplied only by the foreground challenge above and are never persisted.
     // Do not set a socket read timeout: a bootstrap script can be silent for a minute while it
     // waits for dsh web's token. The link owns keepalive/probes and enforces command deadlines.
     session.setTimeout(0)
@@ -301,6 +315,7 @@ internal class JschSshTransportFactory(
       cur = cur.cause
     }
     repository.failure?.let { return it }
+    repository.interactiveFailure?.let { return it }
     val text = error.message.orEmpty()
     // JSch exposes the server key before authentication. Do not let that diagnostic
     // mask a real password/private-key failure when the key was already accepted.
@@ -337,6 +352,7 @@ private class VerifyingHostKeyRepository(
   @Volatile var accepted: Boolean = false
   @Volatile var presented: PresentedSshHostKey? = null
   @Volatile var failure: SshFailure? = null
+  @Volatile var interactiveFailure: SshFailure? = null
 
   override fun check(host: String, key: ByteArray): Int {
     accepted = false
@@ -475,6 +491,9 @@ private class JschSshTransport(private val session: Session) : SshTransport {
       }
     } catch (failure: SshFailure) {
       throw failure
+    } catch (error: InterruptedException) {
+      Thread.currentThread().interrupt()
+      throw java.util.concurrent.CancellationException("SSH 远程命令已取消").apply { initCause(error) }
     } catch (error: TimeoutException) {
       throw SshFailure(SshFailureKind.DSH_TIMEOUT, "读取远程命令输出超时", error.message.orEmpty())
     } catch (error: Exception) {

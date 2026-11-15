@@ -54,7 +54,7 @@ class SshCodexTransportTest {
     assertEquals("Unsupported server request", rejected.getJSONObject("error").getString("message"))
     assertFalse(rejected.has("result"))
     assertTrue(runCatching { transport.respondError(42.0, -32601, "bad") }.isFailure)
-    assertEquals("exec codex app-server --listen stdio://", ssh.script)
+    assertEquals(SshExecutableSearch.prologue + "\nexec codex app-server --listen stdio://", ssh.script)
     transport.close()
     assertTrue(wire.closed.get())
     assertTrue(ssh.isClosed)

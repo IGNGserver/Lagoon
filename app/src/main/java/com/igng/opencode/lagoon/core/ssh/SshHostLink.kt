@@ -40,6 +40,10 @@ import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.Closeable
 
+// Covers SSH setup, bounded DSH probe/start, socket ownership proof and its 45s health check.
+// This is an upper bound for one caller; callers may cancel without closing sibling leases.
+internal const val HARNESS_START_BUDGET_MILLIS = 240_000L
+
 /**
  * One SSH host's link: SSH handshake + host-key pinning, remote `dsh web` bootstrap, a stable local
  * forwarder, a tunneled [DshApi], keepalive and reconnect. The local forwarder port survives SSH
@@ -89,11 +93,11 @@ internal class SshHostLink(
   /** Waits until this link has an authenticated DshApi; starts the link on first use.
    *  [sinceGeneration] waits for a client newer than that generation, so a caller that already holds
    *  a completed generation is not handed the same instance while a reconnect is in flight. */
-  suspend fun awaitClient(timeoutMillis: Long = 20_000, sinceGeneration: Long = -1): DshApi =
+  suspend fun awaitClient(timeoutMillis: Long = HARNESS_START_BUDGET_MILLIS, sinceGeneration: Long = -1): DshApi =
     awaitHarness(timeoutMillis, sinceGeneration) as? DshApi
       ?: throw SshFailure(SshFailureKind.OTHER, "此 SSH binding 不是 DSH", retryable = false)
 
-  suspend fun awaitHarness(timeoutMillis: Long = 20_000, sinceGeneration: Long = -1): HarnessClient {
+  suspend fun awaitHarness(timeoutMillis: Long = HARNESS_START_BUDGET_MILLIS, sinceGeneration: Long = -1): HarnessClient {
     if (closed) throw SshFailure(SshFailureKind.DISCONNECTED, "SSH 主机已移除", retryable = false)
     client?.takeIf { !it.isClosed && mutableStatus.value.isConnected && generation.get() > sinceGeneration }?.let { return it }
     val failed = mutableStatus.value
@@ -125,7 +129,13 @@ internal class SshHostLink(
         error("unreachable")
       }
     } catch (timeout: TimeoutCancellationException) {
-      throw SshFailure(SshFailureKind.UNREACHABLE, "SSH 连接超时，请检查网络和主机状态", retryable = true)
+      val detail = when (mutableStatus.value.step) {
+        SshLinkStep.START_DSH -> "远端 DSH 启动超时，请检查开发机上的服务状态"
+        SshLinkStep.LOGIN -> "Harness 登录超时，请检查开发机上的登录状态"
+        SshLinkStep.TUNNEL -> "SSH 服务安全检查或隧道连接超时"
+        else -> "SSH 连接超时，请检查网络和主机状态"
+      }
+      throw SshFailure(SshFailureKind.UNREACHABLE, detail, retryable = true)
     } catch (cancel: CancellationException) {
       if (closed) throw SshFailure(SshFailureKind.DISCONNECTED, "SSH 主机已移除", retryable = false)
       throw cancel
@@ -217,7 +227,7 @@ internal class SshHostLink(
     val pinned = config.hostKeyFingerprint?.trim().orEmpty()
     if (pinned.isEmpty()) {
       publish(SshLinkPhase.CONNECTING, SshLinkStep.VERIFY_HOST_KEY, "正在读取主机指纹", attempt = attempt)
-      val key = withContext(Dispatchers.IO) { transportFactory.probeHostKey(config) }
+      val key = kotlinx.coroutines.runInterruptible(Dispatchers.IO) { transportFactory.probeHostKey(config) }
       throw SshFailure(
         SshFailureKind.HOST_KEY_UNKNOWN,
         "需要确认主机指纹后才能连接",
@@ -237,7 +247,7 @@ internal class SshHostLink(
         presentedKey = presented
       )
     }
-    val nextTransport = withContext(Dispatchers.IO) { transportFactory.connect(config, secrets, verifier) }
+    val nextTransport = transportFactory.connectInterruptibly(config, secrets, verifier)
     if (closed) {
       nextTransport.close()
       throw SshFailure(SshFailureKind.DISCONNECTED, "SSH 主机已移除", retryable = false)
@@ -250,7 +260,7 @@ internal class SshHostLink(
       }
       publish(SshLinkPhase.CONNECTING, SshLinkStep.START_DSH, "正在检查远端的 dsh web", attempt = attempt)
       val bootstrap = RemoteDshBootstrap(nextTransport, config.launchCommand, config.workingDirectory)
-      val nextEndpoint = withContext(Dispatchers.IO) {
+      val nextEndpoint = kotlinx.coroutines.runInterruptible(Dispatchers.IO) {
         bootstrap.ensureRunning { detail -> publish(SshLinkPhase.CONNECTING, SshLinkStep.START_DSH, detail, attempt = attempt) }
       }
       if (closed) throw SshFailure(SshFailureKind.DISCONNECTED, "SSH 主机已移除", retryable = false)
@@ -260,6 +270,10 @@ internal class SshHostLink(
         nextTransport.probeTunnel("127.0.0.1", nextEndpoint.port, 10_000)
       }
       if (!tunnelOpen) throw SshFailure(SshFailureKind.TUNNEL, "无法建立到远端 dsh web 的隧道")
+      // A successful TCP or public HTTP response alone does not identify the process listening on
+      // this port. No DSH token or cookie is sent until a socket owned by the managed generation
+      // (or its verified child) has been proved; every later socket repeats that proof.
+      withContext(Dispatchers.IO) { SshVerifiedTunnel.verify(nextTransport, SshVerifiedTunnel.dsh(nextEndpoint)) }
       endpoint = nextEndpoint
       if (forwarder == null) {
         forwarder = SshForwarder { input, output ->
@@ -267,7 +281,7 @@ internal class SshHostLink(
             ?: throw SshFailure(SshFailureKind.DISCONNECTED, "SSH 连接已断开")
           val activeEndpoint = (if (closed) drainingEndpoint else endpoint)
             ?: throw SshFailure(SshFailureKind.DISCONNECTED, "dsh web 尚未就绪")
-          activeTransport.openTunnel("127.0.0.1", activeEndpoint.port, input, output)
+          SshVerifiedTunnel.open(activeTransport, SshVerifiedTunnel.dsh(activeEndpoint), input, output)
         }
       }
 
@@ -318,19 +332,21 @@ internal class SshHostLink(
   /** Attach-only OpenCode: registration discovery never launches or terminates a process. */
   private suspend fun attachOpenCode(nextTransport: SshTransport) {
     publish(SshLinkPhase.CONNECTING, SshLinkStep.TUNNEL, "正在读取 OpenCode 服务注册", attempt = attempt)
-    val registration = withContext(Dispatchers.IO) {
+    val registration = kotlinx.coroutines.runInterruptible(Dispatchers.IO) {
       SshHarnessProbe(nextTransport).openCodeRegistration(profile.sshServicePath)
     }
+    val target = SshVerifiedTunnel.openCode(registration)
+    withContext(Dispatchers.IO) { SshVerifiedTunnel.verify(nextTransport, target) }
     forwarder?.close()
     val local = SshForwarder { input, output ->
       val active = transport ?: throw SshFailure(SshFailureKind.DISCONNECTED, "SSH 连接已断开")
-      active.openTunnel(registration.host, registration.port, input, output)
+      SshVerifiedTunnel.open(active, target, input, output)
     }
     forwarder = local
     openCodeEndpoint = registration
     val runtime = profile.copy(url = "http://127.0.0.1:${local.port}", username = "opencode",
       allowCleartext = true, sshHostId = null, remoteHostId = null, remoteHostFingerprint = null)
-    val native = NativeOkHttpTransport(NativeHttpEndpoint(runtime.url))
+    val native = NativeOkHttpTransport(NativeHttpEndpoint(runtime.url), socketFactory = local.socketFactory)
     val api = OpenCodeApi(runtime, ServerCredentials("opencode", registration.password.orEmpty()), transport = native)
     try {
       withTimeout(45_000) {
@@ -378,6 +394,7 @@ internal class SshHostLink(
       runtime,
       ServerCredentials("dsh", endpoint.token, rememberedCookie),
       hostHeader = endpoint.authority,
+      socketFactory = local.socketFactory,
       onCookie = { value -> rememberedCookie = value }
     )
   }

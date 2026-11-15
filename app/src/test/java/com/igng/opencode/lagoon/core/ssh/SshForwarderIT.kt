@@ -7,7 +7,6 @@ import org.junit.Assert.assertTrue
 import org.junit.Assume.assumeTrue
 import org.junit.Test
 import java.io.File
-import java.net.Socket
 import java.nio.file.Files
 
 /** Opt-in live check that the local forwarder actually carries bytes through direct-tcpip. */
@@ -24,7 +23,7 @@ class SshForwarderIT {
     val transport = factory.connect(config, SshSecrets(privateKey = key)) { it.fingerprint == keyInfo.fingerprint }
     val forwarder = SshForwarder { input, output -> transport.openTunnel("127.0.0.1", 22, input, output) }
     try {
-      Socket("127.0.0.1", forwarder.port).use { socket ->
+      forwarder.socketFactory.createSocket("127.0.0.1", forwarder.port).use { socket ->
         socket.soTimeout = 5_000
         val buffer = ByteArray(128)
         val read = socket.getInputStream().read(buffer)

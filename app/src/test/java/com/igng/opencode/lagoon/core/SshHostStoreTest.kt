@@ -43,6 +43,22 @@ class SshHostStoreTest {
     assertNull(store.load().single().hostKeyFingerprint)
   }
 
+  @Test fun acceptedKeyIsOnlySavedForTheUnchangedEndpoint() {
+    val (store, _) = store()
+    store.save(host, SshSecrets(password = "fixture-password"))
+    val key = PresentedSshHostKey("ssh-ed25519", "SHA256:fixture")
+    val changed = host.copy(host = "changed.example")
+    store.save(changed)
+    assertFalse(store.pinHostKeyIfUnchanged(host, key))
+    assertNull(store.load().single().hostKeyFingerprint)
+    assertTrue(store.pinHostKeyIfUnchanged(changed, key))
+    assertEquals("SHA256:fixture", store.load().single().hostKeyFingerprint)
+    assertEquals("fixture-password", store.secrets(host.id).password)
+    store.delete(host.id)
+    assertFalse(store.pinHostKeyIfUnchanged(changed, key))
+    assertTrue(store.load().isEmpty())
+  }
+
   @Test fun corruptConfigRefusesToOverwriteTheOtherHosts() {
     val prefs = FakeSharedPreferences()
     val (store, _) = store(prefs)

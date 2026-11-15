@@ -109,6 +109,8 @@ dependencies {
   implementation("androidx.camera:camera-view:1.4.1")
   implementation("com.google.zxing:core:3.5.3")
   testImplementation("junit:junit:4.13.2")
+  // A loopback-only SSH server exercises JSch's real password and interactive wire protocols.
+  testImplementation("org.apache.sshd:sshd-core:2.15.0")
   testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
   testImplementation("org.json:json:20240303")
   // TranscriptStore's SQL runs against a real SQLite in JVM tests (Android's SQLiteDatabase is device-only).

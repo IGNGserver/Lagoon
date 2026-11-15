@@ -34,6 +34,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
+import javax.net.SocketFactory
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
@@ -79,7 +80,9 @@ class DshApi(
    */
   private val hostHeader: String? = null,
   /** Test seam for the logical $events handshake; production keeps the shared first-frame deadline. */
-  private val eventsReadyTimeoutMillis: Long = EVENTS_READY_TIMEOUT_MILLIS
+  private val eventsReadyTimeoutMillis: Long = EVENTS_READY_TIMEOUT_MILLIS,
+  /** Only for a local SSH bridge; never applied to Remote or direct HTTP connections. */
+  private val socketFactory: SocketFactory? = null
 ) : HarnessClient, RemoteDoctorSource {
   constructor(profile: ServerProfile, password: String) : this(profile, ServerCredentials(profile.username, password))
 
@@ -92,6 +95,7 @@ class DshApi(
     if (profile.dshAuth == DshAuthMode.SECRET) DshCookie.decodeSecret(credentials.password) else null
 
   private val http = OkHttpClient.Builder()
+    .apply { socketFactory?.let { this.socketFactory(it) } }
     .connectTimeout(SharedHttp.CONNECT_TIMEOUT_SECONDS, TimeUnit.SECONDS)
     .readTimeout(25, TimeUnit.SECONDS)
     .callTimeout(callTimeoutSeconds, TimeUnit.SECONDS)
@@ -206,6 +210,9 @@ class DshApi(
   @Volatile private var eventsClientId: String? = null
   /** 仍在等待回答的审批/问答瀑布；键是网关事件 id。 */
   private val pendingApprovals = ConcurrentHashMap<String, PermissionRequest>()
+  /** A failed reply may already have reached the Host; do not send it again until redelivery. */
+  private val uncertainApprovals = ConcurrentHashMap.newKeySet<String>()
+  private val approvalRepliesInFlight = ConcurrentHashMap.newKeySet<String>()
   private val pendingQuestions = ConcurrentHashMap<String, QuestionRequest>()
   /** 当前 `$events` 客户端代次与它重新投递过的瀑布 id（断线重连后对账用）。 */
   private val readyGeneration = java.util.concurrent.atomic.AtomicInteger()
@@ -218,6 +225,32 @@ class DshApi(
   /** DshApi 本身已关闭；follow 重连协程据此退出。 */
   @Volatile private var closed = false
   @Volatile private var catalog: JSONObject? = null
+  private val catalogStateLock = Any()
+  private val catalogFetchLock = Mutex()
+  private var catalogRevision = 0L
+
+  private fun invalidateModelCatalog() = synchronized(catalogStateLock) {
+    catalogRevision++
+    catalog = null
+  }
+
+  /** Never let an older in-flight reply replace a newer invalidation. */
+  private suspend fun currentModelCatalog(): JSONObject = catalogFetchLock.withLock {
+    repeat(3) {
+      val revision = synchronized(catalogStateLock) {
+        catalog?.let { return@withLock it }
+        catalogRevision
+      }
+      val fresh = callObject("session/modelCatalog", noArgs())
+      synchronized(catalogStateLock) {
+        if (revision == catalogRevision) {
+          catalog = fresh
+          return@withLock fresh
+        }
+      }
+    }
+    throw ApiException(409, "模型列表正在更新，请稍后重试")
+  }
   /** 已归档会话集合（`workspace/follow` 的 baseline 与 `archived` 增量维护）。 */
   private val archivedSessions = ConcurrentHashMap.newKeySet<String>()
   @Volatile private var archiveBaselineKnown = false
@@ -228,8 +261,8 @@ class DshApi(
   private val workspaceLock = Any()
   private var workspaceEpoch = 0L
   private val workspaceMutationLock = Mutex()
-  /** Workspace writes must never be replayed by OkHttp after an ambiguous transport failure. */
-  private val workspaceMutationHttp = http.newBuilder().retryOnConnectionFailure(false).build()
+  /** RPCs may mutate state; an unknown result must never trigger an automatic replay. */
+  private val rpcHttp = http.newBuilder().retryOnConnectionFailure(false).build()
   /** Replays the current workspace titles to a controller that starts watching mid-session. */
   private val workspacePublisher = MutableSharedFlow<List<Project>>(replay = 1, extraBufferCapacity = 1)
   override val workspaceUpdates: Flow<List<Project>> = workspacePublisher.asSharedFlow()
@@ -370,7 +403,7 @@ class DshApi(
     durableTurns.clear(); liveParts.clear(); liveAttempts.clear(); changeAnnouncements.clear()
     synchronized(ptcProjections) { ptcProjections.clear() }
     executions.clear(); outcomeReads.clear()
-    pendingApprovals.clear(); pendingQuestions.clear()
+    pendingApprovals.clear(); uncertainApprovals.clear(); pendingQuestions.clear()
     questionEventClients.clear()
     try {
       muxOwner.close()
@@ -569,10 +602,9 @@ class DshApi(
    * connection slot) running in the background. The body is consumed inside the worker so a large
    * response is also interrupted by cancellation.
    */
-  private suspend fun <T> runHttpCall(request: Request, read: (Response) -> T): T =
+  private suspend fun <T> runHttpCall(request: Request, noRetry: Boolean = false, read: (Response) -> T): T =
     suspendCancellableCoroutine { continuation ->
-      val client = if (request.url.encodedPath.substringAfterLast("/api/", "") in WORKSPACE_MUTATIONS)
-        workspaceMutationHttp else http
+      val client = if (noRetry) rpcHttp else http
       val call = client.newCall(request)
       val worker = ioScope.launch {
         try {
@@ -620,12 +652,14 @@ class DshApi(
         .put("method", endpoint)
         .put("payload", wirePayload)
       val encodedBody = envelope.toString().toRequestBody(JSON_MEDIA_TYPE)
-      val outgoingBody = if (endpoint in WORKSPACE_MUTATIONS) object : okhttp3.RequestBody() {
+      // The endpoint contract has both reads and mutations, and can grow independently. Treat every
+      // RPC body as one-shot so redirects or Retry-After never duplicate an unclassified mutation.
+      val outgoingBody = object : okhttp3.RequestBody() {
         override fun contentType() = encodedBody.contentType()
         override fun contentLength() = encodedBody.contentLength()
-        override fun isOneShot() = true // Also prevents HTTP 503 Retry-After:0 status follow-ups.
+        override fun isOneShot() = true
         override fun writeTo(sink: okio.BufferedSink) = encodedBody.writeTo(sink)
-      } else encodedBody
+      }
       val request = Request.Builder()
         .url(url)
         .header("Content-Type", "application/json; charset=utf-8")
@@ -633,7 +667,7 @@ class DshApi(
         .post(outgoingBody)
         .build()
       val (status, contentType, body) = try {
-        runHttpCall(request) { response ->
+        runHttpCall(request, noRetry = true) { response ->
           response.use {
             val body = it.body
             if (body != null && (body.contentLength() > MAX_RPC_RESPONSE_BYTES || body.source().request(MAX_RPC_RESPONSE_BYTES + 1)))
@@ -2088,6 +2122,7 @@ class DshApi(
                 }
               }
               eventsClientId = nextClientId
+              invalidateModelCatalog() // Changes may have occurred while the stream was disconnected.
               eventsReady = true
               wasReady = true
               readySignal.complete(Unit)
@@ -2366,6 +2401,11 @@ class DshApi(
     val name = frame.str("event")
     val args = frame.arr("args")
     when (name) {
+      "llm/adapters-updated", "settings/document-updated", "credentials/record-updated", "credentials/reference-updated" -> {
+        invalidateModelCatalog()
+        push(ServerEvent(id = "dsh:models:${System.nanoTime()}", directory = "", type = "model.catalog.changed",
+          properties = JSONObject(), created = System.currentTimeMillis()))
+      }
       "api-session/added" -> {
         val item = args.optJSONObject(0) ?: return
         val session = itemToSession(item) ?: return
@@ -2464,6 +2504,8 @@ class DshApi(
     when (name) {
       "approval/request" -> {
         if (eventId.isBlank()) return
+        // A Host redelivery confirms that this approval is still pending on this event stream.
+        uncertainApprovals.remove(eventId)
         val toolName = request.str("toolName").ifBlank { "工具" }
         val reason = request.str("reason")
         val properties = JSONObject()
@@ -2516,6 +2558,7 @@ class DshApi(
   }
 
   private fun settleLocally(eventId: String, push: (ServerEvent) -> Unit) {
+    uncertainApprovals.remove(eventId)
     val deliveryId = eventsClientId?.let { questionDeliveryId(it, eventId) }
     val delivery = deliveryId?.let { questionEventClients.remove(it) }
     if (deliveryId != null && questionCoordinatorDelegate.isInitialized()) questionCoordinator.cancelled(deliveryId)
@@ -2536,8 +2579,9 @@ class DshApi(
 
   /** 回一条瀑布：`{clientId, eventId, outcome}`，结果值按事件类型自己决定。 */
   private suspend fun settle(eventId: String, value: Any?) {
+    if (eventsClientId == null) throw ApiException(409, "事件流尚未连接，请重新连接后处理审批")
     if (trySettle(eventId, value)) return
-    throw ApiException(409, "事件流尚未连接，请稍后重试")
+    throw ApiException(409, "审批回复未确认，请重新连接并核对状态")
   }
 
   /**
@@ -3288,6 +3332,7 @@ class DshApi(
       "ops" to ops,
       "expectedRevision" to ns.optInt("revision", 0)
     )))
+    invalidateModelCatalog()
     if (apiKey.isNotBlank()) setCredential(apiKeyEnv, apiKey)
     return true
   }
@@ -3613,12 +3658,14 @@ class DshApi(
   override suspend fun setCredential(ref: String, value: String): Boolean {
     if (ref.isBlank() || value.isBlank()) return false
     call("credentials/set", envelope(argsOf("ref" to ref, "value" to value)))
+    invalidateModelCatalog()
     return true
   }
 
   override suspend fun clearCredential(ref: String): Boolean {
     if (ref.isBlank()) return false
     call("credentials/unset", envelope(argsOf("ref" to ref)))
+    invalidateModelCatalog()
     return true
   }
 
@@ -3914,20 +3961,30 @@ class DshApi(
     id: String,
     delivery: Delivery
   ) {
+    // Validate every local attachment before changing the session or uploading any part. Sending
+    // only the readable subset would make the user believe that the model received missing images.
+    var attachmentBytes = 0L
+    val prepared = inline.map { file ->
+      val bytes = try { readInlineBytes(file) } catch (error: Exception) {
+        throw ApiException(400, "附件无法读取：${file.name}")
+      } ?: throw ApiException(400, "附件无法读取：${file.name}")
+      attachmentBytes += bytes.size
+      if (attachmentBytes > AttachmentPolicy.MAX_BYTES) throw ApiException(413, "附件合计超过 20 MB，请分几条消息发送")
+      Triple(file, AttachmentPolicy.kind(file.mime, file.name), bytes)
+    }
     if (model != null) selectModel(session, model)
     selectPreset(session, agent)
     val content = JSONArray()
     val remote = remoteBackend
     val uploadLines = mutableListOf<String>()
     val mediaBlocks = mutableListOf<JSONObject>()
-    for (file in inline) {
+    for ((file, kind, bytes) in prepared) {
       val mime = file.mime.substringBefore(';').trim().lowercase()
-      val kind = AttachmentPolicy.kind(mime, file.name)
       if (kind == AttachmentPolicy.Kind.IMAGE) {
-        inlineContent(file)?.let { mediaBlocks += it }
+        mediaBlocks += JSONObject().put("type", "image").put("mediaType", mime)
+          .put("data", java.util.Base64.getEncoder().encodeToString(bytes)).put("name", file.name)
         continue
       }
-      val bytes = readInlineBytes(file) ?: throw ApiException(400, "附件无法读取：${file.name}")
       if (remote != null) {
         val uploadedViaReceipt = if (bytes.size <= REMOTE_FILE_RECEIPT_LIMIT_BYTES) {
           try {
@@ -3954,7 +4011,8 @@ class DshApi(
       } catch (error: ApiException) {
         // 旧实例/未装附件插件时才退回「文本内联」，二进制文件仍然明确失败。
         if (kind != AttachmentPolicy.Kind.TEXT || !error.isDshMethodUnavailable) throw error
-        inlineContent(file)?.let { mediaBlocks += it }
+        mediaBlocks += JSONObject().put("type", "text")
+          .put("text", "附件 ${file.name}：\n```\n${String(bytes, Charsets.UTF_8).trimEnd()}\n```")
         continue
       }
       mediaBlocks += JSONObject().put("type", "file").put("receiptId", receipt)
@@ -3980,7 +4038,13 @@ class DshApi(
       .put("mode", delivery.wire)
       .put("content", content)
     clientTimeZone()?.let { request.put("clientTimeZone", it) }
-    call("session/prompt", requestArgs(request))
+    try {
+      call("session/prompt", requestArgs(request))
+    } catch (error: ApiException) {
+      if (error.status == 0 || error.status >= 500)
+        throw ApiException(error.status, "消息发送结果未确认，请先检查会话，再决定是否重试", "delivery/unknown")
+      throw error
+    }
     // prompt 已被接受：本机不再把它当服务端草稿。即使随后的列表/事件仍带旧的 blank，
     // 也由 `itemToSession` 的单调判断保持可见；真正的 turn/start 会由 Host 再确认。
     known[session.id] = (known[session.id] ?: session).copy(blank = false)
@@ -3994,29 +4058,6 @@ class DshApi(
       ?: throw ApiException(502, "服务器没有返回附件回执")
     return value.optString("receiptId").takeIf(String::isNotBlank)
       ?: throw ApiException(502, "服务器没有返回附件回执")
-  }
-
-  /**
-   * 手机附件（[InlineFile.uri] 是 `data:` URI）折算成 DSH 内容块。图片走多模态 `image` 块；
-   * 其余文件由 [uploadFileAttachment] 换成 `file` 块的回执，不再把正文拼进提示词。
-   */
-  private fun inlineContent(file: InlineFile): JSONObject? {
-    val bytes = try { readInlineBytes(file) } catch (error: Exception) {
-      Diagnostics.warn("DshApi", "附件无法读取，已跳过", error)
-      null
-    } ?: return null
-    val mime = file.mime.substringBefore(';').trim().lowercase()
-    return when (AttachmentPolicy.kind(mime, file.name)) {
-      AttachmentPolicy.Kind.IMAGE -> JSONObject()
-        .put("type", "image")
-        .put("mediaType", mime)
-        .put("data", java.util.Base64.getEncoder().encodeToString(bytes))
-        .put("name", file.name)
-      AttachmentPolicy.Kind.TEXT -> JSONObject()
-        .put("type", "text")
-        .put("text", "附件 ${file.name}：\n```\n${String(bytes, Charsets.UTF_8).trimEnd()}\n```")
-      null -> null
-    }
   }
 
   /** `data:<mime>;base64,<…>`（Lagoon 选取附件时生成）或本地 `file:` 路径。 */
@@ -4036,27 +4077,19 @@ class DshApi(
     return null
   }
 
-  /** 会话的 Agent 预设（`agentPresets/select`）；只在轮次边界生效，失败保留当前预设。 */
+  /** Send only after the host confirms the requested preset was selected. */
   private suspend fun selectPreset(session: Session, agent: String?) {
     val wanted = agent?.takeIf(String::isNotBlank) ?: return
     val current = known[session.id] ?: session
-    if (wanted == current.agent) return
-    // 契约要求"在会话开始第一轮之前"选择预设；轮次已开始后 Host 会保留原组合（不报错也不通知），
-    // 本地若照旧改名，药丸显示的预设就和主机真正用的工具集不一致。
-    if (!current.blank) {
-      Diagnostics.info("DshApi", "会话已开始首轮，预设不可再切换（${wanted.take(24)}）")
-      return
-    }
-    try {
-      // 返回的是**已提交**的预设标识：可能是主机规范化后的值，也可能与请求不同。
-      val committed = (call("agentPresets/select", envelope(argsOf("agentId" to session.id, "agentPreset" to wanted))) as? String)
-        ?.takeIf { it.isNotBlank() } ?: wanted
-      known[session.id] = current.copy(agent = normalizeAgentPreset(committed))
-    } catch (error: CancellationException) {
-      throw error
-    } catch (error: Exception) {
-      Diagnostics.warn("DshApi", "切换 Agent 预设失败，沿用当前预设", error)
-    }
+    if (normalizeAgentPreset(wanted) == normalizeAgentPreset(current.agent.orEmpty())) return
+    // A started session silently retains its original combination on the host.
+    if (!current.blank) throw ApiException(409, "会话已开始，无法切换 Agent；请新建会话")
+    val committed = (call("agentPresets/select", envelope(argsOf("agentId" to session.id, "agentPreset" to wanted))) as? String)
+      ?.takeIf(String::isNotBlank) ?: throw ApiException(502, "主机未确认 Agent 切换，消息尚未发送")
+    val selected = normalizeAgentPreset(committed)
+    known[session.id] = current.copy(agent = selected)
+    if (selected != normalizeAgentPreset(wanted))
+      throw ApiException(409, "主机选择了 $selected，未采用请求的 Agent；请核对后重试")
   }
 
   override suspend fun command(
@@ -4160,7 +4193,7 @@ class DshApi(
   }
 
   override suspend fun modelCatalog(directory: String): List<ModelInfo> = withContext(Dispatchers.IO) {
-    val result = catalog ?: callObject("session/modelCatalog", noArgs()).also { catalog = it }
+    val result = currentModelCatalog()
     val models = mutableListOf<ModelInfo>()
     for (group in result.arr("groups").objects()) {
       val providerId = group.str("id")
@@ -4247,12 +4280,26 @@ class DshApi(
   }
 
   override suspend fun replyPermission(request: PermissionRequest, reply: String) {
-    pendingApprovals.remove(request.id)
-    val outcome = when (reply) {
-      "once", "always" -> "allowed-once"
-      else -> "rejected"
+    if (!approvalRepliesInFlight.add(request.id)) throw ApiException(409, "审批正在提交，请稍候")
+    try {
+      if (request.id in uncertainApprovals) throw ApiException(409, "上次审批结果尚未确认，请重新连接并核对后再操作")
+      val pending = pendingApprovals[request.id] ?: throw ApiException(409, "审批已变化，请刷新后确认")
+      val outcome = when (reply) {
+        "once", "always" -> "allowed-once"
+        else -> "rejected"
+      }
+      val hadStream = eventsClientId != null
+      try {
+        settle(request.id, outcome)
+      } catch (error: Throwable) {
+        if (hadStream) uncertainApprovals.add(request.id)
+        throw error
+      }
+      // Redelivery can replace an entry while the network acknowledgement is in flight.
+      pendingApprovals.compute(request.id) { _, current -> if (current === pending) null else current }
+    } finally {
+      approvalRepliesInFlight.remove(request.id)
     }
-    settle(request.id, outcome)
   }
 
   override suspend fun replyQuestion(request: QuestionRequest, answers: List<List<String>>) {
@@ -4488,7 +4535,6 @@ class DshApi(
     const val SHELL_OWNER_SCAN_SESSIONS = 8
     val ACTIVE_JOB_STATUSES = setOf("running", "stopping")
 
-    private val WORKSPACE_MUTATIONS = setOf("workspace/create", "workspace/rename", "workspace/delete", "workspace/insertBefore", "session/fork")
     val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
 
     /**
