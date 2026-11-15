@@ -237,6 +237,27 @@ class RemoteDeviceStoreTest {
     assertNull(store.load(slot))
   }
 
+  @Test fun failedInFlightRegistrationCannotRestoreADeletedIdentity() = runBlocking {
+    val store = TestStore()
+    val slot = "register-delete-race"
+    val started = CompletableDeferred<Unit>()
+    val release = CompletableDeferred<Unit>()
+    val manager = RemoteDeviceManager(store, slot, "https://hub.example", "user@example.com")
+    val job = async {
+      runCatching { manager.register("Lagoon", "android", "1", "account-token-123") { _, _ ->
+        started.complete(Unit)
+        release.await()
+        throw IOException("response lost")
+      } }
+    }
+    withTimeout(3_000) { started.await() }
+    RemoteDeviceManager.invalidateSlot(slot)
+    store.delete(slot)
+    release.complete(Unit)
+    assertTrue(withTimeout(3_000) { job.await() }.isFailure)
+    assertNull(store.load(slot))
+  }
+
   @Test fun expiredRecoveredAccessTokenPerformsSecondHopRotation() = runBlocking {
     val store = TestStore()
     val slot = "double-hop"
@@ -295,7 +316,7 @@ class RemoteDeviceStoreTest {
 
       val seenDeviceIds = mutableListOf<String>()
       val freshPair = tokens(accessExpiry = System.currentTimeMillis() + 3_600_000L)
-      val manager = RemoteDeviceManager(store, slot, "https://hub.example", "user@example.com")
+      val manager = RemoteDeviceManager(store, slot, "https://hub.example", "user@example.com", beforeIdentityReplacement = {})
       val saved = manager.register("Lagoon", "android", "1.0", "account-token-123") { descriptor, _ ->
         seenDeviceIds += descriptor.deviceId
         if (seenDeviceIds.size == 1) throw RemoteServerException(status, code, false)
@@ -307,6 +328,24 @@ class RemoteDeviceStoreTest {
       assertFalse(saved.invalidated)
       assertEquals(saved.identity.deviceId, store.load(slot)?.identity?.deviceId)
     }
+  }
+
+  @Test fun conflictingRegistrationDoesNotReplaceIdentityWhenRevocationCannotBeJournaled() = runBlocking {
+    val store = TestStore()
+    val slot = "conflict-journal"
+    val previous = RemoteDeviceRecord("https://hub.example/", "user@example.com", RemoteIdentity.generate(), tokens())
+    store.save(slot, previous)
+    var attempts = 0
+    val manager = RemoteDeviceManager(store, slot, "https://hub.example", "user@example.com",
+      beforeIdentityReplacement = { throw IOException("queue unavailable") })
+    val failure = runCatching { manager.register("Lagoon", "android", "1.0", "account-token-123") { _, _ ->
+      attempts++
+      throw RemoteServerException(409, "PEER_IDENTITY_MISMATCH", false)
+    } }.exceptionOrNull()
+    assertTrue(failure is IOException)
+    assertEquals(1, attempts)
+    assertEquals(previous.identity.deviceId, store.load(slot)?.identity?.deviceId)
+    assertEquals(previous.tokens, store.load(slot)?.tokens)
   }
 
   @Test fun definitiveCredentialRejectionMarksInvalidatedAndStopsStorm() = runBlocking {

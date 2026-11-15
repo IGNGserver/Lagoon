@@ -23,7 +23,7 @@ class DshJobsRegressionTest {
             .addHeader("Set-Cookie", "dsh-auth-test=fixture; Path=/").addHeader("Location", "./")
           request.path == "/api/session/list" -> MockResponse().setBody(JSONObject().put("result", JSONObject()
             .put("ok", true).put("value", JSONObject().put("items", JSONArray((1..5).map { n ->
-              JSONObject().put("sessionId", "s$n").put("cwd", "/repo").put("updatedAt", n)
+              JSONObject().put("sessionId", "s$n").put("cwd", "/repo").put("updatedAt", n).put("running", false)
                 .put("projections", JSONObject().put("values", JSONObject().put("title", "S$n")))
             })))).toString())
           request.path == "/api/remote.mux" -> MockResponse().withWebSocketUpgrade(object : WebSocketListener() {

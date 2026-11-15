@@ -91,6 +91,10 @@ internal fun RemoteEnrollSheet(
   var busy by remember { mutableStateOf(false) }
   var pending by remember { mutableStateOf<RemoteBrowserLogin?>(null) }
   var candidates by remember { mutableStateOf(emptyList<RemoteHostCandidate>()) }
+  var loggedIn by remember { mutableStateOf(false) }
+  var completedCount by remember { mutableStateOf<Int?>(null) }
+  var totalAttached by remember { mutableIntStateOf(0) }
+  var retryCandidates by remember { mutableStateOf(emptyList<RemoteHostCandidate>()) }
   var selected by remember { mutableStateOf(setOf<String>()) }
   var review by remember { mutableStateOf(false) }
   var confirmed by remember { mutableStateOf(setOf<String>()) }
@@ -107,6 +111,7 @@ internal fun RemoteEnrollSheet(
   var resultText by remember { mutableStateOf<String?>(null) }
 
   suspend fun handlePostLoginCandidates(loaded: List<RemoteHostCandidate>, accountHint: String = account) {
+    loggedIn = true
     val activeManager = manager
     val canonicalOrigin = runCatching { canonicalRemoteOrigin(normalizedOrigin) }.getOrNull()
     val loggedAccount = activeManager?.cachedAccount()?.trim().orEmpty().ifBlank { accountHint.trim() }
@@ -122,13 +127,14 @@ internal fun RemoteEnrollSheet(
     if (wasDegraded && activeManager != null) {
       val renewed = runCatching { activeManager.renewAdoptedPinnedHosts() }.getOrNull()
       if (renewed != null && renewed.registered.isNotEmpty()) {
-        controller.autoAttachEnrolledHosts(renewed.catalog, renewed.registered.keys)
+        val attached = controller.autoAttachEnrolledHosts(renewed.catalog, renewed.registered.keys)
+        totalAttached += attached
         val adoptedIds = existingCatalog.effectiveAdoptedHostIds()
         val loadedIds = loaded.map { it.hostId }.toSet()
         val unresolvedAdopted = (adoptedIds intersect loadedIds) - renewed.registered.keys
         if (unresolvedAdopted.isEmpty() && renewed.failures.isEmpty()) {
-          resultText = "已重新登录并自动恢复 ${renewed.registered.size} 台已绑定设备连接"
-          onDone(renewed.registered.size)
+          resultText = "已重新登录并恢复 ${renewed.registered.size} 台设备的授权；其中 $attached 台已添加可用服务。"
+          completedCount = totalAttached
           return
         }
         val remaining = loaded.filter { it.hostId !in renewed.registered.keys }
@@ -157,6 +163,10 @@ internal fun RemoteEnrollSheet(
     pending = null
     busy = false
     candidates = emptyList()
+    loggedIn = false
+    completedCount = null
+    totalAttached = 0
+    retryCandidates = emptyList()
     selected = emptySet()
     confirmed = emptySet()
     review = false
@@ -218,10 +228,18 @@ internal fun RemoteEnrollSheet(
     Column(Modifier.fillMaxWidth().fillMaxHeight(0.88f)) {
       LazyColumn(Modifier.weight(1f).fillMaxWidth(), contentPadding = PaddingValues(horizontal = 20.dp, vertical = 8.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        resultText?.let { text -> item { HyperInlineNotice(message = text, type = MiuixToastType.SUCCESS) } }
-        if (candidates.isEmpty()) {
+        resultText?.let { text -> item { HyperInlineNotice(message = text, type = if (retryCandidates.isEmpty()) MiuixToastType.SUCCESS else MiuixToastType.WARNING) } }
+        if (completedCount != null) {
+          if (retryCandidates.isNotEmpty()) item {
+            HyperButton(text = "重试未完成的设备", variant = HyperButtonVariant.SECONDARY, onClick = {
+              candidates = retryCandidates; selected = retryCandidates.map { it.hostId }.toSet()
+              confirmed = emptySet(); review = false; completedCount = null; retryCandidates = emptyList(); resultText = null
+            }, modifier = Modifier.fillMaxWidth())
+          }
+          item { HyperButton(text = "完成", onClick = { onDone(completedCount ?: 0) }, modifier = Modifier.fillMaxWidth()) }
+        } else if (!loggedIn) {
           item {
-            Text("登录后选择要接入的电脑。每台主机会在本机注册一个独立设备身份，用于同时保持连接。",
+            Text("登录后选择要接入的电脑。",
               style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
           }
           item {
@@ -253,7 +271,7 @@ internal fun RemoteEnrollSheet(
                     val login = manager!!.beginBrowserLogin(provider)
                     pending = login
                     if (!openLoginUrl(context, login.loginUrl)) {
-                      error = "没能打开浏览器，可复制登录链接后手动打开"; pending = null
+                      error = "没能打开浏览器，可复制登录链接后手动打开"
                     }
                   } catch (cancel: CancellationException) { throw cancel }
                   catch (e: Exception) { error = userFacingError(e, "没能发起登录") }
@@ -311,6 +329,12 @@ internal fun RemoteEnrollSheet(
               }, modifier = Modifier.fillMaxWidth())
             }
           }
+        } else if (candidates.isEmpty()) {
+          item { Text("登录成功，但目前没有可接入的电脑。请确认电脑上的远程服务已启动，然后刷新列表。", style = MiuixTheme.textStyles.body1) }
+          item { HyperButton(text = "刷新设备列表", loading = busy, enabled = !busy && manager != null,
+            onClick = { if (manager != null) loadCandidates { manager.refreshCandidates() } }, modifier = Modifier.fillMaxWidth()) }
+          item { HyperButton(text = "使用其他账号", variant = HyperButtonVariant.SECONDARY,
+            onClick = { loggedIn = false; resultText = null; error = null }, modifier = Modifier.fillMaxWidth()) }
         } else if (!review) {
           item {
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -318,7 +342,7 @@ internal fun RemoteEnrollSheet(
                 Text("选择主机", style = MiuixTheme.textStyles.headline2.copy(fontWeight = FontWeight.Medium))
                 Text("已发现 ${candidates.size} 台 · 已选 ${selected.size}", style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
               }
-              HyperTextAction(text = "重新登录", onClick = { candidates = emptyList(); selected = emptySet() })
+              HyperTextAction(text = "重新登录", onClick = { loggedIn = false; candidates = emptyList(); selected = emptySet() })
             }
           }
           items(candidates, key = { it.hostId }) { candidate ->
@@ -384,11 +408,17 @@ internal fun RemoteEnrollSheet(
                   if (enrollment.registered.isEmpty()) {
                     error = enrollment.failures.values.firstOrNull() ?: "所选主机均未完成接入，请重试"
                   } else {
-                    controller.autoAttachEnrolledHosts(enrollment.catalog, enrollment.registered.keys)
+                    val attached = controller.autoAttachEnrolledHosts(enrollment.catalog, enrollment.registered.keys)
+                    totalAttached += attached
                     val registered = enrollment.registered.size
-                    resultText = if (enrollment.failures.isEmpty()) "已接入并启用 $registered 台主机"
-                      else "已接入 $registered 台；${enrollment.failures.size} 台失败：${enrollment.failures.values.first()}"
-                    onDone(registered)
+                    retryCandidates = chosen.filter { it.hostId in enrollment.failures }
+                    val details = retryCandidates.joinToString("；") { candidate ->
+                      "${candidate.meta.displayName}：${enrollment.failures[candidate.hostId]}"
+                    }
+                    resultText = "已完成 $registered 台电脑的授权，其中 $attached 台已添加可用服务。" +
+                      (if (attached < registered) "其余电脑可在设备详情中刷新发现。" else "") +
+                      (if (details.isNotBlank()) " 未完成：$details" else "")
+                    completedCount = totalAttached
                   }
                 } catch (cancel: CancellationException) { throw cancel }
                 catch (e: Exception) { error = userFacingError(e, "接入远程主机失败") }

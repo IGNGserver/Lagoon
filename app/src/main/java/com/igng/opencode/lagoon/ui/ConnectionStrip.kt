@@ -82,7 +82,7 @@ internal fun ConnectionStrip(state: LagoonState, controller: LagoonController, m
       val baseMessage = if (!banner.subtitle.isNullOrBlank()) "${banner.text} · ${banner.subtitle}" else banner.text
       val message = if (showingOfflineCache && !baseMessage.contains("缓存")) "$baseMessage · 当前显示离线缓存" else baseMessage
       val action = when {
-        loginExpired -> "重新登录"
+        loginExpired -> activeProfile?.let(controller::remoteRecoveryLabel) ?: "重新登录"
         state.remoteRecovery != null -> state.remoteRecovery.label
         banner.retry -> "立即重试"
         else -> null
@@ -105,7 +105,7 @@ internal fun ConnectionStrip(state: LagoonState, controller: LagoonController, m
         else -> "当前未连接服务器 · 正在显示本地离线缓存会话"
       }
       val action = when {
-        loginExpired -> "重新登录"
+        loginExpired -> activeProfile?.let(controller::remoteRecoveryLabel) ?: "重新登录"
         activeProfile?.effectiveEnabled == true -> "立即重试"
         else -> null
       }
@@ -178,7 +178,7 @@ internal fun AggregateConnectionStrip(
     loginProfile != null -> Triple(
       "${loginProfile.name} 登录态已失效，无法同步最新数据$cacheSuffix",
       MiuixToastType.WARNING,
-      "重新登录" to ({ controller.openRemoteRecoveryFor(loginProfile.id, RemoteRecoveryKind.LOGIN) })
+      controller.remoteRecoveryLabel(loginProfile) to ({ controller.openRemoteRecoveryFor(loginProfile.id, RemoteRecoveryKind.LOGIN) })
     )
     otherRecoveryPair != null -> Triple(
       "${otherRecoveryPair.first.name} 连接需要处理$cacheSuffix",

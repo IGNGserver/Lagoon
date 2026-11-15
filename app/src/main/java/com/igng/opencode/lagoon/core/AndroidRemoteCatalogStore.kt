@@ -36,8 +36,19 @@ internal class AndroidRemoteCatalogStore internal constructor(
 
   override fun save(catalog: RemoteCatalog) = synchronized(lock) {
     val current = readCatalogs().filterNot { it.key == catalog.key } + catalog
+    if (current.size > 64) throw java.io.IOException("Remote 账号目录过多，未保存新账号")
     val encoded = JSONArray().apply { current.forEach { put(RemoteCatalogCodec.encode(it)) } }
     if (!preferences.edit().putString(KEY, encoded.toString()).commit()) throw java.io.IOException("Remote 主机目录保存失败")
+  }
+
+  override fun replaceIfUnchanged(expected: RemoteCatalog, updated: RemoteCatalog): Boolean = synchronized(lock) {
+    require(expected.key == updated.key)
+    val current = readCatalogs()
+    if (current.firstOrNull { it.key == expected.key } != expected) return false
+    val next = current.map { if (it.key == expected.key) updated else it }
+    val encoded = JSONArray().apply { next.forEach { put(RemoteCatalogCodec.encode(it)) } }
+    if (!preferences.edit().putString(KEY, encoded.toString()).commit()) throw java.io.IOException("Remote 主机目录保存失败")
+    true
   }
 
   override fun clear(origin: String, account: String) = synchronized(lock) {

@@ -17,7 +17,8 @@ internal class RemoteSession(
   private val devices: RemoteDeviceManager,
   private val trust: RemotePeerTrust,
   private val account: String,
-  private val clientVersion: String = ""
+  private val clientVersion: String = "",
+  private val compactionStore: RemoteCompactionStore = MemoryRemoteCompactionStore()
 ) : AutoCloseable {
   private val mutex = Mutex()
   @Volatile private var active: Active? = null
@@ -27,6 +28,11 @@ internal class RemoteSession(
   @Volatile private var failedAt = 0L
   @Volatile private var lastFailure: RemoteFailureException? = null
   private val statusFlow = MutableStateFlow(RemoteConnectionStatus(hostId = hostId))
+  private val compactionScope = remoteCompactionScope(address, account, hostId)
+  private fun compactions(ownerDeviceId: String) = RemoteCompactionTracker(compactionScope, ownerDeviceId, compactionStore, call = { method, params ->
+    ensure().connection.call(method, params, 30_000)
+  })
+  @Volatile private var compactionRecoveryJob: kotlinx.coroutines.Job? = null
   private data class Active(
     val connection: RemoteConnection,
     val gateway: RemoteGateway,
@@ -87,46 +93,19 @@ internal class RemoteSession(
     if (!current.capabilities.hasAsyncCompaction) {
       throw RemoteFailureException(RemoteFailureKind.INCOMPATIBLE, "此主机不支持异步压缩", retryable = false)
     }
-    val requestId = java.util.UUID.randomUUID().toString()
-    val submitted = current.connection.call(
-      "harness.remote.compaction.submit",
-      JSONObject().put("sessionId", sessionId).put("requestId", requestId),
-      30_000
-    ) as? JSONObject ?: throw RemoteFailureException(RemoteFailureKind.NETWORK, "异步压缩提交响应无效")
-    val operationId = submitted.optString("operationId").takeIf { it.isNotBlank() }
-      ?: throw RemoteFailureException(RemoteFailureKind.NETWORK, "异步压缩缺少操作 ID")
-    try {
-      var state = submitted.optString("state")
-      var message = submitted.optString("message")
-      while (true) {
-        when (state) {
-          "succeeded", "unconfirmed" -> return
-          "failed", "cancelled", "interrupted" -> {
-            throw RemoteFailureException(RemoteFailureKind.REJECTED, message.ifBlank { "会话压缩未完成（$state）" }, retryable = false)
-          }
-          "accepted", "running", "cancelling" -> Unit
-          else -> throw RemoteFailureException(RemoteFailureKind.NETWORK, "异步压缩状态未知：$state")
-        }
-        kotlinx.coroutines.delay(COMPACTION_POLL_INTERVAL_MILLIS)
-        val status = current.connection.call(
-          "harness.remote.compaction.status",
-          JSONObject().put("sessionId", sessionId).put("operationId", operationId),
-          30_000
-        ) as? JSONObject ?: throw RemoteFailureException(RemoteFailureKind.NETWORK, "异步压缩状态响应无效")
-        state = status.optString("state")
-        message = status.optString("message")
-      }
-    } catch (cancel: kotlinx.coroutines.CancellationException) {
-      kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable) {
-        runCatching {
-          current.connection.call(
-            "harness.remote.compaction.cancel",
-            JSONObject().put("sessionId", sessionId).put("operationId", operationId),
-            5_000
-          )
-        }
-      }
-      throw cancel
+    // Cancellation only stops observation; leaving the screen must not cancel a Host operation.
+    compactions(devices.access().identity.deviceId).compact(sessionId)
+  }
+
+  internal suspend fun cancelCompaction(sessionId: String): Boolean =
+    compactions(devices.access().identity.deviceId).cancel(sessionId)
+
+  private fun resumeCompactions(ownerDeviceId: String) {
+    compactionRecoveryJob?.cancel()
+    compactionRecoveryJob = SharedHttp.ioScope.launch {
+      try { compactions(ownerDeviceId).resumePending() }
+      catch (cancel: kotlinx.coroutines.CancellationException) { throw cancel }
+      catch (error: Exception) { Diagnostics.warn("RemoteCompaction", "无法恢复压缩状态", error) }
     }
   }
   /** Synchronous UI projection only; actual terminal requests recheck their pinned carrier. */
@@ -209,10 +188,10 @@ internal class RemoteSession(
         SharedHttp.ioScope.launch {
           try {
             val healthy = try {
-              kotlinx.coroutines.withTimeout(IDLE_PROBE_TIMEOUT_MILLIS) {
+              kotlinx.coroutines.withTimeoutOrNull(IDLE_PROBE_TIMEOUT_MILLIS) {
                 current.connection.call("harness.transport.describe", JSONObject(), IDLE_PROBE_TIMEOUT_MILLIS)
-              }
-              true
+                true
+              } == true
             } catch (cancel: kotlinx.coroutines.CancellationException) {
               throw cancel
             } catch (_: Exception) {
@@ -275,6 +254,7 @@ internal class RemoteSession(
   private suspend fun connectLocked(attempt: Int): Active {
     val api = RemoteServerApi(address, allowCleartext)
     var device = try { devices.access { id, token -> api.refresh(id, token) } }
+    catch (cancel: kotlinx.coroutines.CancellationException) { throw cancel }
     catch (error: RemoteFailureException) { throw error }
     catch (error: RemoteServerException) { throw remoteServerFailure(error) }
     catch (error: Exception) {
@@ -299,10 +279,20 @@ internal class RemoteSession(
       try { api.host(token, hostId) }
       catch (retryError: RemoteServerException) { throw remoteServerFailure(retryError) }
     }
-    val hostOnline = if (host.online) true else {
-      runCatching { api.hostPresence(token, hostId) }.getOrNull() ?: false
+    val hostOnline = if (host.online) true else try {
+      api.hostPresence(token, hostId)
+    } catch (cancel: kotlinx.coroutines.CancellationException) {
+      throw cancel
+    } catch (error: RemoteServerException) {
+      if (!error.isRecoverableTokenRejection || reactiveRefreshUsed) throw remoteServerFailure(error)
+      reactiveRefreshUsed = true
+      device = refreshRejectedOrThrow(api, token, error)
+      token = device.tokens?.accessToken ?: throw RemoteFailureException(RemoteFailureKind.AUTH_REQUIRED, "Remote 设备尚未注册", retryable = false)
+      try { api.hostPresence(token, hostId) } catch (retryError: RemoteServerException) { throw remoteServerFailure(retryError) }
     }
-    if (!hostOnline) throw RemoteFailureException(RemoteFailureKind.OFFLINE, "主机现在不在线", retryable = true)
+    // An older server may not have presence; the directory's cached false is not proof of a
+    // current offline Host. Let the real connect handshake decide in that case.
+    if (hostOnline == false) throw RemoteFailureException(RemoteFailureKind.OFFLINE, "主机现在不在线", retryable = true)
     val scope = RemotePeerScope(canonicalRemoteOrigin(address), account, hostId)
     val key = try { trust.verify(scope, host) }
     catch (error: RemoteTrustException) {
@@ -340,16 +330,21 @@ internal class RemoteSession(
       activeToken = device.tokens?.accessToken ?: throw RemoteFailureException(RemoteFailureKind.AUTH_REQUIRED, "Remote 设备尚未注册", retryable = false)
       try {
         RemoteConnection.connect(address, device.identity, activeToken, host, key, allowCleartext, clientVersion, dispatchEvent)
+      } catch (cancel: kotlinx.coroutines.CancellationException) {
+        throw cancel
       } catch (retryError: RemoteControlException) {
         throw remoteControlFailure(retryError)
       } catch (retryError: Exception) {
         throw RemoteFailureException(RemoteFailureKind.NETWORK, "没能建立加密中继：${detail(retryError)}", retryable = true, cause = retryError)
       }
+    } catch (cancel: kotlinx.coroutines.CancellationException) {
+      throw cancel
     } catch (error: Exception) {
       throw RemoteFailureException(RemoteFailureKind.NETWORK, "没能建立加密中继：${detail(error)}", retryable = true, cause = error)
     }
     return try {
       val capabilities = try { connection.capabilities() }
+      catch (cancel: kotlinx.coroutines.CancellationException) { throw cancel }
       catch (error: Exception) {
         throw RemoteFailureException(RemoteFailureKind.INCOMPATIBLE,
           "主机或远程插件版本不兼容：${detail(error)}", retryable = false, cause = error)
@@ -385,6 +380,7 @@ internal class RemoteSession(
           harnessVersion = host.harnessVersion, transport = connection.transport,
           relayAssignment = connection.relayAttached, capabilities = capabilities.capabilities,
           lastError = null)
+        if (capabilities.hasAsyncCompaction) resumeCompactions(device.identity.deviceId)
         SharedHttp.ioScope.launch {
           val closeCause = connection.awaitClosed()
           nextOpenCodeAcp.close()
@@ -395,13 +391,18 @@ internal class RemoteSession(
           if (!closed && active?.connection === connection) {
             val snapshot = when {
               closeCause is RemoteControlException && closeCause.code in setOf("TOKEN_EXPIRED", "AUTH_INVALID") -> {
-                val refreshed = runCatching {
-                  devices.refreshAfterRejected(activeToken) { id, rt -> api.refresh(id, rt) }
-                }.isSuccess
-                if (refreshed) {
+                val failure = try {
+                  refreshRejectedOrThrow(api, activeToken, closeCause)
+                  null
+                } catch (cancel: kotlinx.coroutines.CancellationException) {
+                  throw cancel
+                } catch (error: RemoteFailureException) {
+                  error
+                }
+                if (failure == null) {
                   RemoteFailureSnapshot(RemoteFailureKind.NETWORK, "访问令牌已自动续期，正在重连", retryable = true, closeCause.code)
                 } else {
-                  RemoteFailureSnapshot(RemoteFailureKind.AUTH_REQUIRED, "DSH Remote 凭据已失效，请重新登录", retryable = false, closeCause.code)
+                  RemoteFailureSnapshot(failure.kind, failure.message ?: "凭据暂时无法续期", failure.retryable, closeCause.code)
                 }
               }
               closeCause is RemoteControlException -> {
@@ -410,7 +411,10 @@ internal class RemoteSession(
               }
               else -> RemoteFailureSnapshot(RemoteFailureKind.NETWORK, "加密中继已断开", retryable = true)
             }
-            statusFlow.value = statusFlow.value.copy(phase = RemotePhase.FAILED, readyAt = 0, lastError = snapshot)
+            // Refresh may suspend while a later operation has already installed a replacement.
+            if (!closed && active?.connection === connection && statusFlow.value.generation == attempt) {
+              statusFlow.value = statusFlow.value.copy(phase = RemotePhase.FAILED, readyAt = 0, lastError = snapshot)
+            }
           }
         }
       }
@@ -438,7 +442,6 @@ internal class RemoteSession(
     const val FAILURE_REUSE_MILLIS = 2_000L
     const val IDLE_PROBE_AFTER_MILLIS = 45_000L
     const val IDLE_PROBE_TIMEOUT_MILLIS = 5_000L
-    const val COMPACTION_POLL_INTERVAL_MILLIS = 1_000L
     const val RELAY_WORKSPACE_UPLOAD_LIMIT_BYTES = 20 * 1024 * 1024
     const val LEGACY_UPLOAD_CHUNK_BYTES = 65_536
     const val BINARY_UPLOAD_CHUNK_BYTES = 256 * 1024
@@ -510,19 +513,24 @@ internal class RemoteSession(
         throw RemoteFailureException(RemoteFailureKind.NETWORK, "上传提交结果无效")
       committed = true
       return RemoteUploadedFile(finalName, "./$finalName", bytes.size.toLong())
+    } catch (cancel: kotlinx.coroutines.CancellationException) {
+      throw cancel
     } catch (error: RemoteFailureException) {
       throw error
     } catch (error: Exception) {
       throw RemoteFailureException(RemoteFailureKind.NETWORK, "上传文件失败", retryable = false, cause = error)
     } finally {
       if (!committed) {
-        runCatching { current.connection.call("workspace.upload.abort", JSONObject(scope.toString()), 5_000) }
+        kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable) {
+          runCatching { kotlinx.coroutines.withTimeout(5_000) { current.connection.call("workspace.upload.abort", JSONObject(scope.toString()), 5_000) } }
+        }
       }
     }
   }
 
   override fun close() {
     closed = true
+    compactionRecoveryJob?.cancel()
     publishClosed()
     active?.let(::closeActiveBundle)
     active = null

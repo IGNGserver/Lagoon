@@ -1,5 +1,6 @@
 package com.igng.opencode.lagoon.core
 
+import android.content.SharedPreferences
 import kotlinx.coroutines.runBlocking
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
@@ -17,6 +18,7 @@ class RemoteDeletionAndRevocationTest {
   private class MemoryDeviceStore : RemoteDeviceStore {
     val slots = linkedMapOf<String, RemoteDeviceRecord>()
     val queue = mutableListOf<PendingRemoteRevocation>()
+    var rejectEnqueue = false
 
     override fun load(slot: String): RemoteDeviceRecord? = slots[slot]
     override fun save(slot: String, record: RemoteDeviceRecord) { slots[slot] = record }
@@ -27,6 +29,7 @@ class RemoteDeletionAndRevocationTest {
     override fun listSlots(): Set<String> = slots.keys.toSet()
     override fun pendingRevocations(): List<PendingRemoteRevocation> = queue.toList()
     override fun enqueueRevocation(item: PendingRemoteRevocation) {
+      if (rejectEnqueue) throw java.io.IOException("injected queue write failure")
       queue.removeAll { it.id == item.id }
       queue += item
     }
@@ -151,11 +154,136 @@ class RemoteDeletionAndRevocationTest {
     store.save(legacyA, RemoteDeviceRecord(origin, "alice", RemoteIdentity(hostId2, sampleKeyA, sampleKeyB), tokensA))
     store.save(slotB, RemoteDeviceRecord(origin, "bob", RemoteIdentity(hostId2, sampleKeyA, sampleKeyB), tokensB))
 
-    val wiped = RemoteIdentitySlots.wipeHostSlotsReturningTokens(store, origin, "alice", hostId1)
-    assertEquals(1, wiped.size) // deduplicated by client deviceId while both slots removed
+    val wiped = RemoteIdentitySlots.queueAndWipeHostSlots(store, origin, "alice", hostId1, false)
+    assertEquals(2, wiped) // both slots removed but only one client identity is queued
+    assertEquals(1, store.pendingRevocations().size)
     assertNull(store.load(slotA))
     assertNull(store.load(legacyA))
     assertNotNull("other account slot for same hostId must remain untouched", store.load(slotB))
+  }
+
+  @Test fun failingToPersistRevocationDoesNotWipeDeviceIdentity() {
+    val origin = "https://hub.example.com/"
+    val store = MemoryDeviceStore()
+    val slot = RemoteIdentitySlots.scoped(origin, "alice", hostId1)
+    val tokens = RemoteTokenPair("old_access_token_123456", 4_000_000_000_000L,
+      "old_refresh_token_123456", 4_000_000_000_000L)
+    val record = RemoteDeviceRecord(origin, "alice", RemoteIdentity(hostId2, sampleKeyA, sampleKeyB), tokens)
+    store.save(slot, record)
+    store.rejectEnqueue = true
+    assertNotNull(runCatching { RemoteIdentitySlots.queueAndWipeHostSlots(store, origin, "alice", hostId1, false) }.exceptionOrNull())
+    assertEquals(record, store.load(slot))
+    assertTrue(store.pendingRevocations().isEmpty())
+  }
+
+  @Test fun repeatedWipeDoesNotReplaceAlreadyRotatedQueuedCredential() {
+    val origin = "https://hub.example.com/"
+    val store = MemoryDeviceStore()
+    val slot = RemoteIdentitySlots.scoped(origin, "alice", hostId1)
+    val tokens = RemoteTokenPair("old_access_token_123456", 4_000_000_000_000L,
+      "old_refresh_token_123456", 4_000_000_000_000L)
+    store.save(slot, RemoteDeviceRecord(origin, "alice", RemoteIdentity(hostId2, sampleKeyA, sampleKeyB), tokens))
+    val existing = PendingRemoteRevocation("existing", origin, "alice", hostId1, hostId2,
+      "new_access_token_123456", "new_refresh_token_123456")
+    store.enqueueRevocation(existing)
+    RemoteIdentitySlots.queueAndWipeHostSlots(store, origin, "alice", hostId1, false)
+    assertNull(store.load(slot))
+    assertEquals(listOf(existing), store.pendingRevocations())
+  }
+
+  @Test fun rotatedTokenSurvivesFailureAndBackoffBeforeNextSelfRevocation() = runBlocking {
+    MockWebServer().use { server ->
+      server.start()
+      val origin = canonicalRemoteOrigin(server.url("/").toString())
+      val store = MemoryDeviceStore()
+      store.enqueueRevocation(PendingRemoteRevocation("revoke", origin, "alice", "unknown", hostId2,
+        "old_access_token_123456", "old_refresh_token_123456", allowCleartext = true))
+      server.enqueue(MockResponse().setResponseCode(401).setBody("""{"error":{"code":"TOKEN_EXPIRED","message":"expired","retryable":false}}"""))
+      server.enqueue(MockResponse().setBody(JSONObject().put("accessToken", "new_access_token_123456")
+        .put("accessTokenExpiresAt", 2_000_000_000_000L).put("refreshToken", "new_refresh_token_123456")
+        .put("refreshTokenExpiresAt", 2_100_000_000_000L).toString()))
+      server.enqueue(MockResponse().setResponseCode(503).setBody("""{"error":{"code":"UNAVAILABLE","message":"down","retryable":true}}"""))
+      val now = 1_700_000_000_000L
+      drainPendingRemoteRevocations(store, nowMillis = { now })
+      val pending = store.pendingRevocations().single()
+      assertEquals("new_access_token_123456", pending.accessToken)
+      assertEquals("new_refresh_token_123456", pending.refreshToken)
+      assertEquals("UNAVAILABLE", pending.lastError)
+      assertEquals(1, pending.attempts)
+      assertEquals(3, server.requestCount)
+      server.enqueue(MockResponse().setResponseCode(204))
+      drainPendingRemoteRevocations(store, nowMillis = { now + 1_000L })
+      assertEquals("no network before retry delay", 3, server.requestCount)
+      drainPendingRemoteRevocations(store, nowMillis = { now + 3_000L })
+      assertTrue(store.pendingRevocations().isEmpty())
+      assertEquals(4, server.requestCount)
+    }
+  }
+
+  @Test fun unclassified401AndOldFailuresRemainVisibleInsteadOfBeingDiscarded() = runBlocking {
+    MockWebServer().use { server ->
+      server.start()
+      val store = MemoryDeviceStore()
+      store.enqueueRevocation(PendingRemoteRevocation("old", canonicalRemoteOrigin(server.url("/").toString()),
+        "alice", "unknown", hostId2, "old_access_token_123456", "old_refresh_token_123456", true,
+        createdAt = 1L, attempts = 20, lastAttemptAt = 0L))
+      server.enqueue(MockResponse().setResponseCode(401).setBody(""))
+      drainPendingRemoteRevocations(store, nowMillis = { 1_700_000_000_000L })
+      val pending = store.pendingRevocations().single()
+      assertEquals(21, pending.attempts)
+      assertEquals("HTTP_401", pending.lastError)
+      assertEquals(1, server.requestCount)
+    }
+  }
+
+  @Test fun corruptEncryptedQueueFailsClosedWithoutReplacingStoredData() {
+    val prefs = FakeSharedPreferences()
+    prefs.values["__pending_remote_revocations_v1__"] = "not-json"
+    val store = AndroidRemoteDeviceStore(prefs, { it }, { it })
+    assertNotNull(runCatching { store.pendingRevocations() }.exceptionOrNull())
+    assertEquals("not-json", prefs.values["__pending_remote_revocations_v1__"])
+  }
+
+  @Test fun failedAndroidQueueCommitLeavesDeviceIdentityIntact() {
+    val base = FakeSharedPreferences()
+    var failQueueCommit = false
+    val prefs = object : SharedPreferences by base {
+      override fun edit(): SharedPreferences.Editor {
+        val editor = base.edit()
+        return object : SharedPreferences.Editor by editor {
+          var queueTouched = false
+          override fun putString(key: String, value: String?): SharedPreferences.Editor {
+            if (key == "__pending_remote_revocations_v1__") queueTouched = true
+            editor.putString(key, value)
+            return this
+          }
+          override fun commit(): Boolean = if (failQueueCommit && queueTouched) false else editor.commit()
+        }
+      }
+    }
+    val store = AndroidRemoteDeviceStore(prefs, { it }, { it })
+    val origin = "https://hub.example.com/"
+    val slot = RemoteIdentitySlots.scoped(origin, "alice", hostId1)
+    val tokens = RemoteTokenPair("old_access_token_123456", 4_000_000_000_000L,
+      "old_refresh_token_123456", 4_000_000_000_000L)
+    store.save(slot, RemoteDeviceRecord(origin, "alice", RemoteIdentity(hostId2, sampleKeyA, sampleKeyB), tokens))
+    failQueueCommit = true
+    assertNotNull(runCatching { RemoteIdentitySlots.queueAndWipeSlot(store, slot, origin, "alice", hostId1, false) }.exceptionOrNull())
+    assertNotNull("failed queue commit must not delete the identity", store.load(slot))
+  }
+
+  @Test fun fullQueueRejectsNewTaskWithoutDroppingEarlierAuthorizations() {
+    val store = AndroidRemoteDeviceStore(FakeSharedPreferences(), { it }, { it })
+    val origin = "https://hub.example.com/"
+    repeat(64) { index ->
+      store.enqueueRevocation(PendingRemoteRevocation("item-$index", origin, "alice", hostId1,
+        UUID.randomUUID().toString(), "old_access_token_123456", "old_refresh_token_123456"))
+    }
+    val before = store.pendingRevocations()
+    val extra = PendingRemoteRevocation("extra", origin, "alice", hostId1, UUID.randomUUID().toString(),
+      "old_access_token_123456", "old_refresh_token_123456")
+    assertNotNull(runCatching { store.enqueueRevocation(extra) }.exceptionOrNull())
+    assertEquals(before, store.pendingRevocations())
   }
 
   @Test fun connectionCatalogProjectionDoesNotResurrectHostRemovedFromAdoptedSet() {

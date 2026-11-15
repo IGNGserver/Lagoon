@@ -1,11 +1,17 @@
 package com.igng.opencode.lagoon.core
 
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.channels.ClosedReceiveChannelException
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.json.JSONObject
 import org.junit.Assert.*
 import org.junit.Test
 import java.io.IOException
 import java.util.Base64
+import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 class RemoteGatewayTest {
   @Test fun callIsNotReplayedWhenResultIsUnknown() = runBlocking {
@@ -35,6 +41,119 @@ class RemoteGatewayTest {
     assertEquals("baseline", (stream.receive() as JSONObject).getString("type"))
     stream.close()
     assertTrue(closed)
+  }
+
+  @Test fun normalCloseWaitsForSlowTransferAndQueuedFinalFrame() = runBlocking {
+    assertFramesDrainedBeforeRemoteClose("completed")
+  }
+
+  @Test fun failedCloseDeliversQueuedFramesBeforeFailure() = runBlocking {
+    assertFramesDrainedBeforeRemoteClose("failed")
+  }
+
+  private suspend fun assertFramesDrainedBeforeRemoteClose(reason: String) {
+    val readStarted = CompletableDeferred<Unit>()
+    val finishRead = CompletableDeferred<Unit>()
+    val transferClosed = CompletableDeferred<Unit>()
+    val closeCalls = AtomicInteger()
+    lateinit var streamId: String
+    val transferId = UUID.randomUUID().toString()
+    lateinit var transferBytes: ByteArray
+    val gateway = RemoteGateway(transferFrames = true) { method, params ->
+      when (method) {
+        "harness.remote.stream.open" -> {
+          streamId = params.getString("streamId")
+          JSONObject()
+        }
+        "harness.remote.transfer.read" -> {
+          readStarted.complete(Unit)
+          finishRead.await()
+          JSONObject().put("transferId", transferId).put("index", 0)
+            .put("data", Base64.getEncoder().encodeToString(transferBytes))
+        }
+        "harness.remote.transfer.close" -> JSONObject().also { transferClosed.complete(Unit) }
+        "harness.remote.stream.close" -> JSONObject().also { closeCalls.incrementAndGet() }
+        "harness.remote.call" -> JSONObject().put("ok", true).put("value", "still-alive")
+        else -> throw AssertionError("unexpected $method")
+      }
+    }
+    val stream = gateway.open("session/follow", JSONObject())
+    try {
+      transferBytes = JSONObject().put("streamId", streamId).put("hasValue", true)
+        .put("value", JSONObject().put("type", "transfer-frame")).toString().toByteArray(Charsets.UTF_8)
+      val transfer = JSONObject().put("kind", "chunked").put("transferId", transferId)
+        .put("totalBytes", transferBytes.size).put("totalChunks", 1)
+      gateway.event(JSONObject().put("event", "harness.remote.frame").put("data", JSONObject()
+        .put("streamId", streamId).put("hasValue", true).put("transfer", transfer)))
+      withTimeout(5_000) { readStarted.await() }
+      gateway.event(JSONObject().put("event", "harness.remote.frame").put("data", JSONObject()
+        .put("streamId", streamId).put("hasValue", true).put("value", JSONObject().put("type", "final-frame"))))
+      val closed = JSONObject().put("streamId", streamId).put("reason", reason)
+      if (reason == "failed") closed.put("failure", JSONObject().put("message", "Host failed"))
+      gateway.event(JSONObject().put("event", "harness.remote.stream.closed").put("data", closed))
+      finishRead.complete(Unit)
+
+      assertEquals("transfer-frame", (withTimeout(5_000) { stream.receive() } as JSONObject).getString("type"))
+      assertEquals("final-frame", (withTimeout(5_000) { stream.receive() } as JSONObject).getString("type"))
+      val failure = runCatching { withTimeout(5_000) { stream.receive() } }.exceptionOrNull()
+      if (reason == "failed") {
+        assertTrue("the Host error must follow the queued frames", failure is IOException && failure.message.orEmpty().contains("Host failed"))
+      } else {
+        assertTrue("normal EOF must follow the queued frames", failure is ClosedReceiveChannelException)
+      }
+      withTimeout(5_000) { transferClosed.await() }
+      assertEquals("a remote-closed stream needs no redundant close", 0, closeCalls.get())
+      assertEquals("still-alive", gateway.call("session/list", JSONObject()))
+    } finally {
+      finishRead.complete(Unit)
+      stream.closeNow()
+      gateway.close()
+    }
+  }
+
+  @Test fun closingOneStreamDoesNotCancelItsInFlightTransferOrSiblingRpc() = runBlocking {
+    val readStarted = CompletableDeferred<Unit>()
+    val finishRead = CompletableDeferred<Unit>()
+    val transferClosed = CompletableDeferred<Unit>()
+    val readCancelled = AtomicBoolean(false)
+    lateinit var streamId: String
+    lateinit var transferBytes: ByteArray
+    val transferId = UUID.randomUUID().toString()
+    val gateway = RemoteGateway(transferFrames = true) { method, params ->
+      when (method) {
+        "harness.remote.stream.open" -> JSONObject().also { streamId = params.getString("streamId") }
+        "harness.remote.transfer.read" -> {
+          readStarted.complete(Unit)
+          try { finishRead.await() } catch (cancel: kotlinx.coroutines.CancellationException) {
+            readCancelled.set(true)
+            throw cancel
+          }
+          JSONObject().put("transferId", transferId).put("index", 0)
+            .put("data", Base64.getEncoder().encodeToString(transferBytes))
+        }
+        "harness.remote.transfer.close" -> JSONObject().also { transferClosed.complete(Unit) }
+        "harness.remote.stream.close" -> JSONObject()
+        "harness.remote.call" -> JSONObject().put("ok", true).put("value", "still-alive")
+        else -> throw AssertionError("unexpected $method")
+      }
+    }
+    val stream = gateway.open("session/follow", JSONObject())
+    try {
+      transferBytes = JSONObject().put("streamId", streamId).put("hasValue", true)
+        .put("value", JSONObject().put("type", "transfer-frame")).toString().toByteArray(Charsets.UTF_8)
+      gateway.event(JSONObject().put("event", "harness.remote.frame").put("data", JSONObject()
+        .put("streamId", streamId).put("hasValue", true).put("transfer", JSONObject()
+          .put("kind", "chunked").put("transferId", transferId).put("totalBytes", transferBytes.size).put("totalChunks", 1))))
+      withTimeout(5_000) { readStarted.await() }
+      stream.closeNow()
+      assertEquals("still-alive", gateway.call("session/list", JSONObject()))
+      finishRead.complete(Unit)
+      withTimeout(5_000) { transferClosed.await() }
+      assertFalse("closing a logical stream must not cancel its carrier's transfer RPC", readCancelled.get())
+    } finally {
+      finishRead.complete(Unit)
+      gateway.close()
+    }
   }
 
   @Test fun largeRequestIsCommittedExactlyOnceAndTransferIsClosed() = runBlocking {

@@ -109,14 +109,13 @@ internal class RemoteServerApi(address: String, allowCleartext: Boolean = false)
     return requiredText(body, "account", 320)
   }
 
-  /** Revoke this device on the Server. A missing/expired token is not a local failure. */
+  /** Revoke this device on the Server, preserving structured authorization failures for recovery. */
   suspend fun revokeSelf(accessToken: String) = withContext(Dispatchers.IO) {
     if (!validToken(accessToken)) throw IllegalArgumentException("Remote 设备凭据无效")
     val request = Request.Builder().url(sameOriginUrl("/api/v1/devices/self")).delete()
       .header("Accept", "application/json").header("Authorization", "Bearer $accessToken").build()
-    http.newCall(request).execute().use { response ->
-      if (!response.isSuccessful) throw RemoteServerException(response.code, null, response.code == 429 || response.code >= 500)
-    }
+    executeJson(request)
+    Unit
   }
 
   suspend fun register(identity: RemoteClientDescriptor, accountToken: String): RemoteTokenPair {
@@ -140,7 +139,7 @@ internal class RemoteServerApi(address: String, allowCleartext: Boolean = false)
     do {
       if (++pages > 100) throw IOException("DSH Hub 设备分页超过上限，未使用不完整列表")
       val url = base.newBuilder().addEncodedPathSegments("api/v1/devices")
-        .apply { cursor?.let { addQueryParameter("limit", "50"); addQueryParameter("cursor", it) } }.build()
+        .apply { addQueryParameter("limit", "50"); cursor?.let { addQueryParameter("cursor", it) } }.build()
       val body = requestAt("GET", url, bearer = accessToken)
       val items = body.optJSONArray("items") ?: throw IOException("DSH Hub 设备列表无效")
       if (items.length() > 5000 || hosts.size + items.length() > 5000) throw IOException("DSH Hub 设备列表超过上限")
@@ -170,15 +169,13 @@ internal class RemoteServerApi(address: String, allowCleartext: Boolean = false)
     val hosts = linkedMapOf<String, RemoteHost>()
     val seen = mutableSetOf<String>()
     var cursor: String? = null
+    var pages = 0
     while (true) {
-      val url = if (cursor == null) {
-        sameOriginUrl("/api/v1/account/devices")
-      } else {
-        sameOriginUrl("/api/v1/account/devices").newBuilder()
-          .addQueryParameter("limit", "50")
-          .addQueryParameter("cursor", cursor)
-          .build()
-      }
+      if (++pages > 100) throw IOException("DSH Hub 账号目录分页超过上限，未使用不完整列表")
+      val url = sameOriginUrl("/api/v1/account/devices").newBuilder()
+        .addQueryParameter("limit", "50")
+        .apply { cursor?.let { addQueryParameter("cursor", it) } }
+        .build()
       val body = try {
         requestAt("GET", url, null, accountToken)
       } catch (error: RemoteServerException) {
@@ -187,15 +184,22 @@ internal class RemoteServerApi(address: String, allowCleartext: Boolean = false)
         throw error
       }
       val items = body.optJSONArray("items") ?: throw IOException("DSH Hub 设备列表无效")
+      if (items.length() > 5000) throw IOException("DSH Hub 设备列表超过上限")
       for (index in 0 until items.length()) {
         val item = items.optJSONObject(index) ?: throw IOException("DSH Hub 设备信息无效")
         if (item.optString("role") != "host") continue
         val host = accountHost(item)
-        hosts[host.deviceId] = host
+        if (hosts.put(host.deviceId, host) != null) throw IOException("DSH Hub 账号目录包含重复身份，未使用不完整列表")
         if (hosts.size > 5000) throw IOException("DSH Hub 设备列表超过上限")
       }
-      val next = (body.opt("nextCursor") as? String)?.takeIf(String::isNotBlank) ?: break
-      if (!seen.add(next)) throw IOException("DSH Hub 返回重复分页游标，未使用不完整列表")
+      val next = when (val value = body.opt("nextCursor")) {
+        null, JSONObject.NULL -> null
+        is String -> value.takeIf(String::isNotEmpty)?.also {
+          if (it.length > 4096 || it.any { c -> c.code < 0x21 || c.code == 0x7f } || !seen.add(it))
+            throw IOException("DSH Hub 返回无效或循环分页游标，未使用不完整列表")
+        }
+        else -> throw IOException("DSH Hub 返回无效分页游标")
+      } ?: break
       cursor = next
     }
     return hosts.values.toList()
@@ -224,11 +228,7 @@ internal class RemoteServerApi(address: String, allowCleartext: Boolean = false)
   suspend fun deleteMembership(accessToken: String, peerDeviceId: String) {
     require(validToken(accessToken)) { "Remote 设备凭据无效" }
     require(validDeviceId(peerDeviceId)) { "DSH Hub 设备 ID 无效" }
-    try {
-      request("DELETE", "api/v1/device-memberships/$peerDeviceId", bearer = accessToken)
-    } catch (error: RemoteServerException) {
-      if (error.status != 404) throw error
-    }
+    request("DELETE", "api/v1/device-memberships/$peerDeviceId", bearer = accessToken)
   }
 
   /**

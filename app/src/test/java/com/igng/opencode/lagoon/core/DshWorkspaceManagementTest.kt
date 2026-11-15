@@ -232,6 +232,22 @@ class DshWorkspaceManagementTest {
     DshApi::class.java.getDeclaredMethod("applyWorkspaceFrame", JSONObject::class.java).apply { isAccessible = true }.invoke(client, frame)
   }
 
+  @Test fun displayReadsInitialBaselineOnceWithoutKeepingAWorkspaceStream() = runBlocking {
+    Fixture(baseline(row())).use { f ->
+      assertEquals("Repo", f.client.projectsForDisplay().single().name)
+      assertEquals("Repo", f.client.projectsForDisplay().single().name)
+      assertEquals(1, f.reads.get())
+    }
+  }
+
+  @Test fun displayDoesNotUseAnInitialBaselineOvertakenByALiveUpdate() = runBlocking {
+    Fixture(baseline(row())).use { f ->
+      f.beforeBaseline = { applyFrame(f.client, JSONObject().put("type", "upsert").put("workspace", row(title = "Live"))) }
+      assertTrue(f.client.projectsForDisplay().isEmpty())
+      assertEquals(1, f.reads.get())
+    }
+  }
+
   @Test fun incrementAfterMutationInvalidationCannotBecomeAPartialCompleteCatalog() = runBlocking {
     Fixture(baseline(row(), row("w2", "/two", "Two"))).use { f ->
       val expected = f.client.serverWorkspaces().first()

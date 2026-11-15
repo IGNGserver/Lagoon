@@ -15,11 +15,17 @@ import java.io.IOException
 import java.util.Base64
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 
 /** Typert carrier bound to one Noise connection and its owner peer. Never retries business calls. */
 internal class RemoteGateway(private val transferFrames: Boolean = false, private val rpc: suspend (String, JSONObject) -> Any?) : AutoCloseable {
-  private data class StreamState(val endpoint: String, val output: Channel<Any>, val frames: Channel<JSONObject>,
-    var worker: Job? = null, var failure: IOException? = null)
+  private class StreamState(val endpoint: String, val output: Channel<Any>, val frames: Channel<JSONObject>) {
+    var worker: Job? = null
+    @Volatile var failure: IOException? = null
+    val terminal = AtomicBoolean(false)
+    val remoteClosed = AtomicBoolean(false)
+    val closeSent = AtomicBoolean(false)
+  }
   private val streams = ConcurrentHashMap<String, StreamState>()
   private val transfers = Semaphore(2)
   @Volatile private var closed = false
@@ -172,8 +178,15 @@ internal class RemoteGateway(private val transferFrames: Boolean = false, privat
         // 坏帧不会切断事件通道：先把已排队的帧交给消费者，再以记录下来的原因收尾。
         stream.output.close(stream.failure)
       } catch (cancel: CancellationException) { stream.output.close(cancel); throw cancel }
-      catch (error: Exception) { stream.output.close(error) }
-      finally { streams.remove(id, stream) }
+      catch (error: Exception) {
+        stream.terminal.set(true)
+        stream.frames.close()
+        stream.output.close(error)
+      }
+      finally {
+        streams.remove(id, stream)
+        if (stream.terminal.get()) notifyRemoteCloseAsync(id, stream)
+      }
     }
     try {
       val request = JSONObject().put("streamId", id).put("endpoint", endpoint).put("payload", payload)
@@ -181,9 +194,14 @@ internal class RemoteGateway(private val transferFrames: Boolean = false, privat
       rpc("harness.remote.stream.open", request)
       return RemoteGatewayStream(id, stream.output, this)
     } catch (error: Exception) {
-      streams.remove(id); stream.frames.close(error); stream.output.close(error); stream.worker?.cancel()
+      streams.remove(id, stream)
+      val notifyRemote = claimRemoteClose(stream)
+      stream.terminal.set(true)
+      // A frame may already be fetching a transfer before open's response arrives. Closing the
+      // output lets that worker unwind after the RPC rather than cancelling the shared carrier.
+      stream.frames.close(); stream.output.close(error)
       // Close is idempotent and releases a stream registered before an open error. Never replay open.
-      withContext(NonCancellable) {
+      if (notifyRemote) withContext(NonCancellable) {
         try { withTimeout(5_000) { rpc("harness.remote.stream.close", JSONObject().put("streamId", id)) } } catch (_: Exception) { }
       }
       throw error
@@ -202,13 +220,19 @@ internal class RemoteGateway(private val transferFrames: Boolean = false, privat
     val id = (data.opt("streamId") as? String) ?: run { lastError = "流事件缺少 streamId"; return }
     val stream = streams[id] ?: return
     if (name == "harness.remote.stream.closed") {
+      if (!stream.terminal.compareAndSet(false, true)) return
       val failure = if (data.optString("reason") == "failed") IOException(
         "Remote 流失败：${data.optJSONObject("failure")?.optString("message").orEmpty().ifBlank { "主机未给出原因" }}")
       else null
-      stream.frames.close(failure); stream.output.close(failure); stream.worker?.cancel()
+      // The worker may be awaiting a transfer and other frames can already be queued. Host EOF
+      // terminates input only: let the worker deliver those frames before publishing EOF/error.
+      stream.remoteClosed.set(true)
+      stream.failure = failure
+      stream.frames.close()
       if (failure != null) lastError = failure.message
       return
     }
+    if (stream.terminal.get()) return
     val hasValue = data.has("value")
     val hasTransfer = data.has("transfer")
     val problem = when {
@@ -219,26 +243,39 @@ internal class RemoteGateway(private val transferFrames: Boolean = false, privat
       else -> null
     }
     if (problem != null) {
-      failStream(id, stream, IOException(problem))
+      failStream(stream, IOException(problem))
       return
     }
-    if (stream.frames.trySend(data).isFailure) failStream(id, stream, IOException("Remote 流消费者过慢"))
+    if (stream.frames.trySend(data).isFailure) failStream(stream, IOException("Remote 流消费者过慢"))
   }
 
-  private fun failStream(id: String, stream: StreamState, error: IOException) {
+  private fun failStream(stream: StreamState, error: IOException) {
+    if (!stream.terminal.compareAndSet(false, true)) return
     lastError = error.message
-    streams.remove(id, stream)
     stream.failure = error
     // 不带 cause 关闭帧队列：worker 会先送完已缓冲的帧，再用 failure 结束输出。
     stream.frames.close()
   }
 
+  private fun claimRemoteClose(stream: StreamState): Boolean =
+    !closed && !stream.remoteClosed.get() && stream.closeSent.compareAndSet(false, true)
+
+  private fun notifyRemoteCloseAsync(id: String, stream: StreamState) {
+    if (!claimRemoteClose(stream)) return
+    SharedHttp.ioScope.launch {
+      try { withTimeout(5_000) { rpc("harness.remote.stream.close", JSONObject().put("streamId", id)) } }
+      catch (_: CancellationException) { } catch (_: Exception) { }
+    }
+  }
+
   internal suspend fun closeStream(id: String) {
     val stream = streams.remove(id) ?: return
+    val notifyRemote = claimRemoteClose(stream)
+    stream.terminal.set(true)
     // Let the worker unwind on channel closure; cancelling it inside a transfer RPC would close
     // the whole relay (RemoteRpc treats cancellation as an unknown-delivery failure).
     stream.frames.close(); stream.output.close()
-    if (!closed) withContext(NonCancellable) {
+    if (notifyRemote) withContext(NonCancellable) {
       try { withTimeout(5_000) { rpc("harness.remote.stream.close", JSONObject().put("streamId", id)) } }
       catch (_: CancellationException) { } catch (_: Exception) { }
     }
@@ -251,11 +288,13 @@ internal class RemoteGateway(private val transferFrames: Boolean = false, privat
    */
   internal fun closeStreamNow(id: String) {
     val stream = streams.remove(id) ?: return
+    val notifyRemote = claimRemoteClose(stream)
+    stream.terminal.set(true)
     // Close both queues and let the worker unwind on its own. Do not cancel it while it may be
     // inside a transfer RPC: RemoteRpc treats cancellation as an unknown-delivery failure and
     // would tear down the whole relay, turning one cancelled stream into a connection outage.
     stream.frames.close(); stream.output.close()
-    if (closed) return
+    if (!notifyRemote) return
     SharedHttp.ioScope.launch {
       try { withTimeout(5_000) { rpc("harness.remote.stream.close", JSONObject().put("streamId", id)) } }
       catch (_: CancellationException) { } catch (_: Exception) { }

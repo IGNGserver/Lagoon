@@ -13,6 +13,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.igng.opencode.lagoon.core.*
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import top.yukonga.miuix.kmp.basic.*
 import top.yukonga.miuix.kmp.extra.SuperDialog
@@ -22,32 +23,42 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
 @Composable
 internal fun RemoteHostsSheet(
   controller: LagoonController,
+  targetSourceId: String? = null,
   onDismiss: () -> Unit,
   onEnroll: () -> Unit,
   onOpenPairing: (() -> Unit)? = null,
 ) {
   val scope = rememberCoroutineScope()
-  var catalogState by remember { mutableStateOf(controller.activeHubCatalog()) }
+  var hubs by remember { mutableStateOf(controller.remoteCatalogs().filterNot(controller::isPairedRemoteCatalog)) }
+  var selectedHubKey by remember(targetSourceId) {
+    mutableStateOf(
+      if (targetSourceId == null) controller.activeHubCatalog()?.key
+      else hubs.firstOrNull { MigrationProjection.hubSourceId(it.origin, it.account) == targetSourceId }?.key
+    )
+  }
   var pairedState by remember { mutableStateOf(controller.pairedRemoteCatalogs()) }
-  val catalog = catalogState
+  val catalog = hubs.firstOrNull { it.key == selectedHubKey }
   val managerResult = remember(catalog?.origin, catalog?.account, catalog?.signedOut) {
     catalog?.let { saved ->
-      saved.takeUnless { it.signedOut }?.let { active ->
-        runCatching { controller.remoteAccountManager(active.origin, active.allowCleartext).also { it.resume(active) } }
-      }
+      runCatching { controller.remoteAccountManager(saved.origin, saved.allowCleartext).also { if (!saved.signedOut) it.resume(saved) } }
     }
   }
-  val manager = managerResult?.getOrNull()
   val signedOut = catalog?.signedOut == true
+  val manager = managerResult?.getOrNull()?.takeUnless { signedOut }
+  val signOutManager = managerResult?.getOrNull()
+  val hasRemainingCredentials = catalog?.let { runCatching { controller.hasRemoteCredentials(it.origin, it.account) }.getOrDefault(true) } == true
   val managerError = managerResult?.exceptionOrNull()?.message
   var busy by remember { mutableStateOf(false) }
   var error by remember { mutableStateOf<String?>(null) }
+  var revocationNotice by remember { mutableStateOf<String?>(null) }
   var confirmSignOut by remember { mutableStateOf(false) }
   var confirmDeleteHub by remember { mutableStateOf(false) }
-  var deletingPaired by remember { mutableStateOf<RemoteCatalog?>(null) }
+  var deletingPaired by remember { mutableStateOf<Pair<RemoteCatalog, RemoteHostMeta>?>(null) }
   val runtime by controller.state.collectAsState()
   val graph by controller.connectionGraph.collectAsState()
   val profiles = runtime.profiles
+  var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
+  LaunchedEffect(Unit) { while (true) { delay(15_000L); now = System.currentTimeMillis() } }
   var choosingTarget by remember { mutableStateOf<Pair<RemoteCatalog, RemoteHostMeta>?>(null) }
   var renamingTarget by remember { mutableStateOf<Pair<RemoteCatalog, RemoteHostMeta>?>(null) }
 
@@ -62,8 +73,18 @@ internal fun RemoteHostsSheet(
       runCatching { canonicalRemoteOrigin(it.url) == targetCatalog.origin }.getOrDefault(false)
   }
 
+  fun connectedHost(targetCatalog: RemoteCatalog, hostId: String): Boolean = profiles.any { profile ->
+    profile.remoteHostId == hostId && profile.username.trim() == targetCatalog.account.trim() &&
+      runCatching { canonicalRemoteOrigin(profile.url) == targetCatalog.origin }.getOrDefault(false) &&
+      (runtime.allServerSnapshots[profile.id]?.connected == true || (runtime.serverId == profile.id && runtime.connected))
+  }
+
+  fun freshPresence(host: RemoteHostMeta): Boolean =
+    host.presenceObservedAt?.let { it <= now && now - it <= 60_000L } == true
+
   fun reload() {
-    catalogState = controller.activeHubCatalog()
+    hubs = controller.remoteCatalogs().filterNot(controller::isPairedRemoteCatalog)
+    if (selectedHubKey != null && hubs.none { it.key == selectedHubKey }) selectedHubKey = null
     pairedState = controller.pairedRemoteCatalogs()
   }
 
@@ -72,21 +93,37 @@ internal fun RemoteHostsSheet(
     onEnroll()
   }
 
+  fun recoverHost(target: RemoteCatalog, host: RemoteHostMeta) {
+    if (controller.remoteHostUsesPairing(target.origin, target.account, host.hostId) && onOpenPairing != null)
+      onOpenPairing()
+    else triggerRelogin(target)
+  }
+
   if (confirmSignOut && catalog != null) {
     SuperDialog(title = "退出 DSH 远程中枢？", show = true, onDismissRequest = { confirmSignOut = false }) {
       Column(Modifier.padding(top = 8.dp)) {
-        Text("仅注销本机登录态并停止后台重连，本地保存的设备列表、主机指纹和离线聊天缓存会保留（便于下次重新登录后一键恢复）。如需彻底清除本地所有记录，请使用「删除中枢」。",
+        Text("退出后停止后台重连，并尝试撤销远端授权；设备列表、主机指纹和离线聊天缓存会保留。网络不可用时，远端授权会在联网后继续尝试撤销。",
           style = MiuixTheme.textStyles.body1)
         DialogActions("取消", { confirmSignOut = false }, if (busy) "正在退出…" else "退出登录", !busy, danger = true) {
           scope.launch {
             busy = true; error = null
             try {
+              val activeManager = requireNotNull(signOutManager) { "无法读取中枢授权，请稍后重试" }
               controller.markRemoteSignedOut(catalog.origin, catalog.account)
-              manager?.signOut(catalog)
+              activeManager.signOut(catalog)
+              controller.triggerPendingRemoteRevocationsDrain()
+              revocationNotice = try {
+                val count = controller.pendingRemoteRevocationCount()
+                if (count > 0) "本机已退出，$count 项远端授权仍待撤销；联网后会继续尝试。" else "本机已退出，远端撤销已完成。"
+              } catch (_: Exception) { "本机已退出，但无法读取待撤销状态，请稍后重试。" }
               reload()
               confirmSignOut = false
             } catch (cancel: CancellationException) { throw cancel }
-            catch (e: Exception) { error = userFacingError(e, "退出登录失败") }
+            catch (e: Exception) {
+              controller.triggerPendingRemoteRevocationsDrain()
+              reload(); confirmSignOut = false
+              error = userFacingError(e, "退出未完全结束，请重试撤销授权")
+            }
             finally { busy = false }
           }
         }
@@ -97,7 +134,7 @@ internal fun RemoteHostsSheet(
   if (confirmDeleteHub && catalog != null) {
     SuperDialog(title = "彻底删除此远程中枢？", show = true, onDismissRequest = { confirmDeleteHub = false }) {
       Column(Modifier.padding(top = 8.dp)) {
-        Text("将从本机彻底删除 ${catalog.account}（${catalog.origin}）下的所有中枢设备、Harness 配置、主机公钥指纹、发现缓存、离线聊天缓存与设备令牌，并自动吊销远端令牌。远端电脑上的工作区、进程与会话不受影响。",
+        Text("将从本机删除 ${catalog.account}（${catalog.origin}）下的设备、连接配置、指纹和离线缓存。远端授权会在联网后尝试撤销，撤销完成前可能仍然有效；远端电脑上的工作区和会话不受影响。",
           style = MiuixTheme.textStyles.body1)
         DialogActions("取消", { confirmDeleteHub = false }, "彻底删除", !busy, danger = true) {
           controller.deleteRemoteSource(catalog.origin, catalog.account)
@@ -111,13 +148,13 @@ internal fun RemoteHostsSheet(
     }
   }
 
-  deletingPaired?.let { target ->
+  deletingPaired?.let { (target, host) ->
     SuperDialog(title = "移除扫码配对设备？", show = true, onDismissRequest = { deletingPaired = null }) {
       Column(Modifier.padding(top = 8.dp)) {
-        Text("将从本机彻底删除扫码配对设备（${target.origin}）的接入配置、主机指纹、发现缓存、离线聊天缓存与设备令牌。",
+        Text("将从本机移除 ${host.displayName} 的接入配置与离线缓存。远端授权会在联网后尝试撤销，撤销完成前可能仍然有效。",
           style = MiuixTheme.textStyles.body1)
         DialogActions("取消", { deletingPaired = null }, "确认移除", !busy, danger = true) {
-          controller.deleteRemoteSource(target.origin, target.account)
+          controller.deleteDevice(MigrationProjection.hostId(MigrationProjection.hubSourceId(target.origin, target.account), host.hostId))
           reload()
           deletingPaired = null
           if (controller.activeHubCatalog() == null && controller.pairedRemoteCatalogs().isEmpty()) {
@@ -186,11 +223,25 @@ internal fun RemoteHostsSheet(
     Column(Modifier.fillMaxWidth().fillMaxHeight(0.78f)) {
       LazyColumn(Modifier.weight(1f).fillMaxWidth(), contentPadding = PaddingValues(horizontal = 20.dp, vertical = 8.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        revocationNotice?.let { notice -> item { HyperInlineNotice(message = notice, type = MiuixToastType.WARNING) } }
+        if (hubs.size > 1) {
+          item { Text("选择中枢账号", style = MiuixTheme.textStyles.footnote1) }
+          items(hubs, key = { "hub:${it.key}" }) { hub ->
+            HyperButton(
+              text = "${hub.account} · ${hub.origin}${if (hub.key == selectedHubKey) "（当前）" else ""}",
+              variant = if (hub.key == selectedHubKey) HyperButtonVariant.PRIMARY else HyperButtonVariant.SECONDARY,
+              onClick = { selectedHubKey = hub.key; error = null },
+              modifier = Modifier.fillMaxWidth()
+            )
+          }
+        }
         if (catalog == null) {
           item {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-              Text("还没有登录 DSH 远程中枢。登录后选择要接入的电脑，或直接扫描电脑上的配对二维码。", style = MiuixTheme.textStyles.footnote1)
-              HyperButton(text = "登录并接入主机", onClick = onEnroll, modifier = Modifier.fillMaxWidth())
+              Text(if (hubs.isEmpty()) "还没有登录 DSH 远程中枢。登录后选择要接入的电脑，或直接扫描电脑上的配对二维码。"
+                else "请选择要管理的中枢账号，或查看下方扫码设备。", style = MiuixTheme.textStyles.footnote1)
+              if (hubs.size == 1) HyperButton(text = "管理 ${hubs.first().account}", onClick = { selectedHubKey = hubs.first().key }, modifier = Modifier.fillMaxWidth())
+              HyperButton(text = "登录并接入主机", onClick = { controller.prepareRemoteRelogin(); onEnroll() }, modifier = Modifier.fillMaxWidth())
               if (onOpenPairing != null) {
                 HyperButton(
                   text = "扫码配对主机",
@@ -225,6 +276,9 @@ internal fun RemoteHostsSheet(
               onAction = { triggerRelogin(catalog) }
             )
           }
+          if (catalog.directoryPartial) item {
+            HyperInlineNotice(message = catalog.directoryIssue ?: "部分设备未能核实，正在显示上次记录，请稍后刷新。", type = MiuixToastType.WARNING)
+          }
           if (authStatus == HubAuthStatus.ACTIVE && hubSource != null) item {
             Card(Modifier.fillMaxWidth(), insideMargin = PaddingValues(horizontal = 4.dp, vertical = 2.dp)) {
               HyperSwitchRow(
@@ -242,7 +296,7 @@ internal fun RemoteHostsSheet(
               HyperButton(text = "刷新", variant = HyperButtonVariant.TERTIARY, loading = busy, enabled = manager != null && authStatus == HubAuthStatus.ACTIVE, onClick = {
                 scope.launch {
                   busy = true; error = null
-                  try { manager?.refresh()?.let(controller::saveRemoteCatalog); reload() }
+                  try { manager?.refresh()?.let(controller::publishRefreshedRemoteCatalog); reload() }
                   catch (cancel: CancellationException) { throw cancel }
                   catch (e: Exception) { error = userFacingError(e, "刷新中枢主机失败") }
                   finally { busy = false }
@@ -253,17 +307,21 @@ internal fun RemoteHostsSheet(
           items(catalog.hosts, key = { it.hostId }) { host ->
             val hostExpired = authStatus != HubAuthStatus.ACTIVE ||
               controller.hostAuthExpired(catalog.origin, catalog.account, host.hostId, runtime)
+            val hostConnected = connectedHost(catalog, host.hostId)
+            val fresh = freshPresence(host)
             val statusLabel = when {
               signedOut -> "已退出登录 · 本地缓存记录"
               hostExpired -> "登录态失效 · 本地缓存记录"
               hubSource?.enabled == false -> "中枢已暂停 · 缓存记录"
+              hostConnected -> "已连接"
+              !fresh -> "状态待确认"
               host.online -> "在线"
               else -> "离线"
             }
             val statusColor = when {
               signedOut || hostExpired -> MiuixColorTokens.Warning
               hubSource?.enabled == false -> MiuixTheme.colorScheme.onSurfaceVariantSummary
-              host.online -> MiuixColorTokens.Success
+              hostConnected || (fresh && host.online) -> MiuixColorTokens.Success
               else -> MiuixTheme.colorScheme.onSurfaceVariantSummary
             }
             Row(Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -284,9 +342,12 @@ internal fun RemoteHostsSheet(
                   })
               }
               Column(horizontalAlignment = Alignment.End) {
-                if (signedOut || hostExpired) HyperTextAction(text = "重新登录", onClick = { triggerRelogin(catalog) })
+                if (signedOut || hostExpired) HyperTextAction(
+                  text = if (controller.remoteHostUsesPairing(catalog.origin, catalog.account, host.hostId)) "重新扫码配对" else "重新登录",
+                  onClick = { recoverHost(catalog, host) }
+                )
                 else if (host.trust == RemoteTrustState.PINNED) HyperTextAction(text = "选择 Harness", onClick = { choosingTarget = catalog to host })
-                else HyperTextAction(text = "核对并接入", onClick = { triggerRelogin(catalog) })
+                else HyperTextAction(text = "核对并接入", onClick = { recoverHost(catalog, host) })
                 HyperTextAction(text = "命名", onClick = { renamingTarget = catalog to host })
               }
             }
@@ -300,8 +361,8 @@ internal fun RemoteHostsSheet(
                   modifier = Modifier.weight(1f)
                 )
                 HyperButton(
-                  text = if (signedOut) "已退出登录" else "退出登录",
-                  enabled = !signedOut,
+                  text = if (signedOut && hasRemainingCredentials) "继续撤销授权" else if (signedOut) "已退出登录" else "退出登录",
+                  enabled = !busy && (!signedOut || hasRemainingCredentials),
                   variant = HyperButtonVariant.SECONDARY,
                   onClick = { confirmSignOut = true },
                   modifier = Modifier.weight(1f)
@@ -310,7 +371,14 @@ internal fun RemoteHostsSheet(
               HyperButton(
                 text = "删除中枢（彻底清除本地数据）",
                 variant = HyperButtonVariant.DESTRUCTIVE,
+                enabled = !busy,
                 onClick = { confirmDeleteHub = true },
+                modifier = Modifier.fillMaxWidth()
+              )
+              HyperButton(
+                text = "登录另一个中枢账号",
+                variant = HyperButtonVariant.SECONDARY,
+                onClick = { controller.prepareRemoteRelogin(); onEnroll() },
                 modifier = Modifier.fillMaxWidth()
               )
               if (onOpenPairing != null) {
@@ -334,7 +402,9 @@ internal fun RemoteHostsSheet(
             )
           }
           items(pairedEntries, key = { (paired, host) -> "${paired.key}:${host.hostId}" }) { (paired, host) ->
-            val pairedExpired = controller.hubAuthStatus(paired, runtime) != HubAuthStatus.ACTIVE
+            val pairedExpired = paired.signedOut || controller.hostAuthExpired(paired.origin, paired.account, host.hostId, runtime)
+            val pairedConnected = connectedHost(paired, host.hostId)
+            val fresh = freshPresence(host)
             Row(Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
               Column(Modifier.weight(1f)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -343,13 +413,15 @@ internal fun RemoteHostsSheet(
                   Text(
                     when {
                       pairedExpired -> "凭证已失效 · 本地缓存记录"
+                      pairedConnected -> "已连接"
+                      !fresh -> "状态待确认"
                       host.online -> "在线"
                       else -> "离线"
                     },
                     style = MiuixTheme.textStyles.footnote2.copy(
                       color = when {
                         pairedExpired -> MiuixColorTokens.Warning
-                        host.online -> MiuixColorTokens.Success
+                        pairedConnected || (fresh && host.online) -> MiuixColorTokens.Success
                         else -> MiuixTheme.colorScheme.onSurfaceVariantSummary
                       }
                     )
@@ -368,10 +440,25 @@ internal fun RemoteHostsSheet(
               }
               Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                 HyperTextAction(text = "命名", onClick = { renamingTarget = paired to host })
+                if (!pairedExpired) HyperTextAction(text = "刷新", onClick = {
+                  if (!busy) scope.launch {
+                    busy = true; error = null
+                    try {
+                      val pairManager = controller.remoteAccountManager(paired.origin, paired.allowCleartext)
+                      pairManager.resume(paired)
+                      controller.publishRefreshedRemoteCatalog(pairManager.refresh())
+                      reload()
+                    } catch (cancel: CancellationException) { throw cancel }
+                    catch (e: Exception) { error = userFacingError(e, "刷新设备状态失败") }
+                    finally { busy = false }
+                  }
+                })
                 if (!pairedExpired) {
                   HyperTextAction(text = "选择 Harness", onClick = { choosingTarget = paired to host })
+                } else if (onOpenPairing != null) {
+                  HyperTextAction(text = "重新扫码", onClick = onOpenPairing)
                 }
-                HyperTextAction(text = "移除", danger = true, onClick = { deletingPaired = paired })
+                HyperTextAction(text = "移除", danger = true, onClick = { deletingPaired = paired to host })
               }
             }
           }

@@ -37,7 +37,6 @@ import com.igng.opencode.lagoon.core.SshPassphrasePolicy
 import com.igng.opencode.lagoon.core.connectionTypeLabel
 import com.igng.opencode.lagoon.core.endpointSummary
 import com.igng.opencode.lagoon.core.userFacingError
-import kotlinx.coroutines.CancellationException
 import top.yukonga.miuix.kmp.basic.HorizontalDivider
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.extra.SuperDialog
@@ -243,7 +242,7 @@ internal fun DeviceDetailScreen(
   onRefreshDiscovery: (String) -> Unit,
   discoveryError: String?,
   onEditSsh: (String) -> Unit,
-  onManageHub: () -> Unit,
+  onManageHub: (String) -> Unit,
   onDeleteDevice: (String) -> Unit
 ) {
   val graph by controller.connectionGraph.collectAsState()
@@ -290,16 +289,16 @@ internal fun DeviceDetailScreen(
           HyperInlineNotice(
             message = "中枢登录态或设备令牌已失效，当前显示本地缓存记录。",
             type = MiuixToastType.WARNING,
-            action = "重新登录",
-            onAction = { controller.openRemoteRelogin(device.endpoint, null, device.sourceName) }
+            action = controller.deviceRecoveryLabel(device),
+            onAction = { controller.openRemoteRecoveryForDevice(device) }
           )
         }
         authStatus == HubAuthStatus.SIGNED_OUT -> item {
           HyperInlineNotice(
             message = "所属中枢账号已退出登录，当前显示本地缓存记录。",
             type = MiuixToastType.WARNING,
-            action = "重新登录",
-            onAction = { controller.openRemoteRelogin(device.endpoint, null, device.sourceName) }
+            action = controller.deviceRecoveryLabel(device),
+            onAction = { controller.openRemoteRecoveryForDevice(device) }
           )
         }
         device.access == DeviceAccess.HUB && !device.sourceEnabled -> item {
@@ -410,7 +409,7 @@ internal fun DeviceDetailScreen(
               title = "中枢与账号",
               summary = "查看账号、接入其他主机或退出中枢",
               trailing = { DropdownChevron() },
-              onClick = onManageHub
+              onClick = { onManageHub(device.sourceId) }
             )
             else -> HyperRow(title = "连接信息", summary = "兼容直连资料在 Harness 详情里编辑")
           }
@@ -432,7 +431,7 @@ internal fun DeviceDetailScreen(
     SuperDialog(title = "移除 ${device.name}？", show = true, onDismissRequest = { confirmingDelete = false }) {
       Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Text("${device.access.label} · ${device.endpoint}")
-        Text("会删除这台设备的本机接入配置、身份和 ${device.attachedCount} 条 Harness 记录；远端任务与文件不受影响。")
+        Text("会删除这台设备的本机接入配置、身份和 ${device.attachedCount} 条 Harness 记录；远端授权将在联网后尝试撤销，远端任务与文件不受影响。")
         DialogActions("取消", { confirmingDelete = false }, "确认移除", danger = true) {
           confirmingDelete = false
           // 删除后设备会从投影里消失，上方 device == null 的分支负责退这一层；这里再退会多退一级。

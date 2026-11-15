@@ -1,5 +1,7 @@
 package com.igng.opencode.lagoon.core
 
+import java.util.concurrent.atomic.AtomicBoolean
+
 /**
  * 一台 Host 只保留一条加密连接。
  *
@@ -11,17 +13,25 @@ package com.igng.opencode.lagoon.core
 internal object RemoteConnectionRegistry {
   private class Entry(val session: RemoteSession, var refs: Int)
 
-  private val entries = HashMap<String, Entry>()
-
-  @Synchronized fun acquire(key: String, create: () -> RemoteSession): RemoteSession {
-    entries[key]?.let { it.refs++; return it.session }
-    val session = create()
-    entries[key] = Entry(session, 1)
-    return session
+  /** Each acquisition owns exactly one reference to the specific session it received. */
+  class Lease internal constructor(val session: RemoteSession, private val release: () -> Unit) : AutoCloseable {
+    private val closed = AtomicBoolean(false)
+    override fun close() {
+      if (closed.compareAndSet(false, true)) release()
+    }
   }
 
-  @Synchronized fun release(key: String) {
-    val entry = entries[key] ?: return
+  private val entries = HashMap<String, Entry>()
+
+  @Synchronized fun acquire(key: String, create: () -> RemoteSession): Lease {
+    val entry = entries[key]?.also { it.refs++ } ?: Entry(create(), 1).also { entries[key] = it }
+    return Lease(entry.session) { release(key, entry) }
+  }
+
+  @Synchronized private fun release(key: String, entry: Entry) {
+    // Eviction removes the old entry immediately. A late release must never decrement the
+    // reference count of a replacement that happens to have the same host key.
+    if (entries[key] !== entry) return
     entry.refs -= 1
     if (entry.refs > 0) return
     entries.remove(key)

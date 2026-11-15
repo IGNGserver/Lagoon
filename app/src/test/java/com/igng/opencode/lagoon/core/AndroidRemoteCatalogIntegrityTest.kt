@@ -38,4 +38,17 @@ class AndroidRemoteCatalogIntegrityTest {
     assertEquals("other@example.org", store.load().single().account)
     assertFalse(preferences.getString("catalogs", "")!!.contains("accessToken"))
   }
+
+  @Test fun staleRefreshCannotUndoSignOutOrRecreateDeletedAccount() {
+    val store = AndroidRemoteCatalogStore(FakeSharedPreferences())
+    val original = catalog()
+    val refreshed = original.copy(updatedAt = 2)
+    store.save(original)
+    store.save(original.copy(signedOut = true))
+    assertFalse(store.replaceIfUnchanged(original, refreshed))
+    assertTrue(store.load().single().signedOut)
+    store.clear(original.origin, original.account)
+    assertFalse(store.replaceIfUnchanged(original, refreshed))
+    assertTrue(store.load().isEmpty())
+  }
 }

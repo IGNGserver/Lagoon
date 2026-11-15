@@ -66,7 +66,7 @@ class RemoteServerApiTest {
     assertEquals("NoKey", hosts[1].name)
     assertNull(hosts[1].publicKey)
     val request = mock.takeRequest()
-    assertEquals("/api/v1/account/devices", request.path)
+    assertEquals("/api/v1/account/devices?limit=50", request.path)
     assertEquals("Bearer $accountToken", request.getHeader("Authorization"))
   }
 
@@ -75,6 +75,13 @@ class RemoteServerApiTest {
       .setBody("""{"error":{"code":"ACCOUNT_AUTH_REQUIRED","message":"ACCOUNT_AUTH_REQUIRED","retryable":false}}"""))
     try { api.accountHosts(accountToken); fail("expected failure") }
     catch (error: IOException) { assertTrue(error.message!!.contains("重新登录")) }
+  }
+
+  @Test fun accountDirectoryRejectsDuplicateHostsAcrossPages() = server { mock, api ->
+    val host = """{"deviceId":"$hostId","name":"Host","platform":"linux","role":"host","membershipId":"member","online":true,"identityKey":"$key"}"""
+    mock.enqueue(MockResponse().setBody("""{"items":[$host],"nextCursor":"more"}"""))
+    mock.enqueue(MockResponse().setBody("""{"items":[$host],"nextCursor":null}"""))
+    assertTrue(runCatching { api.accountHosts(accountToken) }.exceptionOrNull() is IOException)
   }
 
   @Test fun loginRejectsWrongPasswordWithCredentialMessage() = server { mock, api ->
@@ -144,7 +151,7 @@ class RemoteServerApiTest {
     mock.enqueue(MockResponse().setBody("""{"items":[{"deviceId":"$hostId","name":"One","platform":"linux","role":"host","membershipId":"member","online":true}],"nextCursor":"more"}"""))
     mock.enqueue(MockResponse().setBody("""{"items":[{"deviceId":"$id","name":"Two","platform":"linux","role":"host","membershipId":"member","online":false}],"nextCursor":null}"""))
     assertEquals(listOf(hostId, id), api.hosts(access).map { it.deviceId })
-    assertEquals("/api/v1/devices", mock.takeRequest().path)
+    assertEquals("/api/v1/devices?limit=50", mock.takeRequest().path)
     val next = mock.takeRequest()
     assertEquals("more", next.requestUrl!!.queryParameter("cursor"))
     assertEquals("50", next.requestUrl!!.queryParameter("limit"))

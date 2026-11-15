@@ -6,6 +6,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -27,6 +28,13 @@ internal class RemoteControlException(
   val retryable: Boolean
 ) : IOException(message)
 
+internal data class RemoteRelayTimeouts(
+  val helloMillis: Long = 10_000L,
+  val connectMillis: Long = 20_000L,
+  val attachMillis: Long = 15_000L,
+  val handshakeMillis: Long = 20_000L,
+)
+
 /** Relay over the authenticated control socket. Separate relay endpoints are not yet supported. */
 internal class RemoteRelay(
   address: String,
@@ -38,7 +46,8 @@ internal class RemoteRelay(
   private val onMessage: (ByteArray) -> Unit,
   private val onClose: (IOException) -> Unit,
   /** Sent in `hello`; the Hub stores it as the peer version and shows it in the device list. */
-  private val clientVersion: String = ""
+  private val clientVersion: String = "",
+  private val phaseTimeouts: RemoteRelayTimeouts = RemoteRelayTimeouts(),
 ) : RemoteSecureChannel {
   private val base = requireNotNull(address.trim().toHttpUrlOrNull()) { "DSH Hub 地址无效" }
   private val http = OkHttpClient.Builder().connectTimeout(10, TimeUnit.SECONDS).readTimeout(0, TimeUnit.SECONDS)
@@ -48,6 +57,9 @@ internal class RemoteRelay(
     // sharing it lets several Remote hosts starve ordinary requests and prevents liveness pings.
     .connectionPool(SharedHttp.connectionPool).dispatcher(SharedHttp.streamDispatcher).build()
   private val ready = CompletableDeferred<Unit>()
+  private val helloReady = CompletableDeferred<Unit>()
+  private val connectionAssigned = CompletableDeferred<Boolean>()
+  private val relayReady = CompletableDeferred<Unit>()
   private val sendLock = Mutex()
   private val incoming = RemoteSecureFragments()
   private val outgoing = RemoteSecureFragments()
@@ -90,7 +102,7 @@ internal class RemoteRelay(
     require(RemoteServerApi.validToken(token) && RemoteServerApi.validPublicKey(pinnedHostKey))
   }
 
-  suspend fun connect(timeoutMillis: Long = 20_000) {
+  suspend fun connect(timeoutMillis: Long = 70_000) {
     require(timeoutMillis in 1..120_000)
     synchronized(this) {
       check(state == State.NEW) { "Remote 连接不可重复使用" }
@@ -98,9 +110,24 @@ internal class RemoteRelay(
       val request = Request.Builder().url(base.newBuilder().addPathSegments("ws/v1/connect").build()).build()
       socket = http.newWebSocket(request, listener)
     }
-    try { withTimeout(timeoutMillis) { ready.await() } }
-    catch (error: Exception) { fail(IOException("Remote 连接未建立", error)); throw error }
+    try {
+      val completed = withTimeoutOrNull(timeoutMillis) {
+        awaitPhase(helloReady, phaseTimeouts.helloMillis, "中枢认证")
+        val separateRelay = awaitPhase(connectionAssigned, phaseTimeouts.connectMillis, "主机连接")
+        if (separateRelay) awaitPhase(relayReady, phaseTimeouts.attachMillis, "中继连接")
+        awaitPhase(ready, phaseTimeouts.handshakeMillis, "安全握手")
+        true
+      }
+      if (completed != true) throw RemoteControlException("CONNECTION_FAILED", "远程连接超时，请重试", true)
+    } catch (error: Exception) {
+      fail(if (error is IOException) error else IOException("Remote 连接未建立", error))
+      throw error
+    }
   }
+
+  private suspend fun <T : Any> awaitPhase(signal: CompletableDeferred<T>, timeout: Long, label: String): T =
+    withTimeoutOrNull(timeout) { signal.await() }
+      ?: throw RemoteControlException("CONNECTION_FAILED", "${label}超时，请重试", true)
 
   override suspend fun send(message: ByteArray) = sendLock.withLock {
     try {
@@ -185,6 +212,7 @@ internal class RemoteRelay(
           lastTrafficAt = System.currentTimeMillis()
           state = State.CONNECT
           sendFrame("connect.request", JSONObject().put("hostDeviceId", hostId).put("preferredTransports", JSONArray().put("relay")), controlLimit)
+          helloReady.complete(Unit)
         }
         "connect.accepted" -> {
           if (state != State.CONNECT) throw IOException("Remote 握手顺序无效")
@@ -200,9 +228,11 @@ internal class RemoteRelay(
             relayTicket = ticket
             relayEpoch = (payload.opt("relayEpoch") as? Number)?.toLong()
             state = State.ASSIGNED
+            connectionAssigned.complete(true)
             SharedHttp.ioScope.launch { attachRelay(endpoint) }
           } else {
             state = State.HANDSHAKE
+            connectionAssigned.complete(false)
             sendFrame("secure.handshake", JSONObject().put("connectionId", id).put("targetDeviceId", hostId)
               .put("step", 1).put("data", encode(session.writeHandshake())), controlLimit)
           }
@@ -264,6 +294,7 @@ internal class RemoteRelay(
           .put("targetDeviceId", hostId).put("transport", "relay"), controlLimit)
         sendFrame("secure.handshake", JSONObject().put("connectionId", id).put("targetDeviceId", hostId)
           .put("step", 1).put("data", encode(session.writeHandshake())), controlLimit)
+        relayReady.complete(Unit)
       }
     } catch (cancel: CancellationException) {
       throw cancel
@@ -357,6 +388,9 @@ internal class RemoteRelay(
       if (state == State.CLOSED) return
       state = State.CLOSED
       ready.completeExceptionally(error)
+      helloReady.completeExceptionally(error)
+      connectionAssigned.completeExceptionally(error)
+      relayReady.completeExceptionally(error)
       attachSignal?.completeExceptionally(error)
       dataReady = false
       noise?.close(); noise = null

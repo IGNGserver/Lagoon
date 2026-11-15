@@ -19,7 +19,9 @@ internal data class RemoteHostMeta(
   val fingerprint: String?,
   val trust: RemoteTrustState = RemoteTrustState.UNKNOWN,
   /** 手机本地显示名；只影响本机 UI，不回写中枢，也不参与主机身份。 */
-  val alias: String? = null
+  val alias: String? = null,
+  /** Time at which online/offline was actually observed, not when pairing was approved. */
+  val presenceObservedAt: Long? = null
 ) {
   /** Host 自报名不可用（空或全问号）时仍保留原始字段供诊断，但界面不应直接展示。 */
   val nameUnavailable: Boolean get() = name.isBlank() || name.all { it == '?' }
@@ -57,7 +59,10 @@ internal data class RemoteCatalog(
   val signedOut: Boolean = false,
   val adoptedHostIds: Set<String>? = null,
   /** Explicit user pause toggle for HUB ConnectionSource; null preserves legacy projection fallback. */
-  val userPaused: Boolean? = null
+  val userPaused: Boolean? = null,
+  /** A partial refresh preserves unverified entries and must not be presented as authoritative. */
+  val directoryPartial: Boolean = false,
+  val directoryIssue: String? = null
 ) {
   val key: String get() = "$origin\u0000$account"
   val requiresCleartextConsent: Boolean
@@ -74,14 +79,23 @@ internal interface RemoteCatalogStore {
   fun load(): List<RemoteCatalog>
   fun save(catalog: RemoteCatalog)
   fun clear(origin: String, account: String)
+  /** A stale network refresh must not undo a concurrent sign-out, deletion or edit. */
+  fun replaceIfUnchanged(expected: RemoteCatalog, updated: RemoteCatalog): Boolean {
+    require(expected.key == updated.key)
+    if (load().firstOrNull { it.key == expected.key } != expected) return false
+    save(updated)
+    return true
+  }
 }
 
 internal object RemoteCatalogCodec {
   fun encode(catalog: RemoteCatalog): String = JSONObject()
+    .apply { require(catalog.hosts.size <= 5000) { "Remote 主机目录过大" } }
     .put("version", 1).put("origin", catalog.origin).put("account", catalog.account)
     .put("provider", catalog.provider ?: JSONObject.NULL).put("deviceLabel", catalog.deviceLabel)
     .put("updatedAt", catalog.updatedAt)
     .put("allowCleartext", catalog.allowCleartext).put("signedOut", catalog.signedOut)
+    .put("directoryPartial", catalog.directoryPartial).put("directoryIssue", catalog.directoryIssue ?: JSONObject.NULL)
     .apply {
       if (catalog.adoptedHostIds != null) {
         put("adoptedHostIds", JSONArray(catalog.adoptedHostIds.toList()))
@@ -97,7 +111,7 @@ internal object RemoteCatalogCodec {
           .put("harnessVersion", host.harnessVersion ?: JSONObject.NULL)
           .put("pluginVersion", host.pluginVersion ?: JSONObject.NULL)
           .put("fingerprint", host.fingerprint ?: JSONObject.NULL)
-          .put("trust", host.trust.name).putOpt("alias", host.alias))
+          .put("trust", host.trust.name).putOpt("alias", host.alias).putOpt("presenceObservedAt", host.presenceObservedAt))
       }
     }).toString()
 
@@ -115,7 +129,7 @@ internal object RemoteCatalogCodec {
       }
       val updated = json.optLong("updatedAt", 0).takeIf { it > 0 } ?: System.currentTimeMillis()
       val rawHosts = json.optJSONArray("hosts") ?: throw IOException("Remote 主机目录无效")
-      if (rawHosts.length() > 64) throw IOException("Remote 主机目录过大")
+      if (rawHosts.length() > 5000) throw IOException("Remote 主机目录过大")
       val hosts = (0 until rawHosts.length()).map { index ->
         val item = rawHosts.optJSONObject(index) ?: throw IOException("Remote 主机目录无效")
         val hostId = item.getString("hostId")
@@ -131,7 +145,8 @@ internal object RemoteCatalogCodec {
           pluginVersion = (item.opt("pluginVersion") as? String)?.let { truncateByCodePointsSafe(it, 64) },
           fingerprint = fingerprint,
           trust = runCatching { RemoteTrustState.valueOf(item.optString("trust")) }.getOrDefault(RemoteTrustState.UNKNOWN),
-          alias = sanitizeRemoteAlias(item.opt("alias") as? String)
+          alias = sanitizeRemoteAlias(item.opt("alias") as? String),
+          presenceObservedAt = item.optLong("presenceObservedAt", 0).takeIf { it > 0 }
         )
       }
       if (hosts.distinctBy { it.hostId }.size != hosts.size) throw IOException("Remote 主机目录重复")
@@ -146,7 +161,9 @@ internal object RemoteCatalogCodec {
         json.optBoolean("allowCleartext", false),
         json.optBoolean("signedOut", false),
         adoptedHostIds,
-        userPaused
+        userPaused,
+        json.optBoolean("directoryPartial", false),
+        (json.opt("directoryIssue") as? String)?.take(256)
       )
     } catch (error: IOException) { throw error }
     catch (error: Exception) { throw IOException("Remote 主机目录损坏", error) }

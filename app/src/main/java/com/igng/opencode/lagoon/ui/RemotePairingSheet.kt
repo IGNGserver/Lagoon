@@ -50,6 +50,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import top.yukonga.miuix.kmp.basic.*
 import top.yukonga.miuix.kmp.theme.MiuixTheme
@@ -70,6 +71,7 @@ internal fun RemotePairingSheet(
   val context = LocalContext.current
   val lifecycleOwner = LocalLifecycleOwner.current
   val scope = rememberCoroutineScope()
+  val recoveryStore = remember(context.applicationContext) { RemotePairingRecoveryStore(context.applicationContext) }
 
   var hasCameraPermission by remember {
     mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED)
@@ -81,6 +83,7 @@ internal fun RemotePairingSheet(
   var rawInput by remember { mutableStateOf("") }
   var allowHttp by rememberSaveable { mutableStateOf(false) }
   var needsHttpConsent by remember { mutableStateOf(false) }
+  var proposedOrigin by remember { mutableStateOf<String?>(null) }
   var scannedIsTicket by remember { mutableStateOf(true) }
   var cameraActive by remember { mutableStateOf(true) }
   var busy by remember { mutableStateOf(false) }
@@ -95,7 +98,34 @@ internal fun RemotePairingSheet(
   var claim by remember { mutableStateOf<RemotePairingClaim?>(null) }
   var statusState by remember { mutableStateOf(RemotePairingState.CREATED) }
   var terminalFailure by remember { mutableStateOf<String?>(null) }
-  var customOriginConfirmed by remember { mutableStateOf(false) }
+  var pending by remember { mutableStateOf<PendingRemotePairing?>(null) }
+  var recoveryLoaded by remember { mutableStateOf(false) }
+  var recoveryReadFailed by remember { mutableStateOf(false) }
+  var cancelling by remember { mutableStateOf(false) }
+  var cancelIntentFailed by remember { mutableStateOf(false) }
+  var connectionScheduled by remember { mutableStateOf(false) }
+
+  LaunchedEffect(recoveryStore) {
+    try {
+      val saved = withContext(Dispatchers.IO) { recoveryStore.load() }
+      if (saved != null) {
+        pending = saved
+        offer = saved.offer
+        sessionIdentity = saved.identity
+        sessionDevice = saved.device
+        frozenClaimBody = saved.claimBody
+        allowHttp = saved.allowCleartext
+        cameraActive = false
+      }
+    } catch (cancel: CancellationException) {
+      throw cancel
+    } catch (e: Exception) {
+      recoveryReadFailed = true
+      error = userFacingError(e, "未能读取之前的配对")
+    } finally {
+      recoveryLoaded = true
+    }
+  }
 
   fun resetToScan(clearInput: Boolean = false) {
     offer = null
@@ -105,7 +135,10 @@ internal fun RemotePairingSheet(
     claim = null
     statusState = RemotePairingState.CREATED
     terminalFailure = null
-    customOriginConfirmed = false
+    pending = null
+    proposedOrigin = null
+    connectionScheduled = false
+    cancelIntentFailed = false
     error = null
     busy = false
     if (clearInput) {
@@ -116,39 +149,49 @@ internal fun RemotePairingSheet(
     cameraActive = true
   }
 
-  fun resolveInput(text: String, explicitHttpConsent: Boolean) {
+  fun resolveInput(text: String, explicitHttpConsent: Boolean, originConfirmed: Boolean = false) {
     if (busy) return
+    rawInput = text
+    cameraActive = false
     val inspected = try {
       parseRemotePairingScan(text, allowCleartext = true)
     } catch (e: RemotePairingException) {
       error = e.message ?: "无效的配对二维码"
       return
     }
-    rawInput = text
     scannedIsTicket = inspected is RemotePairingScan.Ticket
+    if (!originConfirmed || proposedOrigin != inspected.origin) {
+      proposedOrigin = inspected.origin
+      needsHttpConsent = inspected.isCleartext
+      error = null
+      return
+    }
     if (inspected.isCleartext && !explicitHttpConsent) {
       needsHttpConsent = true
       cameraActive = false
       error = "配对链接使用明文 HTTP (${inspected.origin})，请确认受信任后再允许连接"
       return
     }
+    val confirmedOrigin = proposedOrigin
     scope.launch {
       busy = true
       error = null
       needsHttpConsent = false
       try {
-        val validatedScan = parseRemotePairingScan(text, allowCleartext = explicitHttpConsent)
         val resolved = withContext(Dispatchers.IO) {
-          RemotePairingClient(RemoteServerApi(validatedScan.origin, explicitHttpConsent)).resolve(validatedScan)
+          resolveConfirmedRemotePairing(text, explicitHttpConsent, confirmedOrigin) { scan ->
+            RemotePairingClient(RemoteServerApi(scan.origin, explicitHttpConsent)).resolve(scan)
+          }
         }
         offer = resolved
+        rawInput = ""
         sessionIdentity = null
         sessionDevice = null
         frozenClaimBody = null
         claim = null
         statusState = RemotePairingState.CREATED
         terminalFailure = null
-        customOriginConfirmed = false
+        proposedOrigin = null
         cameraActive = false
       } catch (cancel: CancellationException) {
         throw cancel
@@ -176,12 +219,12 @@ internal fun RemotePairingSheet(
     }
   }
 
-  // Protect the 8-digit verification code from screenshots / screen recording / task switcher thumbnails.
-  DisposableEffect(claim != null) {
+  // Both the scanned ticket and the verification code are secrets.
+  DisposableEffect(Unit) {
     val activity = context.findActivity()
     val window = activity?.window
     val hadSecure = window != null && (window.attributes.flags and WindowManager.LayoutParams.FLAG_SECURE) != 0
-    if (claim != null && window != null && !hadSecure) {
+    if (window != null && !hadSecure) {
       window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
     }
     onDispose {
@@ -191,35 +234,57 @@ internal fun RemotePairingSheet(
     }
   }
 
-  // Foreground-only pairing status polling while waiting on the host confirmation.
-  LaunchedEffect(offer?.sessionId, claim?.verificationCode, lifecycleOwner) {
-    val activeOffer = offer ?: return@LaunchedEffect
-    val activeClaim = claim ?: return@LaunchedEffect
-    val identity = sessionIdentity ?: return@LaunchedEffect
-    val device = sessionDevice ?: return@LaunchedEffect
-    if (terminalFailure != null || statusState.isTerminal) return@LaunchedEffect
-    val client = RemotePairingClient(RemoteServerApi(activeOffer.origin, allowHttp))
-
+  // The exact claim is written before it is sent. On recreation, try that same claim first;
+  // if the server has already completed it, status still recovers the original credentials.
+  LaunchedEffect(pending?.offer?.sessionId, pending?.cancelRequested, cancelling, cancelIntentFailed, lifecycleOwner) {
+    val active = pending ?: return@LaunchedEffect
+    if (cancelling || cancelIntentFailed) return@LaunchedEffect
+    val client = RemotePairingClient(RemoteServerApi(active.offer.origin, active.allowCleartext))
     lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
-      while (offer?.sessionId == activeOffer.sessionId &&
-        claim?.verificationCode == activeClaim.verificationCode &&
-        !statusState.isTerminal &&
-        terminalFailure == null
-      ) {
+      while (pending?.offer?.sessionId == active.offer.sessionId && terminalFailure == null) {
         var nextDelayMs = 2_500L
         try {
-          val polled = withContext(Dispatchers.IO) {
-            client.pollStatus(activeOffer, identity, device)
+          val needsCode = !active.cancelRequested && claim == null &&
+            (statusState == RemotePairingState.CREATED || statusState == RemotePairingState.CLAIMED)
+          var cancelError: Exception? = null
+          val attempt = remotePairingOperationMutex.withLock {
+            withContext(Dispatchers.IO) {
+              if (active.cancelRequested) {
+                try { client.cancel(active.offer, active.identity) }
+                catch (cancel: CancellationException) { throw cancel }
+                catch (failure: Exception) { cancelError = failure }
+              }
+              recoverRemotePairingStatus(
+                pending = active,
+                recoverCode = needsCode,
+                claim = { client.claim(it.offer, it.identity, it.device, it.claimBody) },
+                status = { client.pollStatus(it.offer, it.identity, it.device) },
+              )
+            }
           }
+          attempt.claim?.let { claim = it }
+          val polled = attempt.status
           statusState = polled.state
+          if (polled.recoverUntilMillis != null && pending?.recoverUntilMillis != polled.recoverUntilMillis) {
+            val updated = active.copy(recoverUntilMillis = polled.recoverUntilMillis)
+            withContext(Dispatchers.IO) { recoveryStore.save(updated) }
+            pending = updated
+          }
           when (polled.state) {
             RemotePairingState.COMPLETED -> {
               val credentials = polled.credentials
                 ?: throw RemotePairingException("PAIRING_FAILED", "配对完成但未收到设备凭据")
-              withContext(Dispatchers.IO) {
-                controller.completeRemotePairing(activeOffer, credentials, identity, allowHttp)
+              val catalog = withContext(Dispatchers.IO) {
+                controller.completeRemotePairing(active.offer, credentials, active.identity, active.allowCleartext)
               }
-              onPaired(activeOffer.host.name)
+              if (!connectionScheduled) {
+                controller.connectPairedRemoteHostAsync(catalog, active.offer.host.deviceId)
+                connectionScheduled = true
+              }
+              // If cleanup fails, retain the recovery record. Re-adoption preserves rotated tokens.
+              withContext(Dispatchers.IO) { recoveryStore.clear(active.offer.sessionId) }
+              pending = null
+              onPaired(active.offer.host.name)
               return@repeatOnLifecycle
             }
             RemotePairingState.FAILED -> {
@@ -227,38 +292,33 @@ internal fun RemotePairingSheet(
               return@repeatOnLifecycle
             }
             RemotePairingState.CANCELLED -> {
-              terminalFailure = "电脑端已取消本次配对"
+              terminalFailure = "本次配对已取消"
               return@repeatOnLifecycle
             }
             RemotePairingState.EXPIRED -> {
-              terminalFailure = "本次配对已超时过期，请在电脑上重新生成二维码"
+              terminalFailure = "本次配对已超时，请在电脑上重新生成二维码"
               return@repeatOnLifecycle
             }
-            RemotePairingState.CREATED, RemotePairingState.CLAIMED, RemotePairingState.APPROVED -> Unit
+            RemotePairingState.CREATED, RemotePairingState.CLAIMED, RemotePairingState.APPROVED -> {
+              error = if (active.cancelRequested) cancelError?.let { userFacingError(it, "取消结果暂时未知，正在重试") }
+              else if (polled.state == RemotePairingState.CLAIMED && claim == null)
+                attempt.claimError?.let { userFacingError(it, "验证码暂时无法恢复，正在重试") } else null
+            }
           }
         } catch (cancel: CancellationException) {
           throw cancel
         } catch (e: RemotePairingException) {
-          if (e.code in setOf(
-              "PAIRING_NOT_FOUND",
-              "PAIRING_EXPIRED",
-              "PAIRING_IDENTITY_MISMATCH",
-              "PAIRING_PROOF_INVALID",
-              "PAIRING_SCAN_INVALID",
-              "PAIRING_DEVICE_CONFLICT",
-              "PAIRING_ACCOUNT_CONFLICT",
-              "PAIRING_CLOSED",
-            )
-          ) {
-            terminalFailure = e.message ?: "配对已中止"
+          val recoveryDeadline = pending?.recoverUntilMillis ?: active.offer.expiresAtMillis
+          if (e.code == "PAIRING_NOT_FOUND" && System.currentTimeMillis() > recoveryDeadline) {
+            terminalFailure = "配对会话已不存在，请在电脑端重新生成二维码"
             return@repeatOnLifecycle
           }
           nextDelayMs = e.retryAfterMs ?: 2_500L
-          error = e.message
+          error = userFacingError(e, "配对状态暂时无法确认，正在重试")
         } catch (e: Exception) {
-          error = userFacingError(e, "轮询配对状态失败，正在重试")
+          error = userFacingError(e, if (statusState == RemotePairingState.COMPLETED) "已完成配对，保存失败，正在重试" else "配对状态暂时无法确认，正在重试")
         }
-        delay(nextDelayMs)
+        delay(nextDelayMs.coerceAtLeast(500L))
       }
     }
   }
@@ -266,16 +326,8 @@ internal fun RemotePairingSheet(
   HyperBottomSheet(
     title = "扫码配对电脑",
     show = true,
-    onDismissRequest = {
-      val currentOffer = offer
-      val currentIdentity = sessionIdentity
-      if (currentOffer != null && currentIdentity != null && !statusState.isTerminal &&
-        statusState != RemotePairingState.APPROVED
-      ) {
-        controller.cancelRemotePairingAsync(currentOffer, currentIdentity, allowHttp)
-      }
-      onDismiss()
-    },
+    // Closing the sheet pauses polling; it is not consent to cancel an approved transaction.
+    onDismissRequest = onDismiss,
   ) {
     Column(Modifier.fillMaxWidth().fillMaxHeight(0.88f)) {
       LazyColumn(
@@ -286,6 +338,10 @@ internal fun RemotePairingSheet(
         val activeOffer = offer
         val activeClaim = claim
         when {
+          !recoveryLoaded -> item { Text("正在检查未完成的配对…") }
+          recoveryReadFailed -> item {
+            HyperInlineNotice(message = "无法读取之前的配对资料，请稍后重试。为保护已有身份，暂不能开始新配对。", type = MiuixToastType.ERROR)
+          }
           activeOffer == null -> {
             item {
               Text(
@@ -319,6 +375,7 @@ internal fun RemotePairingSheet(
                   text = "从相册选择二维码",
                   variant = HyperButtonVariant.SECONDARY,
                   loading = busy,
+                  enabled = !busy,
                   onClick = { galleryLauncher.launch("image/*") },
                   modifier = Modifier.weight(1f),
                 )
@@ -326,7 +383,8 @@ internal fun RemotePairingSheet(
                   HyperButton(
                     text = "恢复相机",
                     variant = HyperButtonVariant.SECONDARY,
-                    onClick = { cameraActive = true; error = null },
+                    enabled = !busy,
+                    onClick = { rawInput = ""; proposedOrigin = null; allowHttp = false; cameraActive = true; error = null },
                     modifier = Modifier.weight(1f),
                   )
                 }
@@ -336,11 +394,13 @@ internal fun RemotePairingSheet(
               TextField(
                 value = rawInput,
                 onValueChange = {
+                  if (busy) return@TextField
                   val changed = it != rawInput
                   rawInput = it
                   if (changed) {
                     allowHttp = false
                     needsHttpConsent = false
+                    proposedOrigin = null
                   }
                   error = null
                 },
@@ -350,6 +410,14 @@ internal fun RemotePairingSheet(
             val parsedPreview = runCatching {
               if (rawInput.isBlank()) null else parseRemotePairingScan(rawInput, allowCleartext = true)
             }.getOrNull()
+            proposedOrigin?.let { origin ->
+              item {
+                HyperInlineNotice(
+                  message = "请确认电脑端显示的服务器地址：$origin。确认后才会向该地址发送配对请求。",
+                  type = MiuixToastType.WARNING,
+                )
+              }
+            }
             if (needsHttpConsent || parsedPreview?.isCleartext == true) {
               item {
                 HyperSwitchRow(
@@ -362,17 +430,16 @@ internal fun RemotePairingSheet(
             }
             item {
               HyperButton(
-                text = "解析配对码",
+                text = if (proposedOrigin == null) "检查配对码" else "确认服务器并继续",
                 loading = busy,
                 enabled = rawInput.isNotBlank() && (!(needsHttpConsent || parsedPreview?.isCleartext == true) || allowHttp),
-                onClick = { resolveInput(rawInput, explicitHttpConsent = allowHttp) },
+                onClick = { resolveInput(rawInput, explicitHttpConsent = allowHttp, originConfirmed = proposedOrigin != null) },
                 modifier = Modifier.fillMaxWidth(),
               )
             }
           }
 
-          activeClaim == null -> {
-            val isCustomOrigin = activeOffer.origin.removeSuffix("/") != "https://dsh.r2049.cn"
+          activeClaim == null && pending == null -> {
             item {
               HyperInlineNotice(
                 message = if (scannedIsTicket) {
@@ -382,16 +449,6 @@ internal fun RemotePairingSheet(
                 },
                 type = MiuixToastType.WARNING,
               )
-            }
-            if (isCustomOrigin) {
-              item {
-                HyperSwitchRow(
-                  title = "确认连接自定义中枢地址",
-                  summary = "该配对码指向非默认中枢 (${activeOffer.origin})，确认受信任后再继续",
-                  checked = customOriginConfirmed,
-                  onCheckedChange = { customOriginConfirmed = it },
-                )
-              }
             }
             item {
               Card(Modifier.fillMaxWidth(), insideMargin = PaddingValues(14.dp)) {
@@ -417,7 +474,7 @@ internal fun RemotePairingSheet(
               HyperButton(
                 text = "确认主机并获取 8 位验证码",
                 loading = busy,
-                enabled = !busy && (!isCustomOrigin || customOriginConfirmed),
+                enabled = !busy,
                 onClick = {
                   if (busy) return@HyperButton
                   scope.launch {
@@ -434,12 +491,9 @@ internal fun RemotePairingSheet(
                         clientVersion = appVersionName(context),
                       ).also { sessionDevice = it }
                       val body = frozenClaimBody ?: pairingClaimBody(activeOffer.scanSecret, device).also { frozenClaimBody = it }
-                      val claimed = withContext(Dispatchers.IO) {
-                        RemotePairingClient(RemoteServerApi(activeOffer.origin, allowHttp))
-                          .claim(activeOffer, identity, device, body)
-                      }
-                      claim = claimed
-                      statusState = RemotePairingState.CLAIMED
+                      val prepared = PendingRemotePairing(activeOffer, identity, device, body, allowHttp)
+                      withContext(Dispatchers.IO) { recoveryStore.save(prepared) }
+                      pending = prepared
                     } catch (cancel: CancellationException) {
                       throw cancel
                     } catch (e: Exception) {
@@ -464,24 +518,26 @@ internal fun RemotePairingSheet(
           }
 
           else -> {
-            val formattedCode = "${activeClaim.verificationCode.substring(0, 4)} ${activeClaim.verificationCode.substring(4)}"
-            item {
-              Card(Modifier.fillMaxWidth(), insideMargin = PaddingValues(18.dp)) {
-                Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                  Text(
-                    "配对验证码",
-                    style = MiuixTheme.textStyles.footnote1.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary),
-                  )
-                  Text(
-                    formattedCode,
-                    style = MiuixTheme.textStyles.title1.copy(fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold),
-                    textAlign = TextAlign.Center,
-                  )
-                  Text(
-                    "请在电脑端输入这 8 位数字并点击确认。为保护安全，此界面已开启防截屏，验证码仅在本界面显示一次。",
-                    style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary),
-                    textAlign = TextAlign.Center,
-                  )
+            if (activeClaim != null && !statusState.isTerminal && pending?.cancelRequested != true) {
+              val formattedCode = "${activeClaim.verificationCode.substring(0, 4)} ${activeClaim.verificationCode.substring(4)}"
+              item {
+                Card(Modifier.fillMaxWidth(), insideMargin = PaddingValues(18.dp)) {
+                  Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                      "配对验证码",
+                      style = MiuixTheme.textStyles.footnote1.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary),
+                    )
+                    Text(
+                      formattedCode,
+                      style = MiuixTheme.textStyles.title1.copy(fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold),
+                      textAlign = TextAlign.Center,
+                    )
+                    Text(
+                      "请在电脑端输入这 8 位数字并点击确认。为保护安全，此界面已开启防截屏。",
+                      style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary),
+                      textAlign = TextAlign.Center,
+                    )
+                  }
                 }
               }
             }
@@ -491,7 +547,18 @@ internal fun RemotePairingSheet(
               item {
                 HyperButton(
                   text = "重新扫码",
-                  onClick = { resetToScan(clearInput = true) },
+                  onClick = {
+                    scope.launch {
+                      try {
+                        withContext(Dispatchers.IO) { recoveryStore.clear(activeOffer.sessionId) }
+                        resetToScan(clearInput = true)
+                      } catch (cancel: CancellationException) {
+                        throw cancel
+                      } catch (e: Exception) {
+                        error = userFacingError(e, "清理已结束的配对失败")
+                      }
+                    }
+                  },
                   modifier = Modifier.fillMaxWidth(),
                 )
               }
@@ -504,8 +571,11 @@ internal fun RemotePairingSheet(
                 ) {
                   InfiniteProgressIndicator(size = 18.dp, strokeWidth = 2.dp)
                   Text(
-                    when (statusState) {
-                      RemotePairingState.APPROVED -> "电脑已提交正确验证码，正在完成绑定…"
+                    when {
+                      statusState == RemotePairingState.COMPLETED -> "电脑已完成配对，正在安全保存…"
+                      pending?.cancelRequested == true -> "正在确认取消配对…"
+                      statusState == RemotePairingState.APPROVED -> "电脑已提交正确验证码，正在完成绑定…"
+                      activeClaim == null -> "正在恢复配对…"
                       else -> "等待你在 ${activeOffer.host.name} 上输入验证码…"
                     },
                     style = MiuixTheme.textStyles.body2,
@@ -516,15 +586,26 @@ internal fun RemotePairingSheet(
                 HyperButton(
                   text = "取消配对",
                   variant = HyperButtonVariant.DESTRUCTIVE,
-                  enabled = !busy && statusState != RemotePairingState.APPROVED,
+                  enabled = !busy && !cancelling && pending?.cancelRequested != true && statusState != RemotePairingState.COMPLETED,
                   onClick = {
-                    if (statusState == RemotePairingState.APPROVED) return@HyperButton
-                    val identity = sessionIdentity
-                    if (identity != null && !statusState.isTerminal) {
-                      controller.cancelRemotePairingAsync(activeOffer, identity, allowHttp)
+                    val current = pending ?: return@HyperButton
+                    cancelling = true
+                    scope.launch {
+                      try {
+                        val requested = current.copy(cancelRequested = true)
+                        withContext(Dispatchers.IO) { recoveryStore.save(requested) }
+                        pending = requested
+                        cancelIntentFailed = false
+                        error = null
+                      } catch (cancel: CancellationException) {
+                        throw cancel
+                      } catch (e: Exception) {
+                        cancelIntentFailed = true
+                        error = userFacingError(e, "取消请求未能保存，请重试")
+                      } finally {
+                        cancelling = false
+                      }
                     }
-                    resetToScan(clearInput = true)
-                    onDismiss()
                   },
                   modifier = Modifier.fillMaxWidth(),
                 )

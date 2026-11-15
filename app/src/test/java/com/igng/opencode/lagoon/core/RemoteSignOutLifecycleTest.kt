@@ -25,6 +25,19 @@ class RemoteSignOutLifecycleTest {
     override fun load(slot: String): RemoteDeviceRecord? = values[slot]
     override fun save(slot: String, record: RemoteDeviceRecord) { values[slot] = record }
     override fun delete(slot: String) { values.remove(slot) }
+    override fun listSlots(): Set<String> = values.keys.toSet()
+    val queue = mutableListOf<PendingRemoteRevocation>()
+    var rejectEnqueue = false
+    override fun pendingRevocations(): List<PendingRemoteRevocation> = queue.toList()
+    override fun enqueueRevocation(item: PendingRemoteRevocation) {
+      if (rejectEnqueue) throw java.io.IOException("injected queue write failure")
+      queue += item
+    }
+    override fun updateRevocation(item: PendingRemoteRevocation) {
+      val index = queue.indexOfFirst { it.id == item.id }
+      if (index >= 0) queue[index] = item
+    }
+    override fun removeRevocation(id: String) { queue.removeAll { it.id == id } }
   }
   private class Pins : RemotePeerTrustStore {
     val values = mutableMapOf<RemotePeerScope, String>()
@@ -70,6 +83,10 @@ class RemoteSignOutLifecycleTest {
       }
       val started = System.currentTimeMillis()
       manager(mock, devices, pins, catalogs).signOut(before)
+      assertEquals("identity is durably queued before asynchronous revoke", 1, devices.pendingRevocations().size)
+      assertEquals(0, mock.requestCount)
+      drainPendingRemoteRevocations(devices)
+      assertTrue(devices.pendingRevocations().isEmpty())
       val retained = requireNotNull(catalogs.value)
       assertEquals(before.copy(signedOut = true, hosts = before.hosts.map { it.copy(online = false) },
         updatedAt = retained.updatedAt), retained)
@@ -83,6 +100,35 @@ class RemoteSignOutLifecycleTest {
       assertEquals("DELETE", request.method)
       assertEquals("/api/v1/devices/self", request.path)
       assertEquals("Bearer $access", request.getHeader("Authorization"))
+    }
+  }
+
+  @Test fun signOutQueueFailureKeepsIdentityAndStillDeniesReconnect() = runBlocking {
+    MockWebServer().use { mock ->
+      mock.start()
+      val devices = Devices(); val catalogs = Catalog(); val pins = Pins()
+      val before = saved(mock.url("/").toString()).also(catalogs::save)
+      val slot = scopedRemoteDeviceSlot(before.origin, account, hostId)
+      val original = record(before.origin)
+      devices.save(slot, original)
+      devices.rejectEnqueue = true
+      assertNotNull(runCatching { manager(mock, devices, pins, catalogs).signOut(before) }.exceptionOrNull())
+      assertTrue(requireNotNull(catalogs.value).signedOut)
+      assertSame("uncommitted revocation must leave identity available for recovery", original, devices.load(slot))
+      assertTrue(devices.pendingRevocations().isEmpty())
+      assertEquals(0, mock.requestCount)
+    }
+  }
+
+  @Test fun staleSignOutDoesNotRecreateADeletedAccount() = runBlocking {
+    MockWebServer().use { mock ->
+      mock.start()
+      val catalogs = Catalog()
+      val previous = saved(mock.url("/").toString()).also(catalogs::save)
+      catalogs.clear(previous.origin, previous.account)
+      assertNotNull(runCatching { manager(mock, Devices(), Pins(), catalogs).signOut(previous) }.exceptionOrNull())
+      assertNull(catalogs.value)
+      assertEquals(0, mock.requestCount)
     }
   }
 

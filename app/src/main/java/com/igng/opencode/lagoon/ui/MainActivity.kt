@@ -116,6 +116,7 @@ class MainActivity : ComponentActivity() {
        var showingModelManagement by rememberSaveable { mutableStateOf(false) }
        var showingRemoteEnroll by rememberSaveable { mutableStateOf(false) }
        var showingRemoteHosts by rememberSaveable { mutableStateOf(false) }
+       var remoteHostsSourceId by rememberSaveable { mutableStateOf<String?>(null) }
        var showingRemotePairing by rememberSaveable { mutableStateOf(false) }
        LaunchedEffect(controller) {
          controller.remoteRecoveryHandler = { kind ->
@@ -124,8 +125,14 @@ class MainActivity : ComponentActivity() {
                showingRemoteHosts = false
                showingRemoteEnroll = true
              }
+             RemoteRecoveryKind.PAIR -> {
+               showingRemoteHosts = false
+               showingRemoteEnroll = false
+               showingRemotePairing = true
+             }
              RemoteRecoveryKind.HOST, RemoteRecoveryKind.TRUST -> {
                showingRemoteEnroll = false
+               remoteHostsSourceId = null
                showingRemoteHosts = true
              }
              RemoteRecoveryKind.RECONNECT -> Unit
@@ -429,7 +436,7 @@ class MainActivity : ComponentActivity() {
                   onBack = { goBack() },
                   onOpenSshEditor = { hostId -> openSshEditor(hostId) },
                   onLoginHub = { showingRemoteEnroll = true },
-                  onManageHub = { showingRemoteHosts = true },
+                  onManageHub = { remoteHostsSourceId = null; showingRemoteHosts = true },
                   onDeviceSaved = { deviceId -> openDeviceFromEditor(deviceId) },
                   onSshDeviceSaved = { deviceId, discover ->
                     openDeviceFromEditor(deviceId)
@@ -445,7 +452,7 @@ class MainActivity : ComponentActivity() {
                     state = state, controller = controller, leafId = target.harness,
                     onBack = { if (navigator.navigation.editors.isEmpty()) goBack() },
                     onEditProfile = { profile -> openEditor(editorForHarness(profile)) },
-                    onManageHub = { showingRemoteHosts = true },
+                    onManageHub = { remoteHostsSourceId = controller.sourceOfLeaf(target.harness); showingRemoteHosts = true },
                     onManageModels = { showingModelManagement = true }
                   )
                   target.page == RootPage.DEVICES && target.device != null -> DeviceDetailScreen(
@@ -462,7 +469,7 @@ class MainActivity : ComponentActivity() {
                     onRefreshDiscovery = ::refreshDevice,
                     discoveryError = deviceDiscoveryErrors[target.device],
                     onEditSsh = { hostId -> openSshEditor(hostId) },
-                    onManageHub = { showingRemoteHosts = true },
+                    onManageHub = { sourceId -> remoteHostsSourceId = sourceId; showingRemoteHosts = true },
                     onDeleteDevice = { deviceId -> controller.deleteDevice(deviceId) }
                   )
                  target.page == RootPage.DEVICES -> DeviceManagementScreen(
@@ -470,7 +477,7 @@ class MainActivity : ComponentActivity() {
                    onAddDevice = { addDevice() },
                    onEditGroup = { groupId -> editingGroupId = groupId; showingDeviceGroups = true },
                    onOpenDevice = { id -> openDevice(id) },
-                   onManageHub = { showingRemoteHosts = true }
+                   onManageHub = { remoteHostsSourceId = null; showingRemoteHosts = true }
                  )
                  target.page == RootPage.SETTINGS -> SettingsScreen(state, controller, themeMode, { themeMode = it; preferences.edit().putString("themeMode", it.name).apply() }, previewBack, { previewBack = it; preferences.edit().putBoolean("previewBack", it).apply() }, refreshMode, { refreshMode = it; controller.setRefreshMode(it) }, {
                    if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
@@ -577,7 +584,7 @@ class MainActivity : ComponentActivity() {
                showingDeviceGroups = false; editingGroupId = null
              })
             if (showingModelManagement) ModelManagementSheet(state, controller) { showingModelManagement = false }
-            if (showingRemoteHosts) RemoteHostsSheet(controller, onDismiss = { showingRemoteHosts = false }, onEnroll = {
+            if (showingRemoteHosts) RemoteHostsSheet(controller, targetSourceId = remoteHostsSourceId, onDismiss = { showingRemoteHosts = false }, onEnroll = {
               showingRemoteHosts = false; showingRemoteEnroll = true
             }, onOpenPairing = {
               showingRemoteHosts = false; showingRemotePairing = true
@@ -595,7 +602,7 @@ class MainActivity : ComponentActivity() {
               onDismiss = { showingRemotePairing = false },
               onPaired = { hostName ->
                 showingRemotePairing = false
-                globalMessage = "已配对并连接 $hostName"
+                globalMessage = "已配对 $hostName，正在检查连接"
                 globalMessageType = MiuixToastType.SUCCESS
               },
             )
