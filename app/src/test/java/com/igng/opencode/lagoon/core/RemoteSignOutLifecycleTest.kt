@@ -128,7 +128,10 @@ class RemoteSignOutLifecycleTest {
       assertTrue(enrollment.failures.isEmpty())
       assertFalse(enrollment.catalog.signedOut)
       assertEquals(listOf(hostId), enrollment.catalog.hosts.map { it.hostId })
-      assertEquals(disabled, merge(enrollment.catalog, signedOutGraph))
+      assertEquals(previous, merge(enrollment.catalog, signedOutGraph))
+      val paused = merge(enrollment.catalog.copy(userPaused = true), previous)
+      assertEquals(disabled, paused)
+      assertEquals(previous, merge(enrollment.catalog.copy(userPaused = false), paused))
       assertEquals(enrollment.catalog, catalogs.value)
       assertEquals(3, mock.requestCount)
     }

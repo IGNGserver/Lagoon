@@ -195,10 +195,97 @@ internal class RemoteAccountManager(
       hosts = catalogHosts,
       updatedAt = System.currentTimeMillis(),
       allowCleartext = allowCleartext,
+      signedOut = false,
       adoptedHostIds = adopted,
+      userPaused = false,
     )
     catalogs.save(catalog)
     if (registered.isNotEmpty()) accountToken = null
+    this.account = name
+    return RemoteEnrollment(catalog, registered, failures)
+  }
+
+  /**
+   * 重新登录后，对先前已采纳且公钥指纹与本地 Pin 完全匹配（PINNED）的主机一步无感续期设备令牌。
+   * 不清空当前 accountToken，以便用户随后仍可继续勾选新主机或确认变更指纹的主机。
+   */
+  suspend fun renewAdoptedPinnedHosts(): RemoteEnrollment? {
+    val (name, token) = requirePending()
+    val previousCatalog = catalogs.load().firstOrNull { it.origin == origin && it.account == name }
+      ?: return null
+    val previousById = previousCatalog.hosts.associateBy { it.hostId }
+    val previousAdopted = previousCatalog.effectiveAdoptedHostIds()
+    if (previousAdopted.isEmpty()) return null
+    val targets = candidates.filter { candidate ->
+      candidate.hostId in previousAdopted &&
+        candidate.meta.trust == RemoteTrustState.PINNED &&
+        candidate.canEnroll
+    }
+    if (targets.isEmpty()) return null
+    val registered = LinkedHashMap<String, String>()
+    val failures = LinkedHashMap<String, String>()
+    val catalogHosts = candidates.map { next ->
+      if (next.meta.trust == RemoteTrustState.PINNED) return@map next.meta
+      val prev = previousById[next.meta.hostId]?.takeIf { next.meta.hostId in previousAdopted }
+      val matchesPrev = prev?.trust == RemoteTrustState.PINNED &&
+        prev.fingerprint != null &&
+        next.meta.fingerprint != null &&
+        equalFingerprint(prev.fingerprint, next.meta.fingerprint)
+      if (matchesPrev) next.meta.copy(trust = RemoteTrustState.PINNED) else next.meta
+    }.toMutableList()
+    for (candidate in targets) {
+      try {
+        val host = candidate.host
+        val scope = RemotePeerScope(origin, name, host.deviceId)
+        val slot = deviceSlot(host.deviceId, name)
+        val existingRecord = runCatching { devices.load(slot) }.getOrNull()
+        val manager = RemoteDeviceManager(devices, slot, origin, name,
+          registerer = { descriptor, acctToken -> api.register(descriptor, acctToken) },
+          refresher = { id, refresh -> api.refresh(id, refresh) })
+        val device = manager.register(deviceName(host), platform, clientVersion, token)
+        RemotePeerTrust(pins).pinOrReplaceAfterConfirmation(scope, host)
+        if (existingRecord != null &&
+          existingRecord.identity.deviceId != device.identity.deviceId &&
+          existingRecord.tokens != null &&
+          !existingRecord.invalidated
+        ) {
+          devices.enqueueRevocation(
+            PendingRemoteRevocation(
+              id = java.util.UUID.randomUUID().toString(),
+              origin = origin,
+              account = name,
+              peerHostId = host.deviceId,
+              clientDeviceId = existingRecord.identity.deviceId,
+              accessToken = existingRecord.tokens.accessToken,
+              refreshToken = existingRecord.tokens.refreshToken,
+              allowCleartext = allowCleartext
+            )
+          )
+        }
+        registered[host.deviceId] = device.identity.deviceId
+        val index = catalogHosts.indexOfFirst { it.hostId == host.deviceId }
+        if (index >= 0) catalogHosts[index] = catalogHosts[index].copy(trust = RemoteTrustState.PINNED)
+      } catch (cancel: kotlinx.coroutines.CancellationException) {
+        throw cancel
+      } catch (error: Exception) {
+        failures[candidate.hostId] = userFacingError(error, "自动续期主机失败")
+      }
+    }
+    if (registered.isEmpty() && failures.isEmpty()) return null
+    val adopted = (previousAdopted + registered.keys).toSet()
+    val catalog = RemoteCatalog(
+      origin = origin,
+      account = name,
+      provider = provider,
+      deviceLabel = deviceLabel,
+      hosts = catalogHosts,
+      updatedAt = System.currentTimeMillis(),
+      allowCleartext = allowCleartext,
+      signedOut = false,
+      adoptedHostIds = adopted,
+      userPaused = false,
+    )
+    catalogs.save(catalog)
     this.account = name
     return RemoteEnrollment(catalog, registered, failures)
   }
@@ -301,6 +388,7 @@ internal class RemoteAccountManager(
       allowCleartext = allowCleartext,
       signedOut = false,
       adoptedHostIds = adopted,
+      userPaused = false,
     )
     catalogs.save(updated)
     this.account = accountName
@@ -314,27 +402,32 @@ internal class RemoteAccountManager(
     // drop metadata or permit a new discovery using a half-signed-out source after process restart.
     catalogs.save(catalog.copy(signedOut = true, hosts = catalog.hosts.map { it.copy(online = false) },
       updatedAt = System.currentTimeMillis()))
+    val revokedDeviceIds = mutableSetOf<String>()
     for (host in catalog.hosts) {
-      val slot = deviceSlot(host.hostId, catalog.account)
-      val record = runCatching { devices.load(slot) }.getOrNull() ?: continue
-      RemoteDeviceManager.invalidateSlot(slot)
-      val now = System.currentTimeMillis()
-      val cachedToken = record.tokens?.takeIf { !record.invalidated && it.accessTokenExpiresAt > now + 10_000L }?.accessToken
-      val token = cachedToken ?: try {
-        RemoteDeviceManager(
-          devices,
-          slot,
-          origin,
-          name,
-          refresher = { id, refresh -> api.refresh(id, refresh) },
-        ).access().tokens?.accessToken
-      } catch (cancel: kotlinx.coroutines.CancellationException) {
-        throw cancel
-      } catch (_: Exception) {
-        null
+      for (slot in RemoteIdentitySlots.candidateSlots(origin, name, host.hostId)) {
+        val record = runCatching { devices.load(slot) }.getOrNull() ?: continue
+        if (record.origin != origin || record.account.trim() != name.trim()) continue
+        RemoteDeviceManager.invalidateSlot(slot)
+        if (revokedDeviceIds.add(record.identity.deviceId)) {
+          val now = System.currentTimeMillis()
+          val cachedToken = record.tokens?.takeIf { !record.invalidated && it.accessTokenExpiresAt > now + 10_000L }?.accessToken
+          val token = cachedToken ?: try {
+            RemoteDeviceManager(
+              devices,
+              slot,
+              origin,
+              name,
+              refresher = { id, refresh -> api.refresh(id, refresh) },
+            ).access().tokens?.accessToken
+          } catch (cancel: kotlinx.coroutines.CancellationException) {
+            throw cancel
+          } catch (_: Exception) {
+            null
+          }
+          if (token != null) try { api.revokeSelf(token) } catch (cancel: kotlinx.coroutines.CancellationException) { throw cancel } catch (_: Exception) { }
+        }
+        runCatching { devices.delete(slot) }
       }
-      if (token != null) try { api.revokeSelf(token) } catch (cancel: kotlinx.coroutines.CancellationException) { throw cancel } catch (_: Exception) { }
-      runCatching { devices.delete(slot) }
     }
     accountToken = null
     account = null

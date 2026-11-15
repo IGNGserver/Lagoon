@@ -48,7 +48,8 @@ data class ServerOverviewSnapshot(
   val backgroundRunning: Set<String> = emptySet(),
   val summary: TaskSummary = TaskSummary.EMPTY,
   val autoApprovalFailures: Set<String> = emptySet(),
-  val shells: Map<String, ShellJob> = emptyMap()
+  val shells: Map<String, ShellJob> = emptyMap(),
+  val remoteRecovery: RemoteRecoveryKind? = null
 )
 
 /**
@@ -113,7 +114,8 @@ internal class AllServersOverview(
         if (error is CancellationException) throw error
         remove(id)
         publish(ServerOverviewSnapshot(id, profile, connected = false, loading = false,
-          error = userFacingError(error, "连接路由尚未提交")))
+          error = userFacingError(error, "连接路由尚未提交"),
+          remoteRecovery = remoteFailure(error)?.kind?.recovery()))
         return
       }
       val config = profile to store.credentials(id)
@@ -260,7 +262,9 @@ internal class AllServersOverview(
     } catch (cancel: CancellationException) {
       throw cancel
     } catch (error: Exception) {
-      publish(ServerOverviewSnapshot(id, profile, connected = false, loading = false, error = userFacingError(error, "连接失败")))
+      publish(ServerOverviewSnapshot(id, profile, connected = false, loading = false,
+        error = userFacingError(error, "连接失败"),
+        remoteRecovery = remoteFailure(error)?.kind?.recovery()))
       return
     }
     val cachedCatalog = cache.catalog(id)
@@ -351,7 +355,8 @@ internal class AllServersOverview(
           } catch (error: Exception) {
             if (isNonRetryableRemoteFailure(error)) parkedNonRetryable.set(true)
             previous.copy(connected = false, loading = false, cached = previous.cached || cachedCatalog != null,
-              degraded = true, error = userFacingError(error, "连接失败"))
+              degraded = true, error = userFacingError(error, "连接失败"),
+              remoteRecovery = remoteFailure(error)?.kind?.recovery())
           }
         }
         snapshot = if (revision == waitingRevision) next.copy(streamConnected = snapshot.streamConnected, autoApprovalFailures = snapshot.autoApprovalFailures)
@@ -557,6 +562,14 @@ internal class AllServersOverview(
             throw cancel
           } catch (error: Exception) {
             if (isNonRetryableRemoteFailure(error)) parkedNonRetryable.set(true)
+            val recovery = remoteFailure(error)?.kind?.recovery()
+            if (recovery != null) {
+              snapshot = snapshot.copy(
+                connected = false,
+                error = userFacingError(error, "连接失败"),
+                remoteRecovery = recovery
+              )
+            }
             Diagnostics.warn("AllServers", "服务器 ${profile.name} 实时连接断开", error)
           }
           // A cancelled monitor from an older client must not unregister its replacement's stream.
@@ -777,6 +790,7 @@ internal class AllServersOverview(
       loading = false,
       lastReadAt = now(),
       error = null,
+      remoteRecovery = null,
       degraded = degraded,
       projects = projects,
       workspaceCatalog = workspaceCatalog,

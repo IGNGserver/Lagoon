@@ -38,8 +38,10 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.igng.opencode.lagoon.core.ConnectionBanner
+import com.igng.opencode.lagoon.core.HubAuthStatus
 import com.igng.opencode.lagoon.core.LagoonController
 import com.igng.opencode.lagoon.core.LagoonState
+import com.igng.opencode.lagoon.core.RemoteRecoveryKind
 import kotlinx.coroutines.delay
 import top.yukonga.miuix.kmp.basic.InfiniteProgressIndicator
 import top.yukonga.miuix.kmp.basic.Text
@@ -65,28 +67,148 @@ internal fun ConnectionStrip(state: LagoonState, controller: LagoonController, m
     transcriptSince = state.transcriptLoadingSince,
     transportDetail = state.transportDetail
   )
+  val activeProfile = state.server
+  val loginExpired = state.remoteRecovery == RemoteRecoveryKind.LOGIN ||
+    (activeProfile?.remoteHostId != null &&
+      controller.hostAuthExpired(activeProfile.url, activeProfile.username, activeProfile.remoteHostId, state))
+  val showingOfflineCache = state.serverId != null && !state.connected && state.sessions.isNotEmpty()
+  val notice = when {
+    banner != null -> {
+      val type = when (banner.tone) {
+        ConnectionBanner.Tone.PROGRESS -> MiuixToastType.INFO
+        ConnectionBanner.Tone.WARNING -> MiuixToastType.WARNING
+        ConnectionBanner.Tone.ERROR -> MiuixToastType.ERROR
+      }
+      val baseMessage = if (!banner.subtitle.isNullOrBlank()) "${banner.text} · ${banner.subtitle}" else banner.text
+      val message = if (showingOfflineCache && !baseMessage.contains("缓存")) "$baseMessage · 当前显示离线缓存" else baseMessage
+      val action = when {
+        loginExpired -> "重新登录"
+        state.remoteRecovery != null -> state.remoteRecovery.label
+        banner.retry -> "立即重试"
+        else -> null
+      }
+      val onAction: (() -> Unit)? = when {
+        loginExpired -> ({
+          activeProfile?.let { controller.openRemoteRecoveryFor(it.id, RemoteRecoveryKind.LOGIN) }
+            ?: controller.openRemoteRecovery()
+        })
+        state.remoteRecovery != null -> ({ controller.openRemoteRecovery() })
+        banner.retry -> ({ controller.retryNow() })
+        else -> null
+      }
+      Triple(message, if (loginExpired) MiuixToastType.WARNING else type, action to onAction)
+    }
+    showingOfflineCache -> {
+      val message = when {
+        loginExpired -> "中枢登录态已失效 · 正在显示本地离线缓存会话"
+        activeProfile?.effectiveEnabled == false -> "当前连接已停用 · 正在显示本地离线缓存会话"
+        else -> "当前未连接服务器 · 正在显示本地离线缓存会话"
+      }
+      val action = when {
+        loginExpired -> "重新登录"
+        activeProfile?.effectiveEnabled == true -> "立即重试"
+        else -> null
+      }
+      val onAction: (() -> Unit)? = when {
+        loginExpired -> ({
+          activeProfile?.let { controller.openRemoteRecoveryFor(it.id, RemoteRecoveryKind.LOGIN) }
+            ?: controller.openRemoteRecovery()
+        })
+        activeProfile?.effectiveEnabled == true -> ({ controller.retryNow() })
+        else -> null
+      }
+      Triple(message, if (loginExpired) MiuixToastType.WARNING else MiuixToastType.INFO, action to onAction)
+    }
+    else -> null
+  }
   AnimatedVisibility(
-    visible = banner != null,
+    visible = notice != null,
     modifier = modifier,
     enter = fadeIn(HyperMotion.sheetFloatSpring) + expandVertically(HyperMotion.controlSpring()),
     exit = fadeOut(HyperMotion.sheetFloatSpring) + shrinkVertically(HyperMotion.controlSpring())
   ) {
-    val shown = banner ?: return@AnimatedVisibility
-    val type = when (shown.tone) {
-      ConnectionBanner.Tone.PROGRESS -> MiuixToastType.INFO
-      ConnectionBanner.Tone.WARNING -> MiuixToastType.WARNING
-      ConnectionBanner.Tone.ERROR -> MiuixToastType.ERROR
-    }
-    val combinedMessage = if (!shown.subtitle.isNullOrBlank()) "${shown.text} · ${shown.subtitle}" else shown.text
-
+    val shown = notice ?: return@AnimatedVisibility
     HyperInlineNotice(
-      message = combinedMessage,
-      type = type,
-      action = if (state.remoteRecovery != null) state.remoteRecovery.label else if (shown.retry) "立即重试" else null,
-      onAction = {
-        if (state.remoteRecovery != null) controller.openRemoteRecovery()
-        else if (shown.retry) controller.retryNow()
-      },
+      message = shown.first,
+      type = shown.second,
+      action = shown.third.first,
+      onAction = shown.third.second,
+      modifier = Modifier
+        .padding(horizontal = 14.dp, vertical = 4.dp)
+        .semantics { liveRegion = LiveRegionMode.Polite }
+    )
+  }
+}
+
+/**
+ * 聚合首页（全部设备 / 设备分组）顶部的连接与恢复提示条：
+ * - 当作用域内任一中枢设备登录态/设备令牌失效时，直接提供「重新登录」入口；
+ * - 当全部设备都离线且列表展示的是本地离线缓存时，明确提示「正在显示本地离线缓存会话」。
+ */
+@Composable
+internal fun AggregateConnectionStrip(
+  state: LagoonState,
+  controller: LagoonController,
+  onManageDevices: () -> Unit = {},
+  modifier: Modifier = Modifier
+) {
+  val scopeProfiles = when {
+    state.allServers -> state.enabledProfiles
+    state.homeGroup != null -> state.enabledProfiles.filter { it.id in state.homeGroup!!.memberIds }
+    else -> emptyList()
+  }
+  val loginProfile = scopeProfiles.firstOrNull { profile ->
+    state.allServerSnapshots[profile.id]?.remoteRecovery == RemoteRecoveryKind.LOGIN ||
+      (profile.remoteHostId != null && controller.hostAuthExpired(profile.url, profile.username, profile.remoteHostId, state))
+  }
+  val otherRecoveryPair = scopeProfiles.firstNotNullOfOrNull { profile ->
+    state.allServerSnapshots[profile.id]?.remoteRecovery
+      ?.takeIf { it != RemoteRecoveryKind.LOGIN && it != RemoteRecoveryKind.RECONNECT }
+      ?.let { profile to it }
+  }
+  val onlineCount = scopeProfiles.count { state.allServerSnapshots[it.id]?.connected == true }
+  val anyLoading = scopeProfiles.any { state.allServerSnapshots[it.id]?.loading == true }
+  val degradedCatalog = if (scopeProfiles.isEmpty() && state.profiles.isNotEmpty()) {
+    controller.remoteCatalogs()
+      .filterNot(controller::isPairedRemoteCatalog)
+      .firstOrNull { controller.hubAuthStatus(it, state) != HubAuthStatus.ACTIVE }
+  } else null
+  val cacheSuffix = if (state.sessions.isNotEmpty()) " · 当前显示离线缓存" else ""
+  val notice = when {
+    loginProfile != null -> Triple(
+      "${loginProfile.name} 登录态已失效，无法同步最新数据$cacheSuffix",
+      MiuixToastType.WARNING,
+      "重新登录" to ({ controller.openRemoteRecoveryFor(loginProfile.id, RemoteRecoveryKind.LOGIN) })
+    )
+    otherRecoveryPair != null -> Triple(
+      "${otherRecoveryPair.first.name} 连接需要处理$cacheSuffix",
+      MiuixToastType.WARNING,
+      otherRecoveryPair.second.label to ({ controller.openRemoteRecoveryFor(otherRecoveryPair.first.id, otherRecoveryPair.second) })
+    )
+    degradedCatalog != null -> Triple(
+      "远程中枢（${degradedCatalog.account}）已退出或登录失效$cacheSuffix",
+      MiuixToastType.WARNING,
+      "重新登录" to ({ controller.openRemoteRelogin(degradedCatalog.origin, degradedCatalog.allowCleartext, degradedCatalog.account) })
+    )
+    scopeProfiles.isNotEmpty() && onlineCount == 0 && !anyLoading && state.sessions.isNotEmpty() -> Triple(
+      "当前无在线设备，正在显示本地离线缓存会话",
+      MiuixToastType.INFO,
+      "设备管理" to onManageDevices
+    )
+    else -> null
+  }
+  AnimatedVisibility(
+    visible = notice != null,
+    modifier = modifier,
+    enter = fadeIn(HyperMotion.sheetFloatSpring) + expandVertically(HyperMotion.controlSpring()),
+    exit = fadeOut(HyperMotion.sheetFloatSpring) + shrinkVertically(HyperMotion.controlSpring())
+  ) {
+    val shown = notice ?: return@AnimatedVisibility
+    HyperInlineNotice(
+      message = shown.first,
+      type = shown.second,
+      action = shown.third.first,
+      onAction = shown.third.second,
       modifier = Modifier
         .padding(horizontal = 14.dp, vertical = 4.dp)
         .semantics { liveRegion = LiveRegionMode.Polite }

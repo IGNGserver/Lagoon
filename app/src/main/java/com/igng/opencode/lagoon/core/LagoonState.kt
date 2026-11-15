@@ -3,6 +3,16 @@ package com.igng.opencode.lagoon.core
 /** Semantic tone for global toast feedback so non-error notices/warnings are never painted as green success. */
 enum class FeedbackTone { INFO, SUCCESS, WARNING }
 
+/** High-level authentication state of a Remote Hub account or its devices. */
+enum class HubAuthStatus { ACTIVE, SIGNED_OUT, EXPIRED }
+
+/** Pre-filled target passed to the Remote login sheet when recovering an existing Hub. */
+data class RemoteEnrollPreset(
+  val origin: String,
+  val allowCleartext: Boolean = false,
+  val account: String = ""
+)
+
 /** Pending operations and phone attachments are keyed by server/session/project. */
 internal fun operationKey(server: String?, session: String?, project: String?, action: String): String {
   val target = when {
@@ -136,6 +146,8 @@ data class LagoonState(
   val transportDetail: String? = null,
   /** Set only for a typed Remote failure whose fix needs a UI sheet (login/trust/host). */
   val remoteRecovery: RemoteRecoveryKind? = null,
+  /** Optional target prefill for RemoteEnrollSheet when opened from a recovery CTA. */
+  val remoteEnrollPreset: RemoteEnrollPreset? = null,
   val goal: RemoteGoal? = null,
   /**
    * The Host's current whole todo list (`todos` projection) for the open conversation. It is
@@ -241,3 +253,6 @@ data class LagoonState(
     return sessionStatus(state, notices.unseenFor(session.id))
   }
 }
+
+internal val ServerProfile.usesRemoteTransport: Boolean
+  get() = remoteHostId != null || kind == ServerKind.DSH_REMOTE

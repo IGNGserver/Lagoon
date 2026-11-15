@@ -142,7 +142,8 @@ internal fun HomeScreen(
         }
         GlobalTaskStrip(state, controller, onOpen = onOpen)
       }
-      if (!state.multiServerView) ConnectionStrip(state, controller)
+      if (state.multiServerView) AggregateConnectionStrip(state, controller, onManageDevices = onManageDevices)
+      else ConnectionStrip(state, controller)
       Box(Modifier.weight(1f).fillMaxWidth()) {
         SessionList(
           state, controller, grouping, query.trim(), onOpen, onNewSession, onManageDevices,

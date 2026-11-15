@@ -162,4 +162,61 @@ class DeviceProjectionTest {
     assertEquals("opencode-native|/state/opencode/service.json", DeviceProjection.slotKey(profile))
     assertEquals("opencode-native|", DeviceProjection.slotKey(sshLeaf("other", "cfg", ServerKind.OPENCODE)))
   }
+
+  @Test fun attachedSlotsSurfaceUnavailableAndRemovedHubDiscoveryReasons() {
+    val codexLeaf = hubCodex("leaf-codex")
+    val nativeLeaf = ServerProfile(
+      id = "leaf-native",
+      name = "Old OpenCode",
+      url = "https://hub.example.test",
+      username = "me@example.test",
+      kind = ServerKind.OPENCODE,
+      remoteHostId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      remoteHostFingerprint = "0123456789ab",
+      remoteServiceId = "svc-old"
+    )
+    val profiles = listOf(codexLeaf, nativeLeaf)
+    val graph = graphOf(profiles)
+    val hostBindingId = graph.hosts.single().id
+
+    val freshDiscovery = DeviceDiscovery(
+      deviceId = hostBindingId,
+      observedAtMs = now - 2_000,
+      harnesses = listOf(
+        DiscoveredHarness(
+          protocol = HarnessProtocolId.CODEX_APP_SERVER,
+          name = "Codex",
+          status = HarnessDiscoveryStatus(
+            installed = DiscoveryValue.YES,
+            available = DiscoveryValue.NO,
+            observedAtMs = now - 2_000,
+            freshUntilMs = now + 600_000,
+            completeness = DiscoveryCompleteness.COMPLETE,
+            reason = "Host 未声明 Codex 能力"
+          )
+        )
+      ),
+      completeness = DiscoveryCompleteness.COMPLETE
+    )
+    val withFresh = DeviceProjection.devices(graph, profiles, discovery = { freshDiscovery }, nowMs = now).single()
+    val codexSlot = withFresh.harnesses.first { it.leafId?.value == "leaf-codex" }
+    val nativeSlot = withFresh.harnesses.first { it.leafId?.value == "leaf-native" }
+    assertEquals("Host 未声明 Codex 能力", codexSlot.reason)
+    assertEquals("远端最近一次探测未发现此服务（可能已停止或移除）", nativeSlot.reason)
+
+    val expiredDiscovery = DeviceDiscovery(
+      deviceId = hostBindingId,
+      observedAtMs = now - DeviceDiscovery.DEFAULT_TTL_MS - 10,
+      harnesses = listOf(
+        DiscoveredHarness(
+          protocol = HarnessProtocolId.CODEX_APP_SERVER,
+          name = "Codex",
+          status = available(now - DeviceDiscovery.DEFAULT_TTL_MS - 10)
+        )
+      ),
+      completeness = DiscoveryCompleteness.COMPLETE
+    )
+    val withExpired = DeviceProjection.devices(graph, profiles, discovery = { expiredDiscovery }, nowMs = now).single()
+    assertEquals("上次发现已过期", withExpired.harnesses.first { it.leafId?.value == "leaf-codex" }.reason)
+  }
 }

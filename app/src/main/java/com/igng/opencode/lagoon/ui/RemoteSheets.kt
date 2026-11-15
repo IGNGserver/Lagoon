@@ -60,8 +60,27 @@ internal fun RemoteEnrollSheet(
   val scope = rememberCoroutineScope()
   val context = LocalContext.current
   val clipboard = LocalClipboardManager.current
-  var origin by rememberSaveable { mutableStateOf(DEFAULT_REMOTE_ORIGIN) }
-  var allowHttp by rememberSaveable { mutableStateOf(false) }
+  val runtime by controller.state.collectAsState()
+  val initialPreset = remember {
+    runtime.remoteEnrollPreset ?: run {
+      val fallback = controller.remoteCatalogs()
+        .filterNot(controller::isPairedRemoteCatalog)
+        .let { hubs ->
+          hubs.firstOrNull { controller.hubAuthStatus(it, runtime) != HubAuthStatus.ACTIVE }
+            ?: controller.activeHubCatalog()
+        }
+      fallback?.let { RemoteEnrollPreset(it.origin, it.allowCleartext, it.account) }
+    }
+  }
+  DisposableEffect(controller) {
+    onDispose { controller.clearRemoteEnrollPreset() }
+  }
+  var origin by rememberSaveable(initialPreset?.origin) {
+    mutableStateOf(initialPreset?.origin?.ifBlank { null } ?: DEFAULT_REMOTE_ORIGIN)
+  }
+  var allowHttp by rememberSaveable(initialPreset?.origin, initialPreset?.allowCleartext) {
+    mutableStateOf(initialPreset?.allowCleartext ?: false)
+  }
   val normalizedOrigin = remember(origin) { normalizeRemoteHubAddressInput(origin) }
   val managerResult = remember(normalizedOrigin, allowHttp) { runCatching { controller.remoteAccountManager(normalizedOrigin, allowHttp) } }
   val manager = managerResult.getOrNull()
@@ -75,10 +94,62 @@ internal fun RemoteEnrollSheet(
   var selected by remember { mutableStateOf(setOf<String>()) }
   var review by remember { mutableStateOf(false) }
   var confirmed by remember { mutableStateOf(setOf<String>()) }
-  var account by remember { mutableStateOf("") }
+  var account by remember(initialPreset?.account) { mutableStateOf(initialPreset?.account.orEmpty()) }
   var password by remember { mutableStateOf("") }
-  var showSelfHosted by rememberSaveable { mutableStateOf(false) }
+  var showSelfHosted by rememberSaveable(initialPreset?.origin, initialPreset?.account) {
+    mutableStateOf(
+      initialPreset != null && (
+        normalizeRemoteHubAddressInput(initialPreset.origin).trimEnd('/') != DEFAULT_REMOTE_ORIGIN.trimEnd('/') ||
+          initialPreset.account.contains("@")
+        )
+    )
+  }
   var resultText by remember { mutableStateOf<String?>(null) }
+
+  suspend fun handlePostLoginCandidates(loaded: List<RemoteHostCandidate>, accountHint: String = account) {
+    val activeManager = manager
+    val canonicalOrigin = runCatching { canonicalRemoteOrigin(normalizedOrigin) }.getOrNull()
+    val loggedAccount = activeManager?.cachedAccount()?.trim().orEmpty().ifBlank { accountHint.trim() }
+    val existingCatalog = canonicalOrigin?.let { orig ->
+      controller.remoteCatalogs()
+        .filterNot(controller::isPairedRemoteCatalog)
+        .let { hubs ->
+          hubs.firstOrNull { it.origin == orig && (loggedAccount.isBlank() || it.account.equals(loggedAccount, ignoreCase = true)) }
+            ?: hubs.firstOrNull { it.origin == orig }
+        }
+    }
+    val wasDegraded = existingCatalog != null && controller.hubAuthStatus(existingCatalog, runtime) != HubAuthStatus.ACTIVE
+    if (wasDegraded && activeManager != null) {
+      val renewed = runCatching { activeManager.renewAdoptedPinnedHosts() }.getOrNull()
+      if (renewed != null && renewed.registered.isNotEmpty()) {
+        controller.autoAttachEnrolledHosts(renewed.catalog, renewed.registered.keys)
+        val adoptedIds = existingCatalog.effectiveAdoptedHostIds()
+        val loadedIds = loaded.map { it.hostId }.toSet()
+        val unresolvedAdopted = (adoptedIds intersect loadedIds) - renewed.registered.keys
+        if (unresolvedAdopted.isEmpty() && renewed.failures.isEmpty()) {
+          resultText = "已重新登录并自动恢复 ${renewed.registered.size} 台已绑定设备连接"
+          onDone(renewed.registered.size)
+          return
+        }
+        val remaining = loaded.filter { it.hostId !in renewed.registered.keys }
+        candidates = remaining
+        selected = emptySet()
+        confirmed = emptySet()
+        review = false
+        val partialDetail = buildList {
+          add("已自动恢复 ${renewed.registered.size} 台设备连接")
+          if (unresolvedAdopted.isNotEmpty()) add("仍有 ${unresolvedAdopted.size} 台已绑定设备需核对指纹")
+          if (renewed.failures.isNotEmpty()) add("部分续期失败：${renewed.failures.values.first()}")
+        }.joinToString("；")
+        resultText = partialDetail
+        return
+      }
+    }
+    candidates = loaded
+    selected = emptySet()
+    confirmed = emptySet()
+    review = false
+  }
 
   LaunchedEffect(manager) {
     providers = emptyList()
@@ -117,8 +188,9 @@ internal fun RemoteEnrollSheet(
           is RemoteQrPoll.Complete -> {
             busy = true
             try {
-              candidates = manager.completeBrowserLogin(login, polled.accountToken)
+              val loaded = manager.completeBrowserLogin(login, polled.accountToken)
               pending = null
+              handlePostLoginCandidates(loaded, manager.cachedAccount().orEmpty())
             } catch (cancel: CancellationException) { throw cancel }
             catch (e: Exception) { error = userFacingError(e, "登录后读取主机失败"); pending = null }
             finally { busy = false }
@@ -134,10 +206,8 @@ internal fun RemoteEnrollSheet(
     scope.launch {
       busy = true; error = null
       try {
-        candidates = action()
-        selected = emptySet()
-        confirmed = emptySet()
-        review = false
+        val loaded = action()
+        handlePostLoginCandidates(loaded, manager?.cachedAccount().orEmpty().ifBlank { account })
       } catch (cancel: CancellationException) { throw cancel }
       catch (e: Exception) { error = userFacingError(e, "登录 DSH 远程中枢失败") }
       finally { busy = false }
@@ -148,6 +218,7 @@ internal fun RemoteEnrollSheet(
     Column(Modifier.fillMaxWidth().fillMaxHeight(0.88f)) {
       LazyColumn(Modifier.weight(1f).fillMaxWidth(), contentPadding = PaddingValues(horizontal = 20.dp, vertical = 8.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        resultText?.let { text -> item { HyperInlineNotice(message = text, type = MiuixToastType.SUCCESS) } }
         if (candidates.isEmpty()) {
           item {
             Text("登录后选择要接入的电脑。每台主机会在本机注册一个独立设备身份，用于同时保持连接。",
@@ -327,7 +398,6 @@ internal fun RemoteEnrollSheet(
           }
           item { HyperButton(text = "返回选择", variant = HyperButtonVariant.SECONDARY, onClick = { review = false }, modifier = Modifier.fillMaxWidth()) }
         }
-        resultText?.let { text -> item { Text(text, color = MiuixColorTokens.Success, style = MiuixTheme.textStyles.footnote1) } }
         error?.let { text ->
           item {
             Column {
