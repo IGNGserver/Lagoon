@@ -21,8 +21,8 @@ internal class SshAgyProbe(private val transport: SshTransport) {
     if (lines.size != 1) return SshAgyObservation(null, issue = "invalid_output")
     val value = lines.single().removePrefix(PREFIX)
     if (value == "absent") return SshAgyObservation(false)
-    if (value == "version-unavailable") return SshAgyObservation(true, issue = "version_unavailable")
-    if (value == "no-acp") return SshAgyObservation(true, compatible = false, issue = "acp_unavailable")
+    if (value == "version-unavailable") return SshAgyObservation(true, compatible = true, issue = "version_unavailable")
+    if (value == "acp-probe-failed" || value == "no-acp") return SshAgyObservation(true, issue = "acp_probe_failed")
     val version = value.removePrefix("version:").takeIf {
       value.startsWith("version:") && it.length in 1..128 && it.all { char -> char.code in 32..126 }
     } ?: return SshAgyObservation(null, issue = "invalid_output")
@@ -31,11 +31,11 @@ internal class SshAgyProbe(private val transport: SshTransport) {
 
   companion object {
     private const val PREFIX = "LAGOON_AGY_DISCOVERY "
-    internal const val SCRIPT = """
+    internal val SCRIPT = SshExecutableSearch.prologue + "\n" + """
       if ! command -v agy >/dev/null 2>&1; then
         printf '%s\n' 'LAGOON_AGY_DISCOVERY absent'
       elif ! agy acp --help >/dev/null 2>&1; then
-        printf '%s\n' 'LAGOON_AGY_DISCOVERY no-acp'
+        printf '%s\n' 'LAGOON_AGY_DISCOVERY acp-probe-failed'
       else
         version=$(agy --version 2>/dev/null | head -n 1)
         if [ -z "${'$'}version" ]; then

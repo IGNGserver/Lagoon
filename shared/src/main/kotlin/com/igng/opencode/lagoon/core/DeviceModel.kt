@@ -43,7 +43,7 @@ data class HarnessSlot(
   val availability: HarnessDiscoveryStatus = HarnessDiscoveryStatus(),
   /** 用户能不能现在把它打开：已挂载（可关）或观测到可用；中枢/SSH 的 DSH 恒可挂载。 */
   val attachable: Boolean = false,
-  /** 一句话解释不可用原因；可用时为空。 */
+  /** 未验证、过期或不可用时的一句话说明。 */
   val reason: String = ""
 ) {
   val effectiveEnabled: Boolean get() = attached && enabled
@@ -181,6 +181,17 @@ object DeviceProjection {
     deviceName: String
   ): List<HarnessSlot> {
     val slots = LinkedHashMap<String, HarnessSlot>()
+    // Older SSH discovery persisted the absolute path of the one default registration. Its
+    // observation is the same logical slot as a pre-existing null-path default leaf. Preserve
+    // explicit-path leaves (including existing duplicates) and never merge multiple observations.
+    val rawObservations = discovery?.harnesses.orEmpty()
+    val defaultObservation = rawObservations.filter { it.protocol == HarnessProtocolId.OPENCODE_NATIVE }.singleOrNull()
+    val normalizeOldDefault = access == DeviceAccess.SSH && defaultObservation?.locator != null &&
+      attached.any { it.protocol == HarnessProtocolId.OPENCODE_NATIVE && it.sshServicePath == null } &&
+      attached.none { it.protocol == HarnessProtocolId.OPENCODE_NATIVE && it.sshServicePath == defaultObservation.locator }
+    val observations = rawObservations.map {
+      if (normalizeOldDefault && it === defaultObservation) it.copy(locator = null) else it
+    }
     fun put(slot: HarnessSlot) {
       // 已挂载的 leaf 永远优先于同槽位的发现结果。
       val existing = slots[slot.key]
@@ -189,13 +200,14 @@ object DeviceProjection {
     attached.forEach { profile ->
       val protocol = protocolOf(profile)
       val locator = locatorOf(profile)
-      val matched = discovery?.harness(protocol, locator)
+      val matched = observations.firstOrNull { it.protocol == protocol && it.locator == locator }
       val fresh = discovery?.isFresh(nowMs) == true
       val attachedReason = when {
         discovery == null -> ""
-        matched != null && !attachable(access, matched.status, nowMs) ->
+        matched != null && (!fresh || !attachable(access, matched.status, nowMs) ||
+          matched.status.completeness != DiscoveryCompleteness.COMPLETE) ->
           if (!fresh) "上次发现已过期"
-          else matched.detail.ifBlank { unavailableReason(matched.status, true) }
+          else matched.status.reason?.takeIf(String::isNotBlank) ?: matched.detail.ifBlank { unavailableReason(matched.status, true) }
         matched == null && access == DeviceAccess.HUB &&
           protocol != HarnessProtocolId.DSH_TYPERT &&
           fresh && discovery.completeness == DiscoveryCompleteness.COMPLETE ->
@@ -216,7 +228,7 @@ object DeviceProjection {
         reason = attachedReason
       ))
     }
-    discovery?.harnesses.orEmpty().forEach { observed ->
+    observations.forEach { observed ->
       val key = slotKey(observed.protocol, observed.locator)
       if (slots.containsKey(key)) return@forEach
       val fresh = discovery?.isFresh(nowMs) == true
@@ -228,7 +240,15 @@ object DeviceProjection {
         name = observed.name.ifBlank { harnessName(observed.protocol, "") },
         availability = observed.status,
         attachable = canAttach,
-        reason = if (canAttach) "" else observed.detail.ifBlank { unavailableReason(observed.status, fresh) }
+        reason = when {
+          !fresh -> "上次发现已过期"
+          !canAttach -> observed.status.reason?.takeIf(String::isNotBlank) ?: observed.detail.ifBlank { unavailableReason(observed.status, true) }
+          observed.status.completeness != DiscoveryCompleteness.COMPLETE -> observed.status.reason?.takeIf(String::isNotBlank)
+            ?: "尚未完成检测，可尝试连接"
+          access == DeviceAccess.SSH && observed.status.available == DiscoveryValue.UNKNOWN ->
+            observed.status.reason?.takeIf(String::isNotBlank) ?: "已发现，连接后才能确认可用"
+          else -> ""
+        }
       ))
     }
     // 没有发现结果时，仍然给出该接入方式下“恒可挂载”的槽位，避免用户被一次失败的发现锁死。
@@ -258,8 +278,10 @@ object DeviceProjection {
    */
   private fun attachable(access: DeviceAccess, status: HarnessDiscoveryStatus, nowMs: Long): Boolean =
     if (access == DeviceAccess.SSH) {
-      status.installed != DiscoveryValue.NO && status.configured != DiscoveryValue.NO &&
-        status.compatible != DiscoveryValue.NO && status.available != DiscoveryValue.NO
+      // Old negative observations are unknown, not a permanent prohibition on trying again.
+      status.freshness(nowMs) != DiscoveryFreshness.FRESH ||
+        (status.installed != DiscoveryValue.NO && status.configured != DiscoveryValue.NO &&
+          status.compatible != DiscoveryValue.NO && status.available != DiscoveryValue.NO)
     } else {
       status.availableNow(nowMs)
     }

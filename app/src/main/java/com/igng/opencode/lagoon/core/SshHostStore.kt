@@ -22,7 +22,7 @@ internal class SshHostStore internal constructor(
     KeystoreCipher.of("lagoon-ssh-secrets")::decrypt
   )
 
-  fun load(): List<SshHostConfig> = try {
+  @Synchronized fun load(): List<SshHostConfig> = try {
     readHosts()
   } catch (error: IOException) {
     Diagnostics.warn("SshHostStore", "SSH 主机配置读取失败，界面暂不显示", error)
@@ -40,7 +40,7 @@ internal class SshHostStore internal constructor(
     }
   }
 
-  fun save(config: SshHostConfig, secrets: SshSecrets? = null) {
+  @Synchronized fun save(config: SshHostConfig, secrets: SshSecrets? = null) {
     val current = readHosts()
     if (secrets != null) saveSecrets(config, secrets)
     val next = current.filterNot { it.id == config.id } + config
@@ -49,7 +49,7 @@ internal class SshHostStore internal constructor(
     }
   }
 
-  fun delete(id: String) {
+  @Synchronized fun delete(id: String) {
     val next = readHosts().filterNot { it.id == id }
     if (!preferences.edit().putString(KEY, SshHostCodec.encode(next)).commit()) {
       throw IOException("SSH 主机删除失败")
@@ -67,13 +67,21 @@ internal class SshHostStore internal constructor(
   )
 
   /** Trust-on-first-use: remembers the key the person accepted. */
-  fun pinHostKey(id: String, key: PresentedSshHostKey) {
+  @Synchronized fun pinHostKey(id: String, key: PresentedSshHostKey) {
     val current = load().firstOrNull { it.id == id } ?: return
     save(current.copyWith(hostKeyType = key.type, hostKeyFingerprint = key.fingerprint))
   }
 
+  /** Never trust a key displayed for an endpoint that was edited or deleted in the meantime. */
+  @Synchronized fun pinHostKeyIfUnchanged(expected: SshHostConfig, key: PresentedSshHostKey): Boolean {
+    val current = readHosts().firstOrNull { it.id == expected.id } ?: return false
+    if (current != expected) return false
+    save(current.copyWith(hostKeyType = key.type, hostKeyFingerprint = key.fingerprint))
+    return true
+  }
+
   /** Forgets the pinned key after the person explicitly confirmed the machine changed. */
-  fun resetHostKey(id: String) {
+  @Synchronized fun resetHostKey(id: String) {
     val current = load().firstOrNull { it.id == id } ?: return
     save(current.copyWith(clearHostKey = true))
   }

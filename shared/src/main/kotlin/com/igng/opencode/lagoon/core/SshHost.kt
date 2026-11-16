@@ -15,70 +15,126 @@ enum class SshAuthMethod(val label: String) {
 
 const val SSH_DEFAULT_PORT = 22
 const val DEFAULT_DSH_LAUNCH_COMMAND = "dsh web"
-const val SSH_STATE_DIR = "\$HOME/.dsh-app-remote"
+const val SSH_STATE_DIR = "\$HOME/.lagoon-ssh-dsh"
+const val SSH_LEGACY_STATE_DIR = "\$HOME/.dsh-app-remote"
 
 /** Result of reading one address field, so the form can keep user/port out of the first screen. */
-data class SshAddressParts(val host: String, val user: String? = null, val port: Int? = null)
+data class SshAddressParts(val host: String, val user: String? = null, val port: Int? = null, val error: String? = null)
 
 /**
  * What the address field accepts. People copy `user@host`, `host:2222` or a whole
  * `ssh -p 2222 user@host` line out of a terminal or a chat message, so the form splits that instead
- * of asking everyone for three separate fields. Anything it cannot read stays as the host verbatim.
+ * of asking everyone for three separate fields. Unsupported command options are never silently
+ * discarded: [SshAddressParts.error] must be resolved before the address can be used.
  */
 object SshAddress {
-  private val WHITESPACE = Regex("\\s+")
-
   fun parse(raw: String): SshAddressParts {
     val text = raw.trim()
     if (text.isEmpty()) return SshAddressParts("")
     var rest = text
     var flagPort: Int? = null
+    var flagUser: String? = null
+    var unsupported: String? = null
     if (text.length > 3 && text.startsWith("ssh") && text[3].isWhitespace()) {
-      val tokens = text.split(WHITESPACE).filter(String::isNotEmpty).drop(1)
+      val tokens = tokenize(text)?.drop(1) ?: return SshAddressParts(text, error = "SSH 命令格式无法识别，请只填写地址或简单的 ssh -p 命令")
       var destination: String? = null
       var index = 0
+      var endOptions = false
       while (index < tokens.size) {
         val token = tokens[index]
         when {
-          (token == "-p" || token == "-P") && index + 1 < tokens.size -> {
-            flagPort = tokens[index + 1].toPortOrNull()
-            index += 2
+          destination != null -> return SshAddressParts(text, error = "不支持 SSH 命令里的远程命令或额外参数，请只填写连接地址")
+          !endOptions && token == "--" -> { endOptions = true; index++ }
+          !endOptions && (token == "-p" || token.startsWith("-p") && token.length > 2) -> {
+            val value = if (token == "-p") tokens.getOrNull(++index) else token.substring(2)
+            val parsed = value?.toPortOrNull() ?: return SshAddressParts(text, error = "SSH 端口需在 1–65535")
+            if (flagPort != null && flagPort != parsed) return SshAddressParts(text, error = "SSH 命令中包含不同的端口，请保留一个")
+            flagPort = parsed
+            index++
           }
-          (token.startsWith("-p") || token.startsWith("-P")) && token.length > 2 -> {
-            flagPort = token.substring(2).toPortOrNull()
-            index += 1
+          !endOptions && (token == "-l" || token.startsWith("-l") && token.length > 2) -> {
+            val value = if (token == "-l") tokens.getOrNull(++index) else token.substring(2)
+            if (value.isNullOrBlank() || value.startsWith('-')) return SshAddressParts(text, error = "SSH 命令缺少用户名")
+            if (flagUser != null && flagUser != value) return SshAddressParts(text, error = "SSH 命令中包含不同的用户名，请保留一个")
+            flagUser = value
+            index++
           }
-          token.startsWith("-") -> index += 1
+          !endOptions && (token == "-i" || token.startsWith("-i") && token.length > 2) -> {
+            val value = if (token == "-i") tokens.getOrNull(++index) else token.substring(2)
+            if (value.isNullOrBlank() || value.startsWith('-')) return SshAddressParts(text, error = "SSH 命令的 -i 缺少私钥文件")
+            unsupported = "命令使用了 -i 私钥路径，手机无法使用电脑上的文件。请只填连接地址，并在验证方式中导入密钥"
+            index++
+          }
+          token.startsWith("-") -> return SshAddressParts(text, error = "不支持 SSH 命令选项 $token，请去掉该选项后重试")
           else -> {
-            if (destination == null) destination = token
-            index += 1
+            destination = token
+            index++
           }
         }
       }
-      if (destination == null) return SshAddressParts(text)
+      if (destination == null) return SshAddressParts(text, error = "SSH 命令缺少主机地址")
       rest = destination
     }
+    if (rest.any(Char::isWhitespace) || rest.any(Char::isISOControl))
+      return SshAddressParts(text, error = "地址不能包含空格或换行")
     val at = rest.lastIndexOf('@')
+    if (at == 0 || at == rest.lastIndex || (at >= 0 && rest.indexOf('@') != at))
+      return SshAddressParts(text, error = "请填写完整的用户名和主机地址")
     val user = if (at > 0) rest.substring(0, at).takeIf(String::isNotBlank) else null
+    if (flagUser != null && user != null && flagUser != user)
+      return SshAddressParts(text, error = "SSH 命令中包含不同的用户名，请保留一个")
     val hostPort = if (user != null) rest.substring(at + 1) else rest
     val split = splitHostPort(hostPort)
-    if (split.first.isBlank()) return SshAddressParts(text)
-    return SshAddressParts(split.first, user, split.second ?: flagPort)
+    if (split.error != null) return SshAddressParts(text, error = split.error)
+    if (split.host.isBlank()) return SshAddressParts(text, error = "SSH 命令缺少主机地址")
+    if (flagPort != null && split.port != null && flagPort != split.port)
+      return SshAddressParts(text, error = "SSH 命令和地址中包含不同的端口，请保留一个")
+    return SshAddressParts(split.host, user ?: flagUser, split.port ?: flagPort, unsupported)
   }
 
-  private fun splitHostPort(value: String): Pair<String, Int?> {
+  private fun splitHostPort(value: String): SshAddressParts {
     if (value.startsWith("[")) {
       val close = value.indexOf(']')
-      if (close <= 1) return value to null
+      if (close <= 1) return SshAddressParts(value, error = "IPv6 地址的方括号不完整")
       val tail = value.substring(close + 1)
-      val port = if (tail.startsWith(":")) tail.substring(1).toPortOrNull() else null
-      return value.substring(1, close) to port
+      if (tail.isEmpty()) return SshAddressParts(value.substring(1, close))
+      if (!tail.startsWith(":")) return SshAddressParts(value, error = "IPv6 地址格式不正确")
+      val port = tail.substring(1).toPortOrNull() ?: return SshAddressParts(value, error = "SSH 端口需在 1–65535")
+      return SshAddressParts(value.substring(1, close), port = port)
     }
+    if ('[' in value || ']' in value) return SshAddressParts(value, error = "IPv6 地址的方括号不完整")
     val first = value.indexOf(':')
     // More than one colon without brackets is a bare IPv6 address, never a port.
-    if (first <= 0 || first != value.lastIndexOf(':')) return value to null
-    val port = value.substring(first + 1).toPortOrNull() ?: return value to null
-    return value.substring(0, first) to port
+    if (first != value.lastIndexOf(':') || first < 0) return SshAddressParts(value)
+    if (first == 0) return SshAddressParts(value, error = "SSH 地址缺少主机名")
+    val port = value.substring(first + 1).toPortOrNull() ?: return SshAddressParts(value, error = "SSH 端口需在 1–65535")
+    return SshAddressParts(value.substring(0, first), port = port)
+  }
+
+  /** Tokenize, never evaluate, a small shell-like command; reject expansions and operators. */
+  private fun tokenize(text: String): List<String>? {
+    val tokens = mutableListOf<String>()
+    val token = StringBuilder()
+    var quote: Char? = null
+    var escaped = false
+    var started = false
+    for (char in text) {
+      if (char.isISOControl() || char == '$' || char == '`') return null
+      if (escaped) { token.append(char); escaped = false; started = true; continue }
+      if (char == '\\' && quote != '\'') { escaped = true; started = true; continue }
+      if (quote != null) {
+        if (char == quote) quote = null else token.append(char)
+        started = true
+      } else when {
+        char == '\'' || char == '"' -> { quote = char; started = true }
+        char.isWhitespace() -> if (started) { tokens.add(token.toString()); token.clear(); started = false }
+        char in ";|&<>" -> return null
+        else -> { token.append(char); started = true }
+      }
+    }
+    if (quote != null || escaped) return null
+    if (started) tokens.add(token.toString())
+    return tokens
   }
 
   private fun String.toPortOrNull(): Int? = trim().toIntOrNull()?.takeIf { it in 1..65535 }
@@ -267,7 +323,7 @@ data class SshLinkStatus(
 }
 
 enum class SshFailureKind {
-  UNREACHABLE, AUTH, HOST_KEY_UNKNOWN, HOST_KEY_CHANGED, NO_SHELL, DSH_NOT_FOUND,
+  UNREACHABLE, AUTH, AUTH_INTERACTION_REQUIRED, HOST_KEY_UNKNOWN, HOST_KEY_CHANGED, NO_SHELL, DSH_NOT_FOUND,
   DSH_START, DSH_TIMEOUT, TUNNEL, LOGIN, DISCONNECTED, UNRESPONSIVE, BAD_KEY,
   PASSPHRASE_REQUIRED, BIOMETRIC_REQUIRED, OTHER
 }
@@ -294,7 +350,9 @@ data class RemoteDshEndpoint(
   val pid: Int? = null,
   val reused: Boolean = false,
   val home: String? = null,
-  val dshPath: String? = null
+  val dshPath: String? = null,
+  /** Trusted state-directory basename for proving the managed process generation. */
+  val ownershipStateDirectory: String? = null
 ) {
   /** The Host header DSH's loopback API fence expects through the tunnel. */
   val authority: String get() = "127.0.0.1:$port"

@@ -36,7 +36,7 @@ class SshAgyTransportTest {
       assertEquals("session/list", list.getString("method"))
       wire.write(JSONObject().put("id", list.get("id")).put("result", JSONObject().put("sessions", org.json.JSONArray())))
       assertEquals(0, withTimeout(3_000) { call.await() }.getJSONArray("sessions").length())
-      assertEquals("exec agy acp", ssh.script)
+      assertEquals(SshExecutableSearch.prologue + "\nexec agy acp", ssh.script)
 
       val prompt = withTimeout(3_000) { transport.beginPrompt(JSONObject().put("sessionId", "one").put("prompt", org.json.JSONArray())) }
       val sent = wire.next()
@@ -80,7 +80,7 @@ class SshAgyTransportTest {
       val health = async(Dispatchers.IO) { client.health() }
       val init = wire.next()
       assertEquals("initialize", init.getString("method"))
-      assertEquals("exec agy acp", ssh.script)
+      assertEquals(SshExecutableSearch.prologue + "\nexec agy acp", ssh.script)
       wire.write(JSONObject().put("id", init.get("id")).put("result", JSONObject().put("protocolVersion", 1)))
       val listing = wire.next()
       assertEquals("session/list", listing.getString("method"))

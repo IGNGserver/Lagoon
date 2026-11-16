@@ -1,5 +1,7 @@
 package com.igng.opencode.lagoon.ui
 
+import com.igng.opencode.lagoon.core.ServerKind
+import com.igng.opencode.lagoon.core.ServerProfile
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -84,6 +86,22 @@ class SessionNavigationTest {
     assertEquals(profileEditor, sshEditor.back())
     assertEquals(detail, profileEditor.back())
     assertEquals(SessionNavigation(RootPage.DEVICES), detail.back())
+  }
+
+  @Test fun harnessEditorTargetsItsSshDeviceOrDirectProfile() {
+    val ssh = ServerProfile(id = "codex-leaf", name = "Codex", url = "ssh://user@host:22",
+      kind = ServerKind.CODEX, sshHostId = "ssh-host")
+    val direct = ServerProfile(id = "direct-leaf", name = "OpenCode", url = "https://example.invalid")
+    val detail = SessionNavigation(RootPage.DEVICES).openDevice("device").openHarness(ssh.id)
+    val sshEditor = detail.openEditor(editorForHarness(ssh))
+    assertEquals(DeviceEditorMode.SSH_HOST, sshEditor.route.editor?.mode)
+    assertEquals("ssh-host", sshEditor.route.editor?.sshHostId)
+    assertNull(sshEditor.route.editor?.profileId)
+    assertEquals(detail, sshEditor.back())
+    val directEditor = editorForHarness(direct)
+    assertEquals(DeviceEditorMode.DIRECT_PROFILE, directEditor.mode)
+    assertEquals("direct-leaf", directEditor.profileId)
+    assertNull(directEditor.sshHostId)
   }
 
   @Test fun editorOpenedWithoutADeviceReturnsToThePageItCameFrom() {

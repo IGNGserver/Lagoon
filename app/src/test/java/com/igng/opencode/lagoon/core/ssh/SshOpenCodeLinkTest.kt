@@ -40,8 +40,10 @@ import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.Closeable
+import java.io.ByteArrayInputStream
 import java.io.InputStream
 import java.io.OutputStream
+import java.io.SequenceInputStream
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
@@ -82,8 +84,8 @@ class SshOpenCodeLinkTest {
         withTimeout(TIMEOUT_MILLIS) { client.renameSession(session, "Renamed through SSH") }
         val rename = assertRequest(server, "PATCH", "/api/session/ses_tunnel")
         assertEquals("Renamed through SSH", JSONObject(rename.body.readUtf8()).getString("title"))
-        assertTrue(fixture.transport.tunnels.isNotEmpty())
-        assertTrue(fixture.transport.tunnels.all { it.host == LOOPBACK && it.port == server.port })
+        assertTrue(fixture.transport.verifiedChannels.isNotEmpty())
+        assertTrue(fixture.transport.verifiedChannels.all { it.port == server.port })
         fixture.assertOnlyReadOnlyDiscovery()
 
         // NO_RESPONSE keeps a concrete HTTP call pending; receipt is the synchronization barrier.
@@ -103,7 +105,7 @@ class SshOpenCodeLinkTest {
           assertTrue(fixture.link.isClosed)
           assertTrue(fixture.transport.isClosed)
           assertEquals(1, fixture.transport.closes.get())
-          assertTrue(fixture.transport.tunnels.all { !it.isOpen })
+          assertTrue(fixture.transport.verifiedChannels.all { !it.isOpen })
           val afterClose = runCatching { fixture.link.awaitHarness(TIMEOUT_MILLIS) }.exceptionOrNull()
           assertTrue(afterClose is SshFailure)
           assertFalse((afterClose as SshFailure).retryable)
@@ -153,7 +155,7 @@ class SshOpenCodeLinkTest {
         assertEquals("A mismatched process must not receive authenticated project or schema requests",
           1, server.requestCount)
         assertTrue(fixture.transport.isClosed)
-        assertTrue(fixture.transport.tunnels.all { !it.isOpen })
+        assertTrue(fixture.transport.verifiedChannels.all { !it.isOpen })
         fixture.assertOnlyReadOnlyDiscovery()
 
         // Asking again must surface the permanent failure, not silently bootstrap or retry.
@@ -317,6 +319,7 @@ class SshOpenCodeLinkTest {
     val scripts = CopyOnWriteArrayList<String>()
     val execTimeouts = CopyOnWriteArrayList<Long>()
     val tunnels = CopyOnWriteArrayList<SocketTunnel>()
+    val verifiedChannels = CopyOnWriteArrayList<FakeVerifiedChannel>()
     val closes = AtomicInteger()
     override val isClosed: Boolean get() = closed.get()
 
@@ -354,6 +357,14 @@ class SshOpenCodeLinkTest {
       }
     }
 
+    /** This fixture isolates link wiring; the real OS proof is covered by SshVerifiedTunnelTest. */
+    override fun openExecChannel(script: String): SshExecChannel = synchronized(this) {
+      check(!isClosed)
+      check(script.startsWith("python3 -u -c "))
+      val socket = Socket(LOOPBACK, serverPort)
+      FakeVerifiedChannel(socket, serverPort).also { verifiedChannels += it }
+    }
+
     override fun probeTunnel(host: String, port: Int, timeoutMillis: Long): Boolean =
       !isClosed && host == LOOPBACK && port == serverPort
     override fun ping(timeoutMillis: Long): Boolean = !isClosed
@@ -363,6 +374,7 @@ class SshOpenCodeLinkTest {
         if (closed.compareAndSet(false, true)) {
           closes.incrementAndGet()
           tunnels.forEach { it.close() }
+          verifiedChannels.forEach { it.close() }
           workers.shutdownNow()
         }
       }
@@ -372,6 +384,15 @@ class SshOpenCodeLinkTest {
       assertTrue("Socket relay workers must stop after closing their streams",
         workers.awaitTermination(TIMEOUT_MILLIS, TimeUnit.MILLISECONDS))
     }
+  }
+
+  private class FakeVerifiedChannel(private val socket: Socket, val port: Int) : SshExecChannel {
+    override val stdin: OutputStream = socket.getOutputStream()
+    override val stdout: InputStream = SequenceInputStream(
+      ByteArrayInputStream("LAGOON_SOCKET_READY_V1\n".toByteArray(Charsets.US_ASCII)), socket.getInputStream())
+    override val stderr: InputStream = ByteArrayInputStream(ByteArray(0))
+    override val isOpen: Boolean get() = !socket.isClosed
+    override fun close() { socket.close() }
   }
 
   private class SocketTunnel(

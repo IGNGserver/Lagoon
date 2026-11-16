@@ -59,8 +59,13 @@ internal class SshHarnessProbe(
             if not os.path.isabs(path): return {'state':'unknown','issue':'invalid_path'}
             fd = None
             try:
-                fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NONBLOCK', 0))
-                if not stat.S_ISREG(os.fstat(fd).st_mode): return {'state':'corrupt','issue':'invalid_data'}
+                # A registration may contain credentials. Never follow a final symlink or accept
+                # records another user can replace. Retain unknown when ownership is uncertain.
+                if not hasattr(os, 'O_NOFOLLOW'): return {'state':'unknown','issue':'unreadable'}
+                fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, 'O_NONBLOCK', 0))
+                info = os.fstat(fd)
+                if not stat.S_ISREG(info.st_mode): return {'state':'corrupt','issue':'invalid_data'}
+                if info.st_uid != os.geteuid() or info.st_mode & 0o022: return {'state':'unknown','issue':'unreadable'}
                 with os.fdopen(fd, 'rb') as stream:
                     fd = None
                     data = stream.read(${OpenCodeSshRegistration.MAX_BYTES + 1})
@@ -73,8 +78,11 @@ internal class SshHarnessProbe(
         def read_marker(path):
             if not os.path.isabs(path): return {'state':'unknown','issue':'invalid_path'}
             try:
-                mode = os.stat(path).st_mode
-                return {'state':'present'} if stat.S_ISDIR(mode) else {'state':'corrupt','issue':'invalid_data'}
+                info = os.lstat(path)
+                if stat.S_ISLNK(info.st_mode): return {'state':'unknown','issue':'unreadable'}
+                if not stat.S_ISDIR(info.st_mode): return {'state':'corrupt','issue':'invalid_data'}
+                if info.st_uid != os.geteuid() or info.st_mode & 0o022: return {'state':'unknown','issue':'unreadable'}
+                return {'state':'present'}
             except FileNotFoundError: return {'state':'absent','issue':'not_found'}
             except OSError: return {'state':'unknown','issue':'unreadable'}
         registration = read_registration(path)
@@ -143,9 +151,72 @@ internal class SshHarnessProbe(
       "invalid_data", "invalid_path" -> SshDiscoveryIssue.INVALID_DATA
       else -> SshDiscoveryIssue.INVALID_OUTPUT
     }
-    private fun unknown(now: Long, issue: SshDiscoveryIssue) = SshHarnessDiscoveryResult(
+    internal fun unknown(now: Long, issue: SshDiscoveryIssue) = SshHarnessDiscoveryResult(
       SshOpenCodeObservation(SshDiscoveryState.UNKNOWN, issue = issue),
       SshDshLegacyObservation(SshDiscoveryState.UNKNOWN, issue = issue), now, DiscoveryCompleteness.PARTIAL
     )
+  }
+}
+
+/**
+ * Discovery and startup must see exactly the same executable search order. Keep the login-shell
+ * PATH first, append common per-user installations, and never source shell profiles here.
+ * Globs and every directory assignment are quoted so spaces in HOME and installed paths survive.
+ */
+internal object SshExecutableSearch {
+  val prologue: String = """
+    if [ -n "§{HOME:-}" ]; then
+      for __lagoon_dir in "§HOME/.local/bin" "§HOME/.npm-global/bin" "§HOME/.npm/bin" \
+        "§HOME/.volta/bin" "§HOME/.bun/bin" "§HOME/.local/share/pnpm" "§HOME/Library/pnpm" \
+        "§HOME"/.nvm/versions/node/*/bin "§HOME"/.local/share/fnm/node-versions/*/installation/bin; do
+        [ -d "§__lagoon_dir" ] || continue
+        case ":§{PATH:-}:" in *":§__lagoon_dir:"*) ;; *) PATH="§{PATH:+§PATH:}§__lagoon_dir" ;; esac
+      done
+    fi
+    for __lagoon_dir in /usr/local/bin /opt/homebrew/bin; do
+      [ -d "§__lagoon_dir" ] || continue
+      case ":§{PATH:-}:" in *":§__lagoon_dir:"*) ;; *) PATH="§{PATH:+§PATH:}§__lagoon_dir" ;; esac
+    done
+    export PATH
+    unset __lagoon_dir
+  """.trimIndent().replace('§', '$')
+}
+
+/** DSH executable presence is distinct from a running, reusable or authenticated service. */
+internal data class SshDshObservation(
+  val installed: Boolean?,
+  val issue: String? = null,
+  val customCommand: Boolean = false
+)
+
+internal class SshDshProbe(private val transport: SshTransport) {
+  fun discover(customCommand: Boolean): SshDshObservation {
+    val result = try { transport.exec(SCRIPT, 20_000) }
+    catch (cancel: CancellationException) { throw cancel }
+    catch (_: Exception) { return SshDshObservation(null, "probe_failed", customCommand) }
+    if (result.exitCode != 0 || result.stdout.length > 64 * 1024)
+      return SshDshObservation(null, "probe_failed", customCommand)
+    val lines = result.stdout.lineSequence().filter { it.startsWith(PREFIX) }.toList()
+    if (lines.size != 1) return SshDshObservation(null, "invalid_output", customCommand)
+    val found = when (lines.single().removePrefix(PREFIX)) {
+      "present" -> true
+      "absent" -> false
+      else -> return SshDshObservation(null, "invalid_output", customCommand)
+    }
+    // Presence of a globally installed dsh is evidence even with a custom wrapper; absence of
+    // one says nothing about that wrapper, and discovery never executes arbitrary user commands.
+    return if (customCommand) SshDshObservation(if (found) true else null, "custom_command_unverified", true)
+      else SshDshObservation(found)
+  }
+
+  companion object {
+    private const val PREFIX = "LAGOON_DSH_DISCOVERY "
+    internal val SCRIPT = SshExecutableSearch.prologue + "\n" + """
+      if command -v dsh >/dev/null 2>&1; then
+        printf '%s\n' 'LAGOON_DSH_DISCOVERY present'
+      else
+        printf '%s\n' 'LAGOON_DSH_DISCOVERY absent'
+      fi
+    """.trimIndent()
   }
 }

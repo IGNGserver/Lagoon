@@ -576,11 +576,12 @@ class OpenCodeApiTest {
     }
   }
 
-  /** An unexpected shape must yield no sessions, never a session literally named `data`. */
-  @Test fun activeSessionsNeverInventsASessionFromAnEnvelopeKey() = runBlocking {
+  /** A malformed envelope is not an authoritative empty activity snapshot. */
+  @Test fun activeSessionsRejectsAnInvalidEnvelope() = runBlocking {
     MockWebServer().use { server ->
       server.enqueue(MockResponse().setBody("""{"data":[]}"""))
-      assertTrue(api(server).activeSessions().isEmpty())
+      val failure = runCatching { api(server).activeSessions() }.exceptionOrNull()
+      assertTrue("Malformed activity data must fail instead of clearing running tasks", failure is ApiException)
     }
   }
 

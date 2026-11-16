@@ -50,6 +50,12 @@ import top.yukonga.miuix.kmp.icon.MiuixIcons
 import top.yukonga.miuix.kmp.icon.extended.*
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 
+private data class PendingSshDeviceTrust(
+  val deviceId: String,
+  val expected: SshHostConfig,
+  val key: PresentedSshHostKey
+)
+
 class MainActivity : ComponentActivity() {
   private var deepLink by mutableStateOf<Pair<String, String>?>(null)
   /** 已处理的深链目标（随实例状态保存）：旋转/改字体触发重建时不再重复跳回同一会话。 */
@@ -75,8 +81,13 @@ class MainActivity : ComponentActivity() {
     onBackPressedDispatcher.addCallback(navigator.callback)
     // Opening the app refreshes from the server; leaving it lets the live stream wind down.
     lifecycle.addObserver(LifecycleEventObserver { _, event ->
-      if (event == Lifecycle.Event.ON_START) controller.onForeground()
-      else if (event == Lifecycle.Event.ON_STOP) controller.onBackground()
+      if (event == Lifecycle.Event.ON_START) {
+        controller.setSshInteractiveForeground(true)
+        controller.onForeground()
+      } else if (event == Lifecycle.Event.ON_STOP) {
+        controller.setSshInteractiveForeground(false)
+        controller.onBackground()
+      }
     })
     // Frame timing per page for the copied diagnostics (FrameStats); paused while not visible.
     val jank = JankStats.createAndTrack(window) { frame -> FrameStats.record(frame.frameDurationUiNanos, frame.isJank) }
@@ -86,6 +97,7 @@ class MainActivity : ComponentActivity() {
     })
     setContent {
       val state by controller.state.collectAsState()
+      val sshChallenges by controller.sshKeyboardChallenges.collectAsState()
       // A device group scopes the new-session server list; 全部设备 leaves every enabled profile open.
       // 首页的聚合投影不能跟着"当前路由"走：首页在转场里也是一页（离场页、预见式返回的预览页），
       // 那些帧里栈仍指向会话页。首页统一在组合点取投影，见 [rememberHomePage]。
@@ -126,6 +138,8 @@ class MainActivity : ComponentActivity() {
       var draftNonce by rememberSaveable { mutableIntStateOf(0) }
       var globalMessage by remember { mutableStateOf<String?>(null) }
       var globalMessageType by remember { mutableStateOf(MiuixToastType.INFO) }
+      var pendingSshTrust by remember { mutableStateOf<PendingSshDeviceTrust?>(null) }
+      val deviceDiscoveryErrors = remember { mutableStateMapOf<String, String>() }
        val holder = rememberSaveableStateHolder()
        val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
       val focusManager = LocalFocusManager.current
@@ -150,12 +164,50 @@ class MainActivity : ComponentActivity() {
        fun openSshEditor(hostId: String) = openEditor(
          DeviceEditorRoute(mode = DeviceEditorMode.SSH_HOST, access = AddDeviceAccess.SSH, sshHostId = hostId)
        )
-       fun editDirectProfile(profile: ServerProfile) = openEditor(
-         DeviceEditorRoute(mode = DeviceEditorMode.DIRECT_PROFILE, profileId = profile.id)
-       )
        fun openDevice(deviceId: String) {
          focusManager.clearFocus()
          navigator.navigate(navigator.navigation.openDevice(deviceId))
+       }
+       fun refreshDevice(deviceId: String) {
+         scope.launch {
+           // Capture the endpoint before the attempt; never attach an old handshake to a newly edited host.
+           val expected = controller.sshHostForDevice(deviceId)
+           try {
+             deviceDiscoveryErrors.remove(deviceId)
+             controller.refreshDeviceDiscovery(deviceId)
+           } catch (cancel: CancellationException) {
+             throw cancel
+           } catch (error: Exception) {
+             val failure = error as? SshFailure
+             if (expected != null && failure != null &&
+               (failure.kind == SshFailureKind.HOST_KEY_UNKNOWN || failure.kind == SshFailureKind.HOST_KEY_CHANGED) &&
+               controller.sshHostForDevice(deviceId) == expected
+             ) {
+               try {
+                 val key = failure.presentedKey ?: if (failure.kind == SshFailureKind.HOST_KEY_UNKNOWN &&
+                   expected.hostKeyFingerprint.isNullOrBlank()) controller.probeSshHostKey(expected) else null
+                 if (key != null && controller.sshHostForDevice(deviceId) == expected &&
+                   navigator.navigation.device == deviceId && pendingSshTrust == null
+                 ) {
+                   pendingSshTrust = PendingSshDeviceTrust(deviceId, expected, key)
+                   return@launch
+                 }
+               } catch (cancel: CancellationException) {
+                 throw cancel
+               } catch (probe: Exception) {
+                 val message = userFacingError(probe, "读取主机指纹失败")
+                 deviceDiscoveryErrors[deviceId] = message
+                 globalMessage = message
+                 globalMessageType = MiuixToastType.ERROR
+                 return@launch
+               }
+             }
+             val message = userFacingError(error, "发现失败")
+             deviceDiscoveryErrors[deviceId] = message
+             globalMessage = message
+             globalMessageType = MiuixToastType.ERROR
+           }
+         }
        }
        fun openHarness(leafId: String) {
          focusManager.clearFocus()
@@ -378,7 +430,11 @@ class MainActivity : ComponentActivity() {
                   onOpenSshEditor = { hostId -> openSshEditor(hostId) },
                   onLoginHub = { showingRemoteEnroll = true },
                   onManageHub = { showingRemoteHosts = true },
-                  onDeviceSaved = { deviceId -> openDeviceFromEditor(deviceId) }
+                  onDeviceSaved = { deviceId -> openDeviceFromEditor(deviceId) },
+                  onSshDeviceSaved = { deviceId, discover ->
+                    openDeviceFromEditor(deviceId)
+                    if (discover) refreshDevice(deviceId)
+                  }
                 )
                 target.session == DRAFT_SESSION -> DraftScreen(state, controller, onBack = { goBack() }, onModal = {}, interactive = active,
                   profileIds = draftScope, onSwitchServer = { profile -> switchDraftServer(profile) })
@@ -388,7 +444,7 @@ class MainActivity : ComponentActivity() {
                   target.page == RootPage.DEVICES && target.harness != null -> HarnessDetailScreen(
                     state = state, controller = controller, leafId = target.harness,
                     onBack = { if (navigator.navigation.editors.isEmpty()) goBack() },
-                    onEditProfile = { profile -> editDirectProfile(profile) },
+                    onEditProfile = { profile -> openEditor(editorForHarness(profile)) },
                     onManageHub = { showingRemoteHosts = true },
                     onManageModels = { showingModelManagement = true }
                   )
@@ -403,13 +459,8 @@ class MainActivity : ComponentActivity() {
                         catch (error: Exception) { globalMessage = userFacingError(error, "添加 Harness 失败"); globalMessageType = MiuixToastType.ERROR }
                       }
                     },
-                    onRefreshDiscovery = { deviceId ->
-                      scope.launch {
-                        try { controller.refreshDeviceDiscovery(deviceId) }
-                        catch (cancel: CancellationException) { throw cancel }
-                        catch (error: Exception) { globalMessage = userFacingError(error, "发现失败"); globalMessageType = MiuixToastType.ERROR }
-                      }
-                    },
+                    onRefreshDiscovery = ::refreshDevice,
+                    discoveryError = deviceDiscoveryErrors[target.device],
                     onEditSsh = { hostId -> openSshEditor(hostId) },
                     onManageHub = { showingRemoteHosts = true },
                     onDeleteDevice = { deviceId -> controller.deleteDevice(deviceId) }
@@ -548,6 +599,34 @@ class MainActivity : ComponentActivity() {
                 globalMessageType = MiuixToastType.SUCCESS
               },
             )
+            pendingSshTrust?.let { pending ->
+              SshHostKeyDialog(
+                presented = pending.key,
+                saved = pending.expected.hostKeyFingerprint?.takeIf(String::isNotBlank),
+                savedType = pending.expected.hostKeyType,
+                destination = pending.expected.address,
+                onDismiss = {
+                  deviceDiscoveryErrors[pending.deviceId] = "尚未确认主机指纹，检测未完成"
+                  pendingSshTrust = null
+                },
+                onAccept = {
+                  pendingSshTrust = null
+                  try {
+                    controller.confirmSshDeviceHostKey(pending.deviceId, pending.expected, pending.key)
+                    refreshDevice(pending.deviceId)
+                  } catch (error: Exception) {
+                    if (error is CancellationException) throw error
+                    globalMessage = userFacingError(error, "保存主机指纹失败")
+                    globalMessageType = MiuixToastType.ERROR
+                  }
+                }
+              )
+            }
+            sshChallenges.firstOrNull()?.let { challenge ->
+              SshKeyboardChallengeDialog(challenge,
+                onCancel = { controller.answerSshKeyboardChallenge(challenge.id, null) },
+                onSubmit = { answers -> controller.answerSshKeyboardChallenge(challenge.id, answers) })
+            }
           }
         }
       }

@@ -27,6 +27,8 @@ import org.json.JSONObject
 /** Codex business projection. The connected carrier owns initialization and transport lifecycle. */
 class CodexApi(private val transport: CodexTransport) : HarnessClient {
   private val sessions = ConcurrentHashMap<String, Session>()
+  /** Only paths actually returned in this thread's history can be opened as local-image previews. */
+  private val localImages = ConcurrentHashMap<String, MutableSet<String>>()
   private val active = ConcurrentHashMap<String, String>()
   private val busy = ConcurrentHashMap.newKeySet<String>()
   // Live events can lead the paged catalog; do not let a lagging idle row erase them.
@@ -85,7 +87,7 @@ class CodexApi(private val transport: CodexTransport) : HarnessClient {
       finally {
         if (!closed) {
           closed = true
-          active.clear(); busy.clear(); eventBusy.clear(); loaded.clear(); requests.clear(); transport.close()
+          active.clear(); busy.clear(); eventBusy.clear(); loaded.clear(); requests.clear(); localImages.clear(); transport.close()
           finishSubscribers(IOException("Codex 连接已断开，请重新连接并读取历史"))
         }
       }
@@ -107,7 +109,7 @@ class CodexApi(private val transport: CodexTransport) : HarnessClient {
     return raw.ifBlank { null }
   }
   override val isClosed: Boolean get() = closed || transport.isClosed
-  override fun close() { if (!closed) { closed = true; requests.clear(); active.clear(); busy.clear(); eventBusy.clear(); loaded.clear(); scope.cancel(); transport.close(); finishSubscribers(null) } }
+  override fun close() { if (!closed) { closed = true; requests.clear(); active.clear(); busy.clear(); eventBusy.clear(); loaded.clear(); localImages.clear(); scope.cancel(); transport.close(); finishSubscribers(null) } }
   override fun capabilities() = ApiCapabilities(
     actions = mapOf(SessionAction.RENAME to ActionEndpoint("RPC", "thread/name/set")),
     archive = ArchiveEndpoint(ActionEndpoint("RPC", "thread/archive")), documented = false,
@@ -394,7 +396,7 @@ class CodexApi(private val transport: CodexTransport) : HarnessClient {
         val live = data.firstOrNull { it.str("status") == "inProgress" }?.str("id").orEmpty()
         if (live.isNotBlank()) { active[id] = live; busy.add(id) }
       }
-      return ApiPage(nativeTurns(turns), nextCursor(response))
+      return ApiPage(nativeTurns(id, turns), nextCursor(response))
     } catch (error: ApiException) {
       if (cursor != null || error.status !in setOf(404, 501, -32601) && error.code !in setOf("METHOD_NOT_FOUND", "METHOD_NOT_ALLOWED")) throw error
     }
@@ -405,7 +407,7 @@ class CodexApi(private val transport: CodexTransport) : HarnessClient {
     val live = turns.objects().lastOrNull { it.str("status") == "inProgress" }?.str("id").orEmpty()
     if (live.isNotBlank()) { active[id] = live; busy.add(id) }
     else if (id !in eventBusy) { active.remove(id); busy.remove(id) }
-    return ApiPage(nativeTurns(turns))
+    return ApiPage(nativeTurns(id, turns))
   }
   override suspend fun inbox(id: String) = emptyList<Message>()
   override suspend fun activeSessions(): Set<String> {
@@ -479,6 +481,7 @@ class CodexApi(private val transport: CodexTransport) : HarnessClient {
     synchronized(stateGate) { bumpStateRevision(id); active.remove(id); busy.remove(id); eventBusy.remove(id) }
     loaded.remove(id)
     sessions.remove(id)
+    localImages.remove(id)
     requests.entries.filter { it.value.sessionId == id }.forEach { requests.remove(it.key, it.value) }
     releaseFinishedTask(id)
   }
@@ -878,6 +881,38 @@ class CodexApi(private val transport: CodexTransport) : HarnessClient {
     val bytes = try { java.util.Base64.getDecoder().decode(data) } catch (_: IllegalArgumentException) { throw ApiException(502, "Codex 文件内容格式错误") }
     return FileContent("text", bytes.toString(Charsets.UTF_8))
   }
+
+  /**
+   * A Codex localImage is a path on the development machine, not on the phone. Read it only after
+   * the user opens an image that this exact thread's authoritative history returned; do not fetch
+   * arbitrary paths or turn history loading into a potentially large background file transfer.
+   */
+  override suspend fun previewFile(directory: String, path: String, session: Session?): FilePreview? {
+    if (transport.remote || session == null || localImages[session.id]?.contains(path) != true) return null
+    val result = rpc("fs/readFile", JSONObject().put("path", path))
+    val encoded = result.opt("dataBase64") as? String ?: throw ApiException(502, "Codex 图片内容缺失")
+    if (encoded.length > ((MAX_LOCAL_IMAGE_BYTES + 2) / 3) * 4) throw ApiException(413, "图片超过预览大小上限")
+    val bytes = try { java.util.Base64.getDecoder().decode(encoded) }
+      catch (_: IllegalArgumentException) { throw ApiException(502, "Codex 图片内容格式错误") }
+    if (bytes.size > MAX_LOCAL_IMAGE_BYTES) throw ApiException(413, "图片超过预览大小上限")
+    val mime = localImageMime(bytes) ?: throw ApiException(415, "电脑上的文件不是受支持的图片")
+    return FilePreview(mime, bytes)
+  }
+
+  private fun localImageMime(bytes: ByteArray): String? = when {
+    bytes.size >= 8 && bytes.copyOfRange(0, 8).contentEquals(byteArrayOf(
+      0x89.toByte(), 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a)) -> "image/png"
+    bytes.size >= 3 && bytes[0] == 0xff.toByte() && bytes[1] == 0xd8.toByte() && bytes[2] == 0xff.toByte() -> "image/jpeg"
+    bytes.size >= 6 && String(bytes, 0, 6, Charsets.US_ASCII) in setOf("GIF87a", "GIF89a") -> "image/gif"
+    bytes.size >= 12 && String(bytes, 0, 4, Charsets.US_ASCII) == "RIFF" &&
+      String(bytes, 8, 4, Charsets.US_ASCII) == "WEBP" -> "image/webp"
+    else -> null
+  }
+
+  private companion object {
+    const val MAX_LOCAL_IMAGE_BYTES = 4 * 1024 * 1024
+    const val MAX_LOCAL_IMAGES_PER_THREAD = 256
+  }
   private fun codexPath(directory: String, path: String): String {
     val absolute = if (path == "." || path.isBlank()) directory else if (isAbsoluteCodexPath(path)) path
       else directory.trimEnd('/', '\\') + (if ('\\' in directory && '/' !in directory) "\\" else "/") + path
@@ -923,7 +958,7 @@ class CodexApi(private val transport: CodexTransport) : HarnessClient {
   }
 
   /** Translate authoritative native history without mixing different turns or treating errors as empty history. */
-  private fun nativeTurns(turns: JSONArray): List<Message> {
+  private fun nativeTurns(threadId: String, turns: JSONArray): List<Message> {
     val messages = mutableListOf<Message>()
     for (turn in objects(turns, "turns")) {
       val turnId = turn.str("id")
@@ -942,6 +977,14 @@ class CodexApi(private val transport: CodexTransport) : HarnessClient {
               when (content.str("type")) {
                 "text" -> MessagePart("$id:$index", "text", text = content.str("text"))
                 "image" -> MessagePart("$id:$index", "file", path = content.str("url"), mime = "image/*")
+                "localImage" -> {
+                  val path = content.str("path")
+                  val valid = isAbsoluteCodexPath(path) && path.length <= 4096 && path.none(Char::isISOControl)
+                  val paths = if (valid) localImages.computeIfAbsent(threadId) { ConcurrentHashMap.newKeySet() } else null
+                  val admitted = paths != null && (path in paths || paths.size < MAX_LOCAL_IMAGES_PER_THREAD && paths.add(path))
+                  if (admitted) MessagePart("$id:$index", "file", path = path, mime = "image/*", title = "电脑上的图片 · 点按查看")
+                  else MessagePart("$id:$index", "text", text = "图片附件暂时无法预览")
+                }
                 else -> null
               }
             }

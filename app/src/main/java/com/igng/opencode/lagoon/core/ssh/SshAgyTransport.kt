@@ -177,7 +177,7 @@ internal class SshAgyTransport(
       val pin = config.hostKeyFingerprint?.takeIf { it.isNotBlank() }
         ?: throw SshFailure(SshFailureKind.HOST_KEY_UNKNOWN, "请先确认 SSH 主机指纹", retryable = false)
       try {
-        val lease = factory.connect(config, secrets, SshHostKeyVerifier { key ->
+        val lease = factory.connectInterruptibly(config, secrets, SshHostKeyVerifier { key ->
           if (key.fingerprint != pin) throw SshFailure(SshFailureKind.HOST_KEY_CHANGED,
             "SSH 主机指纹已变化", retryable = false, presentedKey = key)
           true
@@ -187,7 +187,7 @@ internal class SshAgyTransport(
           connection = lease
         }
         // Fixed command only. No user-provided path or arguments are interpreted as shell code.
-        val exec = lease.openExecChannel("exec agy acp")
+        val exec = lease.openExecChannel(SshExecutableSearch.prologue + "\nexec agy acp")
         synchronized(lifecycleLock) {
           if (closed.get()) { exec.close(); throw IOException("AGY SSH transport closed") }
           channel = exec

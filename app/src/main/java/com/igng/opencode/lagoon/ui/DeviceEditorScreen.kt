@@ -61,7 +61,8 @@ internal fun DeviceEditorScreen(
   onOpenSshEditor: (String) -> Unit,
   onLoginHub: () -> Unit,
   onManageHub: () -> Unit,
-  onDeviceSaved: (String) -> Unit
+  onDeviceSaved: (String) -> Unit,
+  onSshDeviceSaved: (String, Boolean) -> Unit
 ) {
   when (route.mode) {
     DeviceEditorMode.SSH_HOST -> SshHostPage(
@@ -70,9 +71,9 @@ internal fun DeviceEditorScreen(
       initial = route.sshHostId?.takeIf(String::isNotBlank)?.let { id -> state.sshHosts.firstOrNull { it.id == id } },
       creating = route.sshHostId.isNullOrBlank(),
       onBack = onBack,
-      onSaved = { hostId ->
+      onSaved = { hostId, discover ->
         val deviceId = controller.deviceIdOfSshHost(hostId)
-        if (deviceId != null) onDeviceSaved(deviceId) else onBack()
+        if (deviceId != null) onSshDeviceSaved(deviceId, discover) else onBack()
       }
     )
     DeviceEditorMode.DIRECT_PROFILE -> {
@@ -386,7 +387,7 @@ private fun SshHostPage(
   initial: SshHostConfig?,
   creating: Boolean,
   onBack: () -> Unit,
-  onSaved: (String) -> Unit
+  onSaved: (String, Boolean) -> Unit
 ) {
   Column(Modifier.fillMaxSize().background(HyperTheme.colors.canvas)) {
     PageTopBar(title = if (creating) "添加 SSH 设备" else "编辑 SSH 设备", onBack = onBack)

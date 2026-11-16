@@ -19,14 +19,17 @@ import okio.ByteString.Companion.toByteString
 import java.io.IOException
 import java.util.concurrent.CancellationException
 import java.util.concurrent.TimeUnit
+import javax.net.SocketFactory
 
 /** Stock fixed-origin HTTP, SSE and WebSocket carrier for native services. */
 internal class NativeOkHttpTransport(
   override val endpoint: NativeHttpEndpoint,
   callTimeoutSeconds: Long = 60,
-  streamIdleSeconds: Long = SharedHttp.STREAM_IDLE_SECONDS
+  streamIdleSeconds: Long = SharedHttp.STREAM_IDLE_SECONDS,
+  socketFactory: SocketFactory? = null
 ) : NativeHttpTransport {
   private val client = OkHttpClient.Builder()
+    .apply { socketFactory?.let { this.socketFactory(it) } }
     .connectTimeout(SharedHttp.CONNECT_TIMEOUT_SECONDS, TimeUnit.SECONDS)
     .readTimeout(25, TimeUnit.SECONDS)
     .callTimeout(callTimeoutSeconds, TimeUnit.SECONDS)

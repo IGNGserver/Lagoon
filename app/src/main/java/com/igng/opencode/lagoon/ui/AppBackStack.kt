@@ -1,5 +1,7 @@
 package com.igng.opencode.lagoon.ui
 
+import com.igng.opencode.lagoon.core.ServerProfile
+
 /**
  * Pages of the app. There is no tab bar: 会话 is the only root, and 设置 is pushed over it
  * from its ⋯ menu like any other page.
@@ -49,6 +51,12 @@ internal data class DeviceEditorRoute(
   /** 页面身份：整页过渡的 contentKey 与 saveable 作用域都靠它区分两个相邻的编辑器页。 */
   val key get() = "${mode.name}|${access.name}|${profileId.orEmpty()}|${sshHostId?.let { "ssh:$it" } ?: ""}"
 }
+
+/** An SSH Harness inherits its endpoint and credentials from its containing SSH device. */
+internal fun editorForHarness(profile: ServerProfile): DeviceEditorRoute =
+  profile.sshHostId?.let { hostId ->
+    DeviceEditorRoute(mode = DeviceEditorMode.SSH_HOST, access = AddDeviceAccess.SSH, sshHostId = hostId)
+  } ?: DeviceEditorRoute(mode = DeviceEditorMode.DIRECT_PROFILE, profileId = profile.id)
 
 /**
  * The single in-app back stack shared by the UI and its unit tests.

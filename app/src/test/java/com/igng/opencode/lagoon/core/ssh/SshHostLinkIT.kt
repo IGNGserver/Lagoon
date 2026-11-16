@@ -5,6 +5,7 @@ import com.igng.opencode.lagoon.core.ServerProfile
 import com.igng.opencode.lagoon.core.SshAuthMethod
 import com.igng.opencode.lagoon.core.SshHostConfig
 import com.igng.opencode.lagoon.core.SshSecrets
+import com.igng.opencode.lagoon.core.SshShell
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -26,6 +27,9 @@ import java.nio.file.Files
  *
  *   LAGOON_SSH_IT_HOST=... LAGOON_SSH_IT_USER=... LAGOON_SSH_IT_KEY=... \
  *   ./gradlew :app:testDebugUnitTest --tests '*SshHostLinkIT'
+ *
+ * The restart case intentionally stops a fixture-owned DSH process and therefore requires an
+ * isolated SSH account/home plus LAGOON_SSH_IT_ISOLATED=1. Never point it at a user's live service.
  */
 class SshHostLinkIT {
   @Test fun startsDshAndReturnsAnAuthenticatedClient() = runBlocking {
@@ -66,11 +70,13 @@ class SshHostLinkIT {
     val host = System.getenv("LAGOON_SSH_IT_HOST")
     val user = System.getenv("LAGOON_SSH_IT_USER")
     val keyPath = System.getenv("LAGOON_SSH_IT_KEY")
-    assumeTrue(host != null && user != null && keyPath != null)
+    assumeTrue(host != null && user != null && keyPath != null && System.getenv("LAGOON_SSH_IT_ISOLATED") == "1")
     val key = String(Files.readAllBytes(File(keyPath!!).toPath()))
     val factory = JschSshTransportFactory()
+    // A unique command prevents this destructive fixture from reusing an existing user service.
+    val launch = "env LAGOON_SSH_IT_FIXTURE=${java.util.UUID.randomUUID()} dsh web"
     val base = SshHostConfig(id = "ssh-it-restart", name = "it", host = host!!, user = user!!,
-      auth = SshAuthMethod.PRIVATE_KEY, launchCommand = "dsh web")
+      auth = SshAuthMethod.PRIVATE_KEY, launchCommand = launch)
     val presented = factory.probeHostKey(base)
     val config = base.copyWith(hostKeyType = presented.type, hostKeyFingerprint = presented.fingerprint)
     val profile = ServerProfile(id = config.id, name = config.name, url = config.profileUrl(), username = config.user,
@@ -82,7 +88,13 @@ class SshHostLinkIT {
       val first = withTimeout(90_000) { link.awaitClient(80_000) }
       val admin = factory.connect(config, SshSecrets(privateKey = key)) { it.fingerprint == presented.fingerprint }
       try {
-        admin.exec("kill \$(cat \$HOME/.dsh-app-remote/web.pid) 2>/dev/null || true", 10_000)
+        val stopFixture = "D=\"\$HOME/.lagoon-ssh-dsh\"\n" +
+          "[ \"\$(cat \"\$D/web.cmd\")\" = ${SshShell.quote(launch)} ] || exit 73\n" +
+          "P=\$(cat \"\$D/web.pid\")\n" +
+          "case \"\$P\" in ''|*[!0-9]*) exit 74;; esac\n" +
+          "[ \"\$P\" -gt 1 ] || exit 74\n" +
+          "kill \"\$P\"\n"
+        assertEquals(0, admin.exec(stopFixture, 10_000).exitCode)
       } finally { admin.close() }
       // The link probes dsh's loopback port on its 15s keepalive tick; wait for one tick before asking
       // for the next generation.

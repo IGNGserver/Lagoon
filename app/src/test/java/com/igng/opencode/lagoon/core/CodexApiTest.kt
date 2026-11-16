@@ -837,4 +837,49 @@ class CodexApiTest {
     api.close()
   }
 
+  @Test fun sshLocalImageIsShownAndOnlyReadOnDemandForItsOwnThread() = runBlocking {
+    val png = byteArrayOf(0x89.toByte(), 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a)
+    val path = "/tmp/desktop-image.png"
+    val transport = Fake(false)
+    transport.response = { method, params -> when (method) {
+      "thread/turns/list" -> JSONObject("""{"data":[{"id":"turn-1","status":"completed","items":[{"id":"msg-1","type":"userMessage","content":[{"type":"localImage","path":"/tmp/desktop-image.png"}]}]}],"nextCursor":null}""")
+      "fs/readFile" -> {
+        assertEquals(path, params.getString("path"))
+        JSONObject().put("dataBase64", java.util.Base64.getEncoder().encodeToString(png))
+      }
+      else -> JSONObject()
+    } }
+    val api = CodexApi(transport)
+    try {
+      val parts = api.messagesPage(session.id, null, 20).items.single().parts
+      assertEquals("file", parts.single().type)
+      assertEquals(path, parts.single().path)
+      assertFalse("Listing history must not read the file", transport.calls.any { it.first == "fs/readFile" })
+      assertNull(api.previewFile(session.directory, "/tmp/other.png", session))
+      assertNull(api.previewFile(session.directory, path, session.copy(id = "other-thread")))
+      assertFalse(transport.calls.any { it.first == "fs/readFile" })
+      val preview = api.previewFile(session.directory, path, session)
+      assertEquals("image/png", preview?.mime)
+      assertArrayEquals(png, preview?.bytes)
+      assertEquals(1, transport.calls.count { it.first == "fs/readFile" })
+    } finally { api.close() }
+  }
+
+  @Test fun sshLocalImageRejectsUnsupportedBytesRatherThanDisplayingThem() = runBlocking {
+    val path = "/tmp/not-an-image.png"
+    val transport = Fake(false)
+    transport.response = { method, _ -> when (method) {
+      "thread/turns/list" -> JSONObject("""{"data":[{"id":"turn-1","status":"completed","items":[{"id":"msg-1","type":"userMessage","content":[{"type":"localImage","path":"/tmp/not-an-image.png"}]}]}]}""")
+      "fs/readFile" -> JSONObject().put("dataBase64", java.util.Base64.getEncoder().encodeToString("not an image".toByteArray()))
+      else -> JSONObject()
+    } }
+    val api = CodexApi(transport)
+    try {
+      api.messagesPage(session.id, null, 20)
+      val error = runCatching { api.previewFile(session.directory, path, session) }.exceptionOrNull()
+      assertTrue(error is ApiException)
+      assertEquals(415, (error as ApiException).status)
+    } finally { api.close() }
+  }
+
 }

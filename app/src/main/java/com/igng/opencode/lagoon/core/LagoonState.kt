@@ -30,8 +30,8 @@ data class LagoonState(
   val profiles: List<ServerProfile> = emptyList(),
   /** Bumped when a device discovery observation is recorded; only used to refresh device pages. */
   val discoveryRevision: Int = 0,
-  /** Device id whose discovery is running right now, so the page can show progress without a second store. */
-  val deviceRefreshInFlight: String? = null,
+  /** Device ids whose explicit discovery is running. */
+  val deviceRefreshInFlight: Set<String> = emptySet(),
   /** Saved SSH host metadata; secrets stay in SshHostStore. */
   val sshHosts: List<SshHostConfig> = emptyList(),
   /** Saved SSH key profiles in global keychain; secrets stay in SshKeyStore. */
