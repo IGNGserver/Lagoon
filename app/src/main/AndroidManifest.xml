@@ -1,5 +1,10 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
   <uses-permission android:name="android.permission.CAMERA" />
+  <!-- 生物识别：BiometricManager.canAuthenticate() 与 BiometricPrompt 都会经 binder 校验该权限，
+       缺失时抛 SecurityException。SshKeyGenerateDialog / SshKeyImportDialog 在组合首帧读取
+       isBiometricSupported()，异常会直接杀掉进程。API 28 的 BiometricPrompt 仍校验旧指纹权限。 -->
+  <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+  <uses-permission android:name="android.permission.USE_FINGERPRINT" />
   <uses-feature android:name="android.hardware.camera.any" android:required="false" />
   <uses-permission android:name="android.permission.INTERNET" />
   <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
