@@ -218,36 +218,37 @@ internal class RemoteDshBootstrap(
         kill -0 "§P" 2>/dev/null && kill -9 "§P" 2>/dev/null
         return 0
       }
-      # A lock directory is atomic on every POSIX filesystem and needs no interpreter. The owner
-      # pid inside it lets the next client recover immediately when a client is killed mid-start
-      # (an advisory flock would be released by the kernel, a directory is not).
+      # One exclusive-create file holds both the lock and the owner pid. `set -C` (O_EXCL) is the
+      # atomic primitive every POSIX shell and filesystem provides; directory creation is not
+      # reliably atomic on every filesystem this runs on (a sandboxed or network mount can report
+      # success to two racing creators), and an advisory flock needs an interpreter.
       _lock() {
         LOCK="§D/.bootstrap.lock"
         TICKS=${startTimeoutSeconds.coerceIn(5, 600) * 10}
+        # A directory lock left by an older build cannot be taken by `>`, and nothing protects it
+        # any more: drop it before competing.
+        [ -d "§LOCK" ] && rmdir "§LOCK" 2>/dev/null
         i=0
-        while ! mkdir "§LOCK" 2>/dev/null; do
+        while :; do
+          if ( set -o noclobber; printf '%s' "§§" > "§LOCK" ) 2>/dev/null; then
+            trap 'rm -f "§LOCK" 2>/dev/null' EXIT
+            return 0
+          fi
           i=§((i+1))
           if [ "§i" -gt "§TICKS" ]; then printf 'LAGOON lockbusy\n'; return 1; fi
-          OWNER=§(head -c 32 "§LOCK/pid" 2>/dev/null)
+          OWNER=§(head -c 32 "§LOCK" 2>/dev/null)
           case "§OWNER" in
             ''|*[!0-9]*) ;;
-            *) if ! kill -0 "§OWNER" 2>/dev/null; then
-                 rm -f "§LOCK/pid" 2>/dev/null
-                 rmdir "§LOCK" 2>/dev/null
-                 continue
-               fi;;
+            *) if ! kill -0 "§OWNER" 2>/dev/null; then rm -f "§LOCK" 2>/dev/null; continue; fi;;
           esac
-          # An old client left the directory without an owner file; replace it once it is old.
+          # An old client left the file without an owner; replace it once it looks abandoned.
           if [ "§i" -eq 30 ]; then
             NOW=§(date +%s 2>/dev/null || echo 0)
             MT=§(stat -c %Y "§LOCK" 2>/dev/null || stat -f %m "§LOCK" 2>/dev/null || echo "§NOW")
-            [ "§((NOW - MT))" -gt 90 ] && rmdir "§LOCK" 2>/dev/null
+            [ "§((NOW - MT))" -gt 90 ] && rm -f "§LOCK" 2>/dev/null
           fi
           sleep 0.1
         done
-        printf '%s' "§§" > "§LOCK/pid" 2>/dev/null
-        trap 'rm -f "§LOCK/pid" 2>/dev/null; rmdir "§LOCK" 2>/dev/null' EXIT
-        return 0
       }
     """))
   }
@@ -282,6 +283,12 @@ internal class RemoteDshBootstrap(
       if [ "§STATE" -eq 2 ]; then printf 'LAGOON unusable\n'; exit 70; fi
       # Stale record: replace it, but first stop only the generation we can prove we started.
       _stop_ours
+      # A racing client may have finished while this one waited. Reusing its record here keeps a
+      # lost lock race harmless instead of truncating a live instance's log and metadata.
+      sleep 0.2
+      _existing; RACE=§?
+      if [ "§RACE" -eq 0 ]; then exit 0; fi
+      if [ "§RACE" -eq 2 ]; then printf 'LAGOON unusable\n'; exit 70; fi
     """))
     append(dshSearch(required = command == DEFAULT_DSH_LAUNCH_COMMAND))
     val cwd = workingDirectory?.trim()
