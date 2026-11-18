@@ -421,7 +421,7 @@ internal class SshHostLink(
 
   private suspend fun attachOpenCodeGeneration(nextTransport: SshTransport, registration: OpenCodeSshRegistration) {
     val target = SshVerifiedTunnel.openCode(registration)
-    withContext(Dispatchers.IO) {
+    val proof = withContext(Dispatchers.IO) {
       try {
         SshVerifiedTunnel.verify(nextTransport, target)
       } catch (error: SshFailure) {
@@ -430,10 +430,15 @@ internal class SshHostLink(
         throw error
       }
     }
+    // The registration carries a credential, so an unproved listener is never used. DSH may fall
+    // back to its managed start record; an external OpenCode service has no such record.
+    if (proof != SshVerifiedTunnel.Proof.VERIFIED) throw SshFailure(SshFailureKind.OTHER,
+      "OpenCode 需要设备上的 Python 3（macOS 还需 lsof）才能验证服务身份，未发送任何凭据", retryable = false)
     forwarder?.close()
     val local = SshForwarder { input, output ->
       val active = transport ?: throw SshFailure(SshFailureKind.DISCONNECTED, "SSH 连接已断开")
-      SshVerifiedTunnel.open(active, target, input, output)
+      // The generation was proved once above; later sockets reuse it instead of spawning a helper.
+      SshVerifiedTunnel.openDirect(active, target, input, output)
     }
     forwarder = local
     openCodeEndpoint = registration

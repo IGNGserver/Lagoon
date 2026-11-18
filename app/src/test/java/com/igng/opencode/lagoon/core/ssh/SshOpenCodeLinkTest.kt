@@ -84,8 +84,10 @@ class SshOpenCodeLinkTest {
         withTimeout(TIMEOUT_MILLIS) { client.renameSession(session, "Renamed through SSH") }
         val rename = assertRequest(server, "PATCH", "/api/session/ses_tunnel")
         assertEquals("Renamed through SSH", JSONObject(rename.body.readUtf8()).getString("title"))
-        assertTrue(fixture.transport.verifiedChannels.isNotEmpty())
-        assertTrue(fixture.transport.verifiedChannels.all { it.port == server.port })
+        // One proved generation, then plain tunnels: no helper process per HTTP connection.
+        assertEquals(1, fixture.transport.verifiedChannels.size)
+        assertTrue(fixture.transport.tunnels.isNotEmpty())
+        assertTrue(fixture.transport.tunnels.all { it.port == server.port })
         fixture.assertOnlyReadOnlyDiscovery()
 
         // NO_RESPONSE keeps a concrete HTTP call pending; receipt is the synchronization barrier.
