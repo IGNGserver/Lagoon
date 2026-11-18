@@ -27,7 +27,12 @@ data class ConnectionStatus(
   /** Wall clock of the next automatic attempt while [ConnectStage.RETRYING]; 0 when unknown. */
   val retryAt: Long = 0,
   /** Why the last attempt failed, shown while retrying. */
-  val reason: String? = null
+  val reason: String? = null,
+  /**
+   * The failure cannot heal by retrying (missing executable, unusable remote path, changed host
+   * key). The banner stops promising a countdown and asks the user to act instead.
+   */
+  val permanent: Boolean = false
 ) {
   val busy: Boolean get() = stage == ConnectStage.CONNECTING || stage == ConnectStage.READING || stage == ConnectStage.SYNCING
 }
@@ -53,11 +58,17 @@ data class ConnectionBanner(
      * Filters raw transport status strings so redundant "already connected" or duplicated failure
      * lines never leak below or inside the connection island.
      */
-    fun cleanTransportSubtitle(stage: ConnectStage, detail: String?, reason: String? = null): String? {
+    fun cleanTransportSubtitle(
+      stage: ConnectStage,
+      detail: String?,
+      reason: String? = null,
+      permanent: Boolean = false
+    ): String? {
       val trimmed = detail?.trim()?.takeIf { it.isNotEmpty() } ?: return null
       if (stage == ConnectStage.READY || stage == ConnectStage.IDLE) return null
       if (trimmed.endsWith("已连接") && !trimmed.contains("重连")) return null
-      if (stage == ConnectStage.RETRYING) {
+      // A permanent failure is the only explanation the user gets; keep it even when it says "失败".
+      if (stage == ConnectStage.RETRYING && !permanent) {
         if (trimmed.contains("失败") || (reason != null && trimmed.contains(reason))) return null
       }
       return trimmed
@@ -79,7 +90,7 @@ data class ConnectionBanner(
     ): ConnectionBanner? {
       val name = serverName?.takeIf { it.isNotBlank() } ?: "服务器"
       val elapsed = (now - status.since).coerceAtLeast(0)
-      val sub = cleanTransportSubtitle(status.stage, transportDetail, status.reason)
+      val sub = cleanTransportSubtitle(status.stage, transportDetail, status.reason, status.permanent)
       fun progress(text: String, slow: String): ConnectionBanner? = when {
         elapsed < QUIET_MILLIS -> null
         elapsed >= SLOW_MILLIS -> ConnectionBanner("$slow · 已等待 ${elapsed / 1000} 秒", Tone.WARNING, retry = true, subtitle = sub)
@@ -91,9 +102,14 @@ data class ConnectionBanner(
         ConnectStage.READING -> progress("正在读取会话…", "会话列表读取较慢")
         ConnectStage.SYNCING -> progress("正在同步任务状态…", "任务状态同步较慢")
         ConnectStage.RETRYING -> {
-          val seconds = ((status.retryAt - now + 999) / 1000).coerceAtLeast(0)
           val reason = status.reason?.takeIf { it.isNotBlank() } ?: "连接失败"
-          ConnectionBanner(if (status.retryAt > now) "$reason · ${seconds} 秒后重试" else "$reason · 正在重试", Tone.ERROR, retry = true, subtitle = sub)
+          // Retrying forever on a failure that cannot heal is what made "harness detected, no
+          // conversation" look like an empty account. Say what is wrong and let the user decide.
+          if (status.permanent) ConnectionBanner(reason, Tone.ERROR, retry = true, subtitle = sub)
+          else {
+            val seconds = ((status.retryAt - now + 999) / 1000).coerceAtLeast(0)
+            ConnectionBanner(if (status.retryAt > now) "$reason · ${seconds} 秒后重试" else "$reason · 正在重试", Tone.ERROR, retry = true, subtitle = sub)
+          }
         }
         ConnectStage.READY -> when {
           !streamConnected && streamDownSince > 0 && now - streamDownSince >= STREAM_GRACE_MILLIS ->

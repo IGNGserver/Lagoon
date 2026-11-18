@@ -55,8 +55,40 @@ internal object SshVerifiedTunnel {
       ?: throw SshFailure(SshFailureKind.OTHER, "无法确认 DSH 状态目录，请重新连接设备", retryable = false)
   )
 
-  /** User-facing readiness check; each later channel repeats the proof for its own socket. */
-  fun verify(transport: SshTransport, target: Target) { verifiedChannel(transport, target).close() }
+  /** How much of the remote socket ownership could be proven on this host. */
+  internal enum class Proof {
+    /** The remote helper proved that the recorded process (or its child) owns the socket. */
+    VERIFIED,
+    /** No python3/lsof on the remote: only the managed pid/start record could be checked. */
+    DEGRADED
+  }
+
+  /**
+   * Proves the listener once per SSH generation. Repeating the proof for every socket spawned a
+   * python3 process, a full `/proc` snapshot and an extra HTTP request per HTTP connection (DSH
+   * fans out four reads at a time), which is what pushed connections past the read timeout and
+   * consumed sshd sessions. Later sockets reuse [openDirect] on the same proven generation.
+   *
+   * A remote without python3 (or macOS without lsof) degrades to the record-level check the
+   * bootstrap already performed (managed pid + start stamp + boot id); the caller reports it.
+   */
+  fun verify(transport: SshTransport, target: Target): Proof {
+    val channel = transport.openExecChannel(command(target))
+    discardStderr(channel)
+    val reply = readProof(channel)
+    runCatching { channel.close() }
+    return when (reply) {
+      READY -> Proof.VERIFIED
+      UNSUPPORTED -> Proof.DEGRADED
+      DENIED -> throw SshFailure(SshFailureKind.OTHER, "无法确认远端服务进程身份，请检查注册文件和进程权限", retryable = false)
+      UNAVAILABLE -> throw SshFailure(SshFailureKind.UNRESPONSIVE, "远端服务暂时无法响应安全检查")
+      else -> throw SshFailure(SshFailureKind.OTHER, "远端安全检查返回了无效结果", retryable = false)
+    }
+  }
+
+  /** A plain channel on an already-proven generation: no helper process, no extra request. */
+  fun openDirect(transport: SshTransport, target: Target, input: InputStream, output: OutputStream): TunnelConnection =
+    transport.openTunnel("127.0.0.1", target.port, input, output)
 
   fun open(transport: SshTransport, target: Target, input: InputStream, output: OutputStream): TunnelConnection {
     val channel = verifiedChannel(transport, target)
@@ -76,28 +108,44 @@ internal object SshVerifiedTunnel {
     return listOf("python3", "-u", "-c", SshShell.quote(HELPER), SshShell.quote(encoded)).joinToString(" ")
   }
 
-  private fun verifiedChannel(transport: SshTransport, target: Target): SshExecChannel {
-    val channel = transport.openExecChannel(command(target))
-    // Never retain stderr: login shells or the remote runtime may print paths or credentials.
+  /** Never retain stderr: login shells or the remote runtime may print paths or credentials. */
+  private fun discardStderr(channel: SshExecChannel) {
     Thread({ runCatching { val b = ByteArray(4096); while (channel.stderr.read(b) >= 0) { } } },
       "lagoon-ssh-proof-stderr").apply { isDaemon = true; start() }
+  }
+
+  private fun readProof(channel: SshExecChannel): String {
     val executor = Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "lagoon-ssh-proof-ready").apply { isDaemon = true } }
-    try {
-      val reply = executor.submit<String> { readHandshake(channel.stdout) }.get(12, TimeUnit.SECONDS)
-      when (reply) {
-        READY -> return channel
-        UNSUPPORTED -> throw SshFailure(SshFailureKind.OTHER, "开发机缺少安全验证所需的 Python 3、lsof 或进程信息", retryable = false)
-        DENIED -> throw SshFailure(SshFailureKind.OTHER, "无法确认远端服务进程身份，请检查注册文件和进程权限", retryable = false)
-        UNAVAILABLE -> throw SshFailure(SshFailureKind.UNRESPONSIVE, "远端服务暂时无法响应安全检查")
-        else -> throw SshFailure(SshFailureKind.OTHER, "远端安全检查返回了无效结果", retryable = false)
-      }
-    } catch (error: SshFailure) {
-      runCatching { channel.close() }
-      throw error
+    return try {
+      executor.submit<String> { readHandshake(channel.stdout) }.get(12, TimeUnit.SECONDS)
     } catch (_: Exception) {
-      runCatching { channel.close() }
-      throw SshFailure(SshFailureKind.OTHER, "无法完成远端服务安全检查，请确认 Python 3 可用", retryable = false)
+      // A login shell banner or a timeout is not proof of a foreign socket; report it as unavailable.
+      UNAVAILABLE
     } finally { executor.shutdownNow() }
+  }
+
+  private fun verifiedChannel(transport: SshTransport, target: Target): SshExecChannel {
+    val channel = transport.openExecChannel(command(target))
+    discardStderr(channel)
+    when (readProof(channel)) {
+      READY -> return channel
+      UNSUPPORTED -> {
+        runCatching { channel.close() }
+        throw SshFailure(SshFailureKind.OTHER, "开发机缺少安全验证所需的 Python 3、lsof 或进程信息", retryable = false)
+      }
+      DENIED -> {
+        runCatching { channel.close() }
+        throw SshFailure(SshFailureKind.OTHER, "无法确认远端服务进程身份，请检查注册文件和进程权限", retryable = false)
+      }
+      UNAVAILABLE -> {
+        runCatching { channel.close() }
+        throw SshFailure(SshFailureKind.UNRESPONSIVE, "远端服务暂时无法响应安全检查")
+      }
+      else -> {
+        runCatching { channel.close() }
+        throw SshFailure(SshFailureKind.OTHER, "远端安全检查返回了无效结果", retryable = false)
+      }
+    }
   }
 
   private fun readHandshake(input: InputStream): String {
@@ -178,7 +226,7 @@ def bounded_file(path, maximum=16384):
     except OSError: raise Denied()
     try:
         info=os.fstat(fd)
-        require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and not info.st_mode & 0o022)
+        require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and not info.st_mode & 0o002)
         with os.fdopen(fd, 'rb') as f:
             fd=-1
             data=f.read(maximum+1)
@@ -309,7 +357,7 @@ def target_state(data):
     home=os.environ.get('HOME',''); require(os.path.isabs(home))
     folder=os.path.join(home,dirname)
     info=os.lstat(folder)
-    require(stat.S_ISDIR(info.st_mode) and info.st_uid==os.getuid() and not info.st_mode & 0o022)
+    require(stat.S_ISDIR(info.st_mode) and info.st_uid==os.getuid() and not info.st_mode & 0o002)
     require(bounded_file(os.path.join(folder,'web.pid'),128).decode('ascii').strip()==str(root))
     start=' '.join(bounded_file(os.path.join(folder,'web.st'),256).decode('ascii').split())
     require(bool(start))

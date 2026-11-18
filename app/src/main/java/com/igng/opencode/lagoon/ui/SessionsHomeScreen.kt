@@ -484,9 +484,17 @@ private fun SessionList(
               },
               style = MiuixTheme.textStyles.headline2.copy(color = muted)
             )
+            // The reason belongs on the empty page: a banner scrolls away, this does not.
+            state.error?.takeIf { !state.connected && query.isBlank() }?.let { reason ->
+              Text(
+                reason,
+                style = MiuixTheme.textStyles.footnote1.copy(color = HyperTheme.colors.error),
+                textAlign = androidx.compose.ui.text.style.TextAlign.Center
+              )
+            }
             if (!state.loading && query.isBlank()) {
               val action = when {
-                state.connected || state.enabledProfiles.isNotEmpty() -> "新建会话"
+                state.connected -> "新建会话"
                 allDisabled || state.profiles.isEmpty() -> "管理设备"
                 else -> "重新连接"
               }
@@ -494,7 +502,7 @@ private fun SessionList(
                 text = action,
                 onClick = {
                   when {
-                    state.connected || state.enabledProfiles.isNotEmpty() -> onNewSession()
+                    state.connected -> onNewSession()
                     allDisabled || state.profiles.isEmpty() -> onManageDevices()
                     else -> refreshFromTop()
                   }

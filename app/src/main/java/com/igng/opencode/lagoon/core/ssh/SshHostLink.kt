@@ -72,6 +72,16 @@ internal class SshHostLink(
   val remoteHome: String? get() = endpoint?.home
   val workingDirectory: String? get() = config.workingDirectory
   @Volatile private var forwarder: SshForwarder? = null
+  /** The bootstrap of the current generation, reused by keepalive to detect a replaced process. */
+  @Volatile private var bootstrap: RemoteDshBootstrap? = null
+  /**
+   * Connections for this binding only. The forwarder port is reused by the OS across generations,
+   * and OkHttp does not compare the `SocketFactory` when deciding whether a pooled socket is
+   * eligible, so a process-wide pool could serve a dead or foreign tunnel socket.
+   */
+  private val forwarderPool = okhttp3.ConnectionPool(16, 5, java.util.concurrent.TimeUnit.MINUTES)
+  /** The SSH generation whose listener ownership was proved; later sockets on it skip the helper. */
+  @Volatile private var provenTransport: SshTransport? = null
   /** Closing DSH drains unanswered waterfalls; retain that exact generation for new RPC sockets. */
   @Volatile private var drainingTransport: SshTransport? = null
   @Volatile private var drainingEndpoint: RemoteDshEndpoint? = null
@@ -112,7 +122,14 @@ internal class SshHostLink(
         while (true) {
           if (closed) throw SshFailure(SshFailureKind.DISCONNECTED, "SSH 主机已移除", retryable = false)
           val pending = ready
-          val api = pending.await()
+          val api = try {
+            pending.await()
+          } catch (error: SshFailure) {
+            // A blip only failed the generation that was in flight. `lost()` installed a fresh
+            // gate, so wait for it instead of surfacing a transient disconnect to every caller.
+            if (!closed && error.kind == SshFailureKind.DISCONNECTED && error.retryable && ready !== pending) continue
+            throw error
+          }
           if (generation.get() > sinceGeneration && !api.isClosed && mutableStatus.value.isConnected) return@withTimeout api
           if (api.isClosed && mutableStatus.value.isConnected) {
             lost(SshFailure(SshFailureKind.DISCONNECTED, "Harness 客户端已关闭，正在重新附着"), transport)
@@ -216,7 +233,7 @@ internal class SshHostLink(
           fail(failure)
           return
         }
-        publish(SshLinkPhase.RECONNECTING, mutableStatus.value.step, failure.message, failure, attempt)
+        publish(SshLinkPhase.RECONNECTING, mutableStatus.value.step, failure.display(), failure, attempt)
         delay(backoff)
         backoff = (backoff * 2).coerceAtMost(30_000L)
       }
@@ -259,7 +276,7 @@ internal class SshHostLink(
         return
       }
       publish(SshLinkPhase.CONNECTING, SshLinkStep.START_DSH, "正在检查远端的 dsh web", attempt = attempt)
-      val bootstrap = RemoteDshBootstrap(nextTransport, config.launchCommand, config.workingDirectory)
+      val bootstrap = RemoteDshBootstrap(nextTransport, config.launchCommand, config.workingDirectory).also { this.bootstrap = it }
       val nextEndpoint = kotlinx.coroutines.runInterruptible(Dispatchers.IO) {
         bootstrap.ensureRunning { detail -> publish(SshLinkPhase.CONNECTING, SshLinkStep.START_DSH, detail, attempt = attempt) }
       }
@@ -272,23 +289,31 @@ internal class SshHostLink(
       if (!tunnelOpen) throw SshFailure(SshFailureKind.TUNNEL, "无法建立到远端 dsh web 的隧道")
       // A successful TCP or public HTTP response alone does not identify the process listening on
       // this port. No DSH token or cookie is sent until a socket owned by the managed generation
-      // (or its verified child) has been proved; every later socket repeats that proof.
-      withContext(Dispatchers.IO) { SshVerifiedTunnel.verify(nextTransport, SshVerifiedTunnel.dsh(nextEndpoint)) }
+      // (or its verified child) has been proved. The proof runs once per generation: repeating it
+      // per socket spawned a python process and a full /proc scan for every HTTP connection.
+      val dshProof = withContext(Dispatchers.IO) { SshVerifiedTunnel.verify(nextTransport, SshVerifiedTunnel.dsh(nextEndpoint)) }
       endpoint = nextEndpoint
+      provenTransport = nextTransport
+      if (dshProof == SshVerifiedTunnel.Proof.DEGRADED)
+        Diagnostics.warn("SshHostLink", "远端缺少 python3 或 lsof，本次连接只按启动记录校验")
       if (forwarder == null) {
         forwarder = SshForwarder { input, output ->
           val activeTransport = (if (closed) drainingTransport else transport)
             ?: throw SshFailure(SshFailureKind.DISCONNECTED, "SSH 连接已断开")
           val activeEndpoint = (if (closed) drainingEndpoint else endpoint)
             ?: throw SshFailure(SshFailureKind.DISCONNECTED, "dsh web 尚未就绪")
-          SshVerifiedTunnel.open(activeTransport, SshVerifiedTunnel.dsh(activeEndpoint), input, output)
+          if (activeTransport === provenTransport)
+            SshVerifiedTunnel.openDirect(activeTransport, SshVerifiedTunnel.dsh(activeEndpoint), input, output)
+          else SshVerifiedTunnel.open(activeTransport, SshVerifiedTunnel.dsh(activeEndpoint), input, output)
         }
       }
 
       publish(SshLinkPhase.CONNECTING, SshLinkStep.LOGIN, "正在登录 DSH", attempt = attempt)
       val api = createClient(nextEndpoint)
       try {
-        withTimeout(45_000) { api.health() }
+        // Exchanging the launch token is the login check; `health()` is a full `session/list` and
+        // the first catalog read follows immediately, so it must not run here as well.
+        withTimeout(45_000) { api.probeAuth() }
       } catch (error: Throwable) {
         runCatching { api.close() }
         throw sshFailure(error, "DSH 登录失败")
@@ -395,13 +420,24 @@ internal class SshHostLink(
       ServerCredentials("dsh", endpoint.token, rememberedCookie),
       hostHeader = endpoint.authority,
       socketFactory = local.socketFactory,
-      onCookie = { value -> rememberedCookie = value }
+      // One pool per SSH binding: OkHttp's reuse key ignores the socket factory, so a shared pool
+      // could hand this tunnel's authenticated socket to another loopback listener (and back).
+      connectionPool = forwarderPool,
+      // A cold tunnel can spend the whole first-frame window on the handshake before `open`.
+      eventsReadyTimeoutMillis = 45_000L,
+      onCookie = { value -> rememberedCookie = value },
+      // The recorded process is replaced: drop this generation and let the bootstrap hand out a
+      // fresh launch token. Keeping the dead token would 401 on every later call.
+      onAuthTokenRotated = {
+        lost(SshFailure(SshFailureKind.LOGIN, "远端 dsh web 已重启，正在重新读取启动令牌"))
+      }
     )
   }
 
   private fun startKeepAlive() {
     keepAliveJob?.cancel()
     keepAliveJob = scope.launch(Dispatchers.IO) {
+      var ticks = 0
       while (!closed && mutableStatus.value.isConnected) {
         delay(PING_INTERVAL_MILLIS)
         val active = transport ?: break
@@ -422,6 +458,17 @@ internal class SshHostLink(
             lost(SshFailure(SshFailureKind.DSH_START, "远端的 dsh web 已停止，正在重启"), active)
             break
           }
+          // A restarted dsh can bind the same port; the port probe alone cannot tell. Once a
+          // minute compare the recorded generation and re-read the launch token when it changed.
+          ticks += 1
+          if (ticks % GENERATION_CHECK_TICKS == 0 && active === transport) {
+            val expected = dsh.pid
+            val observed = runCatching { bootstrap?.probe() }.getOrNull()?.pid
+            if (observed != null && expected != null && observed != expected) {
+              lost(SshFailure(SshFailureKind.DSH_START, "远端 dsh web 已更换，正在重新读取启动令牌"), active)
+              break
+            }
+          }
         }
       }
     }
@@ -431,7 +478,7 @@ internal class SshHostLink(
     synchronized(this) {
       if (closed || mutableStatus.value.phase == SshLinkPhase.RECONNECTING || mutableStatus.value.phase == SshLinkPhase.FAILED) return
       if (expectedTransport != null && transport !== expectedTransport) return
-      publish(SshLinkPhase.RECONNECTING, mutableStatus.value.step, failure.message, failure, attempt)
+      publish(SshLinkPhase.RECONNECTING, mutableStatus.value.step, failure.display(), failure, attempt)
       val pending = ready
       if (!pending.isCompleted) pending.completeExceptionally(failure)
       ready = CompletableDeferred()
@@ -442,13 +489,14 @@ internal class SshHostLink(
       transport = null
       endpoint = null
       openCodeEndpoint = null
+      provenTransport = null
       forwarder?.dropConnections()
       if (connectJob?.isActive != true) connectJob = scope.launch(Dispatchers.IO) { connectLoop() }
     }
   }
 
   private fun fail(failure: SshFailure) {
-    publish(SshLinkPhase.FAILED, mutableStatus.value.step, failure.message, failure, attempt)
+    publish(SshLinkPhase.FAILED, mutableStatus.value.step, failure.display(), failure, attempt)
     val pending = ready
     if (!pending.isCompleted) pending.completeExceptionally(failure)
     keepAliveJob?.cancel(); keepAliveJob = null
@@ -458,6 +506,7 @@ internal class SshHostLink(
     transport = null
     endpoint = null
     openCodeEndpoint = null
+    provenTransport = null
     runCatching { forwarder?.close() }
     forwarder = null
   }
@@ -476,10 +525,9 @@ internal class SshHostLink(
 
   override fun close() {
     if (closed) return
-    if (client is DshApi) {
-      drainingTransport = transport
-      drainingEndpoint = endpoint
-    }
+    // The forwarded DshApi may still drain waterfall handoffs; keep this generation's tunnel.
+    drainingTransport = transport.takeIf { client is DshApi }
+    drainingEndpoint = endpoint.takeIf { client is DshApi }
     closed = true
     connectJob?.cancel()
     keepAliveJob?.cancel()
@@ -490,16 +538,15 @@ internal class SshHostLink(
     val closingClient = client
     val closingTransport = transport
     val closingForwarder = forwarder
-    if (closingClient is DshApi) {
-      drainingTransport = closingTransport
-      drainingEndpoint = endpoint
-    }
     client = null
     transport = null
     endpoint = null
     openCodeEndpoint = null
+    provenTransport = null
+    bootstrap = null
     forwarder = null
     runCatching { closingClient?.close() }
+    runCatching { forwarderPool.evictAll() }
     if (closingClient is DshApi) SharedHttp.ioScope.launch {
       // attachWait/legacy waterfall handoffs need the SSH tunnel until the API's bounded drain ends.
       try { closingClient.awaitClosed() } finally {
@@ -518,5 +565,7 @@ internal class SshHostLink(
   private companion object {
     const val PING_INTERVAL_MILLIS = 15_000L
     const val PING_TIMEOUT_MILLIS = 10_000L
+    /** 15 s keepalive ticks: compare the recorded process generation about once a minute. */
+    const val GENERATION_CHECK_TICKS = 4
   }
 }
