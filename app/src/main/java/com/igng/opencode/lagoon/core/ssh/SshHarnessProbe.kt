@@ -65,7 +65,7 @@ internal class SshHarnessProbe(
                 fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, 'O_NONBLOCK', 0))
                 info = os.fstat(fd)
                 if not stat.S_ISREG(info.st_mode): return {'state':'corrupt','issue':'invalid_data'}
-                if info.st_uid != os.geteuid() or info.st_mode & 0o022: return {'state':'unknown','issue':'unreadable'}
+                if info.st_uid != os.geteuid() or info.st_mode & 0o002: return {'state':'unknown','issue':'unreadable'}
                 with os.fdopen(fd, 'rb') as stream:
                     fd = None
                     data = stream.read(${OpenCodeSshRegistration.MAX_BYTES + 1})
@@ -81,7 +81,7 @@ internal class SshHarnessProbe(
                 info = os.lstat(path)
                 if stat.S_ISLNK(info.st_mode): return {'state':'unknown','issue':'unreadable'}
                 if not stat.S_ISDIR(info.st_mode): return {'state':'corrupt','issue':'invalid_data'}
-                if info.st_uid != os.geteuid() or info.st_mode & 0o022: return {'state':'unknown','issue':'unreadable'}
+                if info.st_uid != os.geteuid() or info.st_mode & 0o002: return {'state':'unknown','issue':'unreadable'}
                 return {'state':'present'}
             except FileNotFoundError: return {'state':'absent','issue':'not_found'}
             except OSError: return {'state':'unknown','issue':'unreadable'}

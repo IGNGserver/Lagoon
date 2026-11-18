@@ -280,6 +280,22 @@ internal class SshDshClient(
   override suspend fun searchFiles(directory: String, query: String, session: Session?): List<String> =
     api().searchFiles(directory, query, session)
 
+  // Hand-written forwarding is the only way to keep one client across DSH generations, so every
+  // optional capability the tunneled DshApi specializes must be listed here too. SshClientForwardingTest
+  // fails when a new HarnessClient method is added without this.
+  override suspend fun searchSessionContent(query: String): SessionContentSearchResult? =
+    api().searchSessionContent(query)
+
+  override suspend fun searchResultSession(id: String): Session? = api().searchResultSession(id)
+
+  override suspend fun serverWorkspaces(): List<ServerWorkspace>? = api().serverWorkspaces()
+
+  override suspend fun forkSession(session: Session, boundary: ForkBoundary): Session =
+    api().forkSession(session, boundary)
+
+  override suspend fun modelCatalogForSession(directory: String, session: Session?): List<ModelInfo> =
+    api().modelCatalogForSession(directory, session)
+
   override fun events(onOpen: () -> Unit): Flow<ServerEvent> = flow {
     var seenGeneration = -1L
     while (currentCoroutineContext().isActive && !isClosed) {

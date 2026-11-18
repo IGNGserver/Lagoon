@@ -130,6 +130,41 @@ class SshHostTest {
     }
   }
 
+  @Test fun anotherClientsDshWebNeverBlocksOurOwnInstance() {
+    assumeTrue(File("/bin/sh").exists())
+    val root = Files.createTempDirectory("lagoon-dsh-multi").toFile()
+    val home = File(root, "home").apply { mkdirs() }
+    val bin = File(root, "bin").apply { mkdirs() }
+    // A same-user `dsh web` that Lagoon did not start: Desktop, the CLI, another phone.
+    val decoyBin = File(root, "decoy").apply { mkdirs() }
+    val decoy = File(decoyBin, "dsh").apply {
+      writeText("#!/bin/sh\nexec sleep 60\n")
+      setExecutable(true)
+    }
+    val decoyProcess = ProcessBuilder(decoy.absolutePath, "web").start()
+    File(bin, "dsh").apply {
+      writeText("#!/bin/sh\necho \"dsh web: http://127.0.0.1:45686/?token=own-token\"\nexec sleep 60\n")
+      setExecutable(true)
+    }
+    var launched: FixturePid? = null
+    try {
+      val bootstrap = RemoteDshBootstrap(LocalShellTransport(home, "${bin.absolutePath}:/usr/bin:/bin"),
+        startTimeoutSeconds = 10)
+      val endpoint = bootstrap.ensureRunning()
+      launched = endpoint.pid?.let(::captureFixturePid)
+      // DSH is a multi-instance server: a foreign instance is never a reason to refuse to connect,
+      // and it must never be signalled.
+      assertEquals(45686, endpoint.port)
+      assertEquals("own-token", endpoint.token)
+      assertEquals(".lagoon-ssh-dsh", endpoint.ownershipStateDirectory)
+      assertTrue("a foreign dsh web must be left running", decoyProcess.isAlive)
+    } finally {
+      launched?.let(::stopFixturePid)
+      decoyProcess.destroyForcibly(); decoyProcess.waitFor(5, TimeUnit.SECONDS)
+      root.deleteRecursively()
+    }
+  }
+
   @Test fun missingWorkingDirectoryAbortsBeforeLaunch() {
     assumeTrue(File("/bin/sh").exists())
     val root = Files.createTempDirectory("lagoon-ssh-nocwd").toFile()
@@ -169,8 +204,9 @@ class SshHostTest {
     assertTrue(script.contains("LAUNCH=${SshShell.quote("dsh web --foo 'a b' --host 127.0.0.1 --port 0 --no-open")}"))
     assertTrue(script.contains("eval \"\$1\" >>\"\$D/web.log\" 2>&1 & echo \$! >\"\$D/web.pid\"; wait"))
     assertTrue(script.contains("cd '/nope' || { printf 'LAGOON nocwd"))
-    // 只匹配当前用户的进程：共享主机上别人的 dsh web 不该让本设备连接失败。
-    assertTrue(script.contains("pgrep -u \"\$(id -u)\""))
+    // 其他客户端（用户自己的 dsh web、Desktop、别的手机）不再参与我们的锁，也不再是拒绝启动的理由。
+    assertTrue("our own instance must not be blocked by a foreign dsh web", !script.contains("pgrep"))
+    assertTrue(script.contains("LOCK=\"\$D/.bootstrap.lock\""))
     assertTrue("bootstrap must not signal an unknown parent", !script.contains("kill \"\$PARENT\""))
   }
 
@@ -189,7 +225,7 @@ class SshHostTest {
     }
   }
 
-  @Test fun bootstrapRefusesToReuseLiveProcessWithoutStartTime() {
+  @Test fun bootstrapReplacesUnverifiableGenerationWithoutSignallingIt() {
     assumeTrue(File("/bin/sh").exists())
     val root = Files.createTempDirectory("lagoon-ssh-empty-st").toFile()
     val home = File(root, "home").apply { mkdirs() }
@@ -211,11 +247,14 @@ class SshHostTest {
       val first = bootstrap.start()
       launched = first.pid?.let(::captureFixturePid)
       assertEquals(45679, first.port)
-      // A live PID without its recorded generation is not safe to reuse or signal.
+      // A live PID whose recorded generation is gone is stale, not a conflict: start our own
+      // instance and leave the unprovable process alone.
       File(home, ".lagoon-ssh-dsh/web.st").writeText("")
-      val failure = runCatching { bootstrap.ensureRunning() }.exceptionOrNull() as? SshFailure
-      assertEquals(SshFailureKind.DSH_START, failure?.kind)
+      val second = bootstrap.ensureRunning()
+      assertEquals(false, second.reused)
+      assertTrue("a new generation must be recorded", second.pid != first.pid)
       assertTrue("an unverifiable process must remain untouched", launched?.let(::fixturePidAlive) == true)
+      second.pid?.let(::captureFixturePid)?.let(::stopFixturePid)
     } finally {
       launched?.let(::stopFixturePid)
       dsh.delete()
@@ -236,8 +275,10 @@ class SshHostTest {
     originals.forEach { (name, text) -> File(legacy, name).writeText(text) }
     try {
       val bootstrap = RemoteDshBootstrap(LocalShellTransport(fixtureHome, "/usr/bin:/bin"), startTimeoutSeconds = 5)
+      // An unverifiable legacy record is ignored, not a conflict: the launch proceeds and fails on
+      // the missing binary instead of blaming the other client.
       val failure = runCatching { bootstrap.ensureRunning() }.exceptionOrNull() as? SshFailure
-      assertEquals(SshFailureKind.DSH_START, failure?.kind)
+      assertEquals(SshFailureKind.DSH_NOT_FOUND, failure?.kind)
       assertTrue("a process with mismatched generation must remain alive", unrelated.isAlive)
       originals.forEach { (name, text) -> assertEquals("legacy $name must remain unchanged", text, File(legacy, name).readText()) }
     } finally {
@@ -259,7 +300,7 @@ class SshHostTest {
     try {
       val bootstrap = RemoteDshBootstrap(LocalShellTransport(fixtureHome, "/usr/bin:/bin"), startTimeoutSeconds = 5)
       val failure = runCatching { bootstrap.ensureRunning() }.exceptionOrNull() as? SshFailure
-      assertEquals(SshFailureKind.DSH_START, failure?.kind)
+      assertEquals(SshFailureKind.DSH_NOT_FOUND, failure?.kind)
       assertTrue("a shared process with different command must remain alive", unrelated.isAlive)
       assertEquals("some-other-command", File(legacy, "web.cmd").readText())
       assertEquals("$pid\n", File(legacy, "web.pid").readText())
@@ -324,12 +365,6 @@ class SshHostTest {
     val fixtureHome = File(root, "home").apply { mkdirs() }
     val bin = File(root, "bin").apply { mkdirs() }
     File(bin, "pgrep").apply { writeText("#!/bin/sh\nexit 1\n"); setExecutable(true) }
-    // Model mkdir implementations that report success for both racing creators. A correct lock
-    // must still admit only one client; the delayed fixture keeps the attempts concurrent.
-    File(bin, "mkdir").apply {
-      writeText("#!/bin/sh\ncase \"\$*\" in *'.bootstrap.lock'*) exec /bin/mkdir -p \"\$@\";; *) exec /bin/mkdir \"\$@\";; esac\n")
-      setExecutable(true)
-    }
     File(bin, "dsh").apply {
       writeText("#!/bin/sh\nprintf 'launch\\n' >> \"\$HOME/launches\"\nprintf '%s\\n' \"\$\$\" >> \"\$HOME/fixture-pids\"\nsleep 1\necho 'dsh web: http://127.0.0.1:45684/?token=fixture-token'\nexec sleep 60\n")
       setExecutable(true)

@@ -33,6 +33,7 @@ import com.igng.opencode.lagoon.core.LagoonState
 import com.igng.opencode.lagoon.core.ServerKind
 import com.igng.opencode.lagoon.core.ServerProfile
 import com.igng.opencode.lagoon.core.SshKeyProfile
+import com.igng.opencode.lagoon.core.SshLinkPhase
 import com.igng.opencode.lagoon.core.SshPassphrasePolicy
 import com.igng.opencode.lagoon.core.connectionTypeLabel
 import com.igng.opencode.lagoon.core.endpointSummary
@@ -539,6 +540,13 @@ internal fun HarnessDetailScreen(
     !profile.enabled -> "此 Harness 已停用"
     else -> ""
   }
+  // The SSH link knows why it is not connected (missing executable, unusable state directory,
+  // changed host key). Without it the harness page only ever said "未连接".
+  val sshFlow = remember(profile.sshHostId) { profile.sshHostId?.let(controller::sshLinkStatus) }
+  val sshStatus = sshFlow?.collectAsState()?.value
+  val sshFailure = sshStatus?.error?.takeIf {
+    sshStatus.phase == SshLinkPhase.FAILED || sshStatus.phase == SshLinkPhase.RECONNECTING
+  }
 
   Column(Modifier.fillMaxSize().background(HyperTheme.colors.canvas)) {
     PageTopBar(profile.name, onBack, subtitle = {
@@ -573,6 +581,24 @@ internal fun HarnessDetailScreen(
           HyperRow(title = "所属设备", summary = device?.name ?: "设备记录暂不可用")
           HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
           HyperRow(title = "连接地址", summary = profile.endpointSummary)
+          if (profile.sshHostId != null) {
+            HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
+            HyperRow(
+              title = "SSH 连接状态",
+              summary = when {
+                sshStatus == null -> "尚未建立 SSH 连接（启用后会连接一次）"
+                sshFailure != null -> sshFailure.display()
+                sshStatus?.detail?.isNotBlank() == true -> sshStatus!!.detail
+                else -> sshStatus?.phase?.name?.lowercase().orEmpty()
+              },
+              trailing = {
+                if (sshFailure != null) HyperButton(
+                  text = "重试",
+                  onClick = { profile.sshHostId?.let(controller::retrySshHost) }
+                )
+              }
+            )
+          }
         }
       }
       item {

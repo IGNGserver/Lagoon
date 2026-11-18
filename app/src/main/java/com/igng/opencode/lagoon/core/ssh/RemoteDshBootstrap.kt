@@ -12,16 +12,19 @@ internal data class RemoteDshProbe(
   val home: String? = null,
   val pid: Int? = null,
   val sameCommand: Boolean = false,
+  /** The launch URL recorded for this instance (redact before showing it). */
   val launchLine: String? = null
-) {
-  val reusable: Boolean get() = pid != null && sameCommand && launchLine != null
-}
+)
 
 /**
- * Manages Lagoon's `dsh web` under `~/.lagoon-ssh-dsh` with a private inter-client lock.
- * Existing dsh-Go/legacy records under `~/.dsh-app-remote` are read-only and reused only when the
- * recorded process generation and configuration agree. A conflicting or unverifiable live process
- * is never stopped. The lock coordinates Lagoon clients; dsh-Go does not participate in it.
+ * Manages Lagoon's own `dsh web` under `~/.lagoon-ssh-dsh` with a private inter-client lock.
+ *
+ * DSH is a multi-instance server: every `dsh web` process gets its own launch token and its own
+ * port, so a `dsh web` that the user started (Desktop, the CLI, an older Lagoon) is never a reason
+ * to refuse to connect. This bootstrap only ever manages the instance it recorded itself; unverifiable
+ * or stale records are treated as absent and replaced, and a process that cannot be proven to be
+ * ours is never signalled. Legacy dsh-Go records under `~/.dsh-app-remote` stay read-only and are
+ * reused only when process generation and launch configuration still agree.
  *
  * The server binds `127.0.0.1` on an OS-assigned port and is reached through the SSH tunnel.
  */
@@ -29,7 +32,7 @@ internal class RemoteDshBootstrap(
   private val transport: SshTransport,
   private val launchCommand: String = DEFAULT_DSH_LAUNCH_COMMAND,
   private val workingDirectory: String? = null,
-  private val startTimeoutSeconds: Int = 60
+  private val startTimeoutSeconds: Int = DEFAULT_START_TIMEOUT_SECONDS
 ) {
   private val command = launchCommand.trim().ifBlank { DEFAULT_DSH_LAUNCH_COMMAND }
 
@@ -44,13 +47,13 @@ internal class RemoteDshBootstrap(
     return start()
   }
 
-  /** Read-only observation. Launch admission is rechecked under the managed lock in [start]. */
+  /** Read-only observation of the instance this client recorded (pid/url only, never a start). */
   fun probe(): RemoteDshProbe {
     val result = transport.exec(probeScript(), 20_000)
     if (looksLikeMissingShell(result)) {
       throw SshFailure(SshFailureKind.NO_SHELL, "远端没有 POSIX shell，无法启动 dsh web", tail(result), retryable = false)
     }
-    if (result.stdout.contains("LAGOON conflict")) throw existingInstanceFailure()
+    if (result.stdout.contains("LAGOON unusable")) throw unusableStateFailure()
     if (result.exitCode != 0) throw SshFailure(SshFailureKind.DSH_START, "无法检查远端 DSH 服务", retryable = true)
     return parseProbe(result.stdout)
   }
@@ -64,10 +67,11 @@ internal class RemoteDshBootstrap(
     return parseStart(result)
   }
 
-  private fun existingInstanceFailure() = SshFailure(
+  /** The recorded state directory belongs to another user or is not a directory: never touch it. */
+  private fun unusableStateFailure() = SshFailure(
     SshFailureKind.DSH_START,
-    "已有 DSH 服务，但无法安全复用",
-    "请在电脑上检查现有服务及其启动配置；Lagoon 不会自动停止它。",
+    "无法使用远端 DSH 状态目录",
+    "电脑上的 ~/.lagoon-ssh-dsh 不是普通目录或不属于当前用户。请处理该路径后重试；已有的 DSH 服务不会被停止。",
     retryable = false
   )
 
@@ -96,86 +100,154 @@ internal class RemoteDshBootstrap(
           ps -p "§1" -o lstart= 2>/dev/null
         fi
       }
-      # Reject symlinks, foreign owners and group/world-writable metadata before using it.
-      _safe() {
-        [ ! -L "§1" ] || return 1
-        case "§2" in dir) [ -d "§1" ] || return 1;; file) [ -f "§1" ] || return 1;; *) return 1;; esac
-        INFO=§(stat -c '%u %a' "§1" 2>/dev/null) || INFO=§(stat -f '%u %Lp' "§1" 2>/dev/null) || return 1
-        FILE_OWNER=§{INFO%% *}; MODE=§{INFO#* }
-        [ "§FILE_OWNER" = "§(id -u)" ] || return 1
-        case "§MODE" in ''|*[!0-7]*) return 1;; esac
-        PREFIX=§{MODE%?}; GROUP=§{PREFIX#§{PREFIX%?}}; OTHER=§{MODE#§{MODE%?}}
-        case "§GROUP" in ''|2|3|6|7) return 1;; esac
-        case "§OTHER" in ''|2|3|6|7) return 1;; esac
+      # Classify one managed path into §KIND: absent, ours, or other (symlink / foreign owner).
+      # A path we own is tightened to 0600/0700 in place: umask 002 machines otherwise make our own
+      # record look foreign to the next launch.
+      _kind() {
+        KIND=absent
+        [ -e "§1" ] || [ -L "§1" ] || return 0
+        KIND=other
+        [ ! -L "§1" ] || return 0
+        case "§2" in dir) [ -d "§1" ] || return 0;; file) [ -f "§1" ] || return 0;; *) return 0;; esac
+        OWN=§(stat -c '%u' "§1" 2>/dev/null) || OWN=§(stat -f '%u' "§1" 2>/dev/null) || return 0
+        [ "§OWN" = "§(id -u)" ] || return 0
+        KIND=ours
+        case "§2" in dir) chmod 700 "§1" 2>/dev/null;; file) chmod 600 "§1" 2>/dev/null;; esac
+        return 0
       }
-      # 0 = verified live candidate, 1 = absent/dead, 2 = present but unsafe to reuse.
+      # 0 = verified live candidate, 1 = absent/stale (safe to replace), 2 = untouchable.
+      # A record that no longer matches the live process generation is stale, not a conflict:
+      # reboots and PID reuse are the normal way a managed instance disappears.
       _inspect() {
         SD=§1
-        if [ ! -e "§SD" ] && [ ! -L "§SD" ]; then return 1; fi
-        _safe "§SD" dir || return 2
-        if [ ! -e "§SD/web.pid" ] && [ ! -L "§SD/web.pid" ]; then
-          [ ! -e "§SD/web.launching" ] || return 2
-          return 1
-        fi
-        _safe "§SD/web.pid" file || return 2
-        P=§(head -c 64 "§SD/web.pid" 2>/dev/null) || return 2
-        case "§P" in ''|*[!0-9]*) return 2;; esac
-        [ "§{#P}" -le 10 ] && [ "§P" -gt 1 ] 2>/dev/null || return 2
-        if ! kill -0 "§P" 2>/dev/null; then
-          # A permission-denied or otherwise visible PID is not proof of death.
-          V=§(ps -p "§P" -o pid= 2>/dev/null | tr -d ' ')
-          [ -z "§V" ] || return 2
-          return 1
-        fi
-        _safe "§SD/web.st" file && [ -s "§SD/web.st" ] || return 2
-        B=§(head -c 512 "§SD/web.st" 2>/dev/null) || return 2
-        A=§(_st "§P") || return 2
+        _kind "§SD" dir
+        [ "§KIND" = other ] && return 2
+        [ "§KIND" = ours ] || return 1
+        _kind "§SD/web.pid" file
+        [ "§KIND" = other ] && return 2
+        [ "§KIND" = ours ] || return 1
+        P=§(head -c 64 "§SD/web.pid" 2>/dev/null) || return 1
+        case "§P" in ''|*[!0-9]*) return 1;; esac
+        [ "§{#P}" -le 10 ] && [ "§P" -gt 1 ] 2>/dev/null || return 1
+        kill -0 "§P" 2>/dev/null || return 1
+        _kind "§SD/web.st" file
+        [ "§KIND" = other ] && return 2
+        [ "§KIND" = ours ] || return 1
+        B=§(head -c 512 "§SD/web.st" 2>/dev/null) || return 1
+        A=§(_st "§P") || return 1
         # BSD ps pads lstart with spaces; older clients may store a trimmed value. Compare the
         # canonical fields so the same process generation remains reusable on macOS.
         A=§(printf '%s\n' "§A" | awk '{§1=§1; print}')
         B=§(printf '%s\n' "§B" | awk '{§1=§1; print}')
-        [ -n "§A" ] && [ "§A" = "§B" ] || return 2
-        if [ -e "§SD/web.boot" ] || [ -L "§SD/web.boot" ]; then
-          _safe "§SD/web.boot" file && [ -s "§SD/web.boot" ] || return 2
-          [ -r /proc/sys/kernel/random/boot_id ] || return 2
-          B=§(head -c 128 "§SD/web.boot" 2>/dev/null) || return 2
-          A=§(head -c 128 /proc/sys/kernel/random/boot_id 2>/dev/null) || return 2
-          [ -n "§A" ] && [ "§A" = "§B" ] || return 2
+        [ -n "§A" ] && [ "§A" = "§B" ] || return 1
+        _kind "§SD/web.boot" file
+        [ "§KIND" = other ] && return 2
+        if [ "§KIND" = ours ]; then
+          B=§(head -c 128 "§SD/web.boot" 2>/dev/null) || return 1
+          A=§(head -c 128 /proc/sys/kernel/random/boot_id 2>/dev/null)
+          [ -n "§A" ] && [ "§A" = "§B" ] || return 1
         fi
-        _safe "§SD/web.cmd" file || return 2
-        C=§(head -c 4096 "§SD/web.cmd" 2>/dev/null) || return 2
-        [ "§C" = "§REQUEST_COMMAND" ] || return 2
-        if [ -e "§SD/web.cwd" ] || [ -L "§SD/web.cwd" ]; then
-          _safe "§SD/web.cwd" file || return 2
-          C=§(head -c 4096 "§SD/web.cwd" 2>/dev/null) || return 2
-          [ "§C" = "§REQUEST_CWD" ] || return 2
+        _kind "§SD/web.cmd" file
+        [ "§KIND" = other ] && return 2
+        [ "§KIND" = ours ] || return 1
+        C=§(head -c 4096 "§SD/web.cmd" 2>/dev/null) || return 1
+        [ "§C" = "§REQUEST_COMMAND" ] || return 1
+        _kind "§SD/web.cwd" file
+        [ "§KIND" = other ] && return 2
+        if [ "§KIND" = ours ]; then
+          C=§(head -c 4096 "§SD/web.cwd" 2>/dev/null) || return 1
+          [ "§C" = "§REQUEST_CWD" ] || return 1
         else
           # Older shared records did not save cwd; do not assert a configured cwd was used.
-          [ -z "§REQUEST_CWD" ] || return 2
+          [ -z "§REQUEST_CWD" ] || return 1
         fi
-        _safe "§SD/web.log" file || return 2
+        _kind "§SD/web.log" file
+        [ "§KIND" = other ] && return 2
+        [ "§KIND" = ours ] || return 1
         L=§(tail -c 65536 "§SD/web.log" 2>/dev/null | grep -E 'https?://[^ ]*[?&]token=' | tail -n 1)
-        [ -n "§L" ] || return 2
+        [ -n "§L" ] || return 1
         RESULT_PID=§P; RESULT_URL=§L
         return 0
       }
+      # 0 = reusable now, 1 = start our own, 2 = our state path is untouchable.
+      # A verified managed instance wins; otherwise a verified legacy (dsh-Go) record is reused
+      # read-only; otherwise we start a private instance. An unverifiable legacy record is ignored,
+      # never signalled and never a reason to fail.
       _existing() {
         OWN_STATUS=1; LEGACY_STATUS=1
         _inspect "§D"; OWN_STATUS=§?
-        if [ "§OWN_STATUS" -eq 0 ]; then OWN_PID=§RESULT_PID; OWN_URL=§RESULT_URL; fi
-        _inspect "§LEGACY"; LEGACY_STATUS=§?
-        if [ "§LEGACY_STATUS" -eq 0 ]; then LEGACY_PID=§RESULT_PID; LEGACY_URL=§RESULT_URL; fi
-        [ "§OWN_STATUS" -ne 2 ] && [ "§LEGACY_STATUS" -ne 2 ] || return 2
-        if [ "§OWN_STATUS" -eq 0 ] && [ "§LEGACY_STATUS" -eq 0 ] && [ "§OWN_PID" != "§LEGACY_PID" ]; then return 2; fi
+        if [ "§OWN_STATUS" -eq 2 ]; then return 2; fi
         if [ "§OWN_STATUS" -eq 0 ]; then
+          OWN_PID=§RESULT_PID; OWN_URL=§RESULT_URL
           printf 'LAGOON alive %s\nLAGOON samecmd\nLAGOON reused %s\nLAGOON source managed\nLAGOON url %s\n' "§OWN_PID" "§OWN_PID" "§OWN_URL"
           return 0
         fi
+        _inspect "§LEGACY"; LEGACY_STATUS=§?
         if [ "§LEGACY_STATUS" -eq 0 ]; then
+          LEGACY_PID=§RESULT_PID; LEGACY_URL=§RESULT_URL
           printf 'LAGOON alive %s\nLAGOON samecmd\nLAGOON reused %s\nLAGOON source legacy\nLAGOON url %s\n' "§LEGACY_PID" "§LEGACY_PID" "§LEGACY_URL"
           return 0
         fi
         return 1
+      }
+      # Direct children of a pid. The launcher records the `sh -c` wrapper, whose child is the
+      # actual dsh process; signalling only the wrapper would orphan that child on its port.
+      _children() {
+        ps -eo pid=,ppid= 2>/dev/null | awk -v p="§1" '§2==p {print §1}'
+      }
+      # Stop a previous generation that is provably ours (pid + recorded start stamp) but no longer
+      # usable, so a lost token or an edited launch command cannot leave an orphan `dsh web` behind.
+      # Anything that is not proven ours is left alone.
+      _stop_ours() {
+        _kind "§D/web.pid" file
+        [ "§KIND" = ours ] || return 0
+        _kind "§D/web.st" file
+        [ "§KIND" = ours ] || return 0
+        P=§(head -c 64 "§D/web.pid" 2>/dev/null) || return 0
+        case "§P" in ''|*[!0-9]*) return 0;; esac
+        kill -0 "§P" 2>/dev/null || return 0
+        B=§(head -c 512 "§D/web.st" 2>/dev/null) || return 0
+        A=§(_st "§P") || return 0
+        A=§(printf '%s\n' "§A" | awk '{§1=§1; print}')
+        B=§(printf '%s\n' "§B" | awk '{§1=§1; print}')
+        [ -n "§A" ] && [ "§A" = "§B" ] || return 0
+        KIDS=§(_children "§P")
+        kill "§P" §KIDS 2>/dev/null || return 0
+        i=0
+        while kill -0 "§P" 2>/dev/null && [ "§i" -lt 50 ]; do sleep 0.1; i=§((i+1)); done
+        kill -0 "§P" 2>/dev/null && kill -9 "§P" 2>/dev/null
+        return 0
+      }
+      # A lock directory is atomic on every POSIX filesystem and needs no interpreter. The owner
+      # pid inside it lets the next client recover immediately when a client is killed mid-start
+      # (an advisory flock would be released by the kernel, a directory is not).
+      _lock() {
+        LOCK="§D/.bootstrap.lock"
+        TICKS=${startTimeoutSeconds.coerceIn(5, 600) * 10}
+        i=0
+        while ! mkdir "§LOCK" 2>/dev/null; do
+          i=§((i+1))
+          if [ "§i" -gt "§TICKS" ]; then printf 'LAGOON lockbusy\n'; return 1; fi
+          OWNER=§(head -c 32 "§LOCK/pid" 2>/dev/null)
+          case "§OWNER" in
+            ''|*[!0-9]*) ;;
+            *) if ! kill -0 "§OWNER" 2>/dev/null; then
+                 rm -f "§LOCK/pid" 2>/dev/null
+                 rmdir "§LOCK" 2>/dev/null
+                 continue
+               fi;;
+          esac
+          # An old client left the directory without an owner file; replace it once it is old.
+          if [ "§i" -eq 30 ]; then
+            NOW=§(date +%s 2>/dev/null || echo 0)
+            MT=§(stat -c %Y "§LOCK" 2>/dev/null || stat -f %m "§LOCK" 2>/dev/null || echo "§NOW")
+            [ "§((NOW - MT))" -gt 90 ] && rmdir "§LOCK" 2>/dev/null
+          fi
+          sleep 0.1
+        done
+        printf '%s' "§§" > "§LOCK/pid" 2>/dev/null
+        trap 'rm -f "§LOCK/pid" 2>/dev/null; rmdir "§LOCK" 2>/dev/null' EXIT
+        return 0
       }
     """))
   }
@@ -190,7 +262,7 @@ internal class RemoteDshBootstrap(
     append(prelude())
     appendLine("printf 'LAGOON home %s\\n' \"\$HOME\"")
     appendLine("_existing; S=\$?")
-    appendLine("if [ \"\$S\" -eq 2 ]; then printf 'LAGOON conflict\\n'; fi")
+    appendLine("if [ \"\$S\" -eq 2 ]; then printf 'LAGOON unusable\\n'; fi")
     appendLine("true")
   }
 
@@ -198,62 +270,18 @@ internal class RemoteDshBootstrap(
     append(prelude())
     appendLine("printf 'LAGOON home %s\\n' \"\$HOME\"")
     append(shell("""
-      # Lagoon's lock never claims to coordinate non-participating clients such as dsh-Go.
-      [ ! -L "§D" ] || { printf 'LAGOON nodir\n'; exit 70; }
-      if [ ! -d "§D" ]; then mkdir -m 700 "§D" 2>/dev/null || [ -d "§D" ] || { printf 'LAGOON nodir\n'; exit 70; }; fi
-      [ ! -L "§D" ] && [ -d "§D" ] || { printf 'LAGOON nodir\n'; exit 70; }
-      OWNER=§(stat -c '%u' "§D" 2>/dev/null) || OWNER=§(stat -f '%u' "§D" 2>/dev/null) || OWNER=''
-      [ -n "§OWNER" ] && [ "§OWNER" = "§(id -u)" ] || { printf 'LAGOON nodir\n'; exit 70; }
-      chmod 700 "§D" 2>/dev/null || { printf 'LAGOON nodir\n'; exit 70; }
-      LOCK="§D/.bootstrap.lock"
-      command -v python3 >/dev/null 2>&1 || { printf 'LAGOON nopython\n'; exit 127; }
-      [ ! -L "§LOCK" ] && { [ ! -e "§LOCK" ] || [ -f "§LOCK" ]; } || { printf 'LAGOON lockbusy\n'; exit 73; }
-      # Keep an OS advisory lock on the shell's open file description. Unlike an existence lock,
-      # it is automatically released even if SSH or the bootstrap process is killed abruptly.
-      # The persistent file is never removed: unlinking it would split concurrent clients across
-      # different inodes. Python is also required for the verified SSH tunnel.
-      exec 9>>"§LOCK"
-      python3 -c '
-import fcntl, os, stat, sys, time
-info = os.fstat(9)
-if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
-    sys.exit(1)
-deadline = time.monotonic() + 10
-while True:
-    try:
-        fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        break
-    except BlockingIOError:
-        if time.monotonic() >= deadline: sys.exit(1)
-        time.sleep(0.1)
-' 2>/dev/null || { printf 'LAGOON lockbusy\n'; exit 73; }
+      # Our own state directory is ours to create and tighten; a symlink or a foreign owner is not.
+      _kind "§D" dir
+      [ "§KIND" = other ] && { printf 'LAGOON unusable\n'; exit 70; }
+      [ "§KIND" = ours ] || mkdir -m 700 "§D" 2>/dev/null || true
+      _kind "§D" dir
+      [ "§KIND" = ours ] || { printf 'LAGOON nodir\n'; exit 70; }
+      _lock || exit 73
       _existing; STATE=§?
       if [ "§STATE" -eq 0 ]; then exit 0; fi
-      if [ "§STATE" -eq 2 ]; then printf 'LAGOON conflict\n'; exit 73; fi
-      # Detect other same-user dsh web processes without matching this script's own ancestors.
-      ANCESTORS=" §§ "; A=§§; i=0
-      while [ "§i" -lt 12 ]; do
-        A=§(ps -p "§A" -o ppid= 2>/dev/null | tr -d ' ')
-        case "§A" in ''|*[!0-9]*|0|1) break;; esac
-        ANCESTORS="§ANCESTORS§A "; i=§((i+1))
-      done
-      if command -v pgrep >/dev/null 2>&1; then
-        CANDIDATES=§(pgrep -u "§(id -u)" -f '[d]sh[^[:space:]]*[[:space:]]+web' 2>/dev/null || true)
-      else
-        CANDIDATES=§(ps -u "§(id -u)" -o pid= -o args= 2>/dev/null | awk '/[d]sh[^[:space:]]*[[:space:]]+web/ {print §1}')
-      fi
-      for C in §CANDIDATES; do
-        case "§ANCESTORS" in *" §C "*) continue;; esac
-        # Another Lagoon bootstrap can be waiting on this lock with the launch command in its
-        # own shell argv. It is not a running dsh process and must not block the lock owner.
-        ARGS=§(ps -p "§C" -o args= 2>/dev/null)
-        case "§ARGS" in *'REQUEST_COMMAND='*'LAGOON source managed'*) continue;; esac
-        printf 'LAGOON busy\n'; exit 73
-      done
-      # Recheck the legacy state immediately before launch. Other clients do not share our lock.
-      _existing; STATE=§?
-      if [ "§STATE" -eq 0 ]; then exit 0; fi
-      if [ "§STATE" -eq 2 ]; then printf 'LAGOON conflict\n'; exit 73; fi
+      if [ "§STATE" -eq 2 ]; then printf 'LAGOON unusable\n'; exit 70; fi
+      # Stale record: replace it, but first stop only the generation we can prove we started.
+      _stop_ours
     """))
     append(dshSearch(required = command == DEFAULT_DSH_LAUNCH_COMMAND))
     val cwd = workingDirectory?.trim()
@@ -266,13 +294,12 @@ while True:
       printf '%s' "§REQUEST_COMMAND" > "§D/web.cmd"
       printf '%s' "§REQUEST_CWD" > "§D/web.cwd"
       : > "§D/web.log"
-      : > "§D/web.launching"
       NO_COLOR=1; export NO_COLOR
       N=''; if command -v nohup >/dev/null 2>&1; then N=nohup; fi
     """))
     val launch = "$command --host 127.0.0.1 --port 0 --no-open"
     appendLine("LAUNCH=${SshShell.quote(launch)}")
-    appendLine("\$N sh -c 'eval \"\$1\" >>\"\$D/web.log\" 2>&1 & echo \$! >\"\$D/web.pid\"; wait' sh \"\$LAUNCH\" >/dev/null 2>&1 9>&- &")
+    appendLine("\$N sh -c 'eval \"\$1\" >>\"\$D/web.log\" 2>&1 & echo \$! >\"\$D/web.pid\"; wait' sh \"\$LAUNCH\" >/dev/null 2>&1 &")
     append(shell("""
       i=0
       while [ ! -s "§D/web.pid" ] && [ "§i" -lt 20 ]; do sleep 0.1; i=§((i+1)); done
@@ -292,10 +319,6 @@ while True:
     append(shell("""
         L=§(tail -c 65536 "§D/web.log" 2>/dev/null | grep -E 'https?://[^ ]*[?&]token=' | tail -n 1)
         if [ -n "§L" ]; then
-          # A concurrent legacy client cannot be locked here; do not return a route if it appeared.
-          _inspect "§LEGACY"; LEGACY_STATUS=§?
-          if [ "§LEGACY_STATUS" -ne 1 ]; then printf 'LAGOON conflict\n'; exit 73; fi
-          rm -f "§D/web.launching"
           printf 'LAGOON url %s\n' "§L"; exit 0
         fi
         if ! kill -0 "§P" 2>/dev/null; then
@@ -335,12 +358,10 @@ while True:
     var pid: Int? = null
     var url: String? = null
     var noDsh = false
-    var noPython = false
     var noCwd = false
     var exited = false
     var timedOut = false
-    var conflict = false
-    var busy = false
+    var unusable = false
     var lockBusy = false
     var metadataError = false
     var noDirectory = false
@@ -360,26 +381,20 @@ while True:
         }
         "url" -> url = value.trim()
         "nodsh" -> noDsh = true
-        "nopython" -> noPython = true
         "nocwd" -> noCwd = true
         "exited" -> exited = true
         "timeout" -> timedOut = true
-        "conflict" -> conflict = true
-        "busy" -> busy = true
+        "unusable" -> unusable = true
         "lockbusy" -> lockBusy = true
         "metadata" -> metadataError = true
         "nodir" -> noDirectory = true
         "log" -> log += value
       }
     }
-    if (conflict || busy) throw existingInstanceFailure()
-    if (noPython) throw SshFailure(
-      SshFailureKind.DSH_START, "电脑缺少 Python 3",
-      "SSH 模式需要 Python 3 才能安全启动和连接 DSH。请安装后重试。", retryable = true
-    )
+    if (unusable) throw unusableStateFailure()
     if (lockBusy) throw SshFailure(
-      SshFailureKind.DSH_START, "另一台设备正在检查或启动 DSH",
-      "请稍后重试；若一直出现，请在电脑上检查 Lagoon 的启动锁。", retryable = true
+      SshFailureKind.DSH_START, "另一台设备正在启动这台电脑上的 DSH",
+      "请稍后重试；若一直出现，请检查电脑上的 ~/.lagoon-ssh-dsh/.bootstrap.lock。", retryable = true
     )
     if (metadataError || noDirectory) throw SshFailure(
       SshFailureKind.DSH_START, "无法确认 DSH 启动状态",
@@ -453,6 +468,9 @@ while True:
       .containsMatchIn(log)
 
   internal companion object {
+    /** First `dsh web` on a machine initializes `~/.dsh/profiles/web` (dependency install). */
+    internal const val DEFAULT_START_TIMEOUT_SECONDS = 180
+
     internal fun parseLaunchLine(line: String): RemoteDshEndpoint? {
       val rawUrl = Regex("https?://[^\\s]+").find(line)?.value ?: return null
       return try {

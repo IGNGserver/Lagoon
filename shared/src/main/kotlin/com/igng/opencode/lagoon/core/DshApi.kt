@@ -25,6 +25,7 @@ import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import okhttp3.ConnectionPool
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaType
@@ -38,6 +39,7 @@ import javax.net.SocketFactory
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
+import java.net.Proxy
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
@@ -66,7 +68,7 @@ import kotlin.coroutines.resume
 class DshApi(
   private val profile: ServerProfile,
   private val credentials: ServerCredentials,
-  callTimeoutSeconds: Long = 60,
+  callTimeoutSeconds: Long = 90,
   /**
    * 换到新的浏览器 Cookie，或确认已落盘的 Cookie 被服务端拒绝（传空串）时回调，由调用方加密落盘。
    * 落盘的 Cookie 跨 App 与 dsh 重启复用，启动令牌只在没有可用 Cookie 时才用得上。
@@ -83,8 +85,20 @@ class DshApi(
   private val eventsReadyTimeoutMillis: Long = EVENTS_READY_TIMEOUT_MILLIS,
   /** Only for a local SSH bridge; never applied to Remote or direct HTTP connections. */
   private val socketFactory: SocketFactory? = null,
+  /**
+   * Only for a local SSH bridge. OkHttp's reuse key ignores the `SocketFactory` (it compares port,
+   * TLS material and proxy but not the factory), so a shared pool can hand one transport's pooled
+   * socket to another listener on the same loopback port. A per-link pool keeps generations apart.
+   */
+  private val connectionPool: ConnectionPool? = null,
   /** Test seam: deadline for one workspace, job, or session stream's first item. */
-  private val streamFirstFrameTimeoutMillis: Long = STREAM_FIRST_FRAME_TIMEOUT_MILLIS
+  private val streamFirstFrameTimeoutMillis: Long = STREAM_FIRST_FRAME_TIMEOUT_MILLIS,
+  /**
+   * SSH tunnel only: the remote `dsh web` was replaced, so the launch token this client was built
+   * with is gone. The owner re-reads the token and rebuilds the generation; a saved browser cookie
+   * that still covers the new process is preferred over this hook.
+   */
+  private val onAuthTokenRotated: () -> Unit = {}
 ) : HarnessClient, RemoteDoctorSource {
   constructor(profile: ServerProfile, password: String) : this(profile, ServerCredentials(profile.username, password))
 
@@ -99,10 +113,15 @@ class DshApi(
   private val http = OkHttpClient.Builder()
     .apply { socketFactory?.let { this.socketFactory(it) } }
     .connectTimeout(SharedHttp.CONNECT_TIMEOUT_SECONDS, TimeUnit.SECONDS)
-    .readTimeout(25, TimeUnit.SECONDS)
+    // A tunneled connection may spend up to ~27 s on the SSH channel plus the per-socket proof
+    // before the host sees the request; 25 s timed out before dsh ever answered.
+    .readTimeout(60, TimeUnit.SECONDS)
     .callTimeout(callTimeoutSeconds, TimeUnit.SECONDS)
-    .connectionPool(SharedHttp.connectionPool)
+    .connectionPool(connectionPool ?: SharedHttp.connectionPool)
     .dispatcher(SharedHttp.dispatcher)
+    // A system HTTP proxy must never carry a DSH cookie, and it bypasses a custom SocketFactory
+    // entirely (OkHttp then dials the proxy instead of the local forwarder).
+    .proxy(Proxy.NO_PROXY)
     .followRedirects(false)
     .followSslRedirects(false)
     .addInterceptor { chain ->
@@ -462,8 +481,24 @@ class DshApi(
     } catch (error: ApiException) {
       // 隧道里的启动令牌在远端 dsh 重启后作废，但浏览器 Cookie 跨进程仍然有效。
       val saved = credentials.cookie.trim().takeIf { error.code == AUTH_TOKEN_ROTATED && DshCookie.isFresh(it, clock()) }
-      if (saved != null) saved.also(::adopt) else throw error
+      if (saved != null) saved.also(::adopt)
+      else {
+        // Nothing local can cover the new process: ask the owner to re-read the token instead of
+        // leaving every later call on this generation with a 401 that retrying cannot heal.
+        // Dispatch: the owner rebuilds the link, which must not re-enter this client's auth lock.
+        if (error.code == AUTH_TOKEN_ROTATED) runCatching { ioScope.launch { onAuthTokenRotated() } }
+        throw error
+      }
     }
+  }
+
+  /**
+   * Proves the tunneled credentials work without reading the whole session catalog. `health()` is
+   * `session/list`, so using it as the connection's login check made every connect read the
+   * catalog three times; the first real catalog read follows immediately anyway.
+   */
+  suspend fun probeAuth() {
+    cookie()
   }
 
   private fun repairMessage(): String = if (signingSecret != null) SECRET_REJECTED_MESSAGE else REPAIR_MESSAGE
@@ -4742,6 +4777,8 @@ class DshApi(
 
     /** 首帧等待上限；只覆盖“流被打开到第一帧到达”，不含后续分片/transfer 读取。 */
     const val STREAM_FIRST_FRAME_TIMEOUT_MILLIS = 20_000L
+    /** `$events` readiness on a fresh SSH tunnel (handshake + start share the window). */
+    const val EVENTS_READY_TIMEOUT_TUNNEL_MILLIS = 45_000L
     /** 首屏快照的尝试次数：拿到非 snapshot 帧或流错误时重开一次，仍失败才报错。 */
     const val SNAPSHOT_ATTEMPTS = 2
     const val SNAPSHOT_RETRY_DELAY_MILLIS = 400L

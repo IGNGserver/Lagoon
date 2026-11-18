@@ -551,12 +551,15 @@ class LagoonController private constructor(private val appContext: Context) {
           HarnessProtocolId.CODEX_APP_SERVER, HarnessProtocolId.ANTIGRAVITY_ACP -> ServerKind.CODEX
           HarnessProtocolId.OPENCODE_ACP -> error("SSH 暂不支持 OpenCode ACP，请使用原生 OpenCode")
         }
-        saveSshHost(
+        val attached = saveSshHost(
           config = config, secrets = sshHostStore.secrets(config.id), harnessKind = kind,
           registrationPath = locator.takeIf { kind == ServerKind.OPENCODE },
           harnessProtocol = protocol.takeIf { it == HarnessProtocolId.ANTIGRAVITY_ACP },
           bindingEnabled = true, connect = false
         )
+        // Mirror the Hub branch: adding a harness must show its result. With another server already
+        // selected the background monitor dials it and the device page reports the SSH link state.
+        if (attached.effectiveEnabled && state.value.serverId == null) connect(attached.id, preserveHome = true)
       }
       ConnectionSourceType.DIRECT -> error("直连连接本身就是一条 Harness，不需要再添加")
     }
@@ -3805,6 +3808,10 @@ class LagoonController private constructor(private val appContext: Context) {
       connectTrace.fail(token.toLong(), reason)
       updateState { it.copy(loading = false, connected = false, error = reason,
         remoteRecovery = remoteFailure(error)?.kind?.recovery()) }
+      if (permanentSshFailure(error)) {
+        showPermanentFailure(reason)
+        return
+      }
       scheduleReconnect(id, token, if (error.isAuthFailure) AUTH_RETRY_ATTEMPT else 0, reason)
       return
     }
@@ -3826,6 +3833,12 @@ class LagoonController private constructor(private val appContext: Context) {
         connectTrace.fail(token.toLong(), reason)
         showOffline(id, token, reason)
         if (token == generation) updateState { it.copy(remoteRecovery = remoteFailure(error)?.kind?.recovery()) }
+        // A missing remote executable, an unusable state directory or a changed host key never heals
+        // by retrying. Reconnecting every 60 s only hid the reason behind a fake countdown.
+        if (permanentSshFailure(error)) {
+          showPermanentFailure(reason)
+          return@launch
+        }
         // A refresh while offline must be able to recover: retry the connection with backoff instead
         // of leaving the user on a stale snapshot with no path back to a live stream (A10).
         // Expired credentials do not heal by retrying quickly; keep probing at the slowest pace.
@@ -3854,6 +3867,22 @@ class LagoonController private constructor(private val appContext: Context) {
       resolveSession(target.sessionId) { if (state.value.serverId == target.serverId && state.value.sessionId == target.sessionId) selectSession(target.sessionId) }
     }
   }
+  /** A typed SSH failure that retrying cannot fix (missing binary, unusable path, changed key). */
+  private fun permanentSshFailure(error: Throwable): Boolean = error is SshFailure && !error.retryable
+
+  /** Keep the real reason on screen with a manual retry, instead of a countdown that never lands. */
+  private fun showPermanentFailure(reason: String) {
+    val now = System.currentTimeMillis()
+    updateState {
+      it.copy(
+        loading = false,
+        connected = false,
+        error = reason,
+        connection = ConnectionStatus(ConnectStage.RETRYING, now, retryAt = 0, reason = reason, permanent = true)
+      )
+    }
+  }
+
   private fun scheduleReconnect(id: String, token: Int, attempt: Int = 0, reason: String? = null) {
     if (token != generation || state.value.serverId != id) return
     if (store.profiles().none { it.id == id && it.effectiveEnabled }) return
@@ -3959,7 +3988,9 @@ class LagoonController private constructor(private val appContext: Context) {
     val firstRound = withTimeoutOrNull(firstRoundBudget) {
       coroutineScope {
       val versionTask = async { client.health() }
-      val capabilitiesTask = async { client.discoverCapabilities() }
+      // A lost capability read or a lost catalog row must not blank a device that is reachable:
+      // the cached/background view still has something to show, and the next reconcile retries.
+      val capabilitiesTask = async { attempt { client.discoverCapabilities() } }
       val pageTask = async { attempt { client.rootSessionsPage() } }
       val activeTask = async { attempt { client.activeSessions() } }
       // Display-only titles; a failure or timeout keeps the last known catalog, it never fails the load.
@@ -3968,11 +3999,12 @@ class LagoonController private constructor(private val appContext: Context) {
       }
       val version = versionTask.await()
       if (token == generation) advanceStage(token, ConnectStage.READING)
-      FirstRound(version, capabilitiesTask.await(), pageTask.await().getOrThrow(), activeTask.await(), workspaceTask.await())
+      FirstRound(version, capabilitiesTask.await(), pageTask.await(), activeTask.await(), workspaceTask.await())
       }
     } ?: throw ApiException(0, "连接超时，正在后台重试", "RPC_TIMEOUT")
     val version = firstRound.version
-    val capabilities = firstRound.capabilities
+    // Capabilities are a display hint; falling back to the client's last known set beats failing.
+    val capabilities = firstRound.capabilities.getOrElse { client.capabilities() }
     if (token != generation || state.value.serverId != serverId) return
     // The project list is device-local: the user registers a server directory, and the server's own
     // list is never auto-imported. A control-only refresh keeps the current list to avoid flicker.
@@ -3985,7 +4017,14 @@ class LagoonController private constructor(private val appContext: Context) {
     // Official home index: one global, newest-first listing of root sessions (directory filters are
     // exact, so per-project queries would miss worktrees). Reconciliation re-reads its first page too,
     // so a session created elsewhere while an event was missed still appears.
-    val page = firstRound.page
+    val page = firstRound.page.getOrElse { error ->
+      // The background monitor may have read the same catalog successfully while this foreground
+      // read lost a race (a Host 409, a tunnel flap). Show that list instead of an empty page.
+      val fallback = allSnapshots[serverId]?.sessions.orEmpty().map { scoped(serverId, it) }
+      if (fallback.isEmpty()) throw error
+      Diagnostics.warn("LagoonController", "会话目录读取失败，改用后台快照", error)
+      ApiPage(fallback, null)
+    }
     trace(token, ConnectMilestone.CATALOG)
     advanceStage(token, ConnectStage.SYNCING)
     val sessions = page.items.map { scoped(serverId, it) }
@@ -4361,7 +4400,7 @@ class LagoonController private constructor(private val appContext: Context) {
         }
         true
       }
-      if (completed != true) showNotice("部分电脑仍在刷新，请稍后查看设备状态", FeedbackTone.INFO)
+      if (completed != true) showNotice("仍在刷新，完成后会自动更新", FeedbackTone.INFO)
     }
   }
   private fun reloadConversation(deep: Boolean = true): Job {
@@ -6792,7 +6831,7 @@ class LagoonController private constructor(private val appContext: Context) {
 }
 
 /** The independent reads of a control-plane load's first round trip. */
-private data class FirstRound(val version: String, val capabilities: ApiCapabilities, val page: ApiPage<Session>,
+private data class FirstRound(val version: String, val capabilities: Result<ApiCapabilities>, val page: Result<ApiPage<Session>>,
   val active: Result<Set<String>>, val workspaces: Result<List<Project>?>)
 
 /** A first prompt submitted from the blank page before its target connection is interactive. */
