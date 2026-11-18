@@ -62,6 +62,20 @@ class AgyApiTest {
     }
     override fun close() { frames.close() }
   }
+  @Test fun providerIdentityDrivesProjectIdsAndUnsupportedMessages() = runBlocking {
+    val openCode = AgyApi(Fake(), "opencode", "OpenCode ACP", "opencode")
+    val session = openCode.rootSessionsPage().items.single()
+    assertEquals("opencode:cwd:/repo", session.projectId)
+    val projects = openCode.projects()
+    assertEquals(listOf("opencode:cwd:/repo"), projects.map { it.id })
+    val failure = runCatching { openCode.renameSession(session, "renamed") }.exceptionOrNull()
+    assertTrue("Expected an unsupported failure: $failure", failure is ApiException)
+    assertTrue(failure!!.message.orEmpty().contains("OpenCode ACP"))
+
+    val antigravity = AgyApi(Fake())
+    assertEquals("agy:cwd:/repo", antigravity.rootSessionsPage().items.single().projectId)
+  }
+
   @Test fun replayIsOrderedAndLiveTurnsDoNotReloadTheRunningSession() = runBlocking {
     val transport = Fake(); val api = AgyApi(transport)
     val session = api.rootSessionsPage().items.single()

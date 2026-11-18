@@ -27,7 +27,9 @@ import org.json.JSONObject
 class AgyApi(
   private val transport: AgyTransport,
   private val providerId: String = "antigravity",
-  private val healthLabel: String = "Antigravity ACP"
+  private val healthLabel: String = "Antigravity ACP",
+  /** Stable project id namespace. Changing a live prefix would drop a saved project selection. */
+  private val projectPrefix: String = "agy"
 ) : HarnessClient {
   private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
   private val started = AtomicBoolean(false)
@@ -145,7 +147,7 @@ class AgyApi(
     val old = sessions[id]
     return Session(id, cwd, value.str("title").ifBlank { old?.title ?: "新会话" },
       timestamp(value.str("updatedAt")).takeIf { it > 0 } ?: old?.updated ?: 0,
-      projectId = "agy:cwd:$cwd", created = old?.created ?: 0)
+      projectId = "$projectPrefix:cwd:$cwd", created = old?.created ?: 0)
   }
   override suspend fun rootSessionsPage(directory: String?, cursor: String?, size: Int): ApiPage<Session> {
     val params = JSONObject()
@@ -171,7 +173,7 @@ class AgyApi(
         sessions[parsed.id]?.directory?.takeIf { previous -> locations.any { normalizedDirectory(it) == normalizedDirectory(previous) } }
           ?: parsed.directory
       } else locations.firstOrNull { normalizedDirectory(it) == normalizedDirectory(directory) } ?: return@mapNotNull null
-      parsed.copy(directory = selected, projectId = "agy:cwd:$selected")
+      parsed.copy(directory = selected, projectId = "$projectPrefix:cwd:$selected")
     }
     rows.forEach { sessions[it.id] = it }
     val next = response.optString("nextCursor").takeIf { it.isNotBlank() && it != "null" }
@@ -184,7 +186,7 @@ class AgyApi(
     do {
       val page = rootSessionsPage(null, cursor, 100)
       page.items.forEach { session -> (sessionDirectories[session.id] ?: listOf(session.directory)).forEach { directory ->
-        dirs.putIfAbsent(directory, Project("agy:cwd:$directory", directory,
+        dirs.putIfAbsent(directory, Project("$projectPrefix:cwd:$directory", directory,
           directory.trimEnd('/', '\\').substringAfterLast('/').substringAfterLast('\\').ifBlank { directory }))
       } }
       cursor = page.next
@@ -197,7 +199,7 @@ class AgyApi(
     if (!validPath(directory) || directory.any(Char::isISOControl)) throw ApiException(400, "请选择有效的绝对工作目录")
     val canonical = transport.verifyDirectory(directory)
     if (!validPath(canonical)) throw ApiException(502, "AGY 未确认有效工作目录")
-    return Project("agy:cwd:$canonical", canonical, canonical.trimEnd('/', '\\').substringAfterLast('/').substringAfterLast('\\').ifBlank { canonical })
+    return Project("$projectPrefix:cwd:$canonical", canonical, canonical.trimEnd('/', '\\').substringAfterLast('/').substringAfterLast('\\').ifBlank { canonical })
   }
   override suspend fun session(id: String): Session {
     sessions[id]?.let { return it }
@@ -216,7 +218,7 @@ class AgyApi(
     val result = rpc("session/new", JSONObject().put("cwd", confirmed).put("mcpServers", JSONArray()))
     val id = result.str("sessionId").takeIf(::validSessionId) ?: throw ApiException(502, "AGY 未确认新会话")
     val created = System.currentTimeMillis()
-    val session = Session(id, confirmed, title.ifBlank { "新会话" }, created, projectId = "agy:cwd:$confirmed", created = created)
+    val session = Session(id, confirmed, title.ifBlank { "新会话" }, created, projectId = "$projectPrefix:cwd:$confirmed", created = created)
     sessions[id] = session; loaded.add(id)
     result.optJSONArray("configOptions")?.let { config[id] = it }
     transport.subscribe(id)
@@ -253,7 +255,7 @@ class AgyApi(
   // ACP has no global activity inventory. Locally initiated turns are tracked above,
   // but presenting that subset as the server's complete set would falsely settle
   // work started by another client or a previous connection.
-  override suspend fun activeSessions(): Set<String> = throw ApiException(501, "AGY 未提供完整的活动会话清单")
+  override suspend fun activeSessions(): Set<String> = throw ApiException(501, "$healthLabel 未提供完整的活动会话清单")
   override suspend fun shells(directory: String): List<ShellJob> = unsupported()
   private fun terminalScope(scope: TerminalScope): TerminalScope.Session {
     val target = scope as? TerminalScope.Session ?: throw ApiException(400, "AGY 终端必须指定原会话")
@@ -270,7 +272,7 @@ class AgyApi(
     return terminalApi.value.terminals(owner).singleOrNull { it.id == id }
       ?: throw ApiException(409, "终端改名已返回，但当前清单无法确认；请重新读取")
   }
-  private fun unsupported(): Nothing = throw ApiException(501, "Antigravity 当前连接未提供此功能")
+  private fun unsupported(): Nothing = throw ApiException(501, "$healthLabel 当前连接未提供此功能")
   override suspend fun renameSession(session: Session, title: String): Unit = unsupported()
   override suspend fun setArchived(session: Session, archived: Boolean, now: Long): Unit = unsupported()
   override suspend fun deleteSession(session: Session): Unit = unsupported()
@@ -279,7 +281,7 @@ class AgyApi(
   override suspend fun revert(session: Session, messageId: String): Unit = unsupported()
   override suspend fun unrevert(session: Session): Unit = unsupported()
   override suspend fun abort(session: Session) {
-    if (session.id !in active) throw ApiException(409, "没有已确认运行的 AGY 轮次")
+    if (session.id !in active) throw ApiException(409, "没有已确认运行的 $healthLabel 轮次")
     transport.notify("session/cancel", JSONObject().put("sessionId", session.id))
     if (!transport.remote) {
       requests.entries.filter { it.value.sessionId == session.id }.forEach { (id, pending) ->

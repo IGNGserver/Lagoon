@@ -56,13 +56,18 @@ internal class SshHostManager(
     if (profile.url != config.profileUrl() || profile.username != config.user) {
       throw SshFailure(SshFailureKind.OTHER, "SSH 保存配置已变化，请重新保存绑定路由", retryable = false)
     }
-    if (profile.protocol in setOf(HarnessProtocolId.CODEX_APP_SERVER, HarnessProtocolId.ANTIGRAVITY_ACP)) {
+    if (profile.protocol in setOf(HarnessProtocolId.CODEX_APP_SERVER, HarnessProtocolId.ANTIGRAVITY_ACP,
+        HarnessProtocolId.OPENCODE_ACP)) {
       val entry = synchronized(lock) {
         val current = codexLinks[profile.id]?.takeUnless { it.client.isClosed }
-        (current ?: SharedCodex(hostId, if (profile.protocol == HarnessProtocolId.ANTIGRAVITY_ACP)
-          AgyApi(SshAgyTransport(config, store.secrets(hostId), transports))
-        else CodexApi(SshCodexTransport(config, store.secrets(hostId), transports)))
-          .also { codexLinks[profile.id] = it }).also { it.refs++ }
+        (current ?: SharedCodex(hostId, when (profile.protocol) {
+          HarnessProtocolId.ANTIGRAVITY_ACP ->
+            AgyApi(SshAgyTransport(config, store.secrets(hostId), transports), "antigravity", "Antigravity ACP")
+          HarnessProtocolId.OPENCODE_ACP ->
+            AgyApi(SshAgyTransport(config, store.secrets(hostId), transports,
+              command = "opencode acp", label = "OpenCode ACP", catalog = false), "opencode", "OpenCode ACP", "opencode")
+          else -> CodexApi(SshCodexTransport(config, store.secrets(hostId), transports))
+        }).also { codexLinks[profile.id] = it }).also { it.refs++ }
       }
       return GuardedHarnessClient(object : HarnessLeaseAccess {
         private val released = java.util.concurrent.atomic.AtomicBoolean(false)
@@ -231,13 +236,14 @@ internal class SshHostManager(
           val dsh = SshDshProbe(connection).discover(!config.usesDefaultCommand)
           val codex = SshCodexProbe(connection).discover()
           val agy = SshAgyProbe(connection).discover()
+          val openCodeAcp = SshOpenCodeAcpProbe(connection).discover()
           val partial = files.completeness != com.igng.opencode.lagoon.core.DiscoveryCompleteness.COMPLETE ||
             (local != null && local.completeness != com.igng.opencode.lagoon.core.DiscoveryCompleteness.COMPLETE) ||
-            dsh.issue != null || codex.issue != null || agy.issue != null
+            dsh.issue != null || codex.issue != null || agy.issue != null || openCodeAcp.issue != null
           SshDeviceDiscovery(files, dsh, codex, agy, now,
             if (partial) com.igng.opencode.lagoon.core.DiscoveryCompleteness.PARTIAL else com.igng.opencode.lagoon.core.DiscoveryCompleteness.COMPLETE,
             if (files.openCode.issue == com.igng.opencode.lagoon.core.SshDiscoveryIssue.PYTHON_UNAVAILABLE) "python_unavailable" else null,
-            local)
+            local, openCodeAcp)
         }
       }
     }
@@ -334,5 +340,6 @@ internal data class SshDeviceDiscovery(
   val observedAtMs: Long,
   val completeness: com.igng.opencode.lagoon.core.DiscoveryCompleteness,
   val environmentIssue: String? = null,
-  val localOpenCode: com.igng.opencode.lagoon.core.SshHarnessDiscoveryResult? = null
+  val localOpenCode: com.igng.opencode.lagoon.core.SshHarnessDiscoveryResult? = null,
+  val openCodeAcp: SshOpenCodeAcpObservation? = null
 )

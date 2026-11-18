@@ -478,6 +478,20 @@ class LagoonController private constructor(private val appContext: Context) {
           completeness = if (codex.installed != null && codex.issue == null) DiscoveryCompleteness.COMPLETE else DiscoveryCompleteness.PARTIAL,
           reason = explanation(codex.issue)), codex.version.orEmpty())
     )
+    found.openCodeAcp?.let { acp ->
+      harnesses += DiscoveredHarness(HarnessProtocolId.OPENCODE_ACP, null, "OpenCode ACP",
+        HarnessDiscoveryStatus(
+          installed = value(acp.supported), compatible = value(acp.supported),
+          available = DiscoveryValue.UNKNOWN, observedAtMs = now,
+          freshUntilMs = now + DeviceDiscovery.DEFAULT_TTL_MS,
+          completeness = if (acp.supported == null) DiscoveryCompleteness.PARTIAL else DiscoveryCompleteness.COMPLETE,
+          reason = when {
+            acp.issue == "acp_unavailable" -> "此版本的 opencode 不支持 ACP，请升级"
+            acp.issue != null -> "ACP 检测未完成，请重试"
+            acp.supported == true -> null
+            else -> "未安装 opencode"
+          }), acp.version.orEmpty())
+    }
     found.localOpenCode?.takeIf { it.openCode.state == SshDiscoveryState.PRESENT }?.let { local ->
       harnesses += DiscoveredHarness(HarnessProtocolId.OPENCODE_NATIVE, local.openCode.registrationPath,
         "OpenCode（开发版）", local.openCodeStatus(DeviceDiscovery.DEFAULT_TTL_MS))
@@ -585,13 +599,16 @@ class LagoonController private constructor(private val appContext: Context) {
         val kind = when (protocol) {
           HarnessProtocolId.DSH_TYPERT -> ServerKind.DSH
           HarnessProtocolId.OPENCODE_NATIVE -> ServerKind.OPENCODE
-          HarnessProtocolId.CODEX_APP_SERVER, HarnessProtocolId.ANTIGRAVITY_ACP -> ServerKind.CODEX
-          HarnessProtocolId.OPENCODE_ACP -> error("SSH 暂不支持 OpenCode ACP，请使用原生 OpenCode")
+          // ACP harnesses are carried by their own stdio client, not by the native HTTP protocol.
+          HarnessProtocolId.CODEX_APP_SERVER, HarnessProtocolId.ANTIGRAVITY_ACP,
+          HarnessProtocolId.OPENCODE_ACP -> ServerKind.CODEX
         }
         val added = saveSshHost(
           config = config, secrets = sshHostStore.secrets(config.id), harnessKind = kind,
           registrationPath = locator.takeIf { kind == ServerKind.OPENCODE },
-          harnessProtocol = protocol.takeIf { it == HarnessProtocolId.ANTIGRAVITY_ACP },
+          harnessProtocol = protocol.takeIf {
+            it == HarnessProtocolId.ANTIGRAVITY_ACP || it == HarnessProtocolId.OPENCODE_ACP
+          },
           bindingEnabled = true, connect = false
         )
         // Adding is not selecting: mirror the Hub branch (auto-open when nothing is selected) and
@@ -3531,11 +3548,13 @@ class LagoonController private constructor(private val appContext: Context) {
     }
     val savedProfiles = store.readProfiles()
     val desiredProtocol = harnessProtocol ?: MigrationProjection.protocol(harnessKind)
-    require(harnessProtocol == null || harnessProtocol == HarnessProtocolId.ANTIGRAVITY_ACP && harnessKind == ServerKind.CODEX)
+    require(harnessProtocol == null ||
+      harnessProtocol in setOf(HarnessProtocolId.ANTIGRAVITY_ACP, HarnessProtocolId.OPENCODE_ACP) &&
+      harnessKind == ServerKind.CODEX)
     val existing = savedProfiles.firstOrNull {
       it.sshHostId == clean.id && it.protocol == desiredProtocol && it.sshServicePath == registrationPath
     }
-    val fallbackId = if (desiredProtocol == HarnessProtocolId.ANTIGRAVITY_ACP)
+    val fallbackId = if (desiredProtocol in setOf(HarnessProtocolId.ANTIGRAVITY_ACP, HarnessProtocolId.OPENCODE_ACP))
       java.util.UUID.nameUUIDFromBytes("${clean.id}:${desiredProtocol.wire}".toByteArray(Charsets.UTF_8)).toString()
     else clean.id.takeUnless { candidate -> savedProfiles.any { it.id == candidate } }
       ?: java.util.UUID.randomUUID().toString()
