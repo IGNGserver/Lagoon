@@ -61,24 +61,17 @@ private val markdownCache = object : LinkedHashMap<String, Pair<String, List<Mar
 }
 private const val MARKDOWN_CACHE_ROWS = 256
 private val MARKDOWN_KINDS = setOf("text", "process-output", "reasoning-body")
-private fun parsed(key: String, text: String): List<MarkdownBlock> {
-  synchronized(markdownCache) { markdownCache[key]?.takeIf { it.first == text }?.let { return it.second } }
-  // Parse outside the lock: a background warm-up of a long reply must not block a composition lookup.
-  val blocks = MarkdownBlocks.parse(text)
-  synchronized(markdownCache) { markdownCache[key] = text to blocks }
-  return blocks
-}
+private fun parsed(key: String, text: String): List<MarkdownBlock> = TranscriptBlocks.blocksFor(key, text)
 
 /**
- * Parses the newest Markdown rows off the main thread right after a rebuild, so composing them – a
- * streamed reply grows on every rebuild – finds the blocks ready instead of parsing in the frame.
+ * Warms incremental Markdown blocks + CodeHighlight splits off the main thread right after a rebuild.
  */
 private fun warmMarkdown(rows: List<TranscriptRow>) {
   var budget = MARKDOWN_CACHE_ROWS / 2
   for (index in rows.indices.reversed()) {
     val row = rows[index]
     if (row.kind !in MARKDOWN_KINDS || row.detailOf != null) continue
-    parsed(row.key, row.text)
+    TranscriptBlocks.blocksFor(row.key, row.text)
     if (--budget == 0) break
   }
 }
@@ -98,14 +91,18 @@ internal fun Conversation(state: LagoonState, controller: LagoonController, modi
   // The first change builds at once; later ones are conflated to the newest and built at most every
   // ROWS_THROTTLE_MS, so streaming keeps updating the list.
   val source by rememberUpdatedState(Triple(state.messages, working to unverified, revert))
-  val rows by produceState(emptyList<TranscriptRow>()) {
+  val projected by produceState(emptyList<TranscriptRow>() to emptyList<TranscriptBlockItem>()) {
     snapshotFlow { source }.conflate().collect { (messages, activity, boundary) ->
       val (running, unverified) = activity
-      value = withContext(Dispatchers.Default) { TranscriptRows.build(messages, working = running, revertMessageId = boundary, unverified = unverified).also(::warmMarkdown) }
+      value = withContext(Dispatchers.Default) {
+        val builtRows = TranscriptRows.build(messages, working = running, revertMessageId = boundary, unverified = unverified)
+        builtRows to TranscriptBlocks.expandMainRows(builtRows)
+      }
       delay(TranscriptScroll.ROWS_THROTTLE_MS)
     }
   }
-  val mainRows = remember(rows) { rows.filter { it.detailOf == null } }
+  val rows = projected.first
+  val mainRows = projected.second
   val permissions = state.visiblePermissions.filter { it.sessionId == state.sessionId }
   val questions = state.questions.filter { it.sessionId == state.sessionId }
 
@@ -136,10 +133,14 @@ internal fun Conversation(state: LagoonState, controller: LagoonController, modi
   // (0, 0) here, the new row is not laid out yet. Never during the reader's own drag or fling, which the
   // request would cancel.
   val pinned = remember { arrayOfNulls<Any>(1) }
+  val lastNewestKey = remember { arrayOfNulls<Any>(1) }
   SideEffect {
     val signature = newestKey to contentKey
     if (pinned[0] != signature) {
-      if (follow && !list.isScrollInProgress) list.requestScrollToItem(0)
+      if (TranscriptScroll.shouldPinNewest(lastNewestKey[0], newestKey, list.firstVisibleItemIndex, list.firstVisibleItemScrollOffset)) {
+        if (follow && !list.isScrollInProgress) list.requestScrollToItem(0)
+      }
+      lastNewestKey[0] = newestKey
       pinned[0] = signature
     }
   }
@@ -179,11 +180,42 @@ internal fun Conversation(state: LagoonState, controller: LagoonController, modi
       contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 12.dp, bottom = if (task?.active == true) 60.dp else 12.dp),
       verticalArrangement = Arrangement.spacedBy(10.dp)) {
       // Active requests have one owner: the persistent review dock below the transcript.
-      items(mainRows.asReversed(), key = { it.key }, contentType = { it.kind }) { row ->
-        val messageId = row.key.takeIf { row.kind == "user" && it.startsWith("user:") }?.removePrefix("user:")
-        TranscriptRowView(row, onFile, onOpenChild, onActivityGroup, onQueuedAction,
-          onRevert = messageId?.takeIf(state::canRevertMessage)?.let { id -> { onRevertMessage(id) } },
-          onFork = messageId?.takeIf(state::canForkAt)?.let { id -> { onForkMessage(id) } })
+      items(mainRows.asReversed(), key = { it.key }, contentType = { it.contentType }) { item ->
+        when {
+          item.tableBlocks != null -> {
+            val padStart = if (item.row.kind == "reasoning-body") 24.dp else 0.dp
+            Box(Modifier.fillMaxWidth().padding(start = padStart)) {
+              SelectionContainer {
+                MarkdownTableGroupView(item.tableBlocks, subdued = item.subdued)
+              }
+            }
+          }
+          item.block != null -> {
+            val padStart = if (item.row.kind == "reasoning-body") 24.dp else 0.dp
+            Box(Modifier.fillMaxWidth().padding(start = padStart)) {
+              MarkdownBlockView(
+                block = item.block,
+                subdued = item.subdued,
+                selectable = true,
+                precomputedCode = item.codeFragments
+              )
+            }
+          }
+          else -> {
+            val row = item.row
+            val messageId = row.key.takeIf { row.kind == "user" && it.startsWith("user:") }?.removePrefix("user:")
+            TranscriptRowView(
+              row = row,
+              onFile = onFile,
+              onOpenChild = onOpenChild,
+              onActivityGroup = onActivityGroup,
+              onQueuedAction = onQueuedAction,
+              onRevert = messageId?.takeIf(state::canRevertMessage)?.let { id -> { onRevertMessage(id) } },
+              onFork = messageId?.takeIf(state::canForkAt)?.let { id -> { onForkMessage(id) } },
+              precomputedCode = item.codeFragments
+            )
+          }
+        }
       }
       if (rows.isEmpty()) item(key = "empty-hint") { ResourceHint(state.resource("messages"), "会话尚无消息", "在下方输入第一项任务。", controller::reload) }
       // A fixed height, so the spinner appearing never changes the list's extent.
@@ -253,9 +285,7 @@ private fun WorkingIndicator(task: TaskState?, activity: SessionActivity?, onOpe
 
   Row(
     Modifier
-      .clip(miuixSquircleShape(16.dp))
-      .background(HyperTheme.colors.cardElevated)
-      .border(0.6.dp, HyperTheme.colors.cardBorder, miuixSquircleShape(16.dp))
+      .hyperSurface(miuixSquircleShape(16.dp), HyperTheme.colors.cardElevated, 0.6.dp, HyperTheme.colors.cardBorder)
       .then(if (activityParts.isNotEmpty()) Modifier.heightIn(min = HYPER_TOUCH_TARGET_DP.dp).hyperPress(scaleDown = 0.96f, onClick = onOpenActivity) else Modifier)
       .padding(horizontal = 14.dp, vertical = 7.dp),
     verticalAlignment = Alignment.CenterVertically
@@ -281,7 +311,7 @@ private fun elapsedText(seconds: Long): String = when {
 
 @Composable
 private fun TranscriptRowView(row: TranscriptRow, onFile: (String) -> Unit, onOpenChild: (String) -> Unit, onActivityGroup: (TranscriptRow) -> Unit, onQueuedAction: (TranscriptRow) -> Unit,
-  onRevert: (() -> Unit)? = null, onFork: (() -> Unit)? = null) {
+  onRevert: (() -> Unit)? = null, onFork: (() -> Unit)? = null, precomputedCode: List<CodeFragment>? = null) {
   when (row.kind) {
     "time" -> Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
       Text(row.text, style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
@@ -335,7 +365,7 @@ private fun TranscriptRowView(row: TranscriptRow, onFile: (String) -> Unit, onOp
     }
     "tool-body" -> Column(Modifier.fillMaxWidth().padding(start = 24.dp, top = 4.dp)) {
       if (row.title.isNotBlank()) Text(row.title, modifier = Modifier.padding(bottom = 4.dp), style = MiuixTheme.textStyles.footnote2.copy(color = MiuixTheme.colorScheme.onSurfaceVariantSummary))
-      CodePanel(row.text)
+      CodePanel(row.text, precomputedFragments = precomputedCode)
     }
     "diff-file" -> Row(Modifier.fillMaxWidth().padding(start = 24.dp, top = 6.dp), verticalAlignment = Alignment.CenterVertically) {
       Text(row.title, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis,
@@ -359,8 +389,7 @@ private fun UserMessageRow(row: TranscriptRow, onFile: (String) -> Unit, onQueue
         Column(
           Modifier
             .widthIn(max = bubbleMax)
-            .background(HyperTheme.colors.userBubble, bubbleShape)
-            .border(0.6.dp, HyperTheme.colors.primary.copy(alpha = 0.18f), bubbleShape)
+            .hyperSurface(bubbleShape, HyperTheme.colors.userBubble, 0.6.dp, HyperTheme.colors.primary.copy(alpha = 0.18f))
             .padding(horizontal = 16.dp, vertical = 12.dp)
         ) {
           SelectionContainer {
@@ -397,9 +426,7 @@ private fun GroupRow(row: TranscriptRow, onClick: () -> Unit) {
   Row(
     Modifier
       .fillMaxWidth()
-      .clip(shape)
-      .background(HyperTheme.colors.cardElevated, shape)
-      .border(0.6.dp, HyperTheme.colors.cardBorder, shape)
+      .hyperSurface(shape, HyperTheme.colors.cardElevated, 0.6.dp, HyperTheme.colors.cardBorder)
       .heightIn(min = 48.dp)
       .hyperPress(onClick = onClick)
       .padding(horizontal = 14.dp, vertical = 11.dp),
@@ -426,9 +453,7 @@ private fun QoderSummaryRow(row: TranscriptRow, onClick: () -> Unit) {
   Row(
     Modifier
       .fillMaxWidth()
-      .clip(shape)
-      .background(HyperTheme.colors.cardElevated, shape)
-      .border(0.6.dp, if (error) HyperTheme.colors.error.copy(alpha = 0.35f) else HyperTheme.colors.cardBorder, shape)
+      .hyperSurface(shape, HyperTheme.colors.cardElevated, 0.6.dp, if (error) HyperTheme.colors.error.copy(alpha = 0.35f) else HyperTheme.colors.cardBorder)
       .heightIn(min = 48.dp)
       .hyperPress(onClick = onClick)
       .padding(horizontal = 14.dp, vertical = 12.dp),
@@ -658,12 +683,18 @@ private fun rememberCodeColors(): CodeColors = CodeColors(
 )
 
 @Composable
-private fun CodePanel(text: String, highlight: Boolean = true, background: Color = MiuixTheme.colorScheme.secondaryContainer) {
+private fun CodePanel(
+  text: String,
+  highlight: Boolean = true,
+  background: Color = MiuixTheme.colorScheme.secondaryContainer,
+  precomputedFragments: List<CodeFragment>? = null
+) {
   val colors = rememberCodeColors()
-  val annotated = remember(text, colors, highlight) {
+  val annotated = remember(text, colors, highlight, precomputedFragments) {
     buildAnnotatedString {
       if (!highlight) { append(text); return@buildAnnotatedString }
-      CodeHighlight.split(text).forEach { fragment ->
+      val fragments = precomputedFragments ?: CodeHighlight.split(text)
+      fragments.forEach { fragment ->
         val color = when (fragment.token) {
           CodeToken.PLAIN -> colors.plain
           CodeToken.HEADER -> colors.header
@@ -676,7 +707,7 @@ private fun CodePanel(text: String, highlight: Boolean = true, background: Color
       }
     }
   }
-  Column(Modifier.fillMaxWidth().background(HyperTheme.colors.codeSurface, miuixSquircleShape(12.dp)).padding(12.dp)) {
+  Column(Modifier.fillMaxWidth().hyperSurface(miuixSquircleShape(12.dp), HyperTheme.colors.codeSurface).padding(12.dp)) {
     SelectionContainer {
       BasicText(annotated, Modifier.horizontalScroll(rememberScrollState()),
         style = MiuixTheme.textStyles.body2.copy(fontFamily = FontFamily.Monospace, fontSize = 13.sp, lineHeight = 20.sp, color = HyperTheme.colors.textPrimary))
@@ -734,11 +765,46 @@ private fun annotated(spans: List<MarkdownSpan>): AnnotatedString {
 }
 
 @Composable
-internal fun MarkdownBlockListView(blocks: List<MarkdownBlock>, subdued: Boolean = false) {
+internal fun MarkdownTableGroupView(tableBlocks: List<MarkdownBlock>, subdued: Boolean = false) {
   val base = MiuixTheme.textStyles.body1.copy(
     color = if (subdued) HyperTheme.colors.textSecondary else HyperTheme.colors.textPrimary,
     lineHeight = 25.sp, fontSize = if (subdued) 14.sp else 15.5.sp
   )
+  val tableScroll = rememberScrollState()
+  val tableShape = miuixSquircleShape(12.dp)
+  Column(
+    Modifier
+      .fillMaxWidth()
+      .hyperSurface(tableShape, HyperTheme.colors.container, 0.6.dp, HyperTheme.colors.codeBorder, clipContent = true)
+      .horizontalScroll(tableScroll)
+  ) {
+    tableBlocks.forEachIndexed { rowIndex, rowBlock ->
+      val isHead = rowBlock.kind == "table-head"
+      if (rowIndex > 0) HorizontalDivider(color = HyperTheme.colors.divider)
+      Row(
+        Modifier
+          .background(if (isHead) HyperTheme.colors.containerHigh.copy(alpha = 0.65f) else Color.Transparent)
+          .padding(horizontal = 12.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically
+      ) {
+        rowBlock.cells.forEach { cell ->
+          BasicText(
+            annotated(cell),
+            Modifier.width(168.dp).padding(end = 12.dp),
+            style = base.copy(
+              fontSize = 14.sp,
+              lineHeight = 20.sp,
+              fontWeight = if (isHead) FontWeight.SemiBold else FontWeight.Normal
+            )
+          )
+        }
+      }
+    }
+  }
+}
+
+@Composable
+internal fun MarkdownBlockListView(blocks: List<MarkdownBlock>, subdued: Boolean = false) {
   var index = 0
   while (index < blocks.size) {
     val block = blocks[index]
@@ -748,39 +814,7 @@ internal fun MarkdownBlockListView(blocks: List<MarkdownBlock>, subdued: Boolean
         tableBlocks += blocks[index]
         index++
       }
-      val tableScroll = rememberScrollState()
-      val tableShape = miuixSquircleShape(12.dp)
-      Column(
-        Modifier
-          .fillMaxWidth()
-          .clip(tableShape)
-          .background(HyperTheme.colors.container, tableShape)
-          .border(0.6.dp, HyperTheme.colors.codeBorder, tableShape)
-          .horizontalScroll(tableScroll)
-      ) {
-        tableBlocks.forEachIndexed { rowIndex, rowBlock ->
-          val isHead = rowBlock.kind == "table-head"
-          if (rowIndex > 0) HorizontalDivider(color = HyperTheme.colors.divider)
-          Row(
-            Modifier
-              .background(if (isHead) HyperTheme.colors.containerHigh.copy(alpha = 0.65f) else Color.Transparent)
-              .padding(horizontal = 12.dp, vertical = 8.dp),
-            verticalAlignment = Alignment.CenterVertically
-          ) {
-            rowBlock.cells.forEach { cell ->
-              BasicText(
-                annotated(cell),
-                Modifier.width(168.dp).padding(end = 12.dp),
-                style = base.copy(
-                  fontSize = 14.sp,
-                  lineHeight = 20.sp,
-                  fontWeight = if (isHead) FontWeight.SemiBold else FontWeight.Normal
-                )
-              )
-            }
-          }
-        }
-      }
+      MarkdownTableGroupView(tableBlocks, subdued = subdued)
     } else {
       MarkdownBlockView(block, subdued = subdued, selectable = false)
       index++
@@ -789,7 +823,12 @@ internal fun MarkdownBlockListView(blocks: List<MarkdownBlock>, subdued: Boolean
 }
 
 @Composable
-internal fun MarkdownBlockView(block: MarkdownBlock, subdued: Boolean = false, selectable: Boolean = true) {
+internal fun MarkdownBlockView(
+  block: MarkdownBlock,
+  subdued: Boolean = false,
+  selectable: Boolean = true,
+  precomputedCode: List<CodeFragment>? = null
+) {
   // Nested SelectionContainers would split selection per paragraph; callers wrapping a whole reply pass false.
   val select: @Composable (@Composable () -> Unit) -> Unit = { inner -> if (selectable) SelectionContainer { inner() } else inner() }
   val base = MiuixTheme.textStyles.body1.copy(
@@ -806,14 +845,13 @@ internal fun MarkdownBlockView(block: MarkdownBlock, subdued: Boolean = false, s
       "code" -> Column(
         Modifier
           .fillMaxWidth()
-          .background(HyperTheme.colors.codeSurface, miuixSquircleShape(14.dp))
-          .border(0.6.dp, HyperTheme.colors.codeBorder, miuixSquircleShape(14.dp))
+          .hyperSurface(miuixSquircleShape(14.dp), HyperTheme.colors.codeSurface, 0.6.dp, HyperTheme.colors.codeBorder)
       ) {
         if (block.prefix.isNotBlank() || block.copyText != null) {
           Row(
             Modifier
               .fillMaxWidth()
-              .background(HyperTheme.colors.container.copy(alpha = 0.5f), miuixTopSquircleShape(14.dp))
+              .hyperSurface(miuixTopSquircleShape(14.dp), HyperTheme.colors.container.copy(alpha = 0.5f))
               .padding(horizontal = 12.dp, vertical = 6.dp),
             verticalAlignment = Alignment.CenterVertically
           ) {
@@ -835,7 +873,7 @@ internal fun MarkdownBlockView(block: MarkdownBlock, subdued: Boolean = false, s
           }
           HorizontalDivider(color = HyperTheme.colors.codeBorder)
         }
-        CodePanel(block.text)
+        CodePanel(block.text, precomputedFragments = precomputedCode)
       }
       "table-head", "table-row" -> Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).background(HyperTheme.colors.container).padding(8.dp)) {
         block.cells.forEach { cell -> select { BasicText(annotated(cell), Modifier.width(180.dp).padding(end = 12.dp), style = base.copy(fontWeight = if (block.kind == "table-head") FontWeight.SemiBold else FontWeight.Normal)) } }

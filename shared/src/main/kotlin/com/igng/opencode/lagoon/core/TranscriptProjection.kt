@@ -86,7 +86,12 @@ internal suspend fun <C : Any> widenOlderToTurn(messages: List<Message>, next: C
 }
 
 object TranscriptProjection {
-  data class Result(val messages: List<Message>, val reconcile: Boolean = false)
+  data class Result(
+    val messages: List<Message>,
+    val reconcile: Boolean = false,
+    /** When non-null, only this single message id could have transitioned from provisional to live. */
+    val changedMessageId: String? = null
+  )
 
   /** Event ids become message ids for records projected from that event (`messageIDFromEvent`). */
   fun messageId(event: ServerEvent): String = event.id.replace(Regex("^evt_"), "msg_")
@@ -103,17 +108,23 @@ object TranscriptProjection {
     val p = event.properties
     val at = event.created.takeIf { it > 0 } ?: System.currentTimeMillis()
     val assistantId = p.str("assistantMessageID")
-    fun result(next: List<Message>) = Result(next)
+    fun result(next: List<Message>, changedId: String? = null) = Result(next, changedMessageId = changedId)
     fun editAssistant(change: (Message) -> Message): Result {
-      val index = messages.indexOfFirst { it.id == assistantId && it.role == "assistant" }
+      val index = messages.indexOfLast { it.id == assistantId && it.role == "assistant" }
       if (index < 0) return Result(messages)
-      return result(messages.toMutableList().also { it[index] = change(it[index]) })
+      val previous = messages[index]
+      val updated = change(previous)
+      if (updated === previous) return Result(messages)
+      return result(messages.toMutableList().also { it[index] = updated }, changedId = assistantId)
     }
     /** Like [editAssistant], but asks for an authoritative re-read when the target message was never loaded. */
     fun editAssistantOrReconcile(change: (Message) -> Message): Result {
-      val index = messages.indexOfFirst { it.id == assistantId && it.role == "assistant" }
+      val index = messages.indexOfLast { it.id == assistantId && it.role == "assistant" }
       if (index < 0) return Result(messages, reconcile = true)
-      return result(messages.toMutableList().also { it[index] = change(it[index]) })
+      val previous = messages[index]
+      val updated = change(previous)
+      if (updated === previous) return Result(messages)
+      return result(messages.toMutableList().also { it[index] = updated }, changedId = assistantId)
     }
     fun editLast(kind: String, change: (MessagePart) -> MessagePart) = editAssistant { message ->
       val index = message.parts.indexOfLast { it.type == kind && (kind != "reasoning" || it.status == "running") }
@@ -126,7 +137,7 @@ object TranscriptProjection {
         else message.copy(parts = message.parts + change(MessagePart(p.str("id"), "tool", tool = p.str("name"), status = "running")))
       } else message.copy(parts = message.parts.toMutableList().also { it[index] = change(it[index]) })
     }
-    fun insert(message: Message?): Result = if (message == null || messages.any { it.id == message.id }) Result(messages) else result(messages + message)
+    fun insert(message: Message?): Result = if (message == null || messages.any { it.id == message.id }) Result(messages) else result(messages + message, changedId = message.id)
     fun insertUser(message: Message?): Result {
       if (message == null) return Result(messages)
       val index = messages.indexOfFirst { current ->

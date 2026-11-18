@@ -41,10 +41,14 @@ internal class ConversationStorePool(private val capacity: Int = 12) {
       size > capacity
   }
 
+  @Volatile private var lastRecordedState: LagoonState? = null
+
   private fun key(serverId: String, sessionId: String): String = "$serverId\u0000$sessionId"
 
   @Synchronized
   fun record(state: LagoonState) {
+    if (lastRecordedState === state) return
+    lastRecordedState = state
     val serverId = state.serverId ?: return
     val sessionId = state.sessionId ?: return
     val session = state.session ?: return
@@ -96,7 +100,7 @@ internal class ConversationStorePool(private val capacity: Int = 12) {
   ): LagoonState {
     if (serverId.isNullOrBlank() || sessionId.isNullOrBlank()) return base
     if (base.serverId == serverId && base.sessionId == sessionId && base.session != null) {
-      record(base)
+      if (lastRecordedState !== base) record(base)
       return base
     }
     // 跨服务器路由转场或手势返回时，先用目标服务器的快照替换服务器级状态，防止把另一台服务器的任务/权限/目录混入当前页。

@@ -407,7 +407,9 @@ fun SettingsScreen(
   onNotifications: () -> Unit,
   onManageDevices: () -> Unit = {},
   onBack: () -> Unit,
-  onMessage: (String, MiuixToastType) -> Unit
+  onMessage: (String, MiuixToastType) -> Unit,
+  highRefreshPolicy: HighRefreshPolicy = HighRefreshPolicy.MAX,
+  onHighRefreshPolicy: (HighRefreshPolicy) -> Unit = {}
 ) {
   val context = androidx.compose.ui.platform.LocalContext.current
   val updater = remember(context) { AppUpdater.get(context) }
@@ -531,6 +533,14 @@ fun SettingsScreen(
           summary = "拖动返回手势时轻微预览上一级页面",
           checked = previewBack,
           onCheckedChange = onPreviewBack
+        )
+        HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
+        HyperDropdownRow(
+          title = "高刷新率策略",
+          summary = "在高刷屏（120Hz / 144Hz）上请求当前分辨率的最高刷新率档位",
+          items = HighRefreshPolicy.entries.map { it.label },
+          selectedIndex = HighRefreshPolicy.entries.indexOf(highRefreshPolicy),
+          onSelectedIndexChange = { onHighRefreshPolicy(HighRefreshPolicy.entries[it]) }
         )
         HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
         HyperDropdownRow(

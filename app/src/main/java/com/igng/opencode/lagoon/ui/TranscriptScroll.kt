@@ -33,4 +33,18 @@ internal object TranscriptScroll {
    */
   fun shouldLoadOlder(nearOldest: Boolean, readable: Boolean, loading: Boolean, cursor: String?, attemptedCursor: String?, hasRows: Boolean): Boolean =
     nearOldest && readable && !loading && hasRows && cursor != null && cursor != attemptedCursor
+
+  /**
+   * Whether a content update while `follow == true` actually requires `requestScrollToItem(0)`.
+   * In a `reverseLayout = true` list already sitting at `(0, 0)`, growing the existing bottom item's
+   * text keeps its bottom edge anchored automatically; calling `requestScrollToItem(0)` on every
+   * streamed token forces an unconditional `forceRemeasure()` pass on the UI thread. Only request a
+   * jump when a new bottom item (`newestKey`) is inserted or when the viewport is not at `(0, 0)`.
+   */
+  fun shouldPinNewest(
+    previousNewestKey: Any?,
+    newestKey: Any?,
+    firstVisibleIndex: Int,
+    firstVisibleOffset: Int
+  ): Boolean = newestKey != previousNewestKey || firstVisibleIndex != 0 || firstVisibleOffset > 0
 }

@@ -98,13 +98,28 @@ object TranscriptRows {
     return sb.toString()
   }
 
+  private fun expandedForTurn(turn: Turn, expanded: Set<String>): Set<String> {
+    if (expanded.isEmpty()) return emptySet()
+    val ids = HashSet<String>(turn.entries.size + 2)
+    turn.user?.id?.let(ids::add)
+    turn.shell?.id?.let(ids::add)
+    turn.entries.forEach { ids.add(it.id) }
+    val matched = expanded.filterTo(HashSet()) { key ->
+      val body = key.substringAfter(':')
+      val msgId = body.substringBefore('/').substringBefore(':')
+      msgId in ids
+    }
+    return matched
+  }
+
   private fun cachedTurnRows(turn: Turn, turnKey: String, expanded: Set<String>, working: Boolean, unverified: Boolean): List<TranscriptRow> {
-    if (expanded.isNotEmpty()) return turnRows(turn, turnKey, expanded, working, unverified)
+    val localExpanded = expandedForTurn(turn, expanded)
+    if (localExpanded.isNotEmpty()) return turnRows(turn, turnKey, localExpanded, working, unverified)
     val cacheKey = turnCacheKey(turn, turnKey, working, unverified)
     synchronized(turnRowCache) {
       turnRowCache[cacheKey]?.let { return it }
     }
-    val built = turnRows(turn, turnKey, expanded, working, unverified)
+    val built = turnRows(turn, turnKey, emptySet(), working, unverified)
     synchronized(turnRowCache) {
       turnRowCache[cacheKey] = built
     }
@@ -195,8 +210,15 @@ object TranscriptRows {
   fun details(messages: List<Message>, key: String, working: Boolean = false, revertMessageId: String? = null, unverified: Boolean = false): List<TranscriptRow> {
     if (key.isBlank()) return emptyList()
     val first = build(messages, setOf(key), working, revertMessageId, unverified)
-    val children = first.filter { it.detailOf == key }.map { it.key }.toSet()
-    val rows = if (children.isEmpty()) first else build(messages, setOf(key) + children, working, revertMessageId, unverified)
+    val children = first.filter { it.detailOf == key && (it.kind == "tool" || it.kind == "tool-group" || it.kind == "diff-summary") }
+      .mapTo(HashSet()) { it.key }
+    // Activity groups already emit tool-body and reasoning-body rows when `key in expanded`;
+    // only run a second pass if a nested expandable container actually needs expansion.
+    val needSecondPass = children.any { childKey ->
+      first.none { it.bodyOf == childKey || it.detailOf == childKey } &&
+        (childKey.startsWith("tool:") || childKey.startsWith("batch:") || childKey.startsWith("activities:") || childKey.startsWith("diff:"))
+    }
+    val rows = if (!needSecondPass) first else build(messages, setOf(key) + children, working, revertMessageId, unverified)
     return rows.filter { it.detailOf == key }
   }
 

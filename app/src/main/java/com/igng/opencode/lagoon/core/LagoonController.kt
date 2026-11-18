@@ -1,6 +1,7 @@
 package com.igng.opencode.lagoon.core
 
 import android.content.Context
+import androidx.compose.runtime.Stable
 import com.igng.opencode.lagoon.core.ssh.AndroidKeystoreSshSigner
 import com.igng.opencode.lagoon.core.ssh.JschSshTransportFactory
 import com.igng.opencode.lagoon.core.ssh.SshHostManager
@@ -31,6 +32,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
 
+@Stable
 class LagoonController private constructor(private val appContext: Context) {
   companion object {
     private val TERMINAL_PHASES = setOf(TaskPhase.COMPLETED, TaskPhase.FAILED)
@@ -73,6 +75,13 @@ class LagoonController private constructor(private val appContext: Context) {
     private const val MAX_SWEEP_DIRECTORIES = 12
     /** 一次控制读最多检查多少个待处理目录的表单。 */
     private const val MAX_FORM_DIRECTORIES = 8
+    private val STREAMING_TRANSCRIPT_EVENTS = setOf(
+      "session.text.started", "session.text.delta", "session.text.ended",
+      "session.reasoning.started", "session.reasoning.delta", "session.reasoning.ended",
+      "session.tool.input.started", "session.tool.input.delta", "session.tool.input.ended",
+      "session.tool.called", "session.tool.progress", "session.tool.success", "session.tool.failed",
+      "session.dsh.assistant"
+    )
   }
   private fun scoped(serverId: String, session: Session): Session = session.copy(serverId = serverId)
 
@@ -1605,12 +1614,18 @@ class LagoonController private constructor(private val appContext: Context) {
   /** Verified on-device copy of OpenCode transcripts; its database opens on first use, off the main thread. */
   private val transcripts: TranscriptStore? = TranscriptStore.get(appContext)
   private val transcriptSync = transcripts?.let { TranscriptSync(it, storeDispatcher) }
-  private val notifications = TaskNotifications(appContext)
+  private val notifications = TaskNotifications(appContext, store)
   private val attachmentImporter = AttachmentImporter(appContext)
-  private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+  // Cooperative Dispatchers.Main yields to Choreographer VSYNC between posted blocks so bursts never starve 144Hz frames.
+  private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
   // Writing operations that must survive the UI leaving the foreground (permission replies, aborts)
   // run here rather than in a composer-scoped coroutine.
-  private val operationScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+  private val operationScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+  // Background ordered reducer/polling scope so AllServersOverview HTTP/JSON/Keystore/SSE framing runs off the UI thread.
+  private val overviewScope = CoroutineScope(SupervisorJob() + Dispatchers.Default.limitedParallelism(1))
+  private val liveEventChannel = kotlinx.coroutines.channels.Channel<Pair<String, ServerEvent>>(
+    kotlinx.coroutines.channels.Channel.UNLIMITED
+  )
   private val sshKeyStore = SshKeyStore(appContext)
   private val hardwareSshSigner = AndroidKeystoreSshSigner()
   private val sshHostStore = SshHostStore(appContext)
@@ -1664,38 +1679,65 @@ class LagoonController private constructor(private val appContext: Context) {
     }
   )
   val state: StateFlow<LagoonState> = mutable
-  private val allSnapshots = mutableMapOf<String, ServerOverviewSnapshot>()
+  private val allSnapshots: MutableMap<String, ServerOverviewSnapshot> = java.util.concurrent.ConcurrentHashMap()
   /** Shared per-directory read health; a dead directory must not degrade every server's state. */
   private val directoryHealth = DirectoryHealth()
-  private val allOverview = AllServersOverview(store, cache, scope, ::acceptAllSnapshot, { state.value.serverId },
-    { id, event ->
-      if (id == state.value.serverId) handleEvent(event)
-      else if (event.type == "session.deleted") forgetDeletedSession(id, event.properties.sessionEventId(event.type))
-    },
+  private val allOverview = AllServersOverview(store, cache, overviewScope, ::acceptAllSnapshot, { state.value.serverId },
+    { id, event -> liveEventChannel.trySend(id to event) },
     ::handleOverviewConnected,
     directoryHealth, ::acceptSnapshotRemoved, remoteBackendFactory,
     sshClientFactory = { profile, _ -> sshHostManager.client(profile) },
     selectedSession = { state.value.sessionId })
+  init {
+    overviewScope.launch {
+      val rawBatch = ArrayList<Pair<String, ServerEvent>>(32)
+      while (true) {
+        val first = liveEventChannel.receive()
+        rawBatch.clear()
+        rawBatch += first
+        while (true) {
+          val more = liveEventChannel.tryReceive().getOrNull() ?: break
+          rawBatch += more
+        }
+        // Coalesce high-rate delta bursts within a 5ms sub-frame window (< 6.94ms 144Hz budget);
+        // discrete control/tool/lifecycle events dispatch immediately with zero added latency.
+        if (rawBatch.last().second.type in StreamingEventCoalescer.DELTA_TYPES) {
+          delay(5)
+          while (true) {
+            val more = liveEventChannel.tryReceive().getOrNull() ?: break
+            rawBatch += more
+          }
+        }
+        val coalesced = StreamingEventCoalescer.coalesce(rawBatch)
+        withContext(scope.coroutineContext) {
+          for ((serverId, ev) in coalesced) {
+            if (serverId == state.value.serverId) handleEvent(ev)
+            else if (ev.type == "session.deleted") forgetDeletedSession(serverId, ev.properties.sessionEventId(ev.type))
+          }
+        }
+      }
+    }
+  }
   @Volatile private var api: HarnessClient? = null
   private val codexSelectionCoordinator = CodexSelectionCoordinator()
   private fun handleOverviewConnected(id: String) {
-    if (id == state.value.serverId) trace(generation, ConnectMilestone.STREAM)
-    if (id != state.value.serverId || api == null) return
-    val replacement = if (state.value.server?.protocol == HarnessProtocolId.CODEX_APP_SERVER)
-      runCatching { allOverview.client(id) }.getOrNull() else null
-    if (replacement == null || replacement === api) {
-      if (connecting?.isActive != true) reconcileAfterStream()
-      return
-    }
-    // An old in-flight read must not publish into the replacement's conversation generation.
-    connecting?.cancel()
-    stream?.cancel()
-    generation += 1
-    api = replacement
-    val token = generation
-    val session = state.value.session
-    val revision = selectionRevision
     scope.launch {
+      if (id == state.value.serverId) trace(generation, ConnectMilestone.STREAM)
+      if (id != state.value.serverId || api == null) return@launch
+      val replacement = if (state.value.server?.protocol == HarnessProtocolId.CODEX_APP_SERVER)
+        runCatching { allOverview.client(id) }.getOrNull() else null
+      if (replacement == null || replacement === api) {
+        if (connecting?.isActive != true) reconcileAfterStream()
+        return@launch
+      }
+      // An old in-flight read must not publish into the replacement's conversation generation.
+      connecting?.cancel()
+      stream?.cancel()
+      generation += 1
+      api = replacement
+      val token = generation
+      val session = state.value.session
+      val revision = selectionRevision
       try {
         // Reattach before the authoritative baseline read so events during the read are retained.
         codexSelectionCoordinator.apply({ token == generation && revision == selectionRevision &&
@@ -1906,7 +1948,14 @@ class LagoonController private constructor(private val appContext: Context) {
     refreshMode = store.refreshMode()
     // Single publisher for the server-wide island summary, so the system notification never drifts
     // from the in-app island: both read the same derived `summary` on every state emission.
+    var lastSummaryState: LagoonState? = null
     scope.launch { state.collect { state ->
+      val prev = lastSummaryState
+      if (prev != null && canReuseGlobalSummary(prev, state)) {
+        lastSummaryState = state
+        return@collect
+      }
+      lastSummaryState = state
       // Dedupe on the content the system actually renders, not on the transient task detail: a running
       // task changes detail on every tool step, and re-posting the same island each time makes some
       // systems replay their expand animation on the AOD island.
@@ -1919,6 +1968,24 @@ class LagoonController private constructor(private val appContext: Context) {
     observeNetwork()
     scheduleBackgroundSync()
   }
+  private fun canReuseGlobalSummary(prev: LagoonState, next: LagoonState): Boolean {
+    if (prev.profiles !== next.profiles || prev.allServerSnapshots !== next.allServerSnapshots) return false
+    if (prev.serverId != next.serverId || prev.connected != next.connected || prev.loading != next.loading) return false
+    if (prev.error != next.error || prev.lastContactAt != next.lastContactAt) return false
+    if (prev.summary != next.summary || prev.permissionPolicy != next.permissionPolicy) return false
+    if (prev.notices !== next.notices || prev.permissions !== next.permissions || prev.autoApprovalFailures !== next.autoApprovalFailures) return false
+    if (prev.backgroundRunning !== next.backgroundRunning || prev.shells !== next.shells) return false
+    if (prev.sessions !== next.sessions || prev.knownParents !== next.knownParents) return false
+    if (prev.tasks === next.tasks) return true
+    if (prev.tasks.size != next.tasks.size) return false
+    for ((id, oldTask) in prev.tasks) {
+      val newTask = next.tasks[id] ?: return false
+      if (oldTask === newTask) continue
+      if (oldTask.copy(activeAt = newTask.activeAt) != newTask) return false
+    }
+    return true
+  }
+
   private fun scheduleBackgroundSync() {
     attempt { BackgroundSyncWorker.schedule(appContext, store.profiles().any { it.effectiveEnabled }) }
       .onFailure { Diagnostics.warn("BackgroundSync", "无法安排后台定时刷新", it) }
@@ -4544,6 +4611,7 @@ class LagoonController private constructor(private val appContext: Context) {
     val sessionId = props.sessionEventId(event.type)
     val known = mutable.value.sessions.firstOrNull { it.id == sessionId }
     val directory = known?.directory ?: event.directory.ifBlank { props.sessionInfo().toSession().directory }
+    var deferredActiveAtTask: TaskState? = null
     if (sessionId.isNotBlank()) {
       val before = mutable.value.tasks[sessionId]
       // 事件会话自身子树里是否还有会唤醒它的后台工作（后台 shell / 仍在执行的子代理）。
@@ -4560,7 +4628,22 @@ class LagoonController private constructor(private val appContext: Context) {
           activeAt = before?.activeAt ?: -1L, pendingInput = before?.pendingInput == true)
         val next = after
         val enteringTerminal = next.phase in TERMINAL_PHASES && before?.phase !in TERMINAL_PHASES
-        updateState { current -> withSummary(current.copy(tasks = current.tasks + (sessionId to next))) }
+        val activeAtOnly = !enteringTerminal && before != null && next.copy(activeAt = before.activeAt) == before
+        val canMergeWithTranscript = activeAtOnly &&
+          sessionId == mutable.value.sessionId &&
+          event.type in STREAMING_TRANSCRIPT_EVENTS &&
+          BackgroundWork.backgroundSubagentId(event.type, props) == null &&
+          BackgroundWork.completedSubagentId(event.type, props) == null
+        if (canMergeWithTranscript) {
+          if (next != before) deferredActiveAtTask = next
+        } else if (activeAtOnly) {
+          if (next != before) {
+            mutable.value.serverId?.let { server -> persistTask(server, next, mutable.value.parents[sessionId]) }
+            updateState { current -> current.copy(tasks = current.tasks + (sessionId to next)) }
+          }
+        } else {
+          updateState { current -> withSummary(current.copy(tasks = current.tasks + (sessionId to next))) }
+        }
         if (enteringTerminal && sessionId == state.value.sessionId && messageRefresh?.isActive != true) {
           state.value.session?.let { selected -> val token = generation; messageRefresh = scope.launch { delay(refreshMode.messageDebounceMs); loadSession(selected, ancillary = false, token = token) } }
         }
@@ -4730,11 +4813,40 @@ class LagoonController private constructor(private val appContext: Context) {
       }
       val projected = TranscriptProjection.apply(mutable.value.messages, event)
       if (projected != null && projected.messages !== mutable.value.messages) {
-        val before = mutable.value.messages.associateBy { it.id }
-        val liveIds = projected.messages.filter { before[it.id] != it }.map { it.id }.toSet()
-        updateState { it.copy(messages = projected.messages, provisionalMessageIds = it.provisionalMessageIds - liveIds,
-          resources = it.resources + ("messages" to ResourceStatus(
-            if (transcriptKey in incompleteTranscripts) ResourceState.STALE else ResourceState.READY))) }
+        val currentProvisional = mutable.value.provisionalMessageIds
+        val liveIds: Set<String> = when {
+          currentProvisional.isEmpty() -> emptySet()
+          projected.changedMessageId != null ->
+            if (projected.changedMessageId in currentProvisional) setOf(projected.changedMessageId) else emptySet()
+          else -> {
+            val before = mutable.value.messages.associateBy { it.id }
+            projected.messages.filter { before[it.id] != it }.mapTo(HashSet()) { it.id }
+          }
+        }
+        val mergedTask = deferredActiveAtTask
+        deferredActiveAtTask = null
+        if (mergedTask != null) {
+          mutable.value.serverId?.let { server -> persistTask(server, mergedTask, mutable.value.parents[sessionId]) }
+        }
+        val readyState = if (transcriptKey in incompleteTranscripts) ResourceState.STALE else ResourceState.READY
+        updateState { current ->
+          val nextTasks = if (mergedTask != null) current.tasks + (sessionId to mergedTask) else current.tasks
+          val nextProvisional = if (liveIds.isEmpty()) current.provisionalMessageIds else current.provisionalMessageIds - liveIds
+          val prevMsgRes = current.resources["messages"]
+          val nextResources = if (prevMsgRes?.state == readyState && prevMsgRes.error == null) current.resources
+            else current.resources + ("messages" to ResourceStatus(readyState))
+          current.copy(
+            tasks = nextTasks,
+            messages = projected.messages,
+            provisionalMessageIds = nextProvisional,
+            resources = nextResources
+          )
+        }
+      }
+      deferredActiveAtTask?.let { pendingTask ->
+        deferredActiveAtTask = null
+        mutable.value.serverId?.let { server -> persistTask(server, pendingTask, mutable.value.parents[sessionId]) }
+        updateState { current -> current.copy(tasks = current.tasks + (sessionId to pendingTask)) }
       }
        if (projected?.reconcile == true && messageRefresh?.isActive != true) {
          mutable.value.session?.let { session ->

@@ -12,6 +12,7 @@ import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.runtime.*
@@ -365,6 +366,7 @@ private fun SessionList(
     }
   }
   val muted = HyperTheme.colors.textSecondary
+  val profilesById = remember(state.profiles) { state.profiles.associateBy { it.id } }
 
   fun refreshFromTop() {
     if (refreshing) return
@@ -415,46 +417,50 @@ private fun SessionList(
         item(key = "section:${section.key}", contentType = "section") {
           SectionHeader(section.title, section.sessions.size, collapsed) { controller.toggleSection(section.key) }
         }
-        if (!collapsed) item(key = "sessions:${section.key}", contentType = "sessionGroup") {
-          HyperCard(
-            Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 3.dp),
-            insidePadding = PaddingValues(vertical = 4.dp)
-          ) {
-            section.sessions.forEachIndexed { index, session ->
-              if (index > 0) HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
-          val pinned = session.id in state.pinned
-          val background = if (state.multiServerView) session.serverId?.let { id -> state.allServerSnapshots[id]?.backgroundRunning?.contains(session.id) } == true
-            else state.backgroundRunning.contains(session.id)
-          val workspace = workspaceLabels[session.key]
-          val showWorkspace = showWorkspaceLabel(section.key, state.scopeProjectId, state.scopeWorkspaceKey, workspace?.projectKey)
-          val liveTask = if (state.multiServerView) {
-            session.serverId?.let { id -> state.allServerSnapshots[id]?.tasks?.get(session.id) }
-          } else active[session.id]
-          Box(Modifier.animateItem()) {
-            HomeSessionRow(
-              session = session,
-              status = statuses[session.key] ?: SessionStatus.NONE,
-              unseen = session.key in unseen,
-              pinned = pinned,
-              background = background,
-              liveDetail = liveTask?.detail?.takeIf { it.isNotBlank() && it != TaskState.RUNNING_DETAIL },
-              relativeTime = formatRelative(session.updated, now),
-              serverName = if (state.multiServerView) session.serverId?.let { id -> state.profiles.firstOrNull { it.id == id }?.name } else null,
-              harness = if (state.multiServerView) session.serverId?.let { id -> state.profiles.firstOrNull { it.id == id } } else null,
-              workspace = workspace?.name?.takeIf { showWorkspace },
-              onClick = { (session.target ?: state.serverId?.let { SessionTarget(it, session.id) })?.let(onOpen) },
-              actions = {
-                buildList {
-                  if (!state.multiServerView) {
-                    add(MenuAction(if (pinned) "取消置顶" else "置顶", if (pinned) MiuixIcons.Unpin else MiuixIcons.Pin) { controller.togglePin(session.id) })
-                    if (state.connected && state.capabilities.supports(SessionAction.RENAME)) add(MenuAction("重命名", MiuixIcons.Rename) { onRename(session) })
-                    if (state.connected && state.capabilities.archive != null) add(MenuAction("归档", ARCHIVE_ICON) { controller.setArchived(session.id, true) })
-                    if (state.connected && state.capabilities.deleteSession) add(MenuAction("删除", MiuixIcons.Delete, danger = true) { onDelete(session) })
+        if (!collapsed) {
+          val rowKeys = uniqueListKeys(section.sessions) { "session:${section.key}:${it.key}" }
+          itemsIndexed(
+            items = section.sessions,
+            key = { index, _ -> rowKeys[index] },
+            contentType = { _, _ -> "sessionRow" }
+          ) { index, session ->
+            val pinned = session.id in state.pinned
+            val background = if (state.multiServerView) session.serverId?.let { id -> state.allServerSnapshots[id]?.backgroundRunning?.contains(session.id) } == true
+              else state.backgroundRunning.contains(session.id)
+            val workspace = workspaceLabels[session.key]
+            val showWorkspace = showWorkspaceLabel(section.key, state.scopeProjectId, state.scopeWorkspaceKey, workspace?.projectKey)
+            val liveTask = if (state.multiServerView) {
+              session.serverId?.let { id -> state.allServerSnapshots[id]?.tasks?.get(session.id) }
+            } else active[session.id]
+            val rowProfile = if (state.multiServerView) session.serverId?.let(profilesById::get) else null
+            HyperGroupItem(
+              position = groupRowPosition(index, section.sessions.size),
+              modifier = Modifier.animateItem(),
+              horizontalMargin = 14.dp
+            ) {
+              HomeSessionRow(
+                session = session,
+                status = statuses[session.key] ?: SessionStatus.NONE,
+                unseen = session.key in unseen,
+                pinned = pinned,
+                background = background,
+                liveDetail = liveTask?.detail?.takeIf { it.isNotBlank() && it != TaskState.RUNNING_DETAIL },
+                relativeTime = formatRelative(session.updated, now),
+                serverName = rowProfile?.name,
+                harness = rowProfile,
+                workspace = workspace?.name?.takeIf { showWorkspace },
+                onClick = { (session.target ?: state.serverId?.let { SessionTarget(it, session.id) })?.let(onOpen) },
+                actions = {
+                  buildList {
+                    if (!state.multiServerView) {
+                      add(MenuAction(if (pinned) "取消置顶" else "置顶", if (pinned) MiuixIcons.Unpin else MiuixIcons.Pin) { controller.togglePin(session.id) })
+                      if (state.connected && state.capabilities.supports(SessionAction.RENAME)) add(MenuAction("重命名", MiuixIcons.Rename) { onRename(session) })
+                      if (state.connected && state.capabilities.archive != null) add(MenuAction("归档", ARCHIVE_ICON) { controller.setArchived(session.id, true) })
+                      if (state.connected && state.capabilities.deleteSession) add(MenuAction("删除", MiuixIcons.Delete, danger = true) { onDelete(session) })
+                    }
                   }
                 }
-              }
-            )
-          }
+              )
             }
           }
         }
@@ -646,7 +652,9 @@ internal fun HomeSessionRow(
       Spacer(Modifier.width(4.dp))
       CircleIconButton(MiuixIcons.More, "会话操作", ::openMenu)
     }
-    MenuPopup(menu, { menu = false }, listOf(MenuSection(menuItems)))
+    if (menu || menuItems.isNotEmpty()) {
+      MenuPopup(menu, { menu = false }, listOf(MenuSection(menuItems)))
+    }
   }
 }
 

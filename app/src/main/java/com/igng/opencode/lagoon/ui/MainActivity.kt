@@ -21,6 +21,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.saveable.rememberSaveableStateHolder
@@ -40,6 +41,7 @@ import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
+import androidx.metrics.performance.FrameDataApi24
 import androidx.metrics.performance.JankStats
 import com.igng.opencode.lagoon.core.*
 import kotlinx.coroutines.CancellationException
@@ -90,7 +92,15 @@ class MainActivity : ComponentActivity() {
       }
     })
     // Frame timing per page for the copied diagnostics (FrameStats); paused while not visible.
-    val jank = JankStats.createAndTrack(window) { frame -> FrameStats.record(frame.frameDurationUiNanos, frame.isJank) }
+    val initialUiPrefs = getSharedPreferences("ui", MODE_PRIVATE)
+    val initialRefreshPolicy = runCatching {
+      HighRefreshPolicy.valueOf(initialUiPrefs.getString("highRefreshPolicy", HighRefreshPolicy.MAX.name)!!)
+    }.getOrDefault(HighRefreshPolicy.MAX)
+    applyHighRefreshPolicy(initialRefreshPolicy)
+    val jank = JankStats.createAndTrack(window) { frame ->
+      val cpuNanos = (frame as? FrameDataApi24)?.frameDurationCpuNanos ?: 0L
+      FrameStats.record(maxOf(frame.frameDurationUiNanos, cpuNanos), frame.isJank)
+    }
     lifecycle.addObserver(LifecycleEventObserver { _, event ->
       if (event == Lifecycle.Event.ON_RESUME) jank.isTrackingEnabled = true
       else if (event == Lifecycle.Event.ON_PAUSE) jank.isTrackingEnabled = false
@@ -108,6 +118,8 @@ class MainActivity : ComponentActivity() {
       val systemDark = isSystemInDarkTheme()
       val dark = themeMode == ThemeMode.DARK || themeMode == ThemeMode.SYSTEM && systemDark
       var previewBack by remember { mutableStateOf(preferences.getBoolean("previewBack", true)) }
+      var highRefreshPolicy by remember { mutableStateOf(initialRefreshPolicy) }
+      ObserveDisplayRefreshPolicy(this@MainActivity, highRefreshPolicy)
       var refreshMode by remember { mutableStateOf(controller.currentRefreshMode()) }
       // 设备详情与整页编辑器是路由上的一层（见 SessionNavigation.openDevice / openEditor）：以前用
       // showingAddDevice / detailId 这类布尔量覆盖整页，切换只是同一页里的内容替换，AnimatedContent
@@ -417,7 +429,6 @@ class MainActivity : ComponentActivity() {
       }
       LagoonMiuixTheme(dark) {
         Scaffold(
-          modifier = Modifier.imePadding(),
           contentWindowInsets = WindowInsets(0, 0, 0, 0),
           topBar = {},
           bottomBar = {}
@@ -425,13 +436,20 @@ class MainActivity : ComponentActivity() {
           Box(Modifier.fillMaxSize().background(HyperTheme.colors.canvas)) {
             @Composable
             fun Page(target: NavRoute, active: Boolean) {
-              val displayed = when {
+              val liveDisplayed = when {
                 // The blank page is not a server-scoped session id: it always follows the live
                 // writable connection, including the moment a server switch is connecting.
                 target.session == DRAFT_SESSION -> state
                 target.session != null -> controller.conversationState(state, target.serverId, target.session)
                 else -> state
               }
+              val frozenState = remember { arrayOfNulls<LagoonState>(1) }
+              val displayed = if (!active && pageTransition.isRunning && frozenState[0] != null) {
+                frozenState[0]!!
+              } else {
+                liveDisplayed.also { frozenState[0] = it }
+              }
+              val state = displayed
               when {
                 // 整页编辑器压在设备列表/详情之上，与其它页一样由根路由驱动，所以进退场自动有动画。
                 target.editors.isNotEmpty() -> DeviceEditorScreen(
@@ -487,7 +505,12 @@ class MainActivity : ComponentActivity() {
                    else startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, packageName))
                  },
                    onManageDevices = { openPage(RootPage.DEVICES) }, onBack = { goBack() },
-                    onMessage = { msg, type -> globalMessage = msg; globalMessageType = type })
+                    onMessage = { msg, type -> globalMessage = msg; globalMessageType = type },
+                    highRefreshPolicy = highRefreshPolicy,
+                    onHighRefreshPolicy = {
+                      highRefreshPolicy = it
+                      preferences.edit().putString("highRefreshPolicy", it.name).apply()
+                    })
                  else -> HomeScreen(rememberHomePage(state), controller, onOpen = { openSession(it) }, onNewSession = { openDraft() }, onScope = { showingScope = true },
                     onManageDevices = { openPage(RootPage.DEVICES) },
                     onPage = ::openPage)
@@ -534,11 +557,12 @@ class MainActivity : ComponentActivity() {
                     if (receding) {
                       val p = transitionState.fraction.coerceIn(0f, 1f)
                       shadowElevation = 24.dp.toPx() * (1f - p * 0.5f)
-                      shape = miuixSquircleShape((28f * p.coerceAtMost(0.4f) / 0.4f).dp)
+                      // 跟手退场帧使用硬件 Outline.Rounded，避免 144Hz 下每帧全屏 Stencil Path 裁剪与动态 Shape 泄漏。
+                      shape = gestureRoundedShape(p)
                       clip = true
                     }
                   }
-                  .then(if (active) Modifier else Modifier.pointerInput(Unit) { awaitPointerEventScope { while (true) { awaitPointerEvent().changes.forEach { it.consume() } } } })
+                  .then(if (active) Modifier.imePadding() else Modifier.pointerInput(Unit) { awaitPointerEventScope { while (true) { awaitPointerEvent().changes.forEach { it.consume() } } } })
                   .background(HyperTheme.colors.canvas)
               ) {
                 val key = when {
@@ -691,3 +715,10 @@ class MainActivity : ComponentActivity() {
  */
 @Composable
 private fun rememberHomePage(state: LagoonState): LagoonState = remember(state) { state.homeProjection() }
+
+private val gestureRoundedShapes = Array(57) { step -> RoundedCornerShape((step * 0.5f).dp) }
+
+private fun gestureRoundedShape(progress: Float): RoundedCornerShape {
+  val step = ((28f * (progress.coerceIn(0f, 0.4f) / 0.4f)) * 2f + 0.5f).toInt().coerceIn(0, 56)
+  return gestureRoundedShapes[step]
+}

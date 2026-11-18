@@ -14,7 +14,14 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawWithCache
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawOutline
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.clipRect
+import androidx.compose.ui.graphics.drawscope.translate
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
@@ -128,9 +135,7 @@ fun HyperConnectionIsland(
   // Simplified version of the island for now.
   Box(
     modifier = modifier
-      .clip(miuixSquircleShape(24.dp))
-      .background(bgColor, miuixSquircleShape(24.dp))
-      .border(0.8.dp, color.copy(alpha = 0.35f), miuixSquircleShape(24.dp))
+      .hyperSurface(miuixSquircleShape(24.dp), bgColor, 0.8.dp, color.copy(alpha = 0.35f))
       .padding(horizontal = 16.dp, vertical = 8.dp)
       .then(if (onClick != null) Modifier.heightIn(min = HYPER_TOUCH_TARGET_DP.dp).hyperPress(onClick = onClick) else Modifier),
     contentAlignment = Alignment.Center
@@ -164,8 +169,7 @@ fun HyperInlineNotice(
   Row(
     modifier = modifier
       .fillMaxWidth()
-      .clip(miuixSquircleShape(12.dp))
-      .background(bgColor, miuixSquircleShape(12.dp))
+      .hyperSurface(miuixSquircleShape(12.dp), bgColor)
       .padding(12.dp),
     verticalAlignment = Alignment.CenterVertically,
     horizontalArrangement = Arrangement.spacedBy(10.dp)
@@ -199,13 +203,103 @@ fun HyperCard(
   val shape = miuixSquircleShape(cornerRadius)
   Column(
     modifier = modifier
-      .clip(shape)
-      .background(backgroundColor, shape)
-      .border(0.6.dp, borderColor, shape)
+      .hyperSurface(shape, backgroundColor, 0.6.dp, borderColor, clipContent = onClick != null && surfaceHighlight)
       .then(if (onClick != null) Modifier.heightIn(min = HYPER_TOUCH_TARGET_DP.dp).hyperPress(onClick = onClick, surfaceHighlight = surfaceHighlight) else Modifier)
       .padding(insidePadding),
     content = content
   )
+}
+
+enum class GroupRowPosition { SINGLE, FIRST, MIDDLE, LAST }
+
+internal fun groupRowPosition(index: Int, count: Int): GroupRowPosition = when {
+  count <= 1 -> GroupRowPosition.SINGLE
+  index == 0 -> GroupRowPosition.FIRST
+  index == count - 1 -> GroupRowPosition.LAST
+  else -> GroupRowPosition.MIDDLE
+}
+
+/**
+ * 虚拟化分组卡片岛单行外壳（Virtualized Grouped Squircle Island Item）：
+ * 使 LazyColumn 中的每一行成为独立虚拟化 item，同时在首/中/尾无缝拼接澎湃 22dp 连续曲率大圆角、
+ * 0.6dp 微描边与缩进分割线，彻底消除 `forEachIndexed` 巨型单 item 反模式。
+ */
+@Composable
+internal fun HyperGroupItem(
+  position: GroupRowPosition,
+  modifier: Modifier = Modifier,
+  horizontalMargin: Dp = 14.dp,
+  cornerRadius: Dp = 22.dp,
+  backgroundColor: Color = HyperTheme.colors.cardElevated,
+  borderColor: Color = HyperTheme.colors.cardBorder,
+  dividerColor: Color = HyperTheme.colors.divider,
+  content: @Composable ColumnScope.() -> Unit
+) {
+  val isFirst = position == GroupRowPosition.SINGLE || position == GroupRowPosition.FIRST
+  val isLast = position == GroupRowPosition.SINGLE || position == GroupRowPosition.LAST
+  val shape = miuixSquircleShape(cornerRadius)
+  Column(
+    modifier = modifier
+      .fillMaxWidth()
+      .padding(
+        start = horizontalMargin,
+        end = horizontalMargin,
+        top = if (isFirst) 3.dp else 0.dp,
+        bottom = if (isLast) 3.dp else 0.dp
+      )
+      .drawWithCache {
+        val strokePx = 0.6.dp.toPx()
+        val halfStroke = strokePx * 0.5f
+        val stroke = Stroke(width = strokePx)
+        when (position) {
+          GroupRowPosition.SINGLE -> {
+            val outline = shape.createOutline(size, layoutDirection, this)
+            onDrawBehind {
+              drawOutline(outline, color = backgroundColor)
+              drawOutline(outline, color = borderColor, style = stroke)
+            }
+          }
+          GroupRowPosition.MIDDLE -> {
+            onDrawBehind {
+              drawRect(color = backgroundColor)
+              drawLine(borderColor, Offset(halfStroke, 0f), Offset(halfStroke, size.height), strokePx)
+              drawLine(borderColor, Offset(size.width - halfStroke, 0f), Offset(size.width - halfStroke, size.height), strokePx)
+            }
+          }
+          GroupRowPosition.FIRST -> {
+            val extra = cornerRadius.toPx() * 2f + strokePx * 4f
+            val extended = shape.createOutline(Size(size.width, size.height + extra), layoutDirection, this)
+            onDrawBehind {
+              clipRect(0f, 0f, size.width, size.height) {
+                drawOutline(extended, color = backgroundColor)
+                drawOutline(extended, color = borderColor, style = stroke)
+              }
+            }
+          }
+          GroupRowPosition.LAST -> {
+            val extra = cornerRadius.toPx() * 2f + strokePx * 4f
+            val extended = shape.createOutline(Size(size.width, size.height + extra), layoutDirection, this)
+            onDrawBehind {
+              clipRect(0f, 0f, size.width, size.height) {
+                translate(left = 0f, top = -extra) {
+                  drawOutline(extended, color = backgroundColor)
+                  drawOutline(extended, color = borderColor, style = stroke)
+                }
+              }
+            }
+          }
+        }
+      }
+      .padding(
+        top = if (isFirst) 4.dp else 0.dp,
+        bottom = if (isLast) 4.dp else 0.dp
+      )
+  ) {
+    if (!isFirst) {
+      HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = dividerColor)
+    }
+    content()
+  }
 }
 
 /**
@@ -219,9 +313,7 @@ fun HyperPill(
 ) {
   Row(
     modifier = modifier
-      .clip(miuixSquircleShape(16.dp))
-      .background(background)
-      .border(0.6.dp, HyperTheme.colors.cardBorder, miuixSquircleShape(16.dp))
+      .hyperSurface(miuixSquircleShape(16.dp), background, 0.6.dp, HyperTheme.colors.cardBorder)
       .padding(horizontal = 14.dp, vertical = 7.dp),
     verticalAlignment = Alignment.CenterVertically,
     content = content

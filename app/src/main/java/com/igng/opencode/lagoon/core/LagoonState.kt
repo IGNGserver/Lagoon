@@ -1,5 +1,7 @@
 package com.igng.opencode.lagoon.core
 
+import androidx.compose.runtime.Immutable
+
 /** Semantic tone for global toast feedback so non-error notices/warnings are never painted as green success. */
 enum class FeedbackTone { INFO, SUCCESS, WARNING }
 
@@ -26,6 +28,7 @@ internal fun operationKey(server: String?, session: String?, project: String?, a
 /** Pending phone attachments belong to one composer: a session, or the not-yet-created draft. */
 internal fun attachmentKey(session: String?): String = session ?: "draft"
 
+@Immutable
 data class LagoonState(
   val profiles: List<ServerProfile> = emptyList(),
   /** Bumped when a device discovery observation is recorded; only used to refresh device pages. */
@@ -169,6 +172,11 @@ data class LagoonState(
 ) {
   /** Lazily computed per state instance and offline-TTL epoch; see [homeProjection]. */
   @Volatile internal var homeProjectionCache: Pair<Int, LagoonState>? = null
+  @Volatile internal var livePresentedTasksCache: Pair<Boolean, Map<String, TaskState>>? = null
+  @Volatile internal var activeRootTasksCache: Pair<Boolean, Map<String, TaskState>>? = null
+  internal val cachedServerSnapshots: Map<String, ServerOverviewSnapshot> by lazy(LazyThreadSafetyMode.PUBLICATION) {
+    computeServerSnapshots()
+  }
   val server: ServerProfile? get() = profiles.firstOrNull { it.id == serverId }
   /** Connections allowed by both their leaf preference and parents. Runtime surfaces use this, not [profiles]. */
   val enabledProfiles: List<ServerProfile> by lazy(LazyThreadSafetyMode.PUBLICATION) { profiles.filter { it.effectiveEnabled } }
@@ -227,20 +235,31 @@ data class LagoonState(
   /** Live (running / waiting) state of each session family, rolled up to its root. */
   val presentedTasks: Map<String, TaskState> by lazy(LazyThreadSafetyMode.PUBLICATION) { permissionPolicy.tasks(tasks, permissions, autoApprovalFailures) }
   val visiblePermissions: List<PermissionRequest> by lazy(LazyThreadSafetyMode.PUBLICATION) { permissions.filter { permissionPolicy.visible(it, autoApprovalFailures) } }
-  val globalSummary: TaskSummary get() {
+  val globalSummary: TaskSummary by lazy(LazyThreadSafetyMode.PUBLICATION) {
     val snapshots = serverSnapshots().values
-    if (snapshots.isEmpty()) return if (server?.let { it.effectiveEnabled && it.notifications } == true) summary else TaskSummary.EMPTY
-    // 关闭通知的服务器不进入系统汇总（灵动岛 / 前台服务），但它的数据仍留在应用内首页。
-    return TaskSummary.merge(snapshots.filter { it.profile.notifications }.map { it.displaySummary(permissionPolicy) })
+    if (snapshots.isEmpty()) {
+      if (server?.let { it.effectiveEnabled && it.notifications } == true) summary else TaskSummary.EMPTY
+    } else {
+      // 关闭通知的服务器不进入系统汇总（灵动岛 / 前台服务），但它的数据仍留在应用内首页。
+      TaskSummary.merge(snapshots.filter { it.profile.notifications }.map { it.displaySummary(permissionPolicy) })
+    }
   }
-  val globalSummaryTarget: SessionTarget? get() = globalSummary.items.firstOrNull()?.let { item -> item.serverId?.let { SessionTarget(it, item.sessionId) } }
+  val globalSummaryTarget: SessionTarget? by lazy(LazyThreadSafetyMode.PUBLICATION) {
+    globalSummary.items.firstOrNull()?.let { item -> item.serverId?.let { SessionTarget(it, item.sessionId) } }
+  }
   /** Roots with background activity that should keep the low-key monitor notification alive. */
-  val globalBackgroundTargets: List<SessionTarget>
-    get() = serverSnapshots().values.filter { it.profile.notifications }
+  val globalBackgroundTargets: List<SessionTarget> by lazy(LazyThreadSafetyMode.PUBLICATION) {
+    serverSnapshots().values.filter { it.profile.notifications }
       .flatMap { snapshot -> snapshot.backgroundRunning.map { SessionTarget(snapshot.serverId, it) } }
       .distinct()
+  }
   val globalBackgroundCount: Int get() = globalBackgroundTargets.size
-  val activeRootTasks: Map<String, TaskState> get() = SessionActivityRules.rootStates(livePresentedTasks.filterValues { it.active }, parents)
+  val activeRootTasks: Map<String, TaskState> get() {
+    val stale = staleConnection
+    activeRootTasksCache?.takeIf { it.first == stale }?.let { return it.second }
+    return SessionActivityRules.rootStates(livePresentedTasks.filterValues { it.active }, parents)
+      .also { activeRootTasksCache = stale to it }
+  }
   /** Running shells and the descendant tree for the open conversation's family. */
   fun sessionActivity(sessionId: String? = this.sessionId): SessionActivity =
     SessionActivityRules.activity(sessionId, sessions, presentedTasks, shells, parents)

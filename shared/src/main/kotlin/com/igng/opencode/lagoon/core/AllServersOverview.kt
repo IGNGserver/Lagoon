@@ -459,6 +459,7 @@ internal class AllServersOverview(
                     BackgroundWork.backgroundSubagentId(event.type, props) != null) childDiscoveries.remove(id)
                   val sessionId = props.sessionEventId(event.type)
                   if (event.type == "permission.asked" && approver.pending(listOf(props.toPermission(event.directory))).isEmpty()) return@collect
+                  val previousSnapshot = snapshot
                   val before = snapshot.tasks[sessionId]
                   if (selectedServer() != id && sessionId.isNotBlank()) {
                     TaskReducer.event(sessionId, event.type, props, before, event.created)?.let { task ->
@@ -569,7 +570,7 @@ internal class AllServersOverview(
                     }
                     snapshot.tasks.values.forEach { store.rememberTask(id, it, snapshot.parents[it.sessionId]) }
                   }
-                  emit(snapshot)
+                  if (snapshot !== previousSnapshot) emit(snapshot)
                   if (event.type == "permission.asked") approver.consider(props.toPermission(event.directory))
                   // Events update the snapshot directly. A full HTTP read per event burst was the
                   // main source of "constant loading"; the 5-minute safety loop repairs gaps.

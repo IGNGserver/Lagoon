@@ -7,8 +7,8 @@ package com.igng.opencode.lagoon.core
  * percentile frame time. That is the before/after measure for smoothness work on a real phone.
  */
 object FrameStats {
-  /** Upper bounds (ms) of the duration buckets; the last bucket is open-ended. */
-  internal val BOUNDS_MS = longArrayOf(8, 12, 17, 25, 34, 50, 75, 100, 150, 250, 500, 1000)
+  /** Upper bounds (ms) of the duration buckets (≤7ms = 144Hz, ≤9ms = 120Hz, ≤17ms = 60Hz); the last bucket is open-ended. */
+  internal val BOUNDS_MS = longArrayOf(5, 7, 9, 12, 17, 25, 34, 50, 75, 100, 150, 250, 500, 1000)
 
   private class Page {
     val buckets = LongArray(BOUNDS_MS.size + 1)
@@ -28,7 +28,13 @@ object FrameStats {
     stats.frames++
     if (jank) stats.janky++
     if (ms > stats.worstMs) stats.worstMs = ms
-    val index = BOUNDS_MS.indexOfFirst { ms <= it }.let { if (it < 0) BOUNDS_MS.size else it }
+    var index = BOUNDS_MS.size
+    for (i in BOUNDS_MS.indices) {
+      if (ms <= BOUNDS_MS[i]) {
+        index = i
+        break
+      }
+    }
     stats.buckets[index]++
   }
 
