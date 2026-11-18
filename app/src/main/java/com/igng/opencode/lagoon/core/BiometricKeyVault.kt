@@ -36,12 +36,17 @@ internal object BiometricKeyVault {
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return false
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
       val manager = context.getSystemService(BiometricManager::class.java) ?: return false
-      val status = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-        manager.canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_STRONG)
-      } else {
-        @Suppress("DEPRECATION")
-        manager.canAuthenticate()
-      }
+      // canAuthenticate() 经 binder 校验 USE_BIOMETRIC；权限被 ROM/策略拒绝时抛 SecurityException。
+      // 本方法在 SshKeyGenerateDialog / SshKeyImportDialog 的组合首帧被调用，异常会杀掉进程，
+      // 因此这里只把结果当作能力判断：查询失败一律按“不支持”降级。
+      val status = runCatching {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+          manager.canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_STRONG)
+        } else {
+          @Suppress("DEPRECATION")
+          manager.canAuthenticate()
+        }
+      }.getOrNull() ?: return false
       if (status == BiometricManager.BIOMETRIC_SUCCESS) return true
     }
     val keyguard = context.getSystemService(KeyguardManager::class.java)
