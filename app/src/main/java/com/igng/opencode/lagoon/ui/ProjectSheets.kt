@@ -49,17 +49,25 @@ internal fun HomeScopeSheet(
   }
   if (state.browsePath != null) { DirectoryBrowserSheet(state, controller); return }
   var removing by remember { mutableStateOf<Project?>(null) }
+  var projectQuery by rememberSaveable { mutableStateOf("") }
   val online = state.enabledProfiles.count { profile ->
     if (!state.multiServerView && profile.id == state.serverId) state.connected
     else allSnapshots[profile.id]?.connected == true
   }
   HyperBottomSheet(title = "选择范围", show = true, onDismissRequest = onDismiss) {
     LazyColumn(Modifier.fillMaxWidth().heightIn(max = 680.dp), contentPadding = PaddingValues(bottom = 16.dp)) {
-      if (!state.allServers) item {
-        if (state.homeGroup != null) WorkspaceScopeSection(state, controller, onDismiss)
-        else ProjectScopeSection(state, controller, onDismiss, onRemove = { removing = it },
+      if (!state.allServers) {
+        if (state.homeGroup != null) workspaceScopeItems(state, controller, onDismiss)
+        else projectScopeItems(
+          state = state,
+          controller = controller,
+          query = projectQuery,
+          onQueryChange = { projectQuery = it },
+          onDismiss = onDismiss,
+          onRemove = { removing = it },
           onManageWorkspaces = { state.server?.let { managing = WorkspaceManagementTarget(it) } },
-          onManageOpenCodeProjects = { state.server?.let { managingOpenCode = OpenCodeManagementTarget(it) } })
+          onManageOpenCodeProjects = { state.server?.let { managingOpenCode = OpenCodeManagementTarget(it) } }
+        )
       }
       item { HyperGroupTitle(if (state.allServers) "设备" else "切换设备") }
       item {
@@ -170,35 +178,49 @@ private fun ProfileScopeRow(
 }
 
 /** Project filter of a single-server home; the server's catalog is never auto-imported. */
-@Composable
-private fun ProjectScopeSection(
+private fun androidx.compose.foundation.lazy.LazyListScope.projectScopeItems(
   state: LagoonState,
   controller: LagoonController,
+  query: String,
+  onQueryChange: (String) -> Unit,
   onDismiss: () -> Unit,
   onRemove: (Project) -> Unit,
   onManageWorkspaces: () -> Unit,
   onManageOpenCodeProjects: () -> Unit
 ) {
-  var query by rememberSaveable { mutableStateOf("") }
   val counts = HomeScope.counts(state.sessions, state.projects)
   val projects = HomeScope.byActivity(state.sessions, state.projects).filter {
     query.isBlank() || it.name.contains(query.trim(), true) || it.directory.contains(query.trim(), true)
   }
-  Column(Modifier.fillMaxWidth()) {
-    if (state.projects.size > 8) TextField(query, { query = it }, label = "搜索项目",
+  if (state.projects.size > 8) item(key = "project-search") {
+    TextField(query, onQueryChange, label = "搜索项目",
       useLabelAsPlaceholder = true, modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp))
+  }
+  item(key = "project-all") {
     HyperCard(Modifier.fillMaxWidth().padding(horizontal = 8.dp), insidePadding = PaddingValues(vertical = 2.dp)) {
       ChoiceRow("全部会话", "${state.sessions.count { it.visibleOnHome }} 个会话", state.scopeProjectId == null) {
         controller.setScope(null)
         onDismiss()
       }
     }
-    HyperGroupTitle("项目")
-    if (projects.isEmpty()) Text("尚未添加项目。点下面的「添加服务器目录」，浏览服务器并选一个目录加入。",
-      Modifier.padding(16.dp), style = MiuixTheme.textStyles.footnote1.copy(color = HyperTheme.colors.textSecondary))
-    else HyperCard(Modifier.fillMaxWidth().padding(horizontal = 8.dp), insidePadding = PaddingValues(vertical = 2.dp)) {
-      projects.forEachIndexed { index, project ->
-        if (index > 0) HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
+  }
+  item(key = "project-header") { HyperGroupTitle("项目") }
+  if (projects.isEmpty()) {
+    item(key = "project-empty") {
+      Text("尚未添加项目。点下面的「添加服务器目录」，浏览服务器并选一个目录加入。",
+        Modifier.padding(16.dp), style = MiuixTheme.textStyles.footnote1.copy(color = HyperTheme.colors.textSecondary))
+    }
+  } else {
+    val keys = uniqueListKeys(projects) { "project:${it.key}" }
+    itemsIndexed(
+      items = projects,
+      key = { index, _ -> keys[index] },
+      contentType = { _, _ -> "projectRow" }
+    ) { index, project ->
+      HyperGroupItem(
+        position = groupRowPosition(index, projects.size),
+        horizontalMargin = 8.dp
+      ) {
         ProjectChoiceRow(
           project, "${HomeScope.displayPath(project.directory, null)} · ${counts[project.key] ?: 0} 个会话",
           state.scopeProjectId == project.id,
@@ -207,11 +229,13 @@ private fun ProjectScopeSection(
         )
       }
     }
+  }
+  item(key = "project-actions") {
     Spacer(Modifier.height(10.dp))
     HyperCard(Modifier.fillMaxWidth().padding(horizontal = 8.dp), insidePadding = PaddingValues(vertical = 2.dp)) {
       ChoiceRow("添加服务器目录…", "浏览服务器目录并添加为项目", false) { controller.openDirectoryBrowser() }
       CodexProjectRegistrationRow(state, controller)
-            AgyProjectRegistrationRow(state, controller)
+      AgyProjectRegistrationRow(state, controller)
       if (state.canManageServerWorkspaces()) {
         HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
         ChoiceRow("管理 Host 工作区", "管理此 Host 的共享登记；不会自动保存到本机", false, onManageWorkspaces)
@@ -225,25 +249,38 @@ private fun ProjectScopeSection(
 }
 
 /** Workspace filter of a device group: same-named projects from its harnesses are one entry. */
-@Composable
-private fun WorkspaceScopeSection(state: LagoonState, controller: LagoonController, onDismiss: () -> Unit) {
+private fun androidx.compose.foundation.lazy.LazyListScope.workspaceScopeItems(
+  state: LagoonState,
+  controller: LagoonController,
+  onDismiss: () -> Unit
+) {
   val group = state.homeGroup ?: return
-  val workspaces = remember(state.sessions, state.projects, group.id) {
-    deviceWorkspaces(state.sessions, state.projects, group.id)
-  }
-  Column(Modifier.fillMaxWidth()) {
+  val workspaces = deviceWorkspaces(state.sessions, state.projects, group.id)
+  item(key = "workspace-all") {
     HyperCard(Modifier.fillMaxWidth().padding(horizontal = 8.dp), insidePadding = PaddingValues(vertical = 2.dp)) {
       ChoiceRow("全部会话", "${state.sessions.count { it.visibleOnHome }} 个会话", state.scopeWorkspaceKey == null) {
         controller.setWorkspaceScope(null)
         onDismiss()
       }
     }
-    HyperGroupTitle("工作区")
-    if (workspaces.isEmpty()) Text("这个设备还没有工作区。先在对应 harness 中添加项目目录。", Modifier.padding(16.dp),
-      style = MiuixTheme.textStyles.footnote1.copy(color = HyperTheme.colors.textSecondary))
-    else HyperCard(Modifier.fillMaxWidth().padding(horizontal = 8.dp), insidePadding = PaddingValues(vertical = 2.dp)) {
-      workspaces.forEachIndexed { index, workspace ->
-        if (index > 0) HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
+  }
+  item(key = "workspace-header") { HyperGroupTitle("工作区") }
+  if (workspaces.isEmpty()) {
+    item(key = "workspace-empty") {
+      Text("这个设备还没有工作区。先在对应 harness 中添加项目目录。", Modifier.padding(16.dp),
+        style = MiuixTheme.textStyles.footnote1.copy(color = HyperTheme.colors.textSecondary))
+    }
+  } else {
+    val keys = uniqueListKeys(workspaces) { "workspace:${it.key}" }
+    itemsIndexed(
+      items = workspaces,
+      key = { index, _ -> keys[index] },
+      contentType = { _, _ -> "workspaceRow" }
+    ) { index, workspace ->
+      HyperGroupItem(
+        position = groupRowPosition(index, workspaces.size),
+        horizontalMargin = 8.dp
+      ) {
         ChoiceRow(
           title = workspace.name,
           summary = listOfNotNull(

@@ -41,7 +41,7 @@ class ServerStore internal constructor(private val preferences: SharedPreference
   constructor(context: Context) : this(
     context.getSharedPreferences("servers", Context.MODE_PRIVATE),
     context.getSharedPreferences("secrets", Context.MODE_PRIVATE),
-    KeystoreCipher.of("lagoon-server-passwords", legacyAlias = "opencode-lagoon-server-passwords")::encrypt,
+    KeystoreCipher.also { it.install(context) }.of("lagoon-server-passwords", legacyAlias = "opencode-lagoon-server-passwords")::encrypt,
     KeystoreCipher.of("lagoon-server-passwords", legacyAlias = "opencode-lagoon-server-passwords")::decrypt,
     context.applicationContext
   )
@@ -57,6 +57,13 @@ class ServerStore internal constructor(private val preferences: SharedPreference
   }
 
   private val previewCache = ConcurrentHashMap<String, SessionPreview>()
+  @Volatile private var cachedRawProfiles: Pair<String, List<ServerProfile>>? = null
+  @Volatile private var cachedConnectionGraph: Pair<String, ConnectionGraph>? = null
+  @Volatile private var cachedProjectedProfiles: Triple<List<ServerProfile>, ConnectionGraph?, List<ServerProfile>>? = null
+  private val cachedSessionNotices = ConcurrentHashMap<String, Pair<String, List<SessionNotice>>>()
+  private val taskStatesCache = ConcurrentHashMap<String, ConcurrentHashMap<String, TaskState>>()
+  private val taskParentsCache = ConcurrentHashMap<String, ConcurrentHashMap<String, String>>()
+  private val claimedNotificationsCache = ConcurrentHashMap<String, String>()
 
   /** Runtime view only. Profile writers and graph migration must keep using [readProfiles]. */
   fun profiles(): List<ServerProfile> {
@@ -75,7 +82,10 @@ class ServerStore internal constructor(private val preferences: SharedPreference
       Diagnostics.warn("ServerStore", "connection graph 不可读，保留资料并暂停连接")
       return ConnectionRuntimeProjection.apply(raw, graph = null, unavailable = true)
     }
-    return ConnectionRuntimeProjection.apply(raw, graph)
+    cachedProjectedProfiles?.takeIf { it.first === raw && it.second === graph }?.let { return it.third }
+    return ConnectionRuntimeProjection.apply(raw, graph).also {
+      cachedProjectedProfiles = Triple(raw, graph, it)
+    }
   }
 
   /** Execution admission is stricter than the display overlay; it never migrates or writes. */
@@ -111,13 +121,18 @@ class ServerStore internal constructor(private val preferences: SharedPreference
     val graphPreferences = appContext?.getSharedPreferences("connection-graph", Context.MODE_PRIVATE) ?: return null
     if (!graphPreferences.contains("graph")) return null
     val raw = graphPreferences.getString("graph", null) ?: error("Connection graph is not a string")
+    cachedConnectionGraph?.takeIf { it.first == raw }?.let { return it.second }
     // Do not call ConnectionGraphStore here: runtime reads must not migrate, recover a journal or
     // write anything. Only the committed primary document is authoritative for parent gating.
-    return ConnectionGraphCodec.decode(raw)
+    return ConnectionGraphCodec.decode(raw).also { cachedConnectionGraph = raw to it }
   }
 
   /** Raw leaf preferences only. Writers/migration must never replace an unreadable document. */
-  internal fun readProfiles(): List<ServerProfile> = decodeProfiles(preferences.getString("profiles", "[]") ?: error("连接资料不是文本"))
+  internal fun readProfiles(): List<ServerProfile> {
+    val raw = preferences.getString("profiles", "[]") ?: error("连接资料不是文本")
+    cachedRawProfiles?.takeIf { it.first == raw }?.let { return it.second }
+    return decodeProfiles(raw).also { cachedRawProfiles = raw to it }
+  }
 
   private fun decodeProfiles(raw: String): List<ServerProfile> {
     try {
@@ -154,50 +169,105 @@ class ServerStore internal constructor(private val preferences: SharedPreference
     val unconfirmedConfigurations = PendingConfigurations()
   }
 
-  override fun taskStates(id: String): Map<String, TaskState> = preferences.all.filterKeys { it.startsWith("taskState:$id:") }
-    .mapNotNull { (key, raw) -> runCatching {
-      val json = JSONObject(raw as String); val session = key.removePrefix("taskState:$id:")
-      // Legacy versions folded background shells/children into a synthetic THINKING task; it is not
-      // a server execution claim and must not resurrect a spinner after the upgrade.
-      if (json.optBoolean("background")) return@mapNotNull null
-      session to TaskState(session, TaskPhase.valueOf(json.str("phase")), json.str("detail"), json.optLong("since"),
-        json.optLong("finished").takeIf { it > 0 }, json.optLong("activeAt", -1), json.optBoolean("uncertain"), json.optBoolean("pendingInput"))
-    }.getOrNull() }.toMap()
-  override fun taskParents(id: String): Map<String, String> = preferences.all.filterKeys { it.startsWith("taskParent:$id:") }
-    .mapKeys { it.key.removePrefix("taskParent:$id:") }.mapValues { it.value as? String ?: "" }.filterValues(String::isNotBlank)
+  private fun serverTaskStatesMap(id: String): ConcurrentHashMap<String, TaskState> =
+    taskStatesCache.computeIfAbsent(id) {
+      val prefix = "taskState:$id:"
+      val loaded = ConcurrentHashMap<String, TaskState>()
+      preferences.all.forEach { (key, raw) ->
+        if (!key.startsWith(prefix)) return@forEach
+        runCatching {
+          val json = JSONObject(raw as String)
+          val session = key.removePrefix(prefix)
+          if (json.optBoolean("background")) return@runCatching
+          loaded[session] = TaskState(
+            session,
+            TaskPhase.valueOf(json.str("phase")),
+            json.str("detail"),
+            json.optLong("since"),
+            json.optLong("finished").takeIf { it > 0 },
+            json.optLong("activeAt", -1),
+            json.optBoolean("uncertain"),
+            json.optBoolean("pendingInput")
+          )
+        }
+      }
+      loaded
+    }
+
+  private fun serverTaskParentsMap(id: String): ConcurrentHashMap<String, String> =
+    taskParentsCache.computeIfAbsent(id) {
+      val prefix = "taskParent:$id:"
+      val loaded = ConcurrentHashMap<String, String>()
+      preferences.all.forEach { (key, value) ->
+        if (!key.startsWith(prefix)) return@forEach
+        val parent = (value as? String)?.takeIf(String::isNotBlank) ?: return@forEach
+        loaded[key.removePrefix(prefix)] = parent
+      }
+      loaded
+    }
+
+  override fun taskStates(id: String): Map<String, TaskState> = HashMap(serverTaskStatesMap(id))
+  override fun taskParents(id: String): Map<String, String> = HashMap(serverTaskParentsMap(id))
   override fun rememberParents(id: String, sessions: List<Session>) {
+    val cached = serverTaskParentsMap(id)
     val editor = preferences.edit()
+    var mutated = false
     sessions.forEach { session ->
       val key = "taskParent:$id:${session.id}"
-      if (session.parentId == null) editor.remove(key) else editor.putString(key, session.parentId)
+      if (session.parentId == null) {
+        if (cached.remove(session.id) != null) {
+          editor.remove(key)
+          mutated = true
+        }
+      } else if (cached.put(session.id, session.parentId) != session.parentId) {
+        editor.putString(key, session.parentId)
+        mutated = true
+      }
     }
-    editor.apply()
+    if (mutated) editor.apply()
   }
   override fun rememberTask(id: String, state: TaskState, parent: String?, observedAt: Long, durable: Boolean): TaskState = synchronized(taskLock) {
     val key = "taskState:$id:${state.sessionId}"
     // `uncertain` describes one failed read, not the task: it is re-derived on every start, so the
     // durable record keeps only what this device actually observed (running / waiting / finished).
     val observed = if (state.uncertain) state.copy(uncertain = false) else state
-    val previous = runCatching { JSONObject(preferences.getString(key, "")!!).let { json -> TaskState(observed.sessionId, TaskPhase.valueOf(json.str("phase")), json.str("detail"), json.optLong("since"), json.optLong("finished").takeIf { it > 0 }, json.optLong("activeAt", -1), json.optBoolean("uncertain"), json.optBoolean("pendingInput")) } }.getOrNull()
+    val statesMap = serverTaskStatesMap(id)
+    val parentsMap = serverTaskParentsMap(id)
+    val previous = statesMap[observed.sessionId]
     val lastObserved = preferences.getLong("taskTime:$id:${observed.sessionId}", 0)
     if (observedAt < lastObserved) return@synchronized previous ?: observed
     val next = if (previous != null && observed.active && !previous.active && observed.since <= previous.since)
       observed.copy(since = observedAt, finishedAt = null) else observed
-    if (previous != next || parent != preferences.getString("taskParent:$id:${state.sessionId}", null)) {
+    val currentParent = parentsMap[state.sessionId]
+    if (previous != next || (parent != null && parent != currentParent)) {
+      statesMap[observed.sessionId] = next
       val editor = preferences.edit().putString(key, JSONObject().put("phase", next.phase.name).put("detail", next.detail)
-        .put("since", next.since).put("finished", next.finishedAt).put("activeAt", next.activeAt).put("uncertain", next.uncertain).put("pendingInput", next.pendingInput).toString()).putLong("taskTime:$id:${state.sessionId}", observedAt)
-      if (parent != null) editor.putString("taskParent:$id:${state.sessionId}", parent)
+        .put("since", next.since).put("finished", next.finishedAt).put("activeAt", next.activeAt).put("uncertain", next.uncertain).put("pendingInput", next.pendingInput).toString()).putLong("taskTime:$id:${observed.sessionId}", observedAt)
+      if (parent != null) {
+        parentsMap[state.sessionId] = parent
+        editor.putString("taskParent:$id:${state.sessionId}", parent)
+      }
       if (previous?.since != next.since || previous?.phase !in setOf(TaskPhase.COMPLETED, TaskPhase.FAILED) && next.phase in setOf(TaskPhase.COMPLETED, TaskPhase.FAILED))
         editor.remove("taskRead:$id:${state.sessionId}")
       if (durable) editor.commit() else editor.apply()
+    } else if (observedAt > lastObserved) {
+      preferences.edit().putLong("taskTime:$id:${observed.sessionId}", observedAt).let {
+        if (durable) it.commit() else it.apply()
+      }
     }
     next
   }
   fun claimNotification(id: String, state: TaskState, detail: String): Boolean = synchronized(taskLock) {
     val key = "notification:$id:${state.sessionId}"
     val signature = "${state.since}:${state.phase}:$detail"
-    if (preferences.getString(key, "") == signature) return@synchronized false
-    preferences.edit().putString(key, signature).commit()
+    val previous = claimedNotificationsCache[key] ?: preferences.getString(key, "")
+    if (previous == signature) {
+      claimedNotificationsCache[key] = signature
+      return@synchronized false
+    }
+    claimedNotificationsCache[key] = signature
+    preferences.edit().putString(key, signature).apply()
+    true
   }
 
   /**
@@ -219,24 +289,32 @@ class ServerStore internal constructor(private val preferences: SharedPreference
   override fun migrateTaskLedger(id: String, now: Long) = synchronized(taskLock) {
     if (preferences.getInt("taskLedgerVersion:$id", 0) >= 2) return@synchronized
     val ttl = 30L * 24 * 60 * 60 * 1000
-    val states = taskStates(id)
+    val statesMap = serverTaskStatesMap(id)
+    val states = HashMap(statesMap)
     val editor = preferences.edit()
     preferences.all.keys.filter { it.startsWith("taskRead:$id:") }.forEach(editor::remove)
     states.values.filter { !it.active || preferences.getLong("taskTime:$id:${it.sessionId}", it.since) < now - ttl }.forEach { task ->
+      statesMap.remove(task.sessionId)
       editor.remove("taskState:$id:${task.sessionId}").remove("taskTime:$id:${task.sessionId}")
     }
     editor.putInt("taskLedgerVersion:$id", 2).commit()
   }
 
   override fun sessionNotices(server: String, now: Long): List<SessionNotice> = synchronized(taskLock) {
-    runCatching { JSONArray(preferences.getString("sessionNotices:$server", "[]")).objects().map {
-      SessionNotice(it.str("id"), it.str("session"), it.optLong("time"), it.optBoolean("error"), it.optBoolean("viewed"))
-    }.pruned(now) }.getOrDefault(emptyList())
+    val raw = preferences.getString("sessionNotices:$server", "[]") ?: "[]"
+    val decoded = cachedSessionNotices[server]?.takeIf { it.first == raw }?.second ?: runCatching {
+      JSONArray(raw).objects().map {
+        SessionNotice(it.str("id"), it.str("session"), it.optLong("time"), it.optBoolean("error"), it.optBoolean("viewed"))
+      }
+    }.getOrDefault(emptyList()).also { cachedSessionNotices[server] = raw to it }
+    decoded.pruned(now)
   }
   private fun writeNotices(server: String, notices: List<SessionNotice>) {
-    preferences.edit().putString("sessionNotices:$server", JSONArray().apply { notices.forEach {
+    val serialized = JSONArray().apply { notices.forEach {
       put(JSONObject().put("id", it.id).put("session", it.sessionId).put("time", it.time).put("error", it.error).put("viewed", it.viewed))
-    } }.toString()).apply()
+    } }.toString()
+    cachedSessionNotices[server] = serialized to notices
+    preferences.edit().putString("sessionNotices:$server", serialized).apply()
   }
   override fun rememberNotice(server: String, notice: SessionNotice, now: Long): List<SessionNotice> = synchronized(taskLock) {
     val current = sessionNotices(server, now)
@@ -438,7 +516,12 @@ class ServerStore internal constructor(private val preferences: SharedPreference
   }
   /** Retire activity after an authoritative 404 without destroying unsent composer content. */
   override fun forgetTask(server: String, session: String) {
-    synchronized(taskLock) { writeNotices(server, sessionNotices(server).filterNot { it.sessionId == session }) }
+    synchronized(taskLock) {
+      taskStatesCache[server]?.remove(session)
+      taskParentsCache[server]?.remove(session)
+      claimedNotificationsCache.remove("notification:$server:$session")
+      writeNotices(server, sessionNotices(server).filterNot { it.sessionId == session })
+    }
     val editor = preferences.edit()
     listOf("taskRead", "taskState", "taskParent", "taskTime", "notification").forEach { editor.remove("$it:$server:$session") }
     editor.apply()
@@ -697,6 +780,10 @@ class ServerStore internal constructor(private val preferences: SharedPreference
     recoverConfigurationWrite()
     val remaining = readProfiles().filterNot { it.id == id }
     previewCache.keys.removeAll { it.startsWith("$id\u0000") }
+    taskStatesCache.remove(id)
+    taskParentsCache.remove(id)
+    cachedSessionNotices.remove(id)
+    claimedNotificationsCache.keys.removeAll { it.startsWith("notification:$id:") }
     val editor = preferences.edit().putString("profiles", profilesJson(remaining))
       .remove("directories:$id").remove("sessionNotices:$id").remove("collapsedSections:$id").remove("collapsedProjects:$id").remove("pinned:$id").remove("remoteMigration:$id")
       .remove("backgroundRunning:$id")

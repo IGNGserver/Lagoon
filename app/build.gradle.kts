@@ -80,6 +80,8 @@ dependencies {
   implementation("androidx.work:work-runtime-ktx:2.10.1")
   // 每页帧耗时进入"复制诊断"（FrameStats）：真机上流畅度改动的前后对照。
   implementation("androidx.metrics:metrics-performance:1.0.0")
+  // 预置 Baseline Profile 安装器：侧载 APK 安装/首启时引导 ART AOT 编译核心 Compose / MIUIX 热路径，消除首帧 JIT 卡顿。
+  implementation("androidx.profileinstaller:profileinstaller:1.4.0")
   implementation(platform("androidx.compose:compose-bom:2024.12.01"))
   implementation("androidx.compose.ui:ui")
   implementation("androidx.compose.foundation:foundation")

@@ -31,7 +31,13 @@ import com.igng.opencode.lagoon.core.TaskState
 import com.igng.opencode.lagoon.core.TaskSummary
 import com.igng.opencode.lagoon.ui.MainActivity
 
-class TaskNotifications(private val context: Context) {
+class TaskNotifications(
+  private val context: Context,
+  private val sharedStore: ServerStore? = null
+) {
+  private val defaultStore: ServerStore by lazy(LazyThreadSafetyMode.PUBLICATION) {
+    sharedStore ?: ServerStore(context)
+  }
   private val manager = context.getSystemService(NotificationManager::class.java)
   private val appIcon by lazy(LazyThreadSafetyMode.NONE) {
     BitmapFactory.decodeResource(context.resources, R.drawable.ic_app)
@@ -125,7 +131,7 @@ class TaskNotifications(private val context: Context) {
     if (state.phase == TaskPhase.IDLE || state.phase == TaskPhase.DISCONNECTED || state.phase == TaskPhase.WAITING_SERVER) return
     // 只有「需要处理」与终态结果发普通通知；运行中一律交给灵动岛总览，避免通知中心堆积。
     if (state.phase in TaskState.RUNNING_PHASES) return
-    val store = ServerStore(context)
+    val store = defaultStore
     if (state.phase == TaskPhase.WAITING_PERMISSION && store.permissionPolicy().hide) return
     val previous = store.taskStates(profile.id)[session.id]
     val next = store.rememberTask(profile.id, if (previous != null && previous.phase == state.phase) state.copy(since = previous.since) else state, session.parentId)

@@ -2,32 +2,34 @@ package com.igng.opencode.lagoon.ui
 
 import androidx.compose.animation.AnimatedContentTransitionScope
 import androidx.compose.animation.ContentTransform
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.SpringSpec
+import androidx.compose.animation.core.TweenSpec
+import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.scaleIn
 import androidx.compose.animation.scaleOut
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
-import androidx.compose.animation.core.LinearEasing
-import androidx.compose.animation.core.SpringSpec
-import androidx.compose.animation.core.TweenSpec
-import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.spring
-import androidx.compose.animation.core.tween
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.IndicationNodeFactory
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
-import androidx.compose.foundation.interaction.MutableInteractionSource
-import androidx.compose.foundation.interaction.collectIsPressedAsState
-import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.remember
+import androidx.compose.foundation.interaction.InteractionSource
+import androidx.compose.foundation.interaction.PressInteraction
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.composed
-import androidx.compose.ui.draw.drawBehind
-import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.hapticfeedback.HapticFeedbackType
-import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.graphics.drawscope.ContentDrawScope
+import androidx.compose.ui.node.CompositionLocalConsumerModifierNode
+import androidx.compose.ui.node.DelegatableNode
+import androidx.compose.ui.node.DrawModifierNode
+import androidx.compose.ui.node.currentValueOf
+import androidx.compose.ui.node.invalidateDraw
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.unit.IntOffset
+import kotlin.math.abs
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
 
 /**
  * 澎湃 OS 4（HyperOS 4）物理弹簧动效与触感反馈引擎：
@@ -108,11 +110,94 @@ internal fun AnimatedContentTransitionScope<NavRoute>.pageTransform(direction: I
   }
 }
 
+private data class HyperPressIndication(
+  val scaleDown: Float,
+  val surfaceHighlight: Boolean
+) : IndicationNodeFactory {
+  override fun create(interactionSource: InteractionSource): DelegatableNode =
+    HyperPressIndicationNode(interactionSource, scaleDown, surfaceHighlight)
+}
+
+private val DefaultRowPressIndication = HyperPressIndication(scaleDown = 0.988f, surfaceHighlight = true)
+private val DefaultButtonPressIndication = HyperPressIndication(scaleDown = 0.96f, surfaceHighlight = false)
+private val DefaultIconPressIndication = HyperPressIndication(scaleDown = 0.94f, surfaceHighlight = false)
+
+private class HyperPressIndicationNode(
+  private val interactionSource: InteractionSource,
+  private val scaleDown: Float,
+  private val surfaceHighlight: Boolean
+) : Modifier.Node(), DrawModifierNode, CompositionLocalConsumerModifierNode {
+  private var scaleAnim: Animatable<Float, *>? = null
+  private var highlightAnim: Animatable<Float, *>? = null
+  private var animJob: Job? = null
+
+  override fun onAttach() {
+    coroutineScope.launch {
+      var pressCount = 0
+      interactionSource.interactions.collect { interaction ->
+        when (interaction) {
+          is PressInteraction.Press -> pressCount++
+          is PressInteraction.Release, is PressInteraction.Cancel ->
+            pressCount = (pressCount - 1).coerceAtLeast(0)
+        }
+        animateToState(pressCount > 0)
+      }
+    }
+  }
+
+  private fun animateToState(pressed: Boolean) {
+    val targetScale = if (pressed) scaleDown else 1f
+    val targetAlpha = if (pressed && surfaceHighlight) 1f else 0f
+    val curScale = scaleAnim?.value ?: 1f
+    val curAlpha = highlightAnim?.value ?: 0f
+    if (abs(curScale - targetScale) < 0.0005f && abs(curAlpha - targetAlpha) < 0.005f) return
+    val sAnim = scaleAnim ?: Animatable(1f).also { scaleAnim = it }
+    val hAnim = if (surfaceHighlight) (highlightAnim ?: Animatable(0f).also { highlightAnim = it }) else null
+    animJob?.cancel()
+    animJob = coroutineScope.launch {
+      launch {
+        sAnim.animateTo(targetScale, HyperMotion.pressSpring) { invalidateDraw() }
+      }
+      if (hAnim != null) {
+        launch {
+          hAnim.animateTo(targetAlpha, HyperMotion.pressSpring) { invalidateDraw() }
+        }
+      }
+    }
+  }
+
+  override fun ContentDrawScope.draw() {
+    val s = scaleAnim?.value ?: 1f
+    val alpha = highlightAnim?.value ?: 0f
+    val showHighlight = surfaceHighlight && alpha > 0.005f
+    if (abs(s - 1f) > 0.0005f) {
+      drawContext.canvas.save()
+      val px = size.width * 0.5f
+      val py = size.height * 0.5f
+      drawContext.canvas.translate(px, py)
+      drawContext.canvas.scale(s, s)
+      drawContext.canvas.translate(-px, -py)
+      if (showHighlight) {
+        val pressedColor = currentValueOf(LocalHyperColors).cardPressed
+        drawRect(pressedColor.copy(alpha = alpha))
+      }
+      drawContent()
+      drawContext.canvas.restore()
+    } else {
+      if (showHighlight) {
+        val pressedColor = currentValueOf(LocalHyperColors).cardPressed
+        drawRect(pressedColor.copy(alpha = alpha))
+      }
+      drawContent()
+    }
+  }
+}
+
 /**
- * 澎湃 OS 4 分级实体按压阻尼反馈修饰符：
- * - 独立胶囊、图标按钮、FAB（[surfaceHighlight] = false）：按下物理弹簧微缩至 [scaleDown]（默认 0.96f）；
- * - 列表内嵌行与大面积分组卡片（[surfaceHighlight] = true）：采用克制的 0.988f 微缩放，并在绘制阶段平滑过渡至
- *   [HyperColorPalette.cardPressed] 表面按压高亮色，兼顾澎湃列表触感与防眩晕阅读稳定性。
+ * 澎湃 OS 4 分级实体按压阻尼反馈修饰符（基于 [IndicationNodeFactory] + [Modifier.Node]）：
+ * - 零 `Modifier.composed` 子组合开销；传入 `interactionSource = null` 使列表静止与高速滑动期间零对象与零协程分配，
+ *   仅在用户手指真正触碰该行时按需懒创建交互源与弹簧动画器；
+ * - 静止态零 `graphicsLayer` 离屏层开销，按压缩放与表面微高亮在单次 [DrawModifierNode] 绘制通道内完成。
  */
 @OptIn(ExperimentalFoundationApi::class)
 internal fun Modifier.hyperPress(
@@ -122,57 +207,30 @@ internal fun Modifier.hyperPress(
   role: Role = Role.Button,
   onLongClick: (() -> Unit)? = null,
   onClick: () -> Unit
-): Modifier = composed {
-  val interactionSource = remember { MutableInteractionSource() }
-  val pressed by interactionSource.collectIsPressedAsState()
+): Modifier {
   val effectiveScaleDown = if (surfaceHighlight && scaleDown == 0.96f) 0.988f else scaleDown
-  val scale by animateFloatAsState(
-    targetValue = if (pressed && enabled) effectiveScaleDown else 1f,
-    animationSpec = HyperMotion.pressSpring,
-    label = "hyperPressScale"
-  )
-  val highlightAlpha by animateFloatAsState(
-    targetValue = if (pressed && enabled && surfaceHighlight) 1f else 0f,
-    animationSpec = HyperMotion.pressSpring,
-    label = "hyperPressHighlight"
-  )
-  val pressedColor = HyperTheme.colors.cardPressed
-  val haptics = LocalHapticFeedback.current
-  this
-    .graphicsLayer {
-      scaleX = scale
-      scaleY = scale
-    }
-    .then(
-      if (surfaceHighlight) {
-        Modifier.drawBehind {
-          if (highlightAlpha > 0.005f) {
-            drawRect(pressedColor.copy(alpha = highlightAlpha))
-          }
-        }
-      } else Modifier
+  val indication = when {
+    effectiveScaleDown == 0.988f && surfaceHighlight -> DefaultRowPressIndication
+    effectiveScaleDown == 0.96f && !surfaceHighlight -> DefaultButtonPressIndication
+    effectiveScaleDown == 0.94f && !surfaceHighlight -> DefaultIconPressIndication
+    else -> HyperPressIndication(effectiveScaleDown, surfaceHighlight)
+  }
+  return if (onLongClick != null) {
+    this.combinedClickable(
+      interactionSource = null,
+      indication = indication,
+      enabled = enabled,
+      role = role,
+      onClick = onClick,
+      onLongClick = onLongClick
     )
-    .then(
-      if (onLongClick != null) {
-        Modifier.combinedClickable(
-          interactionSource = interactionSource,
-          indication = null,
-          enabled = enabled,
-          role = role,
-          onClick = onClick,
-          onLongClick = {
-            haptics.performHapticFeedback(HapticFeedbackType.LongPress)
-            onLongClick()
-          }
-        )
-      } else {
-        Modifier.clickable(
-          interactionSource = interactionSource,
-          indication = null,
-          enabled = enabled,
-          role = role,
-          onClick = onClick
-        )
-      }
+  } else {
+    this.clickable(
+      interactionSource = null,
+      indication = indication,
+      enabled = enabled,
+      role = role,
+      onClick = onClick
     )
+  }
 }

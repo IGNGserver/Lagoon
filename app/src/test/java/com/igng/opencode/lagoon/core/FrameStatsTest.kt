@@ -20,7 +20,17 @@ class FrameStatsTest {
     val lines = FrameStats.summary().lines()
     assertEquals(2, lines.size)
     assertEquals("会话：100 帧，卡顿 10（10.0%），P50 ≤12ms P90 ≤12ms P99 ≤34ms，最长 700ms", lines[0])
-    assertEquals("首页：1 帧，卡顿 0（0.0%），P50 ≤8ms P90 ≤8ms P99 ≤8ms，最长 5ms", lines[1])
+    assertEquals("首页：1 帧，卡顿 0（0.0%），P50 ≤5ms P90 ≤5ms P99 ≤5ms，最长 5ms", lines[1])
+  }
+
+  @Test
+  fun distinguishes144HzAnd120HzFrameBudgets() {
+    FrameStats.record(ms(6), jank = false, label = "144Hz")
+    FrameStats.record(ms(8), jank = false, label = "120Hz")
+
+    val lines = FrameStats.summary().lines()
+    assertTrue(lines[0].contains("P50 ≤7ms"))
+    assertTrue(lines[1].contains("P50 ≤9ms"))
   }
 
   @Test

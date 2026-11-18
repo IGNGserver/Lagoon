@@ -5,7 +5,10 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -195,6 +198,12 @@ internal fun MenuPopup(
   sections: List<MenuSection>,
   alignment: PopupPositionProvider.Align = PopupPositionProvider.Align.End
 ) {
+  // Lazy latch: rows whose context menu has never opened skip SuperListPopup + NavigationBackHandler
+  // + WindowInsets.ime subscription altogether during LazyColumn scroll, while still keeping the
+  // popup mounted once opened so MIUIX exit animations play to completion.
+  var everShown by remember { mutableStateOf(show) }
+  if (show) everShown = true
+  if (!everShown) return
   val visible = sections.filter { it.actions.isNotEmpty() }
   val positionProvider = rememberImeAwarePopupPositionProvider(show)
   SuperListPopup(show = show, alignment = alignment, popupPositionProvider = positionProvider, onDismissRequest = onDismiss) {

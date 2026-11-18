@@ -7,8 +7,12 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Shape
+import androidx.compose.ui.graphics.drawOutline
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
@@ -23,27 +27,69 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
 
 /**
  * 澎湃 OS 4 连续曲率平滑圆角（HyperOS Continuous Squircle Shape）
+ * 对任意浮点半径做 0.5dp 量化并限制缓存上限，防止手势插值半径无限堆积 Outline/Path。
  */
-fun miuixSquircleShape(cornerRadius: Dp = 16.dp): Shape = squircles.getOrPut(cornerRadius) {
-  RoundedRectangle(cornerRadius = cornerRadius, style = RoundedCornerStyle.Continuous)
+fun miuixSquircleShape(cornerRadius: Dp = 16.dp): Shape {
+  val halfDpSteps = (cornerRadius.value * 2f + 0.5f).toInt().coerceAtLeast(0)
+  squircles[halfDpSteps]?.let { return it }
+  if (squircles.size >= MAX_SQUIRCLE_CACHE) squircles.clear()
+  val quantized = (halfDpSteps * 0.5f).dp
+  return squircles.computeIfAbsent(halfDpSteps) {
+    RoundedRectangle(cornerRadius = quantized, style = RoundedCornerStyle.Continuous)
+  }
 }
 
 /**
  * 澎湃 OS 4 半屏抽屉顶部连续曲率圆角（底部直角贴合屏幕边缘，消除底角漏黑边）
  */
-fun miuixTopSquircleShape(cornerRadius: Dp = 28.dp): Shape = topSquircles.getOrPut(cornerRadius) {
-  UnevenRoundedRectangle(
-    topStart = cornerRadius,
-    topEnd = cornerRadius,
-    bottomEnd = 0.dp,
-    bottomStart = 0.dp,
-    style = RoundedCornerStyle.Continuous
-  )
+fun miuixTopSquircleShape(cornerRadius: Dp = 28.dp): Shape {
+  val halfDpSteps = (cornerRadius.value * 2f + 0.5f).toInt().coerceAtLeast(0)
+  topSquircles[halfDpSteps]?.let { return it }
+  if (topSquircles.size >= MAX_SQUIRCLE_CACHE) topSquircles.clear()
+  val quantized = (halfDpSteps * 0.5f).dp
+  return topSquircles.computeIfAbsent(halfDpSteps) {
+    UnevenRoundedRectangle(
+      topStart = quantized,
+      topEnd = quantized,
+      bottomEnd = 0.dp,
+      bottomStart = 0.dp,
+      style = RoundedCornerStyle.Continuous
+    )
+  }
 }
 
-/** One shape per radius: a new instance on every call made each background rebuild its outline. */
-private val squircles = java.util.concurrent.ConcurrentHashMap<Dp, Shape>()
-private val topSquircles = java.util.concurrent.ConcurrentHashMap<Dp, Shape>()
+private const val MAX_SQUIRCLE_CACHE = 128
+
+/** One shape per 0.5dp radius step: bounded so continuous gesture fractions never leak memory. */
+private val squircles = java.util.concurrent.ConcurrentHashMap<Int, Shape>()
+private val topSquircles = java.util.concurrent.ConcurrentHashMap<Int, Shape>()
+
+/**
+ * 单次 Outline 缓存绘制修饰符：
+ * 将原本 `.clip(shape).background(bg, shape).border(w, border, shape)` 的 3 次连续曲率贝塞尔 Path
+ * 计算与硬件 Stencil Clip 图层收敛为单次 `drawWithCache` Outline 复用，仅在确实需要裁剪子内容时才开启 `clip`。
+ */
+internal fun Modifier.hyperSurface(
+  shape: Shape,
+  backgroundColor: Color,
+  borderWidth: Dp = 0.dp,
+  borderColor: Color = Color.Transparent,
+  clipContent: Boolean = false
+): Modifier = this
+  .then(if (clipContent) Modifier.clip(shape) else Modifier)
+  .drawWithCache {
+    val outline = shape.createOutline(size, layoutDirection, this)
+    val strokePx = if (borderWidth > 0.dp && borderColor.alpha > 0f) borderWidth.toPx() else 0f
+    val stroke = if (strokePx > 0f) Stroke(width = strokePx) else null
+    onDrawBehind {
+      if (backgroundColor.alpha > 0f) {
+        drawOutline(outline, color = backgroundColor)
+      }
+      if (stroke != null) {
+        drawOutline(outline, color = borderColor, style = stroke)
+      }
+    }
+  }
 
 /**
  * 澎湃 OS 4 语义色彩系统：
@@ -98,8 +144,7 @@ fun MiuixStatePill(
   val pillShape = miuixSquircleShape(10.dp)
   Row(
     modifier = modifier
-      .background(subtleBg, pillShape)
-      .border(0.5.dp, color.copy(alpha = 0.22f), pillShape)
+      .hyperSurface(pillShape, subtleBg, 0.5.dp, color.copy(alpha = 0.22f))
       .padding(horizontal = 9.dp, vertical = 4.dp),
     verticalAlignment = Alignment.CenterVertically,
     horizontalArrangement = Arrangement.spacedBy(6.dp)

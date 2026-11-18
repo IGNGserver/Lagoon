@@ -37,4 +37,23 @@ class TranscriptScrollTest {
     assertFalse("a failed cursor is not retried in a loop", load(attempted = "c1"))
     assertTrue("the next page after a success", load(cursor = "c2", attempted = "c1"))
   }
+
+  @Test fun streamingGrowthAtExactBottomSkipsRedundantForceRemeasure() {
+    assertFalse(
+      "same newest item already pinned at (0, 0) needs no requestScrollToItem",
+      TranscriptScroll.shouldPinNewest("answer:1", "answer:1", firstVisibleIndex = 0, firstVisibleOffset = 0)
+    )
+    assertTrue(
+      "a newly inserted bottom item must request index 0 before measurement",
+      TranscriptScroll.shouldPinNewest("answer:1", "answer:2", firstVisibleIndex = 0, firstVisibleOffset = 0)
+    )
+    assertTrue(
+      "drifted within follow slop snaps back to exact bottom",
+      TranscriptScroll.shouldPinNewest("answer:1", "answer:1", firstVisibleIndex = 0, firstVisibleOffset = 12)
+    )
+    assertTrue(
+      "index > 0 while following snaps back to index 0",
+      TranscriptScroll.shouldPinNewest("answer:1", "answer:1", firstVisibleIndex = 1, firstVisibleOffset = 0)
+    )
+  }
 }

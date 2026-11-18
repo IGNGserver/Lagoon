@@ -65,6 +65,7 @@ private enum class ConversationStatusSheet { GOAL, TODOS }
  */
 @Composable
 internal fun ConversationStatusRail(state: LagoonState, controller: LagoonController) {
+  val state = rememberChatChromeState(state)
   // 已完成的目标与官方客户端一致：不再常驻，避免一行“已完成”长期占位。
   val goal = state.goal?.takeUnless(RemoteGoal::complete)
   val todos = state.todos
@@ -121,9 +122,7 @@ private fun StatusCapsule(
     Row(
       Modifier.then(if (fillWidth) Modifier.fillMaxWidth() else Modifier)
         .height(38.dp)
-        .clip(shape)
-        .background(background, shape)
-        .border(0.6.dp, HyperTheme.colors.cardBorder, shape)
+        .hyperSurface(shape, background, 0.6.dp, HyperTheme.colors.cardBorder)
         .padding(horizontal = 12.dp),
       verticalAlignment = Alignment.CenterVertically,
       horizontalArrangement = Arrangement.spacedBy(6.dp),

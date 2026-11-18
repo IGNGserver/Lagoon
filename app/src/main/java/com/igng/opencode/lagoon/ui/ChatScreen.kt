@@ -77,9 +77,40 @@ internal fun conversationActivityLabel(activity: SessionActivity): String {
   return if (count > 0) "子会话与后台（$count）" else "子会话与后台"
 }
 
+/**
+ * 剥离高频流式消息正文与纯 `activeAt` 心跳戳，为顶栏、连接条、状态轨、待处理底座与输入栏提供引用稳定的切片状态。
+ * 当助手连续流式吐字而会话外围元数据（标题、任务相位、权限、草稿、模型、目标、清单）未变时，返回同一实例（`===`），
+ * 配合 `@Immutable LagoonState` 与 `@Stable LagoonController` 让整套页面外框零重组跳过。
+ */
+@Composable
+internal fun rememberChatChromeState(state: LagoonState): LagoonState {
+  val holder = remember { arrayOfNulls<LagoonState>(1) }
+  val previous = holder[0]
+  val stripped = if (state.messages.isEmpty() && state.provisionalMessageIds.isEmpty()) state
+    else state.copy(messages = emptyList(), provisionalMessageIds = emptySet())
+  if (previous != null && sameChatChrome(previous, stripped)) {
+    return previous
+  }
+  holder[0] = stripped
+  return stripped
+}
+
+private fun sameChatChrome(a: LagoonState, b: LagoonState): Boolean {
+  if (a === b) return true
+  if (a.tasks === b.tasks) return a == b
+  if (a.tasks.size != b.tasks.size) return false
+  for ((id, oldTask) in a.tasks) {
+    val newTask = b.tasks[id] ?: return false
+    if (oldTask === newTask) continue
+    if (oldTask.copy(activeAt = newTask.activeAt) != newTask) return false
+  }
+  return a.copy(tasks = b.tasks) == b
+}
+
 @Composable
 fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> Unit, onOpenChild: (String) -> Unit, onModal: (Boolean) -> Unit, interactive: Boolean = true) {
-  val session = state.session
+  val chromeState = rememberChatChromeState(state)
+  val session = chromeState.session
   var sheet by remember { mutableStateOf<ChatSheet?>(null) }
   var menu by remember { mutableStateOf(false) }
   var rename by rememberSaveable { mutableStateOf(false) }
@@ -165,14 +196,14 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
   HyperLagoonTheme {
     Box(Modifier.fillMaxSize().background(HyperLagoonColors.canvas)) {
       Column(Modifier.fillMaxSize()) {
-        PageTopBar(state.title(session), onBack, subtitle = { SessionSubtitle(state, session) }) {
+        PageTopBar(chromeState.title(session), onBack, subtitle = { SessionSubtitle(chromeState, session) }) {
           Box {
             HyperIconButton(QoderGlyph.MORE, "会话操作", { menu = true }, backgroundColor = Color.Transparent)
             MenuPopup(menu, { menu = false }, menuSections)
           }
         }
-        ConnectionStrip(state, controller)
-        val transcriptStatus = state.resource("messages")
+        ConnectionStrip(chromeState, controller)
+        val transcriptStatus = chromeState.resource("messages")
         if (transcriptStatus.state == ResourceState.STALE || transcriptStatus.state == ResourceState.ERROR) {
           Text(
             if (transcriptStatus.state == ResourceState.STALE) "保留上次内容 · 正在后台重试" else (transcriptStatus.error ?: "加载失败"),
@@ -193,20 +224,20 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
               timelineTarget = state.server?.let { TimelineMutationTarget(it, session.id, session.revertMessageId) }; revertMessage = id
             }, onForkMessage = { id -> state.forkTarget(id)?.let { forkTarget = it } })
         }
-        if (session.parentId != null) ChildSessionBar(state, session, onBack,
-          onContinue = if ((state.server?.kind == ServerKind.DSH || state.server?.kind == ServerKind.DSH_REMOTE) &&
+        if (session.parentId != null) ChildSessionBar(chromeState, session, onBack,
+          onContinue = if ((chromeState.server?.kind == ServerKind.DSH || chromeState.server?.kind == ServerKind.DSH_REMOTE) &&
             session.subagentMode == "continuable") {
             { childContinue = true }
           } else null)
         else {
-          val goalSupported = state.server?.kind == ServerKind.DSH || state.server?.kind == ServerKind.DSH_REMOTE
-          LaunchedEffect(state.sessionId, state.connected, goalSupported) {
-            if (state.connected && goalSupported) controller.loadGoal()
+          val goalSupported = chromeState.server?.kind == ServerKind.DSH || chromeState.server?.kind == ServerKind.DSH_REMOTE
+          LaunchedEffect(chromeState.sessionId, chromeState.connected, goalSupported) {
+            if (chromeState.connected && goalSupported) controller.loadGoal()
           }
           // 状态轨只承载 DSH 的会话级目标与 todo 投影；OpenCode 没有这两项，组件自身不占位。
           if (goalSupported) ConversationStatusRail(state, controller)
-          HyperPendingActionDock(state, controller) { requestModal = it }
-          ChatComposer(state, controller, interactive, onModal = { composerModal = it }, onServerFile = if (state.capabilities.fileBrowser) ({ sheet = ChatSheet.FILES; controller.listFiles() }) else null)
+          HyperPendingActionDock(chromeState, controller) { requestModal = it }
+          ChatComposer(chromeState, controller, interactive, onModal = { composerModal = it }, onServerFile = if (chromeState.capabilities.fileBrowser) ({ sheet = ChatSheet.FILES; controller.listFiles() }) else null)
         }
       }
       // The last group stays composed while the overlay animates out.

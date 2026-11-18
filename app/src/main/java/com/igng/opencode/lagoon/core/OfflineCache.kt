@@ -19,7 +19,7 @@ class OfflineCache internal constructor(
 ) : CatalogCache {
   constructor(context: Context) : this(
     context.getSharedPreferences("offline_cache", Context.MODE_PRIVATE),
-    KeystoreCipher.of("lagoon-offline-cache", legacyAlias = "opencode-lagoon-offline-cache")::encrypt,
+    KeystoreCipher.also { it.install(context) }.of("lagoon-offline-cache", legacyAlias = "opencode-lagoon-offline-cache")::encrypt,
     KeystoreCipher.of("lagoon-offline-cache", legacyAlias = "opencode-lagoon-offline-cache")::decrypt
   )
   private val pendingLock = Any()

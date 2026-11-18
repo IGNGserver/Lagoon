@@ -162,10 +162,17 @@ internal fun ModelManagementSheet(state: LagoonState, controller: LagoonControll
             )
           )
         }
-        if (filtered.isNotEmpty()) item {
-          HyperCard(Modifier.fillMaxWidth().padding(horizontal = 8.dp), insidePadding = PaddingValues(vertical = 4.dp)) {
-            filtered.forEachIndexed { index, info ->
-              if (index > 0) HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
+        if (filtered.isNotEmpty()) {
+          val modelKeys = uniqueListKeys(filtered) { "model:${it.key}" }
+          itemsIndexed(
+            items = filtered,
+            key = { index, _ -> modelKeys[index] },
+            contentType = { _, _ -> "modelSwitchRow" }
+          ) { index, info ->
+            HyperGroupItem(
+              position = groupRowPosition(index, filtered.size),
+              horizontalMargin = 8.dp
+            ) {
               val checked = !state.modelVisibilityConfigured || state.modelOverrides[info.key] == true
               HyperSwitchRow(
                 title = info.choice.label,

@@ -53,9 +53,7 @@ internal fun CapsuleSelector(
   val shape = miuixCapsuleShape()
   Row(
     modifier
-      .clip(shape)
-      .background(HyperTheme.colors.container, shape)
-      .border(0.6.dp, HyperTheme.colors.cardBorder, shape)
+      .hyperSurface(shape, HyperTheme.colors.container, 0.6.dp, HyperTheme.colors.cardBorder)
       .hyperPress(enabled = enabled, scaleDown = 0.95f, onClick = onClick)
       .heightIn(min = HYPER_TOUCH_TARGET_DP.dp)
       .padding(start = if (leading == null) 12.dp else 10.dp, end = 8.dp),

@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
@@ -177,13 +178,18 @@ private fun androidx.compose.foundation.lazy.LazyListScope.deviceSection(
   onOpenDevice: (String) -> Unit
 ) {
   if (devices.isEmpty()) return
-  item { HyperGroupTitle(title) }
-  item {
-    HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(vertical = 4.dp)) {
-      devices.forEachIndexed { index, device ->
-        if (index > 0) HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
-        DeviceRow(device, state, controller, onOpenDevice)
-      }
+  item(key = "device-title:$title", contentType = "groupTitle") { HyperGroupTitle(title) }
+  val keys = uniqueListKeys(devices) { "device:$title:${it.id.value}" }
+  itemsIndexed(
+    items = devices,
+    key = { index, _ -> keys[index] },
+    contentType = { _, _ -> "deviceRow" }
+  ) { index, device ->
+    HyperGroupItem(
+      position = groupRowPosition(index, devices.size),
+      horizontalMargin = 0.dp
+    ) {
+      DeviceRow(device, state, controller, onOpenDevice)
     }
   }
 }

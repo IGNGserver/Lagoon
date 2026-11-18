@@ -7,12 +7,20 @@ internal val LagoonState.staleConnection: Boolean
 
 /** Tasks after applying the same offline TTL as [ServerOverviewSnapshot.displaySummary]. */
 internal val LagoonState.livePresentedTasks: Map<String, TaskState>
-  get() = if (staleConnection) presentedTasks.filterValues {
-    it.phase !in TaskState.RUNNING_PHASES && it.phase != TaskPhase.WAITING_SERVER
-  } else presentedTasks.filterValues { !it.uncertain }
+  get() {
+    val stale = staleConnection
+    livePresentedTasksCache?.takeIf { it.first == stale }?.let { return it.second }
+    val computed = if (stale) presentedTasks.filterValues {
+      it.phase !in TaskState.RUNNING_PHASES && it.phase != TaskPhase.WAITING_SERVER
+    } else presentedTasks.filterValues { !it.uncertain }
+    livePresentedTasksCache = stale to computed
+    return computed
+  }
 
 /** The local conversation overrides its own snapshot, never another server's state. */
-internal fun LagoonState.serverSnapshots(): Map<String, ServerOverviewSnapshot> {
+internal fun LagoonState.serverSnapshots(): Map<String, ServerOverviewSnapshot> = cachedServerSnapshots
+
+internal fun LagoonState.computeServerSnapshots(): Map<String, ServerOverviewSnapshot> {
   val enabledIds = enabledProfiles.mapTo(HashSet()) { it.id }
   val visible = if (enabledIds.size == profiles.size) allServerSnapshots
     else allServerSnapshots.filterKeys { it in enabledIds }
