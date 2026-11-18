@@ -27,6 +27,8 @@ import com.igng.opencode.lagoon.core.ConnectionGraph
 import com.igng.opencode.lagoon.core.DeviceAccess
 import com.igng.opencode.lagoon.core.DeviceView
 import com.igng.opencode.lagoon.core.DiscoveryCompleteness
+import com.igng.opencode.lagoon.core.HarnessProtocolId
+import com.igng.opencode.lagoon.core.serverSnapshots
 import com.igng.opencode.lagoon.core.HarnessSlot
 import com.igng.opencode.lagoon.core.HubAuthStatus
 import com.igng.opencode.lagoon.core.LagoonController
@@ -605,6 +607,22 @@ internal fun HarnessDetailScreen(
               }
             )
           }
+        }
+      }
+      if (profile.sshHostId != null && profile.protocol == HarnessProtocolId.OPENCODE_NATIVE) item {
+        HyperGroupTitle("OpenCode 服务")
+        HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(vertical = 4.dp)) {
+          val transportError = state.serverSnapshots()[profile.id]?.transportError?.takeIf { it.isNotBlank() }
+          HyperRow(
+            title = "服务状态",
+            summary = transportError ?: "应用只附着设备上运行中的服务，不会接管或终止它"
+          )
+          HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
+          HyperRow(
+            title = "启动或重启服务",
+            summary = "在设备上运行 opencode service，再重新读取注册并重连",
+            trailing = { HyperTextAction("执行", onClick = { controller.restartOpenCodeService(profile.id) }) }
+          )
         }
       }
       item {

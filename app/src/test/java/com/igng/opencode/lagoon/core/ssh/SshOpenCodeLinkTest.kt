@@ -242,6 +242,33 @@ class SshOpenCodeLinkTest {
     }
   }
 
+  @Test fun deadRegisteredServiceFailsFastInsteadOfHoldingTheReader() = runBlocking {
+    MockWebServer().use { server ->
+      server.dispatcher = openCodeDispatcher()
+      server.start(InetAddress.getByName(LOOPBACK), 0)
+      LinkFixture(server, serviceAlive = false).use { fixture ->
+        val started = System.currentTimeMillis()
+        val failure = runCatching { withTimeout(15_000) { fixture.link.awaitHarness() } }.exceptionOrNull()
+        val elapsed = System.currentTimeMillis() - started
+        assertTrue("A dead service must surface a typed failure quickly: $failure", failure is SshFailure)
+        assertEquals(SshFailureKind.UNRESPONSIVE, (failure as SshFailure).kind)
+        assertTrue("Expected a fast failure, took ${elapsed}ms", elapsed < 8_000)
+        assertTrue(failure.message.contains("opencode service"))
+        // Nothing was tunnelled and no credential-bearing request reached a service that is down.
+        assertEquals(0, server.requestCount)
+        assertTrue(fixture.transport.tunnels.isEmpty())
+        fixture.assertOnlyReadOnlyDiscovery()
+        // The background loop keeps retrying; a later read sees the same actionable failure.
+        assertTimeoutOrFailure(fixture.link)
+      }
+    }
+  }
+
+  private suspend fun assertTimeoutOrFailure(link: SshHostLink) {
+    val again = runCatching { withTimeout(5_000) { link.awaitHarness() } }.exceptionOrNull()
+    assertTrue("Retries must stay observable: $again", again is SshFailure)
+  }
+
   private fun json(body: String) = MockResponse().setHeader("Content-Type", "application/json").setBody(body)
 
   private fun assertRequest(server: MockWebServer, method: String, path: String): RecordedRequest {
@@ -254,11 +281,11 @@ class SshOpenCodeLinkTest {
     return request
   }
 
-  private class LinkFixture(server: MockWebServer) : Closeable {
+  private class LinkFixture(server: MockWebServer, private val serviceAlive: Boolean = true) : Closeable {
     private val job = SupervisorJob()
     private val scope = CoroutineScope(job + Dispatchers.IO)
     val steps = CopyOnWriteArrayList<SshLinkStep>()
-    val transport = LoopbackTransport(server.port)
+    val transport = LoopbackTransport(server.port, serviceAlive)
     val factory = PinnedFactory(transport)
     private val config = SshHostConfig("ssh-host", "SSH fixture", "ssh.example.test", user = "ssh-user",
       // OpenCode must ignore the saved host's DSH launch command even when one is present.
@@ -270,11 +297,13 @@ class SshOpenCodeLinkTest {
       onStatus = { steps += it.step })
 
     fun assertOnlyReadOnlyDiscovery() {
-      assertEquals(listOf(SshHarnessProbe.probeScript(REGISTRATION_PATH)), transport.scripts.toList())
-      assertEquals(listOf(20_000L), transport.execTimeouts.toList())
+      // One read, plus at most one re-read after a stale registration.
+      assertTrue(transport.scripts.size in 1..2)
+      transport.scripts.forEach { assertEquals(SshHarnessProbe.probeScript(REGISTRATION_PATH), it) }
+      transport.execTimeouts.forEach { assertEquals(25_000L, it) }
       transport.scripts.forEach { script ->
         assertTrue(script.contains("os.O_RDONLY"))
-        listOf("nohup", "mkdir ", "chmod ", "os.kill", "subprocess", "kill ", "dsh web", "opencode serve")
+        listOf("nohup", "mkdir ", "chmod ", "os.kill", "kill ", "dsh web", "opencode serve")
           .forEach { forbidden -> assertFalse("Discovery executed a process mutation: $forbidden", script.contains(forbidden)) }
       }
     }
@@ -311,7 +340,10 @@ class SshOpenCodeLinkTest {
   }
 
   /** Emulates direct-tcpip by relaying the real forwarder's streams to MockWebServer sockets. */
-  private class LoopbackTransport(private val serverPort: Int) : SshTransport {
+  private class LoopbackTransport(
+    private val serverPort: Int,
+    private val serviceAlive: Boolean = true
+  ) : SshTransport {
     private val closed = AtomicBoolean()
     private val workers = Executors.newCachedThreadPool { task ->
       Thread(task, "lagoon-opencode-test-pump").apply { isDaemon = true }
@@ -331,6 +363,8 @@ class SshOpenCodeLinkTest {
         .put("url", "http://$LOOPBACK:$serverPort/").put("pid", PID).put("password", PASSWORD).toString()
       val observation = JSONObject().put("state", "present").put("path", REGISTRATION_PATH)
         .put("rawBase64", Base64.getEncoder().encodeToString(raw.toByteArray(Charsets.UTF_8)))
+        .put("info", if (serviceAlive) JSONObject().put("ok", true).put("status", 200).put("pid", PID).put("version", VERSION)
+          else JSONObject().put("ok", false))
       val envelope = JSONObject().put("python", true).put("opencode", observation)
         // A legacy DSH marker must not cause a DSH bootstrap for an OpenCode binding.
         .put("dshLegacy", JSONObject().put("state", "present").put("path", "/home/fixture/.dsh-app-remote"))

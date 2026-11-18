@@ -31,6 +31,11 @@ data class ServerOverviewSnapshot(
   /** Wall clock of the last successful control-plane read; drives the offline task TTL. */
   val lastReadAt: Long = 0,
   val error: String? = null,
+  /**
+   * Transport-level failure (SSH/Codex/AGY), kept apart from [error]/[remoteRecovery] so a Hub
+   * recovery action is never guessed from an SSH failure. Cleared by the next successful read.
+   */
+  val transportError: String? = null,
   val degraded: Boolean = false,
   val streamConnected: Boolean = false,
   /** The instance accepts `POST /api/session/{id}/view`; DSH and documented-absent instances do not. */
@@ -591,13 +596,13 @@ internal class AllServersOverview(
           } catch (error: Exception) {
             if (isNonRetryableRemoteFailure(error)) parkedNonRetryable.set(true)
             val recovery = remoteFailure(error)?.kind?.recovery()
-            if (recovery != null) {
-              snapshot = snapshot.copy(
-                connected = false,
-                error = userFacingError(error, "连接失败"),
-                remoteRecovery = recovery
-              )
-            }
+            // Every failure is visible, not only the Hub ones that carry a recovery action.
+            snapshot = snapshot.copy(
+              connected = false,
+              error = if (recovery != null) userFacingError(error, "连接失败") else snapshot.error,
+              transportError = if (recovery == null) transportFailureText(error) else null,
+              remoteRecovery = recovery ?: snapshot.remoteRecovery
+            )
             Diagnostics.warn("AllServers", "服务器 ${profile.name} 实时连接断开", error)
           }
           // A cancelled monitor from an older client must not unregister its replacement's stream.
@@ -821,6 +826,7 @@ internal class AllServersOverview(
       loading = false,
       lastReadAt = now(),
       error = null,
+      transportError = null,
       remoteRecovery = null,
       degraded = degraded,
       projects = projects,
@@ -892,4 +898,11 @@ internal class AllServersOverview(
     const val EVENT_READ_COALESCE_MILLIS = 3_000L
     const val STREAM_RESTART = "实时连接重建"
   }
+}
+
+
+/** One readable line for a transport failure; SshFailure already redacts remote detail. */
+internal fun transportFailureText(error: Throwable): String {
+  val ssh = generateSequence(error) { it.cause }.filterIsInstance<SshFailure>().firstOrNull()
+  return ssh?.display() ?: userFacingError(error, "连接失败")
 }

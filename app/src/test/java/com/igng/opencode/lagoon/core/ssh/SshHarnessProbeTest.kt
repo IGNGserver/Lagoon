@@ -17,15 +17,17 @@ class SshHarnessProbeTest {
   private val registration = """{"id":"generation","version":"2.2.6","url":"http://127.0.0.1:5000/","pid":12,"password":"discovery-secret"}"""
 
   @Test fun usesOneBoundedExecAndDoesNotOpenChannelsOrOwnTransport() {
-    val transport = FakeTransport(envelope(registration))
+    val transport = FakeTransport(envelope(registration, info = healthyInfo()))
     val probe = SshHarnessProbe(transport) { 100 }
     val result = probe.discover()
     assertEquals(1, transport.execCount)
-    assertEquals(20_000L, transport.timeout)
+    assertEquals(25_000L, transport.timeout)
     assertEquals(SshDiscoveryState.PRESENT, result.openCode.state)
     assertEquals(DiscoveryCompleteness.COMPLETE, result.completeness)
     assertEquals("discovery-secret", result.openCode.registration?.password)
-    assertEquals(DiscoveryValue.UNKNOWN, result.openCodeStatus().available)
+    assertEquals(DiscoveryValue.YES, result.openCodeStatus().available)
+    assertEquals(DiscoveryValue.YES, result.openCodeStatus().authenticated)
+    assertTrue(result.openCode.verified)
     assertEquals(SshDiscoveryState.PRESENT, result.dshLegacy.state)
     assertEquals("/home/dev/.dsh-app-remote", result.dshLegacy.descriptor?.markerPath)
     assertFalse(result.toString().contains("discovery-secret"))
@@ -94,9 +96,14 @@ class SshHarnessProbeTest {
     listOf("relative/service.json", "/tmp/x\ncommand", "/tmp/x\u0000").forEach { invalid ->
       assertTrue(runCatching { SshHarnessProbe.probeScript(invalid) }.isFailure)
     }
-    listOf("nohup", "mkdir ", "chmod ", "unlink(", "remove(", "os.kill", "subprocess", "urlopen", "curl ").forEach { forbidden ->
+    // The only allowed process or network side effect is one bounded `opencode --version` and one
+    // bounded loopback /api/info. No shell, no arbitrary command, no public network.
+    listOf("nohup", "mkdir ", "chmod ", "unlink(", "remove(", "os.kill", "urlopen", "curl ",
+      "shell=True", "os.system", "Popen(", "request('POST'").forEach { forbidden ->
       assertFalse("Unexpected side effect: $forbidden", script.contains(forbidden))
     }
+    assertTrue(script.contains("[found, '--version']"))
+    assertTrue(script.contains("connection.request('GET', '/api/info'"))
     assertTrue(script.contains("stream.read(16385)"))
     assertTrue(script.contains("os.O_RDONLY"))
   }
@@ -129,13 +136,69 @@ class SshHarnessProbeTest {
     } finally { root.deleteRecursively() }
   }
 
-  private fun envelope(raw: String?, state: String = "present", issue: String? = null): String {
+  @Test fun deadServiceStaleRegistrationAndLoosePermissionsAreDistinct() {
+    val dead = SshHarnessProbe.parseOutput(envelope(registration, info = JSONObject().put("ok", false)), 100)
+    assertEquals(SshDiscoveryState.PRESENT, dead.openCode.state)
+    assertEquals(false, dead.openCode.listening)
+    assertEquals(SshDiscoveryReason.SERVICE_UNREACHABLE, dead.reasonCode())
+    assertEquals(DiscoveryValue.NO, dead.openCodeStatus().available)
+
+    val stale = SshHarnessProbe.parseOutput(
+      envelope(registration, info = JSONObject().put("ok", true).put("status", 200).put("pid", 99).put("version", "2.2.6")), 100)
+    assertEquals(SshDiscoveryIssue.REGISTRATION_STALE, stale.openCode.issue)
+    assertEquals(SshDiscoveryReason.REGISTRATION_STALE, stale.reasonCode())
+    assertEquals(DiscoveryValue.NO, stale.openCodeStatus().compatible)
+
+    val refused = SshHarnessProbe.parseOutput(envelope(registration, info = healthyInfo()), 100)
+    assertEquals(DiscoveryValue.YES, refused.openCodeStatus().available)
+
+    val loose = SshHarnessProbe.parseOutput(envelope(registration, info = healthyInfo(), loose = true), 100)
+    assertEquals(SshDiscoveryReason.LOOSE_PERMISSIONS, loose.reasonCode())
+    assertEquals(DiscoveryValue.YES, loose.openCodeStatus().available)
+
+    val untrusted = SshHarnessProbe.parseOutput(envelope(registration, info = healthyInfo(), untrusted = true), 100)
+    assertEquals(SshDiscoveryState.UNKNOWN, untrusted.openCode.state)
+    assertEquals(SshDiscoveryIssue.PERMISSIONS_TOO_OPEN, untrusted.openCode.issue)
+    assertEquals(SshDiscoveryReason.PERMISSIONS_TOO_OPEN, untrusted.reasonCode())
+    assertNull(untrusted.openCode.registration)
+    assertEquals(DiscoveryCompleteness.PARTIAL, untrusted.completeness)
+  }
+
+  @Test fun versionBelowTwoAndNonOpencodePortAreNotCompatible() {
+    val older = SshHarnessProbe.parseOutput(
+      envelope(registration.replace("2.2.6", "1.18.18"),
+        info = JSONObject().put("ok", true).put("status", 200).put("pid", 12).put("version", "1.18.18")), 100)
+    assertEquals(DiscoveryValue.NO, older.openCodeStatus().compatible)
+    assertEquals(DiscoveryValue.NO, older.openCodeStatus().available)
+
+    val wrongPort = SshHarnessProbe.parseOutput(
+      envelope(registration, info = JSONObject().put("ok", true).put("status", 404)), 100)
+    assertTrue(wrongPort.openCode.protocolMismatch)
+    assertEquals(SshDiscoveryReason.PROTOCOL_MISMATCH, wrongPort.reasonCode())
+  }
+
+  private fun envelope(
+    raw: String?,
+    state: String = "present",
+    issue: String? = null,
+    info: JSONObject? = null,
+    untrusted: Boolean = false,
+    loose: Boolean = false
+  ): String {
     val oc = JSONObject().put("path", path).put("state", state)
     if (raw != null) oc.put("rawBase64", Base64.getEncoder().encodeToString(raw.toByteArray()))
     if (issue != null) oc.put("issue", issue)
+    if (info != null) oc.put("info", info)
+    if (untrusted) oc.put("untrusted", true)
+    if (loose) oc.put("loose", true)
     return "LAGOON_SSH_DISCOVERY " + JSONObject().put("python", true).put("opencode", oc)
+      .put("opencodeBinary", JSONObject().put("installed", true)
+        .put("path", "/home/dev/.opencode/bin/opencode").put("version", "2.2.6"))
       .put("dshLegacy", JSONObject().put("path", "/home/dev/.dsh-app-remote").put("state", "present"))
   }
+
+  private fun healthyInfo(): JSONObject =
+    JSONObject().put("ok", true).put("status", 200).put("pid", 12).put("version", "2.2.6")
 
   private class FakeTransport(private val output: String, private val exit: Int = 0) : SshTransport {
     var execCount = 0

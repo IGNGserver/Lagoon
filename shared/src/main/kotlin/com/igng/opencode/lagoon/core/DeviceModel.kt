@@ -256,7 +256,14 @@ object DeviceProjection {
     candidates(access).forEach { (protocol, locator, name) ->
       if (slots.values.none { it.protocol == protocol }) put(HarnessSlot(
         key = slotKey(protocol, locator), protocol = protocol, locator = locator, name = name,
-        attachable = true, reason = if (discovery == null) "尚未发现；启用后会按该接入方式连接" else "未检测到此 Harness"
+        attachable = true,
+        reason = when {
+          access == DeviceAccess.SSH && protocol == HarnessProtocolId.OPENCODE_NATIVE ->
+            if (discovery == null) "尚未发现；添加可先保存，再从详情页启动服务"
+            else "未发现运行中的 OpenCode 服务；添加后可一键启动"
+          discovery == null -> "尚未发现；启用后会按该接入方式连接"
+          else -> "未检测到此 Harness"
+        }
       ))
     }
     return slots.values.sortedWith(compareBy({ protocolOrder(it.protocol) }, { it.name }))

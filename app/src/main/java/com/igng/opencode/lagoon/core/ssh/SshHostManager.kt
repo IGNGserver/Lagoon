@@ -51,7 +51,11 @@ internal class SshHostManager(
     val hostId = profile.sshHostId ?: throw SshFailure(SshFailureKind.OTHER, "不是 SSH 主机资料", retryable = false)
     val config = store.load().firstOrNull { it.id == hostId }
       ?: throw SshFailure(SshFailureKind.OTHER, "SSH 主机配置已删除", retryable = false)
-    require(profile.url == config.profileUrl() && profile.username == config.user) { "SSH 保存配置已变化，请重新保存绑定路由" }
+    // Typed, not IllegalArgumentException: callers (overview/notification) only recognize SshFailure
+    // and would otherwise swallow a stale route as an anonymous crash.
+    if (profile.url != config.profileUrl() || profile.username != config.user) {
+      throw SshFailure(SshFailureKind.OTHER, "SSH 保存配置已变化，请重新保存绑定路由", retryable = false)
+    }
     if (profile.protocol in setOf(HarnessProtocolId.CODEX_APP_SERVER, HarnessProtocolId.ANTIGRAVITY_ACP)) {
       val entry = synchronized(lock) {
         val current = codexLinks[profile.id]?.takeUnless { it.client.isClosed }
@@ -247,6 +251,20 @@ internal class SshHostManager(
         if (key.fingerprint != pin) throw SshFailure(SshFailureKind.HOST_KEY_CHANGED, "SSH 主机指纹已变化", retryable = false, presentedKey = key)
         true
       }).use { SshHarnessProbe(it).discover(path) }
+    }
+
+  /**
+   * Starts or restarts the user's OpenCode background service. Explicit action only: discovery
+   * never runs this, and the profile is not touched until the caller re-reads the registration.
+   */
+  suspend fun startOpenCodeService(config: SshHostConfig, secrets: SshSecrets): OpenCodeServiceResult =
+    kotlinx.coroutines.runInterruptible(Dispatchers.IO) {
+      val pin = config.hostKeyFingerprint?.takeIf(String::isNotBlank)
+        ?: throw SshFailure(SshFailureKind.HOST_KEY_UNKNOWN, "请先确认 SSH 主机指纹", retryable = false)
+      transports.connect(config, secrets, SshHostKeyVerifier { key ->
+        if (key.fingerprint != pin) throw SshFailure(SshFailureKind.HOST_KEY_CHANGED, "SSH 主机指纹已变化", retryable = false, presentedKey = key)
+        true
+      }).use { SshOpenCodeService(it).restart() }
     }
 
   suspend fun discoverCodex(config: SshHostConfig, secrets: SshSecrets): SshCodexObservation =

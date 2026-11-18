@@ -26,6 +26,16 @@ SSH 发现会在一条经过指纹验证的连接上分别检查各 Harness；�
 显式注册路径保留各自身份。未发现默认服务时可在电脑上执行 `opencode service start` 后刷新。
 该命令由 [OpenCode 官方文档](https://github.com/anomalyco/opencode/blob/dev/services/site/src/docs/content/troubleshooting.mdx)说明。
 
+发现不只读文件：同一次只读探测还会查看 `opencode` 可执行文件与版本，并对注册里的 loopback
+端口发一次有界 `GET /api/info`（带注册文件自己的密码）。因此「注册文件还在，但服务已经退出」
+会显示成「服务未运行（注册可能已过期）」，而不是「已发现」。注册文件由其他用户拥有或任何人
+可写时拒绝使用；同组可写仍可使用，但会提示 `chmod 600`。服务重启后 pid/端口会变化，连接会
+自动重读一次注册；仍然不一致才报错。
+
+在 Harness 详情页可以对 OpenCode 执行「启动或重启服务」（等价于在设备上运行
+`opencode service start`/`restart`）：这是用户点的一次显式动作，发现流程永远不会启动或停止
+进程。应用不接管该进程，也不会在退出时结束它。
+
 DSH、Codex 和 Antigravity 的发现会检查可执行程序；找到程序不等于已登录或可正常工作，实际
 状态以连接后返回的信息为准。对自定义 DSH 启动命令，发现不会运行该命令，也不能因找不到全局
 `dsh` 就断定自定义命令不可用。
