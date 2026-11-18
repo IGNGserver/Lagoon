@@ -128,13 +128,22 @@ internal fun SshKeychainManagerSheet(
       }
 
       if (state.sshKeys.isEmpty()) {
+        val loadError = controller.sshKeyLoadError()
         HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(16.dp)) {
           Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            Text("还没有保存的 SSH 密钥", style = MiuixTheme.textStyles.body1)
-            Text(
-              "可以本机生成 Ed25519 / 硬件密钥，或导入已有私钥；同一把密钥可被多台 SSH 主机复用。",
-              style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary)
-            )
+            if (loadError != null) {
+              Text("SSH 密钥库读取失败", style = MiuixTheme.textStyles.body1.copy(color = MiuixColorTokens.Error))
+              Text(
+                "$loadError。数据可能仍在磁盘上，先不要重新导入覆盖；重启应用后再看，仍然失败需要读取日志。",
+                style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary)
+              )
+            } else {
+              Text("还没有保存的 SSH 密钥", style = MiuixTheme.textStyles.body1)
+              Text(
+                "可以本机生成 Ed25519 / 硬件密钥，或导入已有私钥；同一把密钥可被多台 SSH 主机复用。",
+                style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary)
+              )
+            }
           }
         }
       } else {

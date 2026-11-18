@@ -30,9 +30,19 @@ internal class SshKeyStore internal constructor(
   @Volatile var revision: Long = 0L
     private set
 
+  /**
+   * 最近一次 [load] 的失败原因。读取失败时仍返回空列表（调用方不必处处 try/catch），
+   * 但界面必须据此说明“读取失败”，否则用户会以为密钥被删了。
+   */
+  @Volatile var loadError: String? = null
+    private set
+
   fun load(): List<SshKeyProfile> = try {
-    readKeys()
+    val keys = readKeys()
+    loadError = null
+    keys
   } catch (error: IOException) {
+    loadError = error.message ?: "SSH 密钥库读取失败"
     Diagnostics.warn("SshKeyStore", "SSH 密钥库读取失败，界面暂不显示", error)
     emptyList()
   }
