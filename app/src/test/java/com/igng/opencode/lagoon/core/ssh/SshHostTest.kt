@@ -382,7 +382,10 @@ class SshHostTest {
       val a = first.get(30, TimeUnit.SECONDS); val b = second.get(30, TimeUnit.SECONDS)
       launched = a.pid?.let(::captureFixturePid)
       assertEquals(a.pid, b.pid)
-      assertTrue("exactly one client must reuse the other's process", a.reused != b.reused)
+      assertTrue(
+        "exactly one client must reuse the other's process (a=$a b=$b launches=${File(fixtureHome, "launches").readLines()})",
+        a.reused != b.reused
+      )
       assertEquals(listOf("launch"), File(fixtureHome, "launches").readLines())
     } finally {
       launched?.let(::stopFixturePid)
