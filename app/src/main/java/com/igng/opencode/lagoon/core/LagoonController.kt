@@ -478,7 +478,9 @@ class LagoonController private constructor(private val appContext: Context) {
           completeness = if (codex.installed != null && codex.issue == null) DiscoveryCompleteness.COMPLETE else DiscoveryCompleteness.PARTIAL,
           reason = explanation(codex.issue)), codex.version.orEmpty())
     )
-    found.openCodeAcp?.let { acp ->
+    // An absent binary is already explained by the native row; only report ACP when it exists,
+    // when the version lacks it, or when the probe could not finish.
+    found.openCodeAcp?.takeIf { it.supported != false || it.issue != null }?.let { acp ->
       harnesses += DiscoveredHarness(HarnessProtocolId.OPENCODE_ACP, null, "OpenCode ACP",
         HarnessDiscoveryStatus(
           installed = value(acp.supported), compatible = value(acp.supported),
