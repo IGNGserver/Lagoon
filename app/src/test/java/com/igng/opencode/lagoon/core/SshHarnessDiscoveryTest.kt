@@ -23,6 +23,17 @@ class SshHarnessDiscoveryTest {
     assertFalse(first.toString().contains("test-secret"))
   }
 
+  @Test fun newerServersMayAddFieldsWithoutMakingTheRegistrationUnreadable() {
+    val extended = valid.dropLast(1) + ""","startedAt":1790000000,"meta":{"transport":"local"},"secure":true,"note":null}"""
+    val value = requireNotNull(OpenCodeSshRegistration.parse(path, extended))
+    assertEquals(123, value.pid)
+    assertEquals("2.2.6", value.version)
+    assertEquals("test-secret", value.password)
+    // Explicitly null or wrongly typed known fields are still rejected: absent is not the same.
+    assertNull(OpenCodeSshRegistration.parse(path, valid.replace("\"version\":\"2.2.6\"", "\"version\":null")))
+    assertNull(OpenCodeSshRegistration.parse(path, valid.dropLast(1) + ",\"version\":null}"))
+  }
+
   @Test fun optionalFieldsMayBeAbsentAndIpv6IsAnExactLoopbackLiteral() {
     val value = requireNotNull(OpenCodeSshRegistration.parse(path, """{"url":"http://[::1]:1234","pid":1}"""))
     assertEquals("::1", value.host)
@@ -50,7 +61,6 @@ class SshHarnessDiscoveryTest {
       valid.replace("\"id\"", "id"),
       valid.replace('"', '\''),
       valid.dropLast(1) + ",}",
-      valid.dropLast(1) + ",\"unknown\":1}",
       "$valid trailing",
       "[$valid]"
     ).forEach { assertNull("Should reject invalid registration", OpenCodeSshRegistration.parse(path, it)) }

@@ -23,8 +23,9 @@ class SshDeviceDiscoveryTest {
       assertNull(result.codex.installed)
       assertEquals("probe_failed", result.codex.issue)
       assertEquals(false, result.agy.installed)
+      assertEquals(false, result.openCodeAcp?.supported)
       assertEquals(DiscoveryCompleteness.PARTIAL, result.completeness)
-      assertEquals(6, factory.commands)
+      assertEquals(7, factory.commands)
       assertTrue(factory.closed)
     } finally { manager.closeAll() }
   }
@@ -63,6 +64,7 @@ class SshDeviceDiscoveryTest {
             script.contains("LAGOON_CODEX_DISCOVERY") -> if (codexFailure) RemoteExecResult(1, "", "")
               else RemoteExecResult(0, "LAGOON_CODEX_DISCOVERY version:codex 1\n", "")
             script.contains("LAGOON_AGY_DISCOVERY") -> RemoteExecResult(0, "LAGOON_AGY_DISCOVERY absent\n", "")
+            script.contains("LAGOON_OPENCODE_ACP") -> RemoteExecResult(0, "LAGOON_OPENCODE_ACP absent\n", "")
             else -> error("Unexpected command")
           }
         }

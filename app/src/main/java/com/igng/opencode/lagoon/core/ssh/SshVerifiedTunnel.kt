@@ -265,6 +265,24 @@ def process_snapshot():
             except ValueError: continue
     else: raise Unsupported()
     return result
+def minimal_snapshot(root):
+    # A non-descendant target only needs its own parent/start-time entry. Reading every process
+    # twice was the dominant cost of each new socket on busy hosts.
+    if sys.platform.startswith('linux'):
+        try:
+            with open('/proc/'+str(root)+'/stat','r',encoding='ascii') as f: value=f.read(8192)
+            fields=value[value.rfind(')')+2:].split()
+            require(len(fields)>=20)
+            return {root:(int(fields[1]), fields[19])}
+        except OSError: raise Denied()
+    env=dict(os.environ); env['LC_ALL']='C'
+    try:
+        proc=subprocess.run(['/bin/ps','-p',str(root),'-o','ppid=,lstart='],stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,timeout=4,env=env)
+    except (OSError, subprocess.SubprocessError): raise Unsupported()
+    fields=proc.stdout.decode('ascii','strict').strip().split(None,1)
+    require(len(fields)==2)
+    return {root:(int(fields[0]), ' '.join(fields[1].split()))}
 def chain(pid, root, snapshot, descendants):
     path=[]; seen=set()
     while pid not in seen and len(path)<256:
@@ -375,7 +393,9 @@ try:
     data=json.loads(base64.b64decode(sys.argv[1],validate=True).decode('utf-8'))
     root,descendants,start=target_state(data)
     host=data['host']; port=int(data['port'])
-    before=process_snapshot(); require(root in before)
+    def snapshot():
+        return process_snapshot() if descendants else minimal_snapshot(root)
+    before=snapshot(); require(root in before)
     if start is not None: require(before[root][1]==start)
     family=socket.AF_INET6 if host=='::1' else socket.AF_INET
     channel=socket.socket(family,socket.SOCK_STREAM); channel.settimeout(5); channel.connect((host,port))
@@ -389,7 +409,7 @@ try:
     require(len(response.read(1024*1024+1))<=1024*1024)
     pids=eligible(root,before,descendants); require(len(pids)<=256)
     owner=verify_linux(pids,host,port,client_port) if sys.platform.startswith('linux') else verify_darwin(pids,host,port,client_port)
-    after=process_snapshot()
+    after=snapshot()
     require(chain(owner,root,before,descendants)==chain(owner,root,after,descendants) and chain(owner,root,after,descendants) is not None)
     require(target_state(data)==(root,descendants,start))
     channel.settimeout(None); signal.setitimer(signal.ITIMER_REAL,0)

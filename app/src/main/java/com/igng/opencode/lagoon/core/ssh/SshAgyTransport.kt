@@ -47,8 +47,18 @@ internal class SshAgyTransport(
   private val config: SshHostConfig,
   private val secrets: SshSecrets,
   private val factory: SshTransportFactory,
-  private val timeoutMillis: Long = 60_000
+  private val timeoutMillis: Long = 60_000,
+  /** Fixed ACP command; callers pass an app-owned literal, never profile text. */
+  private val command: String = "agy acp",
+  /** Short label used only in local diagnostics. */
+  private val label: String = "AGY",
+  /** Antigravity publishes a directory database that OpenCode ACP does not. */
+  private val catalog: Boolean = true
 ) : AgyTransport {
+  init {
+    require(command.matches(Regex("[a-z0-9][a-z0-9 ._-]{0,64}")) && "  " !in command) { "Invalid ACP command" }
+    require(label.isNotBlank() && label.length <= 32) { "Invalid ACP label" }
+  }
   private val gate = Mutex()
   private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
   private val closed = AtomicBoolean(false)
@@ -114,8 +124,8 @@ internal class SshAgyTransport(
     require(method.isNotBlank() && method.length <= 256)
     ensureReady()
     val result = request(method, params, if (method == "session/prompt") 30 * 60_000L else timeoutMillis)
-    return if (method == "session/list") withContext(Dispatchers.IO) {
-      SshAgyCatalog.enrich(connection ?: throw IOException("SSH 连接已关闭"), result)
+    return if (method == "session/list" && catalog) withContext(Dispatchers.IO) {
+      SshAgyCatalog.enrich(connection ?: throw IOException("$label SSH connection closed"), result)
     } else result
   }
 
@@ -183,13 +193,13 @@ internal class SshAgyTransport(
           true
         })
         synchronized(lifecycleLock) {
-          if (closed.get()) { lease.close(); throw IOException("AGY SSH transport closed") }
+          if (closed.get()) { lease.close(); throw IOException("$label SSH transport closed") }
           connection = lease
         }
         // Fixed command only. No user-provided path or arguments are interpreted as shell code.
-        val exec = lease.openExecChannel(SshExecutableSearch.prologue + "\nexec agy acp")
+        val exec = lease.openExecChannel(SshExecutableSearch.prologue + "\nexec " + command)
         synchronized(lifecycleLock) {
-          if (closed.get()) { exec.close(); throw IOException("AGY SSH transport closed") }
+          if (closed.get()) { exec.close(); throw IOException("$label SSH transport closed") }
           channel = exec
         }
         scope.launch { readMessages(exec) }
@@ -198,7 +208,7 @@ internal class SshAgyTransport(
         scope.launch { try { val buffer = ByteArray(8192); while (exec.stderr.read(buffer) >= 0) { } } catch (_: Exception) { } }
         val initialization = request("initialize", JSONObject().put("protocolVersion", 1)
           .put("clientCapabilities", JSONObject().put("elicitation", JSONObject().put("form", JSONObject()))).put("clientInfo", JSONObject().put("name", "lagoon").put("version", "1")))
-        if (initialization.optInt("protocolVersion", -1) != 1) throw IOException("AGY ACP 版本不兼容")
+        if (initialization.optInt("protocolVersion", -1) != 1) throw IOException("$label ACP 版本不兼容")
         check(!closed.get()) { "AGY SSH transport closed during initialization" }
         initializedCapabilities = initialization
         ready = true
@@ -260,7 +270,7 @@ internal class SshAgyTransport(
     withTimeout(timeoutMillis) {
       while (true) {
         val acquired = synchronized(eventLock) {
-          if (closed.get()) throw IOException("AGY SSH transport closed")
+          if (closed.get()) throw IOException("$label SSH transport closed")
           if (queuedEventBytes + size <= MAX_QUEUED_EVENT_BYTES) { queuedEventBytes += size; true } else false
         }
         if (acquired) return@withTimeout

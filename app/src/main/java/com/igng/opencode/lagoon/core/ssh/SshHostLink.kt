@@ -99,6 +99,8 @@ internal class SshHostLink(
   @Volatile private var connectJob: Job? = null
   @Volatile private var keepAliveJob: Job? = null
   @Volatile private var attempt = 0
+  /** First-ever attach failure, surfaced to readers instead of blocking the whole start budget. */
+  @Volatile private var firstAttachFailure: SshFailure? = null
 
   /** Waits until this link has an authenticated DshApi; starts the link on first use.
    *  [sinceGeneration] waits for a client newer than that generation, so a caller that already holds
@@ -110,6 +112,10 @@ internal class SshHostLink(
   suspend fun awaitHarness(timeoutMillis: Long = HARNESS_START_BUDGET_MILLIS, sinceGeneration: Long = -1): HarnessClient {
     if (closed) throw SshFailure(SshFailureKind.DISCONNECTED, "SSH 主机已移除", retryable = false)
     client?.takeIf { !it.isClosed && mutableStatus.value.isConnected && generation.get() > sinceGeneration }?.let { return it }
+    // A binding that never connected reports the attempt's typed failure instead of holding the
+    // reader for the whole 4-minute start budget. The background loop keeps retrying, and the next
+    // read picks up the client as soon as the service answers.
+    firstAttachFailure?.let { failure -> if (generation.get() == 0L && !closed) throw failure }
     val failed = mutableStatus.value
     if (failed.phase == SshLinkPhase.FAILED) {
       val error = failed.error
@@ -138,7 +144,9 @@ internal class SshHostLink(
           // A completed ready from the previous generation must not recurse or spin. Await an
           // actual state transition under the original deadline before reading the new gate.
           mutableStatus.first { closed || ready !== pending || generation.get() > sinceGeneration ||
-            it.phase == SshLinkPhase.FAILED }
+            it.phase == SshLinkPhase.FAILED || (generation.get() == 0L && firstAttachFailure != null) }
+          val first = firstAttachFailure
+          if (generation.get() == 0L && first != null) throw first
           val failure = mutableStatus.value.error
           if (mutableStatus.value.phase == SshLinkPhase.FAILED && failure != null) throw failure
         }
@@ -194,6 +202,7 @@ internal class SshHostLink(
       if (closed) return
       if (mutableStatus.value.phase == SshLinkPhase.FAILED || mutableStatus.value.phase == SshLinkPhase.IDLE) {
         attempt = 0
+        firstAttachFailure = null
         if (ready.isCompleted) ready = CompletableDeferred()
         if (connectJob?.isActive != true) connectJob = scope.launch(Dispatchers.IO) { connectLoop() }
       }
@@ -229,6 +238,17 @@ internal class SshHostLink(
       } catch (error: Throwable) {
         if (closed) return
         val failure = sshFailure(error, "SSH 连接失败")
+        if (generation.get() == 0L) {
+          // A first-ever attach must not hold its reader for the whole start budget. Fail the
+          // current gate now, keep retrying in the background, and let the next read pick up the
+          // client as soon as the service answers.
+          firstAttachFailure = failure
+          val pending = ready
+          if (!pending.isCompleted) {
+            pending.completeExceptionally(failure)
+            ready = CompletableDeferred()
+          }
+        }
         if (!failure.retryable) {
           fail(failure)
           return
@@ -354,18 +374,71 @@ internal class SshHostLink(
     }
   }
 
-  /** Attach-only OpenCode: registration discovery never launches or terminates a process. */
+  /**
+   * Attach-only OpenCode: registration discovery never launches or terminates a process.
+   *
+   * The registration is the service's own statement of where it listens and who it is. A service
+   * that restarted or was upgraded rewrites it, so a mismatch is retried once against a fresh read
+   * instead of parking the binding on a stale pid. A registration that is present while nothing
+   * answers is reported as "not running" before the tunnel proof would time out.
+   */
   private suspend fun attachOpenCode(nextTransport: SshTransport) {
     publish(SshLinkPhase.CONNECTING, SshLinkStep.TUNNEL, "正在读取 OpenCode 服务注册", attempt = attempt)
-    val registration = kotlinx.coroutines.runInterruptible(Dispatchers.IO) {
-      SshHarnessProbe(nextTransport).openCodeRegistration(profile.sshServicePath)
+    var observation = kotlinx.coroutines.runInterruptible(Dispatchers.IO) {
+      SshHarnessProbe(nextTransport).discover(profile.sshServicePath).openCode
     }
+    if (observation.listening == false) {
+      throw SshFailure(SshFailureKind.UNRESPONSIVE,
+        "OpenCode 服务没有在运行（注册可能已过期）；请在设备上运行 opencode service start", retryable = true)
+    }
+    var registration = observation.registration ?: throw SshFailure(SshFailureKind.OTHER,
+      "OpenCode 注册文件不可用（${observation.issue.name.lowercase()}）",
+      retryable = observation.state == SshDiscoveryState.UNKNOWN)
+    var reRead = true
+    while (true) {
+      try {
+        attachOpenCodeGeneration(nextTransport, registration)
+        return
+      } catch (stale: OpenCodeRegistrationStale) {
+        // One fresh read per attach: the service may have restarted between discovery and attach.
+        if (!reRead) throw stale.failure
+        reRead = false
+        publish(SshLinkPhase.CONNECTING, SshLinkStep.TUNNEL, "OpenCode 服务已重启，正在重新读取注册", attempt = attempt)
+        observation = kotlinx.coroutines.runInterruptible(Dispatchers.IO) {
+          SshHarnessProbe(nextTransport).discover(profile.sshServicePath).openCode
+        }
+        val fresh = observation.registration
+        if (fresh == null || fresh.pid == registration.pid && fresh.port == registration.port) throw stale.failure
+        registration = fresh
+      }
+    }
+  }
+
+  /** Signalled when the running service no longer matches the registration that was just read. */
+  private class OpenCodeRegistrationStale(val failure: SshFailure) : Exception() {
+    override fun fillInStackTrace(): Throwable = this
+  }
+
+  private suspend fun attachOpenCodeGeneration(nextTransport: SshTransport, registration: OpenCodeSshRegistration) {
     val target = SshVerifiedTunnel.openCode(registration)
-    withContext(Dispatchers.IO) { SshVerifiedTunnel.verify(nextTransport, target) }
+    val proof = withContext(Dispatchers.IO) {
+      try {
+        SshVerifiedTunnel.verify(nextTransport, target)
+      } catch (error: SshFailure) {
+        // The registered pid no longer owns the socket: re-read before blaming the network.
+        if (error.kind == SshFailureKind.UNRESPONSIVE) throw OpenCodeRegistrationStale(error)
+        throw error
+      }
+    }
+    // The registration carries a credential, so an unproved listener is never used. DSH may fall
+    // back to its managed start record; an external OpenCode service has no such record.
+    if (proof != SshVerifiedTunnel.Proof.VERIFIED) throw SshFailure(SshFailureKind.OTHER,
+      "OpenCode 需要设备上的 Python 3（macOS 还需 lsof）才能验证服务身份，未发送任何凭据", retryable = false)
     forwarder?.close()
     val local = SshForwarder { input, output ->
       val active = transport ?: throw SshFailure(SshFailureKind.DISCONNECTED, "SSH 连接已断开")
-      SshVerifiedTunnel.open(active, target, input, output)
+      // The generation was proved once above; later sockets reuse it instead of spawning a helper.
+      SshVerifiedTunnel.openDirect(active, target, input, output)
     }
     forwarder = local
     openCodeEndpoint = registration
@@ -382,7 +455,8 @@ internal class SshHostLink(
         if (response.statusCode == 503) throw SshFailure(SshFailureKind.UNRESPONSIVE, "OpenCode 服务正在启动或停止")
         if (response.statusCode in setOf(401, 403)) throw SshFailure(SshFailureKind.LOGIN, "OpenCode 服务认证失败", retryable = false)
         if (status.compatible != DiscoveryValue.YES || status.listening != DiscoveryValue.YES)
-          throw SshFailure(SshFailureKind.OTHER, "OpenCode 注册与运行进程不匹配，请重新发现服务", retryable = false)
+          throw OpenCodeRegistrationStale(SshFailure(SshFailureKind.OTHER,
+            "OpenCode 注册与运行进程不匹配，请重新发现服务", retryable = false))
         // /api/info can be public. Verify a protected native route before declaring auth ready.
         api.projects()
         api.discoverCapabilities()
@@ -397,8 +471,10 @@ internal class SshHostLink(
       startKeepAlive()
     } catch (error: Throwable) {
       api.close()
-      if (error is ApiException && error.status in setOf(401, 403))
-        throw SshFailure(SshFailureKind.LOGIN, "OpenCode 服务认证失败，请重新发现注册文件", retryable = false)
+      if (error is OpenCodeRegistrationStale) throw error
+      if (error is ApiException && error.status in setOf(401, 403)) {
+        throw OpenCodeRegistrationStale(SshFailure(SshFailureKind.LOGIN, "OpenCode 服务认证失败，请重新发现注册文件", retryable = false))
+      }
       throw error
     }
   }

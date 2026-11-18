@@ -452,16 +452,15 @@ class LagoonController private constructor(private val appContext: Context) {
       "custom_command_unverified" -> "自定义启动命令尚未验证；启用后再连接"
       else -> issue
     }
-    val openCodeDetail = when (files.openCode.issue) {
-      SshDiscoveryIssue.PYTHON_UNAVAILABLE -> "需要在设备上安装 Python 3 才能检测 OpenCode"
-      SshDiscoveryIssue.UNREADABLE -> "无法读取 OpenCode 服务注册文件，请检查权限"
-      SshDiscoveryIssue.TOO_LARGE, SshDiscoveryIssue.INVALID_DATA -> "OpenCode 服务注册文件无效，请在设备上检查服务"
-      SshDiscoveryIssue.EXEC_FAILED, SshDiscoveryIssue.INVALID_OUTPUT -> "OpenCode 检测未完成，请重试"
-      else -> if (files.openCode.state == SshDiscoveryState.ABSENT) "请先在电脑运行 opencode service start，然后刷新检测" else ""
-    }
+    val openCodeDetail = openCodeDetail(files)
+    val binaryLabel = files.openCode.binaryVersion?.takeIf { it.isNotBlank() }?.let { "已安装 $it" }.orEmpty()
     val harnesses = mutableListOf(
       DiscoveredHarness(HarnessProtocolId.OPENCODE_NATIVE, locator, "OpenCode",
-        files.openCodeStatus(DeviceDiscovery.DEFAULT_TTL_MS).copy(reason = openCodeDetail.takeIf(String::isNotBlank)), openCodeDetail),
+        files.openCodeStatus(DeviceDiscovery.DEFAULT_TTL_MS).copy(reason = openCodeDetail.takeIf { it.isNotBlank() }),
+        buildList {
+          if (openCodeDetail.isNotBlank()) add(openCodeDetail)
+          if (binaryLabel.isNotBlank()) add(binaryLabel)
+        }.joinToString(" · ")),
       DiscoveredHarness(HarnessProtocolId.DSH_TYPERT, null, "DeepSeek Harness",
         HarnessDiscoveryStatus(installed = value(dsh.installed), available = DiscoveryValue.UNKNOWN,
           observedAtMs = now, freshUntilMs = now + DeviceDiscovery.DEFAULT_TTL_MS,
@@ -479,6 +478,22 @@ class LagoonController private constructor(private val appContext: Context) {
           completeness = if (codex.installed != null && codex.issue == null) DiscoveryCompleteness.COMPLETE else DiscoveryCompleteness.PARTIAL,
           reason = explanation(codex.issue)), codex.version.orEmpty())
     )
+    // An absent binary is already explained by the native row; only report ACP when it exists,
+    // when the version lacks it, or when the probe could not finish.
+    found.openCodeAcp?.takeIf { it.supported != false || it.issue != null }?.let { acp ->
+      harnesses += DiscoveredHarness(HarnessProtocolId.OPENCODE_ACP, null, "OpenCode ACP",
+        HarnessDiscoveryStatus(
+          installed = value(acp.supported), compatible = value(acp.supported),
+          available = DiscoveryValue.UNKNOWN, observedAtMs = now,
+          freshUntilMs = now + DeviceDiscovery.DEFAULT_TTL_MS,
+          completeness = if (acp.supported == null) DiscoveryCompleteness.PARTIAL else DiscoveryCompleteness.COMPLETE,
+          reason = when {
+            acp.issue == "acp_unavailable" -> "此版本的 opencode 不支持 ACP，请升级"
+            acp.issue != null -> "ACP 检测未完成，请重试"
+            acp.supported == true -> null
+            else -> "未安装 opencode"
+          }), acp.version.orEmpty())
+    }
     found.localOpenCode?.takeIf { it.openCode.state == SshDiscoveryState.PRESENT }?.let { local ->
       harnesses += DiscoveredHarness(HarnessProtocolId.OPENCODE_NATIVE, local.openCode.registrationPath,
         "OpenCode（开发版）", local.openCodeStatus(DeviceDiscovery.DEFAULT_TTL_MS))
@@ -490,6 +505,35 @@ class LagoonController private constructor(private val appContext: Context) {
       else -> null
     }
     return DeviceDiscovery(deviceId, found.observedAtMs, harnesses, found.completeness, environmentNote)
+  }
+
+  /**
+   * One user-facing sentence for an OpenCode observation. The wire-level reasons stay in `shared/`
+   * so the same codes can be rendered by other surfaces without duplicating the wording there.
+   */
+  private fun openCodeDetail(files: SshHarnessDiscoveryResult): String {
+    val binary = files.openCode.binaryVersion?.takeIf { it.isNotBlank() }
+    return when (files.reasonCode()) {
+      SshDiscoveryReason.NOT_FOUND ->
+        if (binary == null) "设备上未发现 OpenCode；请安装 OpenCode 2.x 后运行 opencode service start"
+        else "已安装 $binary，但服务未运行；请运行 opencode service start 后刷新检测"
+      SshDiscoveryReason.PERMISSIONS_TOO_OPEN ->
+        "注册文件允许同组或其他用户改写，已拒绝使用；请在设备上执行 chmod 600 注册文件"
+      SshDiscoveryReason.SERVICE_UNREACHABLE ->
+        "OpenCode 服务没有响应（注册可能已过期）；重启 opencode service 后刷新检测"
+      SshDiscoveryReason.AUTHENTICATION_FAILED ->
+        "OpenCode 拒绝了注册文件里的凭据；重启服务重新生成注册"
+      SshDiscoveryReason.REGISTRATION_STALE ->
+        "注册文件与运行中的服务不一致（服务可能已重启）；刷新检测会重新绑定"
+      SshDiscoveryReason.VERSION_MISMATCH -> "注册文件版本与运行中的服务不一致；重启服务后刷新"
+      SshDiscoveryReason.PROTOCOL_MISMATCH -> "该端口不是 OpenCode 2.x 服务（需要 2.0 以上）"
+      SshDiscoveryReason.PYTHON_UNAVAILABLE -> "设备缺少 Python 3：状态检查和安全连接都需要它，请安装 python3"
+      SshDiscoveryReason.UNREADABLE -> "无法读取 OpenCode 注册文件，请检查路径与权限"
+      SshDiscoveryReason.INVALID_DATA, SshDiscoveryReason.TOO_LARGE ->
+        "OpenCode 注册文件无效，请在设备上重启服务重新生成"
+      SshDiscoveryReason.VERSION_UNKNOWN -> "已连接，但无法确认 OpenCode 版本"
+      else -> ""
+    }
   }
 
   private fun hostedStatus(available: Boolean, now: Long, reason: String): HarnessDiscoveryStatus =
@@ -557,18 +601,25 @@ class LagoonController private constructor(private val appContext: Context) {
         val kind = when (protocol) {
           HarnessProtocolId.DSH_TYPERT -> ServerKind.DSH
           HarnessProtocolId.OPENCODE_NATIVE -> ServerKind.OPENCODE
-          HarnessProtocolId.CODEX_APP_SERVER, HarnessProtocolId.ANTIGRAVITY_ACP -> ServerKind.CODEX
-          HarnessProtocolId.OPENCODE_ACP -> error("SSH 暂不支持 OpenCode ACP，请使用原生 OpenCode")
+          // ACP harnesses are carried by their own stdio client, not by the native HTTP protocol.
+          HarnessProtocolId.CODEX_APP_SERVER, HarnessProtocolId.ANTIGRAVITY_ACP,
+          HarnessProtocolId.OPENCODE_ACP -> ServerKind.CODEX
         }
-        val attached = saveSshHost(
+        val added = saveSshHost(
           config = config, secrets = sshHostStore.secrets(config.id), harnessKind = kind,
           registrationPath = locator.takeIf { kind == ServerKind.OPENCODE },
-          harnessProtocol = protocol.takeIf { it == HarnessProtocolId.ANTIGRAVITY_ACP },
+          harnessProtocol = protocol.takeIf {
+            it == HarnessProtocolId.ANTIGRAVITY_ACP || it == HarnessProtocolId.OPENCODE_ACP
+          },
           bindingEnabled = true, connect = false
         )
-        // Mirror the Hub branch: adding a harness must show its result. With another server already
-        // selected the background monitor dials it and the device page reports the SSH link state.
-        if (attached.effectiveEnabled && state.value.serverId == null) connect(attached.id, preserveHome = true)
+        // Adding is not selecting: mirror the Hub branch (auto-open when nothing is selected) and
+        // say what happened instead of silently leaving the home page on the previous server.
+        if (added.effectiveEnabled && state.value.serverId == null) connect(added.id, preserveHome = true)
+        showNotice(if (kind == ServerKind.OPENCODE)
+          "已添加 OpenCode；若连接失败，可在它的详情页启动服务后重试"
+        else "已添加 ${added.name}，可返回首页打开或切换过去",
+          FeedbackTone.SUCCESS)
       }
       ConnectionSourceType.DIRECT -> error("直连连接本身就是一条 Harness，不需要再添加")
     }
@@ -3499,11 +3550,13 @@ class LagoonController private constructor(private val appContext: Context) {
     }
     val savedProfiles = store.readProfiles()
     val desiredProtocol = harnessProtocol ?: MigrationProjection.protocol(harnessKind)
-    require(harnessProtocol == null || harnessProtocol == HarnessProtocolId.ANTIGRAVITY_ACP && harnessKind == ServerKind.CODEX)
+    require(harnessProtocol == null ||
+      harnessProtocol in setOf(HarnessProtocolId.ANTIGRAVITY_ACP, HarnessProtocolId.OPENCODE_ACP) &&
+      harnessKind == ServerKind.CODEX)
     val existing = savedProfiles.firstOrNull {
       it.sshHostId == clean.id && it.protocol == desiredProtocol && it.sshServicePath == registrationPath
     }
-    val fallbackId = if (desiredProtocol == HarnessProtocolId.ANTIGRAVITY_ACP)
+    val fallbackId = if (desiredProtocol in setOf(HarnessProtocolId.ANTIGRAVITY_ACP, HarnessProtocolId.OPENCODE_ACP))
       java.util.UUID.nameUUIDFromBytes("${clean.id}:${desiredProtocol.wire}".toByteArray(Charsets.UTF_8)).toString()
     else clean.id.takeUnless { candidate -> savedProfiles.any { it.id == candidate } }
       ?: java.util.UUID.randomUUID().toString()
@@ -3593,6 +3646,35 @@ class LagoonController private constructor(private val appContext: Context) {
     allOverview.start(profiles, include = retryIds + setOfNotNull(state.value.serverId))
     retryIds.forEach(allOverview::refresh)
     if (state.value.serverId in retryIds) retryNow()
+  }
+
+  /**
+   * Explicitly start/restart the user's OpenCode service on an SSH device, then re-bind its leaves.
+   * The app never owns or kills that process; it only runs the command the user asked for.
+   */
+  fun restartOpenCodeService(profileId: String) {
+    val profile = store.profiles().firstOrNull { it.id == profileId } ?: return
+    val hostId = profile.sshHostId ?: return
+    val config = sshHostStore.load().firstOrNull { it.id == hostId }
+    if (config == null) { showNotice("SSH 配置已移除", FeedbackTone.WARNING); return }
+    scope.launch {
+      showNotice("正在启动 OpenCode 服务…")
+      try {
+        val result = sshHostManager.startOpenCodeService(config, sshHostStore.secrets(hostId))
+        showNotice(result.summary(), if (result.ok) FeedbackTone.SUCCESS else FeedbackTone.WARNING)
+        if (!result.ok) return@launch
+        sshHostManager.retry(hostId)
+        allOverview.invalidate(profileId)
+        allOverview.refresh(profileId)
+        deviceIdOfSshHost(hostId)?.let { deviceId ->
+          runCatching { refreshDeviceDiscovery(deviceId) }
+        }
+      } catch (cancel: CancellationException) {
+        throw cancel
+      } catch (error: Exception) {
+        showNotice(userFacingError(error, "启动 OpenCode 服务失败"), FeedbackTone.WARNING)
+      }
+    }
   }
 
   private fun cleanSshConfig(config: SshHostConfig): SshHostConfig {

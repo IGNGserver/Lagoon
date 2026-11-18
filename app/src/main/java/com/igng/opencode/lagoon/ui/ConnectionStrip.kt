@@ -42,6 +42,7 @@ import com.igng.opencode.lagoon.core.HubAuthStatus
 import com.igng.opencode.lagoon.core.LagoonController
 import com.igng.opencode.lagoon.core.LagoonState
 import com.igng.opencode.lagoon.core.RemoteRecoveryKind
+import com.igng.opencode.lagoon.core.serverSnapshots
 import kotlinx.coroutines.delay
 import top.yukonga.miuix.kmp.basic.InfiniteProgressIndicator
 import top.yukonga.miuix.kmp.basic.Text
@@ -259,4 +260,30 @@ internal fun SessionRowsSkeleton(rows: Int = 6) {
       }
     }
   }
+}
+
+/**
+ * 传输层失败（SSH/Codex/AGY）必须说出来：这些错误没有 Remote 的恢复动作，过去只写进日志，
+ * 首页就只剩一个空列表。这里复用连接条的提示样式，给出原因与「重试」。
+ */
+@Composable
+internal fun TransportFailureStrip(state: LagoonState, controller: LagoonController, modifier: Modifier = Modifier) {
+  val failing: Pair<String, String>? = when {
+    state.multiServerView -> state.enabledProfiles.firstNotNullOfOrNull { profile ->
+      state.allServerSnapshots[profile.id]?.transportError?.takeIf { it.isNotBlank() }?.let { profile.name to it }
+    }
+    else -> state.serverId?.let { id ->
+      state.serverSnapshots()[id]?.transportError?.takeIf { it.isNotBlank() }?.let { (state.server?.name ?: "") to it }
+    }
+  }
+  val shown = failing ?: return
+  HyperInlineNotice(
+    message = listOf(shown.first, shown.second).filter(String::isNotBlank).joinToString(" · "),
+    type = MiuixToastType.ERROR,
+    action = "重试",
+    onAction = { controller.retryNow() },
+    modifier = modifier
+      .padding(horizontal = 14.dp, vertical = 4.dp)
+      .semantics { liveRegion = LiveRegionMode.Polite }
+  )
 }
