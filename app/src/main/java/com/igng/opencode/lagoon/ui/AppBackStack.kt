@@ -46,11 +46,25 @@ internal data class DeviceEditorRoute(
   val mode: DeviceEditorMode = DeviceEditorMode.ADD_DEVICE,
   val access: AddDeviceAccess = AddDeviceAccess.HUB,
   val profileId: String? = null,
-  val sshHostId: String? = null
+  val sshHostId: String? = null,
+  /**
+   * 本次打开编辑器的实例号。[key] 带上它，saveable 作用域才只属于这一次打开；否则两次
+   * “添加 SSH 设备”的 key 完全相同，上一次的地址、密钥选择和已固定指纹会被恢复进新表单。
+   * 旋转/进程重建时随路由一起编解码，所以同一个实例的草稿仍然会保留。
+   */
+  val instance: String = ""
 ) {
   /** 页面身份：整页过渡的 contentKey 与 saveable 作用域都靠它区分两个相邻的编辑器页。 */
-  val key get() = "${mode.name}|${access.name}|${profileId.orEmpty()}|${sshHostId?.let { "ssh:$it" } ?: ""}"
+  val key get() = buildString {
+    append(mode.name).append('|').append(access.name).append('|').append(profileId.orEmpty()).append('|')
+    append(sshHostId?.let { "ssh:$it" } ?: "")
+    if (instance.isNotEmpty()) append('|').append(instance)
+  }
 }
+
+/** 给一次新打开盖章；已经带实例号（例如从 back stack 恢复）的路由原样返回。 */
+internal fun DeviceEditorRoute.freshInstance(): DeviceEditorRoute =
+  if (instance.isNotEmpty()) this else copy(instance = java.util.UUID.randomUUID().toString())
 
 /** An SSH Harness inherits its endpoint and credentials from its containing SSH device. */
 internal fun editorForHarness(profile: ServerProfile): DeviceEditorRoute =
@@ -159,8 +173,9 @@ internal data class NavRoute(
 internal fun slideDirection(from: NavRoute, to: NavRoute): Int = if (to.depth < from.depth) -1 else 1
 
 /**
- * 编辑器层的落盘编码（旋转、重建后仍停在同一页）。每层是 `mode|access|profileId|ssh:hostId`，空段表示 null。
- * 旧版本的三段格式 `tab|profileId|ssh:hostId` 仍然可读，按当时的语义还原成对应模式。
+ * 编辑器层的落盘编码（旋转、重建后仍停在同一页）。每层是
+ * `mode|access|profileId|ssh:hostId|instance`，空段表示 null / 空值。
+ * 旧版本的四段（无 instance）与三段（`tab|profileId|ssh:hostId`）格式仍然可读。
  */
 internal fun encodeDeviceEditors(editors: List<DeviceEditorRoute>): ArrayList<String> =
   ArrayList(editors.map { route ->
@@ -168,17 +183,18 @@ internal fun encodeDeviceEditors(editors: List<DeviceEditorRoute>): ArrayList<St
       route.mode.name,
       route.access.name,
       route.profileId.orEmpty(),
-      route.sshHostId?.let { "ssh:$it" }.orEmpty()
+      route.sshHostId?.let { "ssh:$it" }.orEmpty(),
+      route.instance
     ).joinToString("|")
   })
 
 internal fun decodeDeviceEditors(raw: List<String>?): List<DeviceEditorRoute> = raw.orEmpty().mapNotNull { line ->
   val parts = line.split("|")
   when (parts.size) {
-    4 -> {
+    5, 4 -> {
       val mode = runCatching { DeviceEditorMode.valueOf(parts[0]) }.getOrNull() ?: return@mapNotNull null
       val access = runCatching { AddDeviceAccess.valueOf(parts[1]) }.getOrDefault(AddDeviceAccess.HUB)
-      DeviceEditorRoute(mode, access, parts[2].ifBlank { null }, sshHostOf(parts[3]))
+      DeviceEditorRoute(mode, access, parts[2].ifBlank { null }, sshHostOf(parts[3]), parts.getOrNull(4).orEmpty())
     }
     // 旧格式：OPENCODE/DSH 是直连表单的分页，不是接入分支。按"有无 ssh/资料"还原语义。
     3 -> {

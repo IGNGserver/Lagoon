@@ -92,6 +92,24 @@ internal fun SshHostForm(
   var inlineInspectError by remember { mutableStateOf<String?>(null) }
   var hostKeyType by rememberSaveable(initial?.id) { mutableStateOf(initial?.hostKeyType.orEmpty()) }
   var hostKeyFingerprint by rememberSaveable(initial?.id) { mutableStateOf(initial?.hostKeyFingerprint.orEmpty()) }
+  // 已固定的指纹只对它被探测时的那个 host:port 有效；地址或端口一改就不再沿用。
+  var pinnedEndpoint by rememberSaveable(initial?.id) {
+    mutableStateOf(
+      initial?.takeIf { !it.hostKeyFingerprint.isNullOrBlank() }?.let { "${it.host}:${it.port}" }.orEmpty()
+    )
+  }
+  // 与文档承诺一致：地址或端口变化后旧指纹不再沿用，避免拿 A 机器的指纹去连 B。
+  LaunchedEffect(address, port) {
+    val parts = SshAddress.parse(address)
+    if (parts.error != null) return@LaunchedEffect
+    val host = parts.host.trim().ifBlank { return@LaunchedEffect }
+    val endpoint = "$host:${parts.port ?: port.trim().toIntOrNull() ?: SSH_DEFAULT_PORT}"
+    if (hostKeyFingerprint.isNotBlank() && pinnedEndpoint != endpoint) {
+      hostKeyType = ""
+      hostKeyFingerprint = ""
+      pinnedEndpoint = ""
+    }
+  }
   var showMore by rememberSaveable(initial?.id) {
     mutableStateOf(
       initial != null && moreOptionsSummary(
@@ -222,7 +240,7 @@ internal fun SshHostForm(
       result = "端口需在 1–65535"; resultIsError = true
       return null
     }
-    val pinStillBelongs = initial == null || (host == initial.host && portValue == initial.port)
+    val pinStillBelongs = pinnedEndpoint == "$host:$portValue"
     return SshHostConfig(
       id = hostId,
       name = name.trim().ifBlank { host },
@@ -330,6 +348,7 @@ internal fun SshHostForm(
           resultIsError = false
           hostKeyType = pinned.hostKeyType.orEmpty()
           hostKeyFingerprint = pinned.hostKeyFingerprint.orEmpty()
+          pinnedEndpoint = "${pinned.host}:${pinned.port}"
         } catch (cancel: CancellationException) {
           throw cancel
         } catch (error: Exception) {
@@ -1021,6 +1040,7 @@ internal fun SshHostForm(
         DialogActions("取消", { confirmingFingerprintReset = false }, "确认重置", danger = true) {
           hostKeyType = ""
           hostKeyFingerprint = ""
+          pinnedEndpoint = ""
           result = null
           confirmingFingerprintReset = false
         }
@@ -1032,8 +1052,10 @@ internal fun SshHostForm(
   if (key != null) {
     SshHostKeyDialog(
       presented = key,
-      saved = hostKeyFingerprint.takeIf(String::isNotBlank),
-      savedType = hostKeyType.takeIf(String::isNotBlank),
+      // 只拿“这次实际被探测的配置”里记住的指纹做对比。表单 state 里的旧指纹可能属于改过的
+      // 地址，用它判断会把一次正常的首次信任误报成“主机指纹变了”。
+      saved = pendingConfig?.hostKeyFingerprint?.takeIf(String::isNotBlank),
+      savedType = pendingConfig?.hostKeyType?.takeIf(String::isNotBlank),
       destination = pendingConfig?.address,
       onDismiss = { pendingKey = null; pendingAction = null; pendingConfig = null },
       onAccept = {
@@ -1041,6 +1063,7 @@ internal fun SshHostForm(
         hostKeyFingerprint = key.fingerprint
         val action = pendingAction
         val base = pendingConfig
+        if (base != null) pinnedEndpoint = "${base.host}:${base.port}"
         pendingKey = null; pendingAction = null; pendingConfig = null
         if (action != null && base != null) {
           action(base.copyWith(hostKeyType = key.type, hostKeyFingerprint = key.fingerprint))

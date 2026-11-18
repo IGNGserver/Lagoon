@@ -4,6 +4,7 @@ import com.igng.opencode.lagoon.core.ServerKind
 import com.igng.opencode.lagoon.core.ServerProfile
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -129,5 +130,21 @@ class SessionNavigationTest {
     val editing = listOf(DeviceEditorRoute(mode = DeviceEditorMode.SSH_HOST, access = AddDeviceAccess.SSH, sshHostId = "host-1"))
     assertEquals(editing, decodeDeviceEditors(encodeDeviceEditors(editing)))
     assertTrue("坏行不能把整页重建弄崩", decodeDeviceEditors(listOf("nonsense")).isEmpty())
+  }
+
+  @Test fun everyEditorOpeningGetsItsOwnSaveableScope() {
+    val base = DeviceEditorRoute(mode = DeviceEditorMode.SSH_HOST, access = AddDeviceAccess.SSH)
+    val first = base.freshInstance()
+    val second = base.freshInstance()
+    assertTrue(first.instance.isNotBlank())
+    assertNotEquals("两次新建不能共用 saveable 作用域", first.key, second.key)
+    assertEquals("已盖章的路由不应该再换实例", first, first.freshInstance())
+    assertEquals(first, decodeDeviceEditors(encodeDeviceEditors(listOf(first))).single())
+  }
+
+  @Test fun editorLinesFromOlderBuildsWithoutAnInstanceStillDecode() {
+    val legacy = decodeDeviceEditors(listOf("SSH_HOST|SSH||ssh:host-1")).single()
+    assertEquals("host-1", legacy.sshHostId)
+    assertTrue(legacy.instance.isEmpty())
   }
 }

@@ -2982,6 +2982,9 @@ class LagoonController private constructor(private val appContext: Context) {
 
   fun sshKeySecrets(id: String): SshKeySecrets = sshKeyStore.secrets(id)
 
+  /** 密钥库最近一次读取失败的原因；null 表示正常。界面据此区分“没有密钥”和“读不出来”。 */
+  fun sshKeyLoadError(): String? = sshKeyStore.loadError
+
   fun isSshKeyUnlocked(profile: SshKeyProfile): Boolean = sshKeyStore.isUnlocked(profile)
 
   fun isBiometricSupported(): Boolean = BiometricKeyVault.isSupported(appContext)

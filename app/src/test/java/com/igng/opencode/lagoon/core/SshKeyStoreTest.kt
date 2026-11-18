@@ -1,9 +1,11 @@
 package com.igng.opencode.lagoon.core
 
 import android.content.SharedPreferences
+import java.io.IOException
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -186,5 +188,42 @@ class SshKeyStoreTest {
     store.unlockRuntimeSecret(hw.id, "unlocked")
     assertTrue(store.isUnlocked(hw))
     assertEquals(hw, SshKeyCodec.decode(SshKeyCodec.encode(listOf(hw))).single())
+  }
+
+  @Test fun corruptDocumentIsReportedInsteadOfLookingLikeAnEmptyKeychain() {
+    val prefs = MapPreferences()
+    prefs.edit().putString("keys", "{not-json").commit()
+    val store = SshKeyStore(prefs, MapPreferences(), encrypt = { "enc:$it" }, decrypt = { it.removePrefix("enc:") })
+    val key = SshKeyProfile(
+      id = "key-1",
+      name = "mobile-dev",
+      algorithm = "ED25519",
+      fingerprint = "SHA256:x",
+      publicKeyOpenSsh = "ssh-ed25519 AAAA x"
+    )
+
+    assertEquals(emptyList<SshKeyProfile>(), store.load())
+    assertNotNull("读取失败必须留下原因，界面不能显示成空密钥库", store.loadError)
+
+    var refused = false
+    try {
+      store.save(key, SshKeySecrets(privateKey = "PEM"))
+    } catch (ignored: IOException) {
+      refused = true
+    }
+    assertTrue("坏文档不能被一次新增覆盖", refused)
+    assertEquals("{not-json", prefs.getString("keys", null))
+  }
+
+  @Test fun aReadableDocumentClearsTheRecordedReadFailure() {
+    val prefs = MapPreferences()
+    prefs.edit().putString("keys", "broken").commit()
+    val store = SshKeyStore(prefs, MapPreferences(), encrypt = { "enc:$it" }, decrypt = { it.removePrefix("enc:") })
+    assertEquals(emptyList<SshKeyProfile>(), store.load())
+    assertNotNull(store.loadError)
+
+    prefs.edit().putString("keys", """{"version":1,"keys":[]}""").commit()
+    assertEquals(emptyList<SshKeyProfile>(), store.load())
+    assertNull(store.loadError)
   }
 }

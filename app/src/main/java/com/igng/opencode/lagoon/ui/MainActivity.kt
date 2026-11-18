@@ -165,7 +165,9 @@ class MainActivity : ComponentActivity() {
        // 整页编辑器：添加入口、编辑已有连接、SSH 主机表单都是路由上的一层，进出场走同一套页面弹簧。
        fun openEditor(target: DeviceEditorRoute) {
          focusManager.clearFocus()
-         navigator.navigate(navigator.navigation.openEditor(target))
+         // 每次打开都盖新的实例号：saveable 作用域只属于这一次打开，上一次的地址/密钥/指纹
+         // 不会被恢复进新表单（旋转重建时实例号随路由一起恢复，草稿仍然保留）。
+         navigator.navigate(navigator.navigation.openEditor(target.freshInstance()))
        }
        fun addDevice(access: AddDeviceAccess = AddDeviceAccess.HUB) = openEditor(DeviceEditorRoute(access = access))
        fun openSshEditor(hostId: String) = openEditor(
@@ -301,7 +303,8 @@ class MainActivity : ComponentActivity() {
       }
       LaunchedEffect(state.profiles.isEmpty()) {
         if (state.profiles.isEmpty() && navigator.navigation.editors.isEmpty()) {
-          navigator.navigate(SessionNavigation(editors = listOf(DeviceEditorRoute(access = AddDeviceAccess.HUB))))
+          val route = DeviceEditorRoute(access = AddDeviceAccess.HUB).freshInstance()
+          navigator.navigate(SessionNavigation(editors = listOf(route)))
         }
       }
       LaunchedEffect(state.error) { state.error?.let { globalMessage = it; globalMessageType = MiuixToastType.ERROR; controller.clearError() } }
