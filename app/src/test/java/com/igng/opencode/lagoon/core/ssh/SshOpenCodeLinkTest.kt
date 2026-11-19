@@ -396,7 +396,7 @@ class SshOpenCodeLinkTest {
     /** This fixture isolates link wiring; the real OS proof is covered by SshVerifiedTunnelTest. */
     override fun openExecChannel(script: String): SshExecChannel = synchronized(this) {
       check(!isClosed)
-      check(script.startsWith("python3 -u -c "))
+      check(script.contains("command -v python3") && script.contains("python3 -u -c "))
       val socket = Socket(LOOPBACK, serverPort)
       FakeVerifiedChannel(socket, serverPort).also { verifiedChannels += it }
     }

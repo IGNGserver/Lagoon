@@ -46,8 +46,8 @@ internal fun DeviceGroupsSheet(
   val editingId = initialGroupId?.takeIf { it.isNotBlank() }.orEmpty()
   val editing = state.deviceGroups.firstOrNull { it.id == editingId }
   val graph by controller.connectionGraph.collectAsState()
-  val devices = remember(graph, state.profiles, state.discoveryRevision) {
-    controller.deviceViews(graph, state.profiles)
+  val devices = remember(graph, state.profiles, state.sshHosts, state.discoveryRevision) {
+    controller.deviceViews(graph, state.profiles, savedSshHosts = state.sshHosts)
   }
   var name by rememberSaveable(initialGroupId) { mutableStateOf(editing?.name.orEmpty()) }
   // 旧分组只有 leaf id：用"成员里有这台设备的任一 Harness"回填勾选，保存后升级为按设备。

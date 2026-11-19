@@ -127,4 +127,17 @@ class SshTransportPoolConcurrencyTest {
       workers.shutdownNow()
     }
   }
+
+  @Test fun closedLeaseProbeIsFalseInsteadOfThrowing() {
+    val pool = SshTransportPool(object : SshTransportFactory {
+      override fun connect(config: SshHostConfig, secrets: SshSecrets, verifier: SshHostKeyVerifier): SshTransport = Transport()
+      override fun probeHostKey(config: SshHostConfig): PresentedSshHostKey = error("unused")
+    })
+    try {
+      val lease = pool.connect(config, SshSecrets(), verify)
+      lease.close()
+      // Keepalive can race a reconnect; this must be a health answer, not an uncaught exception.
+      assertFalse(lease.probeTunnel("127.0.0.1", 4321, 100))
+    } finally { pool.close() }
+  }
 }

@@ -142,7 +142,10 @@ internal class SshTransportPool(
     override fun readWorkspace(root: String, path: String) = active().readWorkspace(root, path)
     override fun openTunnel(host: String, port: Int, input: InputStream, output: OutputStream) =
       active().openTunnel(host, port, input, output)
-    override fun probeTunnel(host: String, port: Int, timeoutMillis: Long) = active().probeTunnel(host, port, timeoutMillis)
+    /** A closed lease is "no tunnel", not an exception: health checks run after a reconnect and
+     *  must never turn a normal close race into an uncaught coroutine failure. */
+    override fun probeTunnel(host: String, port: Int, timeoutMillis: Long): Boolean =
+      if (isClosed) false else runCatching { entry.transport.probeTunnel(host, port, timeoutMillis) }.getOrDefault(false)
     override fun ping(timeoutMillis: Long): Boolean {
       if (isClosed) return false
       val healthy = try { entry.transport.ping(timeoutMillis) } catch (_: Exception) { false }

@@ -255,4 +255,28 @@ class DeviceProjectionTest {
     val withExpired = DeviceProjection.devices(graph, profiles, discovery = { expiredDiscovery }, nowMs = now).single()
     assertEquals("上次发现已过期", withExpired.harnesses.first { it.leafId?.value == "leaf-codex" }.reason)
   }
+
+  @Test fun savedSshParentWithoutHarnessIsAlwaysADevice() {
+    val config = SshHostConfig(id = "ssh-1", name = "arch-dev", host = "arch.test", user = "me")
+    val devices = DeviceProjection.devices(null, emptyList(), savedSshHosts = listOf(config), nowMs = now)
+
+    val device = devices.single()
+    assertEquals(DeviceAccess.SSH, device.access)
+    assertEquals("ssh://me@arch.test:22", device.endpoint)
+    assertTrue(device.sourceEnabled)
+    assertTrue(device.harnesses.any { it.protocol == HarnessProtocolId.DSH_TYPERT && it.attachable })
+  }
+
+  @Test fun savedSshParentFillsAStaleGraphAndKeepsItsHarnesses() {
+    val profile = sshLeaf("leaf", "ssh-1")
+    val config = SshHostConfig(id = "ssh-1", name = "arch-dev", host = "arch.test", user = "me")
+    val stale = graphOf(listOf(sshLeaf("other", "ssh-2").copy(url = "ssh://me@other.test:22")))
+
+    val devices = DeviceProjection.devices(stale, listOf(profile), savedSshHosts = listOf(config), nowMs = now)
+
+    assertEquals(2, devices.size)
+    val saved = devices.first { it.endpoint == "ssh://me@arch.test:22" }
+    assertEquals(1, saved.attachedCount)
+    assertEquals("leaf", saved.harnesses.first { it.attached }.leafId?.value)
+  }
 }
