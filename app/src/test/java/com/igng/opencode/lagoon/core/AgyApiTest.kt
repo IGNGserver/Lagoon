@@ -157,4 +157,35 @@ class AgyApiTest {
       assertEquals(1, api.rootSessionsPage().items.size)
     } finally { api.close() }
   }
+
+  @Test fun percentEncodedWorkspaceIsDecodedForSessionAndProjectLabels() = runBlocking {
+    val transport = Fake()
+    transport.listed = JSONArray().put(JSONObject().put("sessionId", "cn").put("title", "t")
+      .put("cwd", "/Users/dev/%E4%B8%AD%E6%96%87%20%E7%9B%AE%E5%BD%95"))
+    val api = AgyApi(transport)
+    try {
+      val session = api.rootSessionsPage().items.single()
+      assertEquals("/Users/dev/中文 目录", session.directory)
+      assertEquals("agy:cwd:/Users/dev/中文 目录", session.projectId)
+      assertEquals("中文 目录", api.projects().single().name)
+    } finally { api.close() }
+  }
+
+  @Test fun fileUriWorkspaceIsConvertedToAPathAndWinsOverAnEncodedCwd() = runBlocking {
+    val transport = Fake()
+    transport.listed = JSONArray().put(JSONObject().put("sessionId", "cn").put("title", "t")
+      .put("cwd", "/Users/dev/%E4%B8%AD%E6%96%87")
+      .put("_lagoonWorkspaces", JSONArray().put("file:///Users/dev/%E4%B8%AD%E6%96%87%20%E7%9B%AE%E5%BD%95")))
+    val api = AgyApi(transport)
+    try {
+      val session = api.rootSessionsPage().items.single()
+      assertEquals("/Users/dev/中文 目录", session.directory)
+    } finally { api.close() }
+  }
+
+  @Test fun literalPercentAndPlainPathAreNotCorrupted() {
+    assertEquals("/repo/100%", AgyPath.decode("/repo/100%"))
+    assertEquals("/repo/中文", AgyPath.decode("  /repo/中文  "))
+    assertEquals("/repo/中文 目录", AgyPath.decode("/repo/%E4%B8%AD%E6%96%87%20%E7%9B%AE%E5%BD%95"))
+  }
 }

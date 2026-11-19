@@ -763,10 +763,12 @@ private fun rememberDevices(
   state: LagoonState,
   controller: LagoonController,
   graph: ConnectionGraph?
-): List<DeviceView> = remember(graph, state.profiles, state.discoveryRevision, state.allServerSnapshots, state.serverId, state.connected) {
-  controller.deviceViews(graph, state.profiles) { id ->
+): List<DeviceView> = remember(
+  graph, state.profiles, state.sshHosts, state.discoveryRevision, state.allServerSnapshots, state.serverId, state.connected
+) {
+  controller.deviceViews(graph, state.profiles, { id ->
     if (id == state.serverId) state.connected else state.allServerSnapshots[id]?.connected == true
-  }
+  }, savedSshHosts = state.sshHosts)
 }
 
 private fun sshHostOfDevice(graph: ConnectionGraph?, deviceId: String): String? {

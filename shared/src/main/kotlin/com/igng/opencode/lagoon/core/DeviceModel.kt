@@ -125,13 +125,34 @@ object DeviceProjection {
     adoptedDeviceIds: Set<String>? = null,
     discovery: (String) -> DeviceDiscovery? = { null },
     isOnline: (String) -> Boolean = { false },
-    nowMs: Long = System.currentTimeMillis()
+    nowMs: Long = System.currentTimeMillis(),
+    /**
+     * Saved SSH parents are devices even when no Harness is attached. The connection graph is the
+     * normal source, but a graph that failed to load or is one save behind must not hide a device
+     * the person just added: this list makes the saved host explicit instead of inferring it.
+     */
+    savedSshHosts: List<SshHostConfig> = emptyList()
   ): List<DeviceView> {
-    val effectiveGraph = graph ?: runCatching { MigrationProjection.fromProfiles(profiles) }.getOrNull() ?: return emptyList()
+    val effectiveGraph = graph ?: runCatching { MigrationProjection.fromProfiles(profiles) }.getOrNull()
+    val projected = effectiveGraph?.let { value ->
+      projectedDevices(value, profiles, adoptedDeviceIds, discovery, isOnline, nowMs)
+    }.orEmpty()
+    return mergeSavedSshDevices(projected, profiles, savedSshHosts, discovery, isOnline, nowMs)
+      .sortedWith(compareBy({ it.access.ordinal }, { it.name.lowercase() }, { it.id.value }))
+  }
+
+  private fun projectedDevices(
+    graph: ConnectionGraph,
+    profiles: List<ServerProfile>,
+    adoptedDeviceIds: Set<String>?,
+    discovery: (String) -> DeviceDiscovery?,
+    isOnline: (String) -> Boolean,
+    nowMs: Long
+  ): List<DeviceView> {
     val profilesById = profiles.associateBy { it.id }
-    val bindingsByHost = effectiveGraph.bindings.groupBy { it.hostBindingId }
-    val sourcesById = effectiveGraph.sources.associateBy { it.id }
-    return effectiveGraph.hosts.mapNotNull { host ->
+    val bindingsByHost = graph.bindings.groupBy { it.hostBindingId }
+    val sourcesById = graph.sources.associateBy { it.id }
+    return graph.hosts.mapNotNull { host ->
       val source = sourcesById[host.sourceId] ?: return@mapNotNull null
       val access = DeviceAccess.of(source.type)
       val attached = bindingsByHost[host.id].orEmpty().mapNotNull { profilesById[it.id] }
@@ -156,7 +177,72 @@ object DeviceProjection {
         discovery = observed,
         online = attached.any { isOnline(it.id) }
       )
-    }.sortedWith(compareBy({ it.access.ordinal }, { it.name.lowercase() }, { it.id.value }))
+    }
+  }
+
+  /**
+   * Adds saved SSH parents the graph does not contain, and refreshes the display fields of ones it
+   * does. The saved config is authoritative for a device's address and name; the graph remains
+   * authoritative for attached Harness state.
+   */
+  private fun mergeSavedSshDevices(
+    projected: List<DeviceView>,
+    profiles: List<ServerProfile>,
+    savedSshHosts: List<SshHostConfig>,
+    discovery: (String) -> DeviceDiscovery?,
+    isOnline: (String) -> Boolean,
+    nowMs: Long
+  ): List<DeviceView> {
+    if (savedSshHosts.isEmpty()) return projected
+    val savedById = savedSshHosts.associateBy { config ->
+      MigrationProjection.hostId(MigrationProjection.sshSourceId(config.id), config.id)
+    }
+    val profilesByHost = profiles.filter { it.sshHostId != null }.groupBy { it.sshHostId!! }
+    fun attachedFor(config: SshHostConfig): List<ServerProfile> = profilesByHost[config.id].orEmpty()
+    fun refreshed(device: DeviceView, config: SshHostConfig): DeviceView {
+      val attached = attachedFor(config)
+      // A stale graph may not carry the newest leaf yet; the profile list does. Only use it when
+      // the graph has no attached Harness for this device, so graph ordering is not disturbed.
+      val useProfiles = device.attachedCount == 0 && attached.isNotEmpty()
+      val observed = device.discovery ?: discovery(device.id.value)
+      val displayName = config.name.ifBlank { config.address }
+      return device.copy(
+        name = displayName,
+        endpoint = config.profileUrl(),
+        harnesses = if (useProfiles) slots(DeviceAccess.SSH, attached, observed, nowMs, displayName) else device.harnesses,
+        discovery = observed,
+        online = if (useProfiles) attached.any { isOnline(it.id) } else device.online
+      )
+    }
+    val merged = projected.map { device ->
+      val saved = savedById[device.id.value]?.takeIf { device.access == DeviceAccess.SSH } ?: return@map device
+      refreshed(device, saved)
+    }.toMutableList()
+    val known = merged.mapTo(HashSet()) { it.id.value }
+    savedById.forEach { (hostId, config) ->
+      if (hostId in known) return@forEach
+      val sourceId = MigrationProjection.sshSourceId(config.id)
+      val observed = discovery(hostId)
+      val displayName = config.name.ifBlank { config.address }
+      val attached = attachedFor(config)
+      merged += DeviceView(
+        id = DeviceId(hostId),
+        name = displayName,
+        access = DeviceAccess.SSH,
+        endpoint = config.profileUrl(),
+        fingerprint = config.hostKeyFingerprint,
+        sourceId = sourceId,
+        sourceName = config.user,
+        // An SSH parent is its own device switch; a saved config is enabled by definition.
+        enabled = true,
+        sourceEnabled = true,
+        harnesses = slots(DeviceAccess.SSH, attached, observed, nowMs, displayName),
+        discovery = observed,
+        online = attached.any { isOnline(it.id) }
+      )
+      known += hostId
+    }
+    return merged
   }
 
   /** leaf 在设备页上的槽位键：协议 + locator。 */

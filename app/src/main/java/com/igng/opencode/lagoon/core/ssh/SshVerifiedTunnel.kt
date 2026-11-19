@@ -105,7 +105,14 @@ internal object SshVerifiedTunnel {
     } else params.put("kind", "dsh").put("state", target.dshStateDirectory)
     // No token, password, cookie, or request bytes are ever passed in a process argument.
     val encoded = Base64.getEncoder().encodeToString(params.toString().toByteArray(Charsets.UTF_8))
-    return listOf("python3", "-u", "-c", SshShell.quote(HELPER), SshShell.quote(encoded)).joinToString(" ")
+    val python = listOf("python3", "-u", "-c", SshShell.quote(HELPER), SshShell.quote(encoded)).joinToString(" ")
+    // A missing interpreter used to fail before the helper could print UNSUPPORTED, which surfaced
+    // as "remote safety check unavailable" instead of the documented record-level fallback. Probe
+    // from the shell first, so DSH can degrade and OpenCode can refuse with an honest reason.
+    val unsupported = SshShell.quote(UNSUPPORTED)
+    return "if ! command -v python3 >/dev/null 2>&1; then printf '%s\\n' $unsupported; exit 0; fi; " +
+      "if [ \"\$(uname -s 2>/dev/null)\" = Darwin ] && [ ! -x /usr/sbin/lsof ]; then " +
+      "printf '%s\\n' $unsupported; exit 0; fi; exec $python"
   }
 
   /** Never retain stderr: login shells or the remote runtime may print paths or credentials. */

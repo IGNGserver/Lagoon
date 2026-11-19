@@ -313,14 +313,16 @@ class LagoonController private constructor(private val appContext: Context) {
   fun deviceViews(
     graph: ConnectionGraph?,
     profiles: List<ServerProfile>,
-    isOnline: (String) -> Boolean = { false }
+    isOnline: (String) -> Boolean = { false },
+    savedSshHosts: List<SshHostConfig> = emptyList()
   ): List<DeviceView> = DeviceProjection.devices(
     graph = graph,
     profiles = profiles,
     // 图不可用时没有可信的采纳目录：按旧行为显示全部 Host，宁可多显示也不让设备凭空消失。
     adoptedDeviceIds = if (graph == null) null else adoptedDeviceIds(),
     discovery = ::deviceDiscovery,
-    isOnline = isOnline
+    isOnline = isOnline,
+    savedSshHosts = savedSshHosts
   )
 
   /** 设备级开关：只写 `HostBinding.enabled`，不碰任何 leaf 偏好。 */
@@ -968,8 +970,9 @@ class LagoonController private constructor(private val appContext: Context) {
   private fun persistConnectionGraph(profiles: List<ServerProfile> = store.readProfiles(), groups: List<DeviceGroup> = state.value.deviceGroups) {
     if (!connectionGraphWritable) return
     try {
-      // Runtime parentEnabled is an overlay, never part of migration/legacy profile authority.
-      val graph = projectedConnectionGraph(store.readProfiles(), groups)
+      // Use the caller's post-save profiles, not a second disk read: a save that just added a leaf
+      // must publish that leaf in the same frame, or the device page is one edit behind.
+      val graph = projectedConnectionGraph(profiles, groups)
       connectionGraphStore.save(graph)
       connectionGraphMutable.value = graph
     } catch (error: CancellationException) {
@@ -1975,6 +1978,9 @@ class LagoonController private constructor(private val appContext: Context) {
         }
         is ConnectionGraphStore.LoadResult.Unsupported -> {
           connectionGraphWritable = false
+          // Keep the newer document on disk, but still give the device page a read-only projection:
+          // a missing graph must not hide every saved SSH parent.
+          connectionGraphMutable.value = fallbackConnectionGraph()
           Diagnostics.warn("ConnectionGraph", "连接图版本 ${result.version} 高于当前版本，保留原图并继续使用旧连接资料")
         }
       }
@@ -1982,9 +1988,23 @@ class LagoonController private constructor(private val appContext: Context) {
       throw error
     } catch (error: Exception) {
       connectionGraphWritable = false
+      connectionGraphMutable.value = fallbackConnectionGraph()
       Diagnostics.warn("ConnectionGraph", "连接图读取/迁移失败，继续使用旧连接资料", error)
     }
   }
+
+  /**
+   * Display-only graph used when the persisted document is unreadable or from a newer schema.
+   * It is never saved (the writable flag stays false), so the original bytes are preserved.
+   */
+  private fun fallbackConnectionGraph(): ConnectionGraph? = runCatching {
+    ConnectionCatalogProjection.merge(
+      MigrationProjection.fromProfiles(store.readProfiles()),
+      previous = null,
+      sshHosts = sshHostStore.load(),
+      remoteCatalogs = store.remoteCatalogs()
+    )
+  }.onFailure { Diagnostics.warn("ConnectionGraph", "无法构建只读连接图投影", it) }.getOrNull()
 
   init {
     initializeConnectionGraph()

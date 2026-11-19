@@ -141,7 +141,10 @@ class AgyApi(
   private fun timestamp(value: String): Long = runCatching { Instant.parse(value).toEpochMilli() }.getOrDefault(0)
   private fun parseSession(value: JSONObject): Session {
     val id = value.str("sessionId").ifBlank { value.str("id") }
-    val cwd = value.str("cwd").ifBlank { value.str("path") }
+    // ACP implementations report a workspace either as a filesystem path or as a file:// URI. A
+    // percent-encoded path is still a valid absolute path, so it used to pass validation untouched
+    // and every workspace label showed %E4%B8%AD... instead of the folder's name.
+    val cwd = AgyPath.decode(value.str("cwd").ifBlank { value.str("path") })
     if (!validSessionId(id) || !validPath(cwd) || cwd.length > 4096 || cwd.any(Char::isISOControl))
       throw ApiException(502, "AGY 会话缺少有效身份或工作目录")
     val old = sessions[id]
@@ -150,13 +153,14 @@ class AgyApi(
       projectId = "$projectPrefix:cwd:$cwd", created = old?.created ?: 0)
   }
   override suspend fun rootSessionsPage(directory: String?, cursor: String?, size: Int): ApiPage<Session> {
+    val requested = directory?.takeIf { it.isNotBlank() }?.let(AgyPath::decode)
     val params = JSONObject()
-    if (!directory.isNullOrBlank()) params.put("cwd", directory)
+    if (requested != null) params.put("cwd", requested)
     if (!cursor.isNullOrBlank()) params.put("cursor", cursor)
     val response = rpc("session/list", params)
     // Some AGY versions return a global page even when cwd was supplied. Preserve
     // the server cursor and check every Host-reported workspace, not only its first.
-    if (!directory.isNullOrBlank() && response.opt("_lagoonWorkspaceLookupComplete") == false)
+    if (requested != null && response.opt("_lagoonWorkspaceLookupComplete") == false)
       throw ApiException(502, "无法确认 AGY 会话的全部工作目录，请检查开发机的 Python 3 与 AGY 目录数据库")
     val rows = objects(response, "sessions").mapNotNull { value ->
       val parsed = parseSession(value)
@@ -164,15 +168,18 @@ class AgyApi(
       val locations = if (raw == null) listOf(parsed.directory) else {
         if (raw.length() > 64) throw ApiException(502, "AGY 会话工作目录超过上限")
         (0 until raw.length()).map { index ->
-          (raw.opt(index) as? String)?.takeIf { validPath(it) && it.length <= 4096 && it.none(Char::isISOControl) }
+          val decoded = AgyPath.decode((raw.opt(index) as? String).orEmpty())
+          decoded.takeIf { validPath(it) && it.length <= 4096 && it.none(Char::isISOControl) }
             ?: throw ApiException(502, "AGY 会话工作目录无效")
         }.distinct().ifEmpty { listOf(parsed.directory) }
       }
       sessionDirectories[parsed.id] = locations
-      val selected = if (directory.isNullOrBlank()) {
+      val selected = if (requested == null) {
         sessions[parsed.id]?.directory?.takeIf { previous -> locations.any { normalizedDirectory(it) == normalizedDirectory(previous) } }
+          ?: locations.firstOrNull { normalizedDirectory(it) == normalizedDirectory(parsed.directory) }
+          ?: locations.firstOrNull()
           ?: parsed.directory
-      } else locations.firstOrNull { normalizedDirectory(it) == normalizedDirectory(directory) } ?: return@mapNotNull null
+      } else locations.firstOrNull { normalizedDirectory(it) == normalizedDirectory(requested) } ?: return@mapNotNull null
       parsed.copy(directory = selected, projectId = "$projectPrefix:cwd:$selected")
     }
     rows.forEach { sessions[it.id] = it }
@@ -196,8 +203,9 @@ class AgyApi(
     return dirs.values.toList()
   }
   override suspend fun projectAt(directory: String): Project? {
-    if (!validPath(directory) || directory.any(Char::isISOControl)) throw ApiException(400, "请选择有效的绝对工作目录")
-    val canonical = transport.verifyDirectory(directory)
+    val decoded = AgyPath.decode(directory)
+    if (!validPath(decoded) || decoded.any(Char::isISOControl)) throw ApiException(400, "请选择有效的绝对工作目录")
+    val canonical = transport.verifyDirectory(decoded)
     if (!validPath(canonical)) throw ApiException(502, "AGY 未确认有效工作目录")
     return Project("$projectPrefix:cwd:$canonical", canonical, canonical.trimEnd('/', '\\').substringAfterLast('/').substringAfterLast('\\').ifBlank { canonical })
   }
@@ -672,4 +680,41 @@ class AgyApi(
     if (!isReplay && kind in setOf("user_message_chunk", "agent_message_chunk", "agent_thought_chunk", "tool_call", "tool_call_update"))
       event(sessionId, "session.transcript.invalidate")
   }
+}
+
+/**
+ * AGY reports workspace locations either as a plain path or as a `file:` URI. Both carriers can be
+ * percent-encoded (Chinese folder names, spaces, `#`), and decoding belongs at this boundary so
+ * every later consumer — labels, project keys, file APIs — sees one canonical path.
+ */
+internal object AgyPath {
+  fun decode(value: String): String {
+    val trimmed = value.trim()
+    if (trimmed.startsWith("file:", ignoreCase = true)) {
+      val uri = runCatching { java.net.URI(trimmed) }.getOrNull()
+      if (uri != null && uri.scheme.equals("file", ignoreCase = true) &&
+        (uri.host.isNullOrEmpty() || uri.host.equals("localhost", ignoreCase = true))
+      ) {
+        // Do not use Paths.get(uri): it decodes bytes with the JVM's file-name charset, which is not
+        // UTF-8 on every device. The URI is UTF-8 by definition, so decode the raw path ourselves.
+        val decoded = percentDecode(uri.rawPath.orEmpty())
+        // Windows file URIs carry a leading slash before the drive letter: /C:/work -> C:/work.
+        return if (WINDOWS_DRIVE.containsMatchIn(decoded)) decoded.removePrefix("/") else decoded
+      }
+    }
+    return percentDecode(trimmed)
+  }
+
+  private fun percentDecode(value: String): String {
+    if ('%' !in value) return value
+    // Decode only complete %XX runs. A literal percent in an ordinary folder name stays untouched;
+    // invalid UTF-8 is replaced rather than throwing the whole catalog read away.
+    return PERCENT_RUN.replace(value) { match ->
+      val bytes = match.value.chunked(3).map { it.substring(1).toInt(16).toByte() }.toByteArray()
+      String(bytes, Charsets.UTF_8)
+    }
+  }
+
+  private val PERCENT_RUN = Regex("(?:%[0-9A-Fa-f]{2})+")
+  private val WINDOWS_DRIVE = Regex("^/[A-Za-z]:[\\\\/]")
 }

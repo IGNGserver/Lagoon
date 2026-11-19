@@ -18,6 +18,8 @@ import com.igng.opencode.lagoon.core.SshSecrets
 import com.igng.opencode.lagoon.core.SshHostStore
 import com.igng.opencode.lagoon.core.SshKeyStore
 import com.igng.opencode.lagoon.core.SshPublicKeyFormat
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -38,7 +40,15 @@ internal class SshHostManager(
 ) {
   private class SharedLink(val hostId: String, val link: SshHostLink, val refs: AtomicInteger = AtomicInteger(0))
 
-  private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+  /**
+   * Link/keepalive/reconnect work is background maintenance. A failure there is reported to the
+   * link's status and retried; it must never reach Android's default handler and kill the app.
+   */
+  private val scope = CoroutineScope(
+    SupervisorJob() + Dispatchers.IO + CoroutineExceptionHandler { _, error ->
+      if (error !is CancellationException) Diagnostics.warn("SshHostManager", "SSH 后台任务异常", error)
+    }
+  )
   private val links = ConcurrentHashMap<String, SharedLink>()
   private class SharedCodex(val hostId: String, val client: HarnessClient, var refs: Int = 0)
   private val codexLinks = mutableMapOf<String, SharedCodex>()

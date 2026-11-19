@@ -3,6 +3,7 @@ package com.igng.opencode.lagoon.core
 import android.content.Context
 import android.content.SharedPreferences
 import java.io.IOException
+import org.json.JSONObject
 
 /**
  * Persistence for saved SSH hosts: the non-secret config in one preferences file and the password /
@@ -22,12 +23,28 @@ internal class SshHostStore internal constructor(
     KeystoreCipher.of("lagoon-ssh-secrets")::decrypt
   )
 
+  /**
+   * Read-only view for the UI. A malformed document must not blank the whole device list: recover
+   * every host entry that is individually valid, while writers keep using [readHosts] and refuse to
+   * overwrite the original bytes.
+   */
   @Synchronized fun load(): List<SshHostConfig> = try {
     readHosts()
   } catch (error: IOException) {
-    Diagnostics.warn("SshHostStore", "SSH 主机配置读取失败，界面暂不显示", error)
-    emptyList()
+    val recovered = recoverHosts()
+    Diagnostics.warn("SshHostStore",
+      if (recovered.isEmpty()) "SSH 主机配置读取失败，界面暂不显示" else "SSH 主机配置部分损坏，已显示可恢复的设备",
+      error)
+    recovered
   }
+
+  private fun recoverHosts(): List<SshHostConfig> = runCatching {
+    val text = preferences.getString(KEY, null) ?: return@runCatching emptyList()
+    val array = JSONObject(text).optJSONArray("hosts") ?: return@runCatching emptyList()
+    (0 until array.length()).mapNotNull { index ->
+      array.optJSONObject(index)?.let(SshHostConfig::fromJson)
+    }.distinctBy { it.id }
+  }.getOrDefault(emptyList())
 
   /** Throws when the stored document cannot be trusted. Writers must not replace it with a
    *  one-host list, which would erase every other host. */

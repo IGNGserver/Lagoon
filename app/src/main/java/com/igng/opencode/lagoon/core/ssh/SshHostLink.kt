@@ -303,15 +303,21 @@ internal class SshHostLink(
       if (closed) throw SshFailure(SshFailureKind.DISCONNECTED, "SSH 主机已移除", retryable = false)
 
       publish(SshLinkPhase.CONNECTING, SshLinkStep.TUNNEL, "正在建立本地隧道", attempt = attempt)
-      val tunnelOpen = withContext(Dispatchers.IO) {
-        nextTransport.probeTunnel("127.0.0.1", nextEndpoint.port, 10_000)
+      // The proof below opens the remote socket and sends one anonymous request to it, so a
+      // separate ad-hoc HTTP/1.0 probe was both redundant and fragile: a just-started or busy dsh
+      // could miss it and the whole generation was rejected before the real client ever tried.
+      // A listener that is not reachable now surfaces as a typed TUNNEL failure instead.
+      val dshProof = try {
+        withContext(Dispatchers.IO) { SshVerifiedTunnel.verify(nextTransport, SshVerifiedTunnel.dsh(nextEndpoint)) }
+      } catch (error: SshFailure) {
+        if (error.kind == SshFailureKind.UNRESPONSIVE) throw SshFailure(
+          SshFailureKind.TUNNEL,
+          "无法建立到远端 dsh web 的隧道",
+          "远端 127.0.0.1:${nextEndpoint.port} 未响应安全检查；dsh web 可能刚启动、已退出或拒绝 loopback 访问。",
+          retryable = true
+        )
+        throw error
       }
-      if (!tunnelOpen) throw SshFailure(SshFailureKind.TUNNEL, "无法建立到远端 dsh web 的隧道")
-      // A successful TCP or public HTTP response alone does not identify the process listening on
-      // this port. No DSH token or cookie is sent until a socket owned by the managed generation
-      // (or its verified child) has been proved. The proof runs once per generation: repeating it
-      // per socket spawned a python process and a full /proc scan for every HTTP connection.
-      val dshProof = withContext(Dispatchers.IO) { SshVerifiedTunnel.verify(nextTransport, SshVerifiedTunnel.dsh(nextEndpoint)) }
       endpoint = nextEndpoint
       provenTransport = nextTransport
       if (dshProof == SshVerifiedTunnel.Proof.DEGRADED)
@@ -336,7 +342,7 @@ internal class SshHostLink(
         withTimeout(45_000) { api.probeAuth() }
       } catch (error: Throwable) {
         runCatching { api.close() }
-        throw sshFailure(error, "DSH 登录失败")
+        throw dshLoginFailure(error)
       }
       if (closed) {
         runCatching { api.close() }
@@ -516,38 +522,74 @@ internal class SshHostLink(
       var ticks = 0
       while (!closed && mutableStatus.value.isConnected) {
         delay(PING_INTERVAL_MILLIS)
-        val active = transport ?: break
-        if (active.isClosed || !active.ping(PING_TIMEOUT_MILLIS)) {
-          lost(SshFailure(SshFailureKind.DISCONNECTED, "SSH 连接没有响应，正在重连"), active)
-          break
-        }
-        val openCode = openCodeEndpoint
-        if (openCode != null && !active.probeTunnel(openCode.host, openCode.port, 8_000)) {
-          lost(SshFailure(SshFailureKind.DISCONNECTED, "OpenCode 服务已停止，正在重新发现"), active)
-          break
-        }
-        val dsh = endpoint
-        if (dsh != null) {
-          // SSH can stay up while the remote dsh web process dies. Probe its loopback port so the
-          // bootstrap can restart it and hand out a new token before the next control-plane read.
-          if (!active.probeTunnel("127.0.0.1", dsh.port, 8_000)) {
-            lost(SshFailure(SshFailureKind.DSH_START, "远端的 dsh web 已停止，正在重启"), active)
+        var active: SshTransport? = null
+        try {
+          active = transport ?: break
+          if (active.isClosed || !active.ping(PING_TIMEOUT_MILLIS)) {
+            lost(SshFailure(SshFailureKind.DISCONNECTED, "SSH 连接没有响应，正在重连"), active)
             break
           }
-          // A restarted dsh can bind the same port; the port probe alone cannot tell. Once a
-          // minute compare the recorded generation and re-read the launch token when it changed.
-          ticks += 1
-          if (ticks % GENERATION_CHECK_TICKS == 0 && active === transport) {
-            val expected = dsh.pid
-            val observed = runCatching { bootstrap?.probe() }.getOrNull()?.pid
-            if (observed != null && expected != null && observed != expected) {
-              lost(SshFailure(SshFailureKind.DSH_START, "远端 dsh web 已更换，正在重新读取启动令牌"), active)
+          val openCode = openCodeEndpoint
+          if (openCode != null && !active.probeTunnel(openCode.host, openCode.port, 8_000)) {
+            lost(SshFailure(SshFailureKind.DISCONNECTED, "OpenCode 服务已停止，正在重新发现"), active)
+            break
+          }
+          val dsh = endpoint
+          if (dsh != null) {
+            // SSH can stay up while the remote dsh web process dies. Probe its loopback port so the
+            // bootstrap can restart it and hand out a new token before the next control-plane read.
+            if (!active.probeTunnel("127.0.0.1", dsh.port, 8_000)) {
+              lost(SshFailure(SshFailureKind.DSH_START, "远端的 dsh web 已停止，正在重启"), active)
               break
             }
+            // A restarted dsh can bind the same port; the port probe alone cannot tell. Once a
+            // minute compare the recorded generation and re-read the launch token when it changed.
+            ticks += 1
+            if (ticks % GENERATION_CHECK_TICKS == 0 && active === transport) {
+              val expected = dsh.pid
+              val observed = runCatching { bootstrap?.probe() }.getOrNull()?.pid
+              if (observed != null && expected != null && observed != expected) {
+                lost(SshFailure(SshFailureKind.DSH_START, "远端 dsh web 已更换，正在重新读取启动令牌"), active)
+                break
+              }
+            }
           }
+        } catch (cancel: CancellationException) {
+          throw cancel
+        } catch (error: Throwable) {
+          // A close/reconnect can invalidate this generation between the liveness checks. Health
+          // work must report "lost", never escape the supervisor as an uncaught process crash.
+          Diagnostics.warn("SshHostLink", "SSH 保活检查失败", error)
+          lost(SshFailure(SshFailureKind.DISCONNECTED, "SSH 保活检查失败，正在重连"), active)
+          break
         }
       }
     }
+  }
+
+  /**
+   * A login failure through the forwarder is either a credential problem or a tunnel that never
+   * reached dsh web. Keep the two apart: "无法建立隧道" must name the transport, not send the user
+   * looking for a token again.
+   */
+  private fun dshLoginFailure(error: Throwable): SshFailure {
+    val chain = generateSequence(error) { it.cause }.toList()
+    val text = chain.mapNotNull { it.message?.takeIf(String::isNotBlank) }.joinToString(" · ").take(600)
+    val authFailure = chain.filterIsInstance<ApiException>().firstOrNull { it.status in setOf(401, 403) }
+    if (authFailure != null) {
+      // A rotated launch token is not a wrong credential: the owner already dropped this generation
+      // and the same loop must re-read the token, not park the binding on "login failed".
+      val rotated = authFailure.code == "AUTH_TOKEN_ROTATED" || text.contains("重新获取启动令牌")
+      return SshFailure(SshFailureKind.LOGIN, "DSH 登录失败", text, retryable = rotated)
+    }
+    val transportFailure = chain.any {
+      it is java.net.ConnectException || it is java.net.SocketTimeoutException ||
+        it is java.net.NoRouteToHostException || it is java.net.UnknownHostException
+    } || listOf("failed to connect", "connection refused", "connection reset", "timeout", "timed out")
+      .any { text.contains(it, ignoreCase = true) }
+    if (transportFailure)
+      return SshFailure(SshFailureKind.TUNNEL, "无法建立到远端 dsh web 的隧道", text, retryable = true)
+    return sshFailure(error, "DSH 登录失败")
   }
 
   private fun lost(failure: SshFailure, expectedTransport: SshTransport? = null) {
