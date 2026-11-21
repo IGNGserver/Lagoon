@@ -48,7 +48,13 @@ data class LagoonState(
   /** True for one launch after a v1 group document was discarded during the v2 migration. */
   val deviceGroupReset: Boolean = false,
   val serverId: String? = null, val version: String = "",
-  val connected: Boolean = false, val cached: Boolean = false, val loading: Boolean = false, val error: String? = null,
+  val connected: Boolean = false, val cached: Boolean = false, val loading: Boolean = false,
+  /**
+   * 一次显式的首页刷新（[LagoonController.reload]）正在跑。刷新指示器、重试条与“待同步”文案
+   * 都只读这一处，避免同一时刻既说“正在刷新”又提示“下拉重试”。
+   */
+  val refreshing: Boolean = false,
+  val error: String? = null,
   /** True when the last catalog refresh could not read every project; some values are last-known. */
   val degraded: Boolean = false,
   val streamConnected: Boolean = false,

@@ -86,6 +86,9 @@ internal class RemoteDshBootstrap(
     appendLine("LEGACY=\"\$HOME/.dsh-app-remote\"")
     appendLine("REQUEST_COMMAND=${SshShell.quote(command)}")
     appendLine("REQUEST_CWD=${SshShell.quote(workingDirectory?.trim().orEmpty())}")
+    // Only the default launch command is bound to the global dsh install version: a custom command
+    // may be a wrapper with its own lifecycle and must keep the old "reuse while verifiable" rule.
+    appendLine("TRACK_INSTALL=${if (command == DEFAULT_DSH_LAUNCH_COMMAND) 1 else 0}")
     appendLine("export D")
     append(shell("""
       _st() {
@@ -118,6 +121,8 @@ internal class RemoteDshBootstrap(
       # 0 = verified live candidate, 1 = absent/stale (safe to replace), 2 = untouchable.
       # A record that no longer matches the live process generation is stale, not a conflict:
       # reboots and PID reuse are the normal way a managed instance disappears.
+      # The second argument enables the install-fingerprint check (managed directory only); the
+      # legacy dsh-Go directory is read-only and never version-bound.
       _inspect() {
         SD=§1
         _kind "§SD" dir
@@ -147,6 +152,16 @@ internal class RemoteDshBootstrap(
           A=§(head -c 128 /proc/sys/kernel/random/boot_id 2>/dev/null)
           [ -n "§A" ] && [ "§A" = "§B" ] || return 1
         fi
+        # The recorded generation was launched from a specific dsh install. A changed install
+        # (upgrade, reinstall) means the live process can no longer speak the harness protocol the
+        # installed version writes, so it is stale even though the pid/command are ours.
+        if [ "§2" = 1 ] && [ -n "§CURRENT_FP" ]; then
+          _kind "§SD/web.ver" file
+          [ "§KIND" = other ] && return 2
+          [ "§KIND" = ours ] || return 1
+          V=§(head -c 4096 "§SD/web.ver" 2>/dev/null) || return 1
+          [ "§V" = "§CURRENT_FP" ] || return 1
+        fi
         _kind "§SD/web.cmd" file
         [ "§KIND" = other ] && return 2
         [ "§KIND" = ours ] || return 1
@@ -175,14 +190,14 @@ internal class RemoteDshBootstrap(
       # never signalled and never a reason to fail.
       _existing() {
         OWN_STATUS=1; LEGACY_STATUS=1
-        _inspect "§D"; OWN_STATUS=§?
+        _inspect "§D" 1; OWN_STATUS=§?
         if [ "§OWN_STATUS" -eq 2 ]; then return 2; fi
         if [ "§OWN_STATUS" -eq 0 ]; then
           OWN_PID=§RESULT_PID; OWN_URL=§RESULT_URL
           printf 'LAGOON alive %s\nLAGOON samecmd\nLAGOON reused %s\nLAGOON source managed\nLAGOON url %s\n' "§OWN_PID" "§OWN_PID" "§OWN_URL"
           return 0
         fi
-        _inspect "§LEGACY"; LEGACY_STATUS=§?
+        _inspect "§LEGACY" 0; LEGACY_STATUS=§?
         if [ "§LEGACY_STATUS" -eq 0 ]; then
           LEGACY_PID=§RESULT_PID; LEGACY_URL=§RESULT_URL
           printf 'LAGOON alive %s\nLAGOON samecmd\nLAGOON reused %s\nLAGOON source legacy\nLAGOON url %s\n' "§LEGACY_PID" "§LEGACY_PID" "§LEGACY_URL"
@@ -250,6 +265,32 @@ internal class RemoteDshBootstrap(
           sleep 0.1
         done
       }
+      # Fingerprint of the dsh install this machine resolves right now. It must never run
+      # `dsh --version`: invoking the binary is slow, may start side effects, and a broken or
+      # unusual install would hang the whole bootstrap. Resolve with `command -v`, follow symlinks
+      # by hand (readlink is the only portable primitive), then stat the real target.
+      _fp() {
+        FP=§(command -v dsh 2>/dev/null) || return 1
+        [ -n "§FP" ] || return 1
+        i=0
+        while [ -L "§FP" ] && [ "§i" -lt 20 ]; do
+          T=§(readlink "§FP" 2>/dev/null) || break
+          [ -n "§T" ] || break
+          case "§T" in
+            /*) FP=§T ;;
+            *) case "§FP" in */*) FP="§{FP%/*}/§T" ;; *) FP="§T" ;; esac ;;
+          esac
+          i=§((i+1))
+        done
+        [ -e "§FP" ] || return 1
+        S=§(stat -c '%Y:%s' "§FP" 2>/dev/null) || S=§(stat -f '%m:%z' "§FP" 2>/dev/null) || return 1
+        [ -n "§S" ] || return 1
+        printf '%s|%s' "§FP" "§S"
+      }
+      # Empty when dsh is missing or unreadable (PATH anomalies): an unverifiable install must not
+      # make an otherwise valid record look stale.
+      CURRENT_FP=''
+      if [ "§TRACK_INSTALL" = 1 ]; then CURRENT_FP=§(_fp); fi
     """))
   }
 
@@ -297,7 +338,7 @@ internal class RemoteDshBootstrap(
     }
     append(shell("""
       # Only our own stale metadata can be replaced; legacy files are never written or removed.
-      rm -f "§D/web.pid" "§D/web.st" "§D/web.boot"
+      rm -f "§D/web.pid" "§D/web.st" "§D/web.boot" "§D/web.ver"
       printf '%s' "§REQUEST_COMMAND" > "§D/web.cmd"
       printf '%s' "§REQUEST_CWD" > "§D/web.cwd"
       : > "§D/web.log"
@@ -315,6 +356,13 @@ internal class RemoteDshBootstrap(
       [ "§{#P}" -le 10 ] && [ "§P" -gt 1 ] 2>/dev/null || { printf 'LAGOON metadata\n'; exit 1; }
       ST=§(_st "§P" 2>/dev/null)
       [ -n "§ST" ] || { printf 'LAGOON metadata\n'; exit 1; }
+      # Pin the install this generation was launched from before the record becomes visible: an
+      # interrupted bootstrap then still leaves a reusable, correctly versioned record.
+      if [ -n "§CURRENT_FP" ]; then
+        printf '%s' "§CURRENT_FP" > "§D/web.ver" || { printf 'LAGOON metadata\n'; exit 1; }
+      else
+        rm -f "§D/web.ver" 2>/dev/null
+      fi
       printf '%s\n' "§ST" > "§D/web.st"
       if [ -r /proc/sys/kernel/random/boot_id ]; then
         head -c 128 /proc/sys/kernel/random/boot_id > "§D/web.boot" || { printf 'LAGOON metadata\n'; exit 1; }

@@ -171,8 +171,16 @@ private fun PullRefreshIndicator(
   val visible = isRefreshing || completed || value > 0f
   if (!visible) return
   val progress = (value / thresholdPx).coerceIn(0f, 1f)
+  // 慢刷新时把话说清楚：刷新还没结束，只是比预期久；不要在这时冒出一句“已完成/仍在后台”。
+  var slow by remember { mutableStateOf(false) }
+  LaunchedEffect(isRefreshing) {
+    slow = false
+    if (!isRefreshing) return@LaunchedEffect
+    delay(5_000)
+    slow = true
+  }
   val label = when {
-    isRefreshing -> "正在刷新…"
+    isRefreshing -> if (slow) "仍在刷新…" else "正在刷新…"
     completed -> "已刷新"
     value >= thresholdPx -> "松开刷新"
     else -> "下拉刷新"

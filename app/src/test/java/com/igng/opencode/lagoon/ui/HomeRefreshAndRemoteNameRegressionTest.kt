@@ -31,7 +31,34 @@ class HomeRefreshAndRemoteNameRegressionTest {
       Regex("(?<!Lagoon)PullToRefresh\\(").containsMatchIn(text))
     assertEquals("刷新开始和结束各回顶一次", 2, Regex("list\\.scrollToItem\\(0\\)").findAll(text).count())
     assertTrue("下拉和重试共用同一个刷新入口", text.contains("onRefresh = ::refreshFromTop"))
-    assertTrue("同步提示的重试也走刷新入口", text.contains("onAction = { refreshFromTop() }"))
+    assertTrue("指示器读控制器持有的唯一刷新状态", text.contains("isRefreshing = state.refreshing"))
+    assertTrue("离线时下拉先重连", text.contains("controller.retryNow()"))
+  }
+
+  @Test fun homeHasExactlyOneStatusStrip() {
+    val text = source("ui/SessionsHomeScreen.kt")
+    assertTrue("首页使用合并后的状态条", text.contains("HomeStatusStrip(state, controller"))
+    assertFalse("不得再叠加聚合恢复条", text.contains("AggregateConnectionStrip("))
+    assertFalse("不得再叠加传输失败条", text.contains("TransportFailureStrip("))
+    assertFalse("待同步提示不再是列表里的一行", text.contains("item(key = \"sync\")"))
+  }
+
+  @Test fun theControllerOwnsTheRefreshStateAndNeverClaimsABackgroundRefreshAfterItStopped() {
+    val controller = source("core/LagoonController.kt")
+    assertTrue("刷新开始置位 refreshing", controller.contains("it.copy(refreshing = true)"))
+    assertTrue("刷新结束清除 refreshing", controller.contains("it.copy(refreshing = false)"))
+    assertTrue("并发刷新复用同一个 Job", controller.contains("reloadJob?.takeIf { it.isActive }?.let { return it }"))
+    assertFalse("不再弹“刷新已结束但仍在刷新”的假超时提示",
+      controller.contains("仍在刷新，完成后会自动更新"))
+    val home = source("ui/HomeStatusStrip.kt")
+    assertTrue("刷新中隐藏待同步行", home.contains("if (state.refreshing) return null"))
+    assertTrue("OpenCode 服务未运行给“启动服务”", home.contains("HomeStatusAction.StartOpenCodeService"))
+  }
+
+  @Test fun thePullIndicatorSaysItIsStillRunningInsteadOfPretendingToFinish() {
+    val text = source("ui/LagoonPullToRefresh.kt")
+    assertTrue("慢刷新文案诚实", text.contains("仍在刷新…"))
+    assertFalse("刷新中不得提示已完成", text.contains("isRefreshing -> \"已刷新\""))
   }
 
   @Test fun refreshContainerNeverConsumesScrollWhileRefreshing() {

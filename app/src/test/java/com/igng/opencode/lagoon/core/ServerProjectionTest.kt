@@ -74,9 +74,9 @@ class ServerProjectionTest {
     assertNull(liveButCached.homeSyncNotice())
 
     val offline = liveButCached.copy(connected = false, loading = false)
-    assertEquals("离线缓存 · 下拉重试", offline.homeSyncNotice())
-    assertEquals("尚未连接 · 点按重试", offline.copy(sessions = emptyList()).homeSyncNotice())
-    assertEquals("部分数据待同步 · 下拉重试", liveButCached.copy(degraded = true).homeSyncNotice())
+    assertEquals("离线缓存", offline.homeSyncNotice())
+    assertEquals("尚未连接", offline.copy(sessions = emptyList()).homeSyncNotice())
+    assertEquals("部分数据待同步", liveButCached.copy(degraded = true).homeSyncNotice())
   }
 
   @Test fun aggregateCacheFlagNeedsEveryMemberToBeOffline() {
@@ -91,7 +91,7 @@ class ServerProjectionTest {
     val allOffline = LagoonState(profiles = listOf(a, b), allServers = true,
       allServerSnapshots = mapOf("a" to online.copy(connected = false), "b" to offline))
     assertTrue(allOffline.homeProjection().cached)
-    assertEquals("离线缓存 · 下拉重试", allOffline.homeProjection().homeSyncNotice())
+    assertEquals("离线缓存", allOffline.homeProjection().homeSyncNotice())
   }
 
   @Test fun groupViewHasNoGlobalViewAllButSingleServerAndFilteredAllDo() {

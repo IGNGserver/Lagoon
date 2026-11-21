@@ -1842,6 +1842,10 @@ class LagoonController private constructor(private val appContext: Context) {
   private var stream: Job? = null
   private var generation = 0
   private var refresh: Job? = null
+  /** 首页显式刷新的单一所有者：并发下拉/重试共用同一个 Job，指示器只读 [LagoonState.refreshing]。 */
+  private var reloadJob: Job? = null
+  /** 每次刷新/重新连接递增；旧的刷新结束不得清掉新刷新的状态。 */
+  private var reloadEpoch = 0
   private var eventRefresh: Job? = null
   private var messageRefresh: Job? = null
   private val sendMutex = Mutex()
@@ -3890,6 +3894,10 @@ class LagoonController private constructor(private val appContext: Context) {
     // A reconnect to the same server keeps the open conversation's pending prompt; anything else goes back to its draft.
     returnQueuedToDrafts { it.serverId == id && it.sessionId == (sessionOverride ?: previous.sessionId) && id == previousServer }
     stopSingleConnection()
+    // The switch below installs a fresh state (refreshing = false). Retire the old refresh pass so
+    // its completion can neither block the next pull nor clear a newer indicator.
+    reloadEpoch++
+    reloadJob = null
     val token = generation
     connectTrace.begin(token.toLong(), "连接 ${profile.kind.label}")
     allOverview.start(profiles, include = setOfNotNull(id))
@@ -4556,22 +4564,47 @@ class LagoonController private constructor(private val appContext: Context) {
     op.commit { it.copy(messages = (page.items + it.messages).distinctBy { m -> m.id }, messagesCursor = page.next,
       loadedOlderMessages = true, historyRevision = it.historyRevision + 1) }
   }
-  /** Home/pull-to-refresh: a cheap catalog + pending read, not the deep shell/descendant sweep. */
+  /**
+   * Home/pull-to-refresh: a cheap catalog + pending read, not the deep shell/descendant sweep.
+   *
+   * One owner for the whole pass. A second pull/retry while it runs joins the same job instead of
+   * stacking another indicator, and [LagoonState.refreshing] stays true until both the conversation
+   * and the background overview reads really finish. There is deliberately no "gave up but still
+   * working" timeout: that used to surface as a toast after the pull indicator had already stopped.
+   */
   fun reload(): Job {
+    reloadJob?.takeIf { it.isActive }?.let { return it }
     triggerPendingRemoteRevocationsDrain()
+    val epoch = ++reloadEpoch
+    updateState { it.copy(refreshing = true) }
     val foregroundRead = reloadConversation(deep = false)
-    return scope.launch {
-      val completed = withTimeoutOrNull(15_000L) {
+    val job = scope.launch {
+      try {
         coroutineScope {
           val backgroundRead = async { allOverview.refreshAllAndAwait() }
           foregroundRead.join()
           backgroundRead.await()
         }
-        true
+      } finally {
+        // A server switch or a newer refresh owns the indicator now; only this pass may clear it.
+        if (reloadEpoch == epoch) updateState { it.copy(refreshing = false) }
       }
-      if (completed != true) showNotice("仍在刷新，完成后会自动更新", FeedbackTone.INFO)
     }
+    reloadJob = job
+    return job
   }
+  /**
+   * The remote session log was written by a newer DSH than the one our managed `dsh web` instance is
+   * running. The SSH link owns that process: reconnecting makes `RemoteDshBootstrap` compare the
+   * installed binary fingerprint with the recorded generation and restart only our own process.
+   */
+  private fun reconnectManagedDshAfterUpgrade(serverId: String) {
+    val profile = store.profiles().firstOrNull { it.id == serverId } ?: return
+    val hostId = profile.sshHostId ?: return
+    Diagnostics.warn("LagoonController", "会话日志来自更新版本的 DSH，重连托管实例")
+    sshHostManager.retry(hostId)
+  }
+
   private fun reloadConversation(deep: Boolean = true): Job {
     if (api == null || state.value.serverId == null) return scope.launch { }
     val token = generation
@@ -5676,7 +5709,11 @@ class LagoonController private constructor(private val appContext: Context) {
       // A transient transport timeout is not a permanent "load failed": keep the last good page and
       // retry quietly. Only a contract/auth failure (or a retry budget exhausted) becomes an error.
       Diagnostics.warn("LagoonController", "会话消息读取失败", error)
-      val retryable = error.isRetryableTransportFailure()
+      // A log written by a newer DSH can only be read after the managed instance restarts; retrying
+      // the same read is useless, so reconnect the SSH link (the bootstrap re-checks the install).
+      val newerDshLog = error.isNewerDshSessionLog()
+      if (newerDshLog) reconnectManagedDshAfterUpgrade(serverId)
+      val retryable = error.isRetryableTransportFailure() && !newerDshLog
       val fallback = cachedTranscript(serverId, session.id)
       if (current()) updateState {
         val status = if (retryable) ResourceStatus(ResourceState.STALE, "连接中断，正在后台重试")

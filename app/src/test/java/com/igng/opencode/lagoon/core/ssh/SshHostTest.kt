@@ -8,6 +8,7 @@ import com.igng.opencode.lagoon.core.SshHostConfig
 import com.igng.opencode.lagoon.core.SshHostCodec
 import com.igng.opencode.lagoon.core.SshShell
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Assume.assumeTrue
 import org.junit.Test
@@ -125,6 +126,105 @@ class SshHostTest {
       assertTrue(File(home, ".lagoon-ssh-dsh/web.log").readText().contains("test-token"))
     } finally {
       launched?.let(::stopFixturePid)
+      dsh.delete()
+      root.deleteRecursively()
+    }
+  }
+
+  @Test fun managedDshRestartsAfterInstalledBinaryChanges() {
+    assumeTrue(File("/bin/sh").exists())
+    val root = Files.createTempDirectory("lagoon-dsh-upgrade").toFile()
+    val home = File(root, "home").apply { mkdirs() }
+    val bin = File(root, "bin").apply { mkdirs() }
+    val dsh = File(bin, "dsh").apply {
+      writeText(
+        """
+        #!/bin/sh
+        echo "dsh web: http://127.0.0.1:45691/?token=old-token"
+        exec sleep 60
+        """.trimIndent()
+      )
+      setExecutable(true)
+    }
+    val transport = LocalShellTransport(home, "${bin.absolutePath}:/usr/bin:/bin")
+    val bootstrap = RemoteDshBootstrap(transport, launchCommand = "dsh web", startTimeoutSeconds = 10)
+    var launched: FixturePid? = null
+    var replacement: FixturePid? = null
+    try {
+      val first = bootstrap.start()
+      launched = first.pid?.let(::captureFixturePid)
+      assertTrue("first start must record a live pid", launched?.let(::fixturePidAlive) == true)
+      assertTrue(
+        "a managed start must record the installed dsh fingerprint",
+        File(home, ".lagoon-ssh-dsh/web.ver").isFile
+      )
+      // Simulate `npm i -g @deepseek-ai/dsh@next`: same command path, new bytes and a newer mtime.
+      // The size change keeps the fingerprint deterministic even where mtime has 1s resolution.
+      dsh.writeText(
+        """
+        #!/bin/sh
+        echo "dsh web: http://127.0.0.1:45692/?token=new-token"
+        exec sleep 60
+        # upgraded
+        """.trimIndent() + "\n"
+      )
+      dsh.setLastModified(dsh.lastModified() + 2_000L)
+      val second = bootstrap.ensureRunning()
+      replacement = second.pid?.let(::captureFixturePid)
+      assertFalse("an upgraded dsh install must not reuse the old process", second.reused)
+      assertEquals(45692, second.port)
+      assertEquals("new-token", second.token)
+      assertTrue("the old generation must be replaced by a new pid", second.pid != first.pid)
+      assertFalse("the old fixture process must be stopped", launched?.let(::fixturePidAlive) == true)
+    } finally {
+      launched?.let(::stopFixturePid)
+      replacement?.let(::stopFixturePid)
+      stopRecordedFixture(home)
+      dsh.delete()
+      root.deleteRecursively()
+    }
+  }
+
+  @Test fun managedDshWithoutInstallRecordIsReplaced() {
+    assumeTrue(File("/bin/sh").exists())
+    val root = Files.createTempDirectory("lagoon-dsh-nover").toFile()
+    val home = File(root, "home").apply { mkdirs() }
+    val bin = File(root, "bin").apply { mkdirs() }
+    val dsh = File(bin, "dsh").apply {
+      writeText(
+        """
+        #!/bin/sh
+        echo "dsh web: http://127.0.0.1:45693/?token=legacy-token"
+        exec sleep 60
+        """.trimIndent()
+      )
+      setExecutable(true)
+    }
+    val bootstrap = RemoteDshBootstrap(
+      LocalShellTransport(home, "${bin.absolutePath}:/usr/bin:/bin"), startTimeoutSeconds = 10
+    )
+    val state = File(home, ".lagoon-ssh-dsh")
+    var launched: FixturePid? = null
+    var replacement: FixturePid? = null
+    try {
+      val first = bootstrap.start()
+      launched = first.pid?.let(::captureFixturePid)
+      // A record written by a Lagoon build older than the install check has no web.ver. It cannot
+      // be proven to match the installed dsh, so it must be replaced exactly once.
+      assertTrue(File(state, "web.ver").delete())
+      val second = bootstrap.ensureRunning()
+      replacement = second.pid?.let(::captureFixturePid)
+      assertFalse(
+        "a record without an install fingerprint is unverifiable and must be replaced",
+        second.reused
+      )
+      assertTrue("the old generation must be replaced by a new pid", second.pid != first.pid)
+      assertTrue("the replacement must record the current fingerprint", File(state, "web.ver").isFile)
+      assertFalse("the replaced fixture process must be stopped", launched?.let(::fixturePidAlive) == true)
+    } finally {
+      launched?.let(::stopFixturePid)
+      replacement?.let(::stopFixturePid)
+      stopRecordedFixture(home)
       dsh.delete()
       root.deleteRecursively()
     }
@@ -445,6 +545,12 @@ class SshHostTest {
   private fun stopFixturePid(target: FixturePid) {
     // Only signal the exact generation launched by this test, never a reused PID.
     if (fixturePidAlive(target)) ProcessBuilder("/bin/kill", "-KILL", target.pid.toString()).start().waitFor(5, TimeUnit.SECONDS)
+  }
+  /** Stop whatever process the fixture state directory still records (covers a failed start). */
+  private fun stopRecordedFixture(home: File) {
+    val recorded = File(home, ".lagoon-ssh-dsh/web.pid")
+      .takeIf(File::isFile)?.readText()?.trim()?.toIntOrNull() ?: return
+    runCatching { captureFixturePid(recorded) }.getOrNull()?.let(::stopFixturePid)
   }
   private fun startSleepFixture(): Pair<Process, Long> {
     val process = ProcessBuilder("/bin/sh", "-c", "echo \$\$; exec sleep 60").start()

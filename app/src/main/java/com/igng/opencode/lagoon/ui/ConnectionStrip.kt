@@ -38,11 +38,9 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.igng.opencode.lagoon.core.ConnectionBanner
-import com.igng.opencode.lagoon.core.HubAuthStatus
 import com.igng.opencode.lagoon.core.LagoonController
 import com.igng.opencode.lagoon.core.LagoonState
 import com.igng.opencode.lagoon.core.RemoteRecoveryKind
-import com.igng.opencode.lagoon.core.serverSnapshots
 import kotlinx.coroutines.delay
 import top.yukonga.miuix.kmp.basic.InfiniteProgressIndicator
 import top.yukonga.miuix.kmp.basic.Text
@@ -141,82 +139,6 @@ internal fun ConnectionStrip(state: LagoonState, controller: LagoonController, m
   }
 }
 
-/**
- * 聚合首页（全部设备 / 设备分组）顶部的连接与恢复提示条：
- * - 当作用域内任一中枢设备登录态/设备令牌失效时，直接提供「重新登录」入口；
- * - 当全部设备都离线且列表展示的是本地离线缓存时，明确提示「正在显示本地离线缓存会话」。
- */
-@Composable
-internal fun AggregateConnectionStrip(
-  state: LagoonState,
-  controller: LagoonController,
-  onManageDevices: () -> Unit = {},
-  modifier: Modifier = Modifier
-) {
-  val scopeProfiles = when {
-    state.allServers -> state.enabledProfiles
-    state.homeGroup != null -> state.enabledProfiles.filter { it.id in state.homeGroup!!.memberIds }
-    else -> emptyList()
-  }
-  val loginProfile = scopeProfiles.firstOrNull { profile ->
-    state.allServerSnapshots[profile.id]?.remoteRecovery == RemoteRecoveryKind.LOGIN ||
-      (profile.remoteHostId != null && controller.hostAuthExpired(profile.url, profile.username, profile.remoteHostId, state))
-  }
-  val otherRecoveryPair = scopeProfiles.firstNotNullOfOrNull { profile ->
-    state.allServerSnapshots[profile.id]?.remoteRecovery
-      ?.takeIf { it != RemoteRecoveryKind.LOGIN && it != RemoteRecoveryKind.RECONNECT }
-      ?.let { profile to it }
-  }
-  val onlineCount = scopeProfiles.count { state.allServerSnapshots[it.id]?.connected == true }
-  val anyLoading = scopeProfiles.any { state.allServerSnapshots[it.id]?.loading == true }
-  val degradedCatalog = if (scopeProfiles.isEmpty() && state.profiles.isNotEmpty()) {
-    controller.remoteCatalogs()
-      .filterNot(controller::isPairedRemoteCatalog)
-      .firstOrNull { controller.hubAuthStatus(it, state) != HubAuthStatus.ACTIVE }
-  } else null
-  val cacheSuffix = if (state.sessions.isNotEmpty()) " · 当前显示离线缓存" else ""
-  val notice = when {
-    loginProfile != null -> Triple(
-      "${loginProfile.name} 登录态已失效，无法同步最新数据$cacheSuffix",
-      MiuixToastType.WARNING,
-      controller.remoteRecoveryLabel(loginProfile) to ({ controller.openRemoteRecoveryFor(loginProfile.id, RemoteRecoveryKind.LOGIN) })
-    )
-    otherRecoveryPair != null -> Triple(
-      "${otherRecoveryPair.first.name} 连接需要处理$cacheSuffix",
-      MiuixToastType.WARNING,
-      otherRecoveryPair.second.label to ({ controller.openRemoteRecoveryFor(otherRecoveryPair.first.id, otherRecoveryPair.second) })
-    )
-    degradedCatalog != null -> Triple(
-      "远程中枢（${degradedCatalog.account}）已退出或登录失效$cacheSuffix",
-      MiuixToastType.WARNING,
-      "重新登录" to ({ controller.openRemoteRelogin(degradedCatalog.origin, degradedCatalog.allowCleartext, degradedCatalog.account) })
-    )
-    scopeProfiles.isNotEmpty() && onlineCount == 0 && !anyLoading && state.sessions.isNotEmpty() -> Triple(
-      "当前无在线设备，正在显示本地离线缓存会话",
-      MiuixToastType.INFO,
-      "设备管理" to onManageDevices
-    )
-    else -> null
-  }
-  AnimatedVisibility(
-    visible = notice != null,
-    modifier = modifier,
-    enter = fadeIn(HyperMotion.sheetFloatSpring) + expandVertically(HyperMotion.controlSpring()),
-    exit = fadeOut(HyperMotion.sheetFloatSpring) + shrinkVertically(HyperMotion.controlSpring())
-  ) {
-    val shown = notice ?: return@AnimatedVisibility
-    HyperInlineNotice(
-      message = shown.first,
-      type = shown.second,
-      action = shown.third.first,
-      onAction = shown.third.second,
-      modifier = Modifier
-        .padding(horizontal = 14.dp, vertical = 4.dp)
-        .semantics { liveRegion = LiveRegionMode.Polite }
-    )
-  }
-}
-
 /** Placeholder bars while a list has nothing to show yet; they pulse so the wait reads as progress. */
 @Composable
 internal fun LoadingSkeleton(rows: Int = 3, modifier: Modifier = Modifier) {
@@ -260,30 +182,4 @@ internal fun SessionRowsSkeleton(rows: Int = 6) {
       }
     }
   }
-}
-
-/**
- * 传输层失败（SSH/Codex/AGY）必须说出来：这些错误没有 Remote 的恢复动作，过去只写进日志，
- * 首页就只剩一个空列表。这里复用连接条的提示样式，给出原因与「重试」。
- */
-@Composable
-internal fun TransportFailureStrip(state: LagoonState, controller: LagoonController, modifier: Modifier = Modifier) {
-  val failing: Pair<String, String>? = when {
-    state.multiServerView -> state.enabledProfiles.firstNotNullOfOrNull { profile ->
-      state.allServerSnapshots[profile.id]?.transportError?.takeIf { it.isNotBlank() }?.let { profile.name to it }
-    }
-    else -> state.serverId?.let { id ->
-      state.serverSnapshots()[id]?.transportError?.takeIf { it.isNotBlank() }?.let { (state.server?.name ?: "") to it }
-    }
-  }
-  val shown = failing ?: return
-  HyperInlineNotice(
-    message = listOf(shown.first, shown.second).filter(String::isNotBlank).joinToString(" · "),
-    type = MiuixToastType.ERROR,
-    action = "重试",
-    onAction = { controller.retryNow() },
-    modifier = modifier
-      .padding(horizontal = 14.dp, vertical = 4.dp)
-      .semantics { liveRegion = LiveRegionMode.Polite }
-  )
 }
