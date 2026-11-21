@@ -35,4 +35,18 @@ class UserFacingErrorTest {
     assertEquals("操作失败", userFacingError(IOException("unexpected end of stream")))
     assertEquals("刷新失败", userFacingError(RuntimeException(), "刷新失败"))
   }
+
+  @Test fun aSessionLogFromANewerDshIsExplainedAsAVersionProblem() {
+    val raw = "failed to observe session \"session-1\": session \"session-1\" contains event type \"team/mode\" " +
+      "(seq 4) unknown to this harness and not marked ignorable; refusing to interpret the log \u2014 " +
+      "it was likely written by a newer harness (raw log: /home/me/.dsh/sessions/x/session.v4.jsonl.zstd)"
+    val error = ApiException(500, raw)
+    assertEquals(NEWER_DSH_SESSION_LOG_TEXT, userFacingError(error))
+    assertEquals(true, error.isNewerDshSessionLog())
+    // A retired pre-release log is not the same problem and must keep its server text.
+    val retired = ApiException(500, "contains a request/header event with the unsupported legacy reason \"fallback\"; " +
+      "refusing to interpret the log \u2014 it was written by a retired pre-release harness")
+    assertEquals(false, retired.isNewerDshSessionLog())
+    assertEquals(false, IOException("unexpected end of stream").isNewerDshSessionLog())
+  }
 }

@@ -100,7 +100,7 @@ class DeviceGroupProjectionTest {
       ))
     val home = state.homeProjection()
     assertTrue(home.cached)
-    assertEquals("离线缓存 · 下拉重试", home.homeSyncNotice())
+    assertEquals("离线缓存", home.homeSyncNotice())
   }
 
   @Test fun noGroupKeepsSingleServerBehavior() {

@@ -143,9 +143,8 @@ internal fun HomeScreen(
         }
         GlobalTaskStrip(state, controller, onOpen = onOpen)
       }
-      if (state.multiServerView) AggregateConnectionStrip(state, controller, onManageDevices = onManageDevices)
-      else ConnectionStrip(state, controller)
-      TransportFailureStrip(state, controller)
+      // 连接、恢复、缓存、待同步四条来源只保留一条，避免同屏互相矛盾。
+      HomeStatusStrip(state, controller, onManageDevices = onManageDevices)
       Box(Modifier.weight(1f).fillMaxWidth()) {
         SessionList(
           state, controller, grouping, query.trim(), onOpen, onNewSession, onManageDevices,
@@ -306,7 +305,6 @@ private fun SessionList(
   onRename: (Session) -> Unit,
   onDelete: (Session) -> Unit
 ) {
-  var refreshing by remember { mutableStateOf(false) }
   val refreshScope = rememberCoroutineScope()
   val list = rememberLazyListState()
   val now by produceState(System.currentTimeMillis()) { while (true) { kotlinx.coroutines.delay(60_000); value = System.currentTimeMillis() } }
@@ -369,22 +367,22 @@ private fun SessionList(
   val muted = HyperTheme.colors.textSecondary
   val profilesById = remember(state.profiles) { state.profiles.associateBy { it.id } }
 
+  /**
+   * 下拉 / 提示条的重试共用一个入口：[LagoonState.refreshing] 是控制器持有的唯一刷新状态，
+   * 因此其他入口（前台恢复、重连）触发的刷新也会显示同一枚指示器，不会出现“界面说没刷新、
+   * 后台其实还在刷”。离线时下拉先重连，而不是读一个并不存在的连接。
+   */
   fun refreshFromTop() {
-    if (refreshing) return
-    refreshing = true
+    if (state.refreshing) return
     refreshScope.launch {
       if (list.layoutInfo.totalItemsCount > 0) list.scrollToItem(0)
-      try {
-        controller.reload().join()
-      } finally {
-        if (list.layoutInfo.totalItemsCount > 0) list.scrollToItem(0)
-        refreshing = false
-      }
+      if (state.connected) controller.reload().join() else controller.retryNow()
+      if (list.layoutInfo.totalItemsCount > 0) list.scrollToItem(0)
     }
   }
 
   LagoonPullToRefresh(
-    isRefreshing = refreshing,
+    isRefreshing = state.refreshing,
     onRefresh = ::refreshFromTop,
     listState = list
   ) {
@@ -402,17 +400,6 @@ private fun SessionList(
       state = list,
       contentPadding = PaddingValues(top = 6.dp, bottom = 120.dp)
     ) {
-      state.homeSyncNotice()?.takeIf { visibleSections.isNotEmpty() }?.let { notice ->
-        item(key = "sync") {
-          HyperInlineNotice(
-            message = notice,
-            type = MiuixToastType.WARNING,
-            action = "重试",
-            onAction = { refreshFromTop() },
-            modifier = Modifier.padding(horizontal = 14.dp, vertical = 4.dp)
-          )
-        }
-      }
       visibleSections.forEach { section ->
         val collapsed = query.isBlank() && section.key in state.collapsedSections
         item(key = "section:${section.key}", contentType = "section") {
@@ -505,7 +492,7 @@ private fun SessionList(
                   when {
                     state.connected -> onNewSession()
                     allDisabled || state.profiles.isEmpty() -> onManageDevices()
-                    else -> refreshFromTop()
+                    else -> controller.retryNow()
                   }
                 }
               )

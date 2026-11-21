@@ -35,7 +35,11 @@ internal fun LagoonState.computeServerSnapshots(): Map<String, ServerOverviewSna
     streamConnected = streamConnected, projects = projects, sessions = sessions, parents = parents, tasks = tasks,
     notices = notices, permissions = permissions, questions = questions, backgroundRunning = backgroundRunning,
     summary = summary, autoApprovalFailures = autoApprovalFailures, shells = shells,
-    workspaceCatalog = workspaceCatalog, remoteRecovery = remoteRecovery))
+    workspaceCatalog = workspaceCatalog,
+    // The per-server observer owns transport failures and typed recoveries; keep the last one while
+    // this writable connection is down so the home strip can name the cause and its direct fix.
+    remoteRecovery = remoteRecovery ?: visible[id]?.remoteRecovery?.takeIf { !connected },
+    transportError = visible[id]?.transportError?.takeIf { !connected }))
 }
 
 /**
@@ -74,14 +78,18 @@ internal fun LagoonState.homeUnseenSessions(): Set<String> =
  * The off-line wording belongs to the page, not to one device: an aggregate with at least one live
  * server is still usable, and a connected server whose *transcript* came from cache (the `cached`
  * flag) is not an off-line catalog. A single off-line member is shown by its device chip instead.
+ *
+ * The text names the condition only. The retry/refresh affordance belongs to
+ * [com.igng.opencode.lagoon.ui.HomeStatusStrip], so the page never shows a stale "下拉重试" while a
+ * refresh is already running.
  */
 internal fun LagoonState.homeSyncNotice(): String? = when {
-  connected && degraded -> "部分数据待同步 · 下拉重试"
+  connected && degraded -> "部分数据待同步"
   connected -> null
   loading -> null
   enabledProfiles.isEmpty() -> null
-  sessions.isNotEmpty() -> "离线缓存 · 下拉重试"
-  else -> "尚未连接 · 点按重试"
+  sessions.isNotEmpty() -> "离线缓存"
+  else -> "尚未连接"
 }
 
 /**
