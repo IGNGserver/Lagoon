@@ -169,7 +169,11 @@ data class SshHostConfig(
 
   val usesDefaultCommand: Boolean get() = launchCommand.trim() == DEFAULT_DSH_LAUNCH_COMMAND
 
-  /** Fields that need a fresh SSH session. Renaming and re-pinning the key do not move the link. */
+  /** Fields that need a fresh SSH session. Renaming, re-pinning, and DSH launch tweaks stay separate. */
+  val transportKey: String
+    get() = listOf(host.trim(), port, user.trim(), auth.name, keyId.orEmpty()).joinToString("\u0000")
+
+  /** Full link key including DSH bootstrap settings. */
   val connectionKey: String
     get() = listOf(host.trim(), port, user.trim(), auth.name, keyId.orEmpty(), launchCommand.trim(), workingDirectory.orEmpty())
       .joinToString("\u0000")
@@ -344,7 +348,7 @@ data class SshFailure(
 data class RemoteExecResult(val exitCode: Int?, val stdout: String, val stderr: String)
 
 /** A remote `dsh web` reachable through the local forwarder. */
-data class RemoteDshEndpoint(
+data class SshDshEndpoint(
   val port: Int,
   val token: String,
   val pid: Int? = null,

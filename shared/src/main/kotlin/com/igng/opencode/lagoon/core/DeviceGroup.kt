@@ -7,122 +7,100 @@ import java.text.Normalizer
 import java.util.Locale
 
 /**
- * A user-created device group. It only describes how this installation presents several saved
- * servers; it is never uploaded and does not affect authentication, routing or session identity.
- *
- * A profile may belong to several groups, each referencing the same stable profile ID. Group order
- * is the persistence order; member order is the order chosen in the editor. Ungrouped profiles do
- * not get a home tab: 全部 is the only implicit bucket, so every saved profile remains reachable
- * without becoming top-bar noise.
+ * 本机设备分组。只持久化 [deviceIds]（[SshDevice.id]），运行时按设备当前挂载的 Harness 动态展开：
+ * 给组内设备新增或移除 Harness 时分组自动生效，删掉最后一条 Harness 也不会销毁设备组。
  */
 data class DeviceGroup(
   val id: String,
   val name: String,
-  /** 展开后的 Harness leaf id；旧版分组只有这一份，读起来仍然是成员。 */
-  val memberIds: List<String> = emptyList(),
-  /** 用户在编辑器里选中的设备；非空时 [memberIds] 由它展开，新增 Harness 会自动加入。 */
   val deviceIds: List<String> = emptyList(),
-  val updatedAt: Long = 0
-)
-
-/** How a group member is presented. Devices are computers; harnesses are protocol endpoints. */
-enum class DeviceMemberRole(val label: String) { DEVICE("设备"), HARNESS("Harness") }
-
-/**
- * A DSH Remote host and an SSH host are devices; OpenCode and the legacy direct-DSH profile are
- * harnesses. The distinction is presentational only: both kinds remain ordinary ServerProfiles.
- */
-val ServerProfile.deviceMemberRole: DeviceMemberRole
-  get() = when {
-    sshHostId != null -> DeviceMemberRole.DEVICE
-    kind == ServerKind.DSH_REMOTE -> DeviceMemberRole.DEVICE
-    else -> DeviceMemberRole.HARNESS
+  val updatedAt: Long = 0,
+  /** 仅升级迁移读取 v2/v3 旧文档时暂存旧 leaf 列表；v4 写盘时不再输出。 */
+  val legacyMemberIds: List<String> = emptyList()
+) {
+  /** 动态展开该组下所有设备的 Harness ID。 */
+  @JvmName("memberHarnessIdsFromDevices")
+  fun memberHarnessIds(devices: List<SshDevice>): List<String> {
+    if (deviceIds.isEmpty()) return emptyList()
+    val byId = devices.associateBy { it.id }
+    return deviceIds.distinct().flatMap { id -> byId[id]?.harnesses?.map { it.id }.orEmpty() }.distinct()
   }
 
-/** 统一连接类型展示标签（OpenCode 直连、DSH 远程中枢、DSH SSH 直连、旧版直连 DSH） */
+  /** 从已投影的 [ServerProfile] 列表动态展开该组的 Harness ID。 */
+  fun memberHarnessIds(profiles: List<ServerProfile>): List<String> {
+    if (deviceIds.isEmpty()) return emptyList()
+    val deviceSet = deviceIds.toSet()
+    val byDevice = profiles.filter { it.deviceId != null && it.deviceId in deviceSet }.groupBy { it.deviceId!! }
+    return deviceIds.distinct().flatMap { id -> byDevice[id].orEmpty().map { it.id } }.distinct()
+  }
+
+  fun memberProfiles(profiles: List<ServerProfile>): List<ServerProfile> {
+    if (deviceIds.isEmpty()) return emptyList()
+    val byDevice = profiles.filter { it.deviceId != null }.groupBy { it.deviceId!! }
+    return deviceIds.distinct().flatMap { id -> byDevice[id].orEmpty() }.distinctBy { it.id }
+  }
+}
+
+/** 统一连接类型展示标签（例如 "DeepSeek Harness · SSH"）。 */
 val ServerProfile.connectionTypeLabel: String
-  get() = when {
-    sshHostId != null -> "${when (protocol) { HarnessProtocolId.ANTIGRAVITY_ACP -> "Antigravity"; HarnessProtocolId.OPENCODE_ACP -> "OpenCode ACP"; HarnessProtocolId.CODEX_APP_SERVER -> "Codex"; HarnessProtocolId.OPENCODE_NATIVE -> "OpenCode"; else -> "DSH" }} SSH 直连"
-    kind == ServerKind.DSH_REMOTE -> "DSH 远程中枢"
-    remoteHostId != null -> when (protocol) { HarnessProtocolId.ANTIGRAVITY_ACP -> "Antigravity · Remote"; HarnessProtocolId.OPENCODE_ACP -> "OpenCode ACP · Remote"; HarnessProtocolId.CODEX_APP_SERVER -> "Codex · Remote"; else -> "OpenCode 原生 · Remote" }
-    kind == ServerKind.OPENCODE -> "OpenCode 直连"
-    else -> "旧版直连 DSH"
-  }
+  get() = "${protocol.label} · SSH"
 
-/** 统一连接端点简要描述，例如 "OpenCode 直连 · http://..." */
+/** 统一连接端点简要描述，例如 "DeepSeek Harness · dev@10.0.0.5:22" */
 val ServerProfile.endpointSummary: String
-  get() = when {
-    sshHostId != null -> "$connectionTypeLabel · ${url.removePrefix("ssh://")}"
-    kind == ServerKind.DSH_REMOTE -> "DSH 远程中枢 · ${remoteHostId?.take(8).orEmpty()}"
-    remoteHostId != null -> "$connectionTypeLabel · ${remoteHostId.take(8)}"
-    kind == ServerKind.OPENCODE -> "OpenCode 直连 · $url"
-    else -> "旧版直连 DSH · $url"
-  }
-
-/** One profile with its presentation role, used by the device management page and group editor. */
-data class DeviceMember(val profile: ServerProfile, val role: DeviceMemberRole)
-
-fun List<ServerProfile>.deviceMembers(): List<DeviceMember> =
-  map { DeviceMember(it, it.deviceMemberRole) }
+  get() = "${protocol.label} · ${url.removePrefix("ssh://")}"
 
 data class DeviceGroupState(
   val groups: List<DeviceGroup> = emptyList(),
   val selectedGroupId: String? = null
 ) {
-  /** First containing group in save order; a profile may also belong to later groups. */
-  fun groupOf(profileId: String): DeviceGroup? = groups.firstOrNull { profileId in it.memberIds }
+  /** 包含该设备的第一个分组。 */
+  fun groupOfDevice(deviceId: String): DeviceGroup? = groups.firstOrNull { deviceId in it.deviceIds }
+
+  /** 包含该 Harness 所属设备的第一个分组。 */
+  fun groupOf(profile: ServerProfile): DeviceGroup? = profile.deviceId?.let(::groupOfDevice)
 
   /**
-   * Removes duplicate/unknown members within each group, empty groups and duplicate group ids.
-   * A device-based group survives even when the device currently has no Harness attached — that is
-   * a legal state (`docs/DEVICE_MODEL.md` §5), not an empty group.
+   * 清理重复/已删除的设备 ID、空分组和重复组 ID。
+   * 只要组里仍有已保存的 SSH 设备，即使设备当前没有挂载任何 Harness 也会完整保留。
    */
-  fun sanitized(profileIds: Set<String>, deviceIds: Set<String> = emptySet()): DeviceGroupState {
+  fun sanitized(validDeviceIds: Set<String>): DeviceGroupState {
     val seenGroups = HashSet<String>()
     val clean = ArrayList<DeviceGroup>(groups.size)
     for (group in groups) {
       if (group.id.isBlank() || group.id.length > 128 || group.name.isBlank() || !seenGroups.add(group.id)) continue
-      val members = group.memberIds.filter { it in profileIds }.distinct()
-      val devices = group.deviceIds.filter { it in deviceIds }.distinct()
-      if (members.isEmpty() && devices.isEmpty()) continue
-      clean += group.copy(name = group.name.trim().take(128), memberIds = members, deviceIds = devices)
+      val devices = group.deviceIds.filter { it in validDeviceIds }.distinct()
+      if (devices.isEmpty()) continue
+      clean += group.copy(name = group.name.trim().take(128), deviceIds = devices, legacyMemberIds = emptyList())
     }
     val selected = selectedGroupId?.takeIf { id -> clean.any { it.id == id } }
     return DeviceGroupState(clean, selected)
   }
 
-  /**
-   * All groups still containing this profile after removal. An empty leaf list only drops the group
-   * when it is not attached to devices; removing the last Harness must not delete a device group.
-   */
-  fun withoutProfile(profileId: String): DeviceGroupState = copy(
+  /** 移除一台已删除的设备；仅当某组不再含任何设备时才移除该组。 */
+  fun withoutDevice(deviceId: String): DeviceGroupState = copy(
     groups = groups.mapNotNull { group ->
-      if (profileId !in group.memberIds) group
-      else group.copy(memberIds = group.memberIds.filterNot { it == profileId })
-        .takeIf { it.memberIds.isNotEmpty() || it.deviceIds.isNotEmpty() }
+      if (deviceId !in group.deviceIds) group
+      else group.copy(deviceIds = group.deviceIds.filterNot { it == deviceId })
+        .takeIf { it.deviceIds.isNotEmpty() }
     }
   ).let { next ->
     next.copy(selectedGroupId = next.selectedGroupId?.takeIf { id -> next.groups.any { it.id == id } })
   }
 
-  /**
-   * Top-bar entries for the explicit groups only. Ungrouped profiles intentionally produce no tab;
-   * they remain visible in 全部 and in the device management page.
-   */
+  /** 首页顶栏 / 范围选择器用的分组标签，按设备动态展开出已投影的 Harness。 */
   fun tabs(profiles: List<ServerProfile>): List<DeviceTab> {
-    val byId = profiles.associateBy { it.id }
     val result = ArrayList<DeviceTab>(groups.size)
     groups.forEach { group ->
-      val members = group.memberIds.distinct().mapNotNull { byId[it] }
+      val members = group.memberProfiles(profiles)
       if (members.isNotEmpty()) result += DeviceTab("group:${group.id}", group.name, group, members)
     }
     return result
   }
 
-  /** Profiles that are not in any group, in save order. */
-  fun ungrouped(profiles: List<ServerProfile>): List<ServerProfile> {
-    val grouped = groups.flatMap { it.memberIds }.toSet()
-    return profiles.filter { it.id !in grouped }
+  /** 未归入任何分组的设备，保持原顺序。 */
+  fun ungroupedDevices(devices: List<SshDevice>): List<SshDevice> {
+    val grouped = groups.flatMapTo(HashSet()) { it.deviceIds }
+    return devices.filter { it.id !in grouped }
   }
 }
 
@@ -208,7 +186,7 @@ fun deviceWorkspaceKey(session: Session, projects: List<Project>, scope: String)
 }
 
 internal object DeviceGroupCodec {
-  const val VERSION = 3
+  const val VERSION = 4
 
   fun encode(state: DeviceGroupState): String = JSONObject()
     .put("version", VERSION)
@@ -219,7 +197,6 @@ internal object DeviceGroupCodec {
           .put("id", group.id)
           .put("name", group.name)
           .put("updatedAt", group.updatedAt)
-          .put("members", JSONArray(group.memberIds))
           .put("devices", JSONArray(group.deviceIds)))
       }
     }).toString()
@@ -231,25 +208,31 @@ internal object DeviceGroupCodec {
     try {
       val json = JSONObject(text)
       val version = json.optInt("version")
-      if (version != VERSION && version != 2) throw IOException("设备分组版本无效")
+      if (version !in setOf(2, 3, VERSION)) throw IOException("设备分组版本无效")
       val rawGroups = json.optJSONArray("groups") ?: JSONArray()
       if (rawGroups.length() > 64) throw IOException("设备分组过多")
       val groups = (0 until rawGroups.length()).mapNotNull { index ->
         val item = rawGroups.optJSONObject(index) ?: return@mapNotNull null
         val id = item.optString("id").takeIf { it.isNotBlank() && it.length <= 128 } ?: return@mapNotNull null
         val name = item.optString("name").takeIf { it.isNotBlank() && it.length <= 128 } ?: return@mapNotNull null
-        val members = item.optJSONArray("members") ?: JSONArray()
-        if (members.length() > 64) throw IOException("设备分组成员过多")
-        val ids = (0 until members.length()).mapNotNull { members.optString(it).takeIf(String::isNotBlank) }.distinct()
         val devices = item.optJSONArray("devices")
         val deviceIds = devices?.let { array ->
           (0 until minOf(array.length(), 64)).mapNotNull { array.optString(it).takeIf(String::isNotBlank) }.distinct()
         }.orEmpty()
-        DeviceGroup(id, name, ids, deviceIds, item.optLong("updatedAt", 0))
+        val legacyMembers = if (version < VERSION) {
+          val members = item.optJSONArray("members") ?: JSONArray()
+          if (members.length() > 64) throw IOException("设备分组成员过多")
+          (0 until members.length()).mapNotNull { members.optString(it).takeIf(String::isNotBlank) }.distinct()
+        } else emptyList()
+        DeviceGroup(
+          id = id,
+          name = name,
+          deviceIds = deviceIds,
+          updatedAt = item.optLong("updatedAt", 0),
+          legacyMemberIds = legacyMembers
+        )
       }
       val selected = json.opt("selected") as? String
-      // Keep members whose profiles are not loaded yet; the controller sanitizes again with the
-      // current profile ids before publishing state.
       return DeviceGroupState(groups, selected?.takeIf { id -> groups.any { it.id == id } })
     } catch (error: IOException) {
       throw error

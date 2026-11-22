@@ -6,9 +6,8 @@ import kotlinx.coroutines.flow.Flow
 import okhttp3.WebSocket
 import org.json.JSONObject
 
-/** AGY operations over a carrier; calls never replay an uncertain write. */
+/** ACP operations over an SSH stdio carrier; calls never replay an uncertain write. */
 interface AgyTransport : Closeable {
-  val remote: Boolean get() = false
   val isClosed: Boolean get() = false
   /** Raw capability response from initialize, after the first call; null before initialization. */
   val initialization: JSONObject? get() = null
@@ -20,12 +19,12 @@ interface AgyTransport : Closeable {
   val terminalAvailable: Boolean get() = false
   suspend fun discoverCapabilities() = Unit
   suspend fun health() { call("session/list", JSONObject()) }
-  suspend fun terminalCall(endpoint: String, args: JSONObject): Any? = throw ApiException(501, "此 AGY 连接不支持终端")
+  suspend fun terminalCall(endpoint: String, args: JSONObject): Any? = throw ApiException(501, "此 ACP 连接不支持终端")
   suspend fun terminalOpen(endpoint: String, args: JSONObject, onItem: (JSONObject) -> Unit, onClosed: (Throwable?) -> Unit): WebSocket =
-    throw ApiException(501, "此 AGY 连接不支持终端")
-  suspend fun verifyDirectory(path: String): String = throw ApiException(501, "此 AGY 连接不支持目录验证")
-  suspend fun files(session: Session, path: String): List<FileNode> = throw ApiException(501, "此 AGY 连接不支持文件浏览")
-  suspend fun fileContent(session: Session, path: String): FileContent = throw ApiException(501, "此 AGY 连接不支持文件读取")
+    throw ApiException(501, "此 ACP 连接不支持终端")
+  suspend fun verifyDirectory(path: String): String = throw ApiException(501, "此 ACP 连接不支持目录验证")
+  suspend fun files(session: Session, path: String): List<FileNode> = throw ApiException(501, "此 ACP 连接不支持文件浏览")
+  suspend fun fileContent(session: Session, path: String): FileContent = throw ApiException(501, "此 ACP 连接不支持文件读取")
   suspend fun notify(method: String, params: JSONObject)
   suspend fun respond(requestId: Any, result: JSONObject)
   suspend fun respondError(requestId: Any, code: Int, message: String)

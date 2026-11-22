@@ -5,10 +5,11 @@ import android.content.Context
 import android.content.Intent
 import com.igng.opencode.lagoon.core.canApproveFromNotification
 import com.igng.opencode.lagoon.core.ApiException
+import com.igng.opencode.lagoon.core.DeviceStore
 import com.igng.opencode.lagoon.core.Diagnostics
+import com.igng.opencode.lagoon.core.HarnessProtocol
 import com.igng.opencode.lagoon.core.LagoonController
 import com.igng.opencode.lagoon.core.LiveUpdateStage
-import com.igng.opencode.lagoon.core.ServerKind
 import com.igng.opencode.lagoon.core.ServerStore
 import com.igng.opencode.lagoon.core.Session
 import kotlinx.coroutines.CancellationException
@@ -70,8 +71,9 @@ class NotificationActionReceiver : BroadcastReceiver() {
     permissionDirectory: String,
     profileUrl: String?
   ): Boolean {
-    val store = ServerStore(context)
-    val profile = store.profiles().firstOrNull { it.id == serverId } ?: return false
+    val deviceStore = DeviceStore(context)
+    val store = ServerStore(context, deviceStore)
+    val profile = deviceStore.profiles().firstOrNull { it.id == serverId } ?: return false
     if (!profile.effectiveEnabled) return false
     if (profileUrl != profile.url) return false
     val controller = LagoonController.get(context)
@@ -92,7 +94,7 @@ class NotificationActionReceiver : BroadcastReceiver() {
               } catch (e: ApiException) {
                 if (e.status != 404) throw e
               }
-            } else if (profile.kind == ServerKind.DSH || profile.kind == ServerKind.DSH_REMOTE) {
+            } else if (profile.protocol == HarnessProtocol.DSH) {
               return false
             }
           }

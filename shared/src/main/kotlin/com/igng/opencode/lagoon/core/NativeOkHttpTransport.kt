@@ -4,6 +4,7 @@ import kotlinx.coroutines.CancellableContinuation
 import kotlinx.coroutines.suspendCancellableCoroutine
 import okhttp3.Call
 import okhttp3.Callback
+import okhttp3.ConnectionPool
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
@@ -21,19 +22,20 @@ import java.util.concurrent.CancellationException
 import java.util.concurrent.TimeUnit
 import javax.net.SocketFactory
 
-/** Stock fixed-origin HTTP, SSE and WebSocket carrier for native services. */
+/** Stock fixed-origin HTTP, SSE and WebSocket carrier for native services over SSH loopback forwarders. */
 internal class NativeOkHttpTransport(
   override val endpoint: NativeHttpEndpoint,
   callTimeoutSeconds: Long = 60,
   streamIdleSeconds: Long = SharedHttp.STREAM_IDLE_SECONDS,
-  socketFactory: SocketFactory? = null
+  socketFactory: SocketFactory? = null,
+  connectionPool: ConnectionPool = SharedHttp.connectionPool
 ) : NativeHttpTransport {
   private val client = OkHttpClient.Builder()
     .apply { socketFactory?.let { this.socketFactory(it) } }
     .connectTimeout(SharedHttp.CONNECT_TIMEOUT_SECONDS, TimeUnit.SECONDS)
     .readTimeout(25, TimeUnit.SECONDS)
     .callTimeout(callTimeoutSeconds, TimeUnit.SECONDS)
-    .connectionPool(SharedHttp.connectionPool)
+    .connectionPool(connectionPool)
     .dispatcher(SharedHttp.dispatcher)
     .followRedirects(false)
     .followSslRedirects(false)

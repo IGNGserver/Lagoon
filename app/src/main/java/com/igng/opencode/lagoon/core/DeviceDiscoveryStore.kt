@@ -7,9 +7,9 @@ import org.json.JSONObject
 import java.io.IOException
 
 /**
- * 设备发现的观测缓存（`docs/DEVICE_MODEL.md` §7）。
+ * 设备发现的观测缓存（version 2，按 [SshDevice.id] 直接索引）。
  *
- * 发现是带时效的观测，不是连接许可：读不出来就当作"没有观测"，绝不放行任何连接。但它也**不是**可以
+ * 发现是带时效的观测，不是连接许可：读不出来就当作"没有观测"，绝不放行任何连接。但它也不是可以
  * 随手丢弃的缓存——设备停用时页面只靠它显示上次看到的 Harness，所以写坏时必须保留原文件、拒绝覆盖。
  */
 internal class DeviceDiscoveryStore internal constructor(
@@ -18,7 +18,6 @@ internal class DeviceDiscoveryStore internal constructor(
 ) {
   constructor(context: Context) : this(context.getSharedPreferences("device-discovery", Context.MODE_PRIVATE))
 
-  /** 读失败按"这段缓存不可用"处理并保留原文件；写入会要求先修复，不会覆盖证据。 */
   fun load(): Map<String, DeviceDiscovery> = try {
     readStrict()
   } catch (error: Exception) {
@@ -44,14 +43,34 @@ internal class DeviceDiscoveryStore internal constructor(
     if (!preferences.edit().remove(KEY).commit()) throw IOException("无法清除设备发现缓存")
   }
 
-  /** 严格读取：损坏或版本不受支持时抛出，调用方不得用空表覆盖原文档。 */
+  /** 将 v1 的 `host-<sha256>` 键一次性重映射到 v2 的 `SshDevice.id`，丢弃已下线设备的发现缓存。 */
+  fun migrateFromLegacyHostIds(oldHostIdToSshId: Map<String, String>, survivingDeviceIds: Set<String>) {
+    val raw = preferences.getString(KEY, null) ?: return
+    val version = runCatching { JSONObject(raw).optInt("version", -1) }.getOrDefault(-1)
+    if (version == VERSION) return
+    if (version != 1) return
+    runCatching {
+      val legacy = decode(raw, allowLegacyVersion = true)
+      val remapped = LinkedHashMap<String, DeviceDiscovery>()
+      legacy.forEach { (oldId, discovery) ->
+        val nextId = oldHostIdToSshId[oldId] ?: oldId.takeIf { it in survivingDeviceIds } ?: return@forEach
+        val existing = remapped[nextId]
+        if (existing == null || discovery.observedAtMs > existing.observedAtMs) {
+          remapped[nextId] = discovery.copy(deviceId = nextId)
+        }
+      }
+      save(remapped)
+    }.onFailure {
+      Diagnostics.warn("DeviceDiscoveryStore", "升级设备发现缓存到 v2 失败", it)
+    }
+  }
+
   private fun readStrict(): Map<String, DeviceDiscovery> {
     val text = preferences.getString(KEY, null) ?: return emptyMap()
-    return decode(text)
+    return decode(text, allowLegacyVersion = false)
   }
 
   private fun save(devices: Map<String, DeviceDiscovery>) {
-    // Keep the document bounded: a device is a physical machine, not a growing log.
     val bounded = devices.entries
       .sortedByDescending { it.value.observedAtMs }
       .take(MAX_DEVICES)
@@ -93,14 +112,16 @@ internal class DeviceDiscoveryStore internal constructor(
     .put("completeness", status.completeness.wire)
     .putOpt("reason", status.reason?.take(MAX_TEXT))
 
-  private fun decode(text: String): Map<String, DeviceDiscovery> {
+  private fun decode(text: String, allowLegacyVersion: Boolean): Map<String, DeviceDiscovery> {
     val root = try {
       JSONObject(text)
     } catch (error: Exception) {
       throw IOException("设备发现缓存不是 JSON", error)
     }
     val version = root.optInt("version", -1)
-    if (version != VERSION) throw IOException("设备发现缓存版本不受支持：$version")
+    if (version != VERSION && !(allowLegacyVersion && version == 1)) {
+      throw IOException("设备发现缓存版本不受支持：$version")
+    }
     val devices = root.optJSONObject("devices") ?: return emptyMap()
     val result = LinkedHashMap<String, DeviceDiscovery>()
     devices.keys().forEach { id ->
@@ -111,7 +132,7 @@ internal class DeviceDiscoveryStore internal constructor(
       val harnesses = item.optJSONArray("harnesses")?.let { array ->
         (0 until minOf(array.length(), MAX_HARNESSES)).mapNotNull { index ->
           array.optJSONObject(index)?.let { harness ->
-            val protocol = HarnessProtocolId.entries.firstOrNull { it.wire == harness.optString("protocol") }
+            val protocol = HarnessProtocol.fromWireOrNull(harness.optString("protocol"))
               ?: return@mapNotNull null
             DiscoveredHarness(
               protocol = protocol,
@@ -149,8 +170,7 @@ internal class DeviceDiscoveryStore internal constructor(
           ?: DiscoveryCompleteness.UNKNOWN,
         reason = json.stringOrNull("reason")
       )
-    } catch (error: Exception) {
-      // A status that violates its own invariants is unknown evidence, not a reason to drop the page.
+    } catch (_: Exception) {
       HarnessDiscoveryStatus(reason = "发现结果无效")
     }
   }
@@ -162,7 +182,7 @@ internal class DeviceDiscoveryStore internal constructor(
 
   private companion object {
     const val KEY = "discovery"
-    const val VERSION = 1
+    const val VERSION = 2
     const val MAX_DEVICES = 64
     const val MAX_HARNESSES = 32
     const val MAX_TEXT = 4096

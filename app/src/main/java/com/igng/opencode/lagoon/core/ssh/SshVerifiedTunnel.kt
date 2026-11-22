@@ -1,7 +1,7 @@
 package com.igng.opencode.lagoon.core.ssh
 
 import com.igng.opencode.lagoon.core.OpenCodeSshRegistration
-import com.igng.opencode.lagoon.core.RemoteDshEndpoint
+import com.igng.opencode.lagoon.core.SshDshEndpoint
 import com.igng.opencode.lagoon.core.SshFailure
 import com.igng.opencode.lagoon.core.SshFailureKind
 import com.igng.opencode.lagoon.core.SshShell
@@ -48,7 +48,7 @@ internal object SshVerifiedTunnel {
     registrationVersion = registration.version, registrationId = registration.generationId
   )
 
-  fun dsh(endpoint: RemoteDshEndpoint): Target = Target(
+  fun dsh(endpoint: SshDshEndpoint): Target = Target(
     "127.0.0.1", endpoint.port,
     endpoint.pid ?: throw SshFailure(SshFailureKind.OTHER, "无法确认 DSH 进程身份，请重新连接设备", retryable = false),
     dshStateDirectory = endpoint.ownershipStateDirectory
@@ -88,7 +88,7 @@ internal object SshVerifiedTunnel {
 
   /** A plain channel on an already-proven generation: no helper process, no extra request. */
   fun openDirect(transport: SshTransport, target: Target, input: InputStream, output: OutputStream): TunnelConnection =
-    transport.openTunnel("127.0.0.1", target.port, input, output)
+    transport.openTunnel(if (target.host == "localhost") "127.0.0.1" else target.host, target.port, input, output)
 
   fun open(transport: SshTransport, target: Target, input: InputStream, output: OutputStream): TunnelConnection {
     val channel = verifiedChannel(transport, target)

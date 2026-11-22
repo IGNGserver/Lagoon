@@ -32,8 +32,8 @@ data class ServerOverviewSnapshot(
   val lastReadAt: Long = 0,
   val error: String? = null,
   /**
-   * Transport-level failure (SSH/Codex/AGY), kept apart from [error]/[remoteRecovery] so a Hub
-   * recovery action is never guessed from an SSH failure. Cleared by the next successful read.
+   * Transport-level failure (SSH/Codex/ACP), kept apart from [error] so UI can show clear SSH
+   * diagnostics. Cleared by the next successful read.
    */
   val transportError: String? = null,
   val degraded: Boolean = false,
@@ -54,7 +54,8 @@ data class ServerOverviewSnapshot(
   val summary: TaskSummary = TaskSummary.EMPTY,
   val autoApprovalFailures: Set<String> = emptySet(),
   val shells: Map<String, ShellJob> = emptyMap(),
-  val remoteRecovery: RemoteRecoveryKind? = null
+  /** Actionable SSH failure (host key TOFU / changed, biometric / passphrase unlock) for inline CTAs. */
+  val sshActionRequired: SshFailure? = null
 )
 
 /**
@@ -77,7 +78,6 @@ internal class AllServersOverview(
   private val directoryHealth: DirectoryHealth = DirectoryHealth(),
   /** A server stopped being monitored: its last snapshot must leave the global island count too. */
   private val onSnapshotRemoved: (String) -> Unit = {},
-  private val remoteBackendFactory: RemoteBackendFactory? = null,
   private val sshClientFactory: ((ServerProfile, ServerCredentials) -> HarnessClient)? = null,
   /** Current conversation only belongs to the selected server, and can change during a read. */
   private val selectedSession: () -> String? = { null }
@@ -112,81 +112,42 @@ internal class AllServersOverview(
     wanted.forEach { startOne(it) }
   }
 
-  /** Start just one owner so a failed Codex route never replaces unrelated devices. */
+  /** Start just one owner so a failed stdio route never replaces unrelated devices. */
   private fun startOne(profile: ServerProfile, preserveCodexRetry: Boolean = false, alreadyRemoved: Boolean = false) {
-      val id = profile.id
-      try { (store as? ConnectionRouteStore)?.runtimeRoute(profile) }
-      catch (error: Exception) {
-        if (error is CancellationException) throw error
-        remove(id)
-        publish(ServerOverviewSnapshot(id, profile, connected = false, loading = false,
-          error = userFacingError(error, "连接路由尚未提交"),
-          remoteRecovery = remoteFailure(error)?.kind?.recovery()))
-        return
-      }
-      val config = profile to store.credentials(id)
-      val previous = configurations[id]
-      if (jobs[id]?.isActive == true && previous?.second == config.second &&
-        previous.first.copy(name = "", autoConnect = true, notifications = true) == profile.copy(name = "", autoConnect = true, notifications = true)) {
-        clients[id]?.setContentWatching(id == selectedServer())
-        return
-      }
-      if (!alreadyRemoved) remove(id, preserveCodexRetry)
-      configurations[id] = config
-      ownerTokens[id] = Any()
-      wakes[id] = Channel(Channel.CONFLATED)
-      reconnectHints[id] = Channel(Channel.CONFLATED)
-      publish(ServerOverviewSnapshot(id, profile, notices = store.sessionNotices(id), loading = selectedServer() != id))
-      firstReads += id
-      jobs[id] = scope.launch { monitor(profile) }
+    val id = profile.id
+    val config = profile to store.credentials(id)
+    val previous = configurations[id]
+    if (jobs[id]?.isActive == true && previous?.second == config.second &&
+      previous.first.copy(name = "", notifications = true) == profile.copy(name = "", notifications = true)) {
+      clients[id]?.setContentWatching(id == selectedServer())
+      return
+    }
+    if (!alreadyRemoved) remove(id, preserveCodexRetry)
+    configurations[id] = config
+    ownerTokens[id] = Any()
+    wakes[id] = Channel(Channel.CONFLATED)
+    reconnectHints[id] = Channel(Channel.CONFLATED)
+    publish(ServerOverviewSnapshot(id, profile, notices = store.sessionNotices(id), loading = selectedServer() != id))
+    firstReads += id
+    jobs[id] = scope.launch { monitor(profile) }
   }
 
   fun restart(profiles: List<ServerProfile>) { start(profiles); refreshAll() }
 
   /** Drops a server's monitor and client so the next [start] rebuilds it from changed credentials
-   * or an edited SSH host config. */
+   * or an edited SSH device config. */
   fun invalidate(id: String) { remove(id) }
   fun client(id: String): HarnessClient {
     val (configured, credentials) = configurations[id] ?: error("服务器已移除")
-    val route = try {
-      val admitted = (store as? ConnectionRouteStore)?.runtimeRoute(configured)
-      store.requireCurrentAuthentication(id, credentials)
-      admitted
+    val profile = try {
+      store.runtimeProfile(configured)
+    } catch (error: Exception) {
+      if (error is CancellationException) throw error
+      remove(id)
+      throw error
     }
-    catch (error: Exception) { if (error is CancellationException) throw error; remove(id); throw error }
-    val profile = route?.executionProfile(configured) ?: store.runtimeProfile(configured)
-    val token = ownerTokens.getOrPut(id) { Any() }
     return clients.getOrPut(id) {
-      if (route != null) return@getOrPut createRoutedHarnessClient(route, profile, credentials,
-        onCookie = { cookie -> rememberCookie(id, profile, credentials, token, cookie) },
-        remoteFactory = remoteBackendFactory?.let { factory -> { p, c -> factory.create(p, c) } },
-        sshFactory = sshClientFactory)
-      val backend = if (profile.kind == ServerKind.DSH_REMOTE || profile.remoteHostId != null)
-        remoteBackendFactory?.create(profile, credentials) ?: error("DSH Remote storage is not configured") else null
-      createHarnessClient(profile, credentials,
-        onCookie = { cookie -> rememberCookie(id, profile, credentials, token, cookie) }, remoteBackend = backend,
-        sshClientFactory = sshClientFactory)
-    }
-  }
-
-  /**
-   * DSH 换到的会话 Cookie 落盘，下次启动直接复用（启动令牌在 dsh 重启后就作废了）。同步更新
-   * [configurations]，否则下一次 [start] 会把凭据变化误判为资料变更而重建这台服务器的连接。
-   */
-  private fun rememberCookie(id: String, profile: ServerProfile, issuedWith: ServerCredentials, token: Any, cookie: String) {
-    if (ownerTokens[id] !== token) return
-    if (runCatching { store.runtimeProfile(profile) }.isFailure) return
-    val currentCredentials = store.credentials(id)
-    // Owner-generated cookie rotations may change cookie bytes, never the saved auth input.
-    // An old mux's invalidation/renewal must not overwrite credentials replaced at the same URL.
-    if (currentCredentials.username != issuedWith.username || currentCredentials.password != issuedWith.password) return
-    store.rememberCookie(id, profile.url, cookie)
-    scope.launch {
-      if (ownerTokens[id] !== token) return@launch
-      val current = configurations[id] ?: return@launch
-      if (ConnectionRouteAdmission.sameLeafRoute(current.first, profile)) {
-        configurations[id] = current.first to store.credentials(id)
-      }
+      createHarnessClient(profile, credentials, sshClientFactory = sshClientFactory)
     }
   }
   fun refreshAll() { wakes.values.forEach { it.trySend(Unit) }; reconnectHints.values.forEach { it.trySend(Unit) } }
@@ -281,7 +242,7 @@ internal class AllServersOverview(
     } catch (error: Exception) {
       publish(ServerOverviewSnapshot(id, profile, connected = false, loading = false,
         error = userFacingError(error, "连接失败"),
-        remoteRecovery = remoteFailure(error)?.kind?.recovery()))
+        sshActionRequired = actionableSshFailure(error)))
       return
     }
     val cachedCatalog = cache.catalog(id)
@@ -340,16 +301,8 @@ internal class AllServersOverview(
     })
     approvers[id] = approver
     val parkedNonRetryable = java.util.concurrent.atomic.AtomicBoolean(false)
-    fun isNonRetryableRemoteFailure(error: Throwable): Boolean {
-      var current: Throwable? = error
-      val seen = HashSet<Throwable>()
-      while (current != null && seen.add(current)) {
-        if (current is RemoteFailureException && !current.retryable) return true
-        if (current is RemoteControlException && !current.retryable) return true
-        current = current.cause
-      }
-      return false
-    }
+    fun isNonRetryableFailure(error: Throwable): Boolean =
+      generateSequence(error) { it.cause }.any { it is SshFailure && !it.retryable }
 
     suspend fun refresh() {
       // Only requests present when this pass begins belong to this pass. A request arriving during
@@ -386,10 +339,10 @@ internal class AllServersOverview(
               nextDeepReadAt = now() + deepRetryDelay
               deepRetryDelay = (deepRetryDelay * 2).coerceAtMost(60_000L)
             }
-            if (isNonRetryableRemoteFailure(error)) parkedNonRetryable.set(true)
+            if (isNonRetryableFailure(error)) parkedNonRetryable.set(true)
             previous.copy(connected = false, loading = false, cached = previous.cached || cachedCatalog != null,
               degraded = true, error = userFacingError(error, "连接失败"),
-              remoteRecovery = remoteFailure(error)?.kind?.recovery())
+              sshActionRequired = actionableSshFailure(error))
           }
         }
         snapshot = if (revision == waitingRevision) next.copy(streamConnected = snapshot.streamConnected, autoApprovalFailures = snapshot.autoApprovalFailures)
@@ -438,9 +391,9 @@ internal class AllServersOverview(
               val stream = launch(start = CoroutineStart.LAZY) {
                 client.events(onOpen = {
                   scope.launch {
-                    if (clients[id] !== client || profile.protocol in setOf(HarnessProtocolId.CODEX_APP_SERVER, HarnessProtocolId.ANTIGRAVITY_ACP, HarnessProtocolId.OPENCODE_ACP) && client.isClosed) return@launch
+                    if (clients[id] !== client || profile.protocol.isStdioRpc && client.isClosed) return@launch
                     snapshot = snapshot.copy(streamConnected = true)
-                    if (profile.protocol in setOf(HarnessProtocolId.CODEX_APP_SERVER, HarnessProtocolId.ANTIGRAVITY_ACP, HarnessProtocolId.OPENCODE_ACP)) codexRetryDelays.remove(id)
+                    if (profile.protocol.isStdioRpc) codexRetryDelays.remove(id)
                     emit(snapshot)
                     refresh(id)
                     onConnected(id)
@@ -594,14 +547,13 @@ internal class AllServersOverview(
           } catch (cancel: CancellationException) {
             throw cancel
           } catch (error: Exception) {
-            if (isNonRetryableRemoteFailure(error)) parkedNonRetryable.set(true)
-            val recovery = remoteFailure(error)?.kind?.recovery()
-            // Every failure is visible, not only the Hub ones that carry a recovery action.
+            if (isNonRetryableFailure(error)) parkedNonRetryable.set(true)
+            val sshAction = actionableSshFailure(error)
             snapshot = snapshot.copy(
               connected = false,
-              error = if (recovery != null) userFacingError(error, "连接失败") else snapshot.error,
-              transportError = if (recovery == null) transportFailureText(error) else null,
-              remoteRecovery = recovery ?: snapshot.remoteRecovery
+              error = if (sshAction != null) sshAction.message else snapshot.error,
+              transportError = transportFailureText(error),
+              sshActionRequired = sshAction ?: snapshot.sshActionRequired
             )
             Diagnostics.warn("AllServers", "服务器 ${profile.name} 实时连接断开", error)
           }
@@ -615,7 +567,7 @@ internal class AllServersOverview(
             retry = 1_000L
             continue
           }
-          if (profile.protocol in setOf(HarnessProtocolId.CODEX_APP_SERVER, HarnessProtocolId.ANTIGRAVITY_ACP, HarnessProtocolId.OPENCODE_ACP) && client.isClosed) {
+          if (profile.protocol.isStdioRpc && client.isClosed) {
             // Retire the failed owner outside its own monitor job. The identity fence prevents a
             // delayed failure from closing a replacement after profile edits, removal or reconnect.
             val owner = ownerTokens[id]
@@ -676,15 +628,6 @@ internal class AllServersOverview(
         }
       } }
     }
-    // Remote Codex emits thread-specific events. Restore bounded subscriptions for active tasks;
-    // the client protects the currently selected conversation while retiring expired watches.
-    val codexMonitoring = if (profile.protocol == HarnessProtocolId.CODEX_APP_SERVER && profile.remoteHostId != null && active != null)
-      attempt {
-        val activeSessions = active.mapNotNull(identityMap::get)
-        if (activeSessions.size != active.size) throw java.io.IOException("Codex 活动会话目录不完整，保留现有监听")
-        client.monitorCodexSessions(activeSessions) { if (selectedServer() == id) selectedSession() else null }
-      }
-    else Result.success(Unit)
     val oldTasks = previous.tasks + store.taskStates(id).filter { (sessionId, stored) ->
       previous.tasks[sessionId]?.let { old -> stored.since > old.since || (stored.finishedAt ?: 0) > (old.finishedAt ?: 0) } ?: true
     }
@@ -805,17 +748,14 @@ internal class AllServersOverview(
     // the open transcript; this snapshot is only the device-list connection state.
     if (!unchanged()) return previous
     if (!light) onDeepComplete(workspaceResult?.isFailure != true && childRead.incompleteRoots.isEmpty() &&
-      shellResults.none { it.second.isFailure } && activeResult.isSuccess && codexMonitoring.isSuccess)
+      shellResults.none { it.second.isFailure } && activeResult.isSuccess)
     deletedSessions.forEach { store.forgetTask(id, it) }
     val notices = (store.sessionNotices(id) + newlyFinished.filterNot { (session, since) -> store.sessionNotices(id).coversRun(session.id, since) }
       .mapNotNull { (session, since) -> session.transitionNotice(since) }).distinctBy { it.id }
     val background = SessionActivityRules.backgroundRoots(folded, shells, parentMap)
     val titles = sessions.associate { it.id to it.displayTitle() }
     val summary = TaskSummary.of(folded, notices, parentMap, titles, serverId = id, serverName = profile.name)
-    // A session is running exactly when `session.active` says so, so only that read (and the root
-    // catalog, which throws out of this function) can make the page "部分数据待同步". Directory-scoped
-    // reads fail permanently for deleted worktrees and cannot all fit in one sweep.
-    val degraded = activeResult.isFailure || codexMonitoring.isFailure
+    val degraded = activeResult.isFailure
     if (degraded) Diagnostics.warn("AllServers", "服务器 ${profile.name} 部分状态读取失败")
     return reconcileWaiting(previous.copy(
       profile = profile,
@@ -827,7 +767,7 @@ internal class AllServersOverview(
       lastReadAt = now(),
       error = null,
       transportError = null,
-      remoteRecovery = null,
+      sshActionRequired = null,
       degraded = degraded,
       projects = projects,
       workspaceCatalog = workspaceCatalog,
@@ -906,3 +846,15 @@ internal fun transportFailureText(error: Throwable): String {
   val ssh = generateSequence(error) { it.cause }.filterIsInstance<SshFailure>().firstOrNull()
   return ssh?.display() ?: userFacingError(error, "连接失败")
 }
+
+/** Extracts an SSH failure that has a direct in-app recovery CTA (TOFU / changed key / unlock). */
+internal fun actionableSshFailure(error: Throwable): SshFailure? =
+  generateSequence(error) { it.cause }.filterIsInstance<SshFailure>().firstOrNull { failure ->
+    failure.kind in setOf(
+      SshFailureKind.HOST_KEY_UNKNOWN,
+      SshFailureKind.HOST_KEY_CHANGED,
+      SshFailureKind.BIOMETRIC_REQUIRED,
+      SshFailureKind.PASSPHRASE_REQUIRED,
+      SshFailureKind.AUTH_INTERACTION_REQUIRED
+    )
+  }

@@ -30,6 +30,7 @@ class TaskMonitorService : Service() {
   private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
   private var monitor: Job? = null
   private var settle: Job? = null
+  private var foregroundId: Int = 0
   private var lastBackgroundTargets: List<SessionTarget> = emptyList()
   override fun onBind(intent: Intent?): IBinder? = null
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -46,10 +47,11 @@ class TaskMonitorService : Service() {
       background.isNotEmpty() -> notifications.buildBackgroundSummary(TaskNotifications.ALL_PROFILE, background)
       else -> notifications.buildConnecting()
     }
-    var foregroundId = if (LiveUpdateContent.stageOf(summary) == LiveUpdateStage.ACTIVE)
+    val desiredStartId = if (LiveUpdateContent.stageOf(summary) == LiveUpdateStage.ACTIVE)
       TaskNotifications.summaryId(TaskNotifications.ALL_SERVERS_ID)
     else TaskNotifications.backgroundId(TaskNotifications.ALL_SERVERS_ID)
-    if (!tryStartForeground(foregroundId, notification)) return START_NOT_STICKY
+    if (!tryStartForeground(desiredStartId, notification)) return START_NOT_STICKY
+    foregroundId = desiredStartId
     if (monitor == null) {
       controller.setMonitoring(true)
       monitor = scope.launch {

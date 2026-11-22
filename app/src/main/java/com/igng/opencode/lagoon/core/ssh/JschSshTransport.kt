@@ -237,6 +237,8 @@ internal class JschSshTransportFactory(
     // Do not set a socket read timeout: a bootstrap script can be silent for a minute while it
     // waits for dsh web's token. The link owns keepalive/probes and enforces command deadlines.
     session.setTimeout(0)
+    session.setServerAliveInterval(20_000)
+    session.setServerAliveCountMax(2)
     session.connect(12_000)
     return session
   }
@@ -474,10 +476,9 @@ private class JschSshTransport(private val session: Session) : SshTransport {
       val stdout = channel.inputStream
       val stderr = channel.extInputStream
       channel.connect(15_000)
-      val pool = Executors.newFixedThreadPool(2)
+      val out = EXEC_STREAM_POOL.submit<String> { readLimited(stdout, MAX_OUTPUT_BYTES) }
+      val err = EXEC_STREAM_POOL.submit<String> { readLimited(stderr, MAX_OUTPUT_BYTES) }
       try {
-        val out = pool.submit<String> { readLimited(stdout, MAX_OUTPUT_BYTES) }
-        val err = pool.submit<String> { readLimited(stderr, MAX_OUTPUT_BYTES) }
         val deadline = System.currentTimeMillis() + timeoutMillis
         while (!channel.isClosed && System.currentTimeMillis() < deadline) Thread.sleep(40)
         val exit = if (channel.isClosed) channel.exitStatus else null
@@ -487,7 +488,8 @@ private class JschSshTransport(private val session: Session) : SshTransport {
         }
         RemoteExecResult(exit, out.get(2, TimeUnit.SECONDS), err.get(2, TimeUnit.SECONDS))
       } finally {
-        pool.shutdownNow()
+        out.cancel(true)
+        err.cancel(true)
       }
     } catch (failure: SshFailure) {
       throw failure
@@ -543,7 +545,8 @@ private class JschSshTransport(private val session: Session) : SshTransport {
   }
 
   override fun probeTunnel(host: String, port: Int, timeoutMillis: Long): Boolean {
-    val request = "GET / HTTP/1.0\r\nHost: $host:$port\r\nConnection: close\r\n\r\n".toByteArray(Charsets.US_ASCII)
+    val headerHost = if (':' in host && !host.startsWith('[')) "[$host]" else host
+    val request = "GET / HTTP/1.0\r\nHost: $headerHost:$port\r\nConnection: close\r\n\r\n".toByteArray(Charsets.US_ASCII)
     val captured = ByteArrayOutputStream()
     val channel = session.openChannel("direct-tcpip") as ChannelDirectTCPIP
     return try {
@@ -606,6 +609,9 @@ private class JschSshTransport(private val session: Session) : SshTransport {
 
   private companion object {
     const val MAX_OUTPUT_BYTES = 512 * 1024
+    val EXEC_STREAM_POOL = Executors.newCachedThreadPool { runnable ->
+      Thread(runnable, "lagoon-ssh-exec-io").apply { isDaemon = true }
+    }
   }
 }
 

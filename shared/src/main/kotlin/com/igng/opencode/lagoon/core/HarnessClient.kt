@@ -2,24 +2,11 @@ package com.igng.opencode.lagoon.core
 
 import kotlinx.coroutines.flow.Flow
 
-/** 一台已保存服务器使用的 harness 协议。 */
-enum class ServerKind(val wire: String, val label: String) {
-  OPENCODE("opencode", "OpenCode"),
-  CODEX("codex", "Codex"),
-  DSH("dsh", "DeepSeek Harness"),
-  DSH_REMOTE("dsh-remote", "DSH Remote");
-
-  companion object {
-    fun fromWire(value: String?): ServerKind =
-      entries.firstOrNull { it.wire == value?.trim()?.lowercase() } ?: OPENCODE
-  }
-}
-
 /**
  * 一个 harness 客户端。
  *
- * OpenCode（[OpenCodeApi]）与 DeepSeek Harness（[DshApi]）各自实现同一套方法面，
- * 控制器与 UI 因此完全与协议无关：读列表、发消息、中止、审批、事件流都走这里。
+ * OpenCode（[OpenCodeApi]）、DeepSeek Harness（[DshApi]）、Codex（[CodexApi]）与 ACP（[AgyApi]）
+ * 各自实现同一套方法面，控制器与 UI 因此完全与协议无关：读列表、发消息、中止、审批、事件流都走这里。
  */
 sealed interface QueueAction {
   data class Edit(val text: String) : QueueAction
@@ -127,25 +114,22 @@ interface HarnessClient {
     onUpdate: (text: String, running: Boolean, finished: Boolean) -> Unit
   ): Boolean = false
 
-  /** One encrypted RPC round trip, when the harness has a remote diagnostic channel. */
-  suspend fun probeRemote(): RemoteProbe? = null
-
   /** Sends one follow-up to a continuable subagent child. False when unsupported. */
   suspend fun promptSubagent(parentId: String, childId: String, text: String): Boolean = false
 
   /** Official plugin inventory; empty when the harness has no plugin channel. */
-  suspend fun pluginBundles(): List<RemotePluginBundle> = emptyList()
-  suspend fun pluginEntries(): List<RemotePluginEntry> = emptyList()
+  suspend fun pluginBundles(): List<DshPluginBundle> = emptyList()
+  suspend fun pluginEntries(): List<DshPluginEntry> = emptyList()
   suspend fun setPluginBundle(name: String, enabled: Boolean): Boolean = false
   suspend fun setPluginEntry(entryId: String, enabled: Boolean): Boolean = false
 
   /** Host credential metadata; values are never returned. */
-  suspend fun credentialStatus(refs: List<String>): Map<String, RemoteCredentialStatus> = emptyMap()
+  suspend fun credentialStatus(refs: List<String>): Map<String, DshCredentialStatus> = emptyMap()
   suspend fun setCredential(ref: String, value: String): Boolean = false
   suspend fun clearCredential(ref: String): Boolean = false
 
   /** Session goal, when the harness exposes durable goals. */
-  suspend fun goal(sessionId: String): RemoteGoal? = null
+  suspend fun goal(sessionId: String): DshGoal? = null
   suspend fun createGoal(sessionId: String, objective: String, maxRounds: Int? = null): Boolean = false
   /** Long-cap entry point; legacy clients may only represent an Int-sized cap. */
   suspend fun createGoalWithLimit(sessionId: String, objective: String, maxRounds: Long? = null): Boolean =
@@ -154,16 +138,16 @@ interface HarnessClient {
   /** Edit the exact current revision without changing phase or resuming continuation. */
   suspend fun editGoal(
     sessionId: String, id: String, revision: Int, objective: String? = null, maxRounds: Long? = null
-  ): RemoteGoal? = null
+  ): DshGoal? = null
   suspend fun goalAction(sessionId: String, id: String, revision: Int, action: String): Boolean = false
 
   /** PDF/image bytes, or Office converted to PDF; null when the harness cannot preview this path. */
   suspend fun previewFile(directory: String, path: String, session: Session?): FilePreview? = null
 
   /** Legacy active-only reminders bound to this Session. */
-  suspend fun schedules(sessionId: String): List<RemoteSchedule> = emptyList()
+  suspend fun schedules(sessionId: String): List<DshSchedule> = emptyList()
   /** All reminders with original owner/status; null means unsupported, not an empty catalog. */
-  suspend fun scheduleCatalog(): List<RemoteSchedule>? = null
+  suspend fun scheduleCatalog(): List<DshSchedule>? = null
   suspend fun scheduleHistory(
     sessionId: String, id: String, before: String? = null, limit: Int = 20
   ): ScheduleHistoryPage? = null
@@ -390,32 +374,27 @@ data class MessageRecord(val message: Message, val raw: org.json.JSONObject?)
  */
 data class ComposerContext(
   val inbox: List<Message> = emptyList(),
-  val todos: List<RemoteTodo>? = null,
-  val goal: RemoteGoal? = null
+  val todos: List<DshTodo>? = null,
+  val goal: DshGoal? = null
 )
 
-/** 按服务器类型创建对应的客户端。 */
+/** 按 Harness 协议与 SSH 工厂创建对应的客户端。 */
 fun createHarnessClient(
   profile: ServerProfile,
-  credentials: ServerCredentials,
+  credentials: ServerCredentials = ServerCredentials(profile.username),
   callTimeoutSeconds: Long = 60,
-  /** 客户端换到新会话 Cookie（或确认旧 Cookie 失效，传空串）时回调，由调用方落盘。 */
   onCookie: (String) -> Unit = {},
-  remoteBackend: RemoteBackend? = null,
-  /** App-provided factory for `sshHostId != null`; shared/ has no Android SSH implementation. */
-  sshClientFactory: ((ServerProfile, ServerCredentials) -> HarnessClient)? = null,
-  /** Explicit caller-isolated direct DSH sharing. Raw constructors/default acquisition stay independent. */
-  dshRegistry: DshClientRegistry? = null
-): HarnessClient = if (profile.remoteHostId != null && profile.protocol in setOf(HarnessProtocolId.OPENCODE_NATIVE, HarnessProtocolId.CODEX_APP_SERVER, HarnessProtocolId.ANTIGRAVITY_ACP, HarnessProtocolId.OPENCODE_ACP)) {
-  require(profile.sshHostId == null) { "同一个绑定不能混合 SSH 与 Remote carrier" }
-  (remoteBackend ?: throw IllegalStateException("Host 原生服务 backend 尚未配置")).client
-} else if (profile.sshHostId != null) {
-  require(profile.kind != ServerKind.DSH_REMOTE) { "SSH binding 不能使用 Remote carrier" }
-  sshClientFactory?.invoke(profile, credentials) ?: throw IllegalStateException("SSH backend 尚未配置")
-} else when (profile.kind) {
-  ServerKind.OPENCODE -> OpenCodeApi(profile, credentials, callTimeoutSeconds)
-  ServerKind.CODEX -> throw IllegalStateException("Codex 需要 SSH 或 Remote 连接")
-  ServerKind.DSH -> dshRegistry?.acquire(profile, credentials, callTimeoutSeconds, onCookie)
-    ?: DshApi(profile, credentials, callTimeoutSeconds, onCookie)
-  ServerKind.DSH_REMOTE -> (remoteBackend ?: throw IllegalStateException("DSH Remote backend 尚未配置")).client
+  /** App-provided factory for SSH devices (`deviceId != null`); shared/ has no Android SSH implementation. */
+  sshClientFactory: ((ServerProfile, ServerCredentials) -> HarnessClient)? = null
+): HarnessClient {
+  if (profile.deviceId != null) {
+    return sshClientFactory?.invoke(profile, credentials) ?: throw IllegalStateException("SSH backend 尚未配置")
+  }
+  // Direct loopback HTTP fallback is retained only for local JVM protocol unit tests.
+  return when (profile.protocol) {
+    HarnessProtocol.OPENCODE_NATIVE -> OpenCodeApi(profile, credentials, callTimeoutSeconds)
+    HarnessProtocol.DSH -> DshApi(profile, credentials, callTimeoutSeconds, onCookie)
+    HarnessProtocol.CODEX, HarnessProtocol.ANTIGRAVITY_ACP, HarnessProtocol.OPENCODE_ACP ->
+      throw IllegalStateException("${profile.protocol.label} 需要通过 SSH 设备连接")
+  }
 }

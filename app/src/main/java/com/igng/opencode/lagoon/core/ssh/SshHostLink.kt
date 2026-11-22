@@ -3,27 +3,13 @@ package com.igng.opencode.lagoon.core.ssh
 import com.igng.opencode.lagoon.core.*
 import okhttp3.Credentials
 import org.json.JSONObject
-import java.util.concurrent.atomic.AtomicBoolean
-import com.igng.opencode.lagoon.core.Diagnostics
-import com.igng.opencode.lagoon.core.DshApi
-import com.igng.opencode.lagoon.core.DshAuthMode
-import com.igng.opencode.lagoon.core.PresentedSshHostKey
-import com.igng.opencode.lagoon.core.Project
-import com.igng.opencode.lagoon.core.RemoteDshEndpoint
-import com.igng.opencode.lagoon.core.ServerCredentials
-import com.igng.opencode.lagoon.core.ServerProfile
-import com.igng.opencode.lagoon.core.SshFailure
-import com.igng.opencode.lagoon.core.SshFailureKind
-import com.igng.opencode.lagoon.core.SshHostConfig
-import com.igng.opencode.lagoon.core.SshLinkPhase
-import com.igng.opencode.lagoon.core.SshLinkStatus
-import com.igng.opencode.lagoon.core.SshLinkStep
-import com.igng.opencode.lagoon.core.SshSecrets
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -35,9 +21,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
-import kotlinx.coroutines.TimeoutCancellationException
-import java.io.ByteArrayInputStream
-import java.io.ByteArrayOutputStream
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.Closeable
 
 // Covers SSH setup, bounded DSH probe/start, socket ownership proof and its 45s health check.
@@ -64,7 +48,7 @@ internal class SshHostLink(
   @Volatile private var closed = false
   val isClosed: Boolean get() = closed
   @Volatile private var transport: SshTransport? = null
-  @Volatile private var endpoint: RemoteDshEndpoint? = null
+  @Volatile private var endpoint: SshDshEndpoint? = null
   @Volatile private var openCodeEndpoint: OpenCodeSshRegistration? = null
   /** Browser cookie minted for the current remote dsh. Kept on the link, never in the server
    *  credential store: a new dsh process invalidates the launch token but this cookie still works. */
@@ -73,7 +57,7 @@ internal class SshHostLink(
   val workingDirectory: String? get() = config.workingDirectory
   @Volatile private var forwarder: SshForwarder? = null
   /** The bootstrap of the current generation, reused by keepalive to detect a replaced process. */
-  @Volatile private var bootstrap: RemoteDshBootstrap? = null
+  @Volatile private var bootstrap: SshDshBootstrap? = null
   /**
    * Connections for this binding only. The forwarder port is reused by the OS across generations,
    * and OkHttp does not compare the `SocketFactory` when deciding whether a pooled socket is
@@ -84,12 +68,14 @@ internal class SshHostLink(
   @Volatile private var provenTransport: SshTransport? = null
   /** Closing DSH drains unanswered waterfalls; retain that exact generation for new RPC sockets. */
   @Volatile private var drainingTransport: SshTransport? = null
-  @Volatile private var drainingEndpoint: RemoteDshEndpoint? = null
+  @Volatile private var drainingEndpoint: SshDshEndpoint? = null
   @Volatile private var client: HarnessClient? = null
   @Volatile private var contentWatching = false
   @Volatile private var visibleQuestionSession: String? = null
   @Volatile private var questionForeground = false
   @Volatile private var ready = CompletableDeferred<HarnessClient>()
+  /** Wakes [connectLoop] immediately out of exponential backoff sleep on explicit retry or kick. */
+  private val wakeSignal = Channel<Unit>(Channel.CONFLATED)
   /** Bumped every time the authenticated DshApi is replaced, including a failed exchange. */
   private val generation = java.util.concurrent.atomic.AtomicLong()
   val generationId: Long get() = generation.get()
@@ -185,9 +171,9 @@ internal class SshHostLink(
   /** Stable across reconnects: the current DSH generation's workspace titles. */
   val workspaceUpdates: Flow<List<Project>> get() = workspacePublisher.asSharedFlow()
 
-  val isOpenCode: Boolean get() = profile.kind == ServerKind.OPENCODE
+  val isOpenCode: Boolean get() = profile.protocol == HarnessProtocol.OPENCODE_NATIVE
   fun capabilities(): ApiCapabilities = client?.capabilities()
-    ?: if (profile.kind == ServerKind.OPENCODE) ApiCapabilities.BASELINE else DshApi.TUNNEL_CAPABILITIES
+    ?: if (isOpenCode) ApiCapabilities.BASELINE else DshApi.TUNNEL_CAPABILITIES
 
   /** Starts connecting in the background; safe to call repeatedly. */
   fun start() {
@@ -200,16 +186,51 @@ internal class SshHostLink(
   fun retry() {
     synchronized(this) {
       if (closed) return
-      if (mutableStatus.value.phase == SshLinkPhase.FAILED || mutableStatus.value.phase == SshLinkPhase.IDLE) {
-        attempt = 0
-        firstAttachFailure = null
-        if (ready.isCompleted) ready = CompletableDeferred()
-        if (connectJob?.isActive != true) connectJob = scope.launch(Dispatchers.IO) { connectLoop() }
+      when (mutableStatus.value.phase) {
+        SshLinkPhase.FAILED, SshLinkPhase.IDLE -> {
+          attempt = 0
+          firstAttachFailure = null
+          if (ready.isCompleted) ready = CompletableDeferred()
+          if (connectJob?.isActive != true) connectJob = scope.launch(Dispatchers.IO) { connectLoop() }
+          else wakeSignal.trySend(Unit)
+        }
+        SshLinkPhase.RECONNECTING -> {
+          attempt = 0
+          firstAttachFailure = null
+          wakeSignal.trySend(Unit)
+        }
+        SshLinkPhase.CONNECTING, SshLinkPhase.CONNECTED -> Unit
       }
     }
   }
 
-  /** Network changed / app resumed: probe a connected link and reconnect a failed one. */
+  /** Forces a fresh generation even while currently CONNECTED (e.g. after remote DSH upgrade). */
+  fun forceReconnect(reason: String = "正在重新连接 SSH 服务") {
+    synchronized(this) {
+      if (closed) return
+      val failure = SshFailure(SshFailureKind.DISCONNECTED, reason, retryable = true)
+      attempt = 0
+      firstAttachFailure = null
+      publish(SshLinkPhase.RECONNECTING, SshLinkStep.CONNECT, reason, failure, 0)
+      val pending = ready
+      if (!pending.isCompleted) pending.completeExceptionally(failure)
+      ready = CompletableDeferred()
+      keepAliveJob?.cancel()
+      keepAliveJob = null
+      runCatching { client?.close() }
+      client = null
+      runCatching { transport?.close() }
+      transport = null
+      endpoint = null
+      openCodeEndpoint = null
+      provenTransport = null
+      forwarder?.dropConnections()
+      if (connectJob?.isActive == true) wakeSignal.trySend(Unit)
+      else connectJob = scope.launch(Dispatchers.IO) { connectLoop() }
+    }
+  }
+
+  /** Network changed / app resumed: probe a connected link and immediately wake or retry failed/reconnecting ones. */
   fun kick() {
     if (closed) return
     val current = transport
@@ -217,6 +238,8 @@ internal class SshHostLink(
       scope.launch(Dispatchers.IO) {
         if (!current.ping(8_000) || current.isClosed) lost(SshFailure(SshFailureKind.DISCONNECTED, "SSH 连接已断开"), current)
       }
+    } else if (mutableStatus.value.phase == SshLinkPhase.RECONNECTING) {
+      wakeSignal.trySend(Unit)
     } else if (mutableStatus.value.phase == SshLinkPhase.FAILED && mutableStatus.value.error?.retryable != false) {
       retry()
     }
@@ -254,8 +277,8 @@ internal class SshHostLink(
           return
         }
         publish(SshLinkPhase.RECONNECTING, mutableStatus.value.step, failure.display(), failure, attempt)
-        delay(backoff)
-        backoff = (backoff * 2).coerceAtMost(30_000L)
+        val woken = withTimeoutOrNull(backoff) { wakeSignal.receive() } != null
+        backoff = if (woken) 1_000L else (backoff * 2).coerceAtMost(30_000L)
       }
     }
   }
@@ -291,12 +314,12 @@ internal class SshHostLink(
     }
     transport = nextTransport
     try {
-      if (profile.kind == ServerKind.OPENCODE) {
+      if (isOpenCode) {
         attachOpenCode(nextTransport)
         return
       }
       publish(SshLinkPhase.CONNECTING, SshLinkStep.START_DSH, "正在检查远端的 dsh web", attempt = attempt)
-      val bootstrap = RemoteDshBootstrap(nextTransport, config.launchCommand, config.workingDirectory).also { this.bootstrap = it }
+      val bootstrap = SshDshBootstrap(nextTransport, config.launchCommand, config.workingDirectory).also { this.bootstrap = it }
       val nextEndpoint = kotlinx.coroutines.runInterruptible(Dispatchers.IO) {
         bootstrap.ensureRunning { detail -> publish(SshLinkPhase.CONNECTING, SshLinkStep.START_DSH, detail, attempt = attempt) }
       }
@@ -448,9 +471,12 @@ internal class SshHostLink(
     }
     forwarder = local
     openCodeEndpoint = registration
-    val runtime = profile.copy(url = "http://127.0.0.1:${local.port}", username = "opencode",
-      allowCleartext = true, sshHostId = null, remoteHostId = null, remoteHostFingerprint = null)
-    val native = NativeOkHttpTransport(NativeHttpEndpoint(runtime.url), socketFactory = local.socketFactory)
+    val runtime = profile.copy(url = "http://127.0.0.1:${local.port}", username = "opencode", allowCleartext = true)
+    val native = NativeOkHttpTransport(
+      NativeHttpEndpoint(runtime.url),
+      socketFactory = local.socketFactory,
+      connectionPool = forwarderPool
+    )
     val api = OpenCodeApi(runtime, ServerCredentials("opencode", registration.password.orEmpty()), transport = native)
     try {
       withTimeout(45_000) {
@@ -485,17 +511,13 @@ internal class SshHostLink(
     }
   }
 
-  private fun createClient(endpoint: RemoteDshEndpoint): DshApi {
+  private fun createClient(endpoint: SshDshEndpoint): DshApi {
     val local = forwarder ?: throw SshFailure(SshFailureKind.TUNNEL, "本地隧道尚未建立")
     val runtime = profile.copy(
       url = "http://127.0.0.1:${local.port}",
       username = "dsh",
-      kind = com.igng.opencode.lagoon.core.ServerKind.DSH,
-      dshAuth = DshAuthMode.TOKEN,
-      allowCleartext = true,
-      sshHostId = null,
-      remoteHostId = null,
-      remoteHostFingerprint = null
+      protocol = HarnessProtocol.DSH,
+      allowCleartext = true
     )
     return DshApi(
       runtime,
@@ -579,7 +601,7 @@ internal class SshHostLink(
     if (authFailure != null) {
       // A rotated launch token is not a wrong credential: the owner already dropped this generation
       // and the same loop must re-read the token, not park the binding on "login failed".
-      val rotated = authFailure.code == "AUTH_TOKEN_ROTATED" || text.contains("重新获取启动令牌")
+      val rotated = authFailure.code == DshApi.AUTH_TOKEN_ROTATED || text.contains("重新获取启动令牌")
       return SshFailure(SshFailureKind.LOGIN, "DSH 登录失败", text, retryable = rotated)
     }
     val transportFailure = chain.any {
@@ -647,6 +669,7 @@ internal class SshHostLink(
     drainingTransport = transport.takeIf { client is DshApi }
     drainingEndpoint = endpoint.takeIf { client is DshApi }
     closed = true
+    wakeSignal.close()
     connectJob?.cancel()
     keepAliveJob?.cancel()
     workspaceCollector?.cancel()

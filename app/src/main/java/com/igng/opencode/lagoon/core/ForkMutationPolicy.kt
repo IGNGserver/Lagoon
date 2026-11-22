@@ -8,7 +8,7 @@ data class ForkMutationTarget(
   val boundary: ForkBoundary? = null
 ) {
   fun sameSource(state: LagoonState): Boolean = state.server?.let {
-    state.sessionId == sessionId && it.id == profile.id && ConnectionRouteAdmission.sameLeafRoute(profile, it)
+    state.sessionId == sessionId && it.sameRoute(profile)
   } == true
   fun matches(state: LagoonState): Boolean = sameSource(state) && when {
     messageId == null -> boundary == null
@@ -19,9 +19,9 @@ data class ForkMutationTarget(
 private fun LagoonState.forkBoundaryFor(messageId: String): ForkBoundary? {
   val message = messages.singleOrNull { it.id == messageId && it.isHumanInput && !it.queued } ?: return null
   if (message.id.isBlank() || message.id.startsWith(PENDING_PREFIX) || message.id.any(Char::isISOControl)) return null
-  return when (server?.kind) {
-    ServerKind.DSH, ServerKind.DSH_REMOTE -> message.sequence?.takeIf { it in 1..9_007_199_254_740_991L }?.let { ForkBoundary.DshEvent(it) }
-    ServerKind.OPENCODE -> message.id.takeIf { it.length <= 512 }?.let { ForkBoundary.OpenCodeBefore(it) }
+  return when (server?.protocol) {
+    HarnessProtocol.DSH -> message.sequence?.takeIf { it in 1..9_007_199_254_740_991L }?.let { ForkBoundary.DshEvent(it) }
+    HarnessProtocol.OPENCODE_NATIVE -> message.id.takeIf { it.length <= 512 }?.let { ForkBoundary.OpenCodeBefore(it) }
     else -> null
   }
 }
@@ -47,6 +47,5 @@ internal class ForkInspection internal constructor(
   val target: ForkMutationTarget,
   val page: ApiPage<Session>,
   internal val client: HarnessClient,
-  internal val route: ConnectionRouteSnapshot?,
   internal val generation: Int
 )

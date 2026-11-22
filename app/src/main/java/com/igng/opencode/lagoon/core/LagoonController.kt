@@ -126,42 +126,6 @@ class LagoonController private constructor(private val appContext: Context) {
     ).also { conversationPool.record(it) }
   }
 
-  private val revocationDrainMutex = Mutex()
-  private val revocationWake = kotlinx.coroutines.channels.Channel<Unit>(kotlinx.coroutines.channels.Channel.CONFLATED)
-
-  /** Coalesce requests; while the app is active, retry pending revocations with bounded backoff. */
-  internal fun triggerPendingRemoteRevocationsDrain() {
-    scope.launch(Dispatchers.IO) {
-      if (!revocationDrainMutex.tryLock()) {
-        revocationWake.trySend(Unit)
-        return@launch
-      }
-      try {
-        while (true) {
-          revocationWake.tryReceive()
-          drainPendingRemoteRevocations(store.remoteDevices)
-          val pending = store.remoteDevices.pendingRevocations()
-          if (pending.isEmpty()) {
-            if (revocationWake.tryReceive().isSuccess) continue
-            break
-          }
-          if (!foreground && !monitoring) break
-          val now = System.currentTimeMillis()
-          val wait = pending.minOf { remoteRevocationRetryDelay(it, now) }.coerceAtLeast(1_000L)
-          withTimeoutOrNull(wait) { revocationWake.receive() }
-        }
-      } catch (cancel: CancellationException) {
-        throw cancel
-      } catch (error: Exception) {
-        Diagnostics.warn("RemoteRevocation", "待撤销授权读取或保存失败，原记录已保留", error)
-      } finally {
-        revocationDrainMutex.unlock()
-        // A request arriving between the empty check and unlock must start a new pass.
-        if (revocationWake.tryReceive().isSuccess) triggerPendingRemoteRevocationsDrain()
-      }
-    }
-  }
-
   private var conversationPoolStorage: ConversationStorePool? = null
   internal val conversationPool: ConversationStorePool
     get() = conversationPoolStorage ?: ConversationStorePool().also { conversationPoolStorage = it }
@@ -180,1487 +144,12 @@ class LagoonController private constructor(private val appContext: Context) {
   fun conversationState(base: LagoonState, serverId: String?, sessionId: String?): LagoonState =
     conversationPool.project(base, serverId, sessionId, sessionViews, transcriptMemory)
 
-  private val store = ServerStore(appContext)
-  /** Device groups remain a legacy presentation store; the graph only references their stable IDs. */
+  private val deviceStore = DeviceStore(appContext)
+  private val store = ServerStore(appContext, deviceStore)
   private val deviceGroupStore = DeviceGroupStore(appContext)
-  /** Graph persistence is a companion projection and never the source of legacy profiles. */
-  private val connectionGraphStore = ConnectionGraphStore(
-    appContext,
-    readProfiles = { store.readProfiles() },
-    readCompositions = { connectionGraphCompositions() }
-  )
-  private val connectionGraphMutable = MutableStateFlow<ConnectionGraph?>(null)
-  /** Null means the graph was unavailable (corrupt/future schema), not that legacy profiles are empty. */
-  val connectionGraph: StateFlow<ConnectionGraph?> = connectionGraphMutable
-  private var connectionGraphWritable = false
-
-  /**
-   * 只读访问当前连接图。反射构造的测试夹具不会初始化这个字段，因此这里不用裸字段访问；
-   * 生产环境下与 `connectionGraphMutable.value` 等价。
-   */
-  private fun currentGraphOrNull(): ConnectionGraph? = runCatching { connectionGraphMutable.value }.getOrNull()
-
-  /** Effective enabled state for one graph leaf, including source and host parents. */
-  data class GraphEnabledProjection(
-    val sourceId: String,
-    val hostId: String,
-    val bindingId: String,
-    val sourceEnabled: Boolean,
-    val hostEnabled: Boolean,
-    val bindingEnabled: Boolean,
-    val effectiveEnabled: Boolean
-  )
-
-  fun graphBinding(bindingId: String): HarnessBinding? = currentGraphOrNull()?.bindings?.firstOrNull { it.id == bindingId }
-  fun graphEffectiveEnabled(bindingId: String): Boolean =
-    store.profiles().firstOrNull { it.id == bindingId }?.effectiveEnabled ?: false
-  fun graphEnabledProjection(bindingId: String): GraphEnabledProjection? {
-    val graph = currentGraphOrNull() ?: return null
-    val binding = graph.bindings.firstOrNull { it.id == bindingId } ?: return null
-    val host = graph.hosts.firstOrNull { it.id == binding.hostBindingId } ?: return null
-    val source = graph.sources.firstOrNull { it.id == host.sourceId } ?: return null
-    val leafEnabled = store.readProfiles().firstOrNull { it.id == bindingId }?.enabled ?: binding.enabled
-    return GraphEnabledProjection(source.id, host.id, binding.id, source.enabled, host.enabled, leafEnabled,
-      source.enabled && host.enabled && leafEnabled)
-  }
-
-  fun setConnectionSourceEnabled(sourceId: String, enabled: Boolean) {
-    setConnectionParentEnabled {
-      connectionGraphStore.setSourceEnabled(sourceId, enabled)
-    }
-    val committed = currentGraphOrNull()?.sources?.firstOrNull { it.id == sourceId && it.enabled == enabled }
-    if (committed != null && committed.type == ConnectionSourceType.HUB && !committed.account.isNullOrBlank()) {
-      runCatching {
-        remoteCatalog(committed.endpoint, committed.account!!)?.let { catalog ->
-          if (!catalog.signedOut && catalog.userPaused != !enabled) {
-            store.saveRemoteCatalog(catalog.copy(userPaused = !enabled, updatedAt = System.currentTimeMillis()))
-          }
-        }
-      }
-    }
-  }
-  fun setConnectionHostEnabled(hostId: String, enabled: Boolean) = setConnectionParentEnabled {
-    connectionGraphStore.setHostEnabled(hostId, enabled)
-  }
-
-  // —— 设备模型（docs/DEVICE_MODEL.md）：界面只认「设备」与「Harness」两级 ——
-
   private val deviceDiscoveryStore = DeviceDiscoveryStore(appContext)
   private val deviceDiscoveryInFlight = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
 
-  /** 最近一次发现观测；null 表示从未发现过。观测不是连接许可。 */
-  fun deviceDiscovery(deviceId: String): DeviceDiscovery? = deviceDiscoveryStore.get(deviceId)
-
-  /** 记录一次发现，并让设备页重新组合（不触发任何连接）。 */
-  fun recordDeviceDiscovery(discovery: DeviceDiscovery) {
-    try {
-      deviceDiscoveryStore.put(discovery)
-      updateState { it.copy(discoveryRevision = it.discoveryRevision + 1) }
-    } catch (cancel: CancellationException) {
-      throw cancel
-    } catch (error: Exception) {
-      showNotice(userFacingError(error, "发现结果保存失败"), FeedbackTone.WARNING)
-    }
-  }
-
-  fun clearDeviceDiscovery(deviceId: String) {
-    try {
-      deviceDiscoveryStore.clear(deviceId)
-      updateState { it.copy(discoveryRevision = it.discoveryRevision + 1) }
-    } catch (cancel: CancellationException) {
-      throw cancel
-    } catch (error: Exception) {
-      Diagnostics.warn("DeviceDiscovery", "清除发现缓存失败", error)
-    }
-  }
-
-  /**
-   * 本机真正“拥有”的设备：SSH/直连由已保存配置或 leaf 直接证明；中枢 Host 必须已为本机注册过
-   * 设备身份，或至少有一条 leaf。目录里出现但从未采纳的主机不在这里。
-   */
-  fun adoptedDeviceIds(): Set<String> {
-    val graph = currentGraphOrNull() ?: return emptySet()
-    val attachedHosts = graph.bindings.mapTo(HashSet()) { it.hostBindingId }
-    val sources = graph.sources.associateBy { it.id }
-    return graph.hosts.mapNotNullTo(LinkedHashSet()) { host ->
-      val source = sources[host.sourceId] ?: return@mapNotNullTo null
-      when (source.type) {
-        ConnectionSourceType.SSH, ConnectionSourceType.DIRECT -> host.id
-        ConnectionSourceType.HUB -> {
-          val external = host.externalHostId
-          // 采纳证据：目录显式记录了 adoptedHostIds 时只认其中主机（老目录无此字段时回退到设备身份/指纹）；
-          // 只要本机还挂着至少一条 Harness，也保留该主机。
-          val catalog = runCatching { remoteCatalog(source.endpoint, source.account.orEmpty()) }.getOrNull()
-          val adoptedSet = catalog?.adoptedHostIds
-          val adoptedByCatalog = external != null && if (adoptedSet != null) {
-            external in adoptedSet
-          } else {
-            val registered = runCatching {
-              val slot = resolveRemoteDeviceSlot(store.remoteDevices, source.endpoint, source.account.orEmpty(), external)
-              store.remoteDevices.load(slot) != null
-            }.getOrDefault(false)
-            val trusted = catalog?.hosts?.firstOrNull { it.hostId == external }
-              ?.let { it.trust != RemoteTrustState.UNKNOWN } == true
-            registered || trusted
-          }
-          host.id.takeIf { adoptedByCatalog || host.id in attachedHosts }
-        }
-      }
-    }
-  }
-
-  /** 设备列表投影；纯读，不拨号、不写盘。 */
-  fun deviceViews(
-    graph: ConnectionGraph?,
-    profiles: List<ServerProfile>,
-    isOnline: (String) -> Boolean = { false },
-    savedSshHosts: List<SshHostConfig> = emptyList()
-  ): List<DeviceView> = DeviceProjection.devices(
-    graph = graph,
-    profiles = profiles,
-    // 图不可用时没有可信的采纳目录：按旧行为显示全部 Host，宁可多显示也不让设备凭空消失。
-    adoptedDeviceIds = if (graph == null) null else adoptedDeviceIds(),
-    discovery = ::deviceDiscovery,
-    isOnline = isOnline,
-    savedSshHosts = savedSshHosts
-  )
-
-  /** 设备级开关：只写 `HostBinding.enabled`，不碰任何 leaf 偏好。 */
-  fun setDeviceEnabled(deviceId: String, enabled: Boolean) = setConnectionHostEnabled(deviceId, enabled)
-
-  /** leaf 所属的设备；用于从通知/深链解析到设备页。 */
-  fun deviceOfLeaf(leafId: String): String? =
-    currentGraphOrNull()?.bindings?.firstOrNull { it.id == leafId }?.hostBindingId
-
-  fun sourceOfLeaf(leafId: String): String? {
-    val graph = currentGraphOrNull() ?: return null
-    val hostId = graph.bindings.firstOrNull { it.id == leafId }?.hostBindingId ?: return null
-    return graph.hosts.firstOrNull { it.id == hostId }?.sourceId
-  }
-
-  /** SSH 配置对应的设备；保存 SSH 表单后据此直接进入设备页。 */
-  fun deviceIdOfSshHost(sshHostId: String): String? {
-    val graph = currentGraphOrNull() ?: return null
-    val sourceId = MigrationProjection.sshSourceId(sshHostId)
-    return graph.hosts.firstOrNull { it.sourceId == sourceId }?.id
-      ?: MigrationProjection.hostId(sourceId, sshHostId)
-  }
-
-  /**
-   * 为一台设备做一次只读发现。设备或接入源停用时直接拒绝——发现也会建立连接。
-   *
-   * 中枢读 Host 的服务目录；SSH 跑只读探测（注册文件/命令），不安装、不启动、不终止任何远端进程。
-   */
-  suspend fun refreshDeviceDiscovery(deviceId: String) {
-    val graph = currentGraphOrNull() ?: error("连接图暂不可用，请重试")
-    val host = graph.hosts.firstOrNull { it.id == deviceId } ?: error("设备已移除")
-    val source = graph.sources.firstOrNull { it.id == host.sourceId } ?: error("接入源已移除")
-    check(host.enabled) { "此设备已停用：先启用再发现" }
-    check(source.enabled) { "接入源已暂停，先恢复接入源再发现" }
-    check(deviceDiscoveryInFlight.add(deviceId)) { "此设备正在检测，请稍候" }
-    updateState { it.copy(deviceRefreshInFlight = it.deviceRefreshInFlight + deviceId) }
-    try {
-      val now = System.currentTimeMillis()
-      val expectedConfig = source.sshHostConfigId?.let { id -> sshHostStore.load().firstOrNull { it.id == id } }
-      val expectedSecrets = expectedConfig?.let { sshHostStore.secrets(it.id) }
-      val discovery = when (source.type) {
-        ConnectionSourceType.HUB -> hubDiscovery(deviceId, source, host, now)
-        ConnectionSourceType.SSH -> sshDiscovery(deviceId, expectedConfig ?: error("SSH 配置已移除"), expectedSecrets!!, now)
-        ConnectionSourceType.DIRECT -> DeviceDiscovery(deviceId, now, emptyList())
-      }
-      // A slow result from a deleted, disabled or edited device must not recreate its cache.
-      val latest = currentGraphOrNull() ?: error("设备配置已变化，请重新检测")
-      check(latest.hosts.firstOrNull { it.id == deviceId } == host &&
-        latest.sources.firstOrNull { it.id == source.id } == source) { "设备配置已变化，请重新检测" }
-      if (expectedConfig != null) check(sshHostStore.load().firstOrNull { it.id == expectedConfig.id } == expectedConfig &&
-        sshHostStore.secrets(expectedConfig.id) == expectedSecrets) { "SSH 配置已变化，请重新检测" }
-      recordDeviceDiscovery(discovery)
-    } finally {
-      deviceDiscoveryInFlight.remove(deviceId)
-      updateState { it.copy(deviceRefreshInFlight = it.deviceRefreshInFlight - deviceId) }
-    }
-  }
-
-  private suspend fun hubDiscovery(
-    deviceId: String,
-    source: ConnectionSource,
-    host: HostBinding,
-    now: Long
-  ): DeviceDiscovery {
-    val catalog = remoteCatalog(source.endpoint, source.account.orEmpty())?.takeUnless { it.signedOut }
-      ?: error("中枢账号已退出登录，请重新登录")
-    val meta = catalog.hosts.firstOrNull { it.hostId == host.externalHostId } ?: error("主机目录已变化，请刷新")
-    val services = remoteHostServices(catalog, meta)
-    return buildHubDiscoveryObservation(deviceId, services, now)
-  }
-
-  private fun buildHubDiscoveryObservation(deviceId: String, services: RemoteHostServices, now: Long): DeviceDiscovery {
-    val native = services.native
-    val completeness = native?.completeness ?: DiscoveryCompleteness.COMPLETE
-    val current = buildHubDiscovery(services, now)
-    // A partial native catalog cannot prove that a previously observed service disappeared.
-    val merged = if (completeness == DiscoveryCompleteness.COMPLETE) current else {
-      val seen = current.map { it.protocol to it.locator }.toSet()
-      current + deviceDiscovery(deviceId)?.harnesses.orEmpty().filter {
-        it.protocol == HarnessProtocolId.OPENCODE_NATIVE && (it.protocol to it.locator) !in seen
-      }
-    }
-    val note = if (completeness != DiscoveryCompleteness.COMPLETE)
-      native?.issues?.takeIf { it.isNotEmpty() }?.joinToString("；") ?: "部分服务未能确认，保留上次发现结果" else null
-    return DeviceDiscovery(deviceId, now, merged, completeness, note)
-  }
-
-  private fun buildHubDiscovery(services: RemoteHostServices, now: Long): List<DiscoveredHarness> =
-    buildList {
-      add(DiscoveredHarness(HarnessProtocolId.DSH_TYPERT, null, "DeepSeek Harness",
-        hostedStatus(services.dshAvailable, now, "Host 未声明 DSH 通道")))
-      add(DiscoveredHarness(HarnessProtocolId.CODEX_APP_SERVER, null, "Codex",
-        hostedStatus(services.codexAvailable, now, "Host 未声明 Codex 能力")))
-      add(DiscoveredHarness(HarnessProtocolId.ANTIGRAVITY_ACP, null, "Antigravity",
-        hostedStatus(services.agyAvailable, now, "Host 未声明 Antigravity ACP 能力")))
-      add(DiscoveredHarness(HarnessProtocolId.OPENCODE_ACP, null, "OpenCode ACP",
-        hostedStatus(services.openCodeAcpAvailable, now, "Host 未声明 OpenCode ACP 能力")))
-      services.native?.services.orEmpty().filter { it.supported }.forEach { service ->
-        add(DiscoveredHarness(HarnessProtocolId.OPENCODE_NATIVE, service.id,
-          service.name.ifBlank { "OpenCode" }, hostedStatus(service.available, now, "Host 报告该服务尚未就绪")))
-      }
-    }
-
-  private suspend fun sshDiscovery(deviceId: String, config: SshHostConfig, secrets: SshSecrets, now: Long): DeviceDiscovery {
-    val found = sshHostManager.discoverDevice(config, secrets)
-    val files = found.files
-    val codex = found.codex
-    val agy = found.agy
-    val dsh = found.dsh
-    val observedPath = files.openCode.registrationPath
-    val existing = store.profiles().filter { it.sshHostId == config.id && it.protocol == HarnessProtocolId.OPENCODE_NATIVE }
-    // Prefer the historic default leaf. An explicit path is equivalent only after this probe has
-    // established that it is the current default, and must retain its existing leaf identity.
-    val locator = if (existing.any { it.sshServicePath == null }) null
-      else observedPath?.takeIf { path -> existing.any { it.sshServicePath == path } }
-    fun value(v: Boolean?): DiscoveryValue = when (v) {
-      true -> DiscoveryValue.YES
-      false -> DiscoveryValue.NO
-      null -> DiscoveryValue.UNKNOWN
-    }
-    fun explanation(issue: String?): String? = when (issue) {
-      null -> null
-      "probe_failed", "invalid_output" -> "检测未完成，请重试"
-      "version_unavailable" -> "已找到程序，但无法确认版本"
-      "acp_unavailable" -> "此版本不支持 ACP，请更新后重试"
-      "acp_probe_failed" -> "无法确认 ACP 是否可用，请检查设备上的 Antigravity"
-      "unsupported_system" -> "当前 SSH 模式支持 Linux 和 macOS；Windows 请使用 WSL"
-      "system_detection_failed" -> "无法识别远端系统，请检查 SSH 的 shell 设置"
-      "custom_command_unverified" -> "自定义启动命令尚未验证；启用后再连接"
-      else -> issue
-    }
-    val openCodeDetail = openCodeDetail(files)
-    val binaryLabel = files.openCode.binaryVersion?.takeIf { it.isNotBlank() }?.let { "已安装 $it" }.orEmpty()
-    val harnesses = mutableListOf(
-      DiscoveredHarness(HarnessProtocolId.OPENCODE_NATIVE, locator, "OpenCode",
-        files.openCodeStatus(DeviceDiscovery.DEFAULT_TTL_MS).copy(reason = openCodeDetail.takeIf { it.isNotBlank() }),
-        buildList {
-          if (openCodeDetail.isNotBlank()) add(openCodeDetail)
-          if (binaryLabel.isNotBlank()) add(binaryLabel)
-        }.joinToString(" · ")),
-      DiscoveredHarness(HarnessProtocolId.DSH_TYPERT, null, "DeepSeek Harness",
-        HarnessDiscoveryStatus(installed = value(dsh.installed), available = DiscoveryValue.UNKNOWN,
-          observedAtMs = now, freshUntilMs = now + DeviceDiscovery.DEFAULT_TTL_MS,
-          completeness = if (dsh.issue == null) DiscoveryCompleteness.COMPLETE else DiscoveryCompleteness.PARTIAL,
-          reason = explanation(dsh.issue) ?: if (dsh.installed == false)
-            "未发现 DSH，请先在电脑安装或配置自定义启动命令" else "连接时启动或复用 DSH")),
-      DiscoveredHarness(HarnessProtocolId.ANTIGRAVITY_ACP, null, "Antigravity",
-        HarnessDiscoveryStatus(installed = value(agy.installed), compatible = value(agy.compatible),
-          available = DiscoveryValue.UNKNOWN, observedAtMs = now, freshUntilMs = now + DeviceDiscovery.DEFAULT_TTL_MS,
-          completeness = if (agy.installed != null && (agy.issue == null || agy.issue == "acp_unavailable")) DiscoveryCompleteness.COMPLETE else DiscoveryCompleteness.PARTIAL,
-          reason = explanation(agy.issue)), agy.version.orEmpty()),
-      DiscoveredHarness(HarnessProtocolId.CODEX_APP_SERVER, null, "Codex",
-        HarnessDiscoveryStatus(installed = value(codex.installed), available = DiscoveryValue.UNKNOWN,
-          observedAtMs = now, freshUntilMs = now + DeviceDiscovery.DEFAULT_TTL_MS,
-          completeness = if (codex.installed != null && codex.issue == null) DiscoveryCompleteness.COMPLETE else DiscoveryCompleteness.PARTIAL,
-          reason = explanation(codex.issue)), codex.version.orEmpty())
-    )
-    // An absent binary is already explained by the native row; only report ACP when it exists,
-    // when the version lacks it, or when the probe could not finish.
-    found.openCodeAcp?.takeIf { it.supported != false || it.issue != null }?.let { acp ->
-      harnesses += DiscoveredHarness(HarnessProtocolId.OPENCODE_ACP, null, "OpenCode ACP",
-        HarnessDiscoveryStatus(
-          installed = value(acp.supported), compatible = value(acp.supported),
-          available = DiscoveryValue.UNKNOWN, observedAtMs = now,
-          freshUntilMs = now + DeviceDiscovery.DEFAULT_TTL_MS,
-          completeness = if (acp.supported == null) DiscoveryCompleteness.PARTIAL else DiscoveryCompleteness.COMPLETE,
-          reason = when {
-            acp.issue == "acp_unavailable" -> "此版本的 opencode 不支持 ACP，请升级"
-            acp.issue != null -> "ACP 检测未完成，请重试"
-            acp.supported == true -> null
-            else -> "未安装 opencode"
-          }), acp.version.orEmpty())
-    }
-    found.localOpenCode?.takeIf { it.openCode.state == SshDiscoveryState.PRESENT }?.let { local ->
-      harnesses += DiscoveredHarness(HarnessProtocolId.OPENCODE_NATIVE, local.openCode.registrationPath,
-        "OpenCode（开发版）", local.openCodeStatus(DeviceDiscovery.DEFAULT_TTL_MS))
-    }
-    val environmentNote = when (found.environmentIssue) {
-      "python_unavailable" -> "设备缺少 Python 3，部分服务无法检测或安全连接"
-      "unsupported_system" -> "当前 SSH 模式支持 Linux 和 macOS；Windows 请使用 WSL"
-      "system_detection_failed" -> "无法识别远端系统，请检查 SSH 的 shell 设置"
-      else -> null
-    }
-    return DeviceDiscovery(deviceId, found.observedAtMs, harnesses, found.completeness, environmentNote)
-  }
-
-  /**
-   * One user-facing sentence for an OpenCode observation. The wire-level reasons stay in `shared/`
-   * so the same codes can be rendered by other surfaces without duplicating the wording there.
-   */
-  private fun openCodeDetail(files: SshHarnessDiscoveryResult): String {
-    val binary = files.openCode.binaryVersion?.takeIf { it.isNotBlank() }
-    return when (files.reasonCode()) {
-      SshDiscoveryReason.NOT_FOUND ->
-        if (binary == null) "设备上未发现 OpenCode；请安装 OpenCode 2.x 后运行 opencode service start"
-        else "已安装 $binary，但服务未运行；请运行 opencode service start 后刷新检测"
-      SshDiscoveryReason.PERMISSIONS_TOO_OPEN ->
-        "注册文件允许同组或其他用户改写，已拒绝使用；请在设备上执行 chmod 600 注册文件"
-      SshDiscoveryReason.SERVICE_UNREACHABLE ->
-        "OpenCode 服务没有响应（注册可能已过期）；重启 opencode service 后刷新检测"
-      SshDiscoveryReason.AUTHENTICATION_FAILED ->
-        "OpenCode 拒绝了注册文件里的凭据；重启服务重新生成注册"
-      SshDiscoveryReason.REGISTRATION_STALE ->
-        "注册文件与运行中的服务不一致（服务可能已重启）；刷新检测会重新绑定"
-      SshDiscoveryReason.VERSION_MISMATCH -> "注册文件版本与运行中的服务不一致；重启服务后刷新"
-      SshDiscoveryReason.PROTOCOL_MISMATCH -> "该端口不是 OpenCode 2.x 服务（需要 2.0 以上）"
-      SshDiscoveryReason.PYTHON_UNAVAILABLE -> "设备缺少 Python 3：状态检查和安全连接都需要它，请安装 python3"
-      SshDiscoveryReason.UNREADABLE -> "无法读取 OpenCode 注册文件，请检查路径与权限"
-      SshDiscoveryReason.INVALID_DATA, SshDiscoveryReason.TOO_LARGE ->
-        "OpenCode 注册文件无效，请在设备上重启服务重新生成"
-      SshDiscoveryReason.VERSION_UNKNOWN -> "已连接，但无法确认 OpenCode 版本"
-      else -> ""
-    }
-  }
-
-  private fun hostedStatus(available: Boolean, now: Long, reason: String): HarnessDiscoveryStatus =
-    HarnessDiscoveryStatus(
-      installed = DiscoveryValue.YES, configured = DiscoveryValue.YES,
-      listening = if (available) DiscoveryValue.YES else DiscoveryValue.UNKNOWN,
-      authenticated = if (available) DiscoveryValue.YES else DiscoveryValue.UNKNOWN,
-      compatible = if (available) DiscoveryValue.YES else DiscoveryValue.UNKNOWN,
-      available = if (available) DiscoveryValue.YES else DiscoveryValue.NO,
-      observedAtMs = now, freshUntilMs = now + DeviceDiscovery.DEFAULT_TTL_MS,
-      completeness = DiscoveryCompleteness.COMPLETE, reason = if (available) null else reason
-    )
-
-  /**
-   * 在设备页添加一条 Harness：始终以“启用”加入，然后由用户自己关。
-   * 同槽位已存在时复用原 leaf（幂等），不会产生第二条记录。
-   */
-  suspend fun attachHarness(deviceId: String, protocol: HarnessProtocolId, locator: String?) {
-    val graph = currentGraphOrNull() ?: error("连接图暂不可用，请重试")
-    val host = graph.hosts.firstOrNull { it.id == deviceId } ?: error("设备已移除")
-    val source = graph.sources.firstOrNull { it.id == host.sourceId } ?: error("接入源已移除")
-    check(host.enabled && source.enabled) { "设备或接入源已停用，先启用再添加 Harness" }
-    when (source.type) {
-      ConnectionSourceType.HUB -> {
-        val catalog = remoteCatalog(source.endpoint, source.account.orEmpty())?.takeUnless { it.signedOut }
-          ?: error("中枢账号已退出登录，请重新登录")
-        val meta = catalog.hosts.firstOrNull { it.hostId == host.externalHostId } ?: error("主机目录已变化，请刷新")
-        val parent = remoteCatalogProfile(catalog, meta)
-        val services = when (protocol) {
-          HarnessProtocolId.DSH_TYPERT -> null
-          HarnessProtocolId.ANTIGRAVITY_ACP -> remoteHostServices(catalog, meta).also {
-            check(it.agyAvailable) { "Host 未启用 Antigravity ACP" }
-          }
-          HarnessProtocolId.OPENCODE_ACP -> remoteHostServices(catalog, meta).also {
-            check(it.openCodeAcpAvailable) { "Host 未启用 OpenCode ACP" }
-          }
-          HarnessProtocolId.CODEX_APP_SERVER -> remoteHostServices(catalog, meta).also {
-            check(it.codexAvailable) { "Host 未声明 Codex 可用" }
-          }
-          HarnessProtocolId.OPENCODE_NATIVE -> remoteHostServices(catalog, meta)
-        }
-        withContext(Dispatchers.Main.immediate) {
-          val attached = when (protocol) {
-            HarnessProtocolId.DSH_TYPERT -> addRemoteDshService(parent, enabled = true, reenableExisting = true)
-            HarnessProtocolId.ANTIGRAVITY_ACP -> addRemoteAgyService(parent, enabled = true, reenableExisting = true)
-            HarnessProtocolId.OPENCODE_ACP -> addRemoteOpenCodeAcpService(parent, enabled = true, reenableExisting = true)
-            HarnessProtocolId.CODEX_APP_SERVER -> addRemoteCodexService(parent, enabled = true, reenableExisting = true)
-            HarnessProtocolId.OPENCODE_NATIVE -> {
-              val service = services!!.native?.services?.firstOrNull { it.id == locator && it.supported }
-                ?: error("原生服务已变化，请刷新发现后重试")
-              val existingOrAdded = saveRemoteNativeService(parent, service, enabled = true)
-              reuseOrReenableRemoteProfile(existingOrAdded, parent, reenableExisting = true)
-            }
-          }
-          if (attached.effectiveEnabled) {
-            allOverview.start(store.profiles(), include = setOfNotNull(state.value.serverId, attached.id))
-            allOverview.refresh(attached.id)
-            if (state.value.serverId == null) connect(attached.id, preserveHome = true)
-          }
-        }
-      }
-      ConnectionSourceType.SSH -> {
-        val config = source.sshHostConfigId?.let { id -> sshHostStore.load().firstOrNull { it.id == id } }
-          ?: error("SSH 配置已移除")
-        val kind = when (protocol) {
-          HarnessProtocolId.DSH_TYPERT -> ServerKind.DSH
-          HarnessProtocolId.OPENCODE_NATIVE -> ServerKind.OPENCODE
-          // ACP harnesses are carried by their own stdio client, not by the native HTTP protocol.
-          HarnessProtocolId.CODEX_APP_SERVER, HarnessProtocolId.ANTIGRAVITY_ACP,
-          HarnessProtocolId.OPENCODE_ACP -> ServerKind.CODEX
-        }
-        val added = saveSshHost(
-          config = config, secrets = sshHostStore.secrets(config.id), harnessKind = kind,
-          registrationPath = locator.takeIf { kind == ServerKind.OPENCODE },
-          harnessProtocol = protocol.takeIf {
-            it == HarnessProtocolId.ANTIGRAVITY_ACP || it == HarnessProtocolId.OPENCODE_ACP
-          },
-          bindingEnabled = true, connect = false
-        )
-        // Adding is not selecting: mirror the Hub branch (auto-open when nothing is selected) and
-        // say what happened instead of silently leaving the home page on the previous server.
-        if (added.effectiveEnabled && state.value.serverId == null) connect(added.id, preserveHome = true)
-        showNotice(if (kind == ServerKind.OPENCODE)
-          "已添加 OpenCode；若连接失败，可在它的详情页启动服务后重试"
-        else "已添加 ${added.name}，可返回首页打开或切换过去",
-          FeedbackTone.SUCCESS)
-      }
-      ConnectionSourceType.DIRECT -> error("直连连接本身就是一条 Harness，不需要再添加")
-    }
-  }
-
-  /**
-   * 移除一台设备：删掉它的全部 Harness、接入配置与中枢设备身份，并清掉发现缓存。
-   * 只影响本机记录；远端进程、文件与会话不动。
-   */
-  fun deleteDevice(deviceId: String) {
-    val graph = currentGraphOrNull() ?: return
-    val host = graph.hosts.firstOrNull { it.id == deviceId } ?: return
-    val source = graph.sources.firstOrNull { it.id == host.sourceId } ?: return
-    val bindingIds = graph.bindings.filter { it.hostBindingId == host.id }.map { it.id }.toSet()
-    val canonicalOrigin = if (source.type == ConnectionSourceType.HUB) {
-      runCatching { canonicalRemoteOrigin(source.endpoint) }.getOrElse { source.endpoint }
-    } else null
-    val acct = if (source.type == ConnectionSourceType.HUB) source.account.orEmpty().trim() else ""
-    val external = if (source.type == ConnectionSourceType.HUB) host.externalHostId else null
-    val profileIdsToDelete = store.profiles().filter { profile ->
-      profile.id in bindingIds ||
-        (source.type == ConnectionSourceType.SSH && source.sshHostConfigId != null && profile.sshHostId == source.sshHostConfigId) ||
-        (source.type == ConnectionSourceType.HUB && external != null && profile.remoteHostId == external &&
-          profile.username.trim() == acct && canonicalOrigin != null &&
-          runCatching { canonicalRemoteOrigin(profile.url) == canonicalOrigin }.getOrDefault(false))
-    }.map { it.id }.distinct()
-
-    if (source.type == ConnectionSourceType.HUB && external != null && canonicalOrigin != null) {
-      val catalogBefore = runCatching { remoteCatalog(canonicalOrigin, acct) }.getOrNull()
-      val lastPairedHost = acct.startsWith("dsh-device:") &&
-        catalogBefore?.hosts.orEmpty().none { it.hostId != external } &&
-        graph.hosts.none { it.sourceId == source.id && it.id != host.id }
-      val allowCleartext = catalogBefore?.allowCleartext == true || source.allowCleartext
-      try {
-        RemoteIdentitySlots.queueAndWipeHostSlots(
-          store.remoteDevices, canonicalOrigin, acct, external, allowCleartext, profileIdsToDelete.map { remoteSlot(it) }
-        )
-      } catch (error: Exception) {
-        if (error is CancellationException) throw error
-        showNotice(userFacingError(error, "保存待撤销授权失败，未移除设备"), FeedbackTone.WARNING)
-        triggerPendingRemoteRevocationsDrain()
-        return
-      }
-      RemoteConnectionRegistry.evictHost(canonicalOrigin, acct, external)
-      try { remoteCompactions.clearScope(remoteCompactionScope(canonicalOrigin, acct, external)) }
-      catch (error: Exception) {
-        if (error is CancellationException) throw error
-        showNotice(userFacingError(error, "部分本机压缩记录未能清理"), FeedbackTone.WARNING)
-      }
-      if (lastPairedHost) {
-        RemoteConnectionRegistry.evictAccount(canonicalOrigin, acct)
-      }
-      runCatching {
-        val trust = RemotePeerTrust(store.remotePins)
-        trust.forget(RemotePeerScope(canonicalOrigin, acct, external))
-        if (lastPairedHost) {
-          trust.forgetAccount(canonicalOrigin, acct)
-        }
-      }
-      if (lastPairedHost) {
-        runCatching { store.clearRemoteCatalog(canonicalOrigin, acct) }
-      } else if (catalogBefore != null) {
-        val nextHosts = catalogBefore.hosts.filterNot { it.hostId == external }
-        val nextAdopted = (catalogBefore.adoptedHostIds ?: catalogBefore.hosts.map { it.hostId }.toSet()) - external
-        if (catalogBefore.signedOut && nextAdopted.isEmpty()) {
-          runCatching { store.clearRemoteCatalog(canonicalOrigin, acct) }
-        } else {
-          runCatching {
-            store.saveRemoteCatalog(catalogBefore.copy(
-              hosts = nextHosts,
-              adoptedHostIds = nextAdopted,
-              updatedAt = System.currentTimeMillis()
-            ))
-          }
-        }
-      }
-      triggerPendingRemoteRevocationsDrain()
-    }
-
-    profileIdsToDelete.forEach { deleteServer(it) }
-
-    if (source.type == ConnectionSourceType.SSH) {
-      source.sshHostConfigId?.let { id ->
-        sshHostManager.close(id)
-        runCatching { sshHostStore.delete(id) }
-          .onFailure { showNotice(userFacingError(it, "删除 SSH 配置失败"), FeedbackTone.WARNING) }
-      }
-    }
-
-    val emptySignedOutHub = source.type == ConnectionSourceType.HUB &&
-      canonicalOrigin != null &&
-      acct.isNotEmpty() &&
-      runCatching { remoteCatalog(canonicalOrigin, acct) }.getOrNull() == null
-    val removeSource = source.type == ConnectionSourceType.SSH ||
-      source.type == ConnectionSourceType.DIRECT ||
-      (source.type == ConnectionSourceType.HUB && emptySignedOutHub &&
-        graph.hosts.none { it.sourceId == source.id && it.id != host.id })
-    pruneConnectionGraph(removeHostIds = setOf(deviceId), removeSourceIds = if (removeSource) setOf(source.id) else emptySet())
-    clearDeviceDiscovery(deviceId)
-    persistConnectionGraph()
-    syncGroupLeaves()
-    updateState { it.copy(profiles = store.profiles(), sshHosts = sshHostStore.load()) }
-  }
-
-  /** Number of encrypted revocation tasks still awaiting confirmation by the Remote server. */
-  internal fun pendingRemoteRevocationCount(): Int = store.remoteDevices.pendingRevocations().size
-
-  internal fun hasRemoteCredentials(origin: String, account: String): Boolean {
-    val canonical = canonicalRemoteOrigin(origin)
-    return store.remoteDevices.listSlots().any { slot ->
-      store.remoteDevices.load(slot)?.let { it.origin == canonical && it.account.trim() == account.trim() } == true
-    }
-  }
-
-
-  fun deleteRemoteSource(origin: String, account: String) {
-    val canonical = runCatching { canonicalRemoteOrigin(origin) }.getOrNull() ?: return
-    val acct = account.trim()
-    val graph = currentGraphOrNull()
-    val matchingSources = graph?.sources.orEmpty().filter { source ->
-      source.type == ConnectionSourceType.HUB &&
-        runCatching { canonicalRemoteOrigin(source.endpoint) == canonical }.getOrDefault(false) &&
-        (acct.isEmpty() || source.account.orEmpty().trim() == acct)
-    }
-    val explicitSourceId = if (acct.isNotEmpty()) MigrationProjection.hubSourceId(canonical, acct) else null
-    val sourceIdsToRemove = (matchingSources.map { it.id } + listOfNotNull(explicitSourceId)).toSet()
-    val hostsUnderSource = graph?.hosts.orEmpty().filter { it.sourceId in sourceIdsToRemove }
-    val hostBindingIdsToRemove = hostsUnderSource.map { it.id }.toSet()
-    val externalHostIds = hostsUnderSource.mapNotNull { it.externalHostId }.toMutableSet()
-
-    val bindingIdsUnderSource = graph?.bindings.orEmpty()
-      .filter { it.hostBindingId in hostBindingIdsToRemove }
-      .mapTo(HashSet()) { it.id }
-    val allProfiles = store.readProfiles()
-    val profilesToDelete = allProfiles.filter { profile ->
-      profile.id in bindingIdsUnderSource ||
-        (profile.usesRemoteTransport &&
-          runCatching { canonicalRemoteOrigin(profile.url) == canonical }.getOrDefault(false) &&
-          (acct.isEmpty() || profile.username.trim() == acct))
-    }
-    profilesToDelete.mapNotNullTo(externalHostIds) { it.remoteHostId }
-
-    val matchingCatalogs = store.remoteCatalogs().filter { cat ->
-      runCatching { canonicalRemoteOrigin(cat.origin) == canonical }.getOrDefault(false) &&
-        (acct.isEmpty() || cat.account.trim() == acct)
-    }
-    val allowCleartext = matchingCatalogs.any { it.allowCleartext } || matchingSources.any { it.allowCleartext }
-    matchingCatalogs.forEach { cat -> cat.hosts.mapTo(externalHostIds) { it.hostId } }
-
-    val legacyProfileSlots = profilesToDelete.map { remoteSlot(it.id) }
-    val accountsForWipe = buildSet {
-      if (acct.isNotEmpty()) add(acct)
-      matchingCatalogs.mapTo(this) { it.account.trim() }
-      profilesToDelete.mapTo(this) { it.username.trim() }
-    }.filter { it.isNotEmpty() }
-
-    try {
-      for (targetAccount in accountsForWipe) {
-        for (extHostId in externalHostIds) {
-          RemoteIdentitySlots.queueAndWipeHostSlots(
-            store.remoteDevices, canonical, targetAccount, extHostId, allowCleartext, legacyProfileSlots
-          )
-        }
-      }
-      // Include legacy slots no longer represented in the Host directory. No slot is wiped until its
-      // revocation has been committed; a failure leaves the source visible for a later retry.
-      for (slot in store.remoteDevices.listSlots()) {
-        val record = store.remoteDevices.load(slot) ?: continue
-        val sameOrigin = canonicalRemoteOrigin(record.origin) == canonical
-        val sameAccount = acct.isEmpty() || record.account.trim() == acct
-        if (sameOrigin && sameAccount) {
-          RemoteIdentitySlots.queueAndWipeSlot(store.remoteDevices, slot, canonical,
-            record.account.trim(), "unknown", allowCleartext)
-        }
-      }
-    } catch (error: Exception) {
-      if (error is CancellationException) throw error
-      showNotice(userFacingError(error, "保存待撤销授权失败，未删除中枢"), FeedbackTone.WARNING)
-      triggerPendingRemoteRevocationsDrain()
-      return
-    }
-
-    var compactionCleanupFailed = false
-    for (targetAccount in accountsForWipe) {
-      RemoteConnectionRegistry.evictAccount(canonical, targetAccount)
-      runCatching { RemotePeerTrust(store.remotePins).forgetAccount(canonical, targetAccount) }
-      externalHostIds.forEach { extHostId ->
-        runCatching { RemotePeerTrust(store.remotePins).forget(RemotePeerScope(canonical, targetAccount, extHostId)) }
-        if (runCatching { remoteCompactions.clearScope(remoteCompactionScope(canonical, targetAccount, extHostId)) }.isFailure)
-          compactionCleanupFailed = true
-      }
-      runCatching { store.clearRemoteCatalog(canonical, targetAccount) }
-    }
-
-    val computedHostIds = sourceIdsToRemove.flatMap { sid ->
-      externalHostIds.map { ext -> MigrationProjection.hostId(sid, ext) }
-    }.toSet()
-    profilesToDelete.forEach { deleteServer(it.id) }
-    (hostBindingIdsToRemove + computedHostIds).forEach { clearDeviceDiscovery(it) }
-    pruneConnectionGraph(removeHostIds = hostBindingIdsToRemove, removeSourceIds = sourceIdsToRemove)
-    persistConnectionGraph()
-    saveDeviceGroups(state.value.deviceGroups, state.value.homeGroupId)
-    syncGroupLeaves()
-    updateState { current ->
-      val updatedProfiles = store.profiles()
-      val clearingPreset = current.remoteEnrollPreset?.let { preset ->
-        runCatching { canonicalRemoteOrigin(preset.origin) == canonical }.getOrDefault(false) &&
-          (acct.isEmpty() || preset.account.trim() == acct)
-      } == true
-      current.copy(
-        profiles = updatedProfiles,
-        sshHosts = sshHostStore.load(),
-        remoteEnrollPreset = if (clearingPreset) null else current.remoteEnrollPreset
-      )
-    }
-    triggerPendingRemoteRevocationsDrain()
-    val waiting = runCatching { pendingRemoteRevocationCount() }.getOrNull()
-    val message = when {
-      compactionCleanupFailed -> "已删除中枢，但部分本机压缩记录未能清理"
-      waiting == null -> "已删除本机中枢数据；无法读取远端授权撤销状态，请稍后检查"
-      waiting > 0 -> "已删除本机中枢数据；远端授权撤销仍在处理"
-      else -> "已删除中枢及本地关联数据"
-    }
-    showNotice(message, when { compactionCleanupFailed || waiting == null -> FeedbackTone.WARNING; waiting > 0 -> FeedbackTone.INFO; else -> FeedbackTone.SUCCESS })
-  }
-
-  private fun pruneConnectionGraph(removeHostIds: Set<String>, removeSourceIds: Set<String>) {
-    val current = currentGraphOrNull() ?: return
-    val nextSources = current.sources.filterNot { it.id in removeSourceIds }
-    val remainingSourceIds = nextSources.mapTo(mutableSetOf()) { it.id }
-    val nextHosts = current.hosts.filterNot { it.id in removeHostIds || it.sourceId !in remainingSourceIds }
-    val remainingHostIds = nextHosts.mapTo(mutableSetOf()) { it.id }
-    val nextBindings = current.bindings.filter { it.hostBindingId in remainingHostIds }
-    val remainingBindingIds = nextBindings.mapTo(mutableSetOf()) { it.id }
-    val nextCompositions = current.compositions.map { group ->
-      group.copy(bindingIds = group.bindingIds.filter { it in remainingBindingIds })
-    }
-    val pruned = current.copy(
-      sources = nextSources,
-      hosts = nextHosts,
-      bindings = nextBindings,
-      compositions = nextCompositions,
-    )
-    connectionGraphMutable.value = pruned
-    runCatching { connectionGraphStore.save(pruned) }
-  }
-
-  private fun setConnectionParentEnabled(change: () -> ConnectionGraph) {
-    if (!connectionGraphWritable) {
-      showNotice("连接图不可写，请先修复或升级；原资料已保留", FeedbackTone.WARNING)
-      return
-    }
-    val next = try { change() }
-    catch (cancel: CancellationException) { throw cancel }
-    catch (error: Exception) {
-      // SharedPreferences may report failure after the new primary was committed but before journal
-      // cleanup. Reread the committed primary and reconcile runtime gates before exposing the error.
-      when (val recovered = runCatching { connectionGraphStore.loadOrMigrate() }.getOrNull()) {
-        is ConnectionGraphStore.LoadResult.Loaded -> { connectionGraphMutable.value = recovered.graph; connectionGraphWritable = true }
-        is ConnectionGraphStore.LoadResult.Unsupported, null -> {
-          connectionGraphMutable.value = null; connectionGraphWritable = false
-        }
-      }
-      applyCurrentGraphRuntimeGates()
-      showNotice(userFacingError(error, "父级状态写入结果不确定，已按磁盘中的连接许可同步运行连接"), FeedbackTone.WARNING)
-      return
-    }
-    connectionGraphMutable.value = next
-    connectionGraphWritable = true
-    applyCurrentGraphRuntimeGates()
-  }
-
-  private fun applyCurrentGraphRuntimeGates() {
-    val before = state.value.profiles
-    val profiles = store.profiles()
-    val denied = before.filter { it.effectiveEnabled }.map { it.id }.toSet() -
-      profiles.filter { it.effectiveEnabled }.map { it.id }.toSet()
-    if (denied.isNotEmpty()) {
-      returnQueuedToDrafts { it.serverId !in denied }
-      for (id in denied) {
-        cancelProfileNotifications(id)
-        allOverview.invalidate(id)
-        if (profiles.any { it.id == id && it.sshHostId != null }) sshHostManager.closeBinding(id)
-        allSnapshots.remove(id)
-      }
-    }
-    val selectedGroup = state.value.homeGroupId
-    updateState { withSummary(it.copy(profiles = profiles, allServerSnapshots = allSnapshots.toMap(),
-      message = "父级连接状态已保存，Harness 自身开关未改动", messageTone = FeedbackTone.INFO)) }
-    allOverview.start(profiles, include = setOfNotNull(state.value.serverId?.takeIf { id -> profiles.any { it.id == id && it.effectiveEnabled } }))
-    if (state.value.serverId in denied) {
-      val fallback = if (selectedGroup != null) state.value.homeGroup?.memberIds?.mapNotNull { id ->
-        profiles.firstOrNull { it.id == id && it.effectiveEnabled }
-      }?.firstOrNull() else profiles.firstOrNull { it.effectiveEnabled }
-      if (fallback != null) connect(fallback.id, preserveHome = true, groupOverride = selectedGroup)
-      else {
-        showAggregateAfterDisable(profiles, "所属接入源或主机已停用")
-        if (selectedGroup != null) updateState { it.copy(homeGroupId = selectedGroup, allServers = false) }
-      }
-    }
-    scheduleBackgroundSync()
-  }
-
-  private fun connectionGraphCompositions(): List<BindingComposition> {
-    val profiles = store.profiles()
-    val valid = profiles.map { it.id }.toSet()
-    return deviceGroupStore.load().state.sanitized(valid).groups.map { group ->
-      BindingComposition(group.id, group.name, group.memberIds)
-    }
-  }
-
-  /**
-   * Reprojects legacy profiles into the graph after a profile/group mutation. Legacy profile fields
-   * remain authoritative for binding enabled/autoConnect/notifications; graph-only source/host
-   * switches and discovery evidence survive the projection.
-   */
-  private fun projectedConnectionGraph(profiles: List<ServerProfile>, groups: List<DeviceGroup>): ConnectionGraph {
-    val existing = currentGraphOrNull()
-    val selectedSlots = existing?.bindings.orEmpty().mapNotNull { binding ->
-      binding.credentials.remoteIdentity?.selected?.key?.let { binding.id to it }
-    }.toMap()
-    val compositions = groups.map { group -> BindingComposition(group.id, group.name, group.memberIds) }
-    val projected = MigrationProjection.fromProfiles(profiles,
-      resolvedRemoteSlots = profiles.mapNotNull { profile ->
-        if (MigrationProjection.sourceType(profile) != ConnectionSourceType.HUB) return@mapNotNull null
-        val selected = selectedSlots[profile.id] ?: return@mapNotNull null
-        selected.takeIf { slot -> MigrationProjection.remoteSlotRefs(profile).candidates.any { it.key == slot } }
-          ?.let { profile.id to it }
-      }.toMap(),
-      compositions = compositions)
-    val catalogued = ConnectionCatalogProjection.merge(projected, existing, sshHostStore.load(), store.remoteCatalogs())
-    if (existing == null) return catalogued
-    val oldBindings = existing.bindings.associateBy { it.id }
-    return catalogued.copy(
-      bindings = catalogued.bindings.map { binding ->
-        val old = oldBindings[binding.id]
-        binding.copy(
-          enabled = binding.legacyProfile?.enabled ?: binding.enabled,
-          discovery = old?.discovery ?: binding.discovery,
-          serviceId = binding.serviceId
-        )
-      }
-    )
-  }
-
-  private fun persistConnectionGraph(profiles: List<ServerProfile> = store.readProfiles(), groups: List<DeviceGroup> = state.value.deviceGroups) {
-    if (!connectionGraphWritable) return
-    try {
-      // Use the caller's post-save profiles, not a second disk read: a save that just added a leaf
-      // must publish that leaf in the same frame, or the device page is one edit behind.
-      val graph = projectedConnectionGraph(profiles, groups)
-      connectionGraphStore.save(graph)
-      connectionGraphMutable.value = graph
-    } catch (error: CancellationException) {
-      throw error
-    } catch (error: Exception) {
-      // The graph is a companion projection. Never make a legacy profile/group edit fail because
-      // graph persistence is unavailable; keep the last published graph and record diagnostics.
-      Diagnostics.warn("ConnectionGraph", "连接图保存失败，保留旧图并继续使用旧连接资料", error)
-    }
-  }
-
-  private val remoteCompactions: RemoteCompactionStore by lazy { AndroidRemoteCompactionStore(appContext) }
-
-  private val remoteBackendFactory = object : RemoteBackendFactory {
-    override fun create(profile: ServerProfile, credentials: ServerCredentials): RemoteBackend = acquireRemoteBackend(profile, requireLeaf = true)
-  }
-
-  private fun acquireRemoteBackend(profile: ServerProfile, requireLeaf: Boolean): RemoteBackend {
-      check(remoteCatalog(profile.url, profile.username)?.signedOut != true) { "中枢账号已退出登录，请重新登录" }
-      if (requireLeaf) store.runtimeProfile(profile) else {
-        val host = requireNotNull(profile.remoteHostId) { "尚未选择主机" }
-        val source = MigrationProjection.hubSourceId(profile.url, profile.username)
-        val (savedSource, savedHost) = store.requireParentRoute(source, MigrationProjection.hostId(source, host))
-        check(savedSource.type == ConnectionSourceType.HUB && savedSource.endpoint == canonicalRemoteOrigin(profile.url) &&
-          savedSource.account == profile.username.trim() && savedSource.allowCleartext == profile.allowCleartext &&
-          savedHost.externalHostId == host && savedHost.fingerprint == profile.remoteHostFingerprint) { "Host 路由与连接图不一致，请刷新后重新确认" }
-        val catalog = remoteCatalog(profile.url, profile.username)
-        val saved = store.readProfiles().firstOrNull { it.id == profile.id }
-        check(catalog?.hosts?.any { it.hostId == host && it.fingerprint == profile.remoteHostFingerprint } == true ||
-          saved?.let { ConnectionRouteAdmission.sameLeafRoute(it, profile) } == true) { "主机目录已变化或账号已移除，请刷新并重新登录" }
-      }
-      val hostId = profile.remoteHostId ?: throw IllegalStateException("请先选择并验证 DSH Host")
-      val origin = canonicalRemoteOrigin(profile.url)
-      val account = profile.username.trim()
-      if (account.isBlank()) throw IllegalStateException("请先登录 DSH Hub 并注册 Remote 设备")
-      val manager = RemoteDeviceManager(store.remoteDevices, remoteSlot(profile), origin, account,
-        registerer = { descriptor, token -> RemoteServerApi(profile.url, profile.allowCleartext).register(descriptor, token) },
-        refresher = { id, token -> RemoteServerApi(profile.url, profile.allowCleartext).refresh(id, token) })
-      // 同一 (Hub, 账号, Host) 全进程只保留一条加密连接，避免 monitor/控制器/测试互相顶掉。
-      val key = "remote|$origin|$account|$hostId"
-      val lease = RemoteConnectionRegistry.acquire(key) {
-        RemoteSession(profile.url, profile.allowCleartext, hostId, manager,
-          RemotePeerTrust(store.remotePins), account, appVersion(), remoteCompactions)
-      }
-      return try {
-        RemoteBackend(lease.session, profile.takeIf { it.kind == ServerKind.OPENCODE || it.protocol in setOf(HarnessProtocolId.CODEX_APP_SERVER, HarnessProtocolId.ANTIGRAVITY_ACP, HarnessProtocolId.OPENCODE_ACP) }) { lease.close() }
-      } catch (error: Throwable) {
-        lease.close()
-        throw error
-      }
-  }
-
-  private fun remoteSlot(profileId: String) = "profile-${profileId.replace(Regex("[^A-Za-z0-9_-]"), "_")}"
-
-  /** Reuse only an identity bound to this Hub/account; never alias another source's Host ID. */
-  private fun remoteSlot(profile: ServerProfile): String {
-    val host = profile.remoteHostId?.takeIf(String::isNotBlank) ?: return remoteSlot(profile.id)
-    return resolveRemoteDeviceSlot(store.remoteDevices, profile.url, profile.username, host,
-      legacyProfileSlots = listOf(remoteSlot(profile.id)))
-  }
-
-  internal suspend fun registerRemote(profile: ServerProfile, account: String, password: String): List<RemoteHost> {
-    require(profile.kind == ServerKind.DSH_REMOTE)
-    val origin = canonicalRemoteOrigin(profile.url)
-    val api = RemoteServerApi(profile.url, profile.allowCleartext)
-    val setup = RemoteSetup(api, store.remoteDevices, store.remotePins, remoteSlot(profile.id), origin,
-      profile.name.ifBlank { "Lagoon Android" }, "android", appVersion())
-    val result = setup.register(account, password)
-    return result.hosts
-  }
-
-  internal suspend fun confirmRemoteHost(profile: ServerProfile, account: String, hostId: String, fingerprint: String): RemoteHost {
-    require(profile.kind == ServerKind.DSH_REMOTE)
-    val origin = canonicalRemoteOrigin(profile.url)
-    val slot = resolveRemoteDeviceSlot(store.remoteDevices, origin, account, hostId,
-      legacyProfileSlots = listOf(remoteSlot(profile.id)))
-    val setup = RemoteSetup(RemoteServerApi(profile.url, profile.allowCleartext), store.remoteDevices, store.remotePins,
-      slot, origin, profile.name.ifBlank { "Lagoon Android" }, "android", appVersion())
-    val host = setup.confirmHost(account, hostId, fingerprint)
-    return host
-  }
-
-  /** Save the grant independently from later discovery and connection attempts. */
-  internal suspend fun completeRemotePairing(
-    offer: RemotePairingOffer,
-    credentials: RemotePairingCredentials,
-    mobileIdentity: RemoteIdentity,
-    allowCleartext: Boolean,
-  ): RemoteCatalog {
-    val host = RemoteHost(
-      deviceId = offer.host.deviceId,
-      name = offer.host.name,
-      platform = offer.host.platform,
-      membershipId = "pairing",
-      online = true,
-      publicKey = offer.host.identityKey,
-      clientVersion = offer.host.clientVersion,
-      harnessVersion = offer.host.harnessVersion,
-      fingerprint = runCatching { RemoteSetup.fingerprint(offer.host.identityKey) }.getOrNull(),
-    )
-    val catalog = remoteAccountManager(offer.origin, allowCleartext).adoptPairing(
-      host = host,
-      accountName = credentials.account,
-      mobileIdentity = mobileIdentity,
-      tokens = credentials.tokens,
-      accountKind = credentials.accountKind,
-      pairingRestricted = credentials.pairingRestricted,
-    )
-    return catalog
-  }
-
-  /** A saved pairing remains valid even when discovery or connection fails. */
-  internal fun connectPairedRemoteHostAsync(catalog: RemoteCatalog, hostId: String) {
-    scope.launch {
-      try {
-        val meta = catalog.hosts.firstOrNull { it.hostId == hostId } ?: return@launch
-        autoAttachAndConnectRemoteHost(catalog, meta, connectPrimary = true)
-      } catch (cancel: CancellationException) {
-        throw cancel
-      } catch (error: Exception) {
-        Diagnostics.warn("RemotePairing", "已保存配对，但自动发现或连接失败", error)
-      }
-    }
-  }
-
-  /** One manager per login flow; the in-memory account token lives only as long as the UI keeps it. */
-  internal fun remoteAccountManager(address: String, allowCleartext: Boolean): RemoteAccountManager =
-    RemoteAccountManager(address, allowCleartext, "Lagoon · ${android.os.Build.MODEL.ifBlank { "Android" }}",
-      "android", appVersion(), store.remoteDevices, store.remotePins, store.remoteCatalogStore)
-
-  internal fun explicitlyRemoveRemoteSource(origin: String, account: String) {
-    val canonical = canonicalRemoteOrigin(origin)
-    require(store.profiles().none { it.remoteHostId != null && it.username == account && canonicalRemoteOrigin(it.url) == canonical }) {
-      "请先单独移除该来源下的 Harness"
-    }
-    store.clearRemoteCatalog(canonical, account)
-    persistConnectionGraph()
-    updateState { it.copy(profiles = store.profiles()) }
-  }
-
-  internal fun remoteCatalogs(): List<RemoteCatalog> = store.remoteCatalogs()
-
-  internal fun isPairedRemoteCatalog(catalog: RemoteCatalog): Boolean =
-    catalog.account.trim().startsWith("dsh-device:") ||
-      (catalog.provider == "pairing" && catalog.effectiveAdoptedHostIds().isNotEmpty() &&
-        catalog.effectiveAdoptedHostIds().all { remoteHostUsesPairing(catalog.origin, catalog.account, it) })
-
-  internal fun remoteHostUsesPairing(origin: String, account: String, hostId: String): Boolean {
-    val explicit = runCatching { RemoteIdentitySlots.pairingStatus(store.remoteDevices, origin, account, hostId) }.getOrNull()
-    if (explicit != null) return explicit
-    val catalog = runCatching { remoteCatalog(origin, account) }.getOrNull()
-    return catalog?.provider == "pairing" || account.trim().startsWith("dsh-device:")
-  }
-
-  internal fun remoteRecoveryLabel(profile: ServerProfile): String =
-    if (profile.remoteHostId?.let { remoteHostUsesPairing(profile.url, profile.username, it) } == true)
-      RemoteRecoveryKind.PAIR.label else RemoteRecoveryKind.LOGIN.label
-
-  private fun deviceUsesPairing(device: DeviceView): Boolean {
-    val graph = currentGraphOrNull()
-    val host = graph?.hosts?.firstOrNull { it.id == device.id.value }
-    val source = host?.let { h -> graph?.sources?.firstOrNull { it.id == h.sourceId } }
-    val account = source?.account ?: device.sourceName.orEmpty()
-    return host?.externalHostId?.let { remoteHostUsesPairing(device.endpoint, account, it) } == true
-  }
-
-  internal fun deviceRecoveryLabel(device: DeviceView): String =
-    if (deviceUsesPairing(device)) RemoteRecoveryKind.PAIR.label else RemoteRecoveryKind.LOGIN.label
-
-  fun openRemoteRecoveryForDevice(device: DeviceView) {
-    if (deviceUsesPairing(device)) {
-      remoteRecoveryHandler?.invoke(RemoteRecoveryKind.PAIR)
-    } else openRemoteRelogin(device.endpoint, null, device.sourceName)
-  }
-
-  /** Active signed-in Hub account (preferred over Scan-to-Pair `dsh-device:*` grants). */
-  internal fun activeHubCatalog(): RemoteCatalog? {
-    val hubs = store.remoteCatalogs().filterNot(::isPairedRemoteCatalog)
-    return hubs.filterNot { it.signedOut }.maxByOrNull { it.updatedAt }
-      ?: hubs.maxByOrNull { it.updatedAt }
-  }
-
-  internal fun pairedRemoteCatalogs(): List<RemoteCatalog> =
-    store.remoteCatalogs().filter(::isPairedRemoteCatalog).sortedByDescending { it.updatedAt }
-
-  /** One active Hub account: prefers Hub login over `dsh-device:*` grants so QR pairing never eclipses Hub. */
-  internal fun activeRemoteCatalog(): RemoteCatalog? =
-    activeHubCatalog() ?: pairedRemoteCatalogs().firstOrNull()
-
-  internal fun remoteCatalog(origin: String, account: String): RemoteCatalog? =
-    store.remoteCatalogs().firstOrNull { it.origin == canonicalRemoteOrigin(origin) && it.account == account }
-
-  private fun syncRemoteProfilesWithCatalog(catalog: RemoteCatalog, refreshState: Boolean = true) {
-    val canonical = runCatching { canonicalRemoteOrigin(catalog.origin) }.getOrNull() ?: return
-    val acct = catalog.account.trim()
-    val pinnedHosts = catalog.hosts.filter {
-      it.trust == RemoteTrustState.PINNED && !it.fingerprint.isNullOrBlank()
-    }.associateBy { it.hostId }
-    if (pinnedHosts.isEmpty()) return
-    val rawProfiles = runCatching { store.readProfiles() }.getOrNull() ?: return
-    var changed = false
-    rawProfiles.forEach { profile ->
-      val hostId = profile.remoteHostId ?: return@forEach
-      val host = pinnedHosts[hostId] ?: return@forEach
-      val sameOrigin = runCatching { canonicalRemoteOrigin(profile.url) == canonical }.getOrDefault(false)
-      if (!sameOrigin || profile.username.trim() != acct) return@forEach
-      if (profile.remoteHostFingerprint != host.fingerprint || profile.allowCleartext != catalog.allowCleartext) {
-        runCatching {
-          store.save(
-            profile.copy(
-              remoteHostFingerprint = host.fingerprint,
-              allowCleartext = catalog.allowCleartext
-            ),
-            password = null
-          )
-          changed = true
-        }.onFailure { Diagnostics.warn("RemoteCatalog", "同步 Remote Profile 指纹失败: ${profile.id}", it) }
-      }
-      // The parent DSH Remote leaf is what the session list shows as the device; keep it aligned
-      // with the catalog's local display name without touching native-service leaves.
-      if (profile.kind == ServerKind.DSH_REMOTE && profile.remoteServiceId == null && profile.name != host.displayName) {
-        runCatching { store.rename(profile.id, host.displayName); changed = true }
-          .onFailure { Diagnostics.warn("RemoteCatalog", "同步 Remote Profile 显示名失败: ${profile.id}", it) }
-      }
-    }
-    if (changed && refreshState) {
-      updateState { it.copy(profiles = store.profiles()) }
-    }
-  }
-
-  internal fun saveRemoteCatalog(catalog: RemoteCatalog) {
-    store.saveRemoteCatalog(catalog)
-    publishRemoteCatalog(catalog)
-  }
-
-  internal fun publishRefreshedRemoteCatalog(catalog: RemoteCatalog) {
-    check(remoteCatalog(catalog.origin, catalog.account) == catalog) { "中枢账号状态已变化，请重新刷新" }
-    publishRemoteCatalog(catalog)
-  }
-
-  private fun publishRemoteCatalog(catalog: RemoteCatalog) {
-    syncRemoteProfilesWithCatalog(catalog, refreshState = false)
-    persistConnectionGraph()
-    val updatedProfiles = store.profiles()
-    updateState { it.copy(profiles = updatedProfiles) }
-    allOverview.start(updatedProfiles, include = setOfNotNull(state.value.serverId))
-  }
-
-  /** 只改本机显示名；不触碰中枢目录、指纹、凭据或连接身份。 */
-  internal fun renameRemoteHost(origin: String, account: String, hostId: String, alias: String?) {
-    val current = remoteCatalog(origin, account) ?: error("中枢账号已退出登录，请重新登录")
-    require(current.hosts.any { it.hostId == hostId }) { "主机已不在目录中，请刷新后重试" }
-    val updated = current.copy(
-      hosts = current.hosts.map { if (it.hostId == hostId) it.copy(alias = sanitizeRemoteAlias(alias)) else it },
-      updatedAt = System.currentTimeMillis(),
-    )
-    saveRemoteCatalog(updated)
-  }
-
-  internal fun hostAuthExpired(
-    origin: String,
-    account: String,
-    hostId: String,
-    state: LagoonState = _stateSnapshot(),
-    nowMs: Long = System.currentTimeMillis()
-  ): Boolean {
-    val canonical = runCatching { canonicalRemoteOrigin(origin) }.getOrNull() ?: return false
-    val acct = account.trim()
-    val matchingProfiles = store.readProfiles().filter { profile ->
-      profile.usesRemoteTransport &&
-        profile.remoteHostId == hostId &&
-        profile.username.trim() == acct &&
-        runCatching { canonicalRemoteOrigin(profile.url) == canonical }.getOrDefault(false)
-    }
-    val runtimeLoginRequired = (state.serverId != null &&
-      state.remoteRecovery == RemoteRecoveryKind.LOGIN &&
-      matchingProfiles.any { it.id == state.serverId }) ||
-      matchingProfiles.any { p ->
-        state.allServerSnapshots[p.id]?.remoteRecovery == RemoteRecoveryKind.LOGIN
-      }
-    if (runtimeLoginRequired) return true
-
-    val catalog = runCatching { remoteCatalog(canonical, acct) }.getOrNull()
-    val isAdopted = matchingProfiles.isNotEmpty() ||
-      (catalog != null && !catalog.signedOut && hostId in catalog.effectiveAdoptedHostIds())
-    if (!isAdopted) return false
-
-    val legacySlots = matchingProfiles.map { remoteSlot(it.id) }
-    // Match the exact slot the connection will use. A valid but superseded legacy slot cannot
-    // make an invalid scoped identity look healthy in the device management UI.
-    val record = runCatching {
-      val slot = RemoteIdentitySlots.resolve(store.remoteDevices, canonical, acct, hostId, legacySlots)
-      store.remoteDevices.load(slot)
-    }.getOrNull() ?: return true
-    val tokens = record.tokens ?: return true
-    return record.invalidated || tokens.refreshTokenExpiresAt <= nowMs
-  }
-
-  internal fun hubAuthStatus(
-    catalog: RemoteCatalog,
-    state: LagoonState = _stateSnapshot(),
-    nowMs: Long = System.currentTimeMillis()
-  ): HubAuthStatus {
-    if (catalog.signedOut) return HubAuthStatus.SIGNED_OUT
-    val adopted = catalog.effectiveAdoptedHostIds()
-    if (adopted.isNotEmpty() && adopted.all { hostAuthExpired(catalog.origin, catalog.account, it, state, nowMs) }) {
-      return HubAuthStatus.EXPIRED
-    }
-    return HubAuthStatus.ACTIVE
-  }
-
-  fun deviceAuthStatus(
-    device: DeviceView,
-    state: LagoonState = _stateSnapshot(),
-    nowMs: Long = System.currentTimeMillis()
-  ): HubAuthStatus {
-    if (device.access != DeviceAccess.HUB) return HubAuthStatus.ACTIVE
-    val canonical = runCatching { canonicalRemoteOrigin(device.endpoint) }.getOrNull() ?: return HubAuthStatus.ACTIVE
-    val graphHost = currentGraphOrNull()?.hosts?.firstOrNull { it.id == device.id.value }
-    val graphSource = graphHost?.let { h -> currentGraphOrNull()?.sources?.firstOrNull { it.id == h.sourceId } }
-    val acct = graphSource?.account?.trim() ?: device.sourceName.orEmpty().trim()
-    val catalog = runCatching { remoteCatalog(canonical, acct) }.getOrNull()
-    if (catalog?.signedOut == true) return HubAuthStatus.SIGNED_OUT
-    val extHostId = graphHost?.externalHostId ?: return HubAuthStatus.ACTIVE
-    return if (hostAuthExpired(canonical, acct, extHostId, state, nowMs)) HubAuthStatus.EXPIRED else HubAuthStatus.ACTIVE
-  }
-
-  fun prepareRemoteRelogin(origin: String? = null, allowCleartext: Boolean? = null, account: String? = null) {
-    val canonical = origin?.let { runCatching { canonicalRemoteOrigin(it) }.getOrNull() }
-    if (canonical == null && account.isNullOrBlank()) {
-      updateState { it.copy(remoteEnrollPreset = null) }
-      return
-    }
-    val savedCatalog = canonical?.let { orig ->
-      store.remoteCatalogs().firstOrNull {
-        it.origin == orig && (account.isNullOrBlank() || it.account.trim() == account.trim())
-      }
-    }
-    val resolvedOrigin = savedCatalog?.origin ?: canonical.orEmpty()
-    val resolvedAllowCleartext = allowCleartext ?: savedCatalog?.allowCleartext
-      ?: resolvedOrigin.startsWith("http://", ignoreCase = true)
-    val resolvedAccount = account?.trim()?.takeIf(String::isNotBlank) ?: savedCatalog?.account.orEmpty()
-    updateState {
-      it.copy(remoteEnrollPreset = RemoteEnrollPreset(resolvedOrigin, resolvedAllowCleartext, resolvedAccount))
-    }
-  }
-
-  fun clearRemoteEnrollPreset() {
-    if (state.value.remoteEnrollPreset != null) {
-      updateState { it.copy(remoteEnrollPreset = null) }
-    }
-  }
-
-  fun openRemoteReloginForServer(serverId: String, onOpenEnroll: () -> Unit) {
-    val profile = store.profiles().firstOrNull { it.id == serverId }
-    if (profile != null && profile.usesRemoteTransport) {
-      prepareRemoteRelogin(profile.url, profile.allowCleartext, profile.username)
-    }
-    onOpenEnroll()
-  }
-
-  fun openRemoteRelogin(origin: String? = null, allowCleartext: Boolean? = null, account: String? = null) {
-    val saved = if (origin != null && account != null) runCatching { remoteCatalog(origin, account) }.getOrNull() else null
-    if (saved != null && saved.hosts.size == 1 && remoteHostUsesPairing(saved.origin, saved.account, saved.hosts.first().hostId)) {
-      remoteRecoveryHandler?.invoke(RemoteRecoveryKind.PAIR)
-      return
-    }
-    prepareRemoteRelogin(origin, allowCleartext, account)
-    remoteRecoveryHandler?.invoke(RemoteRecoveryKind.LOGIN)
-  }
-
-  fun openRemoteRecoveryFor(serverId: String, kind: RemoteRecoveryKind = RemoteRecoveryKind.LOGIN) {
-    if (kind == RemoteRecoveryKind.RECONNECT) {
-      connect(serverId)
-      return
-    }
-    val profile = store.profiles().firstOrNull { it.id == serverId }
-    if (kind == RemoteRecoveryKind.LOGIN && profile != null && profile.usesRemoteTransport) {
-      if (profile.remoteHostId?.let { remoteHostUsesPairing(profile.url, profile.username, it) } == true) {
-        remoteRecoveryHandler?.invoke(RemoteRecoveryKind.PAIR)
-        return
-      }
-      prepareRemoteRelogin(profile.url, profile.allowCleartext, profile.username)
-    }
-    remoteRecoveryHandler?.invoke(kind)
-  }
-
-  private fun _stateSnapshot(): LagoonState = state.value
-
-  /** Saves authenticated source/Host metadata; callers follow with auto-attach or user selection. */
-  internal fun saveRemoteHosts(catalog: RemoteCatalog) = saveRemoteCatalog(catalog)
-
-  internal suspend fun autoAttachEnrolledHosts(
-    catalog: RemoteCatalog,
-    registeredHostIds: Set<String>,
-  ): Int {
-    withContext(Dispatchers.Main.immediate) {
-      saveRemoteHosts(catalog)
-    }
-    val hostsToAttach = catalog.hosts.filter { it.hostId in registeredHostIds }
-    if (hostsToAttach.isEmpty()) return 0
-    var attachedCount = 0
-    hostsToAttach.forEachIndexed { index, meta ->
-      val attached = try {
-        autoAttachAndConnectRemoteHost(catalog, meta, connectPrimary = index == 0)
-      } catch (cancel: CancellationException) {
-        throw cancel
-      } catch (error: Exception) {
-        Diagnostics.warn("RemoteEnroll", "自动挂载主机 Harness 失败: ${meta.hostId}", error)
-        emptyList()
-      }
-      if (attached.isNotEmpty()) attachedCount += 1
-    }
-    return attachedCount
-  }
-
-  private fun findHostInCatalog(catalog: RemoteCatalog, hostId: String, fingerprint: String?): RemoteHostMeta? =
-    catalog.hosts.singleOrNull { it.hostId == hostId && it.fingerprint == fingerprint }
-      ?: catalog.hosts.singleOrNull { it.hostId == hostId }
-
-  /**
-   * Probes an enrolled/paired Host with a bounded timeout, records discovery, attaches and enables
-   * all ready Harnesses (falling back to DSH when offline or probe fails), and optionally connects
-   * the primary enabled Harness.
-   */
-  internal suspend fun autoAttachAndConnectRemoteHost(
-    catalog: RemoteCatalog,
-    host: RemoteHostMeta,
-    connectPrimary: Boolean = true,
-  ): List<ServerProfile> {
-    withContext(Dispatchers.Main.immediate) {
-      saveRemoteHosts(catalog)
-    }
-    val parent = remoteCatalogProfile(catalog, host)
-    val now = System.currentTimeMillis()
-    var partialReason: String? = null
-    val services = if (host.online) {
-      var probeThrew = false
-      val result = withTimeoutOrNull(12_000L) {
-        try {
-          remoteHostServices(catalog, host)
-        } catch (cancel: CancellationException) {
-          throw cancel
-        } catch (error: Exception) {
-          probeThrew = true
-          Diagnostics.warn("RemoteAutoAttach", "自动探测主机服务失败，将回退到 DSH: ${host.hostId}", error)
-          null
-        }
-      }
-      if (result == null) {
-        partialReason = if (probeThrew) "实时探测主机服务失败，当前仅挂载默认 DSH；进入设备详情可重试刷新"
-        else "实时探测主机服务超时，当前仅挂载默认 DSH；进入设备详情可重试刷新"
-      }
-      result
-    } else {
-      partialReason = "主机当前离线，尚未完成实时探测；上线后进入设备详情将自动刷新"
-      null
-    }
-
-    val deviceId = MigrationProjection.hostId(
-      MigrationProjection.hubSourceId(catalog.origin, catalog.account),
-      host.hostId
-    )
-    if (services != null) {
-      withContext(Dispatchers.Main.immediate) {
-        recordDeviceDiscovery(buildHubDiscoveryObservation(deviceId, services, now))
-      }
-    } else if (partialReason != null) {
-      withContext(Dispatchers.Main.immediate) {
-        val previous = deviceDiscovery(deviceId)
-        val fallbackObservedAt = previous?.observedAtMs?.takeIf { it > 0L }
-          ?: (now - DeviceDiscovery.DEFAULT_TTL_MS - 1L).coerceAtLeast(1L)
-        recordDeviceDiscovery(
-          DeviceDiscovery(
-            deviceId = deviceId,
-            observedAtMs = fallbackObservedAt,
-            harnesses = previous?.harnesses.orEmpty(),
-            completeness = DiscoveryCompleteness.PARTIAL,
-            note = partialReason
-          )
-        )
-      }
-    }
-
-    return withContext(Dispatchers.Main.immediate) {
-      val attached = buildList {
-        if (services != null) {
-          if (services.dshAvailable) add(addRemoteDshService(parent, enabled = true))
-          val nativeAttached = services.native?.services.orEmpty()
-            .filter { it.supported && it.available && "http" in it.capabilities }
-            .map { service -> saveRemoteNativeService(parent, service, enabled = true).also { add(it) } }
-          if (services.openCodeAcpAvailable && nativeAttached.isEmpty()) add(addRemoteOpenCodeAcpService(parent, enabled = true))
-          if (services.codexAvailable) add(addRemoteCodexService(parent, enabled = true))
-          if (services.agyAvailable) add(addRemoteAgyService(parent, enabled = true))
-        }
-        if (isEmpty() && services == null) {
-          add(addRemoteDshService(parent, enabled = true))
-        }
-      }
-      persistConnectionGraph()
-      val profiles = store.profiles()
-      val enabledAttached = attached.filter { it.effectiveEnabled }
-      val primary = enabledAttached.firstOrNull()
-      allOverview.start(profiles, include = setOfNotNull(state.value.serverId, primary?.id))
-      enabledAttached.forEach { allOverview.refresh(it.id) }
-      if (connectPrimary && primary != null) {
-        connect(primary.id)
-      }
-      attached
-    }
-  }
-
-  internal fun remoteCatalogProfile(catalog: RemoteCatalog, host: RemoteHostMeta): ServerProfile {
-    val current = remoteCatalog(catalog.origin, catalog.account)?.takeUnless { it.signedOut } ?: error("中枢账号已退出登录，请重新登录")
-    val observed = findHostInCatalog(current, host.hostId, host.fingerprint)
-      ?: error("主机目录已变化，请刷新")
-    val origin = canonicalRemoteOrigin(current.origin)
-    val id = java.util.UUID.nameUUIDFromBytes(org.json.JSONArray(listOf(origin, current.account, observed.hostId)).toString().toByteArray()).toString()
-    return ServerProfile(id, observed.displayName, origin, current.account, allowCleartext = current.allowCleartext,
-      kind = ServerKind.DSH_REMOTE, remoteHostId = observed.hostId, remoteHostFingerprint = observed.fingerprint)
-  }
-
-  private fun reuseOrReenableRemoteProfile(
-    existing: ServerProfile,
-    parent: ServerProfile,
-    reenableExisting: Boolean = false
-  ): ServerProfile {
-    val nextFingerprint = parent.remoteHostFingerprint ?: existing.remoteHostFingerprint
-    val needsSync = existing.remoteHostFingerprint != nextFingerprint || existing.allowCleartext != parent.allowCleartext
-    val needsEnable = reenableExisting && !existing.enabled
-    if (needsSync || needsEnable) {
-      val updated = existing.copy(
-        remoteHostFingerprint = nextFingerprint,
-        allowCleartext = parent.allowCleartext,
-        enabled = if (needsEnable) true else existing.enabled
-      )
-      @Suppress("SENSELESS_COMPARISON")
-      if (state != null) {
-        saveServer(updated, password = null, credentialUsername = updated.username, connect = false)
-      } else {
-        store.save(updated, password = null, credentialUsername = updated.username)
-      }
-      return store.profiles().firstOrNull { it.id == existing.id } ?: updated
-    }
-    return existing
-  }
-
-  internal suspend fun remoteNativeServices(catalog: RemoteCatalog, host: RemoteHostMeta): NativeServiceCatalog? {
-    val parent = remoteCatalogProfile(catalog, host)
-    val backend = acquireRemoteBackend(parent, requireLeaf = false)
-    return try { backend.nativeServiceCatalog() } finally { backend.close() }
-  }
-
-  internal fun addRemoteNativeService(catalog: RemoteCatalog, host: RemoteHostMeta, service: NativeServiceDescriptor, enabled: Boolean): ServerProfile =
-    saveRemoteNativeService(remoteCatalogProfile(catalog, host), service, enabled)
-
-  internal suspend fun remoteHostServices(catalog: RemoteCatalog, host: RemoteHostMeta): RemoteHostServices {
-    val backend = acquireRemoteBackend(remoteCatalogProfile(catalog, host), requireLeaf = false)
-    return try { backend.hostServices() } finally { backend.close() }
-  }
-
-  internal suspend fun remoteHostServices(profileId: String): RemoteHostServices {
-    val profile = store.profiles().firstOrNull { it.id == profileId } ?: error("连接已移除")
-    val backend = acquireRemoteBackend(profile, requireLeaf = false)
-    return try { backend.hostServices() } finally { backend.close() }
-  }
-
-  internal fun addRemoteDshService(
-    parent: ServerProfile,
-    enabled: Boolean,
-    reenableExisting: Boolean = false
-  ): ServerProfile {
-    val host = requireNotNull(parent.remoteHostId) { "尚未选择 Host" }
-    val origin = canonicalRemoteOrigin(parent.url)
-    store.profiles().firstOrNull { it.remoteServiceId == null && it.kind in setOf(ServerKind.DSH, ServerKind.DSH_REMOTE) &&
-      it.remoteHostId == host && it.username.trim() == parent.username.trim() && canonicalRemoteOrigin(it.url) == origin }
-      ?.let { return reuseOrReenableRemoteProfile(it, parent, reenableExisting) }
-    val catalog = remoteCatalog(origin, parent.username)?.takeUnless { it.signedOut } ?: error("中枢账号已退出登录")
-    val observed = findHostInCatalog(catalog, host, parent.remoteHostFingerprint) ?: error("Host 目录已变化")
-    val profile = remoteCatalogProfile(catalog, observed).copy(enabled = enabled)
-    saveServer(profile, null, credentialUsername = profile.username, connect = false)
-    return store.profiles().first { it.id == profile.id }
-  }
-
-  internal fun addRemoteCodexService(
-    parent: ServerProfile,
-    enabled: Boolean,
-    reenableExisting: Boolean = false
-  ): ServerProfile {
-    val host = requireNotNull(parent.remoteHostId) { "尚未选择 Host" }
-    val origin = canonicalRemoteOrigin(parent.url)
-    store.profiles().firstOrNull { it.protocol == HarnessProtocolId.CODEX_APP_SERVER && it.remoteHostId == host &&
-      it.username.trim() == parent.username.trim() && canonicalRemoteOrigin(it.url) == origin }
-      ?.let { return reuseOrReenableRemoteProfile(it, parent, reenableExisting) }
-    val catalog = remoteCatalog(origin, parent.username)?.takeUnless { it.signedOut } ?: error("中枢账号已退出登录")
-    val observed = findHostInCatalog(catalog, host, parent.remoteHostFingerprint) ?: error("Host 目录已变化")
-    val id = java.util.UUID.nameUUIDFromBytes("$origin:${parent.username.trim()}:$host:codex".toByteArray(Charsets.UTF_8)).toString()
-    val profile = remoteCatalogProfile(catalog, observed).copy(id = id, kind = ServerKind.CODEX, enabled = enabled)
-    saveServer(profile, null, credentialUsername = profile.username, connect = false)
-    return store.profiles().first { it.id == profile.id }
-  }
-
-  internal fun addRemoteAgyService(
-    parent: ServerProfile,
-    enabled: Boolean,
-    reenableExisting: Boolean = false
-  ): ServerProfile {
-    val host = requireNotNull(parent.remoteHostId) { "尚未选择 Host" }
-    val origin = canonicalRemoteOrigin(parent.url)
-    store.profiles().firstOrNull { it.protocol == HarnessProtocolId.ANTIGRAVITY_ACP && it.remoteHostId == host &&
-      it.username.trim() == parent.username.trim() && canonicalRemoteOrigin(it.url) == origin }
-      ?.let { return reuseOrReenableRemoteProfile(it, parent, reenableExisting) }
-    val catalog = remoteCatalog(origin, parent.username)?.takeUnless { it.signedOut } ?: error("中枢账号已退出登录")
-    val observed = findHostInCatalog(catalog, host, parent.remoteHostFingerprint) ?: error("Host 目录已变化")
-    val id = java.util.UUID.nameUUIDFromBytes("$origin:${parent.username.trim()}:$host:antigravity".toByteArray(Charsets.UTF_8)).toString()
-    val profile = remoteCatalogProfile(catalog, observed).copy(id = id, kind = ServerKind.CODEX,
-      protocolId = HarnessProtocolId.ANTIGRAVITY_ACP, enabled = enabled)
-    saveServer(profile, null, credentialUsername = profile.username, connect = false)
-    return store.profiles().first { it.id == profile.id }
-  }
-
-  internal fun addRemoteOpenCodeAcpService(
-    parent: ServerProfile,
-    enabled: Boolean,
-    reenableExisting: Boolean = false
-  ): ServerProfile {
-    val host = requireNotNull(parent.remoteHostId) { "尚未选择 Host" }
-    val origin = canonicalRemoteOrigin(parent.url)
-    store.profiles().firstOrNull { it.protocol == HarnessProtocolId.OPENCODE_ACP && it.remoteHostId == host &&
-      it.username.trim() == parent.username.trim() && canonicalRemoteOrigin(it.url) == origin }
-      ?.let { return reuseOrReenableRemoteProfile(it, parent, reenableExisting) }
-    val catalog = remoteCatalog(origin, parent.username)?.takeUnless { it.signedOut } ?: error("中枢账号已退出登录")
-    val observed = findHostInCatalog(catalog, host, parent.remoteHostFingerprint) ?: error("Host 目录已变化")
-    val id = java.util.UUID.nameUUIDFromBytes("$origin:${parent.username.trim()}:$host:opencode-acp".toByteArray(Charsets.UTF_8)).toString()
-    val profile = remoteCatalogProfile(catalog, observed).copy(id = id, kind = ServerKind.CODEX,
-      protocolId = HarnessProtocolId.OPENCODE_ACP, enabled = enabled)
-    saveServer(profile, null, credentialUsername = profile.username, connect = false)
-    return store.profiles().first { it.id == profile.id }
-  }
-
-  /** Read-only discovery on the shared Host connection; never starts a native service or an ACP fallback. */
-  internal suspend fun remoteNativeServices(profileId: String): NativeServiceCatalog? {
-    val profile = store.profiles().firstOrNull { it.id == profileId } ?: error("连接已移除")
-    require(profile.remoteHostId != null) { "此连接不是 Remote Host" }
-    check(profile.parentEnabled) { "所属接入源或主机已停用，请先启用父级" }
-    val backend = remoteBackendFactory.create(profile, store.credentials(profile.id))
-    return try { backend.nativeServiceCatalog() } finally { backend.close() }
-  }
-
-  /** Durable locator identity only. A rediscovery never overwrites an existing leaf's preferences. */
-  internal fun addRemoteNativeService(profileId: String, service: NativeServiceDescriptor, enabled: Boolean = true): ServerProfile {
-    require(service.supported && service.available && "http" in service.capabilities) { "此原生服务当前不受支持或不可用" }
-    require(service.id.matches(Regex("[A-Za-z0-9][A-Za-z0-9._:-]{0,255}"))) { "原生服务标识无效" }
-    val profiles = store.profiles()
-    val parent = profiles.firstOrNull { it.id == profileId && it.remoteHostId != null } ?: error("Remote Host 已移除")
-    return saveRemoteNativeService(parent, service, enabled)
-  }
-
-  private fun saveRemoteNativeService(parent: ServerProfile, service: NativeServiceDescriptor, enabled: Boolean): ServerProfile {
-    require(service.supported && service.available && "http" in service.capabilities) { "此原生服务当前不可用" }
-    require(service.id.matches(Regex("[A-Za-z0-9][A-Za-z0-9._:-]{0,255}"))) { "原生服务标识无效" }
-    val profiles = store.profiles()
-    val origin = canonicalRemoteOrigin(parent.url)
-    profiles.firstOrNull { it.kind == ServerKind.OPENCODE && it.remoteServiceId == service.id &&
-      it.remoteHostId == parent.remoteHostId && it.username.trim() == parent.username.trim() &&
-      canonicalRemoteOrigin(it.url) == origin }?.let { return reuseOrReenableRemoteProfile(it, parent, reenableExisting = false) }
-    val locator = org.json.JSONArray(listOf(origin, parent.username.trim(), parent.remoteHostId, service.id)).toString()
-    val profile = ServerProfile(java.util.UUID.nameUUIDFromBytes(locator.toByteArray(Charsets.UTF_8)).toString(),
-      ProfileNames.uniqueDeviceName("${parent.name} · ${service.name}", profiles), origin, username = parent.username,
-      allowCleartext = parent.allowCleartext, kind = ServerKind.OPENCODE, remoteHostId = parent.remoteHostId,
-      remoteHostFingerprint = parent.remoteHostFingerprint, enabled = enabled, remoteServiceId = service.id)
-    saveServer(profile, password = null, credentialUsername = parent.username, connect = false)
-    return store.profiles().first { it.id == profile.id }
-  }
-
-  /** Stop background retries after a sign-out; profiles and cached conversations stay local. */
-  internal fun markRemoteSignedOut(origin: String, account: String) {
-    val normalizedOrigin = canonicalRemoteOrigin(origin)
-    val saved = store.remoteCatalogs().firstOrNull { it.origin == normalizedOrigin && it.account == account }
-      ?: error("中枢账号已移除")
-    // Source sign-out never rewrites child choices. Retain metadata even with zero leaves.
-    check(store.remoteCatalogStore.replaceIfUnchanged(saved, saved.copy(signedOut = true,
-      hosts = saved.hosts.map { it.copy(online = false) }, updatedAt = System.currentTimeMillis()))) {
-      "中枢账号状态已变化，请重试退出"
-    }
-    persistConnectionGraph() // signed-out catalog projects a denied source before credential revocation
-    applyCurrentGraphRuntimeGates()
-  }
   private fun appVersion(): String = runCatching {
     appContext.packageManager.getPackageInfo(appContext.packageName, 0).versionName
   }.getOrNull()?.takeIf(String::isNotBlank) ?: "0.1.0"
@@ -1685,51 +174,71 @@ class LagoonController private constructor(private val appContext: Context) {
   )
   private val sshKeyStore = SshKeyStore(appContext)
   private val hardwareSshSigner = AndroidKeystoreSshSigner()
-  private val sshHostStore = SshHostStore(appContext)
   private val sshKeyboardBroker = SshKeyboardInteractiveBroker()
   private val sshHostManager = SshHostManager(
-    store = sshHostStore,
+    store = deviceStore,
     transportFactory = JschSshTransportFactory(sshKeyStore, hardwareSshSigner, sshKeyboardBroker),
     keyStore = sshKeyStore
   )
+  private val deviceCoordinator: DeviceCoordinator = run {
+    // 升级迁移在构建初始领域状态之前同步执行（仅在旧版本数据存在时跑一次，幂等且崩溃安全）。
+    runCatching {
+      LegacyToSshMigration.runIfNeeded(
+        context = appContext,
+        deviceStore = deviceStore,
+        serverStore = store,
+        groupStore = deviceGroupStore,
+        discoveryStore = deviceDiscoveryStore,
+        offlineCache = cache,
+        transcripts = transcripts
+      )
+    }.onFailure { Diagnostics.warn("Migration", "升级迁移执行失败，将按现有存储加载", it) }
+    DeviceCoordinator(deviceStore, deviceDiscoveryStore, deviceGroupStore)
+  }
+  private val sshKeyCoordinator = SshKeyCoordinator(
+    keyStore = sshKeyStore,
+    hardwareSigner = hardwareSshSigner,
+    scope = scope,
+    onKeyInvalidated = ::handleSshKeyInvalidated
+  )
   private val mutable = MutableStateFlow(
     run {
-      val storedProfiles = store.profiles()
-      // Old builds deduped device names against every profile, including OpenCode Harnesses. Strip
-      // only suffixes proven to be generated: the base must still be the Hub's name for this Host.
-      val profiles = ProfileNames.repairGeneratedSuffixes(storedProfiles, store.remoteCatalogs()).also { repaired ->
-        repaired.filterIndexed { index, profile -> profile.name != storedProfiles[index].name }.forEach { profile ->
-          runCatching { store.rename(profile.id, profile.name) }
-            .onFailure { Diagnostics.warn("ServerStore", "无法修复设备名称 ${profile.id}", it) }
-        }
-      }
-      val groupLoad = deviceGroupStore.load()
-      val groups = groupLoad.state.sanitized(profiles.map { it.id }.toSet())
-      val sshHosts = sshHostStore.load()
-      val sshKeys = sshKeyStore.load()
+      val domain = deviceCoordinator.state.value
+      val keychain = sshKeyCoordinator.state.value
+      val profiles = domain.profiles
       val enabledIds = profiles.filter { it.effectiveEnabled }.mapTo(HashSet()) { it.id }
       val storedHome = store.homeServerId()?.takeIf { it in enabledIds }
-      // Parent gates hide runtime members, never the user's saved composition selection. When
-      // its members are all denied, do not silently dial an unrelated outside profile at startup.
-      val selectedGroup = groups.selectedGroupId?.takeIf { id -> groups.groups.any { it.id == id } }
+      val selectedGroup = domain.selectedGroupId?.takeIf { id -> domain.deviceGroups.any { it.id == id } }
+      val storedHomeDevice = if (selectedGroup == null) {
+        store.homeDeviceId()?.takeIf { did -> domain.devices.any { it.id == did } }
+      } else null
       val allowedSelection = profiles.filter { profile ->
-        profile.effectiveEnabled && (selectedGroup == null || groups.groups.firstOrNull { it.id == selectedGroup }?.memberIds?.contains(profile.id) == true)
+        profile.effectiveEnabled && when {
+          selectedGroup != null -> domain.deviceGroups.firstOrNull { it.id == selectedGroup }
+            ?.let { profile.deviceId in it.deviceIds } == true
+          storedHomeDevice != null -> profile.deviceId == storedHomeDevice
+          else -> true
+        }
       }
       val selectedProfile = store.selectedId()?.takeIf { id -> allowedSelection.any { it.id == id } }
         ?: storedHome?.takeIf { id -> allowedSelection.any { it.id == id } }
         ?: allowedSelection.firstOrNull()?.id
       LagoonState(
+        devices = domain.devices,
         profiles = profiles,
-        sshHosts = sshHosts,
-        sshKeys = sshKeys,
-        deviceGroups = groups.groups,
+        discoveryRevision = domain.discoveryRevision,
+        harnessLinkStatuses = sshHostManager.harnessStatusSnapshot(),
+        sshKeys = keychain.keys,
+        sshKeysRevision = keychain.revision,
+        deviceGroups = domain.deviceGroups,
         homeGroupId = selectedGroup,
-        deviceGroupReset = groupLoad.resetLegacy,
-        // 全部 is the default home; a selected group is the only other explicit home mode.
-        allServers = selectedGroup == null,
+        homeDeviceId = storedHomeDevice,
+        deviceGroupReset = domain.deviceGroupReset,
+        migrationNotice = store.migrationNotice(),
+        allServers = selectedGroup == null && storedHomeDevice == null,
         serverId = selectedProfile,
         homeServerId = storedHome ?: selectedProfile,
-        message = if (groupLoad.resetLegacy) "设备分组已按新版规则重置，请重新创建" else null,
+        message = if (domain.deviceGroupReset) "设备分组已按新版规则重置，请重新创建" else null,
         messageTone = FeedbackTone.INFO,
         permissionPolicy = store.permissionPolicy()
       )
@@ -1739,12 +248,19 @@ class LagoonController private constructor(private val appContext: Context) {
   private val allSnapshots: MutableMap<String, ServerOverviewSnapshot> = java.util.concurrent.ConcurrentHashMap()
   /** Shared per-directory read health; a dead directory must not degrade every server's state. */
   private val directoryHealth = DirectoryHealth()
-  private val allOverview = AllServersOverview(store, cache, overviewScope, ::acceptAllSnapshot, { state.value.serverId },
-    { id, event -> liveEventChannel.trySend(id to event) },
-    ::handleOverviewConnected,
-    directoryHealth, ::acceptSnapshotRemoved, remoteBackendFactory,
+  private val allOverview = AllServersOverview(
+    store = store,
+    cache = cache,
+    scope = overviewScope,
+    onSnapshot = ::acceptAllSnapshot,
+    selectedServer = { state.value.serverId },
+    onEvent = { id, event -> liveEventChannel.trySend(id to event) },
+    onConnected = ::handleOverviewConnected,
+    directoryHealth = directoryHealth,
+    onSnapshotRemoved = ::acceptSnapshotRemoved,
     sshClientFactory = { profile, _ -> sshHostManager.client(profile) },
-    selectedSession = { state.value.sessionId })
+    selectedSession = { state.value.sessionId }
+  )
   init {
     overviewScope.launch {
       val rawBatch = ArrayList<Pair<String, ServerEvent>>(32)
@@ -1781,7 +297,7 @@ class LagoonController private constructor(private val appContext: Context) {
     scope.launch {
       if (id == state.value.serverId) trace(generation, ConnectMilestone.STREAM)
       if (id != state.value.serverId || api == null) return@launch
-      val replacement = if (state.value.server?.protocol == HarnessProtocolId.CODEX_APP_SERVER)
+      val replacement = if (state.value.server?.protocol == HarnessProtocol.CODEX)
         runCatching { allOverview.client(id) }.getOrNull() else null
       if (replacement == null || replacement === api) {
         if (connecting?.isActive != true) reconcileAfterStream()
@@ -1815,7 +331,7 @@ class LagoonController private constructor(private val appContext: Context) {
   /** Selection and background-monitor ownership are separate from the server's read receipt. */
   private fun synchronizeCodexSelection() {
     val current = state.value
-    if (current.server?.protocol != HarnessProtocolId.CODEX_APP_SERVER) return
+    if (current.server?.protocol != HarnessProtocol.CODEX) return
     val serverId = current.serverId ?: return
     val client = api ?: return
     val session = current.session
@@ -1962,68 +478,32 @@ class LagoonController private constructor(private val appContext: Context) {
   /** Prompts submitted while the server was unreachable; delivered once it is interactive again. */
   private val queuedSends = mutableListOf<QueuedPrompt>()
 
-  private fun initializeConnectionGraph() {
-    runCatching {
-      store.remoteCatalogs().forEach { catalog ->
-        val activeCatalog = if (!catalog.signedOut && catalog.userPaused == null) {
-          catalog.copy(userPaused = false).also { store.saveRemoteCatalog(it) }
-        } else catalog
-        syncRemoteProfilesWithCatalog(activeCatalog, refreshState = false)
-      }
-    }.onFailure { Diagnostics.warn("RemoteCatalog", "启动时自愈远程中枢目录状态失败", it) }
-    try {
-      when (val result = connectionGraphStore.loadOrMigrate()) {
-        is ConnectionGraphStore.LoadResult.Loaded -> {
-          // SSH sources never carry a second gate; a legacy disabled source moves its denial down to
-          // the device once, before anything reads the runtime parent gates.
-          connectionGraphMutable.value = ConnectionCatalogProjection.normalizeSshSources(result.graph)
-          connectionGraphWritable = true
-          persistConnectionGraph()
-        }
-        is ConnectionGraphStore.LoadResult.Unsupported -> {
-          connectionGraphWritable = false
-          // Keep the newer document on disk, but still give the device page a read-only projection:
-          // a missing graph must not hide every saved SSH parent.
-          connectionGraphMutable.value = fallbackConnectionGraph()
-          Diagnostics.warn("ConnectionGraph", "连接图版本 ${result.version} 高于当前版本，保留原图并继续使用旧连接资料")
-        }
-      }
-    } catch (error: CancellationException) {
-      throw error
-    } catch (error: Exception) {
-      connectionGraphWritable = false
-      connectionGraphMutable.value = fallbackConnectionGraph()
-      Diagnostics.warn("ConnectionGraph", "连接图读取/迁移失败，继续使用旧连接资料", error)
-    }
-  }
-
-  /**
-   * Display-only graph used when the persisted document is unreadable or from a newer schema.
-   * It is never saved (the writable flag stays false), so the original bytes are preserved.
-   */
-  private fun fallbackConnectionGraph(): ConnectionGraph? = runCatching {
-    ConnectionCatalogProjection.merge(
-      MigrationProjection.fromProfiles(store.readProfiles()),
-      previous = null,
-      sshHosts = sshHostStore.load(),
-      remoteCatalogs = store.remoteCatalogs()
-    )
-  }.onFailure { Diagnostics.warn("ConnectionGraph", "无法构建只读连接图投影", it) }.getOrNull()
-
   init {
-    initializeConnectionGraph()
-    // Recovery can promote a prepared parent denial after the initial state was constructed.
-    // Refresh runtime gates BEFORE any monitor or selected client is allowed to dial.
-    val startupProfiles = store.profiles()
-    updateState { current -> current.copy(profiles = startupProfiles,
-      serverId = current.serverId?.takeIf { id -> startupProfiles.any { it.id == id && it.effectiveEnabled } },
-      homeServerId = current.homeServerId?.takeIf { id -> startupProfiles.any { it.id == id && it.effectiveEnabled } }) }
     store.migrateLocalProjects()
     // OpenCode transcripts moved to the verified store; drop their truncated SharedPreferences copies.
     if (transcriptSync != null) scope.launch(storeDispatcher) {
-      attempt { store.profiles().filter { it.kind == ServerKind.OPENCODE }.forEach { cache.deleteTranscripts(it.id) } }
+      attempt { deviceCoordinator.profiles().filter { it.protocol == HarnessProtocol.OPENCODE_NATIVE }.forEach { cache.deleteTranscripts(it.id) } }
     }
     refreshMode = store.refreshMode()
+    // Mirror keychain changes (including background biometric key expiry) into UI state.
+    scope.launch {
+      sshKeyCoordinator.state.collect { keychain ->
+        updateState { current ->
+          if (current.sshKeys == keychain.keys && current.sshKeysRevision == keychain.revision) current
+          else current.copy(sshKeys = keychain.keys, sshKeysRevision = keychain.revision)
+        }
+      }
+    }
+    // Mirror live SSH status updates across all 5 protocols into UI state.
+    scope.launch {
+      sshHostManager.statusVersion.collect {
+        val snapshot = sshHostManager.harnessStatusSnapshot()
+        updateState { current ->
+          if (current.harnessLinkStatuses == snapshot) current
+          else current.copy(harnessLinkStatuses = snapshot)
+        }
+      }
+    }
     // Single publisher for the server-wide island summary, so the system notification never drifts
     // from the in-app island: both read the same derived `summary` on every state emission.
     var lastSummaryState: LagoonState? = null
@@ -2034,9 +514,6 @@ class LagoonController private constructor(private val appContext: Context) {
         return@collect
       }
       lastSummaryState = state
-      // Dedupe on the content the system actually renders, not on the transient task detail: a running
-      // task changes detail on every tool step, and re-posting the same island each time makes some
-      // systems replay their expand animation on the AOD island.
       val signature = Triple(TaskNotifications.ALL_SERVERS_ID, state.globalSummaryTarget, LiveUpdateContent.of(state.globalSummary)) to
         state.globalBackgroundTargets
       if (signature != lastSummary) { lastSummary = signature; publishSummary(state); ensureMonitoring(state) }
@@ -2065,7 +542,7 @@ class LagoonController private constructor(private val appContext: Context) {
   }
 
   private fun scheduleBackgroundSync() {
-    attempt { BackgroundSyncWorker.schedule(appContext, store.profiles().any { it.effectiveEnabled }) }
+    attempt { BackgroundSyncWorker.schedule(appContext, deviceCoordinator.profiles().any { it.effectiveEnabled }) }
       .onFailure { Diagnostics.warn("BackgroundSync", "无法安排后台定时刷新", it) }
   }
 
@@ -2077,7 +554,7 @@ class LagoonController private constructor(private val appContext: Context) {
 
   /** Rebuilds the home/notification projection after one overview connection changes. */
   private fun acceptAllSnapshot(snapshot: ServerOverviewSnapshot) {
-    val profiles = store.profiles()
+    val profiles = deviceCoordinator.profiles()
     val currentProfile = profiles.firstOrNull { it.id == snapshot.serverId }
     if (currentProfile == null || !currentProfile.effectiveEnabled) {
       // A monitor can publish once more while it is being removed. A disabled profile must never
@@ -2171,41 +648,19 @@ class LagoonController private constructor(private val appContext: Context) {
     refreshMode = mode
     store.rememberRefreshMode(mode)
   }
-  /** [onCookie] 收到测试连接换到的会话 Cookie，保存资料时一并落盘，避免保存后再用令牌换一次。 */
-  suspend fun testServer(profile: ServerProfile, credentials: ServerCredentials, onCookie: (String) -> Unit = {}): String {
-    val saved = store.profiles().firstOrNull { it.id == profile.id }
-    check(saved == null || saved.parentEnabled) { "所属接入源或主机已停用，请先启用父级" }
-    // A saved DSH diagnostic must not create another physical mux/$events owner. Browser cookies
-    // permit extra sockets; API-peer cookies may reject a second socket. Borrow the monitor only for
-    // the SAME route and credentials, never silently test old settings from an edited draft.
-    if (saved?.effectiveEnabled == true && (profile.kind != ServerKind.OPENCODE || profile.remoteHostId != null || profile.sshHostId != null)) {
-      check(ConnectionRouteAdmission.sameLeafRoute(saved, profile) && store.credentials(profile.id) == credentials) {
-        "连接信息已修改，请先保存后再测试；不会另建连接或用旧配置代测"
-      }
-      store.runtimeRoute(saved)
+  /** Probes an already-saved SSH Harness, reusing the live overview client when enabled. */
+  suspend fun testServer(profile: ServerProfile): String {
+    val saved = deviceCoordinator.profiles().firstOrNull { it.id == profile.id }
+    check(saved == null || saved.deviceEnabled) { "所属 SSH 设备已停用，请先启用设备" }
+    if (saved?.effectiveEnabled == true) {
+      check(saved.sameRoute(profile)) { "连接信息已修改，请先保存后再测试" }
+      store.runtimeProfile(saved)
       val existing = allOverview.client(profile.id)
       val version = existing.health()
       existing.projects()
-      return version // borrowed owner: never close or alter presentation/content watching
+      return version
     }
-    if (profile.sshHostId != null) {
-      // Saved SSH profiles are tested through testSshHost, which dials the form draft on its own link.
-      // Reaching here means a caller asked to probe the already-saved host; reuse its live client so a
-      // second SSH session does not fight the monitor for the same remote dsh web.
-      if (store.profiles().any { it.id == profile.id }) {
-        val existing = runCatching { allOverview.client(profile.id) }.getOrNull()
-        if (existing != null) return existing.health()
-      }
-      val client = sshHostManager.client(profile)
-      return try {
-        val version = client.health()
-        client.projects()
-        version
-      } finally { client.close() }
-    }
-    val client = createHarnessClient(profile, credentials, onCookie = onCookie,
-      remoteBackend = if (profile.kind == ServerKind.DSH_REMOTE || profile.remoteHostId != null) remoteBackendFactory.create(profile, credentials) else null,
-      sshClientFactory = { p, _ -> sshHostManager.client(p) })
+    val client = sshHostManager.client(profile)
     return try {
       val version = client.health()
       client.projects()
@@ -2215,29 +670,28 @@ class LagoonController private constructor(private val appContext: Context) {
   fun notifyOverviewAction(serverId: String) = allOverview.refresh(serverId)
 
   private fun clientFor(serverId: String): HarnessClient? {
-    if (store.profiles().none { it.id == serverId && it.effectiveEnabled }) return null
+    val profile = store.findProfile(serverId)?.takeIf { it.effectiveEnabled } ?: return null
     if (serverId == state.value.serverId) {
-      val expected = state.value.server ?: return null
-      if (runCatching { store.runtimeRoute(expected) }.isFailure) return null
-      // Resolve through the owner even for cached clients, so its captured route is re-admitted.
+      val expected = state.value.server ?: profile
+      if (runCatching { store.runtimeProfile(expected) }.isFailure) return null
       return runCatching { allOverview.client(serverId) }.getOrNull()?.also { api = it }
     }
     return runCatching { allOverview.client(serverId) }.getOrNull()
   }
 
-  /** A settings dialog may not retarget an edited same-ID Host, especially with credential values. */
+  /** A settings dialog may not retarget an edited same-ID Harness, especially with credential values. */
   private fun settingsClient(expected: ServerProfile): HarnessClient {
-    check(expected.kind == ServerKind.DSH || expected.kind == ServerKind.DSH_REMOTE) { "此原生协议未提供 DSH 主机设置" }
-    val route = store.runtimeRoute(expected)
+    check(expected.protocol == HarnessProtocol.DSH) { "此协议未提供 DSH 主机设置" }
+    val admitted = store.runtimeProfile(expected)
     val client = requireNotNull(clientFor(expected.id)) { "主机尚未就绪或连接已停用" }
-    check(store.runtimeRoute(expected) == route) { "主机路由已变化，请重新打开设置" }
+    check(store.runtimeProfile(expected).sameRoute(admitted)) { "主机路由已变化，请重新打开设置" }
     return client
   }
 
-  internal suspend fun pluginBundles(expected: ServerProfile): List<RemotePluginBundle> =
+  internal suspend fun pluginBundles(expected: ServerProfile): List<DshPluginBundle> =
     settingsClient(expected).pluginBundles()
 
-  internal suspend fun pluginEntries(expected: ServerProfile): List<RemotePluginEntry> =
+  internal suspend fun pluginEntries(expected: ServerProfile): List<DshPluginEntry> =
     settingsClient(expected).pluginEntries()
 
   internal suspend fun setPluginBundle(expected: ServerProfile, name: String, enabled: Boolean): Boolean =
@@ -2246,7 +700,7 @@ class LagoonController private constructor(private val appContext: Context) {
   internal suspend fun setPluginEntry(expected: ServerProfile, entryId: String, enabled: Boolean): Boolean =
     settingsClient(expected).setPluginEntry(entryId, enabled)
 
-  internal suspend fun credentialStatus(expected: ServerProfile, ref: String): RemoteCredentialStatus? =
+  internal suspend fun credentialStatus(expected: ServerProfile, ref: String): DshCredentialStatus? =
     settingsClient(expected).credentialStatus(listOf(ref))[ref]
 
   internal suspend fun setCredential(expected: ServerProfile, ref: String, value: String): Boolean =
@@ -2418,7 +872,7 @@ class LagoonController private constructor(private val appContext: Context) {
       if (op.isCurrent(this)) ++scheduleSequence
       op.commit { current -> current.copy(schedules = current.schedules.map { task ->
         if (task.id == expected.scheduleId && task.sessionId == expected.sessionId && task.record == expected.record)
-          record.toRemoteSchedule(task.sessionId, task.status, task.lastDelivery) else task
+          record.toDshSchedule(task.sessionId, task.status, task.lastDelivery) else task
       }, schedulesLoading = false, message = if (result.updated) "定时任务已更新" else "任务内容未变更") }
       if (op.isCurrent(this)) { onUpdated?.invoke(); reconcileSchedulesAfterMutation(op, expected.sessionId) }
     } catch (error: Exception) {
@@ -2430,7 +884,7 @@ class LagoonController private constructor(private val appContext: Context) {
 
   fun createGoal(objective: String, maxRounds: Long? = null, onCreated: (() -> Unit)? = null,
     expectedProfile: ServerProfile? = null, expectedSession: String? = null) = withSession("goal") { op, client, session ->
-    check(expectedProfile == null || op.snapshot.server?.let { it.id == expectedProfile.id && ConnectionRouteAdmission.sameLeafRoute(it, expectedProfile) } == true) { "连接已变化，目标未创建" }
+    check(expectedProfile == null || op.snapshot.server?.sameRoute(expectedProfile) == true) { "连接已变化，目标未创建" }
     check(expectedSession == null || expectedSession == session.id) { "会话已变化，目标未创建" }
     check(op.snapshot.goal == null || op.snapshot.goal.complete) { "当前目标尚未完成，请编辑或清除后再创建" }
     check(op.snapshot.canManageGoal()) { "请先连接并同步此 DSH 会话" }
@@ -2480,37 +934,6 @@ class LagoonController private constructor(private val appContext: Context) {
     }
   }
 
-  /** Set by the composition root; the connection strip asks it to open the Remote recovery sheet. */
-  @Volatile var remoteRecoveryHandler: ((RemoteRecoveryKind) -> Unit)? = null
-
-  fun openRemoteRecovery() {
-    val kind = state.value.remoteRecovery ?: RemoteRecoveryKind.LOGIN
-    if (kind == RemoteRecoveryKind.RECONNECT) {
-      val id = state.value.serverId ?: return
-      connect(id)
-      return
-    }
-    if (kind == RemoteRecoveryKind.LOGIN && state.value.serverId != null) {
-      openRemoteRecoveryFor(state.value.serverId!!, kind)
-      return
-    }
-    remoteRecoveryHandler?.invoke(kind)
-  }
-
-  /** Full connection report for the diagnostic dialog; only DSH Remote connections implement it. */
-  internal suspend fun remoteDoctor(serverId: String? = state.value.serverId): RemoteDoctor? {
-    val id = serverId ?: return null
-    val client = clientFor(id) ?: return null
-    return (client as? RemoteDoctorSource)?.remoteDoctor(appVersion())
-  }
-
-  /** Measures one encrypted RPC round trip on the requested Remote connection, not only the open chat. */
-  internal suspend fun probeRemote(serverId: String? = state.value.serverId): RemoteProbe? {
-    val id = serverId ?: return null
-    val profile = store.profiles().firstOrNull { it.id == id } ?: return null
-    if (profile.kind != ServerKind.DSH_REMOTE || !profile.effectiveEnabled) return null
-    return clientFor(id)?.probeRemote()
-  }
   fun clearError() = updateState { it.copy(error = null) }
   /**
    * The live stream (re)connected. Events between the last read and the handshake may be lost, so the
@@ -2602,7 +1025,7 @@ class LagoonController private constructor(private val appContext: Context) {
   private fun prefetchTranscripts(token: Int, client: HarnessClient) {
     val current = state.value
     val serverId = current.serverId ?: return
-    if (current.server?.kind != ServerKind.OPENCODE) return
+    if (current.server?.protocol != HarnessProtocol.OPENCODE_NATIVE) return
     val sync = transcriptSync?.takeIf { client.cacheableTranscripts }
     if (sync != null) {
       val candidates = current.sessions.filter { it.parentId == null && !it.archived && it.id != current.sessionId }.take(PREFETCH_SESSIONS)
@@ -2661,7 +1084,7 @@ class LagoonController private constructor(private val appContext: Context) {
     scope.launch {
       kotlinx.coroutines.withContext(storeDispatcher) {
         attempt { transcripts?.clear() }
-        attempt { store.profiles().forEach { cache.deleteTranscripts(it.id) } }
+        attempt { deviceCoordinator.profiles().forEach { cache.deleteTranscripts(it.id) } }
       }
       onCleared()
     }
@@ -2694,7 +1117,7 @@ class LagoonController private constructor(private val appContext: Context) {
   }
   /** Transcripts of this server live in [transcripts]: an OpenCode server with an open database. */
   private fun storesTranscripts(serverId: String?): Boolean =
-    transcriptSync != null && serverId != null && state.value.profiles.firstOrNull { it.id == serverId }?.kind == ServerKind.OPENCODE
+    transcriptSync != null && serverId != null && state.value.profiles.firstOrNull { it.id == serverId }?.protocol == HarnessProtocol.OPENCODE_NATIVE
   /** The device's last copy of a conversation: the verified store for OpenCode, the snapshot cache otherwise. */
   private suspend fun cachedTranscript(serverId: String, sessionId: String): List<Message> = kotlinx.coroutines.withContext(storeDispatcher) {
     attempt { if (storesTranscripts(serverId)) transcriptSync!!.paint(serverId, sessionId) else cache.messages(serverId, sessionId) }.getOrDefault(emptyList())
@@ -2776,305 +1199,574 @@ class LagoonController private constructor(private val appContext: Context) {
     }.onFailure { Diagnostics.warn("Network", "无法监听网络恢复", it) }
   }
 
-  /**
-   * Changes only the home projection. 全部 is the implicit aggregate; the only other home mode is
-   * an explicit group. Connections and the open conversation remain alive.
-   */
+  // ------------------------------------------------------------------ Home scope & Device groups
+
+  fun dismissMigrationNotice() {
+    store.dismissMigrationNotice()
+    if (state.value.migrationNotice != null) updateState { it.copy(migrationNotice = null) }
+  }
+
+  fun dismissDeviceGroupReset() {
+    deviceCoordinator.dismissGroupReset()
+    if (state.value.deviceGroupReset) updateState { it.copy(deviceGroupReset = false) }
+  }
+
+  /** 将首页切换到「全部」聚合视图，保持现有连接和会话存活。 */
   fun setAllServers(enabled: Boolean) {
     if (!enabled) {
       val group = state.value.homeGroup
       if (group != null) selectGroup(group.id)
-      else if (!state.value.allServers) updateState { it.copy(allServers = true, homeGroupId = null) }
+      else if (state.value.homeDevice != null) selectHomeDevice(state.value.homeDevice!!.id)
+      else if (!state.value.allServers) updateState { it.copy(allServers = true, homeGroupId = null, homeDeviceId = null) }
       return
     }
-    if (state.value.allServers && state.value.homeGroupId == null) return
+    if (state.value.allServers && state.value.homeGroupId == null && state.value.homeDeviceId == null) return
     store.rememberAllServers(true)
-    saveDeviceGroups(state.value.deviceGroups, null)
-    updateState { it.copy(allServers = true, homeGroupId = null, scopeWorkspaceKey = null, scopeProjectId = null) }
-  }
-
-  /** Persists a device-group edit and publishes it without touching any server connection. */
-  private fun saveDeviceGroups(groups: List<DeviceGroup>, selected: String?) {
-    val expanded = groups.map(::expandGroupMembers)
-    val clean = DeviceGroupState(expanded, selected).sanitized(
-      store.profiles().map { it.id }.toSet(),
-      currentGraphOrNull()?.hosts?.map { it.id }?.toSet().orEmpty()
-    )
-    try {
-      deviceGroupStore.save(clean)
-    } catch (cancel: CancellationException) {
-      throw cancel
-    } catch (error: Exception) {
-      Diagnostics.warn("LagoonController", "设备分组保存失败", error)
-      updateState { it.copy(error = "设备分组保存失败") }
-      return
-    }
+    store.rememberHomeDevice(null)
+    val clean = runCatching { deviceCoordinator.saveGroups(state.value.deviceGroups, null) }.getOrNull()
     updateState {
       it.copy(
-        deviceGroups = clean.groups,
-        homeGroupId = clean.selectedGroupId,
-        // 全部 is the fallback home whenever no explicit group is selected.
-        allServers = if (clean.selectedGroupId == null) true else it.allServers
+        allServers = true,
+        homeGroupId = null,
+        homeDeviceId = null,
+        deviceGroups = clean?.groups ?: it.deviceGroups,
+        scopeWorkspaceKey = null,
+        scopeProjectId = null
       )
     }
-    persistConnectionGraph(store.profiles(), clean.groups)
-    allOverview.start(store.profiles(), include = setOfNotNull(state.value.serverId))
   }
 
-  /** A group edit can move the writable profile out of the selected group. Pick a surviving member. */
-  private fun ensureSelectedGroupActive() {
-    val group = state.value.homeGroup ?: return
-    val active = state.value.server?.takeIf { it.effectiveEnabled }
-    if (active == null || active.id !in group.memberIds) selectGroup(group.id)
+  /** 将首页范围聚焦到单台 SSH 设备（聚合该设备下所有已启用 Harness）。 */
+  fun selectHomeDevice(deviceId: String, harnessId: String? = null) {
+    val device = deviceCoordinator.findDevice(deviceId) ?: return
+    val enabledHarnesses = deviceCoordinator.profiles().filter { it.deviceId == device.id && it.effectiveEnabled }
+    if (enabledHarnesses.isEmpty()) {
+      updateState { it.copy(message = "「${device.name}」目前没有已启用的 Harness", messageTone = FeedbackTone.WARNING) }
+      return
+    }
+    val current = state.value.serverId
+    val active = harnessId?.let { id -> enabledHarnesses.firstOrNull { it.id == id } }
+      ?: current?.let { id -> enabledHarnesses.firstOrNull { it.id == id } }
+      ?: enabledHarnesses.firstOrNull { p -> state.value.allServerSnapshots[p.id]?.connected == true }
+      ?: enabledHarnesses.first()
+    store.rememberAllServers(false)
+    store.rememberHomeDevice(device.id)
+    val clean = runCatching { deviceCoordinator.saveGroups(state.value.deviceGroups, null) }.getOrNull()
+    updateState {
+      it.copy(
+        allServers = false,
+        homeGroupId = null,
+        homeDeviceId = device.id,
+        deviceGroups = clean?.groups ?: it.deviceGroups,
+        scopeWorkspaceKey = null,
+        scopeProjectId = null
+      )
+    }
+    if (active.id != state.value.serverId || !state.value.connected) {
+      connect(active.id, preserveHome = true)
+    }
   }
 
-  /** 分组按设备选：成员一旦随设备走，之后新加的 Harness 会自动进入组。 */
-  private fun expandGroupMembers(group: DeviceGroup): DeviceGroup {
-    if (group.deviceIds.isEmpty()) return group
-    val graph = currentGraphOrNull() ?: return group
-    val leaves = group.deviceIds.flatMap { deviceId ->
-      graph.bindings.filter { it.hostBindingId == deviceId }.map { it.id }
-    }.distinct()
-    return group.copy(memberIds = leaves)
-  }
-
-  /** 设备上新挂或移除 Harness 后，把按设备成立的分组成员重新展开一次。 */
-  private fun syncGroupLeaves() {
-    val groups = state.value.deviceGroups
-    if (groups.none { it.deviceIds.isNotEmpty() }) return
-    val expanded = groups.map(::expandGroupMembers)
-    if (expanded == groups) return
-    val clean = DeviceGroupState(expanded, state.value.homeGroupId).sanitized(
-      store.profiles().map { it.id }.toSet(),
-      currentGraphOrNull()?.hosts?.map { it.id }?.toSet().orEmpty()
-    )
-    runCatching { deviceGroupStore.save(clean) }
-      .onFailure { Diagnostics.warn("LagoonController", "设备分组成员同步失败", it) }
-    updateState { it.copy(deviceGroups = clean.groups, homeGroupId = clean.selectedGroupId) }
+  private fun syncDeviceDomainToState(message: String? = null, tone: FeedbackTone = FeedbackTone.INFO) {
+    val domain = deviceCoordinator.state.value
+    updateState { current ->
+      val nextHomeDevice = current.homeDeviceId?.takeIf { did -> domain.devices.any { it.id == did } }
+      val nextHomeGroup = domain.selectedGroupId?.takeIf { gid -> domain.deviceGroups.any { it.id == gid } }
+      current.copy(
+        devices = domain.devices,
+        profiles = domain.profiles,
+        discoveryRevision = domain.discoveryRevision,
+        deviceGroups = domain.deviceGroups,
+        homeGroupId = nextHomeGroup,
+        homeDeviceId = if (nextHomeGroup != null) null else nextHomeDevice,
+        deviceGroupReset = domain.deviceGroupReset,
+        allServers = if (nextHomeGroup == null && nextHomeDevice == null) true else current.allServers,
+        message = message ?: current.message,
+        messageTone = if (message != null) tone else current.messageTone
+      )
+    }
   }
 
   fun createDeviceGroup(name: String, deviceIds: List<String>): String {
-    val graph = currentGraphOrNull()
-    val valid = deviceIds.filter { id -> graph?.hosts?.any { it.id == id } == true }.distinct()
-    val label = name.trim().take(128)
-    if (label.isBlank() || valid.isEmpty()) return ""
-    val id = java.util.UUID.randomUUID().toString()
-    val groups = state.value.deviceGroups + DeviceGroup(
-      id = id, name = label, memberIds = emptyList(), deviceIds = valid, updatedAt = System.currentTimeMillis()
-    )
-    saveDeviceGroups(groups, state.value.homeGroupId)
+    val id = try {
+      deviceCoordinator.createGroup(name, deviceIds)
+    } catch (cancel: CancellationException) {
+      throw cancel
+    } catch (error: Exception) {
+      Diagnostics.warn("LagoonController", "设备分组创建失败", error)
+      updateState { it.copy(error = "设备分组保存失败") }
+      return ""
+    }
+    if (id.isBlank()) return ""
+    syncDeviceDomainToState()
     ensureSelectedGroupActive()
     return id
   }
 
   fun updateDeviceGroup(id: String, name: String, deviceIds: List<String>) {
-    val graph = currentGraphOrNull()
-    val label = name.trim().take(128)
-    val valid = deviceIds.filter { deviceId -> graph?.hosts?.any { it.id == deviceId } == true }.distinct()
-    if (label.isBlank() || valid.isEmpty() || state.value.deviceGroups.none { it.id == id }) return
-    val groups = state.value.deviceGroups.map { group ->
-      if (group.id == id) group.copy(name = label, deviceIds = valid, updatedAt = System.currentTimeMillis()) else group
+    val ok = try {
+      deviceCoordinator.updateGroup(id, name, deviceIds)
+    } catch (cancel: CancellationException) {
+      throw cancel
+    } catch (error: Exception) {
+      Diagnostics.warn("LagoonController", "设备分组更新失败", error)
+      updateState { it.copy(error = "设备分组保存失败") }
+      return
     }
-    saveDeviceGroups(groups, state.value.homeGroupId)
+    if (!ok) return
+    syncDeviceDomainToState()
     if (state.value.homeGroupId == id) {
-      val members = store.profiles().map { it.id }.toSet().let { ids ->
-        groups.first { it.id == id }.let { expandGroupMembers(it).memberIds.filter { member -> member in ids } }
-      }
-      val active = state.value.serverId?.takeIf { it in members }
-      if (active == null) selectGroup(id)
-    }
-    ensureSelectedGroupActive()
-  }
-
-  fun createDevice(name: String, memberIds: List<String>): String {
-    val valid = memberIds.filter { id -> state.value.profiles.any { it.id == id } }.distinct()
-    val label = name.trim().take(128)
-    if (label.isBlank() || valid.isEmpty()) return ""
-    val id = java.util.UUID.randomUUID().toString()
-    val groups = state.value.deviceGroups + DeviceGroup(
-      id = id, name = label, memberIds = valid, updatedAt = System.currentTimeMillis()
-    )
-    saveDeviceGroups(groups, state.value.homeGroupId)
-    ensureSelectedGroupActive()
-    return id
-  }
-
-  fun updateDevice(id: String, name: String, memberIds: List<String>) {
-    val label = name.trim().take(128)
-    val valid = memberIds.filter { profileId -> state.value.profiles.any { it.id == profileId } }.distinct()
-    if (label.isBlank() || valid.isEmpty() || state.value.deviceGroups.none { it.id == id }) return
-    val groups = state.value.deviceGroups.map { group ->
-      if (group.id == id) group.copy(name = label, memberIds = valid, updatedAt = System.currentTimeMillis())
-      else group
-    }
-    saveDeviceGroups(groups, state.value.homeGroupId)
-    if (state.value.homeGroupId == id) {
-      val active = state.value.serverId?.takeIf { it in valid }
-      if (active == null) selectGroup(id)
+      val group = state.value.homeGroup
+      val members = group?.memberHarnessIds(state.value.enabledProfiles).orEmpty()
+      if (state.value.serverId !in members) selectGroup(id)
     }
     ensureSelectedGroupActive()
   }
 
   /** 删除设备组（不是设备）；设备用 [deleteDevice]。 */
   fun deleteDeviceGroup(id: String) {
-    if (state.value.deviceGroups.none { it.id == id }) return
-    val groups = state.value.deviceGroups.filterNot { it.id == id }
-    saveDeviceGroups(groups, state.value.homeGroupId?.takeIf { it != id })
+    try {
+      deviceCoordinator.deleteGroup(id)
+    } catch (cancel: CancellationException) {
+      throw cancel
+    } catch (error: Exception) {
+      Diagnostics.warn("LagoonController", "设备分组删除失败", error)
+      updateState { it.copy(error = "设备分组保存失败") }
+      return
+    }
+    syncDeviceDomainToState()
   }
 
-  fun moveProfile(profileId: String, groupId: String?) {
-    if (state.value.profiles.none { it.id == profileId }) return
-    if (groupId != null && state.value.deviceGroups.none { it.id == groupId }) return
-    val groups = state.value.deviceGroups.map { group ->
-      val without = group.copy(memberIds = group.memberIds.filterNot { it == profileId })
-      if (group.id == groupId) without.copy(memberIds = without.memberIds + profileId, updatedAt = System.currentTimeMillis()) else without
-    }.filter { it.memberIds.isNotEmpty() }
-    saveDeviceGroups(groups, state.value.homeGroupId)
-    ensureSelectedGroupActive()
+  private fun ensureSelectedGroupActive() {
+    val group = state.value.homeGroup ?: return
+    val active = state.value.server?.takeIf { it.effectiveEnabled }
+    val members = group.memberHarnessIds(state.value.enabledProfiles)
+    if (active == null || active.id !in members) selectGroup(group.id)
   }
 
-  /** Selects a device tab: a group keeps its last active profile, a singleton connects directly. */
+  /** 选择一个设备组作为首页投影范围。 */
   fun selectGroup(id: String, profileId: String? = null) {
     val group = state.value.deviceGroups.firstOrNull { it.id == id } ?: return
-    val members = group.memberIds.mapNotNull { member -> state.value.profiles.firstOrNull { it.id == member && it.effectiveEnabled } }
+    val members = group.memberProfiles(state.value.enabledProfiles)
     if (members.isEmpty()) {
-      updateState { it.copy(message = "这个设备组没有启用的连接", messageTone = FeedbackTone.WARNING) }
+      updateState { it.copy(message = "这个设备组没有已启用的 Harness", messageTone = FeedbackTone.WARNING) }
       return
     }
     val current = state.value.serverId
-    val active: ServerProfile = profileId?.let { requested -> members.firstOrNull { it.id == requested } }
+    val active = profileId?.let { requested -> members.firstOrNull { it.id == requested } }
       ?: current?.let { selected -> members.firstOrNull { it.id == selected } }
       ?: members.firstOrNull { profile -> state.value.allServerSnapshots[profile.id]?.connected == true }
       ?: members.first()
     store.rememberAllServers(false)
-    saveDeviceGroups(state.value.deviceGroups, id)
-    updateState { it.copy(allServers = false, homeGroupId = id, scopeWorkspaceKey = null, scopeProjectId = null) }
+    store.rememberHomeDevice(null)
+    runCatching { deviceCoordinator.saveGroups(state.value.deviceGroups, id) }
+    updateState {
+      it.copy(
+        allServers = false,
+        homeGroupId = id,
+        homeDeviceId = null,
+        scopeWorkspaceKey = null,
+        scopeProjectId = null
+      )
+    }
     if (active.id != state.value.serverId || !state.value.connected) {
       connect(active.id, preserveHome = true, groupOverride = id)
     }
   }
 
   fun selectProfile(profileId: String) {
-    val group = state.value.deviceGroups.firstOrNull { profileId in it.memberIds }
-    if (group != null) selectGroup(group.id, profileId)
-    else connect(profileId, preserveHome = true)
+    val profile = deviceCoordinator.profiles().firstOrNull { it.id == profileId } ?: return
+    val group = state.value.deviceGroups.firstOrNull { profile.deviceId in it.deviceIds }
+    if (group != null && state.value.homeGroupId == group.id) selectGroup(group.id, profileId)
+    else connect(profileId, preserveHome = false)
   }
 
-  fun saveServer(profile: ServerProfile, password: String?, cookie: String? = null, credentialUsername: String? = null, connect: Boolean = true) {
-    val hadNotifications = store.profiles().firstOrNull { it.id == profile.id }?.notifications == true
-    store.save(profile, password, cookie, credentialUsername)
-    if (hadNotifications && !profile.notifications) {
-      (store.taskStates(profile.id).keys + store.sessionNotices(profile.id).map { it.sessionId }).distinct().forEach { session ->
-        notifications.cancel(profile.id, session)
-      }
+  // ------------------------------------------------------------------ SSH Devices & Harnesses
+
+  /** 设备列表纯投影（覆盖全部 5 种 Harness 的实时 SSH 链接状态）。 */
+  fun deviceViews(
+    devices: List<SshDevice> = state.value.devices,
+    isOnline: (String) -> Boolean = { id -> state.value.serverConnected(id) },
+    linkStatuses: Map<String, SshLinkStatus> = state.value.harnessLinkStatuses
+  ): List<DeviceView> = DeviceProjection.devices(
+    devices = devices,
+    discovery = deviceCoordinator::deviceDiscovery,
+    linkStatus = { harnessId -> linkStatuses[harnessId] ?: sshHostManager.harnessStatus(harnessId)?.value },
+    isOnline = isOnline
+  )
+
+  fun device(deviceId: String): SshDevice? = deviceCoordinator.findDevice(deviceId)
+  fun deviceSecrets(deviceId: String): SshSecrets = deviceCoordinator.secrets(deviceId)
+  fun deviceDiscovery(deviceId: String): DeviceDiscovery? = deviceCoordinator.deviceDiscovery(deviceId)
+  fun deviceOfHarness(harnessId: String): String? = deviceCoordinator.findHarness(harnessId)?.first?.id
+  fun devicesUsingSshKey(keyId: String): List<SshDevice> = deviceCoordinator.devicesUsingKey(keyId)
+  fun sshLinkStatus(deviceId: String) = sshHostManager.status(deviceId)
+  fun harnessLinkStatus(harnessId: String) = sshHostManager.harnessStatus(harnessId)
+
+  internal val sshKeyboardChallenges get() = sshKeyboardBroker.challenges
+  internal fun setSshInteractiveForeground(active: Boolean) = sshKeyboardBroker.setForeground(active)
+  internal fun answerSshKeyboardChallenge(id: String, answers: List<String>?) = sshKeyboardBroker.respond(id, answers)
+
+  fun recordDeviceDiscovery(discovery: DeviceDiscovery) {
+    try {
+      deviceCoordinator.recordDiscovery(discovery)
+      syncDeviceDomainToState()
+    } catch (cancel: CancellationException) {
+      throw cancel
+    } catch (error: Exception) {
+      showNotice(userFacingError(error, "发现结果保存失败"), FeedbackTone.WARNING)
     }
-    if (!profile.effectiveEnabled) cancelProfileNotifications(profile.id)
-    val profiles = store.profiles()
-    val groups = DeviceGroupState(state.value.deviceGroups, state.value.homeGroupId).sanitized(profiles.map { it.id }.toSet())
-    persistConnectionGraph(profiles, groups.groups)
-    updateState { it.copy(profiles = profiles, deviceGroups = groups.groups, homeGroupId = groups.selectedGroupId) }
-    scheduleBackgroundSync()
-    val connectNow = connect && profiles.any { it.id == profile.id && it.effectiveEnabled }
-    allOverview.start(profiles, include = setOfNotNull(if (connectNow) profile.id else state.value.serverId))
-    if (connectNow) connect(profile.id, preserveHome = true)
+  }
+
+  fun clearDeviceDiscovery(deviceId: String) {
+    try {
+      deviceCoordinator.clearDiscovery(deviceId)
+      syncDeviceDomainToState()
+    } catch (cancel: CancellationException) {
+      throw cancel
+    } catch (error: Exception) {
+      Diagnostics.warn("DeviceDiscovery", "清除发现缓存失败", error)
+    }
+  }
+
+  /** 对一台 SSH 设备做一次只读发现（不自动安装或启动远端服务）。 */
+  suspend fun refreshDeviceDiscovery(deviceId: String) {
+    val device = deviceCoordinator.findDevice(deviceId) ?: error("设备已移除")
+    check(device.enabled) { "此设备已停用：先启用再发现" }
+    check(deviceDiscoveryInFlight.add(deviceId)) { "此设备正在检测，请稍候" }
+    updateState { it.copy(deviceRefreshInFlight = it.deviceRefreshInFlight + deviceId) }
+    try {
+      val now = System.currentTimeMillis()
+      val expectedConfig = device.toHostConfig()
+      val expectedSecrets = deviceCoordinator.secrets(deviceId)
+      val found = sshHostManager.discoverDevice(expectedConfig, expectedSecrets)
+      val latest = deviceCoordinator.findDevice(deviceId) ?: error("设备配置已变化，请重新检测")
+      check(latest.transportKey == device.transportKey &&
+        latest.hostKeyFingerprint == device.hostKeyFingerprint &&
+        deviceCoordinator.secrets(deviceId) == expectedSecrets) { "SSH 配置已变化，请重新检测" }
+      val discovery = DeviceCoordinator.buildSshDiscovery(latest, found, now)
+      recordDeviceDiscovery(discovery)
+    } finally {
+      deviceDiscoveryInFlight.remove(deviceId)
+      updateState { it.copy(deviceRefreshInFlight = it.deviceRefreshInFlight - deviceId) }
+    }
   }
 
   /**
-   * Enables or disables one saved connection. Disabling stops its monitor/client immediately (an SSH
-   * link is closed too), removes it from every home/notification projection, and switches away when
-   * it was the writable server. Re-enabling starts monitoring at once so cached conversations
-   * return and a live read is scheduled. Credentials, drafts, caches and the unread ledger are
-   * never touched.
+   * 保存或更新一台 SSH 设备（不破坏已有 Harness 列表与开关）。
+   * 若传输层地址/端口/认证/指纹/凭据发生变化，仅废止该设备的 SSH 连接池并让已启用 Harness 按新配置重连。
    */
-  fun setProfileEnabled(profileId: String, enabled: Boolean) {
-    val profile = store.profiles().firstOrNull { it.id == profileId } ?: return
-    if (profile.enabled == enabled) return
-    val saved = try { store.setProfileEnabled(profileId, enabled) } catch (cancel: CancellationException) {
+  fun saveSshDevice(
+    device: SshDevice,
+    secrets: SshSecrets? = null
+  ): SshDevice {
+    val clean = cleanSshDevice(device)
+    val effectiveSecrets = secrets ?: deviceCoordinator.secrets(clean.id)
+    validateSshSecrets(clean.toHostConfig(), effectiveSecrets)
+    val previous = deviceCoordinator.findDevice(clean.id)
+    val previousSecrets = previous?.let { deviceCoordinator.secrets(it.id) }
+    val transportChanged = previous == null ||
+      previous.transportKey != clean.transportKey ||
+      previous.hostKeyType != clean.hostKeyType ||
+      previous.hostKeyFingerprint != clean.hostKeyFingerprint ||
+      previousSecrets != effectiveSecrets
+    val saved = deviceCoordinator.saveDevice(clean, secrets)
+    val profiles = deviceCoordinator.profiles()
+    if (transportChanged) {
+      saved.harnesses.forEach { allOverview.invalidate(it.id) }
+      sshHostManager.replaceDevice(saved.id)
+    }
+    syncDeviceDomainToState()
+    scheduleBackgroundSync()
+    val enabledIds = saved.harnesses.filter { saved.enabled && it.enabled }.map { it.id }.toSet()
+    allOverview.start(profiles, include = enabledIds + setOfNotNull(state.value.serverId))
+    if (transportChanged && state.value.serverId in enabledIds) {
+      connect(state.value.serverId!!, preserveHome = true)
+    }
+    return saved
+  }
+
+  /** 设备级开关：只写 [SshDevice.enabled]，绝不改动子 Harness 的开关。 */
+  fun setDeviceEnabled(deviceId: String, enabled: Boolean) {
+    val before = deviceCoordinator.profiles()
+    val updated = try {
+      deviceCoordinator.setDeviceEnabled(deviceId, enabled) ?: return
+    } catch (cancel: CancellationException) {
       throw cancel
     } catch (error: Exception) {
-      updateState { it.copy(error = userFacingError(error, "无法保存连接状态，请重试")) }
+      showNotice(userFacingError(error, "更新设备启用状态失败"), FeedbackTone.WARNING)
       return
     }
-    if (!saved) {
-      updateState { it.copy(error = "无法保存连接状态，请重试") }
+    val profiles = deviceCoordinator.profiles()
+    val denied = before.filter { it.effectiveEnabled }.map { it.id }.toSet() -
+      profiles.filter { it.effectiveEnabled }.map { it.id }.toSet()
+    if (denied.isNotEmpty()) {
+      returnQueuedToDrafts { it.serverId !in denied }
+      for (id in denied) {
+        if (draftServerId == id) clearDraftIntent()
+        cancelProfileNotifications(id)
+        allOverview.invalidate(id)
+        allSnapshots.remove(id)
+      }
+      sshHostManager.closeDevice(deviceId)
+    }
+    syncDeviceDomainToState(
+      message = if (enabled) "已启用设备「${updated.name}」" else "已停用设备「${updated.name}」，子 Harness 开关保持不变",
+      tone = FeedbackTone.INFO
+    )
+    updateState { withSummary(it.copy(allServerSnapshots = allSnapshots.toMap())) }
+    allOverview.start(profiles, include = setOfNotNull(state.value.serverId?.takeIf { id -> profiles.any { it.id == id && it.effectiveEnabled } }))
+    if (state.value.serverId in denied) {
+      val fallback = state.value.homeGroup?.memberProfiles(profiles)?.firstOrNull { it.effectiveEnabled }
+        ?: profiles.firstOrNull { it.effectiveEnabled }
+      if (fallback != null) connect(fallback.id, preserveHome = true, groupOverride = state.value.homeGroupId)
+      else showAggregateAfterDisable(profiles, "设备「${updated.name}」已停用")
+    } else if (enabled) {
+      val enabledOnDevice = profiles.filter { it.deviceId == deviceId && it.effectiveEnabled }
+      enabledOnDevice.forEach { allOverview.refresh(it.id) }
+      if (state.value.serverId == null && enabledOnDevice.isNotEmpty()) {
+        connect(enabledOnDevice.first().id, preserveHome = true)
+      }
+    }
+    scheduleBackgroundSync()
+  }
+
+  /** 在一台 SSH 设备上挂载或复用一条 Harness（按 protocol + locator 幂等）。 */
+  fun attachHarness(
+    deviceId: String,
+    protocol: HarnessProtocol,
+    locator: String? = null,
+    config: HarnessConfig? = null
+  ): DeviceHarness {
+    val device = deviceCoordinator.findDevice(deviceId) ?: error("设备已移除")
+    check(device.enabled) { "此设备已停用，请先启用设备再添加 Harness" }
+    val normalizedLocator = locator?.trim()?.takeIf(String::isNotBlank)
+    if (protocol == HarnessProtocol.OPENCODE_NATIVE && normalizedLocator != null) {
+      require(normalizedLocator.startsWith('/') && normalizedLocator.length <= 4096 && normalizedLocator.none(Char::isISOControl)) {
+        "OpenCode 注册路径必须是远端绝对路径"
+      }
+    }
+    val existing = device.harnesses.firstOrNull { it.protocol == protocol && it.locator == normalizedLocator }
+    val resolvedConfig = config ?: existing?.config ?: when (protocol) {
+      HarnessProtocol.OPENCODE_NATIVE -> HarnessConfig.OpenCodeNative(normalizedLocator)
+      else -> HarnessConfig.defaultFor(protocol)
+    }
+    val harness = (existing ?: DeviceHarness(
+      id = DeviceHarness.newId(),
+      deviceId = device.id,
+      protocol = protocol,
+      enabled = true,
+      notifications = true,
+      config = resolvedConfig
+    )).copy(enabled = true, config = resolvedConfig)
+    val (_, savedHarness) = deviceCoordinator.upsertHarness(device.id, harness)
+    val profiles = deviceCoordinator.profiles()
+    syncDeviceDomainToState()
+    allOverview.invalidate(savedHarness.id)
+    sshHostManager.replaceHarness(savedHarness.id)
+    allOverview.start(profiles, include = setOfNotNull(state.value.serverId, savedHarness.id))
+    allOverview.refresh(savedHarness.id)
+    scheduleBackgroundSync()
+    if (state.value.serverId == null) connect(savedHarness.id, preserveHome = true)
+    showNotice(
+      if (protocol == HarnessProtocol.OPENCODE_NATIVE)
+        "已添加 OpenCode；若服务尚未运行，可点击「启动服务」"
+      else "已添加 ${protocol.label}",
+      FeedbackTone.SUCCESS
+    )
+    return savedHarness
+  }
+
+  /** 更新单条 Harness 的自定义名、通知开关或协议专属配置（如 DSH 启动命令/工作目录），绝不踢掉同设备其他 SSH 会话。 */
+  fun updateHarnessConfig(
+    harnessId: String,
+    label: String? = null,
+    clearLabel: Boolean = false,
+    notifications: Boolean? = null,
+    config: HarnessConfig? = null
+  ): DeviceHarness? {
+    val (_, before) = deviceCoordinator.findHarness(harnessId) ?: return null
+    val cleanLabel = when {
+      clearLabel -> null
+      label != null -> label.trim().takeIf(String::isNotBlank)?.take(128)
+      else -> before.label
+    }
+    val nextConfig = config ?: before.config
+    if (nextConfig is HarnessConfig.Dsh) {
+      val cmd = nextConfig.launchCommand.trim().ifBlank { DEFAULT_DSH_LAUNCH_COMMAND }
+      require(cmd.length <= 512 && '\n' !in cmd && '\r' !in cmd) { "启动命令不能包含换行" }
+    }
+    val nextNotifications = notifications ?: before.notifications
+    val configChanged = nextConfig != before.config
+    val (_, saved) = deviceCoordinator.updateHarness(harnessId) { current ->
+      current.copy(
+        label = cleanLabel,
+        notifications = nextNotifications,
+        config = nextConfig
+      )
+    } ?: return null
+    if (before.notifications && !nextNotifications) cancelProfileNotifications(harnessId)
+    val profiles = deviceCoordinator.profiles()
+    syncDeviceDomainToState()
+    if (configChanged) {
+      allOverview.invalidate(harnessId)
+      sshHostManager.replaceHarness(harnessId)
+      allOverview.start(profiles, include = setOfNotNull(state.value.serverId, harnessId))
+      if (state.value.serverId == harnessId) connect(harnessId, preserveHome = true)
+    }
+    scheduleBackgroundSync()
+    return saved
+  }
+
+  /** 启用或停用单条 Harness（不影响同设备上的其他 Harness，也不删除任何本地草稿/项目/缓存）。 */
+  fun setHarnessEnabled(harnessId: String, enabled: Boolean) {
+    val (device, harness) = deviceCoordinator.findHarness(harnessId) ?: return
+    if (harness.enabled == enabled) return
+    val result = try {
+      deviceCoordinator.setHarnessEnabled(harnessId, enabled)
+    } catch (cancel: CancellationException) {
+      throw cancel
+    } catch (error: Exception) {
+      updateState { it.copy(error = userFacingError(error, "无法保存 Harness 状态，请重试")) }
       return
     }
-    val profiles = store.profiles()
-    persistConnectionGraph(profiles, state.value.deviceGroups)
-    val wasActive = state.value.serverId == profileId
+    if (result == null) return
+    val profiles = deviceCoordinator.profiles()
+    val displayName = harness.displayName(device.name)
+    val wasActive = state.value.serverId == harnessId
     val currentGroupId = state.value.homeGroupId
     if (!enabled) {
-      if (draftServerId == profileId) clearDraftIntent()
-      cancelProfileNotifications(profileId)
-      if (profile.sshHostId != null) sshHostManager.closeBinding(profileId)
-      allSnapshots.remove(profileId)
+      if (draftServerId == harnessId) clearDraftIntent()
+      cancelProfileNotifications(harnessId)
+      sshHostManager.closeHarness(harnessId)
+      allOverview.invalidate(harnessId)
+      allSnapshots.remove(harnessId)
       val enabledIds = profiles.filter { it.effectiveEnabled }.mapTo(HashSet()) { it.id }
-      val groups = DeviceGroupState(state.value.deviceGroups, currentGroupId).sanitized(profiles.map { it.id }.toSet())
+      syncDeviceDomainToState(message = "已停用 $displayName", tone = FeedbackTone.INFO)
       updateState {
         it.copy(
-          profiles = profiles,
-          deviceGroups = groups.groups,
-          homeGroupId = groups.selectedGroupId,
-          homeServerId = it.homeServerId?.takeIf { id -> id != profileId },
-          allServerSnapshots = allSnapshots.toMap(),
-          message = "已禁用 ${profile.name}",
-          messageTone = FeedbackTone.INFO
+          homeServerId = it.homeServerId?.takeIf { id -> id != harnessId },
+          allServerSnapshots = allSnapshots.toMap()
         )
       }
       allOverview.start(profiles, include = setOfNotNull(state.value.serverId?.takeIf { it in enabledIds }))
       if (wasActive) {
         val fallback = if (currentGroupId != null) {
-          // Another enabled member keeps the group and its writable connection alive.
-          state.value.homeGroup?.memberIds
-            ?.mapNotNull { member -> profiles.firstOrNull { it.id == member && it.effectiveEnabled } }
-            ?.firstOrNull()
+          state.value.homeGroup?.memberProfiles(profiles)?.firstOrNull { it.effectiveEnabled }
         } else if (!state.value.allServers) {
           profiles.firstOrNull { it.effectiveEnabled }
         } else null
         if (fallback != null) {
-          val group = currentGroupId?.takeIf { groupId ->
-            state.value.deviceGroups.firstOrNull { it.id == groupId }?.memberIds?.contains(fallback.id) == true
-          }
-          connect(fallback.id, preserveHome = true, groupOverride = group)
+          connect(fallback.id, preserveHome = true, groupOverride = currentGroupId)
         } else {
-          showAggregateAfterDisable(profiles, "已禁用 ${profile.name}")
+          showAggregateAfterDisable(profiles, "已停用 $displayName")
         }
-        // Remember this only after the fallback connect: connect() clears it when a different
-        // profile becomes active. Re-enabling the disabled connection can then restore the view.
-        lastDisabledActiveId = profileId
+        lastDisabledActiveId = harnessId
       }
       scheduleBackgroundSync()
       return
     }
 
-    if (profiles.none { it.id == profileId && it.effectiveEnabled }) {
-      updateState { it.copy(profiles = profiles, message = "已保留 Harness 启用选择；所属接入源或主机仍停用", messageTone = FeedbackTone.INFO) }
-      allOverview.start(profiles)
+    if (!device.enabled) {
+      syncDeviceDomainToState(message = "已保留 Harness 启用选择；所属设备当前仍处于停用状态", tone = FeedbackTone.INFO)
       scheduleBackgroundSync()
       return
     }
-    val restore = lastDisabledActiveId == profileId
+    val restore = lastDisabledActiveId == harnessId
     lastDisabledActiveId = null
-    val groups = DeviceGroupState(state.value.deviceGroups, state.value.homeGroupId)
-      .sanitized(profiles.map { it.id }.toSet())
-    updateState {
-      it.copy(
-        profiles = profiles,
-        deviceGroups = groups.groups,
-        homeGroupId = groups.selectedGroupId,
-        homeServerId = it.homeServerId ?: profileId,
-        message = "已启用 ${profile.name}，正在连接",
-        messageTone = FeedbackTone.INFO
-      )
-    }
-    allOverview.start(profiles, include = setOfNotNull(state.value.serverId, profileId))
-    allOverview.refresh(profileId)
+    syncDeviceDomainToState(message = "已启用 $displayName，正在连接", tone = FeedbackTone.INFO)
+    updateState { it.copy(homeServerId = it.homeServerId ?: harnessId) }
+    allOverview.start(profiles, include = setOfNotNull(state.value.serverId, harnessId))
+    allOverview.refresh(harnessId)
     val current = state.value
     if (restore || current.serverId == null ||
-      (!current.allServers && current.homeGroupId == null && current.homeServerId == profileId)) {
-      connect(profileId, preserveHome = true)
+      (!current.allServers && current.homeGroupId == null && current.homeDeviceId == null && current.homeServerId == harnessId)) {
+      connect(harnessId, preserveHome = true)
     }
     scheduleBackgroundSync()
+  }
+
+  /** 兼容别名，等价于 [setHarnessEnabled]。 */
+  fun setProfileEnabled(profileId: String, enabled: Boolean) = setHarnessEnabled(profileId, enabled)
+
+  /** 删除单条 Harness（保留所属 SSH 设备、凭据和其余 Harness，也不影响包含该设备的设备组）。 */
+  fun deleteHarness(harnessId: String) {
+    if (draftServerId == harnessId) clearDraftIntent()
+    cancelProfileNotifications(harnessId)
+    com.igng.opencode.lagoon.system.SummaryDismissals.clear(appContext, harnessId)
+    val wasActive = mutable.value.serverId == harnessId
+    if (wasActive) stopSingleConnection()
+    allSnapshots.remove(harnessId)
+    allOverview.invalidate(harnessId)
+    sshHostManager.closeHarness(harnessId)
+    transcriptMemory.forgetServer(harnessId)
+    sessionViews.forgetServer(harnessId)
+    conversationPool.forgetServer(harnessId)
+    choicesCache.invalidateServer(harnessId)
+    deviceCoordinator.removeHarness(harnessId)
+    store.cleanupRetiredHarness(harnessId)
+    cache.delete(harnessId)
+    if (transcripts != null) scope.launch(storeDispatcher) { attempt { transcripts.deleteServer(harnessId) } }
+    val profiles = deviceCoordinator.profiles()
+    syncDeviceDomainToState()
+    updateState {
+      it.copy(
+        allServerSnapshots = allSnapshots.toMap(),
+        homeServerId = it.homeServerId.takeUnless { selected -> selected == harnessId }
+      )
+    }
+    allOverview.start(profiles, include = setOfNotNull(state.value.serverId))
+    scheduleBackgroundSync()
+    if (wasActive) {
+      val fallback = state.value.homeGroup?.memberProfiles(profiles)?.firstOrNull { it.effectiveEnabled }
+        ?: profiles.firstOrNull { it.effectiveEnabled }
+      if (fallback != null) connect(fallback.id, preserveHome = true)
+      else showAggregateAfterDisable(profiles, "已移除 Harness")
+    }
+  }
+
+  /** 兼容别名，等价于 [deleteHarness]。 */
+  fun deleteServer(id: String) = deleteHarness(id)
+
+  /** 删除整台 SSH 设备及其全部 Harness、加密凭据、发现缓存与本地运行态数据（不动远端进程与文件）。 */
+  fun deleteDevice(deviceId: String) {
+    val device = deviceCoordinator.findDevice(deviceId) ?: return
+    val harnessIds = device.harnesses.map { it.id }
+    val wasActive = state.value.serverId in harnessIds
+    if (wasActive) stopSingleConnection()
+    harnessIds.forEach { id ->
+      if (draftServerId == id) clearDraftIntent()
+      cancelProfileNotifications(id)
+      com.igng.opencode.lagoon.system.SummaryDismissals.clear(appContext, id)
+      allSnapshots.remove(id)
+      allOverview.invalidate(id)
+      transcriptMemory.forgetServer(id)
+      sessionViews.forgetServer(id)
+      conversationPool.forgetServer(id)
+      choicesCache.invalidateServer(id)
+      store.cleanupRetiredHarness(id)
+      cache.delete(id)
+      if (transcripts != null) scope.launch(storeDispatcher) { attempt { transcripts.deleteServer(id) } }
+    }
+    sshHostManager.closeDevice(deviceId)
+    if (state.value.homeDeviceId == deviceId) store.rememberHomeDevice(null)
+    deviceCoordinator.deleteDevice(deviceId)
+    val profiles = deviceCoordinator.profiles()
+    syncDeviceDomainToState(message = "已删除设备「${device.name}」", tone = FeedbackTone.INFO)
+    updateState {
+      it.copy(
+        allServerSnapshots = allSnapshots.toMap(),
+        homeServerId = it.homeServerId.takeUnless { selected -> selected in harnessIds }
+      )
+    }
+    allOverview.start(profiles, include = setOfNotNull(state.value.serverId))
+    scheduleBackgroundSync()
+    if (wasActive) {
+      val fallback = state.value.homeGroup?.memberProfiles(profiles)?.firstOrNull { it.effectiveEnabled }
+        ?: profiles.firstOrNull { it.effectiveEnabled }
+      if (fallback != null) connect(fallback.id, preserveHome = true)
+      else showAggregateAfterDisable(profiles, "已删除设备「${device.name}」")
+    }
   }
 
   private fun cancelProfileNotifications(id: String) {
@@ -3084,23 +1776,28 @@ class LagoonController private constructor(private val appContext: Context) {
     }
   }
 
-  /**
-   * Leaves single-server mode after its last enabled connection was disabled. Other enabled
-   * profiles keep their overview monitors; the home becomes the aggregate projection with no
-   * writable server until the user picks one.
-   */
   private fun showAggregateAfterDisable(profiles: List<ServerProfile>, message: String) {
     clearDraftIntent()
     stopSingleConnection()
     store.rememberAllServers(true)
+    store.rememberHomeDevice(null)
     val snapshots = allSnapshots.filterKeys { id -> profiles.any { it.id == id && it.effectiveEnabled } }
+    val domain = deviceCoordinator.state.value
+    val keychain = sshKeyCoordinator.state.value
     updateState { latest ->
       LagoonState(
+        devices = domain.devices,
         profiles = profiles,
-        sshHosts = latest.sshHosts,
-        deviceGroups = latest.deviceGroups,
-        deviceGroupReset = latest.deviceGroupReset,
+        discoveryRevision = domain.discoveryRevision,
+        deviceRefreshInFlight = latest.deviceRefreshInFlight,
+        harnessLinkStatuses = sshHostManager.harnessStatusSnapshot(),
+        sshKeys = keychain.keys,
+        sshKeysRevision = keychain.revision,
+        deviceGroups = domain.deviceGroups,
+        deviceGroupReset = domain.deviceGroupReset,
+        migrationNotice = latest.migrationNotice,
         homeGroupId = null,
+        homeDeviceId = null,
         allServers = true,
         permissionPolicy = latest.permissionPolicy,
         pendingAttachments = latest.pendingAttachments,
@@ -3111,406 +1808,119 @@ class LagoonController private constructor(private val appContext: Context) {
     }
   }
 
-
-  // ------------------------------------------------------------------ SSH hosts
-
-  /** Saved SSH metadata only; passwords and private keys stay encrypted in SshHostStore. */
-  fun sshHosts(): List<SshHostConfig> = state.value.sshHosts
-
-  fun sshHost(id: String): SshHostConfig? = state.value.sshHosts.firstOrNull { it.id == id }
-
-  fun sshHostSecrets(hostId: String): SshSecrets = sshHostStore.secrets(hostId)
-
-  fun sshKeys(): List<SshKeyProfile> = state.value.sshKeys
-
-  fun sshKey(id: String?): SshKeyProfile? = id?.let { keyId -> state.value.sshKeys.firstOrNull { it.id == keyId } }
-
-  fun sshKeySecrets(id: String): SshKeySecrets = sshKeyStore.secrets(id)
-
-  /** 密钥库最近一次读取失败的原因；null 表示正常。界面据此区分“没有密钥”和“读不出来”。 */
-  fun sshKeyLoadError(): String? = sshKeyStore.loadError
-
-  fun isSshKeyUnlocked(profile: SshKeyProfile): Boolean = sshKeyStore.isUnlocked(profile)
-
-  fun isBiometricSupported(): Boolean = BiometricKeyVault.isSupported(appContext)
-
-  fun hostsUsingSshKey(keyId: String): List<SshHostConfig> =
-    sshHostStore.load().filter { it.keyId == keyId }
-
-  /** Generates a new software SSH keypair (Ed25519 / ECDSA P-256 / RSA 4096) into the global keychain. */
-  suspend fun generateSoftwareSshKey(
-    name: String,
-    algorithm: SshKeyAlgorithm,
-    passphrase: String?,
-    policy: SshPassphrasePolicy,
-    biometricActivityContext: Context? = null,
-    comment: String = "lagoon"
-  ): SshKeyProfile {
-    val keyId = SshKeyProfile.newId()
-    val cleanName = name.trim().ifBlank { "${algorithm.label} 密钥" }.take(128)
-    val cleanPassphrase = passphrase?.takeIf { it.isNotEmpty() }
-    if (policy == SshPassphrasePolicy.SAVED || policy == SshPassphrasePolicy.PROMPT) {
-      require(!cleanPassphrase.isNullOrEmpty()) { "请输入私钥口令，或切换为「无口令」" }
-    }
-    val effectivePolicy = if (cleanPassphrase == null && policy != SshPassphrasePolicy.BIOMETRIC) {
-      SshPassphrasePolicy.NONE
-    } else {
-      policy
-    }
-    val generated = kotlinx.coroutines.withContext(Dispatchers.Default) {
-      SshKeyCodec.generateKeyPair(
-        algorithm = algorithm,
-        comment = comment,
-        passphrase = if (effectivePolicy == SshPassphrasePolicy.NONE || (effectivePolicy == SshPassphrasePolicy.BIOMETRIC && cleanPassphrase == null)) {
-          null
-        } else {
-          cleanPassphrase
-        }
-      )
-    }
-    val encrypted = !cleanPassphrase.isNullOrEmpty()
-    val secrets = when (effectivePolicy) {
-      SshPassphrasePolicy.BIOMETRIC -> {
-        val uiContext = biometricActivityContext ?: error("需要界面上下文以触发系统生物识别")
-        val payloadToSeal = cleanPassphrase ?: generated.privateKeyPem
-        val sealed = BiometricKeyVault.seal(
-          context = uiContext,
-          keyId = keyId,
-          plaintext = payloadToSeal,
-          title = "启用生物识别保护",
-          subtitle = "验证身份以保护 SSH 密钥「$cleanName」"
-        )
-        sshKeyStore.unlockRuntimeSecret(keyId, payloadToSeal)
-        SshKeySecrets(
-          privateKey = if (encrypted) generated.privateKeyPem else null,
-          passphrase = null,
-          biometricCiphertext = sealed.ciphertextBase64,
-          biometricIv = sealed.ivBase64
-        )
-      }
-      SshPassphrasePolicy.PROMPT -> {
-        if (cleanPassphrase != null) sshKeyStore.unlockRuntimeSecret(keyId, cleanPassphrase)
-        SshKeySecrets(privateKey = generated.privateKeyPem, passphrase = null)
-      }
-      SshPassphrasePolicy.SAVED, SshPassphrasePolicy.NONE -> {
-        SshKeySecrets(privateKey = generated.privateKeyPem, passphrase = cleanPassphrase)
-      }
-    }
-    val profile = SshKeyProfile(
-      id = keyId,
-      name = cleanName,
-      algorithm = generated.algorithm,
-      fingerprint = generated.fingerprint,
-      publicKeyOpenSsh = generated.publicKeyOpenSsh,
-      encrypted = encrypted,
-      passphrasePolicy = effectivePolicy,
-      source = SshKeySource.GENERATED,
-      biometricProtected = effectivePolicy == SshPassphrasePolicy.BIOMETRIC,
-      createdAt = System.currentTimeMillis()
-    )
-    sshKeyStore.save(profile, secrets)
-    refreshSshKeys(invalidateKeyId = keyId)
-    return profile
-  }
-
-  /** Creates a non-exportable ECDSA P-256 SSH key inside AndroidKeyStore hardware. */
-  fun generateHardwareSshKey(name: String, requireBiometric: Boolean): SshKeyProfile {
-    val keyId = SshKeyProfile.newId()
-    val cleanName = name.trim().ifBlank { "本机硬件密钥" }.take(128)
-    if (requireBiometric) require(isBiometricSupported()) { "当前设备未启用生物识别或系统锁屏" }
-    val profile = hardwareSshSigner.generateKey(keyId, cleanName, requireBiometric)
-    sshKeyStore.save(profile, SshKeySecrets())
-    refreshSshKeys(invalidateKeyId = keyId)
-    return profile
-  }
-
-  /** Parses, validates, and imports an existing private key (PEM / OpenSSH / PKCS#8 / PuTTY) into the keychain. */
-  suspend fun importSshKey(
-    name: String,
-    privateKeyText: String,
-    passphrase: String?,
-    policy: SshPassphrasePolicy,
-    certificateText: String? = null,
-    biometricActivityContext: Context? = null
-  ): SshKeyProfile {
-    val cleanKey = privateKeyText.trim()
-    val cleanPass = passphrase?.takeIf { it.isNotEmpty() }
-    val parsed = kotlinx.coroutines.withContext(Dispatchers.Default) {
-      SshKeyCodec.inspectPrivateKey(cleanKey, cleanPass)
-    }
-    if (parsed.encrypted && !parsed.decrypted) {
-      throw SshFailure(SshFailureKind.PASSPHRASE_REQUIRED, "此私钥已加密，请先填写私钥口令校验后再导入", retryable = false)
-    }
-    val cert = certificateText?.trim()?.takeIf { it.isNotEmpty() }?.let {
-      SshKeyCodec.parseCertificate(it).normalizedLine
-    }
-    val keyId = SshKeyProfile.newId()
-    val cleanName = name.trim().ifBlank { "${parsed.algorithm} 导入密钥" }.take(128)
-    val effectivePolicy = when {
-      policy == SshPassphrasePolicy.BIOMETRIC -> SshPassphrasePolicy.BIOMETRIC
-      !parsed.encrypted -> SshPassphrasePolicy.NONE
-      policy == SshPassphrasePolicy.NONE -> SshPassphrasePolicy.SAVED
-      else -> policy
-    }
-    val secrets = when (effectivePolicy) {
-      SshPassphrasePolicy.BIOMETRIC -> {
-        val uiContext = biometricActivityContext ?: error("需要界面上下文以触发系统生物识别")
-        val payloadToSeal = if (parsed.encrypted) cleanPass!! else cleanKey
-        val sealed = BiometricKeyVault.seal(
-          context = uiContext,
-          keyId = keyId,
-          plaintext = payloadToSeal,
-          title = "启用生物识别保护",
-          subtitle = "验证身份以保护 SSH 密钥「$cleanName」"
-        )
-        sshKeyStore.unlockRuntimeSecret(keyId, payloadToSeal)
-        SshKeySecrets(
-          privateKey = if (parsed.encrypted) cleanKey else null,
-          passphrase = null,
-          biometricCiphertext = sealed.ciphertextBase64,
-          biometricIv = sealed.ivBase64
-        )
-      }
-      SshPassphrasePolicy.PROMPT -> {
-        if (cleanPass != null) sshKeyStore.unlockRuntimeSecret(keyId, cleanPass)
-        SshKeySecrets(privateKey = cleanKey, passphrase = null)
-      }
-      SshPassphrasePolicy.SAVED, SshPassphrasePolicy.NONE -> {
-        SshKeySecrets(privateKey = cleanKey, passphrase = cleanPass)
-      }
-    }
-    val profile = SshKeyProfile(
-      id = keyId,
-      name = cleanName,
-      algorithm = parsed.algorithm,
-      fingerprint = parsed.fingerprint,
-      publicKeyOpenSsh = parsed.publicKeyOpenSsh,
-      certificateOpenSsh = cert,
-      encrypted = parsed.encrypted,
-      passphrasePolicy = effectivePolicy,
-      source = SshKeySource.IMPORTED,
-      biometricProtected = effectivePolicy == SshPassphrasePolicy.BIOMETRIC,
-      createdAt = System.currentTimeMillis()
-    )
-    sshKeyStore.save(profile, secrets)
-    refreshSshKeys(invalidateKeyId = keyId)
-    return profile
-  }
-
-  /** Attaches or clears an OpenSSH `-cert.pub` user certificate on a stored key profile. */
-  fun updateSshKeyCertificate(keyId: String, certificateText: String?): SshKeyProfile {
-    val existing = sshKeyStore.find(keyId) ?: error("SSH 密钥不存在")
-    val normalized = certificateText?.trim()?.takeIf { it.isNotEmpty() }?.let {
-      SshKeyCodec.parseCertificate(it).normalizedLine
-    }
-    val updated = existing.copy(certificateOpenSsh = normalized)
-    sshKeyStore.save(updated)
-    refreshSshKeys(invalidateKeyId = keyId)
-    return updated
-  }
-
-  fun renameSshKey(keyId: String, newName: String) {
-    val existing = sshKeyStore.find(keyId) ?: return
-    val clean = newName.trim().takeIf { it.isNotEmpty() }?.take(128) ?: return
-    sshKeyStore.save(existing.copy(name = clean))
-    refreshSshKeys(invalidateKeyId = null)
-  }
-
-  /** Unlocks a `PROMPT` policy encrypted key into process memory after verifying the passphrase. */
-  suspend fun unlockSshKeyWithPassphrase(keyId: String, passphrase: String) {
-    val profile = sshKeyStore.find(keyId) ?: error("SSH 密钥不存在")
-    val stored = sshKeyStore.secrets(keyId)
-    val privateKey = stored.privateKey ?: error("私钥内容缺失")
-    require(passphrase.isNotEmpty()) { "请输入私钥口令" }
-    val parsed = kotlinx.coroutines.withContext(Dispatchers.Default) {
-      SshKeyCodec.inspectPrivateKey(privateKey, passphrase)
-    }
-    require(!parsed.encrypted || parsed.decrypted) { "私钥口令不正确" }
-    sshKeyStore.unlockRuntimeSecret(keyId, passphrase)
-    refreshSshKeys(invalidateKeyId = keyId)
-  }
-
-  /** Unlocks a `BIOMETRIC` software or hardware SSH key using platform BiometricPrompt. */
-  suspend fun unlockSshKeyWithBiometric(keyId: String, activityContext: Context) {
-    val profile = sshKeyStore.find(keyId) ?: error("SSH 密钥不存在")
-    when (profile.source) {
-      SshKeySource.HARDWARE_KEYSTORE -> {
-        BiometricKeyVault.authenticateHardwareKey(
-          context = activityContext,
-          title = "解锁硬件 SSH 密钥",
-          subtitle = "验证身份以使用「${profile.name}」"
-        )
-        sshKeyStore.unlockRuntimeSecret(keyId, "hardware-unlocked")
-      }
-      SshKeySource.GENERATED, SshKeySource.IMPORTED -> {
-        val stored = sshKeyStore.secrets(keyId)
-        val cipher = stored.biometricCiphertext ?: error("生物识别密文缺失，请重新导入密钥")
-        val iv = stored.biometricIv ?: error("生物识别 IV 缺失，请重新导入密钥")
-        val plain = BiometricKeyVault.unseal(
-          context = activityContext,
-          keyId = keyId,
-          ciphertextBase64 = cipher,
-          ivBase64 = iv,
-          title = "解锁 SSH 密钥",
-          subtitle = "验证身份以使用「${profile.name}」"
-        )
-        sshKeyStore.unlockRuntimeSecret(keyId, plain)
-      }
-    }
-    refreshSshKeys(invalidateKeyId = keyId)
-  }
-
-  fun lockSshKey(keyId: String) {
-    sshKeyStore.lockRuntimeSecret(keyId)
-    refreshSshKeys(invalidateKeyId = keyId)
-  }
-
-  fun deleteSshKey(keyId: String) {
-    val existing = sshKeyStore.find(keyId)
-    if (existing?.source == SshKeySource.HARDWARE_KEYSTORE) {
-      hardwareSshSigner.deleteKey(keyId)
-    }
-    BiometricKeyVault.deleteKey(keyId)
-    sshKeyStore.delete(keyId)
-    refreshSshKeys(invalidateKeyId = keyId)
-  }
-
-  suspend fun deploySshPublicKey(config: SshHostConfig, secrets: SshSecrets, publicKeyOpenSsh: String) {
-    val clean = cleanSshConfig(config)
-    validateSshSecrets(clean, secrets)
-    sshHostManager.deployPublicKey(clean, secrets, publicKeyOpenSsh)
-  }
-
-  private fun refreshSshKeys(invalidateKeyId: String?) {
-    val keys = sshKeyStore.load()
-    updateState { it.copy(sshKeys = keys, sshKeysRevision = it.sshKeysRevision + 1) }
-    if (invalidateKeyId != null) {
-      val affected = sshHostStore.load().filter { it.keyId == invalidateKeyId }
-      val allProfiles = store.profiles()
-      affected.forEach { host ->
-        val hostProfiles = allProfiles.filter { it.sshHostId == host.id }
-        hostProfiles.forEach { allOverview.invalidate(it.id) }
-        sshHostManager.replace(host.id)
-        val restart = hostProfiles.filter { it.effectiveEnabled }.map { it.id }.toSet()
-        if (restart.isNotEmpty()) allOverview.start(allProfiles, include = restart)
-      }
-    }
-  }
-
-  internal class NotificationClientLease(val client: HarnessClient, private val owned: Boolean) : AutoCloseable {
-    private val closed = java.util.concurrent.atomic.AtomicBoolean(false)
-    override fun close() {
-      if (closed.compareAndSet(false, true) && owned) client.close()
-    }
-  }
-
-  /**
-   * 通知栏操作专用客户端租约：
-   * - DSH / DSH_REMOTE / SSH 优先复用 [allOverview] 持有的在线客户端（DSH 审批瀑布绑定在活跃 `$events` 流上，
-   *   且 DSH_REMOTE / SSH 共享单条加密连接）；进程冷启动尚未建立在线客户端时再按完整工厂构造并在用后关闭。
-   * - OpenCode 使用 8 秒超时的独立 REST 客户端并在完成后关闭。
-   */
-  internal fun notificationClient(profile: ServerProfile, credentials: ServerCredentials): NotificationClientLease {
-    val route = store.runtimeRoute(profile)
-    if (profile.kind == ServerKind.DSH || profile.kind == ServerKind.DSH_REMOTE || profile.sshHostId != null || profile.remoteHostId != null) {
-      val live = clientFor(profile.id)?.takeUnless { it.isClosed }
-      if (live != null) return NotificationClientLease(live, owned = false)
-      return NotificationClientLease(createRoutedHarnessClient(route, profile, credentials, callTimeoutSeconds = 8,
-        remoteFactory = remoteBackendFactory::create,
-        sshFactory = { p, _ -> sshHostManager.client(p) }), owned = true)
-    }
-    return NotificationClientLease(createRoutedHarnessClient(route, profile, credentials, callTimeoutSeconds = 8), owned = true)
-  }
-
-  /** A bounded client for notification actions; SSH may need to reconnect first. */
-  internal fun sshClientForNotification(profile: ServerProfile): HarnessClient {
-    val admitted = store.runtimeRoute(profile).executionProfile(profile)
-    return sshHostManager.client(admitted)
-  }
-
-  fun sshLinkStatus(hostId: String) = sshHostManager.status(hostId)
-
-  /** Interactive SSH answers live only in the broker until the current handshake consumes them. */
-  internal val sshKeyboardChallenges get() = sshKeyboardBroker.challenges
-  internal fun setSshInteractiveForeground(active: Boolean) = sshKeyboardBroker.setForeground(active)
-  internal fun answerSshKeyboardChallenge(id: String, answers: List<String>?) = sshKeyboardBroker.respond(id, answers)
-
-  /** Resolve a device to its actual SSH config; a leaf id is never accepted as a device id. */
-  internal fun sshHostForDevice(deviceId: String): SshHostConfig? {
-    val graph = currentGraphOrNull() ?: return null
-    val host = graph.hosts.firstOrNull { it.id == deviceId } ?: return null
-    val source = graph.sources.firstOrNull { it.id == host.sourceId && it.type == ConnectionSourceType.SSH } ?: return null
-    return sshHostStore.load().firstOrNull { it.id == source.sshHostConfigId }
-  }
-
-  fun dismissDeviceGroupReset() {
-    if (state.value.deviceGroupReset) updateState { it.copy(deviceGroupReset = false) }
-  }
+  // ------------------------------------------------------------------ SSH TOFU, Testing & Service Recovery
 
   suspend fun probeSshHostKey(config: SshHostConfig): PresentedSshHostKey =
     sshHostManager.probeHostKey(cleanSshConfig(config))
 
-  fun pinSshHostKey(hostId: String, key: PresentedSshHostKey) {
-    sshHostManager.pinHostKey(hostId, key)
-    updateState { it.copy(sshHosts = sshHostStore.load()) }
+  fun pinSshHostKey(deviceId: String, key: PresentedSshHostKey) {
+    deviceCoordinator.pinHostKey(deviceId, key)
+    syncDeviceDomainToState()
   }
 
-  /** Pin only the exact still-enabled device whose endpoint was shown in the confirmation. */
+  /** CAS 固定主机密钥：确认弹窗期间若端点已修改或停用则拒绝写入。 */
   internal fun confirmSshDeviceHostKey(deviceId: String, expected: SshHostConfig, key: PresentedSshHostKey) {
-    val current = sshHostForDevice(deviceId) ?: error("设备已移除，请重新打开设备")
-    check(current == expected) { "设备设置已变化，请重新核对主机指纹" }
-    val graph = currentGraphOrNull() ?: error("连接图暂不可用，请重试")
-    val host = graph.hosts.firstOrNull { it.id == deviceId } ?: error("设备已移除")
-    val source = graph.sources.firstOrNull { it.id == host.sourceId } ?: error("接入源已移除")
-    check(host.enabled && source.enabled) { "此设备已停用，请先启用" }
-    check(sshHostStore.pinHostKeyIfUnchanged(expected, key)) { "设备设置已变化，请重新核对主机指纹" }
-    val saved = sshHostStore.load().firstOrNull { it.id == current.id }
+    val current = deviceCoordinator.findDevice(deviceId) ?: error("设备已移除，请重新打开设备")
+    check(current.enabled) { "此设备已停用，请先启用" }
+    check(deviceCoordinator.pinHostKeyIfUnchanged(expected, key)) { "设备设置已变化，请重新核对主机指纹" }
+    val saved = deviceCoordinator.findDevice(deviceId)
     check(saved?.hostKeyType == key.type && saved.hostKeyFingerprint == key.fingerprint) { "主机指纹未能保存，请重试" }
-    val profiles = store.profiles()
-    profiles.filter { it.sshHostId == current.id }.forEach { allOverview.invalidate(it.id) }
-    sshHostManager.replace(current.id)
-    updateState { it.copy(sshHosts = sshHostStore.load()) }
-    val enabled = profiles.filter { it.sshHostId == current.id && it.effectiveEnabled }.map { it.id }.toSet()
-    if (enabled.isNotEmpty()) allOverview.start(profiles, include = enabled)
+    invalidateAndRestartDevice(deviceId)
   }
 
-  /** Read-only discovery after host pin confirmation. Passwords stay in the returned runtime-only descriptor. */
-  suspend fun discoverSshHarnesses(config: SshHostConfig, secrets: SshSecrets, path: String? = null): SshHarnessDiscoveryResult {
-    val clean = cleanSshConfig(config)
-    validateSshSecrets(clean, secrets)
-    if (sshHostStore.load().any { it.id == clean.id }) {
-      val source = MigrationProjection.sshSourceId(clean.id)
-      store.requireParentRoute(source, MigrationProjection.hostId(source, clean.id))
+  /** 从首页/聊天页内联故障条一键信任出示的主机指纹并立即重连。 */
+  fun trustPresentedHostKeyAndRetry(deviceId: String, key: PresentedSshHostKey) {
+    val device = deviceCoordinator.findDevice(deviceId) ?: return
+    deviceCoordinator.pinHostKey(device.id, key)
+    invalidateAndRestartDevice(device.id)
+    showNotice("已信任主机指纹，正在重新连接", FeedbackTone.SUCCESS)
+  }
+
+  /** 重置已固定的主机指纹（重装系统或更换主机密钥后使用）。 */
+  fun resetSshDeviceHostKey(deviceId: String) {
+    val updated = deviceCoordinator.resetHostKey(deviceId) ?: return
+    invalidateAndRestartDevice(updated.id)
+    showNotice("已重置「${updated.name}」的主机指纹，下次连接时需重新确认", FeedbackTone.INFO)
+  }
+
+  private fun invalidateAndRestartDevice(deviceId: String) {
+    val profiles = deviceCoordinator.profiles()
+    val deviceProfiles = profiles.filter { it.deviceId == deviceId }
+    deviceProfiles.forEach { allOverview.invalidate(it.id) }
+    sshHostManager.replaceDevice(deviceId)
+    syncDeviceDomainToState()
+    val enabled = deviceProfiles.filter { it.effectiveEnabled }.map { it.id }.toSet()
+    if (enabled.isNotEmpty()) {
+      allOverview.start(profiles, include = enabled + setOfNotNull(state.value.serverId))
+      enabled.forEach(allOverview::refresh)
+      if (state.value.serverId in enabled) {
+        updateState { it.copy(sshActionRequired = null) }
+        connect(state.value.serverId!!, preserveHome = true)
+      }
     }
-    return sshHostManager.discover(clean, secrets, path)
   }
 
-  internal suspend fun discoverSshCodex(config: SshHostConfig, secrets: SshSecrets): com.igng.opencode.lagoon.core.ssh.SshCodexObservation {
-    val clean = cleanSshConfig(config)
-    validateSshSecrets(clean, secrets)
-    if (sshHostStore.load().any { it.id == clean.id }) {
-      val source = MigrationProjection.sshSourceId(clean.id)
-      store.requireParentRoute(source, MigrationProjection.hostId(source, clean.id))
+  fun retrySshDevice(deviceId: String) {
+    val device = deviceCoordinator.findDevice(deviceId) ?: return
+    if (!device.enabled) return
+    val profiles = deviceCoordinator.profiles()
+    val retryIds = profiles.filter { it.deviceId == deviceId && it.effectiveEnabled }.map { it.id }.toSet()
+    if (retryIds.isEmpty()) return
+    sshHostManager.retryDevice(deviceId)
+    allOverview.start(profiles, include = retryIds + setOfNotNull(state.value.serverId))
+    retryIds.forEach(allOverview::refresh)
+    if (state.value.serverId in retryIds) {
+      updateState { it.copy(sshActionRequired = null) }
+      retryNow()
     }
-    return sshHostManager.discoverCodex(clean, secrets)
   }
 
-  /** Runs the real connect → host key → bootstrap → tunnel → login flow without saving. */
-  suspend fun testSshHost(
+  /** 在设备上显式启动/重启 OpenCode 后台服务，并刷新发现与 OpenCode 连接。 */
+  fun startOpenCodeServiceOnDevice(deviceId: String) {
+    val device = deviceCoordinator.findDevice(deviceId) ?: return
+    if (!device.enabled) {
+      showNotice("此设备已停用，请先启用设备", FeedbackTone.WARNING)
+      return
+    }
+    scope.launch {
+      showNotice("正在启动 OpenCode 服务…")
+      try {
+        val result = sshHostManager.startOpenCodeService(device.toHostConfig(), deviceCoordinator.secrets(deviceId))
+        showNotice(result.summary(), if (result.ok) FeedbackTone.SUCCESS else FeedbackTone.WARNING)
+        if (!result.ok) return@launch
+        val openCodeHarnesses = deviceCoordinator.findDevice(deviceId)?.harnesses
+          ?.filter { it.protocol == HarnessProtocol.OPENCODE_NATIVE }.orEmpty()
+        openCodeHarnesses.forEach { h ->
+          sshHostManager.retryHarness(h.id)
+          allOverview.invalidate(h.id)
+          allOverview.refresh(h.id)
+        }
+        runCatching { refreshDeviceDiscovery(deviceId) }
+      } catch (cancel: CancellationException) {
+        throw cancel
+      } catch (error: Exception) {
+        showNotice(userFacingError(error, "启动 OpenCode 服务失败"), FeedbackTone.WARNING)
+      }
+    }
+  }
+
+  fun restartOpenCodeService(harnessId: String) {
+    val (device, _) = deviceCoordinator.findHarness(harnessId) ?: return
+    startOpenCodeServiceOnDevice(device.id)
+  }
+
+  /** 测试 SSH 连接（支持设备表单测试，不落盘）。 */
+  suspend fun testSshConnection(
     config: SshHostConfig,
     secrets: SshSecrets,
     onStatus: (SshLinkStatus) -> Unit,
-    harnessKind: ServerKind = ServerKind.DSH,
+    protocol: HarnessProtocol = HarnessProtocol.DSH,
     registrationPath: String? = null
   ): String {
     val clean = cleanSshConfig(config)
     validateSshSecrets(clean, secrets)
-    if (sshHostStore.load().any { it.id == clean.id }) {
-      val source = MigrationProjection.sshSourceId(clean.id)
-      store.requireParentRoute(source, MigrationProjection.hostId(source, clean.id))
-    }
-    if (harnessKind == ServerKind.CODEX) return sshHostManager.testCodex(clean, secrets)
-    val link = sshHostManager.testLink(clean, secrets, onStatus, harnessKind, registrationPath)
+    if (protocol == HarnessProtocol.CODEX) return sshHostManager.testCodex(clean, secrets)
+    val link = sshHostManager.testLink(clean, secrets, onStatus, protocol, registrationPath)
     return try {
       val client = link.awaitHarness()
       client.projects()
@@ -3520,185 +1930,129 @@ class LagoonController private constructor(private val appContext: Context) {
     }
   }
 
-  /** Save a host whose Harness leaves are all disabled, without starting a runtime. */
-  fun saveSshSourceOnly(config: SshHostConfig, secrets: SshSecrets) {
-    val clean = cleanSshConfig(config)
-    validateSshSecrets(clean, secrets)
-    val savedProfiles = store.readProfiles()
-    val old = sshHostStore.load().firstOrNull { it.id == clean.id }
-    val changed = old == null || old.connectionKey != clean.connectionKey || old.hostKeyType != clean.hostKeyType ||
-      old.hostKeyFingerprint != clean.hostKeyFingerprint || sshHostStore.secrets(clean.id) != secrets
-    // Disable leaves before replacing source credentials; no new runtime can dial mid-update.
-    val restore = savedProfiles.filter { it.sshHostId == clean.id && it.enabled }.map { it.id }
-    restore.forEach { setProfileEnabled(it, false) }
-    sshHostStore.save(clean, secrets)
-    store.updateSshSourceRoute(clean.id, clean.profileUrl(), clean.user)
-    if (changed) sshHostManager.replace(clean.id)
-    persistConnectionGraph()
-    updateState { it.copy(profiles = store.profiles(), sshHosts = sshHostStore.load()) }
-    // 编辑设备配置不应该顺手关掉它上面的 Harness：把开关原样放回去，并让它们按新配置重连。
-    restoreLeafSwitches(restore)
-  }
-
-  /** 批量恢复 leaf 开关，只刷新一次状态，避免逐条弹出"正在连接"的提示。 */
-  private fun restoreLeafSwitches(ids: List<String>) {
-    if (ids.isEmpty()) return
-    ids.forEach { id -> runCatching { store.setProfileEnabled(id, true) } }
-    val profiles = store.profiles()
-    updateState { it.copy(profiles = profiles) }
-    allOverview.start(profiles)
-    scheduleBackgroundSync()
-  }
-
-  /**
-   * Saves the SSH config + secrets and one native Harness binding. The profile id is stable across edits;
-   * an existing link and overview monitor are dropped so the next connection uses the new config.
-   */
-  fun saveSshHost(
+  /** 仅测试 SSH 握手与认证（设备表单「测试连接」用，不强制要求远端已装 DSH）。 */
+  suspend fun testSshDeviceHandshake(
     config: SshHostConfig,
-    secrets: SshSecrets,
-    autoConnect: Boolean = true,
-    notifications: Boolean = true,
-    groupId: String? = null,
-    connect: Boolean = true,
-    harnessKind: ServerKind = ServerKind.DSH,
-    registrationPath: String? = null,
-    bindingEnabled: Boolean? = null,
-    harnessProtocol: HarnessProtocolId? = null
-  ): ServerProfile {
-    require(harnessKind != ServerKind.DSH_REMOTE) { "SSH source 不使用 Remote carrier" }
+    secrets: SshSecrets
+  ): String {
     val clean = cleanSshConfig(config)
     validateSshSecrets(clean, secrets)
-    require(registrationPath == null || registrationPath.startsWith('/') && registrationPath.length <= 4096 && registrationPath.none(Char::isISOControl)) {
-      "OpenCode 注册路径必须是远端绝对路径"
+    val found = sshHostManager.discoverDevice(clean, secrets)
+    val detected = buildList {
+      if (found.dsh.installed == true) add("DSH")
+      if (found.files.openCode.state == SshDiscoveryState.PRESENT) add("OpenCode")
+      if (found.codex.installed == true) add("Codex")
+      if (found.agy.installed == true) add("Antigravity")
+      if (found.openCodeAcp?.supported == true) add("OpenCode ACP")
     }
-    val savedProfiles = store.readProfiles()
-    val desiredProtocol = harnessProtocol ?: MigrationProjection.protocol(harnessKind)
-    require(harnessProtocol == null ||
-      harnessProtocol in setOf(HarnessProtocolId.ANTIGRAVITY_ACP, HarnessProtocolId.OPENCODE_ACP) &&
-      harnessKind == ServerKind.CODEX)
-    val existing = savedProfiles.firstOrNull {
-      it.sshHostId == clean.id && it.protocol == desiredProtocol && it.sshServicePath == registrationPath
-    }
-    val fallbackId = if (desiredProtocol in setOf(HarnessProtocolId.ANTIGRAVITY_ACP, HarnessProtocolId.OPENCODE_ACP))
-      java.util.UUID.nameUUIDFromBytes("${clean.id}:${desiredProtocol.wire}".toByteArray(Charsets.UTF_8)).toString()
-    else clean.id.takeUnless { candidate -> savedProfiles.any { it.id == candidate } }
-      ?: java.util.UUID.randomUUID().toString()
-    val profileId = existing?.id ?: fallbackId
-    val previousHost = sshHostStore.load().firstOrNull { it.id == clean.id }
-    val hadHostConfig = previousHost != null
-    val hostChanged = previousHost == null || previousHost.connectionKey != clean.connectionKey ||
-      previousHost.hostKeyType != clean.hostKeyType || previousHost.hostKeyFingerprint != clean.hostKeyFingerprint ||
-      sshHostStore.secrets(clean.id) != secrets
-    sshHostStore.save(clean, secrets)
-    val profile = (existing ?: ServerProfile(profileId, clean.name, clean.profileUrl(), clean.user)).copy(
-      name = clean.name,
-      url = clean.profileUrl(),
-      username = clean.user,
-      autoConnect = autoConnect,
-      notifications = notifications,
-      allowCleartext = true,
-      kind = harnessKind,
-      protocolId = harnessProtocol,
-      dshAuth = DshAuthMode.TOKEN,
-      remoteHostId = null,
-      remoteHostFingerprint = null,
-      sshHostId = clean.id,
-      sshServicePath = registrationPath,
-      enabled = bindingEnabled ?: existing?.enabled ?: true
-    )
-    try {
-      store.save(profile, password = null, cookie = null, credentialUsername = clean.user)
-      store.updateSshSourceRoute(clean.id, clean.profileUrl(), clean.user)
-    } catch (cancel: CancellationException) {
-      throw cancel
-    } catch (error: Exception) {
-      if (!hadHostConfig) runCatching { sshHostStore.delete(clean.id) }
-      throw error
-    }
-    val profiles = store.profiles()
-    val groups = DeviceGroupState(state.value.deviceGroups, state.value.homeGroupId).sanitized(profiles.map { it.id }.toSet())
-    persistConnectionGraph(profiles, groups.groups)
-    if (!profile.effectiveEnabled) cancelProfileNotifications(profile.id)
-    updateState {
-      it.copy(
-        profiles = profiles,
-        sshHosts = sshHostStore.load(),
-        deviceGroups = groups.groups,
-        homeGroupId = groups.selectedGroupId
-      )
-    }
-    // Drop the monitor's client first. Its close() only releases a refcount, so closing the link
-    // afterwards is what actually tears the old forwarder down; start() below then dials the new config.
-    if (hostChanged) {
-      profiles.filter { it.sshHostId == clean.id }.forEach { allOverview.invalidate(it.id) }
-      sshHostManager.replace(clean.id)
-    } else {
-      allOverview.invalidate(profile.id)
-      sshHostManager.closeBinding(profile.id)
-    }
-    scheduleBackgroundSync()
-    allOverview.start(profiles, include = setOfNotNull(if (profiles.any { it.id == profile.id && it.effectiveEnabled }) profile.id else state.value.serverId))
-    if (groupId != null) moveProfile(profile.id, groupId)
-    if (connect && profiles.any { it.id == profile.id && it.effectiveEnabled }) connect(profile.id, preserveHome = true)
-    return profile
+    return if (detected.isEmpty()) "SSH 连接成功 · ${clean.address}"
+    else "SSH 连接成功 · 检测到 ${detected.joinToString(" / ")}"
   }
 
-  fun deleteSshHost(hostId: String) {
-    val deviceId = deviceIdOfSshHost(hostId)
-    val profiles = store.profiles().filter { it.sshHostId == hostId }
-    profiles.forEach { deleteServer(it.id) }
-    sshHostManager.close(hostId)
-    runCatching { sshHostStore.delete(hostId) }
-      .onFailure { showNotice(userFacingError(it, "删除 SSH 接入源失败"), FeedbackTone.WARNING); return }
-    val removeHosts = deviceId?.let { setOf(it) } ?: emptySet()
-    pruneConnectionGraph(removeHostIds = removeHosts, removeSourceIds = setOf(MigrationProjection.sshSourceId(hostId)))
-    deviceId?.let(::clearDeviceDiscovery)
-    persistConnectionGraph()
-    syncGroupLeaves()
-    updateState { it.copy(sshHosts = sshHostStore.load()) }
+  suspend fun deploySshPublicKey(config: SshHostConfig, secrets: SshSecrets, publicKeyOpenSsh: String) {
+    val clean = cleanSshConfig(config)
+    validateSshSecrets(clean, secrets)
+    sshHostManager.deployPublicKey(clean, secrets, publicKeyOpenSsh)
   }
 
-  fun retrySshHost(hostId: String) {
-    val graph = currentGraphOrNull() ?: return
-    val source = graph.sources.firstOrNull { it.sshHostConfigId == hostId && it.enabled } ?: return
-    if (graph.hosts.none { it.sourceId == source.id && it.enabled }) return
-    val profiles = store.profiles()
-    val retryIds = profiles.filter { it.sshHostId == hostId && it.effectiveEnabled }.map { it.id }.toSet()
-    if (retryIds.isEmpty()) return
-    sshHostManager.retry(hostId)
-    allOverview.start(profiles, include = retryIds + setOfNotNull(state.value.serverId))
-    retryIds.forEach(allOverview::refresh)
-    if (state.value.serverId in retryIds) retryNow()
-  }
+  // ------------------------------------------------------------------ SSH Keychain (delegated to SshKeyCoordinator)
 
-  /**
-   * Explicitly start/restart the user's OpenCode service on an SSH device, then re-bind its leaves.
-   * The app never owns or kills that process; it only runs the command the user asked for.
-   */
-  fun restartOpenCodeService(profileId: String) {
-    val profile = store.profiles().firstOrNull { it.id == profileId } ?: return
-    val hostId = profile.sshHostId ?: return
-    val config = sshHostStore.load().firstOrNull { it.id == hostId }
-    if (config == null) { showNotice("SSH 配置已移除", FeedbackTone.WARNING); return }
-    scope.launch {
-      showNotice("正在启动 OpenCode 服务…")
-      try {
-        val result = sshHostManager.startOpenCodeService(config, sshHostStore.secrets(hostId))
-        showNotice(result.summary(), if (result.ok) FeedbackTone.SUCCESS else FeedbackTone.WARNING)
-        if (!result.ok) return@launch
-        sshHostManager.retry(hostId)
-        allOverview.invalidate(profileId)
-        allOverview.refresh(profileId)
-        deviceIdOfSshHost(hostId)?.let { deviceId ->
-          runCatching { refreshDeviceDiscovery(deviceId) }
+  fun sshKeys(): List<SshKeyProfile> = sshKeyCoordinator.keys()
+  fun sshKey(id: String?): SshKeyProfile? = sshKeyCoordinator.find(id)
+  fun sshKeySecrets(id: String): SshKeySecrets = sshKeyCoordinator.secrets(id)
+  fun sshKeyLoadError(): String? = sshKeyCoordinator.loadError()
+  fun isSshKeyUnlocked(profile: SshKeyProfile): Boolean = sshKeyCoordinator.isUnlocked(profile)
+  fun isBiometricSupported(): Boolean = sshKeyCoordinator.isBiometricSupported(appContext)
+
+  suspend fun generateSoftwareSshKey(
+    name: String,
+    algorithm: SshKeyAlgorithm,
+    passphrase: String?,
+    policy: SshPassphrasePolicy,
+    biometricActivityContext: Context? = null,
+    comment: String = "lagoon"
+  ): SshKeyProfile = sshKeyCoordinator.generateSoftwareKey(name, algorithm, passphrase, policy, biometricActivityContext, comment)
+
+  fun generateHardwareSshKey(name: String, requireBiometric: Boolean): SshKeyProfile =
+    sshKeyCoordinator.generateHardwareKey(appContext, name, requireBiometric)
+
+  suspend fun importSshKey(
+    name: String,
+    privateKeyText: String,
+    passphrase: String?,
+    policy: SshPassphrasePolicy,
+    certificateText: String? = null,
+    biometricActivityContext: Context? = null
+  ): SshKeyProfile = sshKeyCoordinator.importKey(name, privateKeyText, passphrase, policy, certificateText, biometricActivityContext)
+
+  fun updateSshKeyCertificate(keyId: String, certificateText: String?): SshKeyProfile =
+    sshKeyCoordinator.updateCertificate(keyId, certificateText)
+
+  fun renameSshKey(keyId: String, newName: String) = sshKeyCoordinator.renameKey(keyId, newName)
+
+  suspend fun unlockSshKeyWithPassphrase(keyId: String, passphrase: String) =
+    sshKeyCoordinator.unlockWithPassphrase(keyId, passphrase)
+
+  suspend fun unlockSshKeyWithBiometric(keyId: String, activityContext: Context) =
+    sshKeyCoordinator.unlockWithBiometric(keyId, activityContext)
+
+  fun lockSshKey(keyId: String) = sshKeyCoordinator.lockKey(keyId)
+
+  fun deleteSshKey(keyId: String) = sshKeyCoordinator.deleteKey(keyId)
+
+  private fun handleSshKeyInvalidated(keyId: String) {
+    val affected = deviceCoordinator.devicesUsingKey(keyId)
+    if (affected.isEmpty()) return
+    val allProfiles = deviceCoordinator.profiles()
+    affected.forEach { device ->
+      val deviceProfiles = allProfiles.filter { it.deviceId == device.id }
+      deviceProfiles.forEach { allOverview.invalidate(it.id) }
+      sshHostManager.replaceDevice(device.id)
+      val restart = deviceProfiles.filter { it.effectiveEnabled }.map { it.id }.toSet()
+      if (restart.isNotEmpty()) {
+        allOverview.start(allProfiles, include = restart + setOfNotNull(state.value.serverId))
+        if (state.value.serverId in restart) {
+          updateState { it.copy(sshActionRequired = null) }
+          connect(state.value.serverId!!, preserveHome = true)
         }
-      } catch (cancel: CancellationException) {
-        throw cancel
-      } catch (error: Exception) {
-        showNotice(userFacingError(error, "启动 OpenCode 服务失败"), FeedbackTone.WARNING)
       }
     }
+  }
+
+  // ------------------------------------------------------------------ Notification client leases
+
+  internal class NotificationClientLease(val client: HarnessClient, private val owned: Boolean) : AutoCloseable {
+    private val closed = java.util.concurrent.atomic.AtomicBoolean(false)
+    override fun close() {
+      if (closed.compareAndSet(false, true) && owned) client.close()
+    }
+  }
+
+  /**
+   * 通知栏操作专用客户端租约：优先复用 [allOverview] 持有的在线 SSH 客户端，冷启动时按需建连并在用后释放。
+   */
+  internal fun notificationClient(profile: ServerProfile, credentials: ServerCredentials): NotificationClientLease {
+    val admitted = store.runtimeProfile(profile)
+    val live = clientFor(admitted.id)?.takeUnless { it.isClosed }
+    if (live != null) return NotificationClientLease(live, owned = false)
+    return NotificationClientLease(sshHostManager.client(admitted), owned = true)
+  }
+
+  internal fun sshClientForNotification(profile: ServerProfile): HarnessClient {
+    val admitted = store.runtimeProfile(profile)
+    return sshHostManager.client(admitted)
+  }
+
+  private fun cleanSshDevice(device: SshDevice): SshDevice {
+    val host = device.host.trim()
+    val user = device.user.trim()
+    require(host.isNotBlank()) { "填写主机地址（IP 或域名）" }
+    require(host.length <= 512) { "主机地址过长" }
+    require(user.isNotBlank()) { "填写登录用户名" }
+    require(user.length <= 128) { "登录用户名过长" }
+    require(device.port in 1..65535) { "端口需在 1–65535" }
+    val name = device.name.trim().ifBlank { host }.take(128)
+    return device.copy(name = name, host = host, user = user)
   }
 
   private fun cleanSshConfig(config: SshHostConfig): SshHostConfig {
@@ -3751,54 +2105,6 @@ class LagoonController private constructor(private val appContext: Context) {
     }
   }
 
-  fun deleteServer(id: String) {
-    if (draftServerId == id) clearDraftIntent()
-    val removed = store.profiles().firstOrNull { it.id == id }
-    cancelProfileNotifications(id)
-    com.igng.opencode.lagoon.system.SummaryDismissals.clear(appContext, id)
-    if (mutable.value.serverId == id) {
-      stopSingleConnection()
-    }
-    allSnapshots.remove(id)
-    transcriptMemory.forgetServer(id)
-    sessionViews.forgetServer(id)
-    conversationPool.forgetServer(id)
-    choicesCache.invalidateServer(id)
-    store.delete(id)
-    removed?.sshHostId?.let {
-      // Removing even the last Harness is NOT removing its source. Only explicit deleteSshHost
-      // may remove shared host configuration/credentials; the empty source remains manageable.
-      sshHostManager.closeBinding(id)
-    }
-    cache.delete(id)
-    if (transcripts != null) scope.launch(storeDispatcher) { attempt { transcripts.deleteServer(id) } }
-    scheduleBackgroundSync()
-
-    // A deleted profile cannot stay in a device tab. Empty groups disappear; the selected group
-    // falls back to all when it no longer has members.
-    val nextGroups = DeviceGroupState(state.value.deviceGroups, state.value.homeGroupId).withoutProfile(id)
-    val nextSelected = nextGroups.selectedGroupId
-    saveDeviceGroups(nextGroups.groups, nextSelected)
-    persistConnectionGraph()
-    allOverview.start(store.profiles(), include = setOfNotNull(state.value.serverId))
-    updateState { it.copy(
-      profiles = store.profiles(),
-      sshHosts = sshHostStore.load(),
-      allServerSnapshots = allSnapshots.toMap(),
-      homeServerId = it.homeServerId.takeUnless { selected -> selected == id },
-      allServers = nextSelected == null,
-      homeGroupId = nextSelected
-    ) }
-    if (mutable.value.serverId == id) {
-      val group = state.value.homeGroup
-      if (group != null) selectGroup(group.id)
-      if (mutable.value.serverId == id) {
-        val next = store.profiles().firstOrNull { it.effectiveEnabled }?.id
-        if (next != null) connect(next, preserveHome = true)
-        else showAggregateAfterDisable(store.profiles(), "已删除连接")
-      }
-    }
-  }
   private fun stopSingleConnection() {
     api?.questionPresentation(null, false)
     stream?.cancel()
@@ -3864,7 +2170,7 @@ class LagoonController private constructor(private val appContext: Context) {
   }
   fun connect(id: String, projectOverride: String? = null, sessionOverride: String? = null, preserveHome: Boolean = false,
     groupOverride: String? = null) {
-    val profiles = store.profiles()
+    val profiles = deviceCoordinator.profiles()
     val profile = profiles.firstOrNull { it.id == id && it.effectiveEnabled }
     if (profile == null) {
       updateState {
@@ -3882,10 +2188,17 @@ class LagoonController private constructor(private val appContext: Context) {
     // Hand the old server's control state back to its persistent observer, not to a disconnected cache.
     allSnapshots.putAll(previous.serverSnapshots())
     previousServer?.let { previous.serverSnapshots()[it]?.let(allOverview::handoff) }
-    if (!preserveHome) { store.rememberAllServers(false); store.rememberHomeServer(id) }
+    if (!preserveHome) {
+      store.rememberAllServers(false)
+      store.rememberHomeDevice(null)
+      store.rememberHomeServer(id)
+    }
     // Only keep a device group when the newly active profile is still one of its enabled members.
     val group = (groupOverride ?: if (preserveHome) previous.homeGroupId else null)?.let { groupId ->
-      previous.deviceGroups.firstOrNull { it.id == groupId && id in it.memberIds }
+      previous.deviceGroups.firstOrNull { it.id == groupId && id in it.memberHarnessIds(profiles) }
+    }
+    val homeDeviceId = if (group != null || !preserveHome) null else previous.homeDeviceId?.takeIf { did ->
+      previous.devices.any { it.id == did }
     }
     // A disabled previous home must not survive as the single-server projection.
     val homeServerId = previous.homeServerId?.takeIf { homeId ->
@@ -3894,22 +2207,17 @@ class LagoonController private constructor(private val appContext: Context) {
     // A reconnect to the same server keeps the open conversation's pending prompt; anything else goes back to its draft.
     returnQueuedToDrafts { it.serverId == id && it.sessionId == (sessionOverride ?: previous.sessionId) && id == previousServer }
     stopSingleConnection()
-    // The switch below installs a fresh state (refreshing = false). Retire the old refresh pass so
-    // its completion can neither block the next pull nor clear a newer indicator.
     reloadEpoch++
     reloadJob = null
     val token = generation
-    connectTrace.begin(token.toLong(), "连接 ${profile.kind.label}")
+    connectTrace.begin(token.toLong(), "连接 ${profile.protocol.label}")
     allOverview.start(profiles, include = setOfNotNull(id))
-    if (transcripts != null && profile.kind == ServerKind.OPENCODE) scope.launch(storeDispatcher) {
+    if (transcripts != null && profile.protocol == HarnessProtocol.OPENCODE_NATIVE) scope.launch(storeDispatcher) {
       attempt { transcripts.bindServer(id, transcriptIdentity(profile)) }.onFailure { Diagnostics.warn("TranscriptStore", "绑定服务器失败", it) }
     }
     val snapshot = allSnapshots[id]
-    // A blank draft owns the page while it is open: never restore the server's last conversation,
-    // even when loadAll reads the catalog again after this connect.
     val draftIntent = draftServerId == id
     val rememberedProject = projectOverride ?: draftProjectId.takeIf { draftIntent } ?: store.selectedProject(id)
-    // 恢复上次打开的会话时，不把服务端空白草稿恢复成聊天页；回到本地「新会话」草稿。
     val rememberedSession = if (draftIntent) null else (sessionOverride ?: store.selectedSession(id))?.takeIf { selected ->
       snapshot?.sessions?.firstOrNull { it.id == selected }?.blank != true
     }
@@ -3918,8 +2226,6 @@ class LagoonController private constructor(private val appContext: Context) {
     resolvedPermissions.clear()
     val configuration = rememberedSession?.let { store.configuration(id, it) } ?: SessionConfiguration()
     val defaults = store.newSessionDefaults(id)
-    // A reconnect to the same blank page keeps the reader's manual preset/model choice; switching
-    // to another server starts from that server's defaults because catalogs differ.
     val keepDraftSelection = draftIntent && previous.serverId == id && previous.sessionId == null
     val draftAgent = if (keepDraftSelection) previous.agent else defaults.agent
     val draftModel = if (keepDraftSelection) previous.model else defaults.model?.let { model ->
@@ -3932,13 +2238,24 @@ class LagoonController private constructor(private val appContext: Context) {
       else -> ""
     }
     store.select(id, rememberedProject, rememberedSession)
-    // Drop the pre-ledger “永久已完成” states and read markers; keep runs this device saw as still running.
     store.migrateTaskLedger(id)
-    updateState { latest -> LagoonState(profiles = profiles, sshHosts = previous.sshHosts,
-      deviceGroups = previous.deviceGroups, deviceGroupReset = previous.deviceGroupReset,
+    val domain = deviceCoordinator.state.value
+    val keychain = sshKeyCoordinator.state.value
+    updateState { latest -> LagoonState(
+      devices = domain.devices,
+      profiles = domain.profiles,
+      discoveryRevision = domain.discoveryRevision,
+      deviceRefreshInFlight = latest.deviceRefreshInFlight,
+      harnessLinkStatuses = sshHostManager.harnessStatusSnapshot(),
+      sshKeys = keychain.keys,
+      sshKeysRevision = keychain.revision,
+      deviceGroups = domain.deviceGroups,
+      deviceGroupReset = domain.deviceGroupReset,
+      migrationNotice = latest.migrationNotice,
       homeGroupId = group?.id,
+      homeDeviceId = homeDeviceId,
       serverId = id, loading = true, projectId = rememberedProject, sessionId = rememberedSession,
-      allServers = if (group != null) false else preserveHome && previous.allServers,
+      allServers = if (group != null || homeDeviceId != null) false else preserveHome && previous.allServers,
       homeServerId = homeServerId,
       allServerSnapshots = allSnapshots.toMap(), permissionPolicy = store.permissionPolicy(),
       workspaceCatalog = allSnapshots[id]?.workspaceCatalog.orEmpty(),
@@ -3946,7 +2263,8 @@ class LagoonController private constructor(private val appContext: Context) {
       permissions = snapshot?.permissions.orEmpty(), questions = snapshot?.questions.orEmpty(),
       autoApprovalFailures = snapshot?.autoApprovalFailures.orEmpty(), streamConnected = snapshot?.streamConnected == true,
       streamDownSince = 0L,
-      connection = ConnectionStatus(ConnectStage.CONNECTING, System.currentTimeMillis()), remoteRecovery = null,
+      connection = ConnectionStatus(ConnectStage.CONNECTING, System.currentTimeMillis()),
+      sshActionRequired = null,
       agent = if (draftIntent) draftAgent else configuration.agent,
       model = if (draftIntent) draftModel else configuration.model,
       agentChanged = if (draftIntent) {
@@ -3965,7 +2283,8 @@ class LagoonController private constructor(private val appContext: Context) {
       tasks = snapshot?.tasks ?: TaskReconciliation.restored(store.taskStates(id)), knownParents = store.taskParents(id), notices = store.sessionNotices(id), collapsedSections = store.collapsedSections(id), pinned = store.pinnedSessions(id),
       pendingAttachments = previous.pendingAttachments,
       modelOverrides = store.modelOverrides(id), modelVisibilityConfigured = store.modelVisibilityConfigured(id),
-      modelVariants = store.modelVariants(id), recentModels = store.recentModels(id), scopeProjectId = store.scope(id)).withForkUncertaintyFrom(latest) }
+      modelVariants = store.modelVariants(id), recentModels = store.recentModels(id), scopeProjectId = store.scope(id)
+    ).withForkUncertaintyFrom(latest) }
     if (state.value.sessions.isNotEmpty()) trace(token, ConnectMilestone.CACHE_PAINT)
     else paintCachedCatalog(id, token)
     rememberedSession?.let {
@@ -3974,9 +2293,6 @@ class LagoonController private constructor(private val appContext: Context) {
       restoreComposerInput(id, it, selectionRevision)
     }
     allOverview.selectionChanged(previousServer)
-    // A broken DSH Remote / SSH profile can fail while the client is being constructed (missing
-    // host, blank account). That used to escape connect() on the main thread and close the app;
-    // keep the page on its offline state and let the normal retry loop pick up a fixed profile.
     api = try {
       allOverview.client(id)
     } catch (error: Exception) {
@@ -3984,7 +2300,7 @@ class LagoonController private constructor(private val appContext: Context) {
       val reason = userFacingError(error, "连接失败")
       connectTrace.fail(token.toLong(), reason)
       updateState { it.copy(loading = false, connected = false, error = reason,
-        remoteRecovery = remoteFailure(error)?.kind?.recovery()) }
+        sshActionRequired = actionableSshFailure(error)) }
       if (permanentSshFailure(error)) {
         showPermanentFailure(reason)
         return
@@ -4009,16 +2325,11 @@ class LagoonController private constructor(private val appContext: Context) {
         val reason = userFacingError(error, "连接失败")
         connectTrace.fail(token.toLong(), reason)
         showOffline(id, token, reason)
-        if (token == generation) updateState { it.copy(remoteRecovery = remoteFailure(error)?.kind?.recovery()) }
-        // A missing remote executable, an unusable state directory or a changed host key never heals
-        // by retrying. Reconnecting every 60 s only hid the reason behind a fake countdown.
+        if (token == generation) updateState { it.copy(sshActionRequired = actionableSshFailure(error)) }
         if (permanentSshFailure(error)) {
           showPermanentFailure(reason)
           return@launch
         }
-        // A refresh while offline must be able to recover: retry the connection with backoff instead
-        // of leaving the user on a stale snapshot with no path back to a live stream (A10).
-        // Expired credentials do not heal by retrying quickly; keep probing at the slowest pace.
         scheduleReconnect(id, token, if (error.isAuthFailure) AUTH_RETRY_ATTEMPT else 0, reason)
       }
     }
@@ -4026,10 +2337,11 @@ class LagoonController private constructor(private val appContext: Context) {
   /** Opens immediately; loading the transcript does not change the originating home filter. */
   fun openConversation(target: SessionTarget) {
     clearDraftIntent()
-    if (store.profiles().none { it.id == target.serverId && it.effectiveEnabled }) {
+    val profiles = deviceCoordinator.profiles()
+    if (profiles.none { it.id == target.serverId && it.effectiveEnabled }) {
       updateState {
         it.copy(
-          message = if (store.profiles().any { profile -> profile.id == target.serverId }) "这个连接已禁用，请先在设备管理中启用" else "这个连接已移除",
+          message = if (profiles.any { profile -> profile.id == target.serverId }) "这个连接已禁用，请先在设备管理中启用" else "这个连接已移除",
           messageTone = FeedbackTone.WARNING
         )
       }
@@ -4039,7 +2351,6 @@ class LagoonController private constructor(private val appContext: Context) {
       connect(target.serverId, sessionOverride = target.sessionId, preserveHome = true)
     } else if (state.value.sessions.any { it.id == target.sessionId }) selectSession(target.sessionId)
     else {
-      // 先清掉上一个会话的输入：随后的 selectSession 会把它当作"重新选中"而保留，并异步填回本会话的草稿。
       updateState { it.copy(sessionId = target.sessionId, messages = emptyList(), draft = "", references = emptyList(), resources = mapOf("messages" to ResourceStatus(ResourceState.LOADING))) }
       resolveSession(target.sessionId) { if (state.value.serverId == target.serverId && state.value.sessionId == target.sessionId) selectSession(target.sessionId) }
     }
@@ -4062,7 +2373,7 @@ class LagoonController private constructor(private val appContext: Context) {
 
   private fun scheduleReconnect(id: String, token: Int, attempt: Int = 0, reason: String? = null) {
     if (token != generation || state.value.serverId != id) return
-    if (store.profiles().none { it.id == id && it.effectiveEnabled }) return
+    if (deviceCoordinator.profiles().none { it.id == id && it.effectiveEnabled }) return
     val delayMillis = (2_000L shl attempt.coerceAtMost(4)).coerceAtMost(60_000L)
     val now = System.currentTimeMillis()
     updateState { it.copy(connection = ConnectionStatus(ConnectStage.RETRYING, now, now + delayMillis, reason ?: retryReason(it.error))) }
@@ -4072,11 +2383,9 @@ class LagoonController private constructor(private val appContext: Context) {
     }
   }
   private suspend fun reconnect(id: String, token: Int, attempt: Int) {
-    val profile = store.profiles().firstOrNull { it.id == id && it.effectiveEnabled } ?: return
-    connectTrace.begin(token.toLong(), "重连 ${profile.kind.label} 第 ${attempt + 1} 次")
+    val profile = deviceCoordinator.profiles().firstOrNull { it.id == id && it.effectiveEnabled } ?: return
+    connectTrace.begin(token.toLong(), "重连 ${profile.protocol.label} 第 ${attempt + 1} 次")
     setStage(token, ConnectStage.CONNECTING)
-    // Rebuilds the client from the current profile; a still-broken DSH Remote / SSH setup must
-    // surface as an offline banner + retry, not as an uncaught coroutine exception.
     api = try {
       allOverview.client(id)
     } catch (error: Exception) {
@@ -4085,7 +2394,11 @@ class LagoonController private constructor(private val appContext: Context) {
       if (token == generation) {
         connectTrace.fail(token.toLong(), reason)
         showOffline(id, token, reason)
-        updateState { it.copy(remoteRecovery = remoteFailure(error)?.kind?.recovery()) }
+        updateState { it.copy(sshActionRequired = actionableSshFailure(error)) }
+        if (permanentSshFailure(error)) {
+          showPermanentFailure(reason)
+          return
+        }
         scheduleReconnect(id, token, if (error.isAuthFailure) AUTH_RETRY_ATTEMPT else attempt + 1, reason)
       }
       return
@@ -4104,7 +2417,11 @@ class LagoonController private constructor(private val appContext: Context) {
       val reason = userFacingError(error, "连接失败")
       if (token == generation) connectTrace.fail(token.toLong(), reason)
       if (token == generation) showOffline(id, token, reason)
-      if (token == generation) updateState { it.copy(remoteRecovery = remoteFailure(error)?.kind?.recovery()) }
+      if (token == generation) updateState { it.copy(sshActionRequired = actionableSshFailure(error)) }
+      if (permanentSshFailure(error)) {
+        showPermanentFailure(reason)
+        return
+      }
       scheduleReconnect(id, token, if (error.isAuthFailure) AUTH_RETRY_ATTEMPT else attempt + 1, reason)
     }
   }
@@ -4474,7 +2791,7 @@ class LagoonController private constructor(private val appContext: Context) {
         connected = true, cached = previous.cached && previous.sessionId != null, loading = false,
         error = null, degraded = degraded, lastContactAt = System.currentTimeMillis(),
         connection = if (previous.connection.stage == ConnectStage.READY) previous.connection else ConnectionStatus(ConnectStage.READY, System.currentTimeMillis()),
-        remoteRecovery = null,
+        sshActionRequired = null,
         projects = projects, workspaceCatalog = workspaceCatalog, sessions = nextSessions, knownParents = store.taskParents(serverId), tasks = states, shells = nextShells, notices = store.sessionNotices(serverId), collapsedSections = store.collapsedSections(serverId), sessionCursors = cursors, catalogComplete = cursors.isEmpty(),
         permissions = nextPermissions, questions = nextQuestions,
         projectId = (previous.projectId ?: store.selectedProject(serverId))?.takeIf { id -> projects.any { it.id == id } } ?: projects.firstOrNull()?.id,
@@ -4574,7 +2891,6 @@ class LagoonController private constructor(private val appContext: Context) {
    */
   fun reload(): Job {
     reloadJob?.takeIf { it.isActive }?.let { return it }
-    triggerPendingRemoteRevocationsDrain()
     val epoch = ++reloadEpoch
     updateState { it.copy(refreshing = true) }
     val foregroundRead = reloadConversation(deep = false)
@@ -4595,14 +2911,13 @@ class LagoonController private constructor(private val appContext: Context) {
   }
   /**
    * The remote session log was written by a newer DSH than the one our managed `dsh web` instance is
-   * running. The SSH link owns that process: reconnecting makes `RemoteDshBootstrap` compare the
-   * installed binary fingerprint with the recorded generation and restart only our own process.
+   * running. Force-reconnecting tears down the CONNECTED link so `SshDshBootstrap` compares the
+   * installed binary fingerprint with the recorded generation and restarts only our own process.
    */
   private fun reconnectManagedDshAfterUpgrade(serverId: String) {
-    val profile = store.profiles().firstOrNull { it.id == serverId } ?: return
-    val hostId = profile.sshHostId ?: return
-    Diagnostics.warn("LagoonController", "会话日志来自更新版本的 DSH，重连托管实例")
-    sshHostManager.retry(hostId)
+    if (deviceCoordinator.findHarness(serverId) == null) return
+    Diagnostics.warn("LagoonController", "会话日志来自更新版本的 DSH，强制重连托管实例")
+    sshHostManager.forceReconnectHarness(serverId, "远端 DSH 已更新，正在重新连接")
   }
 
   private fun reloadConversation(deep: Boolean = true): Job {
@@ -4632,8 +2947,7 @@ class LagoonController private constructor(private val appContext: Context) {
           scheduleReconnect(serverId, token, reason = "连接中断，正在重连")
         } else {
           updateState { state -> state.copy(error = reason,
-            remoteRecovery = remoteFailure(error)?.kind?.recovery()
-              ?: if (error.isAuthFailure) RemoteRecoveryKind.LOGIN else state.remoteRecovery,
+            sshActionRequired = actionableSshFailure(error) ?: state.sshActionRequired,
             connection = if (state.connection.stage == ConnectStage.READY) state.connection
               else ConnectionStatus(ConnectStage.RETRYING, System.currentTimeMillis(), state.connection.retryAt, retryReason(reason))) }
         }
@@ -4641,26 +2955,18 @@ class LagoonController private constructor(private val appContext: Context) {
     }.also { refresh = it }
   }
 
-  /**
-   * The controller's own fallback reconcile only runs while the app is visible or the monitoring
-   * service is up. The process-level SSE subscriptions in AllServersOverview stay connected, so
-   * background notifications still work; this only stops the extra polling pass.
-   */
   private fun streamAllowed() = foreground || monitoring
 
   /** The app came to the foreground: re-read the server unless that just happened, and resume live events. */
   fun onForeground() {
     foreground = true
     synchronizeQuestionPresentation()
-    triggerPendingRemoteRevocationsDrain()
     backgroundStop?.cancel()
-    // After a long pause the OS may have frozen or silently dropped the sockets; reconnect rather than
-    // trust a stream that only looks open.
     val away = backgroundedAt.takeIf { it > 0 }?.let { System.currentTimeMillis() - it } ?: 0
     backgroundedAt = 0
     if (away > STREAM_RESUME_RESTART_MILLIS) allOverview.restartStreams()
     sshHostManager.kickAll()
-    allOverview.start(store.profiles(), include = setOfNotNull(state.value.serverId))
+    allOverview.start(deviceCoordinator.profiles(), include = setOfNotNull(state.value.serverId))
     ensureMonitoring(state.value)
     val server = state.value.serverId ?: return
     if (connecting?.isActive == true || refresh?.isActive == true) return
@@ -4948,7 +3254,7 @@ class LagoonController private constructor(private val appContext: Context) {
       }
       // 任务清单是整值投影：每次 `todo_write` 都带来完整列表，事件本身就是最新真值。
       "session.todos.changed" -> if (sessionId.isNotBlank() && sessionId == mutable.value.sessionId) {
-        val todos = props.arr("todos").toRemoteTodos()
+        val todos = props.arr("todos").toDshTodos()
         updateState { it.copy(todos = todos) }
       }
       // 目标阶段/阻塞/完成由 Host 的 goal 快照变化驱动；activation 只能通过 `goals/get` 重读。
@@ -5173,7 +3479,7 @@ class LagoonController private constructor(private val appContext: Context) {
         val client = runCatching { allOverview.client(server) }.getOrNull() ?: return@launch
         val pending = attempt { client.sessionPermissions(session) }.getOrNull()
         val sameClient = runCatching { allOverview.client(server) === client }.getOrDefault(false)
-        if (store.profiles().none { it.id == server } || state.value.serverId == server || !sameClient) return@launch
+        if (deviceCoordinator.profiles().none { it.id == server } || state.value.serverId == server || !sameClient) return@launch
         if (pending != null && pending.none { it.id == permission.id }) { allOverview.settled(server, permission.id); allOverview.refresh(server); return@launch }
         if (!state.value.permissionPolicy.visible(permission, allSnapshots[server]?.autoApprovalFailures.orEmpty())) return@launch
       }
@@ -5264,7 +3570,7 @@ class LagoonController private constructor(private val appContext: Context) {
   private suspend fun loadChoices(directory: String, token: Int = generation, force: Boolean = false) {
     val snapshot = state.value
     val serverId = snapshot.serverId ?: return
-    val sessionScopedModels = snapshot.server?.protocol in setOf(HarnessProtocolId.ANTIGRAVITY_ACP, HarnessProtocolId.OPENCODE_ACP)
+    val sessionScopedModels = snapshot.server?.protocol?.isAcp == true
     val revision = selectionRevision
     val choiceEpoch = choicesEpoch
     val cached = if (force || sessionScopedModels) null else choicesCache.get(serverId, directory)
@@ -5304,7 +3610,7 @@ class LagoonController private constructor(private val appContext: Context) {
     updateState { current ->
       val agentList = agents.getOrDefault(current.agents)
       val catalog = models.getOrElse {
-        if (current.server?.protocol in setOf(HarnessProtocolId.ANTIGRAVITY_ACP, HarnessProtocolId.OPENCODE_ACP)) emptyList() else current.modelCatalog
+        if (current.server?.protocol?.isAcp == true) emptyList() else current.modelCatalog
       }
       val serverId = current.serverId
       val variants = serverId?.let(store::modelVariants) ?: current.modelVariants
@@ -5644,7 +3950,7 @@ class LagoonController private constructor(private val appContext: Context) {
     val revision = selectionRevision
     val requestSequence = ++messageSequence
     fun current() = token == generation && revision == selectionRevision && state.value.serverId == serverId && state.value.sessionId == session.id &&
-      requestSequence == messageSequence && (state.value.server?.protocol != HarnessProtocolId.CODEX_APP_SERVER || api === client)
+      requestSequence == messageSequence && (state.value.server?.protocol != HarnessProtocol.CODEX || api === client)
     // Capture before any HTTP/cache suspension, not after the page returns. Live events replace
     // immutable Message values, letting us protect only the IDs that changed during this read.
     val readStart = state.value.messages.associateBy { it.id }
@@ -5670,7 +3976,7 @@ class LagoonController private constructor(private val appContext: Context) {
     // todo list and the durable goal projection, like the official client's syncs.
     val (result, composer) = coroutineScope {
       val page = async { attempt {
-        if (state.value.server?.protocol == HarnessProtocolId.CODEX_APP_SERVER && !codexSelectionCoordinator.apply(::current) {
+        if (state.value.server?.protocol == HarnessProtocol.CODEX && !codexSelectionCoordinator.apply(::current) {
             client.selectCodexSession(session)
           }) throw CancellationException("Codex 会话选择已变化")
         // A cacheable conversation opens from its verified stored run plus only what is new on the server.
@@ -5898,29 +4204,86 @@ class LagoonController private constructor(private val appContext: Context) {
     if (server == state.value.serverId) updateState { it.copy(newSessionAgent = clean) }
   }
   /** Phone-local default model; the strength stays in [modelVariants], keyed by the model. */
-  fun setNewSessionModel(model: ModelChoice?, serverId: String? = state.value.serverId) {
+  fun setNewSessionModel(
+    model: ModelChoice?,
+    serverId: String? = state.value.serverId,
+    catalog: List<ModelInfo> = state.value.modelCatalog
+  ) {
     val server = serverId ?: return
     val clean = model?.let { candidate ->
-      state.value.modelCatalog.firstOrNull { it.key == modelKey(candidate) }?.choice?.copy(variant = null)
+      catalog.firstOrNull { it.key == modelKey(candidate) }?.choice?.copy(variant = null)
         ?: candidate.copy(variant = null)
     }
     store.rememberNewSessionDefaults(server, store.newSessionDefaults(server).copy(model = clean))
     if (server == state.value.serverId) updateState { it.copy(newSessionModel = clean) }
   }
   /** The default strength for one model; null means "follow the model". */
-  fun setNewSessionVariant(modelKey: String, variant: String?, serverId: String? = state.value.serverId) {
+  fun setNewSessionVariant(
+    modelKey: String,
+    variant: String?,
+    serverId: String? = state.value.serverId,
+    catalog: List<ModelInfo> = state.value.modelCatalog
+  ) {
     val server = serverId ?: return
-    val info = state.value.modelCatalog.firstOrNull { it.key == modelKey } ?: return
-    val clean = variant?.takeIf { id -> info.variants.any { it.id == id } }
+    val info = catalog.firstOrNull { it.key == modelKey }
+    val clean = if (info != null) variant?.takeIf { id -> info.variants.any { it.id == id } }
+      else variant?.takeIf(String::isNotBlank)
     store.rememberModelVariant(server, modelKey, clean)
     if (server == state.value.serverId) updateState { it.copy(modelVariants = store.modelVariants(server)) }
   }
+
+  /** 读取任意 Harness 的本地默认新建会话配置（用于 Harness 详情页，不再错绑当前活跃会话）。 */
+  fun newSessionDefaultsFor(harnessId: String): NewSessionDefaults = store.newSessionDefaults(harnessId)
+
+  /** 读取任意 Harness 的本地模型可见性配置（overrides, configured）。 */
+  fun modelVisibilityFor(harnessId: String): Pair<Map<String, Boolean>, Boolean> =
+    store.modelOverrides(harnessId) to store.modelVisibilityConfigured(harnessId)
+
+  /** 读取任意 Harness 的本地模型强度配置。 */
+  fun modelVariantsFor(harnessId: String): Map<String, String> = store.modelVariants(harnessId)
+
+  /** 为任意已启用的 Harness 加载其 Agent 与模型目录（供 Harness 详情页与模型管理使用）。 */
+  suspend fun loadCatalogForHarness(harnessId: String, force: Boolean = false): Pair<List<AgentChoice>, List<ModelInfo>> {
+    val directory = if (harnessId == state.value.serverId) {
+      state.value.executionDirectory ?: state.value.homeDirectory
+    } else {
+      val snapshot = state.value.allServerSnapshots[harnessId]
+      snapshot?.projects?.firstOrNull()?.directory
+        ?: snapshot?.sessions?.firstOrNull()?.directory
+        ?: store.localProjects(harnessId).firstOrNull()?.directory
+    }.orEmpty()
+    if (!force) {
+      choicesCache.get(harnessId, directory)?.let { cached ->
+        return cached.agents to cached.models
+      }
+    }
+    val client = clientFor(harnessId) ?: error("此 Harness 尚未连接或已停用")
+    val (agents, models) = coroutineScope {
+      val a = async { attempt { client.agents(directory) }.getOrDefault(emptyList()) }
+      val m = async { attempt { client.modelCatalog(directory) }.getOrDefault(emptyList()) }
+      a.await() to m.await()
+    }
+    if (harnessId == state.value.serverId) {
+      updateState { current ->
+        current.copy(
+          agents = agents.ifEmpty { current.agents },
+          modelCatalog = models.ifEmpty { current.modelCatalog },
+          models = models.map { it.choice }.ifEmpty { current.models }
+        )
+      }
+    }
+    return agents to models
+  }
+
   /**
-   * Loads the agent/model catalog for the Settings page even when no conversation is open.  The
-   * blank page normally learns it from loadChoices when a workspace is chosen; Settings can be
-   * opened straight from the home list, so it needs its own trigger.
+   * Loads the agent/model catalog for the Settings page even when no conversation is open.
    */
   fun loadDefaultCatalog(force: Boolean = false, serverId: String? = state.value.serverId) {
+    val target = serverId ?: state.value.serverId ?: return
+    if (target != state.value.serverId) {
+      scope.launch { runCatching { loadCatalogForHarness(target, force) } }
+      return
+    }
     val current = state.value
     if (current.server == null) return
     if (!force && current.agents.isNotEmpty() && current.modelCatalog.isNotEmpty()) return
@@ -5928,23 +4291,30 @@ class LagoonController private constructor(private val appContext: Context) {
     val token = generation
     scope.launch { loadChoices(directory.orEmpty(), token, force) }
   }
-  /** A switch from the phone's "管理模型" list; it overrides the official default rule for this server. */
-  fun setModelVisible(model: ModelInfo, visible: Boolean) {
-    val server = state.value.serverId ?: return
-    val current = state.value
-    // The first edit materializes the current all-visible catalog as an allow-list, so changing one
-    // switch does not accidentally hide every other model.
-    val baseline = if (current.modelVisibilityConfigured) current.modelOverrides
-    else current.modelCatalog.associate { it.key to true }
+  /** A switch from the phone's "管理模型" list; it overrides the official default rule for this Harness. */
+  fun setModelVisible(
+    model: ModelInfo,
+    visible: Boolean,
+    serverId: String? = state.value.serverId,
+    catalog: List<ModelInfo> = state.value.modelCatalog
+  ) {
+    val server = serverId ?: return
+    val configured = store.modelVisibilityConfigured(server)
+    val baseline = if (configured) store.modelOverrides(server)
+    else catalog.associate { it.key to true }
     val next = baseline + (model.key to visible)
     store.rememberModelOverrides(server, next)
-    updateState { it.copy(modelOverrides = next, modelVisibilityConfigured = true) }
+    if (server == state.value.serverId) {
+      updateState { it.copy(modelOverrides = next, modelVisibilityConfigured = true) }
+    }
   }
-  /** Returns to the unconfigured state: every model currently offered by the server is visible. */
-  fun resetModelVisibility() {
-    val server = state.value.serverId ?: return
+  /** Returns to the unconfigured state: every model currently offered by the Harness is visible. */
+  fun resetModelVisibility(serverId: String? = state.value.serverId) {
+    val server = serverId ?: return
     store.clearModelVisibility(server)
-    updateState { it.copy(modelOverrides = emptyMap(), modelVisibilityConfigured = false) }
+    if (server == state.value.serverId) {
+      updateState { it.copy(modelOverrides = emptyMap(), modelVisibilityConfigured = false) }
+    }
   }
   /** Copies picked phone files into the cache off the main thread; each rejection is reported once. */
   fun addLocalAttachments(uris: List<android.net.Uri>) {
@@ -6067,14 +4437,14 @@ class LagoonController private constructor(private val appContext: Context) {
     val result = op.client.searchSessionContent(query) ?: throw ApiException(501, "此 Host 未提供服务器正文搜索")
     requireContentSearchOperation(op, expected)
     check(sequence == contentSearchSequence) { "已有更新的搜索请求，旧结果已丢弃" }
-    return SessionContentSearchPage(expected, result, op.client, op.route, op.token).also { contentSearchPage = it }
+    return SessionContentSearchPage(expected, result, op.client, op.token).also { contentSearchPage = it }
   }
   /** Resolve authorization again on explicit open; search never selects, resumes or creates a Session. */
   internal suspend fun openSearchHit(page: SessionContentSearchPage, sessionId: String, onOpen: (SessionTarget) -> Unit) {
     val op = contentSearchOperation(page.target)
     fun requirePage() {
       requireContentSearchOperation(op, page.target)
-      check(contentSearchPage === page && op.client === page.client && op.route == page.route && op.token == page.generation) {
+      check(contentSearchPage === page && op.client === page.client && op.token == page.generation) {
         "搜索结果已过期，请在原 Host 重新搜索"
       }
       check(page.result.items.any { it.sessionId == sessionId }) { "此会话不在该次服务器搜索结果中" }
@@ -6200,20 +4570,6 @@ class LagoonController private constructor(private val appContext: Context) {
   }
 
   // ---- Device-local projects ----
-  /** Explicitly registers an existing directory with a Remote Codex Host. */
-  fun createCodexProject(directory: String, expectedServer: ServerProfile): Job = act("project-add", directory) { op ->
-    val server = op.snapshot.server
-    check(server?.protocol == HarnessProtocolId.CODEX_APP_SERVER && server.remoteHostId != null &&
-      ConnectionRouteAdmission.sameLeafRoute(expectedServer, server)) { "连接已变化或不支持 Codex Host 项目登记" }
-    val project = op.client.createCodexProject(directory) ?: throw ApiException(501, "此 Host 未提供 Codex 项目登记")
-    if (!op.isCurrent(this)) return@act
-    val resolved = project.copy(serverId = op.serverId)
-    val projects = store.addLocalProject(op.serverId, resolved)
-    op.commit { withSummary(it.copy(projects = projects, projectId = resolved.id)) }
-    store.rememberLocation(resolved.id, null)
-    loadChoices(resolved.directory, generation)
-  }
-
   /** Resolve [directory] on the server and register the canonical project on this device. */
   fun addProject(directory: String): Job = act("project-add", directory) { op ->
     val project = op.client.projectAt(directory) ?: error("服务器没有解析出这个目录对应的项目")
@@ -6307,7 +4663,7 @@ class LagoonController private constructor(private val appContext: Context) {
    * draft into that conversation.
    */
   fun enterDraft(serverId: String, projectId: String? = null, keepComposer: Boolean = false) {
-    if (store.profiles().none { it.id == serverId && it.effectiveEnabled }) return
+    if (store.findProfile(serverId)?.effectiveEnabled != true) return
     val current = state.value
     val keptText = if (keepComposer) liveDraft(current) else ""
     draftServerId = serverId
@@ -6396,8 +4752,7 @@ class LagoonController private constructor(private val appContext: Context) {
     // A DSH workspace in `workspace/follow` is already the canonical project. Register it locally
     // without a `projectAt` round trip (which used to open a second workspace/follow and wait up to
     // 20 seconds before the new-session page could be used).
-    val kind = current.server?.kind
-    val knownWorkspace = if (kind == ServerKind.DSH || kind == ServerKind.DSH_REMOTE) {
+    val knownWorkspace = if (current.server?.protocol == HarnessProtocol.DSH) {
       current.workspaceCatalog.firstOrNull { normalizedDirectory(it.directory) == unique }
     } else null
     if (knownWorkspace != null) {
@@ -6582,24 +4937,24 @@ class LagoonController private constructor(private val appContext: Context) {
    * switched server/project cannot write its result into the new context (A02).
    */
   private data class OperationContext(val token: Int, val serverId: String, val client: HarnessClient,
-    val revision: Long, val snapshot: LagoonState, val route: ConnectionRouteSnapshot? = null) {
-    fun connectionCurrent(c: LagoonController) = token == c.generation && c.state.value.serverId == serverId && c.api === client && !client.isClosed &&
-      (route == null || runCatching {
-        val current = c.store.profiles().firstOrNull { it.id == serverId } ?: return@runCatching false
-        c.store.runtimeRoute(current) == route
-      }.getOrDefault(false))
+    val revision: Long, val snapshot: LagoonState, val route: ServerProfile? = null) {
+    fun connectionCurrent(c: LagoonController): Boolean {
+      if (token != c.generation || c.state.value.serverId != serverId || c.api !== client || client.isClosed) return false
+      val expected = route ?: return true
+      return runCatching { c.store.runtimeProfile(expected).sameRoute(expected) }.getOrDefault(false)
+    }
     fun isCurrent(c: LagoonController) = connectionCurrent(c) && revision == c.selectionRevision &&
       c.state.value.projectId == snapshot.projectId && c.state.value.sessionId == snapshot.sessionId && c.state.value.executionDirectory == snapshot.executionDirectory
   }
   private fun beginOperation(targetDirectory: String? = null): OperationContext {
     val current = state.value
     check(current.connected && current.server?.effectiveEnabled != false) { "数据尚未同步或连接已停用，请重新连接后操作" }
-    val saved = store.profiles().firstOrNull { it.id == current.serverId } ?: error("连接资料已移除")
-    val route = store.runtimeRoute(current.server ?: saved)
+    val serverId = current.serverId ?: error("请先连接服务器")
+    val candidate = current.server ?: store.findProfile(serverId) ?: error("连接资料已移除")
+    val route = store.runtimeProfile(candidate)
     val client = requireNotNull(api) { "请先连接服务器" }
     check(!client.isClosed) { "连接路由已更新，请重新连接后操作" }
-    return OperationContext(generation, current.serverId ?: error("请先连接服务器"),
-      client, selectionRevision, current, route)
+    return OperationContext(generation, serverId, client, selectionRevision, current, route)
   }
   private fun OperationContext.commit(update: (LagoonState) -> LagoonState) {
     if (isCurrent(this@LagoonController)) updateState(update)
@@ -6610,8 +4965,7 @@ class LagoonController private constructor(private val appContext: Context) {
   /** DSH workspaces are identified by an opaque id; a session created without it is invisible to
    *  clients that enumerate by workspace. Prefer the catalog entry for the exact directory. */
   private fun workspaceIdFor(snapshot: LagoonState, directory: String): String? {
-    val kind = snapshot.server?.kind ?: return null
-    if (kind != ServerKind.DSH && kind != ServerKind.DSH_REMOTE) return null
+    if (snapshot.server?.protocol != HarnessProtocol.DSH) return null
     return snapshot.workspaceCatalog.firstOrNull {
       normalizedDirectory(it.directory) == normalizedDirectory(directory)
     }?.id?.takeIf(String::isNotBlank)
@@ -6791,7 +5145,7 @@ class LagoonController private constructor(private val appContext: Context) {
     workRevision++
     // ACP cancellation is a notification, not confirmation that the turn has ended.
     // The eventual prompt result supplies the authoritative terminal state.
-    if (op.snapshot.server?.protocol !in setOf(HarnessProtocolId.ANTIGRAVITY_ACP, HarnessProtocolId.OPENCODE_ACP))
+    if (op.snapshot.server?.protocol?.isAcp != true)
       op.commitConnection { withSummary(it.copy(tasks = it.tasks + (session.id to TaskState(session.id, TaskPhase.ABORTED, "任务已停止", it.tasks[session.id]?.since ?: System.currentTimeMillis(), System.currentTimeMillis())))) }
   }
   /** Renames [target] (a session id from the home list) or, by default, the open session. */
@@ -6833,7 +5187,7 @@ class LagoonController private constructor(private val appContext: Context) {
     try {
       client.deleteSession(session)
     } catch (error: java.io.IOException) {
-      if (op.snapshot.server?.protocol == HarnessProtocolId.CODEX_APP_SERVER) {
+      if (op.snapshot.server?.protocol == HarnessProtocol.CODEX) {
         if (error is ApiException) throw ApiException(error.status,
           "${error.message.orEmpty()}；请刷新并核对会话状态后再操作", error.code, error.details)
         throw java.io.IOException("删除结果未知，请重新连接并核对会话状态后再操作", error)
@@ -6897,12 +5251,12 @@ class LagoonController private constructor(private val appContext: Context) {
     val children = op.client.children(source)
     check(op.connectionCurrent(this) && expected.sameSource(state.value)) { "分叉核对结果所属连接已变化" }
     val page = ApiPage((children + recent.items).distinctBy { it.id }, recent.next)
-    return ForkInspection(expected, page, op.client, op.route, op.token).also { forkInspection = it }
+    return ForkInspection(expected, page, op.client, op.token).also { forkInspection = it }
   }
   internal fun acknowledgeForkInspection(inspection: ForkInspection) {
     val op = beginOperation()
     check(forkInspection === inspection && inspection.target.sameSource(op.snapshot) &&
-      op.client === inspection.client && op.route == inspection.route && op.token == inspection.generation) { "原分叉 Host 或核对结果已变化" }
+      op.client === inspection.client && op.token == inspection.generation) { "原分叉 Host 或核对结果已变化" }
     forkInspection = null
     op.commitConnection { it.copy(uncertainForks = it.uncertainForks.filterNot { target -> target.sameSource(op.snapshot) }) }
   }
@@ -7105,5 +5459,18 @@ private data class QueuedPrompt(val serverId: String, val sessionId: String, val
 /** Rows that may be written to the transcript cache: everything except local pending prompts. */
 internal fun List<Message>.persistable(): List<Message> = filterNot { it.id.startsWith(PENDING_PREFIX) }
 
-/** Who a saved server is for the transcript store: a profile edited to another address or account is another server. */
-internal fun transcriptIdentity(profile: ServerProfile): String = "${profile.kind.wire}|${profile.url.trim().trimEnd('/').lowercase()}|${profile.username}"
+/**
+ * Who a saved server is for the transcript store: preserves the exact legacy wire prefix from
+ * v5.3.x (`opencode`, `dsh`, `codex`, `antigravity-acp`, `opencode-acp`) so upgrading to pure SSH
+ * keeps existing SQLite transcripts intact without wiping cached history.
+ */
+internal fun transcriptIdentity(profile: ServerProfile): String {
+  val legacyWire = when (profile.protocol) {
+    HarnessProtocol.OPENCODE_NATIVE -> "opencode"
+    HarnessProtocol.DSH -> "dsh"
+    HarnessProtocol.CODEX -> "codex"
+    HarnessProtocol.ANTIGRAVITY_ACP -> "antigravity-acp"
+    HarnessProtocol.OPENCODE_ACP -> "opencode-acp"
+  }
+  return "$legacyWire|${profile.url.trim().trimEnd('/').lowercase()}|${profile.username}"
+}

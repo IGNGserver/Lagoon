@@ -23,7 +23,7 @@ import kotlinx.coroutines.sync.withLock
 import org.json.JSONArray
 import org.json.JSONObject
 
-/** Google Antigravity ACP projection. Remote carriers translate their restricted Host methods. */
+/** ACP projection (Antigravity ACP / OpenCode ACP) over an SSH stdio carrier. */
 class AgyApi(
   private val transport: AgyTransport,
   private val providerId: String = "antigravity",
@@ -84,7 +84,7 @@ class AgyApi(
           transport.close()
           synchronized(stateLock) {
             localEchoes.clear()
-            subscribers.forEach { it.close(IOException("AGY 连接已断开，请重新连接并核对会话")) }
+            subscribers.forEach { it.close(IOException("$healthLabel 连接已断开，请重新连接并核对会话")) }
             subscribers.clear()
           }
         }
@@ -95,8 +95,11 @@ class AgyApi(
     startCollector()
     return try { transport.call(method, params) }
     catch (error: ApiException) {
-      if (error.status == -32000 && error.message.orEmpty().contains("auth", ignoreCase = true))
-        throw ApiException(401, "开发机上的 Antigravity 尚未登录，请在开发机运行 agy acp --login")
+      if (error.status == -32000 && error.message.orEmpty().contains("auth", ignoreCase = true)) {
+        if (providerId == "antigravity")
+          throw ApiException(401, "开发机上的 Antigravity 尚未登录，请在开发机运行 agy acp --login")
+        throw ApiException(401, "开发机上的 $healthLabel 尚未登录或未就绪")
+      }
       throw error
     }
   }
@@ -105,11 +108,11 @@ class AgyApi(
       payload.put("sessionID", sessionId), System.currentTimeMillis())
     synchronized(stateLock) {
       val failed = subscribers.filter { !it.trySend(item).isSuccess }
-      failed.forEach { it.close(IOException("AGY 事件流过载，请重新读取会话")); subscribers.remove(it) }
+      failed.forEach { it.close(IOException("$healthLabel 事件流过载，请重新读取会话")); subscribers.remove(it) }
     }
   }
   override fun capabilities() = ApiCapabilities(deleteSession = false, fileBrowser = transport.filesAvailable,
-    fileSearch = false, fileReferences = !transport.remote, terminal = transport.terminalAvailable)
+    fileSearch = false, fileReferences = true, terminal = transport.terminalAvailable)
   override suspend fun discoverCapabilities(): ApiCapabilities { transport.discoverCapabilities(); return capabilities() }
   override suspend fun health(): String {
     startCollector()
@@ -291,20 +294,17 @@ class AgyApi(
   override suspend fun abort(session: Session) {
     if (session.id !in active) throw ApiException(409, "没有已确认运行的 $healthLabel 轮次")
     transport.notify("session/cancel", JSONObject().put("sessionId", session.id))
-    if (!transport.remote) {
-      requests.entries.filter { it.value.sessionId == session.id }.forEach { (id, pending) ->
-        if (requests.remove(id, pending)) runCatching { transport.respond(pending.wireId, JSONObject().put("outcome", JSONObject().put("outcome", "cancelled"))) }
-      }
-      questions.entries.filter { it.value.sessionId == session.id }.forEach { (id, pending) ->
-        if (questions.remove(id, pending)) runCatching { transport.respond(pending.wireId, JSONObject().put("action", "cancel")) }
-      }
+    requests.entries.filter { it.value.sessionId == session.id }.forEach { (id, pending) ->
+      if (requests.remove(id, pending)) runCatching { transport.respond(pending.wireId, JSONObject().put("outcome", JSONObject().put("outcome", "cancelled"))) }
+    }
+    questions.entries.filter { it.value.sessionId == session.id }.forEach { (id, pending) ->
+      if (questions.remove(id, pending)) runCatching { transport.respond(pending.wireId, JSONObject().put("action", "cancel")) }
     }
   }
   override suspend fun send(session: Session, text: String, agent: String?, model: ModelChoice?, references: List<FileReference>,
     inline: List<InlineFile>, id: String, delivery: Delivery): Unit = admissionLocks.computeIfAbsent(session.id) { Mutex() }.withLock {
-    if (references.isNotEmpty() && transport.remote) throw ApiException(501, "Remote AGY 暂不支持文件引用")
     val running = session.id in active
-    if (running && (transport.remote || delivery == Delivery.QUEUE)) throw ApiException(409, "此 AGY 连接不支持当前轮次的排队或插话")
+    if (running && delivery == Delivery.QUEUE) throw ApiException(409, "此 $healthLabel 连接不支持当前轮次的排队")
     load(session.id)
     if (model != null) selectModel(session.id, model)
     val content = JSONArray()
@@ -319,15 +319,15 @@ class AgyApi(
       val uri = java.net.URI("file", "", "$root/$relative", null).toASCIIString()
       content.put(JSONObject().put("type", "resource_link").put("uri", uri).put("name", relative.substringAfterLast('/')))
     }
-    if (inline.size > 4) throw ApiException(400, "AGY 每条消息最多支持 4 张图片")
+    if (inline.size > 4) throw ApiException(400, "$healthLabel 每条消息最多支持 4 张图片")
     val parts = mutableListOf<MessagePart>()
     if (text.isNotBlank()) parts.add(MessagePart("$id:text", "text", text = text))
     for ((index, file) in inline.withIndex()) {
       val match = Regex("^data:(image/(?:png|jpeg|webp|gif));base64,([A-Za-z0-9+/]+={0,2})$").matchEntire(file.uri)
-        ?: throw ApiException(400, "AGY 只接受 PNG、JPEG、WebP 或 GIF 图片")
-      if (imageData(match.groupValues[1], match.groupValues[2]) == null) throw ApiException(400, "AGY 图片无效或超过 8 MiB")
-      if (!transport.remote && transport.initialization?.optJSONObject("agentCapabilities")?.optJSONObject("promptCapabilities")?.opt("image") == false)
-        throw ApiException(501, "当前 AGY 不支持图片输入")
+        ?: throw ApiException(400, "$healthLabel 只接受 PNG、JPEG、WebP 或 GIF 图片")
+      if (imageData(match.groupValues[1], match.groupValues[2]) == null) throw ApiException(400, "$healthLabel 图片无效或超过 8 MiB")
+      if (transport.initialization?.optJSONObject("agentCapabilities")?.optJSONObject("promptCapabilities")?.opt("image") == false)
+        throw ApiException(501, "当前 $healthLabel 不支持图片输入")
       content.put(JSONObject().put("type", "image").put("mimeType", match.groupValues[1]).put("data", match.groupValues[2]))
       parts.add(MessagePart("$id:image:$index", "file", path = file.uri, title = file.name, mime = match.groupValues[1]))
     }
@@ -406,9 +406,6 @@ class AgyApi(
   override suspend fun modelCatalogForSession(directory: String, session: Session?): List<ModelInfo> {
     if (session == null || session.directory != directory) return emptyList()
     load(session.id)
-    if (transport.remote && !config.containsKey(session.id)) {
-      rpc("lagoon/modelConfig", JSONObject().put("sessionId", session.id)).optJSONArray("configOptions")?.let { config[session.id] = it }
-    }
     return catalogFor(session.id)
   }
   private fun catalogFor(id: String): List<ModelInfo> {
@@ -553,17 +550,6 @@ class AgyApi(
     val method = frame.str("method")
     val params = frame.optJSONObject("params") ?: JSONObject()
     val sessionId = params.str("sessionId")
-    if (transport.remote && method == "session/update" && !frame.optBoolean("lagoonReplay")) {
-      synchronized(stateLock) {
-        liveDuringReplay[sessionId]?.let { buffered ->
-          val size = frame.toString().length
-          if (buffered.frames.size >= 256 || buffered.chars + size > 16L * 1024 * 1024)
-            throw IOException("AGY 历史加载期间的实时事件过多，请重新连接")
-          buffered.frames.add(frame); buffered.chars += size
-          return
-        }
-      }
-    }
     if (method == "session/request_permission" && frame.has("id") && sessionId.isNotBlank()) {
       val wire = frame.opt("id")?.takeIf { it is String || it is Number } ?: return
       val id = "${wire.javaClass.simpleName}:$wire"

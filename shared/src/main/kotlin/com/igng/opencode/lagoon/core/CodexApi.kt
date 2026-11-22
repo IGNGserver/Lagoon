@@ -115,10 +115,10 @@ class CodexApi(private val transport: CodexTransport) : HarnessClient {
     archive = ArchiveEndpoint(ActionEndpoint("RPC", "thread/archive")), documented = false,
     deleteSession = supportsDelete(), fork = true
   )
-  private fun supportsDelete() = !transport.remote && !transport.isClosed && transport.serverVersion == "0.167.2"
+  private fun supportsDelete() = !transport.isClosed && transport.serverVersion == "0.167.2"
   override suspend fun discoverCapabilities(): ApiCapabilities {
     // The SSH process advertises its version only after initialization.
-    if (!transport.remote && transport.serverVersion == null) rpc("account/read", JSONObject().put("refreshToken", false))
+    if (transport.serverVersion == null) rpc("account/read", JSONObject().put("refreshToken", false))
     return capabilities()
   }
   override suspend fun health(): String {
@@ -184,32 +184,11 @@ class CodexApi(private val transport: CodexTransport) : HarnessClient {
   override suspend fun projectAt(directory: String): Project? {
     if (directory.isBlank()) return projects().firstOrNull()
     if (!isAbsoluteCodexPath(directory)) throw ApiException(400, "请选择绝对目录")
-    if (transport.remote) {
-      // Host verifies the path against its workspace authority and realpath.
-      val listing = rpc("dsh/directoryList", JSONObject().put("path", directory))
-      val confirmed = listing.str("path").takeIf(::isAbsoluteCodexPath) ?: throw ApiException(502, "Codex 未确认目录")
-      return Project("codex:cwd:$confirmed", confirmed, confirmed.substringAfterLast('/').ifBlank { confirmed })
-    }
     val metadata = rpc("fs/getMetadata", JSONObject().put("path", directory))
     if (!metadata.optBoolean("isDirectory")) throw ApiException(400, "所选路径不是目录")
     return Project("codex:cwd:$directory", directory, directory.substringAfterLast('/').ifBlank { directory })
   }
-  override suspend fun createCodexProject(path: String): Project? {
-    if (!transport.remote) return null
-    require(isAbsoluteCodexPath(path) && path.none(Char::isISOControl)) { "请选择绝对目录" }
-    val label = path.trimEnd('/', '\\').substringAfterLast('/').substringAfterLast('\\').ifBlank { "Codex 项目" }
-    val admission = projectAdmissions.computeIfAbsent(path) { java.util.UUID.randomUUID().toString() }
-    val response = rpc("project/create", JSONObject().put("name", label)
-      .put("roots", JSONArray().put(JSONObject().put("path", path))).put("idempotencyKey", admission))
-    val raw = response.optJSONObject("project") ?: throw ApiException(502, "Codex 未确认新项目；请刷新项目列表")
-    val id = raw.str("id")
-    val roots = raw.optJSONArray("roots")?.objects().orEmpty()
-    if (id.isBlank() || roots.size != 1 || !isAbsoluteCodexPath(roots[0].str("path")))
-      throw ApiException(502, "Codex 返回了无效项目；请刷新项目列表")
-    projectAdmissions.remove(path, admission)
-    val root = roots[0].str("path")
-    return Project(id, root, raw.str("name").ifBlank { label })
-  }
+  override suspend fun createCodexProject(path: String): Project? = null
   override suspend fun rootSessionsPage(directory: String?, cursor: String?, size: Int): ApiPage<Session> {
     ensureCollector()
     // App Server lists active and archived threads separately. Carry both phases in the opaque
@@ -311,7 +290,6 @@ class CodexApi(private val transport: CodexTransport) : HarnessClient {
   /** Only these protocol errors prove the request was rejected before a turn was admitted. */
   private fun definiteAdmissionRejection(error: Throwable): Boolean = when (error) {
     is ApiException -> error.status in setOf(-32601, -32602) || error.code in setOf("METHOD_NOT_ALLOWED", "METHOD_NOT_FOUND", "INVALID_MESSAGE")
-    is RemoteRpcException -> error.code in setOf("METHOD_NOT_ALLOWED", "METHOD_NOT_FOUND", "INVALID_MESSAGE")
     else -> false
   }
   private fun releaseFinishedTask(sessionId: String) {
@@ -321,69 +299,9 @@ class CodexApi(private val transport: CodexTransport) : HarnessClient {
       }
     }
   }
-  override suspend fun monitorCodexSessions(active: List<Session>, selectedId: () -> String?) {
-    // A separate SSH stdio process cannot subscribe to turns owned by another process.
-    if (!transport.remote) return
-    ensureCollector()
-    subscriptionMutex.withLock {
-      val selected = selectedId()?.takeIf(String::isNotBlank)
-      // The monitor receives the authoritative current foreground selection for this binding.
-      foregroundId = selected
-      val candidates = active.asSequence().filter { it.id.isNotBlank() && it.id != selected }
-        .distinctBy { it.id }.sortedByDescending { it.activityAt }.toList()
-      val wanted = candidates.take(maxMonitoredThreads).map { it.id }.toSet()
-      monitoredIds = wanted
-      val stale = subscriptions.filter { it !in wanted && it != foregroundId && it !in taskIds }
-      stale.forEach { id ->
-        // Selection may change during this pass; the selected thread takes priority over cleanup.
-        if (id != selectedId() && id != foregroundId) {
-          transport.unsubscribe(id)
-          subscriptions.remove(id)
-        }
-      }
-      if (selected != null && subscriptions.add(selected)) {
-        try { transport.subscribe(selected) } catch (error: Throwable) { subscriptions.remove(selected); throw error }
-      }
-      for (session in candidates.take(maxMonitoredThreads)) {
-        sessions[session.id] = session
-        if (subscriptions.add(session.id)) {
-          try { transport.subscribe(session.id) } catch (error: Throwable) { subscriptions.remove(session.id); throw error }
-        }
-      }
-      if (candidates.size > maxMonitoredThreads) throw ApiException(429, "Codex 后台运行会话超过远端订阅上限，部分会话未监控")
-    }
-  }
+  override suspend fun monitorCodexSessions(active: List<Session>, selectedId: () -> String?) = Unit
   override suspend fun messagesPage(id: String, cursor: String?, size: Int): ApiPage<Message> {
     ensureCollector()
-    if (transport.remote) {
-      val params = JSONObject().put("threadId", id).put("maxMessages", size.coerceIn(1, 100))
-      if (cursor != null) params.put("beforeSeq", cursor.toLongOrNull() ?: throw ApiException(400, "历史游标无效"))
-      val revision = synchronized(stateGate) { stateRevisions[id] ?: 0L }
-      val value = rpc("dsh/sessionHistory", params)
-      val records = value.optJSONArray("records") ?: throw ApiException(502, "Codex 历史响应缺少记录")
-      val hasMore = value.opt("hasMore") as? Boolean ?: throw ApiException(502, "Codex 历史分页格式错误")
-      if (value.has("activeTurnId") && !value.isNull("activeTurnId") && value.opt("activeTurnId") !is String)
-        throw ApiException(502, "Codex 活动轮次格式错误")
-      val activeTurn = value.str("activeTurnId")
-      synchronized(stateGate) {
-        if ((stateRevisions[id] ?: 0L) == revision) {
-          if (activeTurn.isNotBlank() && turnKey(id, activeTurn) !in completedTurns &&
-            (id !in eventBusy || active[id] == null || active[id] == activeTurn)) {
-            active[id] = activeTurn; busy.add(id)
-          } else if (id !in eventBusy) {
-            // bb33 omits activeTurnId for an idle thread; absence is the idle snapshot.
-            active.remove(id); busy.remove(id)
-          }
-          bumpStateRevision(id)
-        }
-      }
-      val messages = remoteRecords(id, records)
-      val next = if (hasMore) {
-        objects(records, "records").mapNotNull { it.optJSONObject("event")?.optLong("seq") }.minOrNull()?.toString()
-          ?: throw ApiException(502, "Codex 历史分页缺少游标")
-      } else null
-      return ApiPage(messages, next)
-    }
     val params = JSONObject().put("threadId", id).put("limit", size.coerceIn(1, 100))
       .put("sortDirection", "desc").put("itemsView", "full")
     cursor?.let { params.put("cursor", it) }
@@ -410,39 +328,7 @@ class CodexApi(private val transport: CodexTransport) : HarnessClient {
     return ApiPage(nativeTurns(id, turns))
   }
   override suspend fun inbox(id: String) = emptyList<Message>()
-  override suspend fun activeSessions(): Set<String> {
-    if (!transport.remote) return busy.toSet()
-    // A single catalog page is not an authoritative inventory: missing pages must never clear
-    // background watches. Limit the read explicitly and report an incomplete scan as degraded.
-    val activeOnHost = mutableSetOf<String>()
-    val idleOnHost = mutableSetOf<String>()
-    val seen = mutableSetOf<String>()
-    var cursor: String? = null
-    var pages = 0
-    do {
-      if (++pages > 64) throw ApiException(429, "Codex 活动会话目录超过扫描上限")
-      val page = listThreads(null, cursor, 100)
-      for (row in objects(page, "data")) {
-        val id = row.str("id").takeIf(String::isNotBlank) ?: throw ApiException(502, "Codex 线程缺少 ID")
-        val status = row.optJSONObject("status")?.str("type").orEmpty()
-        when (status) {
-          "active" -> activeOnHost.add(id)
-          "idle", "notLoaded" -> idleOnHost.add(id)
-          "systemError" -> throw ApiException(502, "Codex 线程状态异常，后台监控未更新")
-          else -> throw ApiException(502, "Codex 线程状态未知，后台监控未更新")
-        }
-      }
-      cursor = nextCursor(page)
-      if (cursor != null && !seen.add(cursor!!)) throw ApiException(502, "Codex 线程分页游标重复")
-    } while (cursor != null)
-    // Own live turns may not have materialized in the catalog yet; never drop their watch.
-    return synchronized(stateGate) {
-      // A successful complete scan can retire old snapshot-derived busy state, but never a
-      // newer live/locally-admitted turn whose terminal event has not yet been observed.
-      idleOnHost.filterNot(eventBusy::contains).forEach { id -> bumpStateRevision(id); busy.remove(id); active.remove(id) }
-      activeOnHost + eventBusy + active.keys
-    }
-  }
+  override suspend fun activeSessions(): Set<String> = busy.toSet()
   override suspend fun shells(directory: String): List<ShellJob> = unsupported()
 
   override suspend fun createSession(directory: String, title: String, workspaceId: String?): Session {
@@ -505,10 +391,9 @@ class CodexApi(private val transport: CodexTransport) : HarnessClient {
     val input = JSONArray()
     if (text.isNotBlank()) input.put(JSONObject().put("type", "text").put("text", text))
     inline.forEach { file ->
-      val match = Regex("^data:(image/(?:png|jpeg|webp|gif));base64,([A-Za-z0-9+/]+={0,2})$").matchEntire(file.uri)
+      Regex("^data:(image/(?:png|jpeg|webp|gif));base64,([A-Za-z0-9+/]+={0,2})$").matchEntire(file.uri)
         ?: throw ApiException(400, "Codex 只接受 PNG、JPEG、WebP 或 GIF 图片")
-      if (transport.remote) input.put(JSONObject().put("type", "image").put("mediaType", match.groupValues[1]).put("data", match.groupValues[2]))
-      else input.put(JSONObject().put("type", "image").put("url", file.uri))
+      input.put(JSONObject().put("type", "image").put("url", file.uri))
     }
     require(input.length() > 0) { "消息不能为空" }
     val existing = active[session.id]
@@ -530,7 +415,7 @@ class CodexApi(private val transport: CodexTransport) : HarnessClient {
         loaded.add(session.id)
       }
       val params = JSONObject().put("threadId", session.id).put("input", input)
-      if (!transport.remote) params.put("clientUserMessageId", id)
+        .put("clientUserMessageId", id)
       model?.let { params.put("model", it.modelId); it.variant?.let { variant -> params.put("effort", variant) } }
       mutationIssued = true
       val response = rpc("turn/start", params)
@@ -543,12 +428,7 @@ class CodexApi(private val transport: CodexTransport) : HarnessClient {
         }
       }
     } catch (error: Throwable) {
-      // A failed resume precedes the prompt mutation. Once a mutation has been dispatched,
-      // only an explicit method/parameter rejection proves that it was not admitted.
-      // Remote image sends use a multi-stage transfer: even INVALID_MESSAGE can describe a
-      // failed response-chunk read after the Host already executed the mutation.
-      val ambiguousTransfer = transport.remote && inline.isNotEmpty()
-      rejected = existing == null && newTaskLease && (!mutationIssued || (!ambiguousTransfer && definiteAdmissionRejection(error)))
+      rejected = existing == null && newTaskLease && (!mutationIssued || definiteAdmissionRejection(error))
       throw error
     } finally {
       // Cancellation or a lost response may still have admitted the turn. Never replay it or
@@ -596,9 +476,9 @@ class CodexApi(private val transport: CodexTransport) : HarnessClient {
           add("此请求还申请在本会话剩余时间内写入此目录及其下内容：$root。服务端是否会应用该授权尚不确定。")
         else if (root != null && root != JSONObject.NULL && root !is String)
           add("服务端返回的授权目录格式无法识别，请拒绝此请求。")
-        add(if (transport.remote) "允许一次：批准此次文件修改。" else "允许一次：批准此次文件修改。Codex 的会话级批准（此处不可选择）会对同一批文件的后续修改免于询问。")
+        add("允许一次：批准此次文件修改。Codex 的会话级批准（此处不可选择）会对同一批文件的后续修改免于询问。")
       }.joinToString("\n")
-      "item/permissions/requestApproval" -> if (transport.remote) "允许一次：授权本轮有效。" else "允许一次：授权本轮有效。Codex 的会话级授权（此处不可选择）在整个会话有效。"
+      "item/permissions/requestApproval" -> "允许一次：授权本轮有效。Codex 的会话级授权（此处不可选择）在整个会话有效。"
       else -> ""
     }
     return PermissionRequest(id, request.sessionId, sessions[request.sessionId]?.directory.orEmpty(),
@@ -765,7 +645,6 @@ class CodexApi(private val transport: CodexTransport) : HarnessClient {
   }
 
   private fun rejectUnsupportedRequest(wireId: Any, sessionId: String, key: String? = null) {
-    if (transport.remote) return // Remote Host has no generic JSON-RPC error response operation.
     scope.launch {
       val message = try {
         transport.respondError(wireId, -32601, "Unsupported server request")
@@ -785,7 +664,7 @@ class CodexApi(private val transport: CodexTransport) : HarnessClient {
       if (root != null && root != JSONObject.NULL && root !is String)
         throw ApiException(502, "服务端返回的授权目录格式无法识别，请拒绝此请求")
     }
-    val decision = when (reply) { "once" -> "accept"; "always" -> if (transport.remote) throw ApiException(501, "Remote 不支持本会话授权") else "acceptForSession"; else -> "decline" }
+    val decision = when (reply) { "once" -> "accept"; "always" -> "acceptForSession"; else -> "decline" }
     val response = if (pending.method == "item/permissions/requestApproval") {
       val granted = if (decision == "accept" || decision == "acceptForSession") pending.params.optJSONObject("permissions") ?: JSONObject() else JSONObject()
       JSONObject().put("permissions", granted).apply { if (decision == "acceptForSession") put("scope", "session") }
@@ -856,14 +735,6 @@ class CodexApi(private val transport: CodexTransport) : HarnessClient {
   override suspend fun diff(session: Session): List<FileChange> = unsupported()
   override suspend fun files(directory: String, path: String, session: Session?): List<FileNode> {
     val absolute = codexPath(directory, path)
-    if (transport.remote) {
-      val listing = rpc("dsh/directoryList", JSONObject().put("path", absolute))
-      val entries = listing.optJSONArray("entries") ?: throw ApiException(502, "Codex 目录格式错误")
-      return objects(entries, "entries").mapNotNull { entry ->
-        val name = entry.str("name"); val child = entry.str("path")
-        if (name.isBlank() || !isAbsoluteCodexPath(child)) null else FileNode(name, "directory", child)
-      }
-    }
     val listing = rpc("fs/readDirectory", JSONObject().put("path", absolute))
     val entries = listing.optJSONArray("entries") ?: throw ApiException(502, "Codex 目录格式错误")
     return objects(entries, "entries").mapNotNull { entry ->
@@ -874,7 +745,6 @@ class CodexApi(private val transport: CodexTransport) : HarnessClient {
     }
   }
   override suspend fun fileContent(directory: String, path: String, session: Session?): FileContent {
-    if (transport.remote) return unsupported()
     val result = rpc("fs/readFile", JSONObject().put("path", codexPath(directory, path)))
     val data = result.opt("dataBase64") as? String ?: throw ApiException(502, "Codex 文件内容缺失")
     if (data.length > 4 * 1024 * 1024) throw ApiException(413, "文件过大")
@@ -888,7 +758,7 @@ class CodexApi(private val transport: CodexTransport) : HarnessClient {
    * arbitrary paths or turn history loading into a potentially large background file transfer.
    */
   override suspend fun previewFile(directory: String, path: String, session: Session?): FilePreview? {
-    if (transport.remote || session == null || localImages[session.id]?.contains(path) != true) return null
+    if (session == null || localImages[session.id]?.contains(path) != true) return null
     val result = rpc("fs/readFile", JSONObject().put("path", path))
     val encoded = result.opt("dataBase64") as? String ?: throw ApiException(502, "Codex 图片内容缺失")
     if (encoded.length > ((MAX_LOCAL_IMAGE_BYTES + 2) / 3) * 4) throw ApiException(413, "图片超过预览大小上限")
@@ -1010,46 +880,6 @@ class CodexApi(private val transport: CodexTransport) : HarnessClient {
       }
     }
     return messages
-  }
-
-  /** Remote Host's documented DSH-shaped history is a projection, not a DSH session store. */
-  private fun remoteRecords(sessionId: String, records: JSONArray): List<Message> {
-    val result = mutableListOf<Message>()
-    val tools = mutableMapOf<String, Int>()
-    var turn = 0L
-    for (record in objects(records, "records")) {
-      val event = record.optJSONObject("event") ?: throw ApiException(502, "Codex 历史记录格式错误")
-      val data = event.optJSONObject("data") ?: JSONObject()
-      val seq = event.optLong("seq")
-      val at = event.optLong("time")
-      when (event.str("type")) {
-        "turn/start" -> turn = data.optLong("turn")
-        "user/message" -> dshInputMessage(sessionId, seq, at, turn.takeIf { it > 0 }, data)?.let(result::add)
-        "assistant/message" -> {
-          val message = data.obj("message")
-          val id = message.str("id").ifBlank { "codex:$sessionId:$seq" }
-          val projected = JSONObject().put("id", id).put("type", "assistant").put("content", message.arr("content")).toMessage()
-          result += projected.copy(created = at, turnId = "turn:$turn", sequence = seq)
-        }
-        "tool/call" -> {
-          val callId = data.str("callId"); if (callId.isBlank()) continue
-          val part = MessagePart(callId, "tool", tool = data.str("name"), title = data.str("name"),
-            input = data.opt("arguments")?.toString().orEmpty(), status = "running")
-          tools[callId] = result.size
-          result += Message("$callId:message", "assistant", at, listOf(part), turnId = "turn:$turn", sequence = seq)
-        }
-        "tool/result" -> {
-          val payload = data.obj("message").arr("content").objects().firstOrNull { it.str("type") == "tool-result" } ?: continue
-          val callId = payload.str("toolCallId")
-          val index = tools[callId] ?: continue
-          result[index] = result[index].copy(parts = result[index].parts.map { part ->
-            if (part.id != callId) part else part.copy(status = if (payload.optBoolean("isError")) "error" else "completed",
-              output = payload.arr("content").contentText())
-          }, completedAt = at.takeIf { it > 0 })
-        }
-      }
-    }
-    return result
   }
 
   private fun projectEvent(frame: JSONObject): List<ServerEvent> {

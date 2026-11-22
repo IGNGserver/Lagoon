@@ -8,21 +8,21 @@ internal data class GoalMutationTarget(
   val revision: Int
 ) {
   fun matches(state: LagoonState): Boolean = state.server?.let { current ->
-    current.id == profile.id && ConnectionRouteAdmission.sameLeafRoute(profile, current) &&
+    current.sameRoute(profile) &&
       state.sessionId == sessionId && state.goal?.id == goalId && state.goal.revision == revision
   } == true
 }
 
 /** Unknown activation or budget is not permission to rearm automatic continuation. */
-internal fun RemoteGoal.canResumeGoal(): Boolean =
+internal fun DshGoal.canResumeGoal(): Boolean =
   (paused || blocked || active && activation == "disarmed") &&
     maxGoalRounds?.let { cap -> roundsStarted?.let { it >= 0 && it < cap } } == true
 
 internal fun LagoonState.canManageGoal(): Boolean = connected && !cached && server?.effectiveEnabled == true &&
-  server?.kind in setOf(ServerKind.DSH, ServerKind.DSH_REMOTE) && session != null
+  server?.protocol == HarnessProtocol.DSH && session != null
 
 /** An older read cannot roll back an acknowledged edit or clear/replace a changed goal. */
-internal fun reconcileGoalRead(current: RemoteGoal?, started: RemoteGoal?, observed: RemoteGoal?): RemoteGoal? {
+internal fun reconcileGoalRead(current: DshGoal?, started: DshGoal?, observed: DshGoal?): DshGoal? {
   if (current?.id == observed?.id && current != null && observed != null) {
     return if (observed.revision >= current.revision) observed else current
   }
@@ -31,5 +31,5 @@ internal fun reconcileGoalRead(current: RemoteGoal?, started: RemoteGoal?, obser
 }
 
 /** A mutation result is authoritative only for its original goal, never a subsequently replaced one. */
-internal fun reconcileGoalMutation(current: RemoteGoal?, expected: GoalMutationTarget, result: RemoteGoal): RemoteGoal? =
+internal fun reconcileGoalMutation(current: DshGoal?, expected: GoalMutationTarget, result: DshGoal): DshGoal? =
   if (current?.id == expected.goalId && current.revision <= result.revision) result else current

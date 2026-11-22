@@ -1,21 +1,17 @@
 package com.igng.opencode.lagoon.core
 
 /**
- * The persistent state [AllServersOverview] reads and writes: credentials, the device-registered
+ * The persistent state [AllServersOverview] reads and writes: the device-registered
  * project list, the task ledger and the unread-result ledger. Android implements it with
  * SharedPreferences ([ServerStore]).
  */
 interface OverviewStore {
-  /** Admit a fresh saved route before returning even a cached client; Android checks committed graph. */
+  /** Admit a fresh saved route before returning even a cached client. */
   fun runtimeProfile(expected: ServerProfile): ServerProfile {
-    check(expected.effectiveEnabled) { "连接或其所属接入源/主机已停用" }
+    check(expected.effectiveEnabled) { "此 Harness 或所属设备已停用" }
     return expected
   }
-  fun credentials(id: String): ServerCredentials
-  /** Owner-issued cookie rotations are not new auth inputs; explicit username/password edits are. */
-  fun requireCurrentAuthentication(id: String, captured: ServerCredentials) = Unit
-  /** Persists a session cookie a client minted for [url]; ignored once the profile moved to another address. */
-  fun rememberCookie(id: String, url: String, cookie: String)
+  fun credentials(id: String): ServerCredentials = ServerCredentials()
   fun localProjects(id: String): List<Project>
   fun permissionPolicy(): PermissionPolicy
   fun refreshMode(): RefreshMode
