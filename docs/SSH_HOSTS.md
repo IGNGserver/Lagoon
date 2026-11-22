@@ -1,112 +1,31 @@
 # SSH 设备
 
-Lagoon 使用 SSH 连接 Linux、macOS 或 WSL 电脑。一台 SSH 设备可以分别添加 DeepSeek Harness
-(DSH)、OpenCode、OpenCode ACP、Codex 和 Antigravity；设备地址、登录信息与主机指纹由这些
-Harness 共用。
-SSH 接入源、设备和 Harness 的身份与开关规则见 [DEVICE_MODEL.md](DEVICE_MODEL.md)。
+Lagoon 通过 SSH 连接 Linux、macOS 或 WSL 开发机，这是本应用唯一的设备连接方式。一台 SSH 设备可按需挂载并独立启停 **DeepSeek Harness (DSH)**、**OpenCode 2.x Native**、**OpenCode ACP**、**Codex** 和 **Antigravity ACP**；设备地址、登录凭据与主机指纹由同一设备上的全部 Harness 共享。
+
+设备与 Harness 的模型、身份与存储契约见 [`DEVICE_MODEL.md`](DEVICE_MODEL.md)。
 
 ## 添加与发现
 
-1. 填写地址、用户名和验证方式。地址支持 `user@host:port` 或 `ssh -p 端口 user@host`；
-   电脑上的 `-i` 文件不能直接用于手机，需要导入或选择密钥。不支持的 SSH 命令选项会提示，
-   不会被静默忽略。
-2. 点「保存并检测」，核对 SSH 主机密钥的类型和 SHA-256 指纹。之后应用保存设备，登录 SSH，
-   只读发现已安装或注册的 Harness。发现不安装、不启动、也不停止远端程序。
-3. 在设备页添加需要的 Harness。打开设备页本身只显示已有结果；「刷新发现」才会重新检测。
-   部分检测失败、过期和尚未验证的结果会保留相应说明。
+1. 点「+ 添加设备」直达 SSH 设备表单，填写地址、用户名和验证方式（密码 / 密钥 / 密钥优先）。地址支持 `user@host:port` 或 `ssh -p 端口 user@host`；不支持的 SSH 命令选项会明确提示，不会静默忽略。
+2. 点「保存并检测」，先核对 SSH 主机密钥的类型和 `SHA256:` 指纹。确认后保存设备、跳入设备详情页并执行一次只读发现。发现不安装、不启动、也不停止任何远端程序。
+3. 也可以先离线保存，稍后在设备详情页或首页状态条确认指纹。地址或端口变化后旧指纹不会沿用；指纹或密钥类型变化时拒绝连接，并在重新信任前展示旧值与新值。
+4. 在设备详情页按需添加或开关 Harness。打开设备页仅展示缓存结果，「刷新发现」才会再次连接探测。
 
-也可以离线保存设备，稍后从设备页检测并确认指纹。指纹或类型变化时连接会被拒绝；重新信任前
-会显示旧值与新值。地址或端口变化后旧指纹不会沿用。设备页提供对已启用 Harness 的「重试连接」。
-SSH 密码、私钥及口令由 Android Keystore 加密保存；交互式验证（包括一次性验证码）按服务器提示
-逐项输入，只在前台、本次握手中使用，不会自动填入已保存密码或私钥口令。
+SSH 密码、私钥、口令与硬件/生物识别密钥均由 Android Keystore 保护；交互式验证（含一次性验证码）仅在前台本次握手中使用，不落盘。
 
-SSH 发现会在一条经过指纹验证的连接上分别检查各 Harness；一个检查失败不会伪装成其他程序
-未安装。OpenCode 2 的默认注册和开发通道注册是不同槽位：默认文件为
-`$XDG_STATE_HOME/opencode/service.json`（未设 XDG 时为 `~/.local/state/opencode/service.json`），
-开发通道为同目录的 `service-local.json`。已有默认槽位与已确认的默认路径复用原有记录；其他
-显式注册路径保留各自身份。未发现默认服务时可在电脑上执行 `opencode service start` 后刷新。
-该命令由 [OpenCode 官方文档](https://github.com/anomalyco/opencode/blob/dev/services/site/src/docs/content/troubleshooting.mdx)说明。
+## 5 种 Harness 的 SSH 运行时
 
-发现不只读文件：同一次只读探测还会查看 `opencode` 可执行文件与版本，并对注册里的 loopback
-端口发一次有界 `GET /api/info`（带注册文件自己的密码）。因此「注册文件还在，但服务已经退出」
-会显示成「服务未运行（注册可能已过期）」，而不是「已发现」。注册文件由其他用户拥有或任何人
-可写时拒绝使用；同组可写仍可使用，但会提示 `chmod 600`。服务重启后 pid/端口会变化，连接会
-自动重读一次注册；仍然不一致才报错。
+同一台设备的全部 Harness 共用 `SshTransportPool` 中的**一条已认证 JSch 物理会话**（开启底层 SSH KeepAlive，支持网络切换自动探活恢复），按传输形态分为两类：
 
-OpenCode ACP 是另一条独立协议：发现会检查 `opencode acp --help` 是否声明 Agent Client Protocol，
-连接时直接在该 SSH 连接上运行 `opencode acp` 并用 JSON-RPC 通信。它不需要服务注册文件、loopback
-转发、进程归属证明或 Python，1.x 与 2.x 都可用；代价是能力以 ACP 为准（没有归档、删除、分叉、
-回退、终端等原生 HTTP 才有的动作，界面上相应入口不出现）。两者可同时添加，互不影响。
+1. **本地隧道型（DSH、OpenCode Native）**：
+   - 使用每链路隔离的 `SshForwarder`（本地随机 `127.0.0.1` 端口 + 32 字节随机接入令牌）与隔离的 OkHttp `ConnectionPool`，并在发送凭据前经 `SshVerifiedTunnel` 证明远端 loopback（支持 `127.0.0.1` 与 `[::1]`）监听套接字的进程属主。
+   - **DSH**：由 `SshDshBootstrap` 在 `~/.lagoon-ssh-dsh/` 下管理 Lagoon 自己的 `dsh web --host 127.0.0.1 --port 0 --no-open` 实例（使用 `set -o noclobber` 原子启动锁、进程代次与安装指纹 `web.ver` 校验；只读兼容复用可验证的旧 `~/.dsh-app-remote/`，绝不干扰用户已运行的桌面版或其它客户端）。启动命令与默认工作目录配置在 DSH Harness 详情中，修改它们不会断开同机其他 Harness。
+   - **OpenCode Native**：附着 `$XDG_STATE_HOME/opencode/service.json`（或显式路径如 `service-local.json`），要求严格属主证明；应用不接管进程，但支持用户在设备详情/Harness 详情/首页状态条显式触发「启动或重启服务」（`opencode service start|restart`）。
+2. **标准流型（Codex、Antigravity ACP、OpenCode ACP）**：
+   - 共用 `SshStdioRpcTransport` 在复用的 SSH 会话上打开非 PTY exec 通道，按协议收发 JSONL / JSON-RPC 2.0 帧，并通过同一连接池执行 SFTP 只读工作区浏览（ACP）或目录查询（AGY）。
+   - 同样暴露实时 `SshLinkStatus`、支持网络切换恢复与显式重试。
 
-在 Harness 详情页可以对 OpenCode 执行「启动或重启服务」（等价于在设备上运行
-`opencode service start`/`restart`）：这是用户点的一次显式动作，发现流程永远不会启动或停止
-进程。应用不接管该进程，也不会在退出时结束它。
+## 限制与验证
 
-DSH、Codex 和 Antigravity 的发现会检查可执行程序；找到程序不等于已登录或可正常工作，实际
-状态以连接后返回的信息为准。对自定义 DSH 启动命令，发现不会运行该命令，也不能因找不到全局
-`dsh` 就断定自定义命令不可用。
-
-## DSH 进程与本地连接
-
-DSH 是允许多实例的服务（每个 `dsh web` 进程有独立的启动令牌和端口），所以这台电脑上**已经**
-在运行的 `dsh web`（桌面版、命令行、另一台手机）不会阻止 Lagoon 连接，也不会被 Lagoon 停止。
-Lagoon 只管理自己记录的那一份：状态目录为 `~/.lagoon-ssh-dsh/`，含进程 ID、进程启动时间、
-启动命令、工作目录、日志和启动锁。令牌只用于当前运行代次，错误信息中的 `token=` 会脱敏。
-对旧版 Lagoon 或 dsh-Go 的 `~/.dsh-app-remote/`，应用只读检查，仅在用户、进程代次、启动命令
-都符合时复用；无法确认时直接忽略该记录并启动自己的实例，绝不向它发信号。
-
-记录过期按「过期」处理而不是「冲突」：进程已退出、启动时间或 boot id 不符、日志里没有启动
-链接、启动命令改过、目录权限被放宽，都会重新启动一份；只有 `~/.lagoon-ssh-dsh/` 本身是符号
-链接或属于别的用户时才拒绝（此时请在电脑上处理该路径）。应用自己的一代进程如果还能证明身份
-（PID + 启动时间），会先正常结束再启动新的，避免留下孤儿进程。启动锁是 `~/.lagoon-ssh-dsh/
-.bootstrap.lock` 文件，用 `set -C`（O_EXCL）独占创建，文件内容即持有者 PID：等待方在持有者
-进程消失时立即接管，因此不需要 `flock`、`python3` 等额外解释器；不用目录锁是因为并非所有
-文件系统都能保证并发 `mkdir` 只有一个成功。
-
-托管实例还绑定 **安装指纹**：启动时把 `dsh` 可执行文件（跟随符号链接后）的 `路径|mtime:size` 记录到
-`~/.lagoon-ssh-dsh/web.ver`；复用前重新计算并逐字比较。DSH 升级/重装后指纹变化，旧进程会被判定为
-过期并只重启“可证明由 Lagoon 启动”的那一代，避免旧进程读不了新版本写入的会话日志（例如 `team/mode`
-事件被旧版 session-persistence 以「unknown to this harness」拒绝）。旧版 Lagoon 留下的记录没有
-`web.ver`，会保守地替换一次；自定义启动命令（wrapper）不绑定全局 dsh 版本，保持旧的复用规则。
-
-需要新实例时，默认运行 `dsh web --host 127.0.0.1 --port 0 --no-open`；用户配置的启动命令也会
-追加这些选项。首次启动会初始化 `~/.dsh/profiles/web`（安装依赖），因此启动等待上限为 180 秒。
-工作目录不存在时直接报错。自定义命令由用户输入并经远端 shell 执行；添加设备或刷新发现不会
-执行它。关闭应用不会停止已启动的远端 DSH。
-
-DSH 和 OpenCode 连接前，会对远端 loopback 上实际接收连接的进程、注册信息和进程代次进行
-验证，再发送登录令牌、Cookie 或 Basic 凭据。该证明每代连接只做一次：远端有 `python3`
-（macOS 还需 `lsof`）时由辅助程序核对 socket 属主；缺少这些工具时降级为「启动记录校验」
-（PID、启动时间、boot id 与本次启动相符），并在诊断里提示降级，不会因此拒绝连接。
-判定为其它进程占用时才拒绝并提示检查权限或环境。Android 本机的转发端口另有进程内随机接入
-凭据，其他应用不能仅凭本机端口访问远端服务。DSH 请求的 `Host` 与远端 loopback 地址保持
-一致；每个 SSH 绑定使用独立连接池，避免不同隧道复用同一 loopback 端口的连接。
-Codex 与 Antigravity 使用各自的 SSH stdio 协议。
-
-DSH 审批或消息提交后如果连接中断、结果无法确认，应用保留待办或草稿并提示先检查远端状态，
-不会因网络失败自动重复执行；切换 Agent 被拒绝、附件读取失败时也不会悄悄发送不完整的消息。
-
-## 限制和验证
-
-- 需要 SSH 登录后的 POSIX shell、可用的远端 exec 通道及 loopback 访问。Windows 原生 cmd /
-  PowerShell 暂不支持此模式，请使用 WSL 或其他已支持的接入方式。
-- 远端 OpenCode/DSH 的进程身份检查依赖操作系统允许当前用户读取相关进程与 socket 信息。
-  缺少 `python3`/`lsof` 时按上面的降级规则连接；只有辅助程序明确判定 socket 属于其它进程时
-  才要求修复远端环境后重试。
-- 用户指定的自定义 DSH 命令和已有第三方进程不会被自动重写或终止。
-- 自动化测试使用临时目录、回环 SSH 服务和虚拟凭据。真实主机集成测试默认跳过；其中会终止测试
-  专用 DSH 进程的场景还要求显式设置 `LAGOON_SSH_IT_ISOLATED=1` 和隔离启动命令，不能指向
-  正在使用的服务。
-- Android 真机、实际目标 SSH 服务器、OpenCode/DSH 版本与不同服务器的认证策略仍需按目标环境
-  验收；纯 JVM 测试不能替代这些检查。
-
-## 主要代码
-
-| 文件 | 作用 |
-|---|---|
-| `shared/.../SshHost.kt` | SSH 地址、配置、认证与连接状态 |
-| `app/.../core/ssh/SshHostManager.kt` | 主机连接共享、只读发现与生命周期 |
-| `app/.../core/ssh/RemoteDshBootstrap.kt` | DSH 托管目录、受限复用和启动 |
-| `app/.../core/ssh/SshForwarder.kt` / `SshVerifiedTunnel.kt` | 本地接入验证与远端 socket 身份验证 |
-| `app/.../core/ssh/JschSshTransport.kt` | JSch 主机密钥、认证、exec 和转发 |
-| `app/.../ui/SshHostForm.kt` / `DeviceManagementScreen.kt` | 配置、指纹确认、检测和设备管理 |
+- 需要 SSH 登录后的 POSIX shell、可用 exec 通道及 loopback 转发。Windows 原生 cmd / PowerShell 暂不支持，请使用 WSL。
+- 自动化测试基于临时目录、回环 `sshd`（Apache MINA SSHD）与虚拟凭据验证；真实开发机与 Android 真机仍需按目标环境验收。

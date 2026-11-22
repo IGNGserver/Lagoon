@@ -17,11 +17,6 @@ class SshTransportOwnershipTest {
     override fun probeTunnel(host: String, port: Int, timeoutMillis: Long) = !isClosed
     override fun ping(timeoutMillis: Long) = !isClosed && healthy
   }
-  private class Channel : SshRuntimeChannel {
-    var closes = 0
-    override val isClosed get() = closes > 0
-    override fun close() { closes++ }
-  }
   private val config = SshHostConfig("source", "host", "example.test", user = "user", hostKeyFingerprint = "pin")
 
   @Test fun poolSharesPhysicalTransportButReleasesChildrenIndependently() {
@@ -80,50 +75,5 @@ class SshTransportOwnershipTest {
     assertTrue(replacement.ping(100))
     assertEquals(1, connections[0].closes)
     replacement.close()
-  }
-
-  @Test fun runtimeSiblingsAndRepeatedLeasesAreIndependent() {
-    val transport = Transport()
-    val session = SshTransportSession(transport)
-    val dshChannel = Channel()
-    val opChannel = Channel()
-    val dsh = session.acquire(SshServiceKey("dsh"), SshServiceLifecycleOwner.MANAGED,
-      factory = SshRuntimeChannelFactory { _, _ -> dshChannel })
-    val op = session.acquire(SshServiceKey("opencode"), SshServiceLifecycleOwner.EXTERNAL,
-      factory = SshRuntimeChannelFactory { _, _ -> opChannel })
-    val op2 = session.acquire(SshServiceKey("opencode"), SshServiceLifecycleOwner.EXTERNAL,
-      factory = SshRuntimeChannelFactory { _, _ -> error("should share existing") })
-    dsh.close(); dsh.close()
-    assertEquals(1, dshChannel.closes)
-    assertEquals(0, opChannel.closes)
-    assertTrue(op.isCurrent)
-    op.close()
-    assertEquals(0, opChannel.closes)
-    op2.close()
-    assertEquals(1, opChannel.closes)
-    assertEquals(1, transport.closes)
-  }
-
-  @Test fun reconnectFencesLateReleaseAndAllowsSameServiceToReattach() {
-    val first = Transport()
-    val second = Transport()
-    val session = SshTransportSession(first)
-    val oldChannel = Channel()
-    val old = session.acquire(SshServiceKey("dsh"), SshServiceLifecycleOwner.MANAGED,
-      factory = SshRuntimeChannelFactory { _, _ -> oldChannel })
-    session.replaceTransport(second)
-    assertEquals(1, first.closes)
-    assertEquals(1, oldChannel.closes)
-    assertFalse(old.isCurrent)
-    assertTrue(runCatching { old.requireCurrent() }.isFailure)
-    val channel = Channel()
-    val next = session.acquire(SshServiceKey("dsh"), SshServiceLifecycleOwner.MANAGED,
-      factory = SshRuntimeChannelFactory { _, _ -> channel })
-    old.close()
-    assertTrue(next.isCurrent)
-    assertEquals(0, channel.closes)
-    assertEquals(0, second.closes)
-    next.close()
-    assertEquals(1, second.closes)
   }
 }

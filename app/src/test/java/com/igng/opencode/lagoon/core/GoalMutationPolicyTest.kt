@@ -4,8 +4,8 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class GoalMutationPolicyTest {
-  private val profile = ServerProfile("leaf", "DSH", "https://dsh.example/", kind = ServerKind.DSH)
-  private val goal = RemoteGoal("g", 2, "Objective", "active", "disarmed", maxGoalRounds = 10L, roundsStarted = 3L)
+  private val profile = ServerProfile("leaf", "DSH", "https://dsh.example/", protocol = HarnessProtocol.DSH)
+  private val goal = DshGoal("g", 2, "Objective", "active", "disarmed", maxGoalRounds = 10L, roundsStarted = 3L)
   private fun state() = LagoonState(profiles = listOf(profile), serverId = profile.id, connected = true,
     sessionId = "session", sessions = listOf(Session("session", "/repo", "Task", 1)), goal = goal)
 
@@ -32,12 +32,11 @@ class GoalMutationPolicyTest {
   @Test fun managementSupportIsNativeProtocolAndRuntimeGateNotCarrier() {
     val direct = state()
     assertTrue(direct.canManageGoal())
-    assertTrue(direct.copy(profiles = listOf(profile.copy(sshHostId = "ssh", url = "ssh://user@host:22"))).canManageGoal())
-    assertTrue(direct.copy(profiles = listOf(profile.copy(kind = ServerKind.DSH_REMOTE, remoteHostId = "host"))).canManageGoal())
+    assertTrue(direct.copy(profiles = listOf(profile.copy(deviceId = "ssh", url = "ssh://user@host:22"))).canManageGoal())
     assertFalse(direct.copy(connected = false).canManageGoal())
     assertFalse(direct.copy(cached = true).canManageGoal())
-    assertFalse(direct.copy(profiles = listOf(profile.copy(parentEnabled = false))).canManageGoal())
-    assertFalse(direct.copy(profiles = listOf(profile.copy(kind = ServerKind.OPENCODE))).canManageGoal())
+    assertFalse(direct.copy(profiles = listOf(profile.copy(deviceEnabled = false))).canManageGoal())
+    assertFalse(direct.copy(profiles = listOf(profile.copy(protocol = HarnessProtocol.OPENCODE_NATIVE))).canManageGoal())
   }
 
   @Test fun oldReadCannotRollbackAnAcknowledgedEdit() {

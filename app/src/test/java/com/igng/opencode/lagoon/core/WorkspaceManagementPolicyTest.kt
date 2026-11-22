@@ -5,7 +5,7 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class WorkspaceManagementPolicyTest {
-  private val profile = ServerProfile("host", "Host", "https://host.example/", kind = ServerKind.DSH)
+  private val profile = ServerProfile("host", "Host", "https://host.example/", protocol = HarnessProtocol.DSH)
   private fun state() = LagoonState(profiles = listOf(profile), serverId = profile.id, connected = true,
     capabilities = ApiCapabilities(workspaceManagement = true))
 
@@ -16,12 +16,12 @@ class WorkspaceManagementPolicyTest {
     assertFalse(state().copy(connected = false).canManageServerWorkspaces())
     assertFalse(state().copy(allServers = true).canManageServerWorkspaces())
     assertFalse(state().copy(capabilities = ApiCapabilities()).canManageServerWorkspaces())
-    assertFalse(state().copy(profiles = listOf(profile.copy(kind = ServerKind.OPENCODE))).canManageServerWorkspaces())
+    assertFalse(state().copy(profiles = listOf(profile.copy(protocol = HarnessProtocol.OPENCODE_NATIVE))).canManageServerWorkspaces())
     val target = WorkspaceManagementTarget(profile)
     assertTrue(target.matches(state().copy(sessionId = "other-session")))
     assertTrue(target.matches(state().copy(profiles = listOf(profile.copy(name = "Renamed")))))
     assertFalse(target.matches(state().copy(profiles = listOf(profile.copy(url = "https://other.example/")))))
-    assertFalse(target.matches(state().copy(profiles = listOf(profile.copy(remoteHostFingerprint = "changed")))))
+    assertFalse(target.matches(state().copy(profiles = listOf(profile.copy(deviceId = "changed")))))
   }
 
   @Test fun unknownMutationCannotBeRepeatedBeforeSuccessfulExplicitRead() = runBlocking {

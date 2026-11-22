@@ -12,7 +12,8 @@ class PersistentConnectionsTest {
     assertNotSame(SharedHttp.dispatcher, SharedHttp.streamDispatcher)
     assertTrue(SharedHttp.streamDispatcher.maxRequestsPerHost > 5)
   }
-  private fun store() = ServerStore(memoryPreferences(), memoryPreferences(), { it }, { it })
+  private fun store(profiles: () -> List<ServerProfile> = { emptyList() }) =
+    ServerStore(memoryPreferences(), memoryPreferences(), { it }, { it }, profiles)
   private fun cache() = OfflineCache(memoryPreferences(), { it }, { it })
   private fun profile(id: String, server: MockWebServer) = ServerProfile(id, id, server.url("/").toString(), allowCleartext = true)
   private fun dispatcher(streams: AtomicInteger, permission: () -> Boolean = { false }, reply: (() -> Unit)? = null) = object : Dispatcher() {
@@ -54,8 +55,8 @@ class PersistentConnectionsTest {
     MockWebServer().use { first -> MockWebServer().use { second ->
       val firstStreams = AtomicInteger(); val secondStreams = AtomicInteger()
       first.dispatcher = dispatcher(firstStreams); second.dispatcher = dispatcher(secondStreams)
-      val store = store(); val a = profile("a", first); val b = profile("b", second)
-      store.save(a, null); store.save(b, null)
+      val a = profile("a", first); val b = profile("b", second)
+      val store = store { listOf(a, b) }
       val scope = CoroutineScope(coroutineContext + SupervisorJob())
       var selected: String? = null
       val snapshots = ConcurrentHashMap<String, ServerOverviewSnapshot>()
@@ -76,7 +77,7 @@ class PersistentConnectionsTest {
   @Test fun droppedStreamsAutomaticallyReconnectWithoutNavigation() = runBlocking {
     MockWebServer().use { server ->
       val streams = AtomicInteger(); server.dispatcher = dispatcher(streams)
-      val store = store(); val profile = profile("a", server); store.save(profile, null)
+      val profile = profile("a", server); val store = store { listOf(profile) }
       val scope = CoroutineScope(coroutineContext + SupervisorJob())
       val manager = AllServersOverview(store, cache(), scope, {})
       try {
@@ -90,7 +91,7 @@ class PersistentConnectionsTest {
     MockWebServer().use { server ->
       val replies = AtomicInteger(); val streams = AtomicInteger()
       server.dispatcher = dispatcher(streams, { replies.get() == 0 }, { replies.incrementAndGet() })
-      val store = store(); val profile = profile("a", server); store.save(profile, null)
+      val profile = profile("a", server); val store = store { listOf(profile) }
       store.rememberPermissionPolicy(PermissionPolicy(autoApprove = true))
       val scope = CoroutineScope(coroutineContext + SupervisorJob())
       val snapshots = ConcurrentHashMap<String, ServerOverviewSnapshot>()
@@ -109,7 +110,7 @@ class PersistentConnectionsTest {
   @Test fun successfulEmptyFormReadsClearPersistedFalseQuestionWaiting() = runBlocking {
     MockWebServer().use { server ->
       server.dispatcher = dispatcher(AtomicInteger())
-      val store = store(); val profile = profile("a", server); store.save(profile, null)
+      val profile = profile("a", server); val store = store { listOf(profile) }
       store.rememberTask("a", TaskState("s", TaskPhase.WAITING_QUESTION, activeAt = 1))
       val scope = CoroutineScope(coroutineContext + SupervisorJob())
       val snapshots = ConcurrentHashMap<String, ServerOverviewSnapshot>()
@@ -126,7 +127,7 @@ class PersistentConnectionsTest {
   @Test fun successfulEmptyPermissionReadsClearPersistedFalseWaiting() = runBlocking {
     MockWebServer().use { server ->
       server.dispatcher = dispatcher(AtomicInteger())
-      val store = store(); val profile = profile("a", server); store.save(profile, null)
+      val profile = profile("a", server); val store = store { listOf(profile) }
       store.rememberTask("a", TaskState("s", TaskPhase.WAITING_PERMISSION, activeAt = 1))
       val scope = CoroutineScope(coroutineContext + SupervisorJob())
       val snapshots = ConcurrentHashMap<String, ServerOverviewSnapshot>()
@@ -160,7 +161,7 @@ class PersistentConnectionsTest {
           else -> base.dispatch(request)
         }
       }
-      val store = store(); val profile = profile("a", server); store.save(profile, null)
+      val profile = profile("a", server); val store = store { listOf(profile) }
       val scope = CoroutineScope(coroutineContext + SupervisorJob())
       val snapshots = ConcurrentHashMap<String, ServerOverviewSnapshot>()
       val manager = AllServersOverview(store, cache(), scope, { snapshots[it.serverId] = it })
@@ -183,7 +184,7 @@ class PersistentConnectionsTest {
             .setBody("data: {\"id\":\"done\",\"type\":\"session.execution.succeeded\",\"data\":{\"sessionID\":\"s\"}}\n\n")
         else base.dispatch(request)
       }
-      val store = store(); val profile = profile("a", server); store.save(profile, null)
+      val profile = profile("a", server); val store = store { listOf(profile) }
       val scope = CoroutineScope(coroutineContext + SupervisorJob())
       val snapshots = ConcurrentHashMap<String, ServerOverviewSnapshot>()
       val manager = AllServersOverview(store, cache(), scope, { snapshots[it.serverId] = it })
@@ -196,7 +197,7 @@ class PersistentConnectionsTest {
     }
   }
 
-  @Test fun anEnabledServerStaysMonitoredEvenWhenAutoConnectIsOff() = runBlocking {
+  @Test fun anEnabledServerStaysMonitoredAcrossStartup() = runBlocking {
     MockWebServer().use { server ->
       val requests = AtomicInteger()
       val base = dispatcher(AtomicInteger())
@@ -206,16 +207,15 @@ class PersistentConnectionsTest {
           return base.dispatch(request)
         }
       }
-      val store = store()
-      val profile = profile("a", server).copy(autoConnect = false)
-      store.save(profile, null)
+      val profile = profile("a", server)
+      val store = store { listOf(profile) }
       val scope = CoroutineScope(coroutineContext + SupervisorJob())
       val snapshots = ConcurrentHashMap<String, ServerOverviewSnapshot>()
       val manager = AllServersOverview(store, cache(), scope, { snapshots[it.serverId] = it })
       try {
         manager.start(listOf(profile))
         awaitCondition { snapshots["a"]?.connected == true }
-        assertTrue("启用的设备应保持连接，自动连接开关不再决定是否拨号", requests.get() > 0)
+        assertTrue("启用的设备应保持连接", requests.get() > 0)
       } finally { manager.stop(); scope.cancel() }
     }
   }
@@ -233,7 +233,7 @@ class PersistentConnectionsTest {
           else -> base.dispatch(request)
         }
       }
-      val store = store(); val profile = profile("a", server); store.save(profile, null)
+      val profile = profile("a", server); val store = store { listOf(profile) }
       val scope = CoroutineScope(coroutineContext + SupervisorJob())
       val snapshots = ConcurrentHashMap<String, ServerOverviewSnapshot>()
       val manager = AllServersOverview(store, cache(), scope, { snapshots[it.serverId] = it })
@@ -253,8 +253,8 @@ class PersistentConnectionsTest {
       server.dispatcher = object : Dispatcher() {
         override fun dispatch(request: RecordedRequest) = MockResponse().setResponseCode(503)
       }
-      val store = store(); val profile = profile("a", server)
-      store.save(profile, null)
+      val profile = profile("a", server)
+      val store = store { listOf(profile) }
       store.rememberTask("a", TaskState("s", TaskPhase.THINKING, since = 100))
       val cache = cache()
       cache.saveCatalog("a", emptyList(), listOf(Session("s", "/repo", "Old task", 1, serverId = "a")))
@@ -309,7 +309,7 @@ class PersistentConnectionsTest {
             .setBody(event + " ".repeat(64)).throttleBody(event.length.toLong(), 3, java.util.concurrent.TimeUnit.SECONDS)
         }
       }
-      val store = store(); val profile = profile("a", server); store.save(profile, null)
+      val profile = profile("a", server); val store = store { listOf(profile) }
       val scope = CoroutineScope(coroutineContext + SupervisorJob())
       val snapshots = ConcurrentHashMap<String, ServerOverviewSnapshot>()
       val manager = AllServersOverview(store, cache(), scope, { snapshots[it.serverId] = it })
@@ -328,7 +328,7 @@ class PersistentConnectionsTest {
   @Test fun stoppingAMonitorDropsItsLastSnapshotFromTheAggregate() = runBlocking {
     MockWebServer().use { server ->
       server.dispatcher = dispatcher(AtomicInteger())
-      val store = store(); val profile = profile("a", server); store.save(profile, null)
+      val profile = profile("a", server); val store = store { listOf(profile) }
       val scope = CoroutineScope(coroutineContext + SupervisorJob())
       val snapshots = ConcurrentHashMap<String, ServerOverviewSnapshot>()
       val removed = mutableListOf<String>()
@@ -355,7 +355,7 @@ class PersistentConnectionsTest {
           return base.dispatch(request)
         }
       }
-      val store = store(); val profile = profile("a", server); store.save(profile, null)
+      val profile = profile("a", server); val store = store { listOf(profile) }
       val scope = CoroutineScope(coroutineContext + SupervisorJob())
       val snapshots = ConcurrentHashMap<String, ServerOverviewSnapshot>()
       val manager = AllServersOverview(store, cache(), scope, { snapshots[it.serverId] = it })

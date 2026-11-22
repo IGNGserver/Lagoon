@@ -120,22 +120,71 @@ internal fun VariantSelector(state: LagoonState, controller: LagoonController, m
 }
 
 /**
- * Per-server model allow-list, rendered with HyperOS 4 island card and switches.
+ * Per-Harness model allow-list, rendered with HyperOS 4 island card and switches.
+ * Strictly scoped to [targetServerId] so managing models from HarnessDetailScreen never edits
+ * a different active Harness's visibility list.
  */
 @Composable
-internal fun ModelManagementSheet(state: LagoonState, controller: LagoonController, onDismiss: () -> Unit) {
-  val catalog = state.modelCatalog
-  var query by rememberSaveable { mutableStateOf("") }
+internal fun ModelManagementSheet(
+  state: LagoonState,
+  controller: LagoonController,
+  targetServerId: String? = state.serverId,
+  onDismiss: () -> Unit
+) {
+  val targetId = targetServerId ?: state.serverId
+  val isCurrent = targetId != null && targetId == state.serverId
+  val targetProfile = targetId?.let { id -> state.profiles.firstOrNull { it.id == id } }
+  val connected = if (isCurrent) state.connected else targetId != null && state.allServerSnapshots[targetId]?.connected == true
+
+  var reloadNonce by remember(targetId) { mutableIntStateOf(0) }
+  var localRevision by remember(targetId) { mutableIntStateOf(0) }
+  var remoteCatalog by remember(targetId) { mutableStateOf<List<ModelInfo>>(emptyList()) }
+  var remoteStatus by remember(targetId) { mutableStateOf(ResourceStatus()) }
+
+  LaunchedEffect(targetId, isCurrent, connected, reloadNonce) {
+    if (targetId == null || isCurrent) return@LaunchedEffect
+    if (!connected) {
+      remoteStatus = ResourceStatus(ResourceState.ERROR, "此 Harness 尚未连接，请先等待连接建立后再管理模型")
+      return@LaunchedEffect
+    }
+    remoteStatus = ResourceStatus(ResourceState.LOADING)
+    try {
+      val (_, loadedModels) = controller.loadCatalogForHarness(targetId, force = reloadNonce > 0)
+      remoteCatalog = loadedModels
+      remoteStatus = ResourceStatus(if (loadedModels.isEmpty()) ResourceState.EMPTY else ResourceState.READY)
+    } catch (cancel: kotlinx.coroutines.CancellationException) {
+      throw cancel
+    } catch (error: Exception) {
+      remoteStatus = ResourceStatus(ResourceState.ERROR, userFacingError(error, "读取模型目录失败"))
+    }
+  }
+
+  val catalog = if (isCurrent) state.modelCatalog else remoteCatalog
+  val (overrides, configured) = remember(targetId, isCurrent, state.modelOverrides, state.modelVisibilityConfigured, localRevision) {
+    if (isCurrent) state.modelOverrides to state.modelVisibilityConfigured
+    else targetId?.let(controller::modelVisibilityFor) ?: (emptyMap<String, Boolean>() to false)
+  }
+  val resourceStatus = if (isCurrent) state.resource("models") else remoteStatus
+
+  var query by rememberSaveable(targetId) { mutableStateOf("") }
   val filtered = filterModelCatalog(catalog, query)
-  val selectedCount = catalog.count { !state.modelVisibilityConfigured || state.modelOverrides[it.key] == true }
+  val selectedCount = catalog.count { !configured || overrides[it.key] == true }
   HyperBottomSheet(
-    title = "管理模型${state.server?.name?.let { " · $it" }.orEmpty()}",
+    title = "管理模型${targetProfile?.name?.let { " · $it" }.orEmpty()}",
     show = true,
     onDismissRequest = onDismiss
   ) {
     LazyColumn(Modifier.fillMaxWidth().heightIn(max = 620.dp), contentPadding = PaddingValues(bottom = 16.dp)) {
       item {
-        ResourceHint(state.resource("models"), "服务器没有可用模型", "模型列表和思考强度均来自服务器。", controller::reload)
+        ResourceHint(
+          resourceStatus,
+          "服务器没有可用模型",
+          "模型列表和思考强度均来自服务器。",
+          retry = {
+            if (isCurrent) controller.loadDefaultCatalog(force = true, serverId = targetId)
+            else reloadNonce += 1
+          }
+        )
       }
       if (catalog.size > 8) item {
         TextField(
@@ -151,7 +200,7 @@ internal fun ModelManagementSheet(state: LagoonState, controller: LagoonControll
       }
       if (filtered.isNotEmpty()) item {
           Text(
-            if (state.modelVisibilityConfigured) "已选择 $selectedCount/${catalog.size} 个模型"
+            if (configured) "已选择 $selectedCount/${catalog.size} 个模型"
             else "尚未配置过滤，当前显示服务器返回的全部 ${catalog.size} 个模型",
             Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
             style = HyperTheme.tabular(
@@ -173,21 +222,27 @@ internal fun ModelManagementSheet(state: LagoonState, controller: LagoonControll
               position = groupRowPosition(index, filtered.size),
               horizontalMargin = 8.dp
             ) {
-              val checked = !state.modelVisibilityConfigured || state.modelOverrides[info.key] == true
+              val checked = !configured || overrides[info.key] == true
               HyperSwitchRow(
                 title = info.choice.label,
                 summary = info.providerName,
                 checked = checked,
-                onCheckedChange = { controller.setModelVisible(info, it) }
+                onCheckedChange = {
+                  controller.setModelVisible(info, it, targetId, catalog)
+                  localRevision += 1
+                }
               )
             }
           }
         }
-        if (state.modelVisibilityConfigured) item {
+        if (configured) item {
           HyperButton(
             text = "恢复显示全部模型",
             variant = HyperButtonVariant.SECONDARY,
-            onClick = controller::resetModelVisibility,
+            onClick = {
+              controller.resetModelVisibility(targetId)
+              localRevision += 1
+            },
             modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
           )
         }

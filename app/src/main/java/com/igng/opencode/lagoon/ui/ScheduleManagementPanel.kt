@@ -31,7 +31,7 @@ internal fun ScheduleManagementPanel(state: LagoonState, controller: LagoonContr
 @Composable
 private fun SchedulePanelContent(state: LagoonState, controller: LagoonController) {
   var page by remember { mutableStateOf(SchedulePanelPage.LIST) }
-  var selected by remember { mutableStateOf<RemoteSchedule?>(null) }
+  var selected by remember { mutableStateOf<DshSchedule?>(null) }
   var target by remember { mutableStateOf<ScheduleMutationTarget?>(null) }
   val pending = state.pending("schedule-mutation")
   fun back() { page = if (page == SchedulePanelPage.DETAILS) SchedulePanelPage.LIST else SchedulePanelPage.DETAILS }

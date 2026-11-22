@@ -11,58 +11,53 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class CompositionOverlapTest {
-  @Test fun sanitizerDeduplicatesWithinEachCompositionAndKeepsCrossCompositionMembership() {
+  @Test fun sanitizerDeduplicatesWithinEachGroupAndKeepsCrossGroupMembership() {
     val state = DeviceGroupState(
       groups = listOf(
-        DeviceGroup("a", "A", listOf("p1", "p1", "p2", "missing")),
-        DeviceGroup("b", "B", listOf("p2", "p2", "p3"))
+        DeviceGroup("a", "A", deviceIds = listOf("d1", "d1", "d2", "missing")),
+        DeviceGroup("b", "B", deviceIds = listOf("d2", "d2", "d3"))
       ),
       selectedGroupId = "b"
     )
-
-    val clean = state.sanitized(setOf("p1", "p2", "p3"))
-
-    assertEquals(listOf(listOf("p1", "p2"), listOf("p2", "p3")), clean.groups.map { it.memberIds })
+    val clean = state.sanitized(setOf("d1", "d2", "d3"))
+    assertEquals(listOf(listOf("d1", "d2"), listOf("d2", "d3")), clean.groups.map { it.deviceIds })
     assertEquals("b", clean.selectedGroupId)
   }
 
-  @Test fun eachTabProjectsItsOwnMembershipIncludingSharedLeaves() {
-    val profiles = listOf(profile("p1"), profile("p2"), profile("p3"), profile("ungrouped"))
+  @Test fun eachTabProjectsItsOwnMembershipIncludingSharedDevices() {
+    val profiles = listOf(profile("p1", "d1"), profile("p2", "d2"), profile("p3", "d3"), profile("p4", "d4"))
+    val devices = listOf(device("d1"), device("d2"), device("d3"), device("d4"))
     val state = DeviceGroupState(listOf(
-      DeviceGroup("a", "A", listOf("p1", "p2", "p1")),
-      DeviceGroup("b", "B", listOf("p2", "p3"))
+      DeviceGroup("a", "A", deviceIds = listOf("d1", "d2", "d1")),
+      DeviceGroup("b", "B", deviceIds = listOf("d2", "d3"))
     ))
-
     val tabs = state.tabs(profiles)
-
     assertEquals(listOf(listOf("p1", "p2"), listOf("p2", "p3")), tabs.map { tab -> tab.profiles.map { it.id } })
-    assertEquals(listOf("ungrouped"), state.ungrouped(profiles).map { it.id })
+    assertEquals(listOf("d4"), state.ungroupedDevices(devices).map { it.id })
   }
 
-  @Test fun codecRoundTripsOverlappingCompositions() {
+  @Test fun codecRoundTripsOverlappingGroups() {
     val state = DeviceGroupState(listOf(
-      DeviceGroup("a", "A", listOf("p1", "p2")),
-      DeviceGroup("b", "B", listOf("p2", "p3"))
+      DeviceGroup("a", "A", deviceIds = listOf("d1", "d2")),
+      DeviceGroup("b", "B", deviceIds = listOf("d2", "d3"))
     ), selectedGroupId = "b")
-
-    assertEquals(state, DeviceGroupCodec.decode(DeviceGroupCodec.encode(state)).sanitized(setOf("p1", "p2", "p3")))
+    assertEquals(state, DeviceGroupCodec.decode(DeviceGroupCodec.encode(state)).sanitized(setOf("d1", "d2", "d3")))
   }
 
-  @Test fun groupLookupRemainsFirstMatchForSharedLeaf() {
-    val first = DeviceGroup("a", "A", listOf("p1"))
-    val state = DeviceGroupState(listOf(first, DeviceGroup("b", "B", listOf("p1"))))
-
-    assertEquals(first, state.groupOf("p1"))
+  @Test fun groupLookupRemainsFirstMatchForSharedDevice() {
+    val first = DeviceGroup("a", "A", deviceIds = listOf("d1"))
+    val state = DeviceGroupState(listOf(first, DeviceGroup("b", "B", deviceIds = listOf("d1"))))
+    assertEquals(first, state.groupOfDevice("d1"))
+    assertEquals(first, state.groupOf(profile("p1", "d1")))
   }
 
   @Test fun controllerCreatePreservesExistingMembershipsAndSelectedGroup() {
     Fixture().use { fixture ->
       val before = fixture.groups()
-      val createdId = fixture.controller.createDevice("New", listOf("p1", "p2", "p2", "missing"))
-
+      val createdId = fixture.controller.createDeviceGroup("New", listOf("d1", "d2", "d2", "missing"))
       assertTrue(createdId.isNotBlank())
       assertEquals(before, fixture.groups().filterNot { it.id == createdId })
-      assertEquals(listOf("p1", "p2"), fixture.groups().first { it.id == createdId }.memberIds)
+      assertEquals(listOf("d1", "d2"), fixture.groups().first { it.id == createdId }.deviceIds)
       fixture.assertSelection("b")
       assertNull(fixture.state.value.error)
     }
@@ -71,11 +66,9 @@ class CompositionOverlapTest {
   @Test fun controllerUpdateOnlyReplacesTheEditedGroupsMemberships() {
     Fixture().use { fixture ->
       val other = fixture.groups().first { it.id == "b" }
-
-      fixture.controller.updateDevice("a", "A edited", listOf("p2", "p3", "p3", "missing"))
-
+      fixture.controller.updateDeviceGroup("a", "A edited", listOf("d2", "d3", "d3", "missing"))
       assertEquals("A edited", fixture.groups().first { it.id == "a" }.name)
-      assertEquals(listOf("p2", "p3"), fixture.groups().first { it.id == "a" }.memberIds)
+      assertEquals(listOf("d2", "d3"), fixture.groups().first { it.id == "a" }.deviceIds)
       assertEquals(other, fixture.groups().first { it.id == "b" })
       fixture.assertSelection("b")
       assertNull(fixture.state.value.error)
@@ -85,57 +78,53 @@ class CompositionOverlapTest {
   @Test fun selectingAnOverlappingGroupKeepsItsOwnIdAndCurrentMember() {
     Fixture().use { fixture ->
       val before = fixture.groups()
-
       fixture.controller.selectGroup("a")
-
       fixture.assertSelection("a")
       assertEquals(before, fixture.groups())
       assertEquals(listOf("p1", "p2"), fixture.state.value.homeGroupProfiles.map { it.id })
     }
   }
 
-  @Test fun explicitMoveStillRemovesTheLeafFromOtherGroups() {
-    Fixture().use { fixture ->
-      fixture.controller.moveProfile("p1", "b")
-
-      assertEquals(listOf("p2"), fixture.groups().first { it.id == "a" }.memberIds)
-      assertEquals(listOf("p2", "p3", "p1"), fixture.groups().first { it.id == "b" }.memberIds)
-      fixture.assertSelection("b")
-    }
-  }
-
   private class Fixture : AutoCloseable {
     private val scope = CoroutineScope(Job().apply { cancel() } + Dispatchers.Unconfined)
-    private val profilePreferences = memoryPreferences()
-    private val groupPreferences = memoryPreferences()
-    private val store = ServerStore(profilePreferences, memoryPreferences(), { it }, { it })
-    private val groupStore = DeviceGroupStore(groupPreferences)
+    private val deviceStore = DeviceStore(memoryPreferences(), memoryPreferences(), { it }, { it })
+    private val discoveryStore = DeviceDiscoveryStore(memoryPreferences())
+    private val groupStore = DeviceGroupStore(memoryPreferences())
+    private val coordinator: DeviceCoordinator
+    private val store = ServerStore(memoryPreferences(), memoryPreferences(), { it }, { it }, readProfiles = { deviceStore.profiles() })
     private val initialGroups = listOf(
-      DeviceGroup("a", "A", listOf("p1", "p2")),
-      DeviceGroup("b", "B", listOf("p2", "p3"))
+      DeviceGroup("a", "A", deviceIds = listOf("d1", "d2")),
+      DeviceGroup("b", "B", deviceIds = listOf("d2", "d3"))
     )
-    val state = MutableStateFlow(LagoonState(
-      profiles = listOf(profile("p1"), profile("p2"), profile("p3")),
-      deviceGroups = initialGroups,
-      homeGroupId = "b",
-      serverId = "p2",
-      connected = true,
-      allServers = false
-    ))
+    val state: MutableStateFlow<LagoonState>
     private val overview = AllServersOverview(store, CatalogCache { null }, scope, {})
     val controller: LagoonController
 
     init {
-      state.value.profiles.forEach { store.save(it, null) }
-      groupStore.save(DeviceGroupState(initialGroups))
+      listOf("d1" to "p1", "d2" to "p2", "d3" to "p3").forEach { (did, hid) ->
+        deviceStore.saveDevice(
+          SshDevice(did, did, "$did.example", user = "me", harnesses = listOf(DeviceHarness(hid, did, HarnessProtocol.DSH))),
+          SshSecrets(password = "pw")
+        )
+      }
+      groupStore.save(DeviceGroupState(initialGroups, selectedGroupId = "b"))
+      coordinator = DeviceCoordinator(deviceStore, discoveryStore, groupStore)
+      state = MutableStateFlow(LagoonState(
+        devices = coordinator.devices(),
+        profiles = coordinator.profiles(),
+        deviceGroups = initialGroups,
+        homeGroupId = "b",
+        serverId = "p2",
+        connected = true,
+        allServers = false
+      ))
       controller = allocate(LagoonController::class.java)
       put(controller, "store", store)
-      put(controller, "deviceGroupStore", groupStore)
+      put(controller, "deviceCoordinator", coordinator)
       put(controller, "mutable", state)
       put(controller, "state", state)
       put(controller, "scope", scope)
       put(controller, "allOverview", overview)
-      put(controller, "connectionGraphWritable", false)
     }
 
     fun groups(): List<DeviceGroup> = groupStore.load().state.groups
@@ -155,7 +144,8 @@ class CompositionOverlapTest {
   }
 
   private companion object {
-    fun profile(id: String) = ServerProfile(id, id, "https://$id.example")
+    fun device(id: String) = SshDevice(id, id, "$id.example", user = "me")
+    fun profile(id: String, deviceId: String) = ServerProfile(id, id, "ssh://me@$deviceId.example:22", protocol = HarnessProtocol.DSH, deviceId = deviceId)
 
     fun allocate(type: Class<LagoonController>): LagoonController {
       val unsafeClass = Class.forName("sun.misc.Unsafe")

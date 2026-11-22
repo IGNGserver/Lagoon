@@ -2,66 +2,49 @@
 
 > 官网与下载入口：<https://lagoon.igng.net/>
 
-面向多种 coding agent harness 的原生 Android 移动控制端。Kotlin + Jetpack Compose 界面采用小米 HyperOS / MIUIX 设计规范，引入连续曲率 Squircle、科技蓝语义调色板。App 首发支持用户自己的 OpenCode 2.x Server，现已适配 DeepSeek Harness：可通过一个 DSH Remote Hub 账号，或任意数量的 SSH 主机接入；旧版直连 DSH 资料保留可编辑/删除，但不再作为新建连接方式。
+面向多种 coding agent harness 的原生 Android 移动控制端。Kotlin + Jetpack Compose 界面采用小米 HyperOS / MIUIX 设计规范，引入连续曲率 Squircle 与科技蓝语义调色板。
+
+自纯 SSH 架构重构起，Lagoon **只通过 SSH 连接用户自己的开发机**，已彻底移除 DSH Remote Hub 模式与 HTTP 明文/直连模式（详见 [`docs/REMOTE_EOL.md`](docs/REMOTE_EOL.md) 与 [`docs/DEVICE_MODEL.md`](docs/DEVICE_MODEL.md)）。一台 SSH 设备即一个主机记录，可在同一套加密通道上按需发现并挂载五种原生 Harness：
+
+- **DeepSeek Harness (`dsh`)**：经 SSH 本地转发拉起或复用远端 `dsh web`（`127.0.0.1` 随机端口），走 Typert RPC + mux 事件流；支持启动命令与工作目录按 Harness 独立配置，以及扩展、模型密钥与自定义服务商管理
+- **OpenCode 原生服务 (`opencode`)**：经 SSH 读取远端服务注册并通过本地转发附着运行中的 OpenCode 2.x 服务端，支持在设备页或首页一键拉起服务
+- **OpenCode ACP (`opencode acp`)**：经 SSH stdio JSON-RPC 直连，实时流式对话、工具轨迹与目录工作区管理
+- **Codex (`codex app-server`)**：经 SSH stdio JSON-RPC 直连开发机上的 Codex，支持浏览和继续线程、发送任务、流式输出与审批（见 [`docs/CODEX.md`](docs/CODEX.md)）
+- **Antigravity (`agy acp`)**：经 SSH stdio JSON-RPC 直连已登录的 Antigravity，支持会话、模型、审批与只读文件浏览（见 [`docs/AGY.md`](docs/AGY.md)）
 
 Lagoon 目前只维护 Android 客户端。v3 曾提供自托管中枢与网页端，现已停止维护并从本仓库移除；相关说明见 [`docs/HUB_EOL.md`](docs/HUB_EOL.md)。
 
 ## 功能
 
-- 首发支持 OpenCode 2.x 服务端（`/api/*` 接口，以 `/api/info` 识别版本；1.x 已不再支持）；多服务器连接、Basic Auth/官方 pair 链接、Android Keystore 保护的密码与会话 Cookie、离线缓存、SSE 自动重连
-- 支持 DeepSeek Harness：一个 DSH Remote Hub（浏览器/邮箱登录、主机目录、逐台指纹核对）或任意数量的 SSH 主机（密码/私钥、Host Key 固定、远端 `dsh web` 启停/复用、稳定本地转发与断线重连）；走 Typert RPC（一元调用 + mux 事件流），时间线、任务状态、审批与问答和其它 harness 共用同一套界面与通知；详见 [`docs/SSH_HOSTS.md`](docs/SSH_HOSTS.md) 与下文「DeepSeek Harness 支持」
-- 支持通过 SSH 或 DSH Remote 接入开发机上的 Codex：浏览和继续线程、发送任务、查看流式输出与工具过程，并处理连接所支持的审批；两种连接的能力和断线行为不同，配置及限制见 [`docs/CODEX.md`](docs/CODEX.md)
-- 支持通过 SSH 或 DSH Remote 接入已登录的 Antigravity（`agy acp`）：会话、流式回复、模型、审批和只读文件；Remote 终端按 Host 授权启用。安装条件、连接器与功能差异见 [`docs/AGY.md`](docs/AGY.md)
-- 项目与会话、异步任务（运行中可继续发送以引导当前轮次）、Agent/Model、新会话默认预设 / 模型 / 思考强度（按连接保存在本机）、斜杠命令（走服务端 `/command`）、文本/Reasoning/Tool 消息、停止与权限/表单处理；时间线按官方客户端规则投影，系统指令、合成输入、技能等给模型看的记录只显示一行通知；会话列表在标题下显示所属工作区（OpenCode 项目 / DSH Workspace，只做展示，不改变筛选与新建目标）
-- 子会话、改动、文件浏览与搜索、重命名、删除；随版本变化的接口（重命名、恢复撤销、改动、已读同步）按实例 `/openapi.json` 选择
-- 设备管理：首页左上角范围面板提供「全部设备」、显式设备组与单台连接，添加设备页用 OpenCode / DeepSeek Harness 分页；DSH 页支持一个 Remote Hub + 无限 SSH 主机，设备组可混合设备与 Harness；每个连接可单独启用/禁用，禁用后不再连接，其对话、归档、任务汇总和通知从本机隐藏，凭据、草稿和缓存保留；分组 v1 升级时只清空一次，旧服务器资料/凭据/缓存不受影响；详见 [`docs/DEVICE_MANAGEMENT.md`](docs/DEVICE_MANAGEMENT.md)
-- 全服务器任务总览：实时显示运行中、未读完成、待回复与失败计数，并可从首页直接打开最需关注的任务；Android 16+ 使用系统实时更新（Live Updates），Android 15 及以下使用普通任务通知与应用内首页概览，详见 `docs/LIVE_UPDATES.md`
-- 本地前台监控与运行中、待处理、完成通知；任务总览仅统计未读结果，用户打开会话后即视为已读；支持一键清空本机未读结果，并可独立把服务端 `time.viewed` 同步到已结束的执行轮次
-- 应用内检查更新：设置页按 SemVer 选择 GitHub 上的正式版或预发布版，下载后校验大小、SHA-256、包名、版本码与签名，再交给系统安装器覆盖安装；首次安装会引导开启“安装未知应用”
+- **两层纯 SSH 设备模型**：`SSH 设备` → `Harness`。支持密码（含 `keyboard-interactive`）、私钥、密钥优先三种认证方式；内置全局 SSH 密钥库（Ed25519 / RSA / ECDSA 软件密钥、AndroidKeyStore 硬件密钥、OpenSSH 证书、生物识别保护、一键部署公钥到 `~/.ssh/authorized_keys`）与严格 TOFU `SHA256:` 主机指纹校验；详见 [`docs/SSH_HOSTS.md`](docs/SSH_HOSTS.md) 与 [`docs/DEVICE_MANAGEMENT.md`](docs/DEVICE_MANAGEMENT.md)
+- **统一设备管理与分组**：首页左上角范围面板支持「全部设备」、自定义设备组、单台 SSH 设备与单个 Harness 切换；设备组按 SSH 设备 ID 持久化，新增或移除 Harness 时自动跟随；设备级与 Harness 级开关相互独立，停用后不占连接与流量，草稿、项目与缓存完整保留
+- **完整会话体验**：项目与工作区浏览、异步任务（运行中引导与排队）、Agent / Model / 思考强度按 Harness 独立配置与可见性过滤、斜杠命令、文本 / Reasoning / Tool 轨迹折叠、停止与权限/问答处理、子会话、代码改动、文件浏览与搜索、重命名、置顶、分叉、归档与离线缓存
+- **全设备任务总览与通知**：聚合运行中、未读完成、待回复与失败计数，支持首页一键跳转最需处理的会话；Android 16+ 使用系统实时更新（Live Updates），Android 15 及以下使用普通通知与首页概览，详见 [`docs/LIVE_UPDATES.md`](docs/LIVE_UPDATES.md)
+- **网络安全边界**：`network_security_config.xml` 全局禁止明文外部 HTTP，仅允许 SSH 本地端口转发使用的 `127.0.0.1` / `localhost` 回环通信；所有 SSH 密钥与凭据由 Android Keystore 加密存储
+- **应用内检查更新**：设置页按 SemVer 检查 GitHub 正式版或预发布版，校验大小、SHA-256、包名、版本码与签名后交由系统安装器安装
 
 ## 本地构建
 
 需要 JDK 17+、Android SDK Platform 36。执行：
 
 ```sh
-ANDROID_HOME=/path/to/Android/Sdk ./gradlew :app:assembleDebug :app:testDebugUnitTest
+ANDROID_HOME=/path/to/Android/Sdk ./gradlew :app:testDebugUnitTest :app:assembleDebug
 ```
 
 本仓库把 Gradle build 输出放在 `BUILD_SCRATCH_ROOT`（默认 `~/.build`），每个 checkout 使用独立路径 `<scratch>/Lagoon/<checkout-hash>/app/outputs/apk/debug/app-debug.apk`。
 
-在 App 中添加可访问的 OpenCode Server URL。服务端需启用 Basic Auth；也可以直接粘贴 `opencode pair` 输出的官方链接，App 会访问一次链接、保存返回的会话 Cookie，再用该 Cookie 连接 API。建议通过 HTTPS 或可信 VPN 访问。使用局域网 HTTP 时，必须在该服务器资料中明确开启明文连接，授权会随资料保存。
+## 上手步骤
 
-添加 DeepSeek Harness 走「添加设备 › DeepSeek Harness」，该页只有两种新连接方式：
+1. 在电脑上启用 SSH 服务，并安装所需工具（如 `dsh`、`opencode`、`codex` 或 `agy`）。主机需提供 POSIX shell（Linux / macOS / WSL）。
+2. 在 Lagoon「设备 › 添加 SSH 设备」中填写主机地址（支持直接粘贴 `user@host` 或 `ssh -p 端口 user@host`）、用户名与验证方式（推荐在密钥库生成 Ed25519 / 硬件密钥并一键安装公钥）。
+3. 核对并固定远端 `SHA256:` 主机指纹，保存后自动进入设备页只读发现可用 Harness，按需打开对应开关即可开始对话。
 
-- **DSH Remote Hub**：登录一个 Hub 账号，发现账号下的电脑，逐台核对 Host 指纹后接入。每台 Host 注册独立的 client 身份，因此可以并行监控；不会退化成一次只连一台。Hub 目录、浏览器登录和自建服务器邮箱登录沿用 `docs/DSH_REMOTE_*` 的链路。
-- **SSH 主机**：填写地址、端口、用户名、密码或私钥，首次连接核对 `SHA256:` 主机指纹。App 通过 SSH 自动探测/启动 `dsh web`（`--host 127.0.0.1 --port 0 --no-open`），把它转发到手机本地，再用 `Host: 127.0.0.1:<远端端口>` 登录 DSH。主机需要 POSIX shell（Linux/macOS/WSL），并已安装 `dsh`；详细字段、状态目录、Host Key、重连与安全边界见 [`docs/SSH_HOSTS.md`](docs/SSH_HOSTS.md)。
+## 更名与升级迁移
 
-旧版直连 DSH（地址 + 启动令牌/签名密钥）资料仍会出现在设备管理的 Harness 区域，可编辑或删除；新版本不再创建直连资料。
-
-### DeepSeek Harness 支持
-
-DSH 的 Client↔Host 协议与 OpenCode 完全不同，Lagoon 用 `HarnessClient` 接口屏蔽差异，由 `DshApi` 做协议翻译（完整契约见 `docs/dsh-protocol.md`）：
-
-- 连接：启动令牌先走浏览器式根路径交换（`GET /?token=…`，长寿命 Cookie，跨进程重启有效），只有根路径不交付 Cookie 时才退回 `GET /connect?token=…&interactions=answer` 的 API Peer（其 Cookie 只放内存）；换到的浏览器 Cookie 落盘复用、签发超过半天自动续期，被服务端拒绝时清掉并提示重新配对；签名密钥模式在本机签发 Cookie。一元调用 `POST /api/<namespace>/<method>`（payload 只含一个 `args` 对象，字段是方法形参名），流式数据走 `/api/remote.mux` WebSocket（`open`/`item`/`end` 帧，20 秒心跳），全局事件与审批/问答瀑布走 `$events`；事件流重连后按 Host 的重新投递对账待办，单条会话流断开会退避重连并补投断线期间的事件。
-- 已支持：会话列表/创建/重命名/归档/分叉、发送（steer 打断当前轮次、queue 排队）、停止、模型目录与选择、Agent 预设（`agentPresets`）、审批与问答（waterfall 折算成同一套提示，回应走 `$events/result`；其他客户端结算后本机自动撤回）、子会话、时间线（用户消息、assistant 文本/Reasoning 的实时流式、工具调用与结果、压缩与命令记录）、文件浏览（`workspaceFiles`；没有会话的目录用 `directoryPicker` 浏览子目录）、文件搜索（`fileReferences`，与 `@` 提及同源）、图片与文本附件、改动列表与逐文件对比、后台任务状态、`/compact` 等斜杠命令。
-- 差异：DSH 没有删除会话与消息级回退，界面上不提供「删除」，改为「归档」，并在会话菜单提供「分叉」；审批只有「允许一次 / 拒绝」；改动摘要只在 dsh 进程内、会话存活期间提供（重启后旧轮次没有对比）；引用的服务器文件以 `@路径` 文本随消息发送。
-
-### 当前连接与授权
-
-本地前台服务只监控当前服务器。切换服务器会明确停止旧服务器的本地监控，远端任务继续。离线缓存与局部失败数据均标记为过期，不能用于发送操作。
-
-消息按官方客户端方式发送：客户端生成消息 id，仅在连接中断时用同一 id 重试一次。待处理权限按会话读取（`/api/session/{id}/permission`），表单按会话所在目录读取，不会因服务器工作目录不同而漏掉。“始终允许”只在服务端给出保存范围时提供，设置页可查看和撤销已保存权限。
-
-## 更名与迁移
-
-项目统一更名为 **“Lagoon”**（应用显示名为 Lagoon，定位从 OpenCode 专用客户端升级为面向多 Harness 的通用移动控制端）。
-- 显示名与工程名：应用显示名为 `Lagoon`，`rootProject.name = "Lagoon"`，发布工作流名为 `发布 Lagoon Release`，安装包产物名为 `Lagoon-<version>.apk`，Gradle 构建输出放在 `BUILD_SCRATCH_ROOT`（默认 `~/.build`）。
-- 应用标识与升级：`applicationId` 保持为 `com.igng.opencode.lagoon` 并使用固定生产签名，与既有安装版本签名完全一致，支持直接平滑覆盖安装升级。
-- 深链接：支持 `lagoon://` 路由（同时兼容接听 `opencode-lagoon://` 历史深链接）。
-- 安全存储：`KeystoreCipher` 别名升级为 `lagoon-*`，并自动兼容读取旧有的 `opencode-lagoon-*` 凭据。
-- CI / CD：发布工作流优先读取 `LAGOON_*` Secrets，并向下兼容读取 `OPENCODE_LAGOON_*` Secrets。
-- `docs/releases/` 下的历史发布说明保持原样，它们记录的是当时实际发布的名称。
+- 应用显示名为 `Lagoon`，`applicationId` 保持为 `com.igng.opencode.lagoon` 且签名不变，可直接覆盖安装。
+- 从旧版（v5.3.x）升级到纯 SSH 版本时，所有既有 SSH 设备、全局 SSH 密钥库（含硬件密钥别名）、TOFU 主机指纹、SSH Harness、设备组、草稿、项目与 SQLite 对话历史会自动无损迁移；已下线的 DSH Remote 与 HTTP 直连记录会自动清理，并在首页与设备页显示一次性可关闭提示。
+- 深链接支持 `lagoon://`（向下兼容 `opencode-lagoon://`）；`docs/releases/` 下的历史发布说明保持原样。
 
 ## 验收边界
 
-Android 构建与单元测试只能证明代码可编译和有限的 API/状态逻辑。真实服务端版本、SSE 断线恢复、Android 16 Live Updates 提升都需要在目标服务器和设备上验收。Android 15+ 的 dataSync 前台服务有运行时长限制。
+Android 构建与单元测试可验证编译、协议解析、存储迁移与状态机逻辑。真实 SSH 主机环境、各 Harness 远端进程生命周期、断网重连与 Android 16 实时更新提升仍需在目标开发机与真机上验收。Android 15+ 的 `dataSync` 前台服务受系统运行时长限制。

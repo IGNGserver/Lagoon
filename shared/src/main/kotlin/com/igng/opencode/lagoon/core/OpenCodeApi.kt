@@ -46,7 +46,7 @@ class OpenCodeApi internal constructor(
   private val credentials: ServerCredentials,
   callTimeoutSeconds: Long = 60,
   streamIdleSeconds: Long = SharedHttp.STREAM_IDLE_SECONDS,
-  /** Optional carrier for SSH/Remote native services; omitted callers keep the stock OkHttp carrier. */
+  /** Optional carrier for SSH native services; omitted callers keep the stock OkHttp carrier. */
   transport: NativeHttpTransport?
 ) : HarnessClient {
   constructor(
@@ -108,7 +108,9 @@ class OpenCodeApi internal constructor(
     if (credentials.password.isNotEmpty()) {
       put("Authorization", Credentials.basic(credentials.username.ifBlank { profile.username.ifBlank { "opencode" } }, credentials.password, Charsets.UTF_8))
     }
-    if (credentials.cookie.isNotBlank()) put("Cookie", credentials.cookie)
+    if (credentials.cookie.isNotBlank()) {
+      put("Cookie", credentials.cookie)
+    }
   }
 
   private fun requestPath(path: String, query: Map<String, String>): String {

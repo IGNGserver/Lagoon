@@ -26,7 +26,7 @@ class ConversationStatusRailTest {
 
   @Test fun goalCapsuleIsOneLineAndCompletedGoalsDoNotReserveSpace() {
     val rail = source("ConversationStatusRail.kt")
-    assertTrue(rail.contains("state.goal?.takeUnless(RemoteGoal::complete)"))
+    assertTrue(rail.contains("state.goal?.takeUnless(DshGoal::complete)"))
     assertTrue(rail.contains("GoalCapsule("))
     // 胶囊内只允许单行阶段与截断后的目标，完整目标只在面板里出现。
     assertTrue(rail.contains("maxLines = 1"))

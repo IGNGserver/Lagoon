@@ -3,8 +3,7 @@ package com.igng.opencode.lagoon.core
 /** A dialog remains scoped to the exact saved route and conversation the reader selected. */
 internal data class TimelineMutationTarget(val profile: ServerProfile, val sessionId: String, val revertMessageId: String? = null) {
   fun matches(state: LagoonState): Boolean = state.server?.let {
-    state.sessionId == sessionId && state.session?.revertMessageId == revertMessageId &&
-      it.id == profile.id && ConnectionRouteAdmission.sameLeafRoute(profile, it)
+    state.sessionId == sessionId && state.session?.revertMessageId == revertMessageId && it.sameRoute(profile)
   } == true
 }
 

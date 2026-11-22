@@ -4,6 +4,9 @@ import android.content.Context
 import android.content.SharedPreferences
 import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 
 /**
  * Persistence for the global SSH keychain: non-secret metadata ([SshKeyProfile]) in `ssh-keys`
@@ -27,8 +30,13 @@ internal class SshKeyStore internal constructor(
   )
 
   private val runtimeSecrets = ConcurrentHashMap<String, String>()
-  @Volatile var revision: Long = 0L
-    private set
+  private val mutableRevision = MutableStateFlow(0L)
+  val revisionFlow: StateFlow<Long> = mutableRevision.asStateFlow()
+  val revision: Long get() = mutableRevision.value
+
+  private fun bumpRevision() {
+    mutableRevision.value = mutableRevision.value + 1L
+  }
 
   /**
    * 最近一次 [load] 的失败原因。读取失败时仍返回空列表（调用方不必处处 try/catch），
@@ -65,7 +73,7 @@ internal class SshKeyStore internal constructor(
     if (!preferences.edit().putString(KEY, SshKeyCodec.encode(next)).commit()) {
       throw IOException("SSH 密钥保存失败")
     }
-    revision += 1
+    bumpRevision()
   }
 
   fun delete(id: String) {
@@ -77,7 +85,7 @@ internal class SshKeyStore internal constructor(
     secretKeys(id).forEach(editor::remove)
     editor.commit()
     runtimeSecrets.remove(id)
-    revision += 1
+    bumpRevision()
   }
 
   fun secrets(id: String): SshKeySecrets = SshKeySecrets(
@@ -91,17 +99,17 @@ internal class SshKeyStore internal constructor(
 
   fun unlockRuntimeSecret(id: String, secret: String) {
     runtimeSecrets[id] = secret
-    revision += 1
+    bumpRevision()
   }
 
   fun lockRuntimeSecret(id: String) {
     runtimeSecrets.remove(id)
-    revision += 1
+    bumpRevision()
   }
 
   fun lockAllRuntimeSecrets() {
     runtimeSecrets.clear()
-    revision += 1
+    bumpRevision()
   }
 
   fun isUnlocked(profile: SshKeyProfile): Boolean = when {

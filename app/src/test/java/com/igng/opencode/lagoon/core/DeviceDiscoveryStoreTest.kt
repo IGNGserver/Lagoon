@@ -20,8 +20,8 @@ class DeviceDiscoveryStoreTest {
     deviceId = deviceId,
     observedAtMs = now,
     harnesses = listOf(
-      DiscoveredHarness(HarnessProtocolId.DSH_TYPERT, null, "DeepSeek Harness", status()),
-      DiscoveredHarness(HarnessProtocolId.OPENCODE_NATIVE, "svc-1", "OpenCode", status(), detail = "ready")
+      DiscoveredHarness(HarnessProtocol.DSH, null, "DeepSeek Harness", status()),
+      DiscoveredHarness(HarnessProtocol.OPENCODE_NATIVE, "svc-1", "OpenCode", status(), detail = "ready")
     )
   )
 

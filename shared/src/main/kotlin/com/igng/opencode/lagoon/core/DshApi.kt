@@ -75,7 +75,6 @@ class DshApi(
    */
   private val onCookie: (String) -> Unit = {},
   private val clock: () -> Long = System::currentTimeMillis,
-  private val remoteBackend: RemoteBackend? = null,
   /**
    * SSH tunnel mode: requests go to a local forwarder, but DSH's loopback Host fence and cookie
    * audience must see the remote authority (`127.0.0.1:<remotePort>`).
@@ -83,7 +82,7 @@ class DshApi(
   private val hostHeader: String? = null,
   /** Test seam for the logical $events handshake; production keeps the shared first-frame deadline. */
   private val eventsReadyTimeoutMillis: Long = EVENTS_READY_TIMEOUT_MILLIS,
-  /** Only for a local SSH bridge; never applied to Remote or direct HTTP connections. */
+  /** Only for a local SSH bridge. */
   private val socketFactory: SocketFactory? = null,
   /**
    * Only for a local SSH bridge. OkHttp's reuse key ignores the `SocketFactory` (it compares port,
@@ -99,16 +98,14 @@ class DshApi(
    * that still covers the new process is preferred over this hook.
    */
   private val onAuthTokenRotated: () -> Unit = {}
-) : HarnessClient, RemoteDoctorSource {
+) : HarnessClient {
   constructor(profile: ServerProfile, password: String) : this(profile, ServerCredentials(profile.username, password))
 
   private val base: HttpUrl = requireNotNull(profile.url.trimEnd('/').toHttpUrlOrNull()) { "服务器地址无效" }
   private val origin = HttpOrigin.of(base)
 
-  /** 凭据的 password 槽位：令牌模式是启动令牌，密钥模式是 Cookie 签名密钥。 */
-  private val token: String = if (profile.dshAuth == DshAuthMode.TOKEN) credentials.password.trim() else ""
-  private val signingSecret: ByteArray? =
-    if (profile.dshAuth == DshAuthMode.SECRET) DshCookie.decodeSecret(credentials.password) else null
+  /** 启动令牌（通过 SSH 隧道启动或复用 `dsh web` 时自动获取）。 */
+  private val token: String = credentials.password.trim()
 
   private val http = OkHttpClient.Builder()
     .apply { socketFactory?.let { this.socketFactory(it) } }
@@ -168,7 +165,7 @@ class DshApi(
   private val goalCacheLock = Any()
   private val goalActivation = mutableMapOf<String, GoalActivation>()
   /** Full mutation views fence lagging durable projections at the exact goal revision. */
-  private val latestGoalViews = mutableMapOf<String, RemoteGoal>()
+  private val latestGoalViews = mutableMapOf<String, DshGoal>()
   /** Reads started before a mutation cannot clear or replace its acknowledged result. */
   private val goalCacheEpochs = mutableMapOf<String, Long>()
   private data class ClearedGoal(val id: String, val revision: Int)
@@ -219,8 +216,8 @@ class DshApi(
    */
   private val followStates = ConcurrentHashMap<String, FollowState>()
   private val followOpenLock = Any()
-  /** 最近一次会话快照的规模；只记数量/游标，不记正文。 */
-  private val snapshotStats = ConcurrentHashMap<String, RemoteSnapshotStats>()
+  /** 最近一次会话快照的游标，用于判断可否直接复用当前 follow 状态。 */
+  private val snapshotCursors = ConcurrentHashMap<String, Long>()
   @Volatile private var eventChannel: Channel<ServerEvent>? = null
   private val sharedEventsDelegate = lazy { SharedEventOwner(ioScope, ::ownedEvents, { eventsReady },
     copyForSubscriber = { it.copy(properties = JSONObject(it.properties.toString())) }) }
@@ -297,34 +294,8 @@ class DshApi(
   private val workspacePublisher = MutableSharedFlow<List<Project>>(replay = 1, extraBufferCapacity = 1)
   override val workspaceUpdates: Flow<List<Project>> = workspacePublisher.asSharedFlow()
   /** False for background notification monitors: keep `$events`, skip workspace/follows. */
-  @Volatile private var leaseManaged = false
-  @Volatile private var leaseSnapshot = DshInterestSnapshot(false, emptySet(), emptySet(), null)
   private val contentWatching = MutableStateFlow(true)
-
-  /** Used only by the explicit shared-client registry; raw constructor semantics stay unchanged. */
-  internal fun manageLeaseInterests(snapshot: DshInterestSnapshot) {
-    leaseManaged = true
-    leaseSnapshot = snapshot
-    activeSessionId = snapshot.foregroundSession
-    contentWatching.value = snapshot.content
-    if (closed) return
-    val keep = snapshot.watched + snapshot.reading
-    val stop = mutableListOf<String>()
-    synchronized(watched) {
-      watched.removeAll { id -> if (id !in keep && (!snapshot.content || !executions.running(id))) { stop += id; true } else false }
-    }
-    stop.forEach(::stopFollow)
-    rememberWatched(keep.mapNotNull(known::get))
-  }
   override fun setContentWatching(enabled: Boolean) { contentWatching.value = enabled }
-  override fun transportStatus(): String? = remoteBackend?.connectionStatus()?.let { status ->
-    val transport = when {
-      status.relayAssignment -> "Relay"
-      status.transport.isNotBlank() -> status.transport
-      else -> null
-    }
-    listOfNotNull(status.phaseLabel(), transport).joinToString(" · ")
-  }
   /** 每个会话的作业清单缓存：`job/list` 是每会话一条流，短 TTL 避免对账风暴。 */
   private val jobCache = ConcurrentHashMap<String, Pair<Long, List<JSONObject>>>()
   /**
@@ -338,9 +309,9 @@ class DshApi(
    * 每条 `job/list` 都是一条流；不限流会和 `$events`/`session/follow` 抢预算。
    */
   private val oneShotStreams = Semaphore(2)
-  /** 后台 `job/follow` 并发闸门，避免多条作业输出流占满 Remote 16 条流预算而饿死核心流。 */
+  /** 后台 `job/follow` 并发闸门。 */
   private val jobFollowStreams = Semaphore(JOB_FOLLOW_CONCURRENCY)
-  private val watchLimit: Int get() = if (remoteBackend != null) REMOTE_WATCH_LIMIT else WATCH_LIMIT
+  private val watchLimit: Int get() = WATCH_LIMIT
   /**
    * 实时事件不是耐久日志，没有可供跨流去重的稳定 ID。每次实际发射都使用单调序号；
    * 时间戳只能当消息时间，不能当身份（同毫秒可能有多个 chunk，重试的 reset 也必须重新投递）。
@@ -372,21 +343,14 @@ class DshApi(
     }
   }
 
-  override val isClosed: Boolean get() = closing.get() || closed || remoteBackend?.isClosed == true
+  override val isClosed: Boolean get() = closing.get() || closed
 
-  override fun capabilities(): ApiCapabilities = if (remoteBackend == null) CAPABILITIES else CAPABILITIES.copy(diff = remoteBackend.changesAvailable(), terminal = remoteBackend.terminalAvailable())
+  override fun capabilities(): ApiCapabilities = CAPABILITIES
 
   private val terminalApiDelegate = lazy { DshTerminalApi(
-    call = { endpoint, args ->
-      val payload = RpcPayload(JSONObject().put("args", args))
-      if (remoteBackend == null) call(endpoint, payload, retried = true)
-      else remoteBackend.terminalCall(endpoint, payload.json)
-    },
-    open = { endpoint, args, onItem, onClosed ->
-      val payload = RpcPayload(JSONObject().put("args", args))
-      if (remoteBackend == null) openMux(endpoint, payload, onItem, onClosed)
-      else remoteBackend.terminalOpen(endpoint, payload.json, onItem, onClosed)
-    }, ownerClosed = { isClosed }
+    call = { endpoint, args -> call(endpoint, RpcPayload(JSONObject().put("args", args)), retried = true) },
+    open = { endpoint, args, onItem, onClosed -> openMux(endpoint, RpcPayload(JSONObject().put("args", args)), onItem, onClosed) },
+    ownerClosed = { isClosed }
   ) }
   private fun sessionTerminal(scope: TerminalScope): TerminalScope.Session {
     return scope as? TerminalScope.Session ?: throw ApiException(400, "DSH 终端必须指定原会话，不能从目录推断")
@@ -441,7 +405,6 @@ class DshApi(
     questionEventClients.clear()
     try {
       muxOwner.close()
-      remoteBackend?.close()
     } finally { shutdown.complete(Unit) }
   }
 
@@ -450,21 +413,14 @@ class DshApi(
     if (sharedEventsDelegate.isInitialized()) sharedEventsDelegate.value.awaitStopped()
   }
 
-  override suspend fun discoverCapabilities(): ApiCapabilities {
-    remoteBackend?.discoverTerminal()
-    remoteBackend?.discoverChanges()
-    return capabilities()
-  }
+  override suspend fun discoverCapabilities(): ApiCapabilities = capabilities()
 
   // ---------------------------------------------------------------- 鉴权
 
-  /** 当前使用的 Cookie；先取落盘的浏览器 Cookie，过期或缺失时才用令牌/密钥换新的。
-   *  SSH 隧道带了新的启动令牌时不预置 Cookie：先用令牌交换，令牌已轮换再退回这张 Cookie。 */
+  /** 当前使用的 Cookie；SSH 隧道带了新的启动令牌时不预置 Cookie：先用令牌交换，令牌已轮换再退回这张 Cookie。 */
   @Volatile private var sessionCookie: String? =
-    credentials.cookie.trim().takeIf {
-      hostHeader == null && DshCookie.isFresh(it, clock()) && (signingSecret == null || DshCookie.isDurable(it))
-    }
-  /** 落盘 Cookie 被服务端拒绝过：换新失败时提示「需要重新配对」而不是泛泛的令牌错误。 */
+    credentials.cookie.trim().takeIf { hostHeader == null && DshCookie.isFresh(it, clock()) }
+  /** 落盘 Cookie 被服务端拒绝过：换新失败时提示重新连接。 */
   @Volatile private var cookieRejected = false
   @Volatile private var renewAttemptedAt = 0L
   private val authLock = Mutex()
@@ -483,9 +439,6 @@ class DshApi(
       val saved = credentials.cookie.trim().takeIf { error.code == AUTH_TOKEN_ROTATED && DshCookie.isFresh(it, clock()) }
       if (saved != null) saved.also(::adopt)
       else {
-        // Nothing local can cover the new process: ask the owner to re-read the token instead of
-        // leaving every later call on this generation with a 401 that retrying cannot heal.
-        // Dispatch: the owner rebuilds the link, which must not re-enter this client's auth lock.
         if (error.code == AUTH_TOKEN_ROTATED) runCatching { ioScope.launch { onAuthTokenRotated() } }
         throw error
       }
@@ -493,58 +446,41 @@ class DshApi(
   }
 
   /**
-   * Proves the tunneled credentials work without reading the whole session catalog. `health()` is
-   * `session/list`, so using it as the connection's login check made every connect read the
-   * catalog three times; the first real catalog read follows immediately anyway.
+   * Proves the tunneled credentials work without reading the whole session catalog.
    */
   suspend fun probeAuth() {
     cookie()
   }
 
-  private fun repairMessage(): String = if (signingSecret != null) SECRET_REJECTED_MESSAGE else REPAIR_MESSAGE
+  private fun repairMessage(): String = REPAIR_MESSAGE
 
-  /** 采用新 Cookie；浏览器 Cookie 回调落盘，API Peer Cookie 只放内存（dsh 重启即失效）。
-   *  SSH 隧道每次换代都会拿到新 token，Cookie 只服务于这一代 DshApi，不写入服务器凭据。 */
+  /** 采用新 Cookie；浏览器 Cookie 回调落盘，API Peer Cookie 只放内存（dsh 重启即失效）。 */
   private fun adopt(pair: String) {
     sessionCookie = pair
     cookieRejected = false
-    // 密钥模式随时能在本机重签，不需要落盘。
-    if (signingSecret == null && DshCookie.isDurable(pair) && pair != credentials.cookie.trim()) {
+    if (DshCookie.isDurable(pair) && pair != credentials.cookie.trim()) {
       runCatching { onCookie(pair) }
     }
   }
 
-  /**
-   * 密钥模式下 HTTPS 地址的 Cookie audience 取决于 dsh 自己是否是 TLS 监听：直连 TLS 是 `https://host`，
-   * HTTPS 反向代理后面的 HTTP 监听是 `host`。先按 TLS 签发，被拒后改用后者再试一次。
-   */
-  @Volatile private var plainListener = false
-
-  /** 服务端拒绝了当前 Cookie（401）：丢弃，并把落盘副本一起清掉，避免每次启动都先撞一次 401。
-   *  SSH 隧道的 Cookie 只活在这一代 DshApi 的内存里，远端进程换代时由新 token 重新交换，不能把
-   *  上一张还能用的长寿命 Cookie 从磁盘上抹掉。 */
+  /** 服务端拒绝了当前 Cookie（401）：丢弃，并把落盘副本一起清掉。 */
   private suspend fun rejectCookie(pair: String) = authLock.withLock {
     if (sessionCookie != pair) return@withLock
     sessionCookie = null
-    if (signingSecret != null && base.isHttps && !plainListener) {
-      plainListener = true
-      return@withLock
-    }
     cookieRejected = true
     if (DshCookie.isDurable(pair)) runCatching { onCookie("") }
   }
 
   /**
-   * 滑动续期：Cookie 有绝对有效期，签发超过 [RENEW_AFTER_MILLIS] 后用手里的凭据在后台换一张新的。
-   * 令牌模式只在该 dsh 进程仍存活（令牌未轮换）时成功，失败静默；密钥模式在本机直接重新签发。
+   * 滑动续期：Cookie 签发超过 [RENEW_AFTER_MILLIS] 后用手里的启动令牌在后台换一张新的。
    */
   private fun scheduleRenewal(current: String) {
     val lifetime = DshCookie.lifetime(current) ?: return
     if (lifetime.version != 1) return
     val now = clock()
-    val dueAt = if (signingSecret != null) lifetime.expiresAt - MINTED_RENEW_MARGIN_MILLIS else lifetime.issuedAt + RENEW_AFTER_MILLIS
+    val dueAt = lifetime.issuedAt + RENEW_AFTER_MILLIS
     if (now < dueAt || now - renewAttemptedAt < RENEW_RETRY_MILLIS) return
-    if (signingSecret == null && token.isEmpty()) return
+    if (token.isEmpty()) return
     renewAttemptedAt = now
     ioScope.launch {
       val fresh = try { connect() } catch (error: CancellationException) { throw error } catch (error: Exception) { null }
@@ -553,16 +489,11 @@ class DshApi(
   }
 
   /**
-   * 换新 Cookie。密钥模式在本机签发；令牌模式先走浏览器式根路径交换（Cookie 跨进程重启有效），
+   * 换新 Cookie。先走浏览器式根路径交换（Cookie 跨进程重启有效），
    * 再退回 `/connect` 的 API Peer（0.2.1 线起；Peer 随生命周期连接与进程重启失效）。
-   *
-   * SSH 隧道的令牌每次远端进程重启都会变。根路径用旧令牌换票得到 401 时，不能把它当成「登录已失效」：
-   * 调用方手里可能还有上一张长寿命 Cookie，那张 Cookie 跨 dsh 重启仍然有效。
    */
   private suspend fun connect(): String = withContext(Dispatchers.IO) {
-    signingSecret?.let { return@withContext DshCookie.mint(it, base, clock(), secureListener = base.isHttps && !plainListener) }
-    if (profile.dshAuth == DshAuthMode.SECRET) throw ApiException(401, "签名密钥格式不正确：应为 43 个字符的 base64url 字符串", AUTH_EXPIRED)
-    if (token.isEmpty()) throw ApiException(401, "请填写 DeepSeek Harness 的启动令牌", AUTH_EXPIRED)
+    if (token.isEmpty()) throw ApiException(401, "缺少 DeepSeek Harness 的启动令牌", AUTH_EXPIRED)
     try {
       exchange(base.newBuilder().addQueryParameter("token", token).build(), browser = true)?.let { return@withContext it }
     } catch (error: ApiException) {
@@ -676,24 +607,6 @@ class DshApi(
   private suspend fun call(endpoint: String, payload: RpcPayload = noArgs(), retried: Boolean = false): Any? =
     withContext(Dispatchers.IO) {
       val wirePayload = payload.json
-      remoteBackend?.let { remote ->
-        try { return@withContext remote.call(endpoint, wirePayload) }
-        catch (cancel: CancellationException) { throw cancel }
-        // Keep typed connection failures intact: the controller uses their kind to offer login,
-        // fingerprint or host recovery. Only untyped I/O is collapsed into a transport failure.
-        catch (error: RemoteFailureException) { throw error }
-        catch (error: RemoteServerException) { throw remoteServerFailure(error) }
-        catch (error: RemoteGatewayException) { throw ApiException(502, friendlyMessage(error.code, error.message.orEmpty()), error.code, error.details) }
-        // The transport died, or its pending RPC could not finish. This is not a Host contract
-        // rejection: name it as a connection problem (and keep the upstream code) so the controller
-        // can reconnect instead of toasting “transfer closed” / WebSocket internals.
-        catch (error: RemoteRpcException) {
-          throw ApiException(502, "与主机的加密中继已断开，正在重连", error.code.ifBlank { "TRANSPORT_CLOSED" })
-        }
-        catch (error: IOException) {
-          throw ApiException(0, "与主机的连接中断，正在重连", "TRANSPORT_CLOSED")
-        }
-      }
       val current = cookie()
       val url = base.newBuilder().addEncodedPathSegment("api").addEncodedPathSegments(endpoint).build()
       val envelope = JSONObject()
@@ -867,7 +780,6 @@ class DshApi(
    * 成功返回字节与 Content-Type；404/403 表示该路径不可读，返回 null 让调用方回落。
    */
   private suspend fun fetchMedia(path: String, maxBytes: Int): FilePreview? = withContext(Dispatchers.IO) {
-    if (remoteBackend != null) return@withContext null
     val url = base.newBuilder()
       .addEncodedPathSegment("api")
       .addEncodedPathSegment("file")
@@ -1316,43 +1228,23 @@ class DshApi(
 
   override suspend fun messagesPage(id: String, cursor: String?, size: Int): ApiPage<Message> = withContext(Dispatchers.IO) {
     val session = sessionOrFetch(id)
-    val caller = kotlin.coroutines.coroutineContext[DshLeaseContext]
-    check(!leaseManaged || caller != null) { "共享 DSH owner 的消息读取必须指定调用者 lease" }
-    val interest = caller?.read?.invoke(session.id)
-    try {
-    if (!leaseManaged) {
-      // Raw clients retain the historical behavior; leases manage independent foreground interest.
-      setContentWatching(true)
-      activeSessionId = session.id
-    }
+    setContentWatching(true)
+    activeSessionId = session.id
     rememberWatched(listOf(session))
     val wanted = size.coerceIn(1, SNAPSHOT_MAX_MESSAGES)
     if (cursor == null) {
-      // 首屏：`session/follow` 的首帧快照是 Host 按 maxMessages/turnWindow 切好的 turn 窗口
-      // （与官方客户端一致：最多 500 条、至少 2 轮）。整窗装入，不再用消息级 size 二次截断；
-      // size 只用于后续 `session/page`。二次截断会从轮次中间开始，丢掉这一轮的用户提问。
-      // 取快照的流会继续留着做实时流，不再取完就取消。
       val snapshot = snapshotFor(session)
       val through = snapshot.optDouble("cursor", 0.0).toLong()
-      // 空会话的切点是 -1（Host 的 `cursorBeforeNext(0)`）；0 也合法，不能当作“没有日志”。
       if (through >= 0) cursors[id] = through
       val records = snapshot.arr("records").objects()
       val messages = recordsToMessages(session, records)
-      // 空白会话排障：记录“拿到了什么”，不记录任何消息内容。
       val snapshotCursor = snapshot.optDouble("cursor", -1.0).toLong()
       val snapshotHasMore = snapshot.optBoolean("hasMore")
-      // 与官方 `installWindow(entries, hasMore)` 对齐：hasMore 就是“还能向更早翻页”，
-      // next 取本页最早一条记录的 seq（等价于官方的 baseSeq / beforeSeq）。
       val next = if (snapshotHasMore && records.isNotEmpty()) earlierCursor(records) else null
-      snapshotStats[session.id] = RemoteSnapshotStats(session.id, records.size, messages.size,
-        snapshotCursor, snapshotHasMore, pageNext = next?.toLongOrNull())
       Diagnostics.info("DshApi", "session/follow 快照 · ${address(id).str("kind")} · records=${records.size} " +
         "messages=${messages.size} cursor=$snapshotCursor hasMore=$snapshotHasMore next=${next ?: "-"}")
-      // 时间线被整页替换：清掉实时部件记录，让后续增量重建部件而不是写进已消失的行。
       liveParts.keys.filter { it.startsWith("${session.id}|") }.forEach { liveParts.remove(it) }
       advanceSeq(id, records.mapNotNull { it.obj("event").optDouble("seq", 0.0).toLong().takeIf { value -> value > 0 } }.maxOrNull())
-      // 不截断：Host 已经限制了窗口大小，且窗口起点是 turn/start。这里再 takeLast(size)
-      // 会把用户提问切掉，UI 只剩最新一轮的 assistant 步骤。
       ApiPage(messages, next)
     } else {
       val through = cursors[id] ?: run {
@@ -1366,8 +1258,6 @@ class DshApi(
         .put("throughSeq", through)
         .put("beforeSeq", before)
         .put("maxMessages", wanted)
-        // 与官方翻页一致：至少 50 条、至少 2 个 turn 再切，避免一页从轮次中间开始。
-        // 0.2.x 早期 Host 若不认识 turnWindow，下面会降级重试一次。
         .put("turnWindow", JSONObject()
           .put("minMessages", wanted.coerceAtMost(SNAPSHOT_MIN_MESSAGES))
           .put("minTurns", 2))
@@ -1384,7 +1274,6 @@ class DshApi(
       val next = if (page.optBoolean("hasMore")) earlierCursor(records) else null
       ApiPage(messages, next)
     }
-    } finally { interest?.close() }
   }
 
   /** Cursor -1 denotes an empty log; 0 is also valid. Do not accept fractional/string cursors. */
@@ -1418,9 +1307,7 @@ class DshApi(
     var acquired: WebSocket? = null
     try {
       return withContext(Dispatchers.IO) {
-        val wirePayload = payload.json
-        (remoteBackend?.open(endpoint, wirePayload, onItem, onClosed)
-          ?: muxOwner.open(endpoint, wirePayload, onItem, onClosed)).also { acquired = it }
+        muxOwner.open(endpoint, payload.json, onItem, onClosed).also { acquired = it }
       }
     } catch (error: Throwable) {
       // withContext has prompt cancellation on the return dispatcher: a freshly opened resource
@@ -1599,11 +1486,8 @@ class DshApi(
                 if (!isActive(attempt)) return@withLock
                 if (sessionCookie == current) {
                   sessionCookie = null
-                  if (signingSecret != null && base.isHttps && !plainListener) plainListener = true
-                  else {
-                    cookieRejected = true
-                    if (DshCookie.isDurable(current)) runCatching { onCookie("") }
-                  }
+                  cookieRejected = true
+                  if (DshCookie.isDurable(current)) runCatching { onCookie("") }
                 }
                 failPhysical(attempt, error)
               }
@@ -1759,20 +1643,14 @@ class DshApi(
   /** 把流层的失败折成用户能看懂、也能定位的一层错误（保留上游 code）。 */
   private fun streamFailure(endpoint: String, error: Throwable): ApiException {
     if (error is ApiException) return error
-    val gateway = error as? RemoteGatewayException
-    val code = gateway?.code ?: (error as? RemoteRpcException)?.code
-    val details = gateway?.details
     val reason = error.message?.takeIf { it.isNotBlank() } ?: error.javaClass.simpleName
-    return ApiException(502, "读取 $endpoint 失败：${friendlyMessage(code.orEmpty(), reason)}", code, details)
+    return ApiException(502, "读取 $endpoint 失败：${friendlyMessage("", reason)}")
   }
 
   /**
    * 首屏快照从长期 follow 流取。参数对齐官方客户端的窗口：`assistantStream` 让“正在跑的轮次”
    * 也能看到已产出的内容，`maxMessages`/`turnWindow` 限制单帧体积，更早的历史仍由
    * `session/page` 翻页补。
-   *
-   * 首帧必须是 `snapshot`：中枢/协议漂移时返回别的帧，若直接当空日志处理就会得到永远空白的会话。
-   * 失败会落在 [snapshotStats] 里，连接医生能看到“读了几条、游标在哪、失败原因是什么”。
    */
   private suspend fun snapshotFor(session: Session, fresh: Boolean = true): JSONObject {
     var failure: Exception? = null
@@ -1788,9 +1666,6 @@ class DshApi(
         throw cancel
       } catch (error: Exception) {
         failure = error
-        snapshotStats[session.id] = RemoteSnapshotStats(session.id, 0, 0, -1, false,
-          error = streamFailure("session/follow", error).message)
-        // Retire this generation only; another reader may already have installed its replacement.
         stopFollowState(state)
         if (attempt < SNAPSHOT_ATTEMPTS) kotlinx.coroutines.delay(SNAPSHOT_RETRY_DELAY_MILLIS)
       }
@@ -2194,7 +2069,7 @@ class DshApi(
         contentJob?.cancel()
         contentJob = null
         if (!enabled) {
-          followStates.values.filter { !leaseManaged || it.sessionId !in leaseSnapshot.reading }.forEach(::stopFollowState)
+          followStates.values.toList().forEach(::stopFollowState)
           return@collect
         }
         contentJob = launch {
@@ -2222,7 +2097,7 @@ class DshApi(
       statusJob.cancelAndJoin()
       contentWatcher.cancelAndJoin()
       contentJob?.cancelAndJoin()
-      followStates.values.filter { !leaseManaged || it.sessionId !in leaseSnapshot.reading }.forEach(::stopFollowState)
+      followStates.values.toList().forEach(::stopFollowState)
       channel.cancel()
       if (eventChannel === channel) eventChannel = null
     } }
@@ -2531,8 +2406,7 @@ class DshApi(
 
   private fun isGatewayArgumentsInvalid(error: Throwable?): Boolean =
     generateSequence(error) { it.cause }.any { candidate ->
-      (candidate as? RemoteGatewayException)?.code == "gateway/arguments-invalid" ||
-        (candidate as? ApiException)?.code == "gateway/arguments-invalid" ||
+      (candidate as? ApiException)?.code == "gateway/arguments-invalid" ||
         candidate.message?.contains("gateway/arguments-invalid") == true
     }
 
@@ -2896,7 +2770,7 @@ class DshApi(
     // the caller wanted a "fresh" page: there is nothing new to fetch. A follow that received
     // events after its snapshot must be replaced for a cold initial page, otherwise those events
     // would be missing from the fetched window.
-    val snapshotCursor = snapshotStats[session.id]?.cursor ?: -1L
+    val snapshotCursor = snapshotCursors[session.id] ?: -1L
     val snapshotStillCurrent = existing?.snapshot?.isCompleted == true && snapshotCursor >= 0 &&
       incompleteTranscripts[session.id] == null && lastSeq(session.id) <= snapshotCursor
     val reusable = existing != null && !existing.closed &&
@@ -2954,10 +2828,7 @@ class DshApi(
   }
 
   private fun isStreamLimitOrRateLimited(error: Throwable?): Boolean =
-    error is RemoteStreamLimitException ||
-      (error as? RemoteGatewayException)?.code == "RATE_LIMITED" ||
-      (error as? RemoteRpcException)?.code == "RATE_LIMITED" ||
-      (error as? ApiException)?.code == "RATE_LIMITED"
+    (error as? ApiException)?.code == "RATE_LIMITED"
 
   private fun failFollow(session: Session, state: FollowState, error: Exception) {
     state.opening = false
@@ -2976,7 +2847,7 @@ class DshApi(
   private fun releaseFollowForRetry(exclude: String): Boolean {
     val victim = synchronized(watched) {
       watched.firstOrNull { id ->
-        id != activeSessionId && id != exclude && (!leaseManaged || id !in leaseSnapshot.reading) && followStates[id]?.socket != null
+        id != activeSessionId && id != exclude && followStates[id]?.socket != null
       }?.also { watched.remove(it) }
     } ?: return false
     Diagnostics.warn("DshApi", "流预算已满，释放旧的会话 follow：${victim.take(24)}")
@@ -3094,9 +2965,7 @@ class DshApi(
           repaired = incompleteTranscripts.remove(session.id, previousGap)
         }
         if (!state.snapshot.isCompleted) state.snapshot.complete(frame)
-        snapshotStats[session.id] = RemoteSnapshotStats(session.id, records,
-          snapshotStats[session.id]?.messages ?: 0, frame.optDouble("cursor", -1.0).toLong(),
-          frame.optBoolean("hasMore"), state.snapshotAt)
+        snapshotCursors[session.id] = frame.optDouble("cursor", -1.0).toLong()
         if (repaired && !emitFollowReliable(state, ServerEvent(
             "dsh:${session.id}:repaired:${nextLiveEventId()}", session.directory,
             "session.transcript.invalidate", JSONObject().put("sessionID", session.id).put("incomplete", false), System.currentTimeMillis()))) {
@@ -3343,7 +3212,7 @@ class DshApi(
       }
       val limit = watchLimit
       while (watched.size > limit) {
-        val oldest = watched.firstOrNull { it != activeSessionId && (!leaseManaged || it !in leaseSnapshot.reading) } ?: break
+        val oldest = watched.firstOrNull { it != activeSessionId } ?: break
         watched.remove(oldest)
         evicted += oldest
       }
@@ -3352,37 +3221,8 @@ class DshApi(
     // 先停掉被淘汰的，释放槽位后再启动新流。
     evicted.forEach(::stopFollow)
     if (eventChannel == null) return
-    if (!contentWatching.value) {
-      if (leaseManaged) retained.filter { it in leaseSnapshot.reading }.forEach(::startFollow)
-      return
-    }
+    if (!contentWatching.value) return
     retained.forEach(::startFollow)
-  }
-
-  /** 连接医生用：每条 follow 的最近状态，只有会话 id 与计数，没有消息正文。 */
-  internal fun followDiagnostics(): List<RemoteFollowStats> = followStates.values.map { state ->
-    RemoteFollowStats(state.sessionId, open = !state.closed && (state.socket != null || state.opening),
-      lastSeq = lastSeq(state.sessionId), lastFrameAt = state.lastFrameAt,
-      reconnects = state.reconnects, error = state.error)
-  }
-
-  override fun remoteDoctor(appVersion: String): RemoteDoctor? {
-    val backend = remoteBackend ?: return null
-    val status = backend.connectionStatus()
-    return RemoteDoctor(
-      hub = backend.hub,
-      account = backend.account,
-      hostName = status.hostName,
-      hostId = backend.hostId,
-      appVersion = appVersion,
-      status = status,
-      credentials = backend.credentials(),
-      snapshots = snapshotStats.values.sortedByDescending { it.at }.take(8),
-      follows = followDiagnostics(),
-      events = RemoteEventStats(eventsReady, eventsClientId, readyGeneration.get(), eventsLastFrameAt,
-        eventsReconnects, eventsError),
-      streams = backend.streamStats() ?: RemoteStreamStats()
-    )
   }
 
   private data class FollowFrame(val value: JSONObject, val bytes: Long)
@@ -3602,26 +3442,24 @@ class DshApi(
     return true
   }
 
-  override suspend fun probeRemote(): RemoteProbe? = remoteBackend?.probe()
-
-  override suspend fun pluginBundles(): List<RemotePluginBundle> {
+  override suspend fun pluginBundles(): List<DshPluginBundle> {
     val list = call("pluginManager/listBundles") as? JSONArray ?: return emptyList()
     return (0 until list.length()).mapNotNull { i ->
       val item = list.optJSONObject(i) ?: return@mapNotNull null
       val name = item.optString("name").takeIf { it.isNotBlank() } ?: return@mapNotNull null
-      RemotePluginBundle(name, item.optBoolean("enabled"), item.optBoolean("installed"),
+      DshPluginBundle(name, item.optBoolean("enabled"), item.optBoolean("installed"),
         item.optBoolean("official"), item.optString("version").takeIf { it.isNotBlank() },
         item.optString("description").takeIf { it.isNotBlank() },
         item.optString("readOnlyReason").takeIf { it.isNotBlank() })
     }
   }
 
-  override suspend fun pluginEntries(): List<RemotePluginEntry> {
+  override suspend fun pluginEntries(): List<DshPluginEntry> {
     val list = call("pluginManager/listPlugins") as? JSONArray ?: return emptyList()
     return (0 until list.length()).mapNotNull { i ->
       val item = list.optJSONObject(i) ?: return@mapNotNull null
       val id = item.optString("entryId").takeIf { it.isNotBlank() } ?: return@mapNotNull null
-      RemotePluginEntry(id, item.optString("moduleName").takeIf { it.isNotBlank() } ?: id,
+      DshPluginEntry(id, item.optString("moduleName").takeIf { it.isNotBlank() } ?: id,
         item.optBoolean("enabled"), item.optString("fiberPhase").takeIf { it.isNotBlank() },
         item.optString("readOnlyReason").takeIf { it.isNotBlank() })
     }
@@ -3680,19 +3518,19 @@ class DshApi(
     return true
   }
 
-  override suspend fun schedules(sessionId: String): List<RemoteSchedule> {
+  override suspend fun schedules(sessionId: String): List<DshSchedule> {
     require(sessionId.isNotBlank()) { "Missing schedule owner" }
     val value = call("schedule/list", requestArgs(JSONObject().put("sessionId", sessionId)))
     return scheduleResponse {
       val rows = value as? JSONArray ?: throw IllegalArgumentException("Missing schedule list")
       scheduleImmutable((0 until rows.length()).map { index ->
         val row = rows.opt(index) as? JSONObject ?: throw IllegalArgumentException("Invalid schedule row")
-        ScheduleRecord.parse(row).toRemoteSchedule(sessionId, "active")
+        ScheduleRecord.parse(row).toDshSchedule(sessionId, "active")
       })
     }
   }
 
-  override suspend fun scheduleCatalog(): List<RemoteSchedule>? {
+  override suspend fun scheduleCatalog(): List<DshSchedule>? {
     val value = try { call("schedule/catalog", noArgs()) } catch (error: ApiException) {
       if (error.isDshMethodUnavailable) return null
       throw error
@@ -3706,7 +3544,7 @@ class DshApi(
         val delivery = if (row.has("lastDelivery")) ScheduleDelivery.parse(
           row.opt("lastDelivery") as? JSONObject ?: throw IllegalArgumentException("Invalid delivery")
         ) else null
-        ScheduleRecord.parse(row).toRemoteSchedule(owner, status, delivery)
+        ScheduleRecord.parse(row).toDshSchedule(owner, status, delivery)
       })
     }
   }
@@ -3807,15 +3645,10 @@ class DshApi(
       else -> null
     }
     val budget = if (imageMime != null) 8 * 1024 * 1024 else 16 * 1024 * 1024
-    // 远程主机的 `workspaceFiles/readBytes` 单次窗口被夹到 4 MiB（Remote Host 的 MAX_READ_BYTES），
-    // 请求更长只会拿到 `eof=false`。直连没有这个窗口，按预算读即可。
-    val window = if (remoteBackend != null) minOf(budget, REMOTE_READ_WINDOW) else budget
+    val window = budget
     val office = ext in setOf("doc", "docx", "xls", "xlsx", "ppt", "pptx")
     if (imageMime == null && ext != "pdf" && !office) return@withContext null
-    // 图片与 PDF 走官方 Web 自己的只读路由 `GET /api/file?path=<绝对路径>`：一次 GET 直接拿到字节和
-    // Content-Type，不必把二进制 RPC 的 multipart 信封往返一次。Remote 中继只代理 RPC，没有这条
-    // HTTP 路由，所以只在直连/SSH 隧道下使用；失败仍回落到 RPC。
-    if (!office && remoteBackend == null) {
+    if (!office) {
       absoluteWorkspacePath(directory, path)?.let { absolute ->
         fetchMedia(absolute, budget)?.let { return@withContext it }
       }
@@ -3848,15 +3681,8 @@ class DshApi(
     FilePreview(if (office) "application/pdf" else imageMime ?: "application/pdf", bytes)
   }
 
-  /**
-   * 会话目标。
-   *
-   * 远程白名单里**没有** `goals/get`（只有 clear/complete/create/edit/pause/resume），所以远程模式
-   * 改用 `session/projections` 里 durable 的 `values.goal`，进程内的 `activation` 由转发事件
-   * `goal/activation-changed` 补齐。直连/SSH 仍然读 `goals/get`——它是 activation 的权威来源。
-   */
-  override suspend fun goal(sessionId: String): RemoteGoal? {
-    if (remoteBackend != null) return composerContext(sessionId).goal
+  /** 会话目标；SSH 隧道下直接读 `goals/get`（activation 的权威来源）。 */
+  override suspend fun goal(sessionId: String): DshGoal? {
     val goalEpoch = goalCacheEpoch(sessionId)
     val value = call("goals/get", envelope(argsOf("agentId" to sessionId))) as? JSONObject
     return mergeGoalRead(sessionId, value?.goalView(), direct = true, startedEpoch = goalEpoch)
@@ -3869,8 +3695,6 @@ class DshApi(
     require(sessionId.isNotBlank()) { "会话 id 不能为空" }
     val request = goalRequest(objective, maxRounds)
     val acknowledgment = call("goals/create", envelope(argsOf("agentId" to sessionId, "request" to request))) as? JSONObject
-    // Create only acknowledges a ref. Preserve a matching activation event which can precede this ack;
-    // never invent armed/disarmed from create itself or retain the previous goal's activation.
     val created = acknowledgment?.optJSONObject("ref")
     synchronized(goalCacheLock) {
       val observed = goalActivation[sessionId]?.takeIf {
@@ -3885,7 +3709,7 @@ class DshApi(
 
   override suspend fun editGoal(
     sessionId: String, id: String, revision: Int, objective: String?, maxRounds: Long?
-  ): RemoteGoal? {
+  ): DshGoal? {
     requireGoalRef(sessionId, id, revision)
     val request = goalRequest(objective, maxRounds)
     val view = call("goals/edit", envelope(argsOf(
@@ -3936,7 +3760,7 @@ class DshApi(
   }
 
   /** Mutation views are authoritative; a ref-only create ack must never enter this cache. */
-  private fun commitGoalView(sessionId: String, view: Any?): RemoteGoal? {
+  private fun commitGoalView(sessionId: String, view: Any?): DshGoal? {
     val goal = (view as? JSONObject)?.goalView() ?: return null
     synchronized(goalCacheLock) {
       val latest = latestGoalViews[sessionId]
@@ -3952,7 +3776,7 @@ class DshApi(
   }
 
   /** Only older revisions of the SAME goal may be replaced with the last mutation response. */
-  private fun mergeGoalRead(sessionId: String, read: RemoteGoal?, direct: Boolean = false, startedEpoch: Long): RemoteGoal? =
+  private fun mergeGoalRead(sessionId: String, read: DshGoal?, direct: Boolean = false, startedEpoch: Long): DshGoal? =
     synchronized(goalCacheLock) {
       if (startedEpoch != goalCacheEpoch(sessionId)) {
         val latest = latestGoalViews[sessionId]
@@ -3988,12 +3812,12 @@ class DshApi(
       result
     }
 
-  override suspend fun credentialStatus(refs: List<String>): Map<String, RemoteCredentialStatus> {
+  override suspend fun credentialStatus(refs: List<String>): Map<String, DshCredentialStatus> {
     if (refs.isEmpty()) return emptyMap()
     val body = call("credentials/describe", envelope(argsOf("refs" to JSONArray(refs)))) as? JSONObject ?: return emptyMap()
     return body.keys().asSequence().mapNotNull { ref ->
       val item = body.optJSONObject(ref) ?: return@mapNotNull null
-      ref to RemoteCredentialStatus(ref, item.optBoolean("configured"), item.optBoolean("writable", true),
+      ref to DshCredentialStatus(ref, item.optBoolean("configured"), item.optBoolean("writable", true),
         item.optString("source").takeIf { it.isNotBlank() })
     }.toMap()
   }
@@ -4265,13 +4089,8 @@ class DshApi(
   }
 
   override suspend fun abort(session: Session) {
-    // A tracked Remote compaction has its own lifecycle: wait for its Host-confirmed cancellation.
-    // An unknown cancellation result must propagate; session/cancel cannot establish that outcome.
-    if (remoteBackend?.cancelCompaction(session.id) == true) return
     val parent = session.parentId?.takeIf { it.isNotBlank() }
     if (parent != null && parent != session.id) {
-      // 子代理会话只能由**父地址**中断：`session/cancel` 的请求体固定只有 `{sessionId}`，
-      // 装不下父地址，Host 会以 `session/agent-busy` 拒绝。DSH 自己走的也是这条端点。
       call("subagents/interruptByParent", envelope(argsOf(
         "childSessionId" to session.id,
         "parentSessionId" to parent,
@@ -4283,14 +4102,7 @@ class DshApi(
   }
 
   override suspend fun compact(session: Session) {
-    // 优先走 `remote.compaction.async.v1` 异步提交+轮询，避免慢后端压缩触及单条 RPC 超时；
-    // 未声明该能力或直连 DSH 时退回 `/compact` 命令。
-    val remote = remoteBackend
-    if (remote != null && remote.supportsAsyncCompaction()) {
-      remote.compactSessionAsync(session.id)
-    } else {
-      executeCommand(session, "/compact")
-    }
+    executeCommand(session, "/compact")
   }
 
   override suspend fun revert(session: Session, messageId: String) {
@@ -4325,33 +4137,12 @@ class DshApi(
     if (model != null) selectModel(session, model)
     selectPreset(session, agent)
     val content = JSONArray()
-    val remote = remoteBackend
-    val uploadLines = mutableListOf<String>()
     val mediaBlocks = mutableListOf<JSONObject>()
     for ((file, kind, bytes) in prepared) {
       val mime = file.mime.substringBefore(';').trim().lowercase()
       if (kind == AttachmentPolicy.Kind.IMAGE) {
         mediaBlocks += JSONObject().put("type", "image").put("mediaType", mime)
           .put("data", java.util.Base64.getEncoder().encodeToString(bytes)).put("name", file.name)
-        continue
-      }
-      if (remote != null) {
-        val uploadedViaReceipt = if (bytes.size <= REMOTE_FILE_RECEIPT_LIMIT_BYTES) {
-          try {
-            val receipt = uploadFileAttachment(session.id, bytes, file.name)
-            mediaBlocks += JSONObject().put("type", "file").put("receiptId", receipt)
-            true
-          } catch (error: Exception) {
-            if (error is CancellationException || !isRemoteFileReceiptUnsupported(error)) throw error
-            false
-          }
-        } else {
-          false
-        }
-        if (!uploadedViaReceipt) {
-          val uploaded = remote.uploadWorkspaceFile(session.id, bytes, file.name)
-          uploadLines += "已上传文件：${uploaded.path}"
-        }
         continue
       }
       // 非图片附件走 `fileUploads/upload` 换 receipt，再以 `{type:"file", receiptId}` 发送：
@@ -4373,10 +4164,6 @@ class DshApi(
       if (references.isNotEmpty()) {
         if (isNotEmpty()) append('\n')
         append(references.joinToString("\n") { "@${it.path}" })
-      }
-      if (uploadLines.isNotEmpty()) {
-        if (isNotEmpty()) append('\n')
-        append(uploadLines.joinToString("\n"))
       }
     }.trim()
     if (body.isNotBlank()) content.put(JSONObject().put("type", "text").put("text", body))
@@ -4459,21 +4246,11 @@ class DshApi(
     }
     val submitted = commandAttachments(session.id, inline)
     if (model != null) selectModel(session, model)
-    // The composer dispatches slash commands through command(), so use the same resumable remote
-    // compaction path as compact() when this is exactly /compact with no arguments or attachments.
-    val remote = remoteBackend
-    if (name == "compact" && arguments.isBlank() && inline.isEmpty() && remote != null && remote.supportsAsyncCompaction()) {
-      remote.compactSessionAsync(session.id)
-    } else {
-      executeCommand(session, "/$name $arguments".trim(), submitted)
-    }
+    executeCommand(session, "/$name $arguments".trim(), submitted)
   }
 
   private suspend fun commandAttachments(sessionId: String, inline: List<InlineFile>): JSONArray {
     if (inline.isEmpty()) return JSONArray()
-    if (remoteBackend != null && inline.any { AttachmentPolicy.kind(it.mime, it.name) != AttachmentPolicy.Kind.IMAGE }) {
-      throw ApiException(400, "此远程主机未提供命令文件附件通道，请更新 Host 连接器或改用普通消息上传", "command/attachments-unsupported")
-    }
     val submitted = JSONArray()
     for (file in inline) {
       val bytes = readInlineBytes(file) ?: throw ApiException(400, "附件无法读取：${file.name}")
@@ -4671,11 +4448,8 @@ class DshApi(
    * 逐文件对比来自认证栅栏内的 `/api/changes.diff`。摘要只在该 Host 进程内、会话存活期间提供。
    */
   override suspend fun diff(session: Session): List<FileChange> = withContext(Dispatchers.IO) {
-    // Capture the authenticated Remote connection before the multi-request comparison. A later
-    // reconnect cannot silently splice a new Host generation into this result.
-    val read: suspend (String, String, Long, Int?) -> JSONObject = remoteBackend?.changesReader() ?: ::readChanges
     val snapshot = snapshotFor(session, fresh = false)
-    DshChangesReadApi(read).changes(session, changeAnnouncements.snapshot(session.id, snapshot))
+    DshChangesReadApi(::readChanges).changes(session, changeAnnouncements.snapshot(session.id, snapshot))
   }
 
   /**
@@ -4772,7 +4546,6 @@ class DshApi(
     const val MUX_STREAM_BUFFER = 256
     const val MAX_RPC_RESPONSE_BYTES = 64L * 1024 * 1024
     const val WATCH_LIMIT = 12
-    const val REMOTE_WATCH_LIMIT = 8
     const val JOB_FOLLOW_CONCURRENCY = 2
 
     /** 首帧等待上限；只覆盖“流被打开到第一帧到达”，不含后续分片/transfer 读取。 */
@@ -4801,18 +4574,15 @@ class DshApi(
       "gateway/arguments-invalid"
     )
 
-    /** 认证失效的错误码：控制器据此提示重新配对，而不是当成网络抖动。 */
+    /** 认证失效的错误码：控制器据此提示重新连接，而不是当成网络抖动。 */
     const val AUTH_EXPIRED = DSH_AUTH_EXPIRED
     /** 隧道启动令牌已轮换，但上一张浏览器 Cookie 可能还能用。不是登录失效。 */
     const val AUTH_TOKEN_ROTATED = "auth/token-rotated"
-    const val REPAIR_MESSAGE = "登录已失效：dsh 重启后旧令牌作废、Cookie 也已过期或被撤销，请用电脑上新的 dsh web 启动链接重新配对"
-    const val SECRET_REJECTED_MESSAGE = "签名密钥被拒绝：密钥不对，或 dsh 的 browser-session 记录已被删除重建，请重新复制 secret"
-    const val UNTRUSTED_HOST_MESSAGE = "dsh 拒绝了这个地址（403）：请用 dsh web --host <该 IP> 启动，域名或反向代理需加 --trusted-host"
+    const val REPAIR_MESSAGE = "登录已失效：远端 dsh 重启后旧令牌作废且 Cookie 已过期，请重新连接设备"
+    const val UNTRUSTED_HOST_MESSAGE = "dsh 拒绝了这个地址（403）：请检查 SSH 隧道转发与 Host 头"
 
-    /** 令牌模式：Cookie 签发超过半天就尝试续期（dsh 未重启时令牌仍可用）。 */
+    /** Cookie 签发超过半天就尝试续期（dsh 未重启时令牌仍可用）。 */
     const val RENEW_AFTER_MILLIS = 12 * 60 * 60_000L
-    /** 密钥模式：过期前两小时重新签发。 */
-    const val MINTED_RENEW_MARGIN_MILLIS = 2 * 60 * 60_000L
     /** 续期失败后的冷却，避免每个请求都撞一次失效令牌。 */
     const val RENEW_RETRY_MILLIS = 60 * 60_000L
     const val STREAM_PING_SECONDS = 20L
@@ -4833,11 +4603,6 @@ class DshApi(
     const val STATUS_FALLBACK_MILLIS = 15_000L
     /** 补读结局时每页的消息数；一轮里的非消息事件不计入，所以要连翻几页。 */
     const val OUTCOME_PAGE_MESSAGES = 20
-    /**
-     * 远程主机的 `workspaceFiles/readBytes` 单次读取窗口。Host 侧夹到 4 MiB
-     * （`harness-remote-bridge.ts` 的 `MAX_READ_BYTES`），请求更长只会拿到 `eof=false`。
-     */
-    const val REMOTE_READ_WINDOW = 4 * 1024 * 1024
     /** 往前翻这么多页还看不到 `turn/end` 就放弃，不当作成功。 */
     const val OUTCOME_PAGE_ATTEMPTS = 4
 
@@ -4847,8 +4612,6 @@ class DshApi(
 
     /** 一条消息里最多回填多少附件字节（base64 后的长度）；超出的只在时间线里显示文件名。 */
     const val ATTACHMENT_BUDGET_BYTES = 12 * 1024 * 1024
-    /** 远程小附件优先尝试 `fileUploads/upload` 的裸字节上限（base64 后适配 Gateway 20 MiB 传输限制）。 */
-    const val REMOTE_FILE_RECEIPT_LIMIT_BYTES = 15 * 1024 * 1024
     /** 附件 data URI 的在内存缓存条数上限。 */
     const val ATTACHMENT_CACHE_LIMIT = 64
 
@@ -4856,25 +4619,11 @@ class DshApi(
       var current = error
       val seen = HashSet<Throwable>()
       while (current != null && seen.add(current)) {
-        when (current) {
-          is RemoteGatewayException -> if (current.code in setOf("METHOD_NOT_ALLOWED", "METHOD_NOT_FOUND")) return true
-          is RemoteRpcException -> if (current.code in setOf("METHOD_NOT_ALLOWED", "METHOD_NOT_FOUND")) return true
-          is ApiException -> if (current.status in setOf(404, 405, 501) ||
-            current.code in setOf("METHOD_NOT_ALLOWED", "METHOD_NOT_FOUND")) return true
-        }
+        if (current is ApiException && (current.status in setOf(404, 405, 501) ||
+            current.code in setOf("METHOD_NOT_ALLOWED", "METHOD_NOT_FOUND"))) return true
         current = current.cause
       }
       return false
-    }
-
-    private fun isRemoteFileReceiptUnsupported(error: Throwable): Boolean = when (error) {
-      is ApiException -> error.isDshMethodUnavailable ||
-        error.code in setOf("METHOD_NOT_ALLOWED", "METHOD_NOT_FOUND") ||
-        error.status in setOf(404, 405, 501)
-      is RemoteGatewayException -> error.code in setOf("METHOD_NOT_ALLOWED", "METHOD_NOT_FOUND")
-      is RemoteRpcException -> error.code in setOf("METHOD_NOT_ALLOWED", "METHOD_NOT_FOUND")
-      is RemoteFailureException -> error.kind == RemoteFailureKind.INCOMPATIBLE
-      else -> false
     }
 
     /** 作业清单缓存的有效期：把同一轮对账里的重复读取收敛掉。 */

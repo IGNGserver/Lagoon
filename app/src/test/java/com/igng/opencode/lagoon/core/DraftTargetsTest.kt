@@ -7,9 +7,13 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class DraftTargetsTest {
-  private fun profile(id: String, name: String, kind: ServerKind = ServerKind.OPENCODE, sshHostId: String? = null,
-    enabled: Boolean = true) =
-    ServerProfile(id, name, "https://$id.test", kind = kind, sshHostId = sshHostId, enabled = enabled)
+  private fun profile(
+    id: String,
+    name: String,
+    protocol: HarnessProtocol = HarnessProtocol.OPENCODE_NATIVE,
+    deviceId: String = "ssh-$id",
+    enabled: Boolean = true
+  ) = ServerProfile(id, name, "ssh://me@$id.test:22", protocol = protocol, deviceId = deviceId, deviceName = name, enabled = enabled)
 
   private fun snapshot(
     id: String,
@@ -30,9 +34,9 @@ class DraftTargetsTest {
   )
 
   @Test fun aggregateListsEveryEnabledProfileEvenWithoutProjects() {
-    val a = profile("a", "MacBook", ServerKind.OPENCODE)
-    val b = profile("b", "Desktop", ServerKind.DSH, sshHostId = "ssh-1")
-    val c = profile("c", "Hub", ServerKind.DSH_REMOTE)
+    val a = profile("a", "MacBook", HarnessProtocol.OPENCODE_NATIVE, "ssh-a")
+    val b = profile("b", "Desktop", HarnessProtocol.DSH, "ssh-b")
+    val c = profile("c", "Workstation", HarnessProtocol.CODEX, "ssh-c")
     val state = LagoonState(
       profiles = listOf(a, b, c), serverId = "a", connected = true,
       allServerSnapshots = mapOf(
@@ -43,7 +47,7 @@ class DraftTargetsTest {
 
     val servers = state.draftServers()
     assertEquals(listOf("a", "b", "c"), servers.map { it.id })
-    assertEquals(listOf("OpenCode 直连", "DSH SSH 直连", "DSH 远程中枢"), servers.map { it.connectionLabel })
+    assertEquals(listOf("OpenCode · SSH", "DeepSeek Harness · SSH", "Codex · SSH"), servers.map { it.connectionLabel })
     assertEquals("已连接", servers[0].statusLabel)
     assertEquals("已连接", servers[1].statusLabel)
     assertEquals("未连接", servers[2].statusLabel)
@@ -58,16 +62,14 @@ class DraftTargetsTest {
       profiles = listOf(b, a), serverId = "a", connected = false,
       allServerSnapshots = mapOf("b" to snapshot("b", b, connected = true))
     )
-
-    // The writable connection stays first even while offline: the blank page can wait for it.
     assertEquals(listOf("a", "b"), state.draftServers().map { it.id })
   }
 
   @Test fun groupScopeKeepsOnlyItsMembers() {
-    val a = profile("a", "A")
-    val b = profile("b", "B")
-    val c = profile("c", "C")
-    val group = DeviceGroup("g", "Group", listOf("a", "b"))
+    val a = profile("a", "A", deviceId = "dev-a")
+    val b = profile("b", "B", deviceId = "dev-b")
+    val c = profile("c", "C", deviceId = "dev-c")
+    val group = DeviceGroup("g", "Group", deviceIds = listOf("dev-a", "dev-b"))
     val state = LagoonState(
       profiles = listOf(a, b, c), deviceGroups = listOf(group), homeGroupId = "g",
       serverId = "a", connected = true,
@@ -77,7 +79,6 @@ class DraftTargetsTest {
         "c" to snapshot("c", c, connected = true)
       )
     )
-
     assertEquals(listOf("a", "b"), state.draftServers(setOf("a", "b")).map { it.id })
   }
 
@@ -85,7 +86,6 @@ class DraftTargetsTest {
     val a = profile("a", "A")
     val disabled = profile("b", "B", enabled = false)
     val state = LagoonState(profiles = listOf(a, disabled), serverId = "a", connected = true)
-
     assertEquals(listOf("a"), state.draftServers().map { it.id })
   }
 
@@ -98,7 +98,6 @@ class DraftTargetsTest {
       profiles = listOf(a), serverId = "a", connected = true, projects = listOf(registered),
       workspaceCatalog = listOf(duplicate, serverOnly).map { it.copy(serverId = "a") }
     )
-
     val workspaces = state.draftWorkspaces("a")
     assertEquals(listOf("p1", "p2"), workspaces.map { it.id })
     assertTrue(workspaces[0].registered)
@@ -117,7 +116,6 @@ class DraftTargetsTest {
           catalog = listOf(Project("pc", "/work/c", "C work")))
       )
     )
-
     assertEquals(listOf("pb", "pc"), state.draftWorkspaces("b").map { it.id })
     assertTrue(state.draftWorkspaces("b").first().registered)
     assertFalse(state.draftWorkspaces("b").last().registered)
@@ -134,7 +132,6 @@ class DraftTargetsTest {
         Project("y", "/y", "Y", serverId = "a")
       )
     )
-
     assertEquals(listOf("y"), state.serverWorkspaceCatalogOn("a").map { it.id })
   }
 
@@ -145,14 +142,9 @@ class DraftTargetsTest {
       profiles = listOf(a, b), serverId = "a", connected = true, allServers = true,
       allServerSnapshots = mapOf("b" to snapshot("b", b, connected = true))
     )
-    // 当前可写设备优先，即使它离线；空白页会显示连接进度，仍可在页内换设备。
     assertEquals("a", aggregate.defaultDraftServer()?.id)
     assertEquals("a", aggregate.copy(connected = false).defaultDraftServer()?.id)
-
-    // 当前设备不在首页范围（例如设备组）时，选第一台已连接成员。
     assertEquals("b", aggregate.copy(serverId = "outside").defaultDraftServer()?.id)
-
-    // 设备组范围只考虑成员；没有启用成员时返回 null，由入口给出提示。
     assertEquals("a", aggregate.copy(serverId = "b").defaultDraftServer(setOf("a"))?.id)
     assertNull(aggregate.defaultDraftServer(setOf("missing")))
     assertNull(LagoonState(profiles = listOf(a.copy(enabled = false))).defaultDraftServer())
@@ -167,7 +159,6 @@ class DraftTargetsTest {
       profiles = listOf(a), serverId = "a", connected = true,
       projects = listOf(first, recent), sessions = listOf(session)
     )
-
     assertEquals("p2", state.preferredDraftProject("a")?.id)
     assertEquals("p1", state.preferredDraftProject("a", preferred = "p1")?.id)
     assertNull(state.preferredDraftProject("other"))
@@ -181,7 +172,6 @@ class DraftTargetsTest {
       profiles = listOf(a), serverId = "a", connected = true,
       projects = listOf(inScope, other), scopeProjectId = "p1"
     )
-
     assertEquals("p1", state.preferredDraftProject("a")?.id)
   }
 }

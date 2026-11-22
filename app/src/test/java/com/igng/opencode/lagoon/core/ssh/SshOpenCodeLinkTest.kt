@@ -1,9 +1,10 @@
 package com.igng.opencode.lagoon.core.ssh
 
+import com.igng.opencode.lagoon.core.HarnessConfig
+import com.igng.opencode.lagoon.core.HarnessProtocol
 import com.igng.opencode.lagoon.core.OpenCodeApi
 import com.igng.opencode.lagoon.core.RemoteExecResult
 import com.igng.opencode.lagoon.core.PresentedSshHostKey
-import com.igng.opencode.lagoon.core.ServerKind
 import com.igng.opencode.lagoon.core.ServerProfile
 import com.igng.opencode.lagoon.core.Session
 import com.igng.opencode.lagoon.core.SessionAction
@@ -293,8 +294,8 @@ class SshOpenCodeLinkTest {
       // OpenCode must ignore the saved host's DSH launch command even when one is present.
       launchCommand = "dsh web --must-not-run", hostKeyType = KEY.type, hostKeyFingerprint = KEY.fingerprint)
     private val profile = ServerProfile("ssh-opencode", "OpenCode", config.profileUrl(),
-      username = "not-the-native-user", kind = ServerKind.OPENCODE, sshHostId = config.id,
-      sshServicePath = REGISTRATION_PATH)
+      username = "not-the-native-user", protocol = HarnessProtocol.OPENCODE_NATIVE, deviceId = config.id,
+      config = HarnessConfig.OpenCodeNative(REGISTRATION_PATH))
     val link = SshHostLink(scope, profile, config, SshSecrets(password = "ssh-fixture-password"), factory,
       onStatus = { steps += it.step })
 

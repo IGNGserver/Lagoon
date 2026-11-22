@@ -46,8 +46,8 @@ import com.igng.opencode.lagoon.core.ResourceState
 import com.igng.opencode.lagoon.core.canResumeGoal
 import kotlinx.coroutines.launch
 import com.igng.opencode.lagoon.core.LagoonState
-import com.igng.opencode.lagoon.core.RemoteGoal
-import com.igng.opencode.lagoon.core.RemoteTodo
+import com.igng.opencode.lagoon.core.DshGoal
+import com.igng.opencode.lagoon.core.DshTodo
 import com.igng.opencode.lagoon.core.todoProgress
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.basic.TextField
@@ -67,7 +67,7 @@ private enum class ConversationStatusSheet { GOAL, TODOS }
 internal fun ConversationStatusRail(state: LagoonState, controller: LagoonController) {
   val state = rememberChatChromeState(state)
   // 已完成的目标与官方客户端一致：不再常驻，避免一行“已完成”长期占位。
-  val goal = state.goal?.takeUnless(RemoteGoal::complete)
+  val goal = state.goal?.takeUnless(DshGoal::complete)
   val todos = state.todos
   var sheet by remember(state.serverId, state.sessionId) { mutableStateOf<ConversationStatusSheet?>(null) }
   if (goal == null && todos.isEmpty() && sheet == null) return
@@ -132,7 +132,7 @@ private fun StatusCapsule(
 }
 
 @Composable
-private fun GoalCapsule(goal: RemoteGoal, modifier: Modifier = Modifier, onClick: () -> Unit) {
+private fun GoalCapsule(goal: DshGoal, modifier: Modifier = Modifier, onClick: () -> Unit) {
   val tint = when {
     goal.blocked -> HyperTheme.colors.error
     goal.paused -> HyperTheme.colors.warning
@@ -163,7 +163,7 @@ private fun GoalCapsule(goal: RemoteGoal, modifier: Modifier = Modifier, onClick
 }
 
 @Composable
-private fun TodoCapsule(todos: List<RemoteTodo>, onClick: () -> Unit) {
+private fun TodoCapsule(todos: List<DshTodo>, onClick: () -> Unit) {
   val progress = todos.todoProgress()
   val tint = when {
     progress.complete -> HyperTheme.colors.success
@@ -185,7 +185,7 @@ private fun TodoCapsule(todos: List<RemoteTodo>, onClick: () -> Unit) {
 private fun GoalSheet(state: LagoonState, controller: LagoonController, onDismiss: () -> Unit) {
   val goal = state.goal
   var editTarget by remember { mutableStateOf<GoalMutationTarget?>(null) }
-  var editSource by remember { mutableStateOf<RemoteGoal?>(null) }
+  var editSource by remember { mutableStateOf<DshGoal?>(null) }
   var clearTarget by remember { mutableStateOf<GoalMutationTarget?>(null) }
   // Keep an open editor intact even if another client clears/completes/replaces the goal.
   LaunchedEffect(goal?.id, goal?.phase, editTarget, clearTarget) {
@@ -258,11 +258,11 @@ private fun GoalSheet(state: LagoonState, controller: LagoonController, onDismis
   }
 }
 
-internal fun goalRoundSummary(goal: RemoteGoal): String =
+internal fun goalRoundSummary(goal: DshGoal): String =
   "自动续跑轮次：${goal.roundsStarted?.toString() ?: "未知"} / 上限 ${goal.maxGoalRounds?.toString() ?: "未知"}"
 
 @Composable
-private fun GoalEditDialog(state: LagoonState, controller: LagoonController, captured: GoalMutationTarget, source: RemoteGoal, onDismiss: () -> Unit) {
+private fun GoalEditDialog(state: LagoonState, controller: LagoonController, captured: GoalMutationTarget, source: DshGoal, onDismiss: () -> Unit) {
   var expected by remember { mutableStateOf(captured) }
   var objective by remember { mutableStateOf(source.objective) }
   var capText by remember { mutableStateOf(source.maxGoalRounds?.toString().orEmpty()) }
@@ -312,7 +312,7 @@ private fun GoalEditDialog(state: LagoonState, controller: LagoonController, cap
 
 /** 当前清单：完成数、逐条状态；清空由 Host 在下一轮开始时自动完成。 */
 @Composable
-private fun TodoSheet(todos: List<RemoteTodo>, onDismiss: () -> Unit) {
+private fun TodoSheet(todos: List<DshTodo>, onDismiss: () -> Unit) {
   LaunchedEffect(todos.isEmpty()) { if (todos.isEmpty()) onDismiss() }
   if (todos.isEmpty()) return
   val progress = todos.todoProgress()
@@ -343,7 +343,7 @@ private fun TodoSheet(todos: List<RemoteTodo>, onDismiss: () -> Unit) {
 }
 
 @Composable
-private fun TodoRow(todo: RemoteTodo) {
+private fun TodoRow(todo: DshTodo) {
   val label = when {
     todo.done -> "已完成"
     todo.active -> "进行中"

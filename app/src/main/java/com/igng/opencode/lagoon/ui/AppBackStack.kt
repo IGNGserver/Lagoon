@@ -1,12 +1,10 @@
 package com.igng.opencode.lagoon.ui
 
-import com.igng.opencode.lagoon.core.ServerProfile
-
 /**
  * Pages of the app. There is no tab bar: 会话 is the only root, and 设置 is pushed over it
  * from its ⋯ menu like any other page.
  *
- * 信息架构主线：设备 → Harness → 项目/目录 → 会话 → 对话。设备是用户操作的单位，Harness 只是设备上的
+ * 信息架构主线：SSH 设备 → Harness → 项目/目录 → 会话 → 对话。设备是用户操作的单位，Harness 只是设备上的
  * 一个能力（见 `docs/DEVICE_MODEL.md`）。
  */
 internal enum class RootPage(val label: String) {
@@ -15,38 +13,16 @@ internal enum class RootPage(val label: String) {
   SETTINGS("设置")
 }
 
-/** 添加设备页的两个接入分支。两条分支产出同一种设备，不再按 Harness 类型分页。 */
-internal enum class AddDeviceAccess(val label: String) {
-  HUB("经由中枢"),
-  SSH("经由 SSH")
-}
-
-/** 整页编辑器的一层。 */
-internal enum class DeviceEditorMode {
-  /** 添加设备：先选接入分支，再登录中枢或填写 SSH。 */
-  ADD_DEVICE,
-
-  /** SSH 设备表单；`sshHostId` 为空串表示新建。 */
-  SSH_HOST,
-
-  /** 兼容直连资料编辑（OpenCode 直连 / 旧版直连 DSH）。 */
-  DIRECT_PROFILE
-}
-
 /**
- * 设备整页编辑器的一层。
+ * SSH 设备整页编辑器的一层。
  *
- * 设备子树里的每一级都是路由上的一层，所以「列表 → 设备 → Harness → 表单」与首页进设备页
+ * 设备子树里的每一级都是路由上的一层，所以「列表 → 设备 → 编辑表单」与首页进设备页
  * 走的是同一套整页过渡，返回手势也能逐级预览上一页：
- * - [mode] 为空场景的默认值：添加设备入口；
- * - [profileId] 只在 [DeviceEditorMode.DIRECT_PROFILE] 下有意义；
- * - [sshHostId] 只在 [DeviceEditorMode.SSH_HOST] 下有意义，空串表示新建。
+ * - [deviceId] 为 null 或空串表示新建 SSH 设备；
+ * - [deviceId] 非空表示编辑对应 [com.igng.opencode.lagoon.core.SshDevice.id]。
  */
 internal data class DeviceEditorRoute(
-  val mode: DeviceEditorMode = DeviceEditorMode.ADD_DEVICE,
-  val access: AddDeviceAccess = AddDeviceAccess.HUB,
-  val profileId: String? = null,
-  val sshHostId: String? = null,
+  val deviceId: String? = null,
   /**
    * 本次打开编辑器的实例号。[key] 带上它，saveable 作用域才只属于这一次打开；否则两次
    * “添加 SSH 设备”的 key 完全相同，上一次的地址、密钥选择和已固定指纹会被恢复进新表单。
@@ -54,23 +30,19 @@ internal data class DeviceEditorRoute(
    */
   val instance: String = ""
 ) {
+  val isNew: Boolean get() = deviceId.isNullOrBlank()
+
   /** 页面身份：整页过渡的 contentKey 与 saveable 作用域都靠它区分两个相邻的编辑器页。 */
-  val key get() = buildString {
-    append(mode.name).append('|').append(access.name).append('|').append(profileId.orEmpty()).append('|')
-    append(sshHostId?.let { "ssh:$it" } ?: "")
-    if (instance.isNotEmpty()) append('|').append(instance)
-  }
+  val key: String
+    get() = buildString {
+      append("ssh:").append(deviceId.orEmpty())
+      if (instance.isNotEmpty()) append('|').append(instance)
+    }
 }
 
 /** 给一次新打开盖章；已经带实例号（例如从 back stack 恢复）的路由原样返回。 */
 internal fun DeviceEditorRoute.freshInstance(): DeviceEditorRoute =
   if (instance.isNotEmpty()) this else copy(instance = java.util.UUID.randomUUID().toString())
-
-/** An SSH Harness inherits its endpoint and credentials from its containing SSH device. */
-internal fun editorForHarness(profile: ServerProfile): DeviceEditorRoute =
-  profile.sshHostId?.let { hostId ->
-    DeviceEditorRoute(mode = DeviceEditorMode.SSH_HOST, access = AddDeviceAccess.SSH, sshHostId = hostId)
-  } ?: DeviceEditorRoute(mode = DeviceEditorMode.DIRECT_PROFILE, profileId = profile.id)
 
 /**
  * The single in-app back stack shared by the UI and its unit tests.
@@ -84,11 +56,11 @@ internal data class SessionNavigation(
   val page: RootPage = RootPage.HOME,
   val sessions: List<String> = emptyList(),
   val parentPages: List<RootPage> = emptyList(),
-  /** 设备详情：`HostBinding.id`，不是任何一条 Harness。 */
+  /** 设备详情：`SshDevice.id`，不是任何一条 Harness。 */
   val device: String? = null,
-  /** Harness 详情：`ServerProfile.id` 的 leaf，挂在设备详情之上。 */
+  /** Harness 详情：`DeviceHarness.id` / `ServerProfile.id`，挂在设备详情之上。 */
   val harness: String? = null,
-  /** 整页编辑器栈：添加设备入口 + 可选的一层 SSH / 直连表单。 */
+  /** 整页 SSH 设备编辑器栈（新建或编辑单台 SSH 设备）。 */
   val editors: List<DeviceEditorRoute> = emptyList()
 ) {
   val canGoBack get() = sessions.isNotEmpty() || parentPages.isNotEmpty() || page != RootPage.HOME ||
@@ -128,7 +100,7 @@ internal data class SessionNavigation(
   fun openDevice(deviceId: String) = copy(device = deviceId, harness = null, editors = emptyList())
   /** 推入 Harness 详情；它永远在设备详情之上。 */
   fun openHarness(leafId: String) = copy(harness = leafId, editors = emptyList())
-  /** 推入一层整页编辑器；设备页之上的添加设备/SSH 表单都是这一层。 */
+  /** 推入一层整页编辑器。 */
   fun openEditor(route: DeviceEditorRoute) = copy(editors = editors + route)
   fun back() = when {
     editors.isNotEmpty() -> copy(editors = editors.dropLast(1))
@@ -173,44 +145,39 @@ internal data class NavRoute(
 internal fun slideDirection(from: NavRoute, to: NavRoute): Int = if (to.depth < from.depth) -1 else 1
 
 /**
- * 编辑器层的落盘编码（旋转、重建后仍停在同一页）。每层是
- * `mode|access|profileId|ssh:hostId|instance`，空段表示 null / 空值。
- * 旧版本的四段（无 instance）与三段（`tab|profileId|ssh:hostId`）格式仍然可读。
+ * 编辑器层的落盘编码（旋转、重建后仍停在同一页）。每层是 `ssh:<deviceId>|<instance>`，空 deviceId 表示新建。
+ * 兼容读取升级前留下的旧版 4/5 段格式（忽略已下线的直连资料页，SSH 项照常恢复）。
  */
 internal fun encodeDeviceEditors(editors: List<DeviceEditorRoute>): ArrayList<String> =
   ArrayList(editors.map { route ->
-    listOf(
-      route.mode.name,
-      route.access.name,
-      route.profileId.orEmpty(),
-      route.sshHostId?.let { "ssh:$it" }.orEmpty(),
-      route.instance
-    ).joinToString("|")
+    "ssh:${route.deviceId.orEmpty()}|${route.instance}"
   })
 
 internal fun decodeDeviceEditors(raw: List<String>?): List<DeviceEditorRoute> = raw.orEmpty().mapNotNull { line ->
   val parts = line.split("|")
   when (parts.size) {
-    5, 4 -> {
-      val mode = runCatching { DeviceEditorMode.valueOf(parts[0]) }.getOrNull() ?: return@mapNotNull null
-      val access = runCatching { AddDeviceAccess.valueOf(parts[1]) }.getOrDefault(AddDeviceAccess.HUB)
-      DeviceEditorRoute(mode, access, parts[2].ifBlank { null }, sshHostOf(parts[3]), parts.getOrNull(4).orEmpty())
+    2 -> {
+      val id = sshDeviceOf(parts[0]) ?: return@mapNotNull null
+      DeviceEditorRoute(deviceId = id.ifBlank { null }, instance = parts[1])
     }
-    // 旧格式：OPENCODE/DSH 是直连表单的分页，不是接入分支。按"有无 ssh/资料"还原语义。
-    3 -> {
-      val profileId = parts[1].ifBlank { null }
-      val sshHostId = sshHostOf(parts[2])
-      when {
-        sshHostId != null -> DeviceEditorRoute(DeviceEditorMode.SSH_HOST, AddDeviceAccess.SSH, null, sshHostId)
-        profileId != null -> DeviceEditorRoute(DeviceEditorMode.DIRECT_PROFILE, AddDeviceAccess.HUB, profileId, null)
-        else -> DeviceEditorRoute()
+    5, 4 -> {
+      val mode = parts[0]
+      val instance = parts.getOrNull(4).orEmpty()
+      when (mode) {
+        "SSH_HOST" -> DeviceEditorRoute(deviceId = sshDeviceOf(parts[3])?.ifBlank { null }, instance = instance)
+        "ADD_DEVICE" -> DeviceEditorRoute(deviceId = null, instance = instance)
+        else -> null
       }
+    }
+    3 -> {
+      val id = sshDeviceOf(parts[2])
+      if (id != null) DeviceEditorRoute(deviceId = id.ifBlank { null }) else null
     }
     else -> null
   }
 }
 
-private fun sshHostOf(segment: String): String? =
+private fun sshDeviceOf(segment: String): String? =
   segment.removePrefix("ssh:").takeIf { segment.startsWith("ssh:") }
 
 /**

@@ -6,6 +6,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.io.Closeable
@@ -46,12 +48,25 @@ internal class SshForwarder(
   private val pairs = ConcurrentHashMap.newKeySet<Pair>()
   private val pending = ConcurrentHashMap.newKeySet<Socket>()
   private val pendingAdmissions = Semaphore(MAX_PENDING_ADMISSIONS)
+  private val reapSignal = Channel<Unit>(Channel.CONFLATED)
   @Volatile private var closed = false
   private val acceptJob: Job
 
   init {
     server.reuseAddress = true
     acceptJob = scope.launch { acceptLoop() }
+    scope.launch { reapLoop() }
+  }
+
+  private suspend fun reapLoop() {
+    while (scope.isActive && !closed) {
+      if (pairs.isEmpty()) {
+        reapSignal.receive()
+        continue
+      }
+      delay(1_000)
+      pairs.toList().forEach { pair -> if (!pair.isOpen) pair.close() }
+    }
   }
 
   val port: Int get() = server.localPort
@@ -108,6 +123,7 @@ internal class SshForwarder(
       val entry = Pair(socket, pair, onDone = { pairs.remove(it) })
       pairs += entry
       entry.start()
+      reapSignal.trySend(Unit)
     } catch (_: Exception) {
       pending.remove(socket)
       runCatching { socket.close() }
@@ -127,6 +143,7 @@ internal class SshForwarder(
     closed = true
     runCatching { server.close() }
     dropConnections()
+    reapSignal.close()
     acceptJob.cancel()
     scope.cancel()
     token.fill(0)
@@ -142,23 +159,13 @@ internal class SshForwarder(
     private val onDone: (Pair) -> Unit
   ) {
     @Volatile private var done = false
+    val isOpen: Boolean get() = !done && channel.isOpen
 
-    /** JSch pumps both directions. Close the local socket as soon as the channel reports closed,
-     *  with a short poll only as a backstop for channels that never fire [TunnelConnection.onClosed]. */
+    /** JSch pumps both directions. Close the local socket immediately on [TunnelConnection.onClosed],
+     *  backed by the forwarder's single shared reaper coroutine for channels that do not emit it. */
     fun start() {
       channel.onClosed { close() }
-      Thread({
-        try {
-          while (!done && channel.isOpen) Thread.sleep(1_000)
-        } catch (_: InterruptedException) {
-          Thread.currentThread().interrupt()
-        } finally {
-          close()
-        }
-      }, "lagoon-ssh-tunnel-${socket.port}").apply {
-        isDaemon = true
-        start()
-      }
+      if (!channel.isOpen) close()
     }
 
     fun close() {

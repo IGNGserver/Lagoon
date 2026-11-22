@@ -99,7 +99,7 @@ class DshEventSubscribersTest {
       }
       server.start()
       client = DshApi(ServerProfile("srv", "DSH", server.url("/").toString().trimEnd('/'),
-        username = "dsh", allowCleartext = true, kind = ServerKind.DSH), ServerCredentials("dsh", "tok"))
+        username = "dsh", allowCleartext = true, protocol = HarnessProtocol.DSH), ServerCredentials("dsh", "tok"))
       client.setContentWatching(false)
     }
     suspend fun open() = withTimeout(5_000) { opens.receive() }

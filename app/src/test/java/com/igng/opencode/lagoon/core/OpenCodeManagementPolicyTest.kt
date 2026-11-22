@@ -14,7 +14,7 @@ class OpenCodeManagementPolicyTest {
     assertFalse(state.copy(degraded = true).canManageOpenCodeProjects())
     assertFalse(state.copy(allServers = true).canManageOpenCodeProjects())
     assertFalse(state.copy(capabilities = ApiCapabilities()).canManageOpenCodeProjects())
-    assertFalse(state.copy(profiles = listOf(profile.copy(kind = ServerKind.DSH))).canManageOpenCodeProjects())
+    assertFalse(state.copy(profiles = listOf(profile.copy(protocol = HarnessProtocol.DSH))).canManageOpenCodeProjects())
     assertTrue(OpenCodeManagementTarget(profile).matches(state.copy(sessionId = "another")))
     assertFalse(OpenCodeManagementTarget(profile).matches(state.copy(profiles = listOf(profile.copy(url = "https://other.example/")))))
   }

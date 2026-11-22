@@ -10,27 +10,20 @@ import org.junit.Test
 class DeviceProjectionTest {
   private val now = 1_700_000_000_000L
 
-  private fun hubDsh(id: String, name: String = "ubuntu-dev", host: String = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa") = ServerProfile(
-    id = id, name = name, url = "https://hub.example.test", username = "me@example.test",
-    kind = ServerKind.DSH_REMOTE, remoteHostId = host, remoteHostFingerprint = "0123456789ab"
+  private fun device(
+    id: String = "ssh-1",
+    name: String = "arch-dev",
+    enabled: Boolean = true,
+    harnesses: List<DeviceHarness> = emptyList()
+  ) = SshDevice(
+    id = id,
+    name = name,
+    host = "arch.test",
+    port = 22,
+    user = "me",
+    enabled = enabled,
+    harnesses = harnesses
   )
-
-  private fun hubCodex(id: String, host: String = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa") = ServerProfile(
-    id = id, name = "Codex", url = "https://hub.example.test", username = "me@example.test",
-    kind = ServerKind.CODEX, remoteHostId = host, remoteHostFingerprint = "0123456789ab"
-  )
-
-  private fun sshLeaf(id: String, hostId: String, kind: ServerKind = ServerKind.DSH) = ServerProfile(
-    id = id, name = "arch-dev", url = "ssh://me@arch.test:22", username = "me", kind = kind, sshHostId = hostId
-  )
-
-  private fun graphOf(profiles: List<ServerProfile>, sourceEnabled: Boolean = true, hostEnabled: Boolean = true) =
-    MigrationProjection.fromProfiles(profiles).let { graph ->
-      graph.copy(
-        sources = graph.sources.map { it.copy(enabled = sourceEnabled) },
-        hosts = graph.hosts.map { it.copy(enabled = hostEnabled) }
-      )
-    }
 
   private fun available(observedAt: Long = now - 5_000) = HarnessDiscoveryStatus(
     installed = DiscoveryValue.YES, configured = DiscoveryValue.YES, listening = DiscoveryValue.YES,
@@ -38,245 +31,138 @@ class DeviceProjectionTest {
     observedAtMs = observedAt, freshUntilMs = observedAt + 600_000, completeness = DiscoveryCompleteness.COMPLETE
   )
 
-  @Test fun oldDefaultPathObservationReusesTheExistingDefaultLeaf() {
-    val profile = sshLeaf("old-default", "ssh-config", ServerKind.OPENCODE)
-    val graph = graphOf(listOf(profile))
-    val discovery = DeviceDiscovery(graph.hosts.single().id, now, listOf(DiscoveredHarness(
-      HarnessProtocolId.OPENCODE_NATIVE, "/home/me/.local/state/opencode/service.json", "OpenCode", available())))
-    val slots = DeviceProjection.devices(graph, listOf(profile), discovery = { discovery }, nowMs = now)
-      .single().harnesses.filter { it.protocol == HarnessProtocolId.OPENCODE_NATIVE }
+  @Test fun oldDefaultPathObservationReusesTheExistingDefaultHarness() {
+    val dev = device(
+      harnesses = listOf(DeviceHarness("old-default", "ssh-1", HarnessProtocol.OPENCODE_NATIVE))
+    )
+    val discovery = DeviceDiscovery("ssh-1", now, listOf(DiscoveredHarness(
+      HarnessProtocol.OPENCODE_NATIVE, "/home/me/.local/state/opencode/service.json", "OpenCode", available()
+    )))
+    val slots = DeviceProjection.devices(listOf(dev), discovery = { discovery }, nowMs = now)
+      .single().harnesses.filter { it.protocol == HarnessProtocol.OPENCODE_NATIVE }
     assertEquals(1, slots.size)
-    assertEquals("old-default", slots.single().leafId?.value)
+    assertEquals("old-default", slots.single().harnessId?.value)
   }
 
   @Test fun existingDistinctRegistrationPathsRemainSeparate() {
-    val default = sshLeaf("old-default", "ssh-config", ServerKind.OPENCODE)
-    val explicit = default.copy(id = "explicit", sshServicePath = "/custom/service.json")
-    val profiles = listOf(default, explicit)
-    val graph = graphOf(profiles)
-    val discovery = DeviceDiscovery(graph.hosts.single().id, now, listOf(DiscoveredHarness(
-      HarnessProtocolId.OPENCODE_NATIVE, "/custom/service.json", "OpenCode", available())))
-    val slots = DeviceProjection.devices(graph, profiles, discovery = { discovery }, nowMs = now)
-      .single().harnesses.filter { it.protocol == HarnessProtocolId.OPENCODE_NATIVE }
-    assertEquals(setOf("old-default", "explicit"), slots.mapNotNull { it.leafId?.value }.toSet())
+    val dev = device(
+      harnesses = listOf(
+        DeviceHarness("old-default", "ssh-1", HarnessProtocol.OPENCODE_NATIVE),
+        DeviceHarness("explicit", "ssh-1", HarnessProtocol.OPENCODE_NATIVE, config = HarnessConfig.OpenCodeNative("/custom/service.json"))
+      )
+    )
+    val discovery = DeviceDiscovery("ssh-1", now, listOf(DiscoveredHarness(
+      HarnessProtocol.OPENCODE_NATIVE, "/custom/service.json", "OpenCode", available()
+    )))
+    val slots = DeviceProjection.devices(listOf(dev), discovery = { discovery }, nowMs = now)
+      .single().harnesses.filter { it.protocol == HarnessProtocol.OPENCODE_NATIVE }
+    assertEquals(setOf("old-default", "explicit"), slots.mapNotNull { it.harnessId?.value }.toSet())
   }
 
   @Test fun expiredSshNegativeIsUnknownAndCanBeRetried() {
-    val profile = sshLeaf("ssh-leaf", "ssh-config")
-    val graph = graphOf(listOf(profile))
-    val stale = HarnessDiscoveryStatus(installed = DiscoveryValue.NO, observedAtMs = now - 700_000,
-      freshUntilMs = now - 100_000, completeness = DiscoveryCompleteness.COMPLETE)
-    val discovery = DeviceDiscovery(graph.hosts.single().id, now - 700_000,
-      listOf(DiscoveredHarness(HarnessProtocolId.CODEX_APP_SERVER, null, "Codex", stale)))
-    val slot = DeviceProjection.devices(graph, listOf(profile), discovery = { discovery }, nowMs = now)
-      .single().harnesses.first { it.protocol == HarnessProtocolId.CODEX_APP_SERVER }
+    val dev = device(harnesses = listOf(DeviceHarness("h-dsh", "ssh-1", HarnessProtocol.DSH)))
+    val stale = HarnessDiscoveryStatus(
+      installed = DiscoveryValue.NO, observedAtMs = now - 700_000,
+      freshUntilMs = now - 100_000, completeness = DiscoveryCompleteness.COMPLETE
+    )
+    val discovery = DeviceDiscovery(
+      "ssh-1", now - 700_000,
+      listOf(DiscoveredHarness(HarnessProtocol.CODEX, null, "Codex", stale))
+    )
+    val slot = DeviceProjection.devices(listOf(dev), discovery = { discovery }, nowMs = now)
+      .single().harnesses.first { it.protocol == HarnessProtocol.CODEX }
     assertTrue(slot.attachable)
     assertEquals("上次发现已过期", slot.reason)
   }
 
   @Test fun oneDeviceCarriesEveryHarnessOfTheSameHost() {
-    val profiles = listOf(hubDsh("leaf-dsh"), hubCodex("leaf-codex"))
-    val graph = graphOf(profiles)
-    val devices = DeviceProjection.devices(graph, profiles, adoptedDeviceIds = null, nowMs = now)
-
-    assertEquals(1, devices.size)
-    val device = devices.single()
-    assertEquals(DeviceAccess.HUB, device.access)
-    assertEquals(2, device.attachedCount)
-    assertEquals(2, device.enabledCount)
-    assertTrue(device.effectiveEnabled)
-    assertEquals(setOf("leaf-dsh", "leaf-codex"), device.harnesses.mapNotNull { it.leafId?.value }.toSet())
-    // leaf 沿用设备名时，设备页显示协议名，否则两行都会叫 ubuntu-dev。
-    assertEquals(setOf("DeepSeek Harness", "Codex"), device.harnesses.map { it.name }.toSet())
+    val dev = device(
+      harnesses = listOf(
+        DeviceHarness("h-dsh", "ssh-1", HarnessProtocol.DSH),
+        DeviceHarness("h-codex", "ssh-1", HarnessProtocol.CODEX)
+      )
+    )
+    val projected = DeviceProjection.devices(listOf(dev), nowMs = now).single()
+    assertEquals(2, projected.attachedCount)
+    assertEquals(2, projected.enabledCount)
+    assertTrue(projected.effectiveEnabled)
+    assertEquals(setOf("h-dsh", "h-codex"), projected.harnesses.mapNotNull { it.harnessId?.value }.toSet())
+    assertTrue(projected.harnesses.any { it.name == "DeepSeek Harness" })
+    assertTrue(projected.harnesses.any { it.name == "Codex" })
   }
 
   @Test fun disablingTheDeviceBlocksEveryHarnessWithoutLosingTheirSwitches() {
-    val profiles = listOf(hubDsh("leaf-dsh"), hubCodex("leaf-codex"))
-    val devices = DeviceProjection.devices(graphOf(profiles, hostEnabled = false), profiles, nowMs = now)
-
-    val device = devices.single()
-    assertFalse(device.effectiveEnabled)
-    assertEquals("此设备已停用", device.blockedReason)
-    assertTrue(device.harnesses.all { it.attached })
-    assertTrue(device.harnesses.all { it.enabled })
-    // The device gate is separate from the Harness preferences: turning the device back on restores both.
-    assertEquals(2, device.enabledCount)
+    val dev = device(
+      enabled = false,
+      harnesses = listOf(
+        DeviceHarness("h-dsh", "ssh-1", HarnessProtocol.DSH, enabled = true),
+        DeviceHarness("h-codex", "ssh-1", HarnessProtocol.CODEX, enabled = true)
+      )
+    )
+    val projected = DeviceProjection.devices(listOf(dev), nowMs = now).single()
+    assertFalse(projected.effectiveEnabled)
+    assertEquals("此设备已停用", projected.blockedReason)
+    assertEquals(2, projected.enabledCount)
+    assertTrue(dev.toProfiles().all { it.enabled && !it.deviceEnabled && !it.effectiveEnabled })
   }
 
   @Test fun disablingOneHarnessDoesNotTouchItsSibling() {
-    val profiles = listOf(hubDsh("leaf-dsh"), hubCodex("leaf-codex").copy(enabled = false))
-    val device = DeviceProjection.devices(graphOf(profiles), profiles, nowMs = now).single()
-
-    val dsh = device.harnesses.first { it.leafId?.value == "leaf-dsh" }
-    val codex = device.harnesses.first { it.leafId?.value == "leaf-codex" }
+    val dev = device(
+      harnesses = listOf(
+        DeviceHarness("h-dsh", "ssh-1", HarnessProtocol.DSH, enabled = true),
+        DeviceHarness("h-codex", "ssh-1", HarnessProtocol.CODEX, enabled = false)
+      )
+    )
+    val projected = DeviceProjection.devices(listOf(dev), nowMs = now).single()
+    val dsh = projected.harnesses.first { it.harnessId?.value == "h-dsh" }
+    val codex = projected.harnesses.first { it.harnessId?.value == "h-codex" }
     assertTrue(dsh.effectiveEnabled)
     assertFalse(codex.effectiveEnabled)
-    assertEquals(1, device.enabledCount)
-  }
-
-  @Test fun hubHostWithoutHarnessIsADeviceButOnlyWhenAdopted() {
-    val host = HostBinding("host-1", "source-1", "windows-vm", externalHostId = "host-1", fingerprint = "0123456789ab")
-    val graph = ConnectionGraph(
-      sources = listOf(ConnectionSource("source-1", ConnectionSourceType.HUB, "hub", "https://hub.example.test", account = "me")),
-      hosts = listOf(host)
-    )
-
-    assertTrue(DeviceProjection.devices(graph, emptyList(), adoptedDeviceIds = emptySet(), nowMs = now).isEmpty())
-
-    val adopted = DeviceProjection.devices(graph, emptyList(), adoptedDeviceIds = setOf("host-1"), nowMs = now)
-    val device = adopted.single()
-    assertEquals(0, device.attachedCount)
-    assertTrue(device.harnesses.any { it.protocol == HarnessProtocolId.DSH_TYPERT && it.attachable })
-  }
-
-  @Test fun sshSourceFlagIsNotASecondGate() {
-    val profiles = listOf(sshLeaf("leaf-ssh", "ssh-config"))
-    val devices = DeviceProjection.devices(graphOf(profiles, sourceEnabled = false), profiles, nowMs = now)
-
-    val device = devices.single()
-    assertEquals(DeviceAccess.SSH, device.access)
-    assertTrue(device.sourceEnabled)
-    assertTrue(device.effectiveEnabled)
+    assertEquals(1, projected.enabledCount)
   }
 
   @Test fun discoveryOffersAttachableSlotsAndExplainsTheRest() {
-    val host = HostBinding("host-1", "source-1", "ubuntu-dev", externalHostId = "host-1")
-    val graph = ConnectionGraph(
-      sources = listOf(ConnectionSource("source-1", ConnectionSourceType.HUB, "hub", "https://hub.example.test", account = "me")),
-      hosts = listOf(host)
-    )
+    val dev = device()
     val missing = HarnessDiscoveryStatus(
       installed = DiscoveryValue.NO, observedAtMs = now - 1_000, freshUntilMs = now + 600_000,
       completeness = DiscoveryCompleteness.COMPLETE
     )
     val observed = DeviceDiscovery(
-      deviceId = "host-1", observedAtMs = now - 1_000,
+      deviceId = "ssh-1", observedAtMs = now - 1_000,
       harnesses = listOf(
-        DiscoveredHarness(HarnessProtocolId.CODEX_APP_SERVER, name = "Codex", status = available()),
-        DiscoveredHarness(HarnessProtocolId.OPENCODE_NATIVE, locator = "svc-1", name = "OpenCode", status = missing)
+        DiscoveredHarness(HarnessProtocol.CODEX, name = "Codex", status = available()),
+        DiscoveredHarness(HarnessProtocol.OPENCODE_NATIVE, locator = "/state/service.json", name = "OpenCode", status = missing)
       )
     )
-
-    val device = DeviceProjection.devices(graph, emptyList(), adoptedDeviceIds = setOf("host-1"), discovery = { observed }, nowMs = now).single()
-
-    val codex = device.harnesses.first { it.protocol == HarnessProtocolId.CODEX_APP_SERVER }
+    val projected = DeviceProjection.devices(listOf(dev), discovery = { observed }, nowMs = now).single()
+    val codex = projected.harnesses.first { it.protocol == HarnessProtocol.CODEX }
     assertTrue(codex.attachable)
-    assertNull(codex.leafId)
-    val openCode = device.harnesses.first { it.protocol == HarnessProtocolId.OPENCODE_NATIVE }
+    assertNull(codex.harnessId)
+    val openCode = projected.harnesses.first { it.protocol == HarnessProtocol.OPENCODE_NATIVE }
     assertFalse(openCode.attachable)
     assertEquals("未安装", openCode.reason)
-    assertNotNull(device.discovery)
-    assertTrue(device.discovery!!.isFresh(now))
+    assertNotNull(projected.discovery)
+    assertTrue(projected.discovery!!.isFresh(now))
   }
 
-  @Test fun staleDiscoveryIsNotAttachable() {
-    val host = HostBinding("host-1", "source-1", "ubuntu-dev", externalHostId = "host-1")
-    val graph = ConnectionGraph(
-      sources = listOf(ConnectionSource("source-1", ConnectionSourceType.HUB, "hub", "https://hub.example.test", account = "me")),
-      hosts = listOf(host)
-    )
-    val observed = DeviceDiscovery(
-      deviceId = "host-1", observedAtMs = now - DeviceDiscovery.DEFAULT_TTL_MS - 1,
-      harnesses = listOf(DiscoveredHarness(HarnessProtocolId.CODEX_APP_SERVER, name = "Codex", status = available(now - DeviceDiscovery.DEFAULT_TTL_MS - 1)))
-    )
-
-    val device = DeviceProjection.devices(graph, emptyList(), adoptedDeviceIds = setOf("host-1"), discovery = { observed }, nowMs = now).single()
-    val codex = device.harnesses.first { it.protocol == HarnessProtocolId.CODEX_APP_SERVER }
-    assertFalse(codex.attachable)
-    assertEquals("上次发现已过期", codex.reason)
-  }
-
-  @Test fun missingGraphFallsBackToTheSavedProfiles() {
-    val profiles = listOf(sshLeaf("leaf-ssh", "ssh-config"))
-    val devices = DeviceProjection.devices(null, profiles, nowMs = now)
-    assertEquals(1, devices.size)
-    assertEquals(DeviceAccess.SSH, devices.single().access)
+  @Test fun savedSshDeviceWithoutHarnessIsAlwaysADeviceWithDefaultCandidates() {
+    val dev = device()
+    val projected = DeviceProjection.devices(listOf(dev), nowMs = now).single()
+    assertEquals("me@arch.test", projected.endpoint)
+    assertEquals(0, projected.attachedCount)
+    assertTrue(projected.harnesses.any { it.protocol == HarnessProtocol.DSH && it.attachable })
+    assertTrue(projected.harnesses.any { it.protocol == HarnessProtocol.OPENCODE_NATIVE && it.attachable })
   }
 
   @Test fun harnessSlotKeyIsProtocolAndLocator() {
-    val profile = sshLeaf("leaf-ssh", "ssh-config", ServerKind.OPENCODE).copy(sshServicePath = "/state/opencode/service.json")
-    assertEquals("opencode-native|/state/opencode/service.json", DeviceProjection.slotKey(profile))
-    assertEquals("opencode-native|", DeviceProjection.slotKey(sshLeaf("other", "cfg", ServerKind.OPENCODE)))
-  }
-
-  @Test fun attachedSlotsSurfaceUnavailableAndRemovedHubDiscoveryReasons() {
-    val codexLeaf = hubCodex("leaf-codex")
-    val nativeLeaf = ServerProfile(
-      id = "leaf-native",
-      name = "Old OpenCode",
-      url = "https://hub.example.test",
-      username = "me@example.test",
-      kind = ServerKind.OPENCODE,
-      remoteHostId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-      remoteHostFingerprint = "0123456789ab",
-      remoteServiceId = "svc-old"
+    val withPath = ServerProfile(
+      "h1", "OC", "ssh://me@arch.test:22",
+      protocol = HarnessProtocol.OPENCODE_NATIVE,
+      deviceId = "ssh-1",
+      config = HarnessConfig.OpenCodeNative("/state/opencode/service.json")
     )
-    val profiles = listOf(codexLeaf, nativeLeaf)
-    val graph = graphOf(profiles)
-    val hostBindingId = graph.hosts.single().id
-
-    val freshDiscovery = DeviceDiscovery(
-      deviceId = hostBindingId,
-      observedAtMs = now - 2_000,
-      harnesses = listOf(
-        DiscoveredHarness(
-          protocol = HarnessProtocolId.CODEX_APP_SERVER,
-          name = "Codex",
-          status = HarnessDiscoveryStatus(
-            installed = DiscoveryValue.YES,
-            available = DiscoveryValue.NO,
-            observedAtMs = now - 2_000,
-            freshUntilMs = now + 600_000,
-            completeness = DiscoveryCompleteness.COMPLETE,
-            reason = "Host 未声明 Codex 能力"
-          )
-        )
-      ),
-      completeness = DiscoveryCompleteness.COMPLETE
-    )
-    val withFresh = DeviceProjection.devices(graph, profiles, discovery = { freshDiscovery }, nowMs = now).single()
-    val codexSlot = withFresh.harnesses.first { it.leafId?.value == "leaf-codex" }
-    val nativeSlot = withFresh.harnesses.first { it.leafId?.value == "leaf-native" }
-    assertEquals("Host 未声明 Codex 能力", codexSlot.reason)
-    assertEquals("远端最近一次探测未发现此服务（可能已停止或移除）", nativeSlot.reason)
-
-    val expiredDiscovery = DeviceDiscovery(
-      deviceId = hostBindingId,
-      observedAtMs = now - DeviceDiscovery.DEFAULT_TTL_MS - 10,
-      harnesses = listOf(
-        DiscoveredHarness(
-          protocol = HarnessProtocolId.CODEX_APP_SERVER,
-          name = "Codex",
-          status = available(now - DeviceDiscovery.DEFAULT_TTL_MS - 10)
-        )
-      ),
-      completeness = DiscoveryCompleteness.COMPLETE
-    )
-    val withExpired = DeviceProjection.devices(graph, profiles, discovery = { expiredDiscovery }, nowMs = now).single()
-    assertEquals("上次发现已过期", withExpired.harnesses.first { it.leafId?.value == "leaf-codex" }.reason)
-  }
-
-  @Test fun savedSshParentWithoutHarnessIsAlwaysADevice() {
-    val config = SshHostConfig(id = "ssh-1", name = "arch-dev", host = "arch.test", user = "me")
-    val devices = DeviceProjection.devices(null, emptyList(), savedSshHosts = listOf(config), nowMs = now)
-
-    val device = devices.single()
-    assertEquals(DeviceAccess.SSH, device.access)
-    assertEquals("ssh://me@arch.test:22", device.endpoint)
-    assertTrue(device.sourceEnabled)
-    assertTrue(device.harnesses.any { it.protocol == HarnessProtocolId.DSH_TYPERT && it.attachable })
-  }
-
-  @Test fun savedSshParentFillsAStaleGraphAndKeepsItsHarnesses() {
-    val profile = sshLeaf("leaf", "ssh-1")
-    val config = SshHostConfig(id = "ssh-1", name = "arch-dev", host = "arch.test", user = "me")
-    val stale = graphOf(listOf(sshLeaf("other", "ssh-2").copy(url = "ssh://me@other.test:22")))
-
-    val devices = DeviceProjection.devices(stale, listOf(profile), savedSshHosts = listOf(config), nowMs = now)
-
-    assertEquals(2, devices.size)
-    val saved = devices.first { it.endpoint == "ssh://me@arch.test:22" }
-    assertEquals(1, saved.attachedCount)
-    assertEquals("leaf", saved.harnesses.first { it.attached }.leafId?.value)
+    val defaultPath = withPath.copy(id = "h2", config = HarnessConfig.OpenCodeNative(null))
+    assertEquals("opencode-native|/state/opencode/service.json", DeviceProjection.slotKey(withPath))
+    assertEquals("opencode-native|", DeviceProjection.slotKey(defaultPath))
   }
 }

@@ -67,7 +67,7 @@ class OfficialSshServiceTest {
       val lastStep = java.util.concurrent.atomic.AtomicReference("not started")
       val links = (1..2).map { index ->
         val profile = ServerProfile("official-ssh-$index", "Official SSH $index", config.profileUrl(),
-          kind = ServerKind.OPENCODE, sshHostId = config.id, sshServicePath = registrationPath)
+          protocol = HarnessProtocol.OPENCODE_NATIVE, deviceId = config.id, config = HarnessConfig.OpenCodeNative(registrationPath))
         SshHostLink(scope, profile, config, secrets, pool) { status ->
           lastStep.set("${status.phase.name}/${status.step.name}/${status.error?.kind?.name ?: "ok"}")
         }

@@ -12,8 +12,8 @@ class ComposerContextTest {
   @Test fun absentTodosKeyMeansNoCapabilityWhileExplicitNullMeansCleared() {
     // 旧 Host 没有 todos 投影：不能把它当成“清单为空”而覆盖已经读到的列表。
     assertNull(JSONObject("""{"inbox":{}}""").todoProjection())
-    assertEquals(emptyList<RemoteTodo>(), JSONObject("""{"todos":null}""").todoProjection())
-    assertEquals(emptyList<RemoteTodo>(), JSONObject("""{"todos":[]}""").todoProjection())
+    assertEquals(emptyList<DshTodo>(), JSONObject("""{"todos":null}""").todoProjection())
+    assertEquals(emptyList<DshTodo>(), JSONObject("""{"todos":[]}""").todoProjection())
   }
 
   @Test fun todoRowsTolerateUnknownStatusesAndBlankContent() {
@@ -28,14 +28,14 @@ class ComposerContextTest {
 
   @Test fun progressCountsCompletedItemsOnly() {
     val todos = listOf(
-      RemoteTodo("a", RemoteTodo.STATUS_DONE),
-      RemoteTodo("b", RemoteTodo.STATUS_ACTIVE),
-      RemoteTodo("c", RemoteTodo.STATUS_DONE)
+      DshTodo("a", DshTodo.STATUS_DONE),
+      DshTodo("b", DshTodo.STATUS_ACTIVE),
+      DshTodo("c", DshTodo.STATUS_DONE)
     )
     assertEquals(TodoProgress(done = 2, total = 3), todos.todoProgress())
     assertFalse(todos.todoProgress().complete)
-    assertTrue(listOf(RemoteTodo("a", RemoteTodo.STATUS_DONE)).todoProgress().complete)
-    assertFalse(emptyList<RemoteTodo>().todoProgress().complete)
+    assertTrue(listOf(DshTodo("a", DshTodo.STATUS_DONE)).todoProgress().complete)
+    assertFalse(emptyList<DshTodo>().todoProgress().complete)
   }
 
   @Test fun goalProjectionCarriesDurableStateWithoutActivation() {
@@ -60,9 +60,9 @@ class ComposerContextTest {
 
   @Test fun onlyAnExplicitlyDisarmedActivationReadsAsPausedContinuation() {
     // 投影没有 activation；把它误读成 disarmed 会让活动中的目标显示“已暂停续跑”。
-    assertEquals("目标进行中", RemoteGoal("g1", 1, "收尾", "active", activation = null).label)
-    assertEquals("目标进行中", RemoteGoal("g1", 1, "收尾", "active", activation = "armed").label)
-    assertEquals("目标已暂停续跑", RemoteGoal("g1", 1, "收尾", "active", activation = "disarmed").label)
-    assertEquals("目标已完成", RemoteGoal("g1", 1, "收尾", "complete").label)
+    assertEquals("目标进行中", DshGoal("g1", 1, "收尾", "active", activation = null).label)
+    assertEquals("目标进行中", DshGoal("g1", 1, "收尾", "active", activation = "armed").label)
+    assertEquals("目标已暂停续跑", DshGoal("g1", 1, "收尾", "active", activation = "disarmed").label)
+    assertEquals("目标已完成", DshGoal("g1", 1, "收尾", "complete").label)
   }
 }

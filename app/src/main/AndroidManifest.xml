@@ -1,11 +1,9 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-  <uses-permission android:name="android.permission.CAMERA" />
   <!-- 生物识别：BiometricManager.canAuthenticate() 与 BiometricPrompt 都会经 binder 校验该权限，
        缺失时抛 SecurityException。SshKeyGenerateDialog / SshKeyImportDialog 在组合首帧读取
        isBiometricSupported()，异常会直接杀掉进程。API 28 的 BiometricPrompt 仍校验旧指纹权限。 -->
   <uses-permission android:name="android.permission.USE_BIOMETRIC" />
   <uses-permission android:name="android.permission.USE_FINGERPRINT" />
-  <uses-feature android:name="android.hardware.camera.any" android:required="false" />
   <uses-permission android:name="android.permission.INTERNET" />
   <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
   <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
@@ -14,7 +12,7 @@
   <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
   <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
   <application android:name=".LagoonApp" android:allowBackup="false" android:label="@string/app_name"
-    android:theme="@style/Theme.Lagoon" android:usesCleartextTraffic="true"
+    android:theme="@style/Theme.Lagoon" android:networkSecurityConfig="@xml/network_security_config"
     android:enableOnBackInvokedCallback="true"
     android:icon="@drawable/ic_app" android:roundIcon="@drawable/ic_app">
     <activity android:name=".ui.MainActivity" android:exported="true"

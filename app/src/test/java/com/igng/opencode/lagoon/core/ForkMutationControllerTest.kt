@@ -6,7 +6,7 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class ForkMutationControllerTest {
-  private val profile = ServerProfile("host", "Host", "https://host.example/", kind = ServerKind.DSH)
+  private val profile = ServerProfile("host", "Host", "https://host.example/", protocol = HarnessProtocol.DSH)
   private val source = Session("source", "/repo", "Source", 1)
   private class Fixture(val client: HarnessClient, profile: ServerProfile, source: Session) {
     private val unsafeClass = Class.forName("sun.misc.Unsafe")
@@ -15,9 +15,10 @@ class ForkMutationControllerTest {
     val state = MutableStateFlow(LagoonState(profiles = listOf(profile), serverId = profile.id, connected = true,
       sessionId = source.id, sessions = listOf(source), capabilities = ApiCapabilities(fork = true, historicalFork = true),
       messages = listOf(Message("input", "user", 1, emptyList(), sequence = 7))))
-    val store = ServerStore(FakeSharedPreferences(), FakeSharedPreferences(), { it }, { it })
+    @Volatile var currentProfiles = listOf(profile)
+    val store = ServerStore(FakeSharedPreferences(), FakeSharedPreferences(), { it }, { it }) { currentProfiles }
     init {
-      store.save(profile, "password", "cookie"); store.rememberDraft(profile.id, source.id, "unsent")
+      store.rememberDraft(profile.id, source.id, "unsent")
       fun set(name: String, value: Any?) { LagoonController::class.java.getDeclaredField(name).apply { isAccessible = true }.set(controller, value) }
       set("mutable", state); set("state", state); set("store", store); set("api", client); set("generation", 1)
       set("operationScope", CoroutineScope(SupervisorJob() + Dispatchers.Unconfined))
@@ -57,7 +58,7 @@ class ForkMutationControllerTest {
     val f = Fixture(client, profile, source); val target = f.state.value.forkTarget("input")!!
     f.state.value = f.state.value.copy(messages = listOf(f.state.value.messages.single().copy(sequence = 8)))
     f.controller.forkAt(target).join(); assertEquals(0, writes)
-    f.store.save(profile.copy(url = "https://other.example/"), "other", "")
+    f.currentProfiles = listOf(profile.copy(url = "https://other.example/"))
     f.controller.forkAt(target).join(); assertEquals(0, writes)
     client.close()
   }
@@ -71,7 +72,7 @@ class ForkMutationControllerTest {
     }
     val f = Fixture(client, profile, source); val target = f.state.value.forkTarget("input")!!
     val job = f.controller.forkAt(target); entered.await()
-    f.store.save(profile.copy(url = "https://replacement.example/"), "new", ""); release.complete(Unit); job.join()
+    f.currentProfiles = listOf(profile.copy(url = "https://replacement.example/")); release.complete(Unit); job.join()
     assertEquals(1, writes); assertEquals(source.id, f.state.value.sessionId)
     assertEquals(listOf(source.id), f.state.value.sessions.map { it.id })
     assertEquals(listOf(target), f.state.value.uncertainForks)
@@ -87,7 +88,7 @@ class ForkMutationControllerTest {
     }
     val f = Fixture(client, profile, source); val target = f.state.value.forkTarget("input")!!
     f.controller.forkAt(target).join(); val receipt = f.controller.inspectForkResults(target)
-    f.store.save(profile.copy(url = "https://replacement.example/"), "new", "")
+    f.currentProfiles = listOf(profile.copy(url = "https://replacement.example/"))
     assertTrue(runCatching { f.controller.acknowledgeForkInspection(receipt) }.isFailure)
     assertEquals(1, writes); assertEquals(listOf(target), f.state.value.uncertainForks)
     client.close()

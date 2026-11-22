@@ -56,7 +56,7 @@ class OfficialDshTerminalTest {
 
   private suspend fun exercise(url: String, token: String, directory: File) {
     val api = DshApi(ServerProfile("official-dsh-terminal", "Isolated DSH terminal", url,
-      kind = ServerKind.DSH, allowCleartext = true), ServerCredentials("dsh", token))
+      protocol = HarnessProtocol.DSH, allowCleartext = true), ServerCredentials("dsh", token))
     var owner: TerminalScope.Session? = null
     var terminal: NativeTerminal? = null
     var first: TerminalAttachment? = null

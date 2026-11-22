@@ -8,7 +8,7 @@ internal data class ScheduleMutationTarget(
   val record: ScheduleRecord
 ) {
   fun routeMatches(state: LagoonState): Boolean = state.server?.let {
-    state.sessionId == sessionId && it.id == profile.id && ConnectionRouteAdmission.sameLeafRoute(profile, it)
+    state.sessionId == sessionId && it.sameRoute(profile)
   } == true
 
   fun matches(state: LagoonState): Boolean = routeMatches(state) && record.id == scheduleId &&
@@ -16,7 +16,7 @@ internal data class ScheduleMutationTarget(
 }
 
 internal fun LagoonState.canManageSchedules(): Boolean = connected && !cached && server?.effectiveEnabled == true &&
-  server?.kind in setOf(ServerKind.DSH, ServerKind.DSH_REMOTE) && session != null
+  server?.protocol == HarnessProtocol.DSH && session != null
 
 internal fun ScheduleMutationTarget.canEdit(state: LagoonState): Boolean = state.canManageSchedules() && matches(state) &&
   state.schedules.any { it.id == scheduleId && it.sessionId == sessionId && it.status == "active" }

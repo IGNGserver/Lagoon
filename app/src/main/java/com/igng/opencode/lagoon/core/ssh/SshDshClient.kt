@@ -74,26 +74,24 @@ internal class SshDshClient(
     onUpdate: (text: String, running: Boolean, finished: Boolean) -> Unit
   ): Boolean = api().followJobOutput(sessionId, jobId, onUpdate)
 
-  override suspend fun probeRemote(): RemoteProbe? = api().probeRemote()
-
   override suspend fun promptSubagent(parentId: String, childId: String, text: String): Boolean =
     api().promptSubagent(parentId, childId, text)
 
-  override suspend fun pluginBundles(): List<RemotePluginBundle> = api().pluginBundles()
+  override suspend fun pluginBundles(): List<DshPluginBundle> = api().pluginBundles()
 
-  override suspend fun pluginEntries(): List<RemotePluginEntry> = api().pluginEntries()
+  override suspend fun pluginEntries(): List<DshPluginEntry> = api().pluginEntries()
 
   override suspend fun setPluginBundle(name: String, enabled: Boolean): Boolean = api().setPluginBundle(name, enabled)
 
   override suspend fun setPluginEntry(entryId: String, enabled: Boolean): Boolean = api().setPluginEntry(entryId, enabled)
 
-  override suspend fun credentialStatus(refs: List<String>): Map<String, RemoteCredentialStatus> = api().credentialStatus(refs)
+  override suspend fun credentialStatus(refs: List<String>): Map<String, DshCredentialStatus> = api().credentialStatus(refs)
 
   override suspend fun setCredential(ref: String, value: String): Boolean = api().setCredential(ref, value)
 
   override suspend fun clearCredential(ref: String): Boolean = api().clearCredential(ref)
 
-  override suspend fun goal(sessionId: String): RemoteGoal? = api().goal(sessionId)
+  override suspend fun goal(sessionId: String): DshGoal? = api().goal(sessionId)
 
   override suspend fun createGoal(sessionId: String, objective: String, maxRounds: Int?): Boolean =
     api().createGoal(sessionId, objective, maxRounds)
@@ -103,7 +101,7 @@ internal class SshDshClient(
 
   override suspend fun editGoal(
     sessionId: String, id: String, revision: Int, objective: String?, maxRounds: Long?
-  ): RemoteGoal? = api().editGoal(sessionId, id, revision, objective, maxRounds)
+  ): DshGoal? = api().editGoal(sessionId, id, revision, objective, maxRounds)
 
   override suspend fun goalAction(sessionId: String, id: String, revision: Int, action: String): Boolean =
     api().goalAction(sessionId, id, revision, action)
@@ -111,9 +109,9 @@ internal class SshDshClient(
   override suspend fun previewFile(directory: String, path: String, session: Session?): FilePreview? =
     api().previewFile(directory, path, session)
 
-  override suspend fun schedules(sessionId: String): List<RemoteSchedule> = api().schedules(sessionId)
+  override suspend fun schedules(sessionId: String): List<DshSchedule> = api().schedules(sessionId)
 
-  override suspend fun scheduleCatalog(): List<RemoteSchedule>? = api().scheduleCatalog()
+  override suspend fun scheduleCatalog(): List<DshSchedule>? = api().scheduleCatalog()
 
   override suspend fun scheduleHistory(
     sessionId: String, id: String, before: String?, limit: Int

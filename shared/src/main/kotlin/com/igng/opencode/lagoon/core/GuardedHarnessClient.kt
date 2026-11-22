@@ -62,32 +62,31 @@ internal class GuardedHarnessClient(private val access: HarnessLeaseAccess) : Ha
       access.callback { onUpdate(text, running, finished) }
     }
   }
-  override suspend fun probeRemote(): RemoteProbe? = access.useSuspending { it.probeRemote() }
   override suspend fun promptSubagent(parentId: String, childId: String, text: String): Boolean =
     access.useSuspending { it.promptSubagent(parentId, childId, text) }
-  override suspend fun pluginBundles(): List<RemotePluginBundle> = access.useSuspending { it.pluginBundles() }
-  override suspend fun pluginEntries(): List<RemotePluginEntry> = access.useSuspending { it.pluginEntries() }
+  override suspend fun pluginBundles(): List<DshPluginBundle> = access.useSuspending { it.pluginBundles() }
+  override suspend fun pluginEntries(): List<DshPluginEntry> = access.useSuspending { it.pluginEntries() }
   override suspend fun setPluginBundle(name: String, enabled: Boolean): Boolean =
     access.useSuspending { it.setPluginBundle(name, enabled) }
   override suspend fun setPluginEntry(entryId: String, enabled: Boolean): Boolean =
     access.useSuspending { it.setPluginEntry(entryId, enabled) }
-  override suspend fun credentialStatus(refs: List<String>): Map<String, RemoteCredentialStatus> =
+  override suspend fun credentialStatus(refs: List<String>): Map<String, DshCredentialStatus> =
     access.useSuspending { it.credentialStatus(refs) }
   override suspend fun setCredential(ref: String, value: String): Boolean = access.useSuspending { it.setCredential(ref, value) }
   override suspend fun clearCredential(ref: String): Boolean = access.useSuspending { it.clearCredential(ref) }
-  override suspend fun goal(sessionId: String): RemoteGoal? = access.useSuspending { it.goal(sessionId) }
+  override suspend fun goal(sessionId: String): DshGoal? = access.useSuspending { it.goal(sessionId) }
   override suspend fun createGoal(sessionId: String, objective: String, maxRounds: Int?): Boolean =
     access.useSuspending { it.createGoal(sessionId, objective, maxRounds) }
   override suspend fun createGoalWithLimit(sessionId: String, objective: String, maxRounds: Long?): Boolean =
     access.useSuspending { it.createGoalWithLimit(sessionId, objective, maxRounds) }
-  override suspend fun editGoal(sessionId: String, id: String, revision: Int, objective: String?, maxRounds: Long?): RemoteGoal? =
+  override suspend fun editGoal(sessionId: String, id: String, revision: Int, objective: String?, maxRounds: Long?): DshGoal? =
     access.useSuspending { it.editGoal(sessionId, id, revision, objective, maxRounds) }
   override suspend fun goalAction(sessionId: String, id: String, revision: Int, action: String): Boolean =
     access.useSuspending { it.goalAction(sessionId, id, revision, action) }
   override suspend fun previewFile(directory: String, path: String, session: Session?): FilePreview? =
     access.useSuspending { it.previewFile(directory, path, session) }
-  override suspend fun schedules(sessionId: String): List<RemoteSchedule> = access.useSuspending { it.schedules(sessionId) }
-  override suspend fun scheduleCatalog(): List<RemoteSchedule>? = access.useSuspending { it.scheduleCatalog() }
+  override suspend fun schedules(sessionId: String): List<DshSchedule> = access.useSuspending { it.schedules(sessionId) }
+  override suspend fun scheduleCatalog(): List<DshSchedule>? = access.useSuspending { it.scheduleCatalog() }
   override suspend fun scheduleHistory(sessionId: String, id: String, before: String?, limit: Int): ScheduleHistoryPage? =
     access.useSuspending { it.scheduleHistory(sessionId, id, before, limit) }
   override suspend fun deleteSchedule(sessionId: String, id: String): ScheduleDeleteResult? =

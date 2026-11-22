@@ -27,7 +27,7 @@ class HomeStatusProjectionRegressionTest {
       "不得再按当前路由决定首页是否投影",
       main.contains("navigator.navigation.sessions.isEmpty()) state.homeProjection()")
     )
-    assertTrue("首页必须由组合点的投影提供", main.contains("HomeScreen(rememberHomePage(state)"))
+    assertTrue("首页必须由组合点的投影提供", Regex("""HomeScreen\(\s*(?:state\s*=\s*)?rememberHomePage\(""").containsMatchIn(main))
     assertTrue("首页范围面板同样使用投影", main.contains("state = rememberHomePage(state)"))
   }
 

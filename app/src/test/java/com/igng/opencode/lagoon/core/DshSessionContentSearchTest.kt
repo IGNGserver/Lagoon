@@ -39,7 +39,7 @@ class DshSessionContentSearchTest {
   private suspend fun withApi(block: suspend (DshApi, MockWebServer) -> Unit) {
     MockWebServer().use { server ->
       val profile = ServerProfile("srv", "DSH", server.url("/").toString().trimEnd('/'),
-        username = "dsh", allowCleartext = true, kind = ServerKind.DSH)
+        username = "dsh", allowCleartext = true, protocol = HarnessProtocol.DSH)
       val api = DshApi(profile, ServerCredentials("dsh", "tok"))
       try { block(api, server) } finally { api.close(); api.awaitClosed() }
     }
@@ -224,7 +224,7 @@ class DshSessionContentSearchTest {
       assertFalse(ApiCapabilities().sessionContentSearch)
       assertFalse(ApiCapabilities.BASELINE.sessionContentSearch)
       assertFalse(ApiCapabilities.fromDocument(JSONObject().put("paths", JSONObject())).sessionContentSearch)
-      val profile = ServerProfile("oc", "OpenCode", server.url("/").toString(), allowCleartext = true, kind = ServerKind.OPENCODE)
+      val profile = ServerProfile("oc", "OpenCode", server.url("/").toString(), allowCleartext = true, protocol = HarnessProtocol.OPENCODE_NATIVE)
       val openCode = OpenCodeApi(profile, ServerCredentials())
       try {
         assertFalse(openCode.capabilities().sessionContentSearch)

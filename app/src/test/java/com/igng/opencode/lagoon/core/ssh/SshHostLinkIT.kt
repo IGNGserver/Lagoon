@@ -1,6 +1,6 @@
 package com.igng.opencode.lagoon.core.ssh
 
-import com.igng.opencode.lagoon.core.ServerKind
+import com.igng.opencode.lagoon.core.HarnessProtocol
 import com.igng.opencode.lagoon.core.ServerProfile
 import com.igng.opencode.lagoon.core.SshAuthMethod
 import com.igng.opencode.lagoon.core.SshHostConfig
@@ -47,7 +47,7 @@ class SshHostLinkIT {
     val config = base.copyWith(hostKeyType = presented.type, hostKeyFingerprint = presented.fingerprint)
     val profile = ServerProfile(
       id = config.id, name = config.name, url = config.profileUrl(), username = config.user,
-      kind = ServerKind.DSH, sshHostId = config.id
+      protocol = HarnessProtocol.DSH, deviceId = config.id
     )
     val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     val link = SshHostLink(scope, profile, config, SshSecrets(privateKey = key), factory,
@@ -80,7 +80,7 @@ class SshHostLinkIT {
     val presented = factory.probeHostKey(base)
     val config = base.copyWith(hostKeyType = presented.type, hostKeyFingerprint = presented.fingerprint)
     val profile = ServerProfile(id = config.id, name = config.name, url = config.profileUrl(), username = config.user,
-      kind = ServerKind.DSH, sshHostId = config.id)
+      protocol = HarnessProtocol.DSH, deviceId = config.id)
     val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     val link = SshHostLink(scope, profile, config, SshSecrets(privateKey = key), factory,
       onStatus = { println("SSHIT2 ${it.phase}/${it.step} ${it.detail} err=${it.error?.message}") })
@@ -117,7 +117,7 @@ class SshHostLinkIT {
     val factory = JschSshTransportFactory()
     val base = SshHostConfig(id = "ssh-it-key", name = "it", host = host!!, user = user!!, auth = SshAuthMethod.PRIVATE_KEY)
     val profile = ServerProfile(id = base.id, name = base.name, url = base.profileUrl(), username = base.user,
-      kind = ServerKind.DSH, sshHostId = base.id)
+      protocol = HarnessProtocol.DSH, deviceId = base.id)
     val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     val unpinned = SshHostLink(scope, profile, base, SshSecrets(privateKey = key), factory)

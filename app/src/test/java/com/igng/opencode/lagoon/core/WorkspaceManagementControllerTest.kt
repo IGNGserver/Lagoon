@@ -6,7 +6,7 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class WorkspaceManagementControllerTest {
-  private val profile = ServerProfile("host", "Host", "https://host.example/", kind = ServerKind.DSH)
+  private val profile = ServerProfile("host", "Host", "https://host.example/", protocol = HarnessProtocol.DSH)
   private val item = ServerWorkspace("workspace-id", "/repo", "Workspace", listOf("retained-session"), "2026-11-01T00:00:00Z", "2026-11-02T00:00:00Z")
   private class Fixture(val client: HarnessClient, profile: ServerProfile) {
     private val unsafeClass = Class.forName("sun.misc.Unsafe")
@@ -15,9 +15,9 @@ class WorkspaceManagementControllerTest {
     val state = MutableStateFlow(LagoonState(profiles = listOf(profile), serverId = profile.id, connected = true,
       capabilities = ApiCapabilities(workspaceManagement = true)))
     val plain = FakeSharedPreferences(); val secrets = FakeSharedPreferences()
-    val store = ServerStore(plain, secrets, { it }, { it })
+    @Volatile var currentProfiles = listOf(profile)
+    val store = ServerStore(plain, secrets, { it }, { it }) { currentProfiles }
     init {
-      store.save(profile, "saved-password", "saved-cookie")
       store.rememberDraft(profile.id, "session", "keep unsent")
       fun set(name: String, value: Any?) { LagoonController::class.java.getDeclaredField(name).apply { isAccessible = true }.set(controller, value) }
       set("mutable", state); set("state", state); set("store", store); set("generation", 1); set("api", client)
@@ -33,7 +33,7 @@ class WorkspaceManagementControllerTest {
       override suspend fun deleteWorkspace(expected: ServerWorkspace): Boolean { calls++; return true }
     }
     val f = Fixture(client, profile); val target = WorkspaceManagementTarget(profile)
-    f.store.save(profile.copy(url = "https://replacement.example/"), "new-password", "")
+    f.currentProfiles = listOf(profile.copy(url = "https://replacement.example/"))
     assertTrue(runCatching { f.controller.serverWorkspaces(target) }.isFailure)
     assertTrue(runCatching { f.controller.deleteWorkspace(target, item) }.isFailure)
     assertEquals(0, calls)
@@ -47,7 +47,7 @@ class WorkspaceManagementControllerTest {
       override suspend fun serverWorkspaces(): List<ServerWorkspace> { entered.complete(Unit); release.await(); return listOf(item) }
     }
     val f = Fixture(client, profile); val reading = async { runCatching { f.controller.serverWorkspaces(WorkspaceManagementTarget(profile)) } }
-    entered.await(); f.store.save(profile.copy(url = "https://replacement.example/"), "new-password", ""); release.complete(Unit)
+    entered.await(); f.currentProfiles = listOf(profile.copy(url = "https://replacement.example/")); release.complete(Unit)
     assertTrue(reading.await().isFailure)
     assertTrue(f.state.value.workspaceCatalog.isEmpty())
     client.close()

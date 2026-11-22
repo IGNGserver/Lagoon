@@ -4,16 +4,15 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class ForkMutationPolicyTest {
-  private val profile = ServerProfile("host", "Host", "https://host.example/", kind = ServerKind.DSH)
-  private fun state(kind: ServerKind = ServerKind.DSH) = LagoonState(profiles = listOf(profile.copy(kind = kind)), serverId = profile.id,
+  private val profile = ServerProfile("host", "Host", "https://host.example/", protocol = HarnessProtocol.DSH)
+  private fun state(protocol: HarnessProtocol = HarnessProtocol.DSH) = LagoonState(profiles = listOf(profile.copy(protocol = protocol)), serverId = profile.id,
     connected = true, sessionId = "source", sessions = listOf(Session("source", "/repo", "Source", 1)),
     capabilities = ApiCapabilities(fork = true, historicalFork = true), messages = listOf(Message("native-user-id", "user", 1,
       listOf(MessagePart("part", "text", text = "hello")), sequence = 7)))
 
   @Test fun protocolsProduceDifferentTypedBoundariesFromNativeIdentityNotRowIndex() {
     assertEquals(ForkBoundary.DshEvent(7), state().forkTarget("native-user-id")!!.boundary)
-    assertEquals(ForkBoundary.DshEvent(7), state(ServerKind.DSH_REMOTE).forkTarget("native-user-id")!!.boundary)
-    assertEquals(ForkBoundary.OpenCodeBefore("native-user-id"), state(ServerKind.OPENCODE).forkTarget("native-user-id")!!.boundary)
+    assertEquals(ForkBoundary.OpenCodeBefore("native-user-id"), state(HarnessProtocol.OPENCODE_NATIVE).forkTarget("native-user-id")!!.boundary)
     assertNull(state().forkTarget("0")); assertNull(state().forkTarget("7"))
   }
 

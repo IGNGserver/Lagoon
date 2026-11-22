@@ -37,41 +37,56 @@ import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import com.igng.opencode.lagoon.core.ConnectStage
 import com.igng.opencode.lagoon.core.ConnectionBanner
 import com.igng.opencode.lagoon.core.LagoonController
 import com.igng.opencode.lagoon.core.LagoonState
-import com.igng.opencode.lagoon.core.RemoteRecoveryKind
+import com.igng.opencode.lagoon.core.SshFailure
+import com.igng.opencode.lagoon.core.SshFailureKind
 import kotlinx.coroutines.delay
-import top.yukonga.miuix.kmp.basic.InfiniteProgressIndicator
-import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 
 /**
- * One line under the page header that says what the connection is waiting for: the stage, how long it
- * has taken, the retry countdown, and a “立即重试” action once waiting stops being routine. It pushes
- * the content down instead of covering the header, and stays hidden for quick, uneventful connects.
+ * One line under the page header that says what the SSH connection is waiting for:
+ * actionable SSH failures (host key verification, key unlock, auth), stage/retry countdown,
+ * or offline cache indicator.
  */
 @Composable
-internal fun ConnectionStrip(state: LagoonState, controller: LagoonController, modifier: Modifier = Modifier) {
+internal fun ConnectionStrip(
+  state: LagoonState,
+  controller: LagoonController,
+  onOpenDevice: (String) -> Unit = {},
+  onSshAction: (deviceId: String, failure: SshFailure) -> Unit = { deviceId, _ -> onOpenDevice(deviceId) },
+  modifier: Modifier = Modifier
+) {
   var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
-  // The copy depends on elapsed time (quiet period, slow hint, countdown): tick while anything could show.
-  val watching = state.serverId != null && (state.connection.stage != com.igng.opencode.lagoon.core.ConnectStage.READY ||
+  val watching = state.serverId != null && (state.connection.stage != ConnectStage.READY ||
     !state.streamConnected || state.transcriptLoadingSince > 0)
   LaunchedEffect(watching) {
     while (watching) { now = System.currentTimeMillis(); delay(1_000) }
   }
+  val activeProfile = state.server
+  val sshFailure = state.sshActionRequired
+    ?: state.serverId?.let { state.harnessLinkStatuses[it]?.error }?.takeIf(::isActionableSshFailure)
   val banner = if (state.serverId == null) null else ConnectionBanner.of(
-    state.connection, state.server?.name, now, state.streamConnected, state.streamDownSince,
+    state.connection, activeProfile?.name, now, state.streamConnected, state.streamDownSince,
     transcriptSyncing = state.provisionalMessageIds.isNotEmpty() && state.transcriptLoadingSince > 0,
     transcriptSince = state.transcriptLoadingSince,
     transportDetail = state.transportDetail
   )
-  val activeProfile = state.server
-  val loginExpired = state.remoteRecovery == RemoteRecoveryKind.LOGIN ||
-    (activeProfile?.remoteHostId != null &&
-      controller.hostAuthExpired(activeProfile.url, activeProfile.username, activeProfile.remoteHostId, state))
   val showingOfflineCache = state.serverId != null && !state.connected && state.sessions.isNotEmpty()
-  val notice = when {
+  val notice: Triple<String, MiuixToastType, Pair<String?, (() -> Unit)?>>? = when {
+    sshFailure != null && activeProfile != null -> {
+      val mapped = sshActionNotice(activeProfile, sshFailure, aggregate = false)
+      val deviceId = activeProfile.deviceId
+      val onAction: (() -> Unit)? = when {
+        deviceId == null -> ({ controller.retryNow() })
+        sshFailure.kind == SshFailureKind.AUTH -> ({ onOpenDevice(deviceId) })
+        else -> ({ onSshAction(deviceId, sshFailure) })
+      }
+      val message = if (showingOfflineCache) "${mapped.message} · 当前显示离线缓存" else mapped.message
+      Triple(message, mapped.type, mapped.actionLabel to onAction)
+    }
     banner != null -> {
       val type = when (banner.tone) {
         ConnectionBanner.Tone.PROGRESS -> MiuixToastType.INFO
@@ -80,43 +95,17 @@ internal fun ConnectionStrip(state: LagoonState, controller: LagoonController, m
       }
       val baseMessage = if (!banner.subtitle.isNullOrBlank()) "${banner.text} · ${banner.subtitle}" else banner.text
       val message = if (showingOfflineCache && !baseMessage.contains("缓存")) "$baseMessage · 当前显示离线缓存" else baseMessage
-      val action = when {
-        loginExpired -> activeProfile?.let(controller::remoteRecoveryLabel) ?: "重新登录"
-        state.remoteRecovery != null -> state.remoteRecovery.label
-        banner.retry -> "立即重试"
-        else -> null
-      }
-      val onAction: (() -> Unit)? = when {
-        loginExpired -> ({
-          activeProfile?.let { controller.openRemoteRecoveryFor(it.id, RemoteRecoveryKind.LOGIN) }
-            ?: controller.openRemoteRecovery()
-        })
-        state.remoteRecovery != null -> ({ controller.openRemoteRecovery() })
-        banner.retry -> ({ controller.retryNow() })
-        else -> null
-      }
-      Triple(message, if (loginExpired) MiuixToastType.WARNING else type, action to onAction)
+      val action = if (banner.retry) "立即重试" else null
+      val onAction: (() -> Unit)? = if (banner.retry) ({ controller.retryNow() }) else null
+      Triple(message, type, action to onAction)
     }
     showingOfflineCache -> {
-      val message = when {
-        loginExpired -> "中枢登录态已失效 · 正在显示本地离线缓存会话"
-        activeProfile?.effectiveEnabled == false -> "当前连接已停用 · 正在显示本地离线缓存会话"
-        else -> "当前未连接服务器 · 正在显示本地离线缓存会话"
-      }
-      val action = when {
-        loginExpired -> activeProfile?.let(controller::remoteRecoveryLabel) ?: "重新登录"
-        activeProfile?.effectiveEnabled == true -> "立即重试"
-        else -> null
-      }
-      val onAction: (() -> Unit)? = when {
-        loginExpired -> ({
-          activeProfile?.let { controller.openRemoteRecoveryFor(it.id, RemoteRecoveryKind.LOGIN) }
-            ?: controller.openRemoteRecovery()
-        })
-        activeProfile?.effectiveEnabled == true -> ({ controller.retryNow() })
-        else -> null
-      }
-      Triple(message, if (loginExpired) MiuixToastType.WARNING else MiuixToastType.INFO, action to onAction)
+      val disabled = activeProfile?.effectiveEnabled == false
+      val message = if (disabled) "当前连接已停用 · 正在显示本地离线缓存会话"
+      else "当前未连接设备 · 正在显示本地离线缓存会话"
+      val action = if (disabled) null else "立即重试"
+      val onAction: (() -> Unit)? = if (disabled) null else ({ controller.retryNow() })
+      Triple(message, MiuixToastType.INFO, action to onAction)
     }
     else -> null
   }
@@ -143,11 +132,12 @@ internal fun ConnectionStrip(state: LagoonState, controller: LagoonController, m
 @Composable
 internal fun LoadingSkeleton(rows: Int = 3, modifier: Modifier = Modifier) {
   val transition = rememberInfiniteTransition(label = "skeleton")
-  // Read in the draw phase only; see ThinkingRow.
   val alpha = transition.animateFloat(0.45f, 0.9f, infiniteRepeatable(tween(800), RepeatMode.Reverse), label = "alpha")
   val fill = MiuixTheme.colorScheme.surfaceContainerHigh
-  Column(modifier.fillMaxWidth().graphicsLayer { this.alpha = alpha.value }.semantics { liveRegion = LiveRegionMode.Polite },
-    verticalArrangement = Arrangement.spacedBy(14.dp)) {
+  Column(
+    modifier.fillMaxWidth().graphicsLayer { this.alpha = alpha.value }.semantics { liveRegion = LiveRegionMode.Polite },
+    verticalArrangement = Arrangement.spacedBy(14.dp)
+  ) {
     repeat(rows) { index ->
       Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
         Bar(fill, if (index % 2 == 0) 0.62f else 0.48f, 14.dp)
@@ -166,11 +156,12 @@ private fun Bar(color: androidx.compose.ui.graphics.Color, fraction: Float, heig
 @Composable
 internal fun SessionRowsSkeleton(rows: Int = 6) {
   val transition = rememberInfiniteTransition(label = "rows")
-  // Read in the draw phase only; see ThinkingRow.
   val alpha = transition.animateFloat(0.45f, 0.9f, infiniteRepeatable(tween(800), RepeatMode.Reverse), label = "alpha")
   val fill = MiuixTheme.colorScheme.surfaceContainerHigh
-  Column(Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 12.dp).graphicsLayer { this.alpha = alpha.value },
-    verticalArrangement = Arrangement.spacedBy(20.dp)) {
+  Column(
+    Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 12.dp).graphicsLayer { this.alpha = alpha.value },
+    verticalArrangement = Arrangement.spacedBy(20.dp)
+  ) {
     repeat(rows) { index ->
       Row(verticalAlignment = Alignment.CenterVertically) {
         Box(Modifier.size(10.dp).clip(RoundedCornerShape(5.dp)).background(fill))

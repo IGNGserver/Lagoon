@@ -47,7 +47,7 @@ internal class SshTransportPool(
     }
     val digest = java.security.MessageDigest.getInstance("SHA-256").digest(material.toByteArray())
       .joinToString("") { "%02x".format(it.toInt() and 255) }
-    val key = ConfigKey(config.id, config.connectionKey, config.hostKeyType, config.hostKeyFingerprint, digest)
+    val key = ConfigKey(config.id, config.transportKey, config.hostKeyType, config.hostKeyFingerprint, digest)
     while (true) {
       val (attempt, owner) = synchronized(lock) {
         val entry = entries[key]

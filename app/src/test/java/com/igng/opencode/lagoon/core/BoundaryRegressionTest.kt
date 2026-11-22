@@ -38,35 +38,6 @@ internal fun memoryPreferences(): SharedPreferences {
 class BoundaryRegressionTest {
   private fun store(p:SharedPreferences=memoryPreferences(),secret:SharedPreferences=memoryPreferences())=ServerStore(p,secret,{"encrypted:$it"},{require(it.startsWith("encrypted:"));it.removePrefix("encrypted:")})
   private fun profile(url:String)=ServerProfile("srv","Server",url,allowCleartext=true)
-  @Test fun originChangeCannotRetainSavedCookieInTheRealConnection()=runBlocking {    MockWebServer().use { a -> MockWebServer().use { b ->
-      val store=store();val old=profile(a.url("/").toString());store.save(old,"old-password","private-cookie","opencode")
-      val edited=old.copy(url=b.url("/").toString())
-      val tested=profileCredentials(old.url,edited.url,store.credentials(old.id),"opencode","new-password")
-      store.save(edited,tested.password,tested.cookie,tested.username)
-      b.enqueue(MockResponse().setBody("""{"healthy":true}"""))
-      OpenCodeApi(store.profiles().single(),store.credentials("srv")).health()
-      assertNull(b.takeRequest().getHeader("Cookie"));assertEquals("new-password",store.credentials("srv").password)
-      // Defence in depth for a future caller that forgets to pass an explicit empty Cookie.
-      store.save(old,"old-password","private-cookie","opencode");store.save(edited,"new-password",credentialUsername="opencode")
-      assertEquals("",store.credentials("srv").cookie)
-    }}
-  }
-  @Test fun interruptedProfileSaveCannotExposeNewCredentialsToOldOrigin() {
-    val prefs=memoryPreferences();val secrets=memoryPreferences();val s=store(prefs,secrets)
-    s.save(profile("https://old.example"),"old-password")
-    val oldProfiles=prefs.getString("profiles",null)
-    s.save(profile("https://new.example"),"new-password","new-cookie")
-    // Simulate death after the credential commit but before the profile commit.
-    prefs.edit().putString("profiles",oldProfiles).commit()
-    assertEquals("",store(prefs,secrets).credentials("srv").password)
-    assertEquals("",store(prefs,secrets).credentials("srv").cookie)
-  }
-  @Test fun unchangedOriginCanSaveCookieOnlyAccount() {
-    val s=store();val p=profile("https://server.example");s.save(p,"","cookie","user")
-    val c=profileCredentials(p.url,p.url,s.credentials(p.id),"user",null)
-    s.save(p.copy(name="Renamed"),c.password,c.cookie,c.username)
-    assertEquals("cookie",s.credentials(p.id).cookie);assertEquals("",s.credentials(p.id).password)
-  }
   @Test fun deletionDuringEncryptionCannotResurrectANewCacheKey()=runBlocking {
     val p=memoryPreferences();val entered=CountDownLatch(1);val release=CountDownLatch(1)
     val cache=OfflineCache(p,{entered.countDown();check(release.await(3,TimeUnit.SECONDS));it},{it})
@@ -114,17 +85,6 @@ class BoundaryRegressionTest {
     assertEquals(listOf("B") to null, listOf("B").splitAnswer(options))
     assertEquals(listOf("B") to "补充", listOf("B", "补充").splitAnswer(options))
     assertEquals(emptyList<String>() to "只有文本", listOf("只有文本").splitAnswer(options))
-  }
-  @Test fun legacyIslandVendorKeysAreIgnoredAndDroppedOnSave() {
-    val p=memoryPreferences();val sec=memoryPreferences()
-    // 旧版本曾在服务器资料 JSON 里保存厂商通道开关；升级后必须能正常读取，并在下次保存时丢弃这些键。
-    p.edit().putString("profiles","""[{"id":"srv","name":"Server","url":"https://x","username":"opencode","autoConnect":true,"notifications":true,"allowCleartext":false,"islandHonor":true,"islandOppoFluidCloud":true}]""").commit()
-    val store=store(p,sec)
-    val loaded=store.profiles().single()
-    assertEquals("https://x",loaded.url)
-    store.save(loaded,"secret-password",credentialUsername="opencode")
-    val raw=p.getString("profiles","")!!
-    assertFalse(raw.contains("islandHonor"));assertFalse(raw.contains("islandOppoFluidCloud"))
   }
   @Test fun repeatedCursorFailsInsteadOfReturningPartialAuthoritativeData()=runBlocking {
     MockWebServer().use { s ->

@@ -112,7 +112,7 @@ class SshHostTest {
       setExecutable(true)
     }
     val transport = LocalShellTransport(home, "${bin.absolutePath}:/usr/bin:/bin")
-    val bootstrap = RemoteDshBootstrap(transport, launchCommand = "dsh web", startTimeoutSeconds = 10)
+    val bootstrap = SshDshBootstrap(transport, launchCommand = "dsh web", startTimeoutSeconds = 10)
     var launched: FixturePid? = null
     try {
       val first = bootstrap.start()
@@ -147,7 +147,7 @@ class SshHostTest {
       setExecutable(true)
     }
     val transport = LocalShellTransport(home, "${bin.absolutePath}:/usr/bin:/bin")
-    val bootstrap = RemoteDshBootstrap(transport, launchCommand = "dsh web", startTimeoutSeconds = 10)
+    val bootstrap = SshDshBootstrap(transport, launchCommand = "dsh web", startTimeoutSeconds = 10)
     var launched: FixturePid? = null
     var replacement: FixturePid? = null
     try {
@@ -200,7 +200,7 @@ class SshHostTest {
       )
       setExecutable(true)
     }
-    val bootstrap = RemoteDshBootstrap(
+    val bootstrap = SshDshBootstrap(
       LocalShellTransport(home, "${bin.absolutePath}:/usr/bin:/bin"), startTimeoutSeconds = 10
     )
     val state = File(home, ".lagoon-ssh-dsh")
@@ -248,7 +248,7 @@ class SshHostTest {
     }
     var launched: FixturePid? = null
     try {
-      val bootstrap = RemoteDshBootstrap(LocalShellTransport(home, "${bin.absolutePath}:/usr/bin:/bin"),
+      val bootstrap = SshDshBootstrap(LocalShellTransport(home, "${bin.absolutePath}:/usr/bin:/bin"),
         startTimeoutSeconds = 10)
       val endpoint = bootstrap.ensureRunning()
       launched = endpoint.pid?.let(::captureFixturePid)
@@ -275,7 +275,7 @@ class SshHostTest {
       setExecutable(true)
     }
     val transport = LocalShellTransport(home, "${bin.absolutePath}:/usr/bin:/bin")
-    val bootstrap = RemoteDshBootstrap(transport, workingDirectory = "/no/such/dir", startTimeoutSeconds = 5)
+    val bootstrap = SshDshBootstrap(transport, workingDirectory = "/no/such/dir", startTimeoutSeconds = 5)
     try {
       val failure = runCatching { bootstrap.start() }.exceptionOrNull() as? SshFailure
       assertEquals(SshFailureKind.DSH_START, failure?.kind)
@@ -288,7 +288,7 @@ class SshHostTest {
   }
 
   @Test fun quotedLaunchCommandKeepsItsOwnArguments() {
-    val bootstrap = RemoteDshBootstrap(
+    val bootstrap = SshDshBootstrap(
       transport = object : SshTransport {
         override val isClosed = false
         override fun exec(script: String, timeoutMillis: Long) = error("unused")
@@ -315,7 +315,7 @@ class SshHostTest {
     val root = Files.createTempDirectory("lagoon-ssh-test").toFile()
     val home = File(root, "home").apply { mkdirs() }
     val transport = LocalShellTransport(home, "/usr/bin:/bin")
-    val bootstrap = RemoteDshBootstrap(transport, startTimeoutSeconds = 5)
+    val bootstrap = SshDshBootstrap(transport, startTimeoutSeconds = 5)
     try {
       val failure = runCatching { bootstrap.start() }.exceptionOrNull() as? SshFailure
       assertEquals(SshFailureKind.DSH_NOT_FOUND, failure?.kind)
@@ -341,7 +341,7 @@ class SshHostTest {
       setExecutable(true)
     }
     val transport = LocalShellTransport(home, "${bin.absolutePath}:/usr/bin:/bin")
-    val bootstrap = RemoteDshBootstrap(transport, launchCommand = "dsh web", startTimeoutSeconds = 10)
+    val bootstrap = SshDshBootstrap(transport, launchCommand = "dsh web", startTimeoutSeconds = 10)
     var launched: FixturePid? = null
     try {
       val first = bootstrap.start()
@@ -374,7 +374,7 @@ class SshHostTest {
     )
     originals.forEach { (name, text) -> File(legacy, name).writeText(text) }
     try {
-      val bootstrap = RemoteDshBootstrap(LocalShellTransport(fixtureHome, "/usr/bin:/bin"), startTimeoutSeconds = 5)
+      val bootstrap = SshDshBootstrap(LocalShellTransport(fixtureHome, "/usr/bin:/bin"), startTimeoutSeconds = 5)
       // An unverifiable legacy record is ignored, not a conflict: the launch proceeds and fails on
       // the missing binary instead of blaming the other client.
       val failure = runCatching { bootstrap.ensureRunning() }.exceptionOrNull() as? SshFailure
@@ -398,7 +398,7 @@ class SshHostTest {
     File(legacy, "web.cmd").writeText("some-other-command")
     File(legacy, "web.log").writeText("dsh web: http://127.0.0.1:45681/?token=fixture-token\n")
     try {
-      val bootstrap = RemoteDshBootstrap(LocalShellTransport(fixtureHome, "/usr/bin:/bin"), startTimeoutSeconds = 5)
+      val bootstrap = SshDshBootstrap(LocalShellTransport(fixtureHome, "/usr/bin:/bin"), startTimeoutSeconds = 5)
       val failure = runCatching { bootstrap.ensureRunning() }.exceptionOrNull() as? SshFailure
       assertEquals(SshFailureKind.DSH_NOT_FOUND, failure?.kind)
       assertTrue("a shared process with different command must remain alive", unrelated.isAlive)
@@ -422,7 +422,7 @@ class SshHostTest {
     )
     originals.forEach { (name, text) -> File(legacy, name).writeText(text) }
     try {
-      val bootstrap = RemoteDshBootstrap(LocalShellTransport(fixtureHome, "/usr/bin:/bin"), startTimeoutSeconds = 5)
+      val bootstrap = SshDshBootstrap(LocalShellTransport(fixtureHome, "/usr/bin:/bin"), startTimeoutSeconds = 5)
       val endpoint = bootstrap.ensureRunning()
       assertTrue(endpoint.reused)
       assertEquals(pid.toInt(), endpoint.pid)
@@ -447,7 +447,7 @@ class SshHostTest {
     }
     var launched: FixturePid? = null
     try {
-      val bootstrap = RemoteDshBootstrap(LocalShellTransport(fixtureHome, "${bin.absolutePath}:/usr/bin:/bin"),
+      val bootstrap = SshDshBootstrap(LocalShellTransport(fixtureHome, "${bin.absolutePath}:/usr/bin:/bin"),
         launchCommand = wrapper.absolutePath, startTimeoutSeconds = 5)
       val endpoint = bootstrap.ensureRunning()
       launched = endpoint.pid?.let(::captureFixturePid)
@@ -473,9 +473,9 @@ class SshHostTest {
     val gate = java.util.concurrent.CountDownLatch(1)
     var launched: FixturePid? = null
     try {
-      fun submit() = executor.submit<com.igng.opencode.lagoon.core.RemoteDshEndpoint> {
+      fun submit() = executor.submit<com.igng.opencode.lagoon.core.SshDshEndpoint> {
         gate.await()
-        RemoteDshBootstrap(LocalShellTransport(fixtureHome, "${bin.absolutePath}:/usr/bin:/bin"),
+        SshDshBootstrap(LocalShellTransport(fixtureHome, "${bin.absolutePath}:/usr/bin:/bin"),
           startTimeoutSeconds = 5).ensureRunning()
       }
       val first = submit(); val second = submit(); gate.countDown()
@@ -507,7 +507,7 @@ class SshHostTest {
       setExecutable(true)
     }
     val path = "${bin.absolutePath}:/usr/bin:/bin"
-    val bootstrap = RemoteDshBootstrap(LocalShellTransport(fixtureHome, path), startTimeoutSeconds = 8)
+    val bootstrap = SshDshBootstrap(LocalShellTransport(fixtureHome, path), startTimeoutSeconds = 8)
     val state = File(fixtureHome, ".lagoon-ssh-dsh")
     val process = ProcessBuilder("/bin/sh", "-c", bootstrap.startScript()).apply {
       environment()["HOME"] = fixtureHome.absolutePath
@@ -572,17 +572,18 @@ class SshHostTest {
   @Test fun sshHostManagerRefCountsSharedLinkAcrossMultipleClientHandles() {
     val prefs = com.igng.opencode.lagoon.core.FakeSharedPreferences()
     val secretPrefs = com.igng.opencode.lagoon.core.FakeSharedPreferences()
-    val store = com.igng.opencode.lagoon.core.SshHostStore(prefs, secretPrefs, { it }, { it })
-    val config = SshHostConfig(
+    val store = com.igng.opencode.lagoon.core.DeviceStore(prefs, secretPrefs, { it }, { it })
+    val harness = com.igng.opencode.lagoon.core.DeviceHarness(
+      id = "p-ssh", deviceId = "ssh-ref", protocol = com.igng.opencode.lagoon.core.HarnessProtocol.DSH
+    )
+    val device = com.igng.opencode.lagoon.core.SshDevice(
       id = "ssh-ref", name = "DevBox", host = "127.0.0.1", port = 22, user = "dev",
       auth = com.igng.opencode.lagoon.core.SshAuthMethod.PASSWORD,
-      hostKeyType = "ssh-ed25519", hostKeyFingerprint = "SHA256:test"
+      hostKeyType = "ssh-ed25519", hostKeyFingerprint = "SHA256:test",
+      harnesses = listOf(harness)
     )
-    store.save(config, com.igng.opencode.lagoon.core.SshSecrets(password = "pw"))
-    val profile = com.igng.opencode.lagoon.core.ServerProfile(
-      id = "p-ssh", name = "DevBox", url = config.profileUrl(), username = "dev",
-      kind = com.igng.opencode.lagoon.core.ServerKind.DSH, sshHostId = config.id
-    )
+    store.saveDevice(device, com.igng.opencode.lagoon.core.SshSecrets(password = "pw"))
+    val profile = harness.toProfile(device)
     val manager = SshHostManager(store)
     try {
       val monitorClient = manager.client(profile)
@@ -591,11 +592,11 @@ class SshHostTest {
       tempClient.close()
       assertTrue(tempClient.isClosed)
       org.junit.Assert.assertFalse("监控持有的客户端不应被临时客户端连带关闭", monitorClient.isClosed)
-      org.junit.Assert.assertNotNull(manager.status(config.id))
+      org.junit.Assert.assertNotNull(manager.harnessStatus(profile.id))
       // 最后一个持有者关闭后才真正回收底层连接
       monitorClient.close()
       assertTrue(monitorClient.isClosed)
-      org.junit.Assert.assertNull(manager.status(config.id))
+      org.junit.Assert.assertNull(manager.harnessStatus(profile.id))
     } finally {
       manager.closeAll()
     }

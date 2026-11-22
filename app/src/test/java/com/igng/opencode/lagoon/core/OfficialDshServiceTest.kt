@@ -46,7 +46,7 @@ class OfficialDshServiceTest {
       "Official connection URL must be a bare HTTP loopback origin on a non-3080 port"
     }
     val profile = ServerProfile("official-dsh-live", "Official DSH test", url,
-      username = "dsh", allowCleartext = true, kind = ServerKind.DSH, dshAuth = DshAuthMode.TOKEN)
+      username = "dsh", allowCleartext = true, protocol = HarnessProtocol.DSH)
     val api = DshApi(profile, ServerCredentials("dsh", token), callTimeoutSeconds = 10)
     try {
       assertEquals("DeepSeek Harness", api.health())

@@ -28,7 +28,7 @@ import java.util.concurrent.atomic.AtomicReference
 /** Actual mux and RPC behavior; the Host is isolated and no approval is sent to a real service. */
 class DshRemoteRecoveryRegressionTest {
   private fun profile(server: MockWebServer) = ServerProfile(
-    "srv", "DSH", server.url("/").toString().trimEnd('/'), username = "dsh", allowCleartext = true, kind = ServerKind.DSH
+    "srv", "DSH", server.url("/").toString().trimEnd('/'), username = "dsh", allowCleartext = true, protocol = HarnessProtocol.DSH
   )
 
   private fun rootOk() = MockResponse().setResponseCode(303)

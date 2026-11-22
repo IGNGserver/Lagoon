@@ -396,27 +396,6 @@ class OpenCodeApiTest {
     }
   }
 
-  @Test fun pairTokenResolvesCredentials() = runBlocking {
-    val token = java.util.Base64.getUrlEncoder().withoutPadding().encodeToString("opencode:secret".toByteArray())
-    val pair = PairLinkResolver.resolve("https://example.test/auth/connect/abc?auth_token=$token")
-    assertEquals("https://example.test", pair.serverUrl)
-    assertEquals("opencode", pair.credentials.username)
-    assertEquals("secret", pair.credentials.password)
-    assertTrue(PairLinkResolver.isPairLink("https://example.test/auth/connect/abc"))
-    assertFalse(PairLinkResolver.isPairLink("https://example.test/"))
-    assertNotNull(pair.credentials)
-  }
-
-  @Test fun resolvesOfficialPairRedirectAndPersistsSessionCookie() = runBlocking {
-    MockWebServer().use { server ->
-      server.enqueue(MockResponse().setResponseCode(302).addHeader("Location", "/"))
-      server.enqueue(MockResponse().setBody("<html>OpenCode</html>").addHeader("Set-Cookie", "opencode-session=session-value; Path=/; HttpOnly"))
-      val pair = PairLinkResolver.resolve(server.url("/auth/connect/one-time").toString())
-      assertEquals(server.url("/").toString().trimEnd('/'), pair.serverUrl)
-      assertEquals("opencode-session=session-value", pair.credentials.cookie)
-    }
-  }
-
   @Test fun encodesSessionIdsExactlyOnceInPath() = runBlocking {
     MockWebServer().use { server ->
       server.enqueue(MockResponse().setBody("""{"data":[],"cursor":{}}"""))
@@ -448,19 +427,6 @@ class OpenCodeApiTest {
     }
   }
 
-  /** A01: pairing must reject a redirect to a different host before sending the one-time token. */
-  @Test fun pairLinkRedirectRejectsBeforeSendingToDisallowedHost() = runBlocking {
-    MockWebServer().use { target ->
-      target.enqueue(MockResponse().setBody("<html>stolen</html>"))
-      MockWebServer().use { origin ->
-        origin.enqueue(MockResponse().setResponseCode(302).addHeader("Location", target.url("/auth/connect/leak")))
-        val result = runCatching { PairLinkResolver.resolve(origin.url("/auth/connect/one-time").toString()) }
-        assertTrue(result.isFailure)
-        assertEquals(0, target.requestCount)
-      }
-    }
-  }
-
   /** A15: cancelling the caller must abort the in-flight HTTP call instead of waiting it out. */
   @Test fun cancellingApiInterruptsNetworkWait() = runBlocking {
     MockWebServer().use { server ->
@@ -473,15 +439,6 @@ class OpenCodeApiTest {
       val elapsedMillis = (System.nanoTime() - started) / 1_000_000
       assertTrue("cancel took ${elapsedMillis}ms", elapsedMillis < 1_500)
     }
-  }
-
-  /** A01: the cleartext target allow-list only accepts loopback hosts. */
-  @Test fun cleartextAllowListIsLoopbackOnly() {
-    assertTrue(HttpOrigin.allowsCleartext("localhost"))
-    assertTrue(HttpOrigin.allowsCleartext("127.0.0.1"))
-    assertTrue(HttpOrigin.allowsCleartext("::1"))
-    assertFalse(HttpOrigin.allowsCleartext("example.com"))
-    assertFalse(HttpOrigin.allowsCleartext("10.0.0.5"))
   }
 
   @Test fun degradedStateDefaultsToHealthyAndIsIndependentOfOfflineFlag() {

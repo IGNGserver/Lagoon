@@ -4,13 +4,13 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Lagoon — 原生 Android 的 coding agent 控制端</title>
-  <meta name="description" content="Lagoon 是面向 coding agent 的原生 Android 控制端，首发支持 OpenCode 2.x：直连你自己的服务器，在手机上查看会话、下达任务、处理授权与提问，任务状态实时浮现在系统通知里。">
+  <meta name="description" content="Lagoon 是面向 coding agent 的原生 Android 控制端：通过 SSH 直连你自己的开发机，统一接入 DeepSeek Harness、OpenCode、Codex 与 Antigravity，在手机上查看会话、下达任务、处理授权与提问，任务状态实时浮现在系统通知里。">
   <meta name="theme-color" content="#030816">
   <meta name="color-scheme" content="dark">
   <meta name="msvalidate.01" content="B411826ACAE5C5CD20EA5574C3F8A6E4">
   <meta property="og:type" content="website">
   <meta property="og:title" content="Lagoon — Agent 在远方深潜，进度在掌心浮现">
-  <meta property="og:description" content="原生 Android 的 coding agent 控制端。直连你自己的 OpenCode 2.x 服务器，无需第三方中转。">
+  <meta property="og:description" content="原生 Android 的 coding agent 控制端。纯 SSH 直连你的开发机，支持 DSH、OpenCode、Codex 与 Antigravity，无需第三方中转。">
   <link rel="canonical" href="https://lagoon.igng.net/">
   <meta property="og:url" content="https://lagoon.igng.net/">
   <meta property="og:image" content="https://lagoon.igng.net/assets/img/og.jpg">
@@ -32,7 +32,7 @@
     "softwareVersion": "__STABLE_VERSION__",
     "downloadUrl": "__STABLE_APK_URL__",
     "codeRepository": "__REPO_URL__",
-    "description": "面向 coding agent 的原生 Android 控制端，首发支持 OpenCode 2.x 服务端。"
+    "description": "面向 coding agent 的原生 Android 控制端，通过 SSH 直连开发机，支持 DeepSeek Harness、OpenCode、Codex 与 Antigravity。"
   }
   </script>
 </head>
@@ -105,7 +105,7 @@
           <span class="line"><span>进度在<em class="shimmer">掌心浮现</em>。</span></span>
         </h1>
         <p class="hero__lede">
-          Lagoon 直连你自己的 <strong>OpenCode 2.x</strong> 服务器——在手机上查看会话、继续下达任务、处理授权与提问。
+          Lagoon 通过 <strong>SSH</strong> 直连你自己的开发机，一套客户端同时驾驭 <strong>DeepSeek Harness</strong>、<strong>OpenCode</strong>、<strong>Codex</strong> 与 <strong>Antigravity</strong>——在手机上查看会话、继续下达任务、处理授权与提问。
           任务状态会浮现在通知与系统实时更新里，全程无需第三方中转。
         </p>
         <div class="hero__actions">
@@ -127,7 +127,7 @@
       <div class="hero__stage" data-tilt-stage>
         <div class="orbit orbit--a" aria-hidden="true"></div>
         <div class="orbit orbit--b" aria-hidden="true"></div>
-        <div class="float-tag float-tag--a" aria-hidden="true"><i class="pulse"></i>SSE 实时事件流</div>
+        <div class="float-tag float-tag--a" aria-hidden="true"><i class="pulse"></i>SSH 加密隧道与实时流</div>
         <div class="float-tag float-tag--b" aria-hidden="true"><svg><use href="#i-warn"/></svg>需确认关键操作</div>
         <div class="float-tag float-tag--c" aria-hidden="true"><code>lagoon://</code>深链直达会话</div>
 
@@ -179,9 +179,9 @@
     <section class="section connect" id="connect" data-depth="18" data-label="连接">
       <header class="section__head reveal">
         <p class="eyebrow"><span class="eyebrow__depth">−18 m</span>连接</p>
-        <h2>一根直连的光纤，<br>中间没有任何中转站。</h2>
-        <p class="section__lede">手机直接与你的 OpenCode 服务端建立连接：REST 读写加上全局 SSE 事件流。
-          v0.2.0 起已彻底移除 FCM 推送与伴随服务，凭据只留在你自己的手机里。</p>
+        <h2>一条加密的 SSH 通道，<br>中间没有任何中转站。</h2>
+        <p class="section__lede">手机通过 SSH 直连你的开发机，按需发现并挂载 DSH、OpenCode、Codex 与 Antigravity，不再依赖中转服务器或明文 HTTP 端口暴露。
+          所有密钥与主机指纹只留在你自己的手机里。</p>
       </header>
 
       <div class="currents reveal" data-currents>
@@ -191,8 +191,8 @@
         </div>
         <div class="currents__canvas">
           <svg class="currents__svg" viewBox="0 -60 800 572" role="img" aria-labelledby="currents-title currents-desc">
-            <title id="currents-title">手机与多台 OpenCode 服务器的连接示意</title>
-            <desc id="currents-desc">正式版只实时监控当前服务器；预览版同时保持全部已配置服务器的连接。</desc>
+            <title id="currents-title">手机与多台 SSH 开发机的连接示意</title>
+            <desc id="currents-desc">按设备聚合多个 Harness；每台 SSH 开发机与各个 Harness 独立重连互不干扰。</desc>
             <defs>
               <linearGradient id="threadGrad" x1="0" y1="1" x2="0" y2="0">
                 <stop offset="0" stop-color="#52e0c4"/>
@@ -217,10 +217,10 @@
           <p class="currents__status" aria-live="polite" data-currents-status>点按任一服务器节点，切换当前服务器。</p>
         </div>
         <ul class="currents__facts">
-          <li><b>直连端点</b><span>填写服务器地址，或直接粘贴 <code>opencode pair</code> 输出的官方配对链接（强制 HTTPS）。</span></li>
-          <li><b>Keystore 加密</b><span>密码与会话 Cookie 由 Android Keystore AES-GCM 保护；请求绑定固定 origin，禁止跨源重定向转发凭据。</span></li>
-          <li><b>断线自动对账</b><span>SSE 断开后自动重连，并重新读取控制状态补齐断线期间的变化。</span></li>
-          <li><b>明文需显式授权</b><span>建议走 HTTPS 或可信 VPN；局域网 HTTP 必须在该服务器资料中明确开启。</span></li>
+          <li><b>纯 SSH 接入</b><span>填写 <code>user@host</code> 或直接粘贴 <code>ssh</code> 命令；仅走 SSH 隧道与 stdio JSON-RPC，无需暴露公网 HTTP 端口。</span></li>
+          <li><b>全局密钥库与 TOFU</b><span>支持本机生成 Ed25519、AndroidKeyStore 硬件密钥与 OpenSSH 证书，一键部署公钥并严格固定 <code>SHA256:</code> 主机指纹。</span></li>
+          <li><b>一机多 Harness</b><span>保存设备后只读发现 DSH、OpenCode、OpenCode ACP、Codex 与 Antigravity，逐个开关按需连接。</span></li>
+          <li><b>断线独立恢复</b><span>SSH 心跳保活、指数退避自动重连并补齐断线期间的完成、授权与问答状态，多设备互不阻塞。</span></li>
         </ul>
       </div>
     </section>
@@ -387,10 +387,10 @@
       <div class="bento">
         <article class="cell cell--wide reveal" data-glass>
           <div class="cell__art art-servers" aria-hidden="true">
-            <span class="srv is-on"><i></i>我的 OpenCode</span><span class="srv"><i></i>工作站</span><span class="srv srv--add">＋</span>
+            <span class="srv is-on"><i></i>linux-dev</span><span class="srv"><i></i>工作站</span><span class="srv srv--add">＋</span>
           </div>
-          <h3>多服务器资料</h3>
-          <p>保存多台服务器，胶囊一键切换。支持 Basic Auth、官方 <code>opencode pair</code> 配对链接，认证失败不会保存资料。</p>
+          <h3>多 SSH 设备与五种 Harness</h3>
+          <p>按 SSH 开发机组织连接与设备组，支持全局密钥库与 TOFU 指纹校验，在同一台机器上按需启用 DSH、OpenCode、Codex 与 Antigravity。</p>
         </article>
         <article class="cell reveal" data-glass>
           <div class="cell__art art-group" aria-hidden="true"><span>日期</span><span class="is-on">项目</span><span>状态</span></div>
@@ -500,7 +500,7 @@
             <div><dt>安装包</dt><dd><code>__STABLE_APK__</code></dd></div>
             <div><dt>大小</dt><dd>__STABLE_SIZE__</dd></div>
             <div><dt>系统</dt><dd>Android 8.0 及以上</dd></div>
-            <div><dt>服务端</dt><dd>OpenCode 2.x</dd></div>
+            <div><dt>接入方式</dt><dd>SSH（DSH / OpenCode / Codex / Antigravity）</dd></div>
           </dl>
           <a class="btn btn--primary btn--block" href="__STABLE_APK_URL__" data-magnetic>
             <svg aria-hidden="true"><use href="#i-down"/></svg><span>下载 APK</span>
@@ -516,23 +516,23 @@
           <li>
             <span class="steps__n">1</span>
             <div>
-              <h3>准备服务端</h3>
-              <p>运行 OpenCode 2.x 服务端并启用 Basic Auth；或者在电脑上生成官方配对链接，免去手动填写密码：</p>
-              <div class="cmd"><code data-copy-src>opencode pair</code><button type="button" class="cmd__copy" data-copy aria-label="复制命令"><svg aria-hidden="true"><use href="#i-copy"/></svg><span data-copy-label>复制</span></button></div>
+              <h3>准备开发机 SSH</h3>
+              <p>在 Linux / macOS / WSL 开发机开启 SSH 服务，并安装需要使用的 coding agent（如 <code>dsh</code>、<code>opencode</code>、<code>codex</code> 或 <code>agy</code>）：</p>
+              <div class="cmd"><code data-copy-src>ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub</code><button type="button" class="cmd__copy" data-copy aria-label="复制命令"><svg aria-hidden="true"><use href="#i-copy"/></svg><span data-copy-label>复制</span></button></div>
             </div>
           </li>
           <li>
             <span class="steps__n">2</span>
             <div>
-              <h3>添加服务器</h3>
-              <p>在 Lagoon 中填写服务器地址（如 <code>https://oc.example.com</code>）或粘贴配对链接。手机无法通过 localhost 访问电脑，请使用电脑的局域网 IP、HTTPS 域名或可信 VPN。</p>
+              <h3>添加 SSH 设备并发现 Harness</h3>
+              <p>在 Lagoon 中输入地址、用户名与密码或密钥（可本机生成密钥并一键安装公钥），核对主机指纹后保存，在设备页逐个启用所需的 Harness。</p>
             </div>
           </li>
           <li>
             <span class="steps__n">3</span>
             <div>
               <h3>开始一次会话</h3>
-              <p>选择项目，描述你的任务。之后就可以把电脑留在原地，让进度在掌心浮现。</p>
+              <p>选择设备、Harness 与工作区，描述你的任务。之后就可以把电脑留在原地，让进度在掌心浮现。</p>
             </div>
           </li>
         </ol>
@@ -541,15 +541,15 @@
       <div class="faq reveal">
         <details>
           <summary>需要中转服务器或推送服务吗？</summary>
-          <p>不需要。手机直接连接你的 OpenCode 服务端；自 v0.2.0 起已移除 FCM 与伴随服务，后台通知由本机前台服务监听事件流后在本地发出。</p>
+          <p>不需要。Lagoon 已彻底移除中转 Hub、HTTP 直连与第三方推送；手机仅通过 SSH 加密连接你自己的开发机，后台通知由本机前台服务实时监听并本地发出。</p>
         </details>
         <details>
-          <summary>支持 OpenCode 1.x 或其他 harness 吗？</summary>
-          <p>目前只支持 OpenCode 2.x（1.x 已不再支持）。适配更多 coding agent harness 是规划方向，尚无承诺的发布时间。</p>
+          <summary>目前支持哪些 coding agent harness？</summary>
+          <p>全部通过 SSH 接入：DeepSeek Harness（DSH）、OpenCode 原生服务、OpenCode ACP、Codex 与 Antigravity（AGY）。不需要在公网暴露任何 HTTP 端口。</p>
         </details>
         <details>
-          <summary>我的凭据和数据存在哪里？</summary>
-          <p>服务器密码与会话 Cookie 经 Android Keystore 加密保存在手机上；离线缓存同样加密存放在本机。除你自己配置的服务器外，Lagoon 没有任何云端服务接收这些数据。</p>
+          <summary>我的 SSH 密钥和数据存在哪里？</summary>
+          <p>SSH 密码、私钥、AndroidKeyStore 硬件密钥与离线缓存均加密保存在你的手机本地，且强制校验 TOFU 主机指纹。除你自己连接的开发机外，Lagoon 没有任何云端服务接收这些数据。</p>
         </details>
         <details>
           <summary>为什么有时收不到后台通知？</summary>

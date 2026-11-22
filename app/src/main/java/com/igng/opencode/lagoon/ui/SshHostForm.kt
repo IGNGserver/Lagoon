@@ -6,8 +6,8 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.runtime.Composable
@@ -26,13 +26,13 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
-import com.igng.opencode.lagoon.core.DEFAULT_DSH_LAUNCH_COMMAND
 import com.igng.opencode.lagoon.core.LagoonController
 import com.igng.opencode.lagoon.core.LagoonState
 import com.igng.opencode.lagoon.core.PresentedSshHostKey
 import com.igng.opencode.lagoon.core.SSH_DEFAULT_PORT
 import com.igng.opencode.lagoon.core.SshAddress
 import com.igng.opencode.lagoon.core.SshAuthMethod
+import com.igng.opencode.lagoon.core.SshDevice
 import com.igng.opencode.lagoon.core.SshFailure
 import com.igng.opencode.lagoon.core.SshFailureKind
 import com.igng.opencode.lagoon.core.SshHostConfig
@@ -52,15 +52,13 @@ import top.yukonga.miuix.kmp.extra.SuperDialog
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 
 /**
- * Add or edit one SSH host. The first screen covers address, user, auth mode (`密码` / `密钥` /
- * `密钥优先`), and credentials/keychain selection; port, the remote `dsh web` command, the
- * display name and the pinned host key live under 「更多选项」. A saved host whose hidden values
- * differ from their defaults opens that section by itself, so a custom port or launch command can
- * never hide from the person editing it.
+ * Add or edit one SSH device. Only device-level transport fields live here (address, user, port,
+ * auth method, credentials/keychain, display name, pinned host key). Harness-specific settings
+ * such as DSH launch command / working directory live on HarnessDetailScreen.
  */
 @Composable
 internal fun SshHostForm(
-  initial: SshHostConfig?,
+  initial: SshDevice?,
   state: LagoonState,
   controller: LagoonController,
   onCancel: () -> Unit,
@@ -68,8 +66,8 @@ internal fun SshHostForm(
 ) {
   val context = LocalContext.current
   val scope = rememberCoroutineScope()
-  val hostId = remember(initial?.id) { initial?.id ?: SshHostConfig.newId() }
-  val initialSecrets = remember(initial?.id) { initial?.let { controller.sshHostSecrets(it.id) } ?: SshSecrets() }
+  val deviceId = remember(initial?.id) { initial?.id ?: SshDevice.newId() }
+  val initialSecrets = remember(initial?.id) { initial?.let { controller.deviceSecrets(it.id) } ?: SshSecrets() }
 
   var address by rememberSaveable(initial?.id) { mutableStateOf(initial?.host.orEmpty()) }
   var user by rememberSaveable(initial?.id) { mutableStateOf(initial?.user.orEmpty()) }
@@ -77,10 +75,6 @@ internal fun SshHostForm(
   var auth by rememberSaveable(initial?.id) { mutableStateOf(initial?.auth ?: SshAuthMethod.PASSWORD) }
   var selectedKeyId by rememberSaveable(initial?.id) { mutableStateOf(initial?.keyId) }
   var name by rememberSaveable(initial?.id) { mutableStateOf(initial?.name.orEmpty()) }
-  var command by rememberSaveable(initial?.id) {
-    mutableStateOf(initial?.launchCommand ?: DEFAULT_DSH_LAUNCH_COMMAND)
-  }
-  var workingDirectory by rememberSaveable(initial?.id) { mutableStateOf(initial?.workingDirectory.orEmpty()) }
   // Saved secrets stay in Android Keystore. Empty fields mean “keep saved”, never “show saved”.
   var password by remember(initial?.id) { mutableStateOf("") }
   var privateKey by remember(initial?.id) { mutableStateOf("") }
@@ -98,7 +92,6 @@ internal fun SshHostForm(
       initial?.takeIf { !it.hostKeyFingerprint.isNullOrBlank() }?.let { "${it.host}:${it.port}" }.orEmpty()
     )
   }
-  // 与文档承诺一致：地址或端口变化后旧指纹不再沿用，避免拿 A 机器的指纹去连 B。
   LaunchedEffect(address, port) {
     val parts = SshAddress.parse(address)
     if (parts.error != null) return@LaunchedEffect
@@ -114,8 +107,6 @@ internal fun SshHostForm(
     mutableStateOf(
       initial != null && moreOptionsSummary(
         port = initial.port.toString(),
-        command = initial.launchCommand,
-        workingDirectory = initial.workingDirectory.orEmpty(),
         name = initial.name,
         host = initial.host,
         fingerprint = initial.hostKeyFingerprint.orEmpty()
@@ -129,11 +120,9 @@ internal fun SshHostForm(
   var pendingAction by remember { mutableStateOf<((SshHostConfig) -> Unit)?>(null) }
   var pendingConfig by remember { mutableStateOf<SshHostConfig?>(null) }
   var importError by remember { mutableStateOf<String?>(null) }
-  var confirmingDelete by remember { mutableStateOf(false) }
   var confirmingSecretClear by remember { mutableStateOf<SshSecretField?>(null) }
   var confirmingFingerprintReset by remember { mutableStateOf(false) }
 
-  // Keychain & Phase 2/3 modals
   var showKeychainSheet by remember { mutableStateOf(false) }
   var showGenerateDialog by remember { mutableStateOf(false) }
   var showImportDialog by remember { mutableStateOf(false) }
@@ -149,17 +138,6 @@ internal fun SshHostForm(
     SshSecretField.PRIVATE_KEY !in clearedSecrets &&
     selectedKeyProfile == null
 
-  // A pinned key belongs to the address it was read from. Clear the display as soon as the user
-  // edits host/port so an old fingerprint can never be sent to a different machine.
-  LaunchedEffect(address, port) {
-    val base = initial ?: return@LaunchedEffect
-    if (address.trim() != base.host || port.trim().toIntOrNull() != base.port) {
-      hostKeyType = ""
-      hostKeyFingerprint = ""
-    }
-  }
-
-  // Real JSch/BouncyCastle inspection for direct inline key edits.
   LaunchedEffect(privateKey, passphrase) {
     val trimmed = privateKey.trim()
     if (trimmed.isEmpty()) {
@@ -188,7 +166,6 @@ internal fun SshHostForm(
     scope.launch {
       try {
         val text = readTextDocument(context, uri)
-        // Validate using real SSH key codec instead of substring matching.
         withContext(Dispatchers.Default) { SshKeyCodec.inspectPrivateKey(text.trim(), passphrase.takeIf { it.isNotEmpty() }) }
         selectedKeyId = null
         showInlineKeyEditor = true
@@ -242,15 +219,13 @@ internal fun SshHostForm(
     }
     val pinStillBelongs = pinnedEndpoint == "$host:$portValue"
     return SshHostConfig(
-      id = hostId,
+      id = deviceId,
       name = name.trim().ifBlank { host },
       host = host,
       port = portValue,
       user = userName,
       auth = auth,
       keyId = if (auth == SshAuthMethod.PASSWORD) null else selectedKeyId?.takeIf { selectedKeyProfile != null },
-      launchCommand = command.trim().ifBlank { DEFAULT_DSH_LAUNCH_COMMAND },
-      workingDirectory = workingDirectory.trim().takeIf { it.isNotEmpty() },
       hostKeyType = hostKeyType.takeIf { pinStillBelongs && it.isNotBlank() },
       hostKeyFingerprint = hostKeyFingerprint.takeIf { pinStillBelongs && it.isNotBlank() }
     )
@@ -290,19 +265,28 @@ internal fun SshHostForm(
   fun errorText(error: Throwable): String =
     if (error is SshFailure) error.display() else userFacingError(error, "SSH 连接失败")
 
-  /**
-   * 先保存设备本身的接入配置。新设备的检测交给设备页，在表单退出后继续；
-   * 即使检测失败，设备和凭据也仍然可供修改和重试。
-   */
   fun commit(config: SshHostConfig, offline: Boolean = false, discover: Boolean = false) {
     working = true
     result = null
     resultIsError = false
     try {
-      controller.saveSshSourceOnly(config, secrets())
+      val device = SshDevice(
+        id = deviceId,
+        name = config.name,
+        host = config.host,
+        port = config.port,
+        user = config.user,
+        auth = config.auth,
+        keyId = config.keyId,
+        hostKeyType = config.hostKeyType,
+        hostKeyFingerprint = config.hostKeyFingerprint,
+        enabled = initial?.enabled ?: true,
+        harnesses = initial?.harnesses.orEmpty()
+      )
+      controller.saveSshDevice(device, secrets())
       result = if (offline) "已保存 SSH 设备；首次连接时会再核对主机指纹" else "已保存 SSH 设备"
       resultIsError = false
-      onSaved(hostId, discover)
+      onSaved(deviceId, discover)
     } catch (cancel: CancellationException) {
       throw cancel
     } catch (error: Exception) {
@@ -336,40 +320,38 @@ internal fun SshHostForm(
     }
   }
 
-  /**
-   * 只读连接测试：确认登录并读取目录标记；完整 Harness 发现由设备页执行。
-   */
+  /** 只读 SSH 握手与认证测试：确认网络、指纹与凭据无误，不启动远端服务。 */
   fun testPinnedConnection(pinned: SshHostConfig) {
-      working = true; result = null; resultIsError = false
-      scope.launch {
-        try {
-          controller.discoverSshHarnesses(pinned, secrets(), null)
-          result = "SSH 登录成功。保存后可在设备页刷新发现 Harness；发现不会启动服务。"
-          resultIsError = false
-          hostKeyType = pinned.hostKeyType.orEmpty()
-          hostKeyFingerprint = pinned.hostKeyFingerprint.orEmpty()
-          pinnedEndpoint = "${pinned.host}:${pinned.port}"
-        } catch (cancel: CancellationException) {
-          throw cancel
-        } catch (error: Exception) {
-          result = errorText(error)
-          resultIsError = true
-          if (error is SshFailure && error.kind == SshFailureKind.HOST_KEY_CHANGED && error.presentedKey != null) {
-            pendingKey = error.presentedKey
-            pendingConfig = pinned
-            pendingAction = { updated -> testPinnedConnection(updated) }
-          }
-          if (error is SshFailure &&
-            (error.kind == SshFailureKind.PASSPHRASE_REQUIRED || error.kind == SshFailureKind.BIOMETRIC_REQUIRED) &&
-            selectedKeyProfile != null
-          ) {
-            retryTestAfterUnlock = true
-            unlockTarget = selectedKeyProfile
-          }
-        } finally {
-          working = false
+    working = true; result = null; resultIsError = false
+    scope.launch {
+      try {
+        val message = controller.testSshDeviceHandshake(pinned, secrets())
+        result = message
+        resultIsError = false
+        hostKeyType = pinned.hostKeyType.orEmpty()
+        hostKeyFingerprint = pinned.hostKeyFingerprint.orEmpty()
+        pinnedEndpoint = "${pinned.host}:${pinned.port}"
+      } catch (cancel: CancellationException) {
+        throw cancel
+      } catch (error: Exception) {
+        result = errorText(error)
+        resultIsError = true
+        if (error is SshFailure && error.kind == SshFailureKind.HOST_KEY_CHANGED && error.presentedKey != null) {
+          pendingKey = error.presentedKey
+          pendingConfig = pinned
+          pendingAction = { updated -> testPinnedConnection(updated) }
         }
+        if (error is SshFailure &&
+          (error.kind == SshFailureKind.PASSPHRASE_REQUIRED || error.kind == SshFailureKind.BIOMETRIC_REQUIRED) &&
+          selectedKeyProfile != null
+        ) {
+          retryTestAfterUnlock = true
+          unlockTarget = selectedKeyProfile
+        }
+      } finally {
+        working = false
       }
+    }
   }
 
   fun testConnection() {
@@ -377,22 +359,19 @@ internal fun SshHostForm(
     withPinnedKey(config, ::testPinnedConnection)
   }
 
-  /** [offline] stores the host without reaching it; the pin is confirmed on the first real connect. */
-  fun save(offline: Boolean) {
+  fun save(offline: Boolean, discover: Boolean = initial == null) {
     val config = configOrNull() ?: return
     if (offline) {
-      commit(config, offline = true)
+      commit(config, offline = true, discover = false)
       return
     }
-    withPinnedKey(config) { pinned -> commit(pinned, discover = initial == null) }
+    withPinnedKey(config) { pinned -> commit(pinned, discover = discover) }
   }
 
-  // The address can still carry a port when it was typed rather than pasted; the form always
-  // shows and saves the effective value so the hidden 更多选项 field never contradicts it.
   val effectivePort = SshAddress.parse(address).port?.toString() ?: port.trim()
 
   LazyColumn(
-    Modifier.fillMaxWidth().heightIn(max = 760.dp),
+    Modifier.fillMaxSize(),
     contentPadding = PaddingValues(horizontal = 20.dp, vertical = 8.dp),
     verticalArrangement = Arrangement.spacedBy(10.dp)
   ) {
@@ -400,8 +379,6 @@ internal fun SshHostForm(
       TextField(
         value = address,
         onValueChange = { raw ->
-          // Pasting a whole `ssh -p 22 user@host` line splits it once; typing is never rewritten,
-          // so a hand-typed ":2222" keeps its digits in the field until the form is saved.
           val pasted = raw.length - address.length > 1
           val parts = SshAddress.parse(raw)
           val isCommand = raw.trimStart().let { it.length > 3 && it.startsWith("ssh") && it[3].isWhitespace() }
@@ -430,7 +407,6 @@ internal fun SshHostForm(
         value = user,
         onValueChange = { typed ->
           user = typed
-          // The dedicated field wins: drop an inline `user@` the address was still carrying.
           address = SshAddress.parse(address).let { parts -> if (parts.error == null && parts.user != null) parts.host else address }
         },
         label = "用户名",
@@ -507,10 +483,7 @@ internal fun SshHostForm(
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
                 verticalAlignment = Alignment.CenterVertically
               ) {
-                HyperTextAction(
-                  text = "更换密钥",
-                  onClick = { showKeychainSheet = true }
-                )
+                HyperTextAction(text = "更换密钥", onClick = { showKeychainSheet = true })
                 HyperTextAction(
                   text = "复制公钥",
                   onClick = {
@@ -563,10 +536,7 @@ internal fun SshHostForm(
                 verticalAlignment = Alignment.CenterVertically
               ) {
                 if (state.sshKeys.isNotEmpty()) {
-                  HyperTextAction(
-                    text = "生成新密钥",
-                    onClick = { showGenerateDialog = true }
-                  )
+                  HyperTextAction(text = "生成新密钥", onClick = { showGenerateDialog = true })
                 }
                 if (hasLegacyInlineKey) {
                   HyperTextAction(
@@ -625,6 +595,7 @@ internal fun SshHostForm(
               else -> "私钥（OpenSSH / PEM / PKCS#8 / PuTTY .ppk）"
             },
             singleLine = false,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
             visualTransformation = if (privateKeyVisible) VisualTransformation.None else PasswordVisualTransformation(),
             modifier = Modifier.fillMaxWidth()
           )
@@ -660,9 +631,7 @@ internal fun SshHostForm(
               parsedInlineKey?.publicKeyOpenSsh?.takeIf { it.isNotBlank() }?.let { pubKey ->
                 HyperTextAction(
                   text = "安装公钥",
-                  onClick = {
-                    if (hostEndpointOrNull() != null) deployPublicKey = pubKey
-                  }
+                  onClick = { if (hostEndpointOrNull() != null) deployPublicKey = pubKey }
                 )
               }
             }
@@ -756,21 +725,19 @@ internal fun SshHostForm(
 
     item {
       Text(
-        "保存后这台主机会作为一台设备出现在「设备」里；到那台设备的页面刷新发现，再逐个启用 DSH / OpenCode / Codex。",
+        "保存后会自动进入设备页，只读发现该开发机上可用的 DSH / OpenCode / Codex / Antigravity；发现不会启动远端服务。",
         style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary)
       )
     }
     item {
       HyperActionRow(
         title = "更多选项",
-        summary = if (showMore) "端口、启动命令、工作目录与主机指纹" else moreOptionsSummary(
+        summary = if (showMore) "端口、设备名称与主机指纹" else moreOptionsSummary(
           port = effectivePort,
-          command = command,
-          workingDirectory = workingDirectory,
           name = name,
           host = address,
           fingerprint = hostKeyFingerprint
-        ) ?: "端口 $port · 启动命令与主机指纹",
+        ) ?: "端口 $port · 名称与主机指纹",
         trailing = { ExpandChevron(showMore) },
         onClick = { showMore = !showMore }
       )
@@ -778,11 +745,9 @@ internal fun SshHostForm(
     if (showMore) {
       item {
         TextField(
-          // A hand-typed ":2222" stays in the address field, so show the effective value here.
           value = effectivePort,
           onValueChange = { typed ->
             port = typed.filter(Char::isDigit)
-            // The dedicated field wins: drop a `:port` the address was still carrying.
             address = SshAddress.parse(address).let { parts -> if (parts.error == null && parts.port != null) parts.host else address }
           },
           label = "端口（默认 $SSH_DEFAULT_PORT）",
@@ -791,25 +756,9 @@ internal fun SshHostForm(
       }
       item {
         TextField(
-          value = command,
-          onValueChange = { command = it },
-          label = "启动命令（默认 $DEFAULT_DSH_LAUNCH_COMMAND）",
-          modifier = Modifier.fillMaxWidth()
-        )
-      }
-      item {
-        TextField(
-          value = workingDirectory,
-          onValueChange = { workingDirectory = it },
-          label = "远端工作目录（可选，例如 ~/code）",
-          modifier = Modifier.fillMaxWidth()
-        )
-      }
-      item {
-        TextField(
           value = name,
           onValueChange = { name = it },
-          label = "名称（可选，默认用地址）",
+          label = "设备名称（可选，默认用地址）",
           modifier = Modifier.fillMaxWidth()
         )
       }
@@ -837,24 +786,6 @@ internal fun SshHostForm(
           }
         }
       }
-      item {
-        HyperButton(
-          text = "只读测试 SSH 连接",
-          variant = HyperButtonVariant.SECONDARY,
-          enabled = !working,
-          loading = working,
-          onClick = { testConnection() },
-          modifier = Modifier.fillMaxWidth()
-        )
-      }
-      if (initial != null) item {
-        HyperTextAction(
-          text = "删除这台主机",
-          danger = true,
-          onClick = { confirmingDelete = true },
-          modifier = Modifier.fillMaxWidth()
-        )
-      }
     }
     result?.let { text ->
       item {
@@ -869,29 +800,43 @@ internal fun SshHostForm(
     item {
       Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         HyperButton(
-          text = "取消",
+          text = "测试连接",
           variant = HyperButtonVariant.SECONDARY,
-          onClick = onCancel,
+          enabled = !working,
+          loading = working,
+          onClick = { testConnection() },
           modifier = Modifier.weight(1f)
         )
         HyperButton(
-          text = if (initial == null) "保存并检测" else "保存设备配置",
+          text = if (initial == null) "保存并检测" else "保存",
           enabled = !working,
           loading = working,
-          onClick = { save(offline = false) },
+          onClick = { save(offline = false, discover = initial == null) },
           modifier = Modifier.weight(1f)
         )
       }
     }
-    if (initial == null) item {
-      Text("保存后会连接并只读发现，不会启动服务；检测失败时设备仍会保留。",
-        style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary))
-      HyperTextAction(
-        text = "跳过指纹核对，仅保存",
-        enabled = !working,
-        onClick = { save(offline = true) },
-        modifier = Modifier.fillMaxWidth()
-      )
+    item {
+      Row(
+        Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+      ) {
+        HyperTextAction(text = "取消", enabled = !working, onClick = onCancel)
+        if (initial == null) {
+          HyperTextAction(
+            text = "跳过指纹核对，仅保存",
+            enabled = !working,
+            onClick = { save(offline = true, discover = false) }
+          )
+        } else {
+          HyperTextAction(
+            text = "保存并重新发现",
+            enabled = !working,
+            onClick = { save(offline = false, discover = true) }
+          )
+        }
+      }
     }
   }
 
@@ -981,6 +926,7 @@ internal fun SshHostForm(
         onPinnedHostKey = { key ->
           hostKeyType = key.type
           hostKeyFingerprint = key.fingerprint
+          pinnedEndpoint = "${endpoint.host}:${endpoint.port}"
         },
         onDismiss = { deployPublicKey = null },
         onSuccess = {
@@ -992,22 +938,6 @@ internal fun SshHostForm(
     }
   }
 
-  if (confirmingDelete && initial != null) {
-    SuperDialog(title = "删除 ${initial.name}？", show = true, onDismissRequest = { confirmingDelete = false }) {
-      Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text(
-          "会删除本机的 SSH 配置、加密凭据和该主机下全部 Harness 连接资料；远端进程与会话不会受到影响。",
-          style = MiuixTheme.textStyles.body1
-        )
-        DialogActions("取消", { confirmingDelete = false }, "确认删除", danger = true) {
-          controller.deleteSshHost(initial.id)
-          confirmingDelete = false
-          onSaved(initial.id, false)
-        }
-      }
-    }
-  }
-
   confirmingSecretClear?.let { field ->
     val label = when (field) {
       SshSecretField.PASSWORD -> "SSH 密码"
@@ -1016,7 +946,7 @@ internal fun SshHostForm(
     }
     SuperDialog(title = "清除已保存的$label？", show = true, onDismissRequest = { confirmingSecretClear = null }) {
       Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text("保存主机后，本机加密存储中的${label}将被删除。远端主机不会受影响。", style = MiuixTheme.textStyles.body1)
+        Text("保存设备后，本机加密存储中的${label}将被删除。远端主机不会受影响。", style = MiuixTheme.textStyles.body1)
         DialogActions("取消", { confirmingSecretClear = null }, "确认清除", danger = true) {
           clearedSecrets = clearedSecrets + field
           when (field) {
@@ -1052,8 +982,6 @@ internal fun SshHostForm(
   if (key != null) {
     SshHostKeyDialog(
       presented = key,
-      // 只拿“这次实际被探测的配置”里记住的指纹做对比。表单 state 里的旧指纹可能属于改过的
-      // 地址，用它判断会把一次正常的首次信任误报成“主机指纹变了”。
       saved = pendingConfig?.hostKeyFingerprint?.takeIf(String::isNotBlank),
       savedType = pendingConfig?.hostKeyType?.takeIf(String::isNotBlank),
       destination = pendingConfig?.address,
@@ -1076,8 +1004,6 @@ internal fun SshHostForm(
 /** One-line summary of the values under 「更多选项」; null when every one of them is still default. */
 private fun moreOptionsSummary(
   port: String,
-  command: String,
-  workingDirectory: String,
   name: String,
   host: String,
   fingerprint: String
@@ -1085,8 +1011,6 @@ private fun moreOptionsSummary(
   val portValue = port.trim().toIntOrNull() ?: SSH_DEFAULT_PORT
   val parts = buildList {
     if (portValue != SSH_DEFAULT_PORT) add("端口 $portValue")
-    if (command.trim() != DEFAULT_DSH_LAUNCH_COMMAND) add("自定义启动命令")
-    if (workingDirectory.isNotBlank()) add("工作目录")
     if (name.isNotBlank() && name.trim() != host.trim()) add("自定义名称")
     if (fingerprint.isNotBlank()) add("已固定指纹")
   }

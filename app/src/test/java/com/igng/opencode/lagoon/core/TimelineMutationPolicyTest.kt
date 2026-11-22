@@ -11,10 +11,9 @@ class TimelineMutationPolicyTest {
     connected = true, capabilities = ApiCapabilities.BASELINE, messages = listOf(human))
 
   @Test fun nativeTimelinePolicyIsCarrierIndependent() {
-    val direct = ServerProfile("leaf", "Direct", "https://native.example/")
-    val ssh = direct.copy(url = "ssh://user@host:22", sshHostId = "ssh", sshServicePath = "/private/service.json")
-    val remote = direct.copy(url = "https://hub.example/", username = "account", remoteHostId = "host", remoteServiceId = "service")
-    for (profile in listOf(direct, ssh, remote)) assertTrue(state(profile).canRevertMessage(human.id))
+    val loopback = ServerProfile("leaf", "Loopback", "https://native.example/")
+    val ssh = loopback.copy(url = "ssh://user@host:22", deviceId = "ssh", config = HarnessConfig.OpenCodeNative("/private/service.json"))
+    for (profile in listOf(loopback, ssh)) assertTrue(state(profile).canRevertMessage(human.id))
   }
 
   @Test fun absentNativeCapabilityNeverOffersRevertOrRestore() {
@@ -28,7 +27,7 @@ class TimelineMutationPolicyTest {
     val blocked = listOf(normal.copy(connected = false), normal.copy(cached = true), normal.copy(degraded = true),
       normal.copy(tasks = mapOf(session.id to TaskState(session.id, TaskPhase.THINKING))),
       normal.copy(profiles = normal.profiles.map { it.copy(enabled = false) }),
-      normal.copy(profiles = normal.profiles.map { it.copy(parentEnabled = false) }),
+      normal.copy(profiles = normal.profiles.map { it.copy(deviceEnabled = false) }),
       normal.copy(pendingOperations = setOf(operationKey("leaf", session.id, null, "send"))),
       normal.copy(pendingOperations = setOf(operationKey("leaf", session.id, null, "unrevert"))))
     blocked.forEach { assertFalse(it.canRevertMessage(human.id)) }

@@ -142,7 +142,7 @@ class OpenCodeSshRegistration private constructor(
 
 /** Legacy .dsh-app-remote is a marker descriptor, never a desktop profile/runtime equivalence. */
 data class DshLegacySshDescriptor(val markerPath: String) {
-  val protocolId: HarnessProtocolId get() = HarnessProtocolId.DSH_TYPERT
+  val protocol: HarnessProtocol get() = HarnessProtocol.DSH
   fun stableLocator(sshHostId: String): String = sshHarnessLocator(sshHostId, markerPath)
 }
 

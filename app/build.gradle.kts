@@ -95,21 +95,10 @@ dependencies {
   // Android 26–32 has no JCE Ed25519; JSch's BouncyCastle adapter supplies Ed25519 host keys and
   // private-key authentication on those API levels.
   implementation("org.bouncycastle:bcprov-jdk18on:1.79")
-  // MIT Noise implementation used for DSH Remote Protocol v1's fixed IK suite.
-  implementation("com.github.auties00:noise-java:1.2") {
-    // The published legacy POM declares JAXB for its old test tooling; Noise's runtime classes do not need it.
-    exclude(group = "javax.xml.bind", module = "jaxb-api")
-  }
   implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
   implementation("io.github.kyant0:shapes-android:1.2.0")
   implementation("top.yukonga.miuix.kmp:miuix-android:0.8.8")
   implementation("top.yukonga.miuix.kmp:miuix-icons-android:0.8.8")
-  // CameraX + ZXing pure-Kotlin QR decode for DSH Remote Scan-to-Pair v1.
-  implementation("androidx.camera:camera-core:1.4.1")
-  implementation("androidx.camera:camera-camera2:1.4.1")
-  implementation("androidx.camera:camera-lifecycle:1.4.1")
-  implementation("androidx.camera:camera-view:1.4.1")
-  implementation("com.google.zxing:core:3.5.3")
   testImplementation("junit:junit:4.13.2")
   // A loopback-only SSH server exercises JSch's real password and interactive wire protocols.
   testImplementation("org.apache.sshd:sshd-core:2.15.0")

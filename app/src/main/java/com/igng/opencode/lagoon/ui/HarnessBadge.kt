@@ -8,9 +8,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import com.igng.opencode.lagoon.core.ServerKind
+import com.igng.opencode.lagoon.core.HarnessProtocol
 import com.igng.opencode.lagoon.core.ServerProfile
-import com.igng.opencode.lagoon.core.HarnessProtocolId
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 
@@ -19,16 +18,16 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
  */
 @Composable
 internal fun HarnessBadge(profile: ServerProfile, modifier: Modifier = Modifier) {
-  val kind = profile.kind
-  val label = if (profile.protocol == HarnessProtocolId.ANTIGRAVITY_ACP) "Antigravity" else if (profile.protocol == HarnessProtocolId.OPENCODE_ACP) "OpenCode ACP" else when (kind) {
-    ServerKind.OPENCODE -> "OpenCode"
-    ServerKind.CODEX -> "Codex"
-    ServerKind.DSH, ServerKind.DSH_REMOTE -> "DSH"
+  val label = when (profile.protocol) {
+    HarnessProtocol.DSH -> "DSH"
+    HarnessProtocol.OPENCODE_NATIVE -> "OpenCode"
+    HarnessProtocol.OPENCODE_ACP -> "OpenCode ACP"
+    HarnessProtocol.CODEX -> "Codex"
+    HarnessProtocol.ANTIGRAVITY_ACP -> "Antigravity"
   }
-  val color = when (kind) {
-    ServerKind.OPENCODE -> HyperTheme.colors.textSecondary
-    ServerKind.CODEX -> HyperTheme.colors.textSecondary
-    ServerKind.DSH, ServerKind.DSH_REMOTE -> HyperTheme.colors.primary
+  val color = when (profile.protocol) {
+    HarnessProtocol.DSH -> HyperTheme.colors.primary
+    else -> HyperTheme.colors.textSecondary
   }
   val shape = miuixSquircleShape(6.dp)
   Text(

@@ -1,9 +1,9 @@
 package com.igng.opencode.lagoon.ui
 
+import com.igng.opencode.lagoon.core.DshGoal
 import com.igng.opencode.lagoon.core.GoalMutationTarget
+import com.igng.opencode.lagoon.core.HarnessProtocol
 import com.igng.opencode.lagoon.core.LagoonState
-import com.igng.opencode.lagoon.core.RemoteGoal
-import com.igng.opencode.lagoon.core.ServerKind
 import com.igng.opencode.lagoon.core.ServerProfile
 import com.igng.opencode.lagoon.core.Session
 import com.igng.opencode.lagoon.core.operationKey
@@ -14,8 +14,8 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class GoalEditorPolicyTest {
-  private val profile = ServerProfile("server", "Host", "https://host.example", kind = ServerKind.DSH)
-  private val goal = RemoteGoal("goal", 4, "Original\nfull objective", "paused")
+  private val profile = ServerProfile("server", "Host", "ssh://user@host:22", protocol = HarnessProtocol.DSH)
+  private val goal = DshGoal("goal", 4, "Original\nfull objective", "paused")
   private val target = GoalMutationTarget(profile, "session", goal.id, goal.revision)
   private fun state() = LagoonState(profiles = listOf(profile), serverId = profile.id,
     connected = true, sessions = listOf(Session("session", "/repo", "Session", 1)), sessionId = "session", goal = goal)
@@ -70,7 +70,7 @@ class GoalEditorPolicyTest {
     }
     assertFalse(canSave(initial.copy(cached = true)))
     assertFalse(canSave(initial.copy(connected = false)))
-    assertFalse(canSave(initial.copy(profiles = listOf(profile.copy(parentEnabled = false)))))
+    assertFalse(canSave(initial.copy(profiles = listOf(profile.copy(deviceEnabled = false)))))
     assertFalse(canSave(initial.copy(profiles = listOf(profile.copy(enabled = false)))))
   }
 }

@@ -3,56 +3,38 @@ package com.igng.opencode.lagoon.core
 import org.json.JSONArray
 import org.json.JSONObject
 
+/**
+ * 一条 Harness 连接的运行态投影。由 [SshDevice] + [DeviceHarness] 派生，不再单独持久化。
+ * 协议层与单元测试也可以直接用本地回环 URL 构造它。
+ */
 data class ServerProfile(
   val id: String,
   val name: String,
   val url: String,
   val username: String = "opencode",
-  val autoConnect: Boolean = true,
   val notifications: Boolean = true,
   val allowCleartext: Boolean = false,
-  /** 该服务器使用的 harness 协议（OpenCode / DeepSeek Harness）。 */
-  val kind: ServerKind = ServerKind.OPENCODE,
-  /** Legacy direct DSH credential mode; ignored by OpenCode and DSH Remote. */
-  val dshAuth: DshAuthMode = DshAuthMode.TOKEN,
-  /** DSH Remote Host selected from the authenticated DSH Hub account. */
-  val remoteHostId: String? = null,
-  /** Upstream's 12-hex-character SHA-256 Host identity fingerprint, confirmed during pairing. */
-  val remoteHostFingerprint: String? = null,
-  /**
-   * Set when this DSH profile is reached through a saved SSH host. The connection is built by the
-   * app's SSH layer; [url] only carries a stable `ssh://user@host:port` display identity.
-   */
-  val sshHostId: String? = null,
-  /**
-   * Local opt-out for this saved connection. A disabled profile is never dialled, monitored or
-   * projected into the home/notification surfaces, even when it is selected or explicitly included.
-   * Credentials, drafts, caches and the unread ledger stay on disk so re-enabling can resume.
-   */
+  val protocol: HarnessProtocol = HarnessProtocol.OPENCODE_NATIVE,
+  /** 所属 SSH 设备 ID（[SshDevice.id]）；单元测试直接针对本地回环 HTTP 服务时可为 null。 */
+  val deviceId: String? = null,
+  /** 所属 SSH 设备展示名（UI 分组与标题用）。 */
+  val deviceName: String = "",
+  /** Harness 自己的开关。 */
   val enabled: Boolean = true,
-  /** OpenCode registration locator on an SSH source; null selects the official default file.
-   * Never a service generation ID or an ephemeral forwarded URL, and never contains a password. */
-  val sshServicePath: String? = null,
-  /** Ephemeral source/Host gate, applied only to runtime reads; never a saved leaf preference. */
-  val parentEnabled: Boolean = true,
-  /** Opaque Host-local native service locator. Generation is negotiated, never persisted as identity. */
-  val remoteServiceId: String? = null,
-  /** Explicit protocol for new harnesses; old profiles derive it from their compatibility kind. */
-  val protocolId: HarnessProtocolId? = null
+  /** 所属设备的开关，运行时投影为 [effectiveEnabled]。 */
+  val deviceEnabled: Boolean = true,
+  /** 协议专属配置（DSH 启动命令/工作目录、OpenCode 注册文件路径等）。 */
+  val config: HarnessConfig = HarnessConfig.defaultFor(protocol)
 ) {
-  init {
-    if (remoteServiceId != null) {
-      require(kind == ServerKind.OPENCODE && !remoteHostId.isNullOrBlank() && sshHostId == null) { "原生 Remote 服务必须绑定独立 Host carrier" }
-      require(remoteServiceId.matches(Regex("[A-Za-z0-9][A-Za-z0-9._:-]{0,255}"))) { "原生 Remote 服务标识无效" }
-    }
-    require(kind != ServerKind.OPENCODE || remoteHostId == null || remoteServiceId != null) { "Remote OpenCode 必须指定原生服务" }
-    require(protocol !in setOf(HarnessProtocolId.CODEX_APP_SERVER, HarnessProtocolId.ANTIGRAVITY_ACP, HarnessProtocolId.OPENCODE_ACP) ||
-      (sshHostId != null) != (remoteHostId != null)) { "此 Harness 必须绑定 SSH 或 Remote Host" }
-    require(protocolId == null || protocolId == MigrationProjection.protocol(kind) ||
-      protocolId in setOf(HarnessProtocolId.ANTIGRAVITY_ACP, HarnessProtocolId.OPENCODE_ACP) && kind == ServerKind.CODEX) { "Harness 协议与兼容类型不一致" }
-  }
-  val protocol: HarnessProtocolId get() = protocolId ?: MigrationProjection.protocol(kind)
-  val effectiveEnabled: Boolean get() = enabled && parentEnabled
+  val effectiveEnabled: Boolean get() = enabled && deviceEnabled
+  val sshHostId: String? get() = deviceId
+  val sshServicePath: String? get() = (config as? HarnessConfig.OpenCodeNative)?.registrationPath
+  val dshConfig: HarnessConfig.Dsh get() = (config as? HarnessConfig.Dsh) ?: HarnessConfig.Dsh()
+
+  /** 判断两次快照是否仍指向同一条 Harness 路由，防止旧页面/旧弹窗把变更落到改动后的目标上。 */
+  fun sameRoute(other: ServerProfile): Boolean =
+    id == other.id && deviceId == other.deviceId && protocol == other.protocol &&
+      url == other.url && config == other.config
 }
 
 data class Project(val id: String, val directory: String, val name: String, val sandboxes: List<String> = emptyList(),

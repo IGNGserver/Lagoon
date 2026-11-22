@@ -14,7 +14,7 @@ class SshDeviceDiscoveryTest {
 
   @Test fun allProbesShareOneConnectionAndKeepIndividualFailures() = runBlocking {
     val factory = FakeFactory("Linux", codexFailure = true)
-    val store = SshHostStore(FakeSharedPreferences(), FakeSharedPreferences(), { it }, { it })
+    val store = DeviceStore(FakeSharedPreferences(), FakeSharedPreferences(), { it }, { it })
     val manager = SshHostManager(store, factory)
     try {
       val result = manager.discoverDevice(config, SshSecrets(password = "fixture"))
@@ -32,7 +32,7 @@ class SshDeviceDiscoveryTest {
 
   @Test fun unsupportedSystemDoesNotInventMissingHarnesses() = runBlocking {
     val factory = FakeFactory("Windows_NT")
-    val store = SshHostStore(FakeSharedPreferences(), FakeSharedPreferences(), { it }, { it })
+    val store = DeviceStore(FakeSharedPreferences(), FakeSharedPreferences(), { it }, { it })
     val manager = SshHostManager(store, factory)
     try {
       val result = manager.discoverDevice(config, SshSecrets(password = "fixture"))

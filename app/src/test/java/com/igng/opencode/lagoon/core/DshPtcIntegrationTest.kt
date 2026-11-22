@@ -12,7 +12,7 @@ import kotlin.coroutines.intrinsics.suspendCoroutineUninterceptedOrReturn
 class DshPtcIntegrationTest {
   private val session = Session("ptc-session", "/repo", "PTC", 1)
   private fun client() = DshApi(ServerProfile("srv", "DSH", "http://127.0.0.1:1",
-    kind = ServerKind.DSH, allowCleartext = true), ServerCredentials("dsh", ""))
+    protocol = HarnessProtocol.DSH, allowCleartext = true), ServerCredentials("dsh", ""))
 
   private fun record(type: String, seq: Int, data: JSONObject) = JSONObject().put("type", "event")
     .put("event", JSONObject().put("type", type).put("seq", seq).put("time", 1000L + seq).put("data", data))

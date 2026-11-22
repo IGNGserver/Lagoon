@@ -55,6 +55,9 @@ internal fun HomeScreen(
   onNewSession: () -> Unit,
   onScope: () -> Unit,
   onManageDevices: () -> Unit = {},
+  onAddDevice: () -> Unit = onManageDevices,
+  onOpenDevice: (String) -> Unit = { onManageDevices() },
+  onSshAction: (deviceId: String, failure: SshFailure) -> Unit = { deviceId, _ -> onOpenDevice(deviceId) },
   onPage: (RootPage) -> Unit
 ) {
   val preferences = LocalContext.current.getSharedPreferences("ui", Context.MODE_PRIVATE)
@@ -62,13 +65,14 @@ internal fun HomeScreen(
   var menu by remember { mutableStateOf(false) }
   var contentSearchTarget by remember { mutableStateOf<SessionContentSearchTarget?>(null) }
   var searching by rememberSaveable { mutableStateOf(false) }
-  var query by rememberSaveable(state.allServers, state.serverId, state.homeGroupId) { mutableStateOf("") }
+  var query by rememberSaveable(state.allServers, state.serverId, state.homeGroupId, state.homeDeviceId) { mutableStateOf("") }
   var renaming by remember { mutableStateOf<Session?>(null) }
   var deleting by remember { mutableStateOf<DeleteSessionTarget?>(null) }
   val hasUnread = state.homeUnseenSessions().isNotEmpty()
   val serverReadCount = state.homeReadSnapshots().values.sumOf { it.serverReadCandidates().size }
-  val groupWorkspaces = remember(state.sessions, state.projects, state.homeGroupId) {
-    state.homeGroup?.let { group -> deviceWorkspaces(state.sessions, state.projects, group.id) }.orEmpty()
+  val multiScopeId = state.homeGroup?.id ?: state.homeDevice?.let { "device:${it.id}" }
+  val groupWorkspaces = remember(state.sessions, state.projects, multiScopeId) {
+    multiScopeId?.let { id -> deviceWorkspaces(state.sessions, state.projects, id) }.orEmpty()
   }
   val scopeWorkspace = state.scopeWorkspaceKey?.let { key -> groupWorkspaces.firstOrNull { it.key == key } }
   fun closeSearch() { searching = false; query = "" }
@@ -81,7 +85,7 @@ internal fun HomeScreen(
     Column(Modifier.fillMaxSize()) {
       if (searching) SearchTopBar(query, { query = it }, ::closeSearch)
       else HomeTopBar(
-        title = state.homeGroup?.name ?: "Lagoon",
+        title = state.homeGroup?.name ?: state.homeDevice?.name ?: "Lagoon",
         action = if (hasUnread) {
           { HyperTextAction("全部已读", onClick = { controller.markAllRead() }) }
         } else null,
@@ -115,27 +119,49 @@ internal fun HomeScreen(
         }
       )
       if (!searching) {
+        state.migrationNotice?.let { notice ->
+          HyperInlineNotice(
+            message = notice,
+            type = MiuixToastType.INFO,
+            action = "知道了",
+            onAction = { controller.dismissMigrationNotice() },
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 4.dp)
+          )
+        }
         val scopeProfiles = when {
           state.allServers -> state.enabledProfiles
-          state.homeGroup != null -> state.enabledProfiles.filter { it.id in state.homeGroup!!.memberIds }
+          state.homeGroup != null -> state.homeGroup!!.memberProfiles(state.enabledProfiles)
+          state.homeDevice != null -> state.homeDeviceProfiles
           else -> listOfNotNull(state.server).filter { it.effectiveEnabled }
         }
         val online = scopeProfiles.count { profile ->
           if (!state.multiServerView && profile.id == state.serverId) state.connected
           else state.allServerSnapshots[profile.id]?.connected == true
         }
+        val deviceCount = when {
+          state.homeDevice != null -> 1
+          state.homeGroup != null -> state.homeGroup!!.deviceIds.count { id -> state.devices.any { it.id == id } }
+          state.allServers -> state.devices.size
+          else -> scopeProfiles.mapNotNull { it.deviceId }.distinct().size
+        }
         HyperCard(
           Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 6.dp),
           insidePadding = PaddingValues(vertical = 4.dp)
         ) {
           HyperRow(
-            title = scopeWorkspace?.name ?: if (state.allServers || state.homeGroup != null) "全部项目" else state.server?.name ?: "选择设备",
+            title = scopeWorkspace?.name ?: if (state.allServers || state.homeGroup != null || state.homeDevice != null) "全部项目"
+            else state.server?.name ?: "选择设备",
             summary = buildString {
               if (scopeWorkspace != null) append("当前项目 · ")
-              // 设备数按 HostBinding 计：同一台机器上的多个 Harness 不再各算一台设备。
-              val deviceCount = scopeProfiles.mapNotNull { controller.deviceOfLeaf(it.id) }.distinct().size
-              append("${deviceCount.takeIf { it > 0 } ?: scopeProfiles.size} 台设备")
-              if (scopeProfiles.isNotEmpty()) append(" · $online 台在线")
+              if (state.multiServerView) {
+                append("$deviceCount 台设备")
+                if (scopeProfiles.isNotEmpty()) append(" · $online/${scopeProfiles.size} 个 Harness 在线")
+                else append(" · 尚未启用 Harness")
+              } else {
+                val devName = state.server?.deviceName?.takeIf { it.isNotBlank() && it != state.server?.name }
+                if (devName != null) append("$devName · ")
+                append(if (online > 0) "在线" else "未连接")
+              }
             },
             trailing = { DropdownChevron(18.dp, description = "切换设备与项目") },
             onClick = onScope
@@ -143,11 +169,17 @@ internal fun HomeScreen(
         }
         GlobalTaskStrip(state, controller, onOpen = onOpen)
       }
-      // 连接、恢复、缓存、待同步四条来源只保留一条，避免同屏互相矛盾。
-      HomeStatusStrip(state, controller, onManageDevices = onManageDevices)
+      // 连接、SSH 故障、缓存、待同步四条来源只保留一条，避免同屏互相矛盾。
+      HomeStatusStrip(
+        state = state,
+        controller = controller,
+        onManageDevices = onManageDevices,
+        onOpenDevice = onOpenDevice,
+        onSshAction = onSshAction
+      )
       Box(Modifier.weight(1f).fillMaxWidth()) {
         SessionList(
-          state, controller, grouping, query.trim(), onOpen, onNewSession, onManageDevices,
+          state, controller, grouping, query.trim(), onOpen, onNewSession, onManageDevices, onAddDevice,
           onRename = { renaming = it }, onDelete = { session ->
             deleting = state.server?.let { DeleteSessionTarget(it, session.id, session.displayTitle()) }
           }
@@ -234,7 +266,7 @@ private fun GlobalTaskStrip(
   controller: LagoonController,
   onOpen: (SessionTarget) -> Unit = {}
 ) {
-  val summary = if (state.homeGroup != null) state.summary else state.globalSummary
+  val summary = if (state.homeGroup != null || state.homeDevice != null) state.summary else state.globalSummary
   val silent = state.silentServersWithTasks()
   if (summary.isEmpty && silent.isEmpty()) return
   val target = state.summaryTarget
@@ -302,6 +334,7 @@ private fun SessionList(
   onOpen: (SessionTarget) -> Unit,
   onNewSession: () -> Unit,
   onManageDevices: () -> Unit,
+  onAddDevice: () -> Unit,
   onRename: (Session) -> Unit,
   onDelete: (Session) -> Unit
 ) {
@@ -319,11 +352,11 @@ private fun SessionList(
   val workspaceLabels = remember(state.sessions, state.projects, state.workspaceCatalog, state.allServerSnapshots, state.serverId) {
     sessionWorkspaceLabels(state.sessions, state.projects) { session -> state.workspaceCatalogFor(session) }
   }
-  val roots = remember(state.sessions, state.projects, state.scopeProjectId, state.scopeWorkspaceKey, state.homeGroupId, query, workspaceLabels) {
+  val multiScopeId = state.homeGroup?.id ?: state.homeDevice?.let { "device:${it.id}" }
+  val roots = remember(state.sessions, state.projects, state.scopeProjectId, state.scopeWorkspaceKey, multiScopeId, query, workspaceLabels) {
     val workspaceScope = state.scopeWorkspaceKey
-    val groupId = state.homeGroupId
     HomeScope.roots(state.sessions, state.projects, state.scopeProjectId)
-      .filter { session -> state.allServers || workspaceScope == null || groupId == null || deviceWorkspaceKey(session, state.projects, groupId) == workspaceScope }
+      .filter { session -> state.allServers || workspaceScope == null || multiScopeId == null || deviceWorkspaceKey(session, state.projects, multiScopeId) == workspaceScope }
       .filter { session ->
         query.isBlank() || session.displayTitle().contains(query, true) ||
           resolveSessionProject(session, state.projects)?.name?.contains(query, true) == true ||
@@ -331,11 +364,10 @@ private fun SessionList(
           workspaceLabels[session.key]?.name?.contains(query, true) == true
       }
   }
-  val sections = remember(grouping, roots, state.projects, statuses, state.pinned, state.homeGroup?.id, now) {
-    val group = state.homeGroup
-    if (group != null && grouping == HomeGrouping.PROJECT) {
+  val sections = remember(grouping, roots, state.projects, statuses, state.pinned, multiScopeId, now) {
+    if (multiScopeId != null && grouping == HomeGrouping.PROJECT) {
       val visible = roots.mapTo(HashSet()) { it.key }
-      deviceWorkspaces(roots, state.projects, group.id).mapNotNull { workspace ->
+      deviceWorkspaces(roots, state.projects, multiScopeId).mapNotNull { workspace ->
         val sessions = workspace.sessions.filter { it.key in visible }
         if (sessions.isEmpty()) null
         else HomeSection("workspace:${workspace.key.replace('\u0000', ':')}", workspace.name, sessions)
@@ -460,13 +492,14 @@ private fun SessionList(
           insidePadding = PaddingValues(horizontal = 24.dp, vertical = 36.dp)
         ) {
           Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            val allDisabled = state.enabledProfiles.isEmpty() && state.profiles.isNotEmpty()
+            val noDevices = state.devices.isEmpty()
+            val noEnabledHarness = !noDevices && state.enabledProfiles.isEmpty()
             Text(
               when {
                 state.loading -> "正在读取会话…"
                 query.isNotBlank() -> "没有符合条件的会话"
-                allDisabled -> "所有连接已禁用"
-                state.profiles.isEmpty() -> "还没有添加设备"
+                noDevices -> "还没有添加 SSH 设备"
+                noEnabledHarness -> "还没有启用的 Harness"
                 state.connected -> "暂无会话"
                 else -> "尚未连接"
               },
@@ -483,7 +516,8 @@ private fun SessionList(
             if (!state.loading && query.isBlank()) {
               val action = when {
                 state.connected -> "新建会话"
-                allDisabled || state.profiles.isEmpty() -> "管理设备"
+                noDevices -> "添加 SSH 设备"
+                noEnabledHarness -> "前往设备页"
                 else -> "重新连接"
               }
               HyperButton(
@@ -491,7 +525,8 @@ private fun SessionList(
                 onClick = {
                   when {
                     state.connected -> onNewSession()
-                    allDisabled || state.profiles.isEmpty() -> onManageDevices()
+                    noDevices -> onAddDevice()
+                    noEnabledHarness -> onManageDevices()
                     else -> controller.retryNow()
                   }
                 }
