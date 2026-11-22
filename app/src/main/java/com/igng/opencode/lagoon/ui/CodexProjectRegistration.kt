@@ -10,45 +10,24 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import com.igng.opencode.lagoon.core.HarnessProtocol
 import com.igng.opencode.lagoon.core.LagoonController
 import com.igng.opencode.lagoon.core.LagoonState
-import com.igng.opencode.lagoon.core.ServerKind
-import com.igng.opencode.lagoon.core.HarnessProtocolId
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.basic.TextField
 import top.yukonga.miuix.kmp.extra.SuperDialog
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 
-/** A Remote Codex Host requires an explicit project root before it can authorize new threads. */
-@Composable
-internal fun CodexProjectRegistrationRow(state: LagoonState, controller: LagoonController) {
-  val server = state.server ?: return
-  if (!state.connected || server.protocol != HarnessProtocolId.CODEX_APP_SERVER || server.remoteHostId == null) return
-  var visible by remember(server.id) { mutableStateOf(false) }
-  var path by remember(server.id) { mutableStateOf("") }
-  ChoiceRow("登记 Codex 项目目录…", "在 Host 上登记已有目录", false) { visible = true }
-  if (visible) SuperDialog(title = "登记 Codex 项目", show = true, onDismissRequest = { visible = false }) {
-    Column(Modifier.fillMaxWidth().padding(top = 8.dp)) {
-      Text("填写 Host 上已存在的绝对目录。登记后该目录会成为 Codex 可访问的项目范围，不会创建目录。",
-        style = MiuixTheme.textStyles.footnote2)
-      TextField(value = path, onValueChange = { path = it }, label = "Host 绝对目录", modifier = Modifier.fillMaxWidth())
-      DialogActions("取消", { visible = false }, "登记", enabled = path.isNotBlank()) {
-        controller.createCodexProject(path.trim(), server)
-        visible = false
-      }
-    }
-  }
-}
-
-/** AGY can create a session in an existing Host directory without inventing a server project. */
+/** ACP harnesses (Antigravity / OpenCode ACP) can open a session in any existing remote directory. */
 @Composable
 internal fun AgyProjectRegistrationRow(state: LagoonState, controller: LagoonController) {
   val server = state.server ?: return
-  if (!state.connected || server.protocol !in setOf(HarnessProtocolId.ANTIGRAVITY_ACP, HarnessProtocolId.OPENCODE_ACP)) return
+  if (!state.connected || !server.protocol.isAcp) return
+  val title = if (server.protocol == HarnessProtocol.OPENCODE_ACP) "添加 OpenCode ACP 工作目录" else "添加 Antigravity 工作目录"
   var visible by remember(server.id) { mutableStateOf(false) }
   var path by remember(server.id) { mutableStateOf("") }
-  ChoiceRow("添加 Antigravity 工作目录…", "选择开发机上已存在的目录", false) { visible = true }
-  if (visible) SuperDialog(title = "添加 Antigravity 工作目录", show = true, onDismissRequest = { visible = false }) {
+  ChoiceRow("$title…", "选择开发机上已存在的目录", false) { visible = true }
+  if (visible) SuperDialog(title = title, show = true, onDismissRequest = { visible = false }) {
     Column(Modifier.fillMaxWidth().padding(top = 8.dp)) {
       Text("填写开发机上的绝对目录。Lagoon 会验证目录存在，并将它保存到本机。", style = MiuixTheme.textStyles.footnote2)
       TextField(value = path, onValueChange = { path = it }, label = "开发机绝对目录", modifier = Modifier.fillMaxWidth())

@@ -157,8 +157,8 @@ internal fun SshKeychainManagerSheet(
               profile.passphrasePolicy == SshPassphrasePolicy.BIOMETRIC ||
               (profile.passphrasePolicy == SshPassphrasePolicy.PROMPT && profile.encrypted)
             val isSelected = profile.id == selectedKeyId
-            val boundHosts = remember(profile.id, state.sshHosts) {
-              controller.hostsUsingSshKey(profile.id).size
+            val boundHosts = remember(profile.id, state.devices) {
+              controller.devicesUsingSshKey(profile.id).size
             }
             HyperCard(Modifier.fillMaxWidth(), insidePadding = PaddingValues(14.dp)) {
               Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -296,7 +296,7 @@ internal fun SshKeychainManagerSheet(
   }
 
   deleteTarget?.let { target ->
-    val affected = controller.hostsUsingSshKey(target.id)
+    val affected = controller.devicesUsingSshKey(target.id)
     SuperDialog(
       title = "删除密钥「${target.name}」？",
       show = true,
@@ -554,6 +554,7 @@ internal fun SshKeyImportDialog(
         label = "私钥全文（支持 OpenSSH / PEM / PKCS#8 / PuTTY .ppk）",
         singleLine = false,
         visualTransformation = if (keyVisible) VisualTransformation.None else PasswordVisualTransformation(),
+        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
         modifier = Modifier.fillMaxWidth()
       )
       Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -862,7 +863,7 @@ internal fun DeploySshPublicKeyDialog(
       val installSecrets = if (loginPassword.isNotEmpty()) {
         SshSecrets(password = loginPassword)
       } else {
-        controller.sshHostSecrets(pinnedConfig.id)
+        controller.deviceSecrets(pinnedConfig.id)
       }
       controller.deploySshPublicKey(installConfig, installSecrets, publicKeyOpenSsh)
       onSuccess()

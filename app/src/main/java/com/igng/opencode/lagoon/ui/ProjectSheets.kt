@@ -57,7 +57,7 @@ internal fun HomeScopeSheet(
   HyperBottomSheet(title = "选择范围", show = true, onDismissRequest = onDismiss) {
     LazyColumn(Modifier.fillMaxWidth().heightIn(max = 680.dp), contentPadding = PaddingValues(bottom = 16.dp)) {
       if (!state.allServers) {
-        if (state.homeGroup != null) workspaceScopeItems(state, controller, onDismiss)
+        if (state.homeGroup != null || state.homeDevice != null) workspaceScopeItems(state, controller, onDismiss)
         else projectScopeItems(
           state = state,
           controller = controller,
@@ -69,10 +69,14 @@ internal fun HomeScopeSheet(
           onManageOpenCodeProjects = { state.server?.let { managingOpenCode = OpenCodeManagementTarget(it) } }
         )
       }
-      item { HyperGroupTitle(if (state.allServers) "设备" else "切换设备") }
+      item { HyperGroupTitle(if (state.allServers) "设备" else "切换范围") }
       item {
         HyperCard(Modifier.fillMaxWidth().padding(horizontal = 8.dp), insidePadding = PaddingValues(vertical = 2.dp)) {
-          ChoiceRow("全部设备", "${state.enabledProfiles.size} 个连接 · $online 在线", state.allServers) {
+          ChoiceRow(
+            "全部设备",
+            "${state.devices.size} 台设备 · ${state.enabledProfiles.size} 个 Harness · $online 在线",
+            state.allServers
+          ) {
             controller.setAllServers(true)
             onDismiss()
           }
@@ -91,17 +95,40 @@ internal fun HomeScopeSheet(
           )
         }
       }
-      item { HyperGroupTitle("单台连接") }
+      val activeDevices = state.devices.filter { device ->
+        device.enabled && state.enabledProfiles.any { it.deviceId == device.id }
+      }
+      if (activeDevices.isNotEmpty()) {
+        item { HyperGroupTitle("按 SSH 设备") }
+        items(activeDevices, key = { "device:${it.id}" }) { device ->
+          val deviceProfiles = state.enabledProfiles.filter { it.deviceId == device.id }
+          val deviceOnline = deviceProfiles.count { profile ->
+            if (!state.multiServerView && profile.id == state.serverId) state.connected
+            else allSnapshots[profile.id]?.connected == true
+          }
+          HyperCard(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 3.dp), insidePadding = PaddingValues(vertical = 2.dp)) {
+            ChoiceRow(
+              device.name,
+              "${device.address} · ${deviceProfiles.size} 个 Harness · $deviceOnline 在线",
+              state.homeDeviceId == device.id
+            ) {
+              if (state.homeDeviceId != device.id) controller.selectHomeDevice(device.id)
+              onDismiss()
+            }
+          }
+        }
+      }
+      item { HyperGroupTitle("单个 Harness") }
       if (state.enabledProfiles.isEmpty()) item {
         Text(
-          "没有启用的连接。请先在设备管理中启用一个连接。",
+          "没有启用的 Harness。请先在设备管理中添加设备并启用至少一个 Harness。",
           Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
           style = MiuixTheme.textStyles.footnote1.copy(color = HyperTheme.colors.textSecondary)
         )
       } else items(state.enabledProfiles, key = { "profile:${it.id}" }) { profile ->
         ProfileScopeRow(
           profile, state, allSnapshots,
-          selected = !state.allServers && state.homeGroupId == null && state.serverId == profile.id
+          selected = !state.allServers && state.homeGroupId == null && state.homeDeviceId == null && state.serverId == profile.id
         ) {
           if (state.multiServerView || profile.id != state.serverId) controller.connect(profile.id)
           onDismiss()
@@ -234,7 +261,6 @@ private fun androidx.compose.foundation.lazy.LazyListScope.projectScopeItems(
     Spacer(Modifier.height(10.dp))
     HyperCard(Modifier.fillMaxWidth().padding(horizontal = 8.dp), insidePadding = PaddingValues(vertical = 2.dp)) {
       ChoiceRow("添加服务器目录…", "浏览服务器目录并添加为项目", false) { controller.openDirectoryBrowser() }
-      CodexProjectRegistrationRow(state, controller)
       AgyProjectRegistrationRow(state, controller)
       if (state.canManageServerWorkspaces()) {
         HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = HyperTheme.colors.divider)
@@ -248,14 +274,14 @@ private fun androidx.compose.foundation.lazy.LazyListScope.projectScopeItems(
   }
 }
 
-/** Workspace filter of a device group: same-named projects from its harnesses are one entry. */
+/** Workspace filter of a device group or single SSH device: same-named projects merge into one entry. */
 private fun androidx.compose.foundation.lazy.LazyListScope.workspaceScopeItems(
   state: LagoonState,
   controller: LagoonController,
   onDismiss: () -> Unit
 ) {
-  val group = state.homeGroup ?: return
-  val workspaces = deviceWorkspaces(state.sessions, state.projects, group.id)
+  val scopeId = state.homeGroup?.id ?: state.homeDevice?.let { "device:${it.id}" } ?: return
+  val workspaces = deviceWorkspaces(state.sessions, state.projects, scopeId)
   item(key = "workspace-all") {
     HyperCard(Modifier.fillMaxWidth().padding(horizontal = 8.dp), insidePadding = PaddingValues(vertical = 2.dp)) {
       ChoiceRow("全部会话", "${state.sessions.count { it.visibleOnHome }} 个会话", state.scopeWorkspaceKey == null) {

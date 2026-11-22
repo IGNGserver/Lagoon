@@ -108,7 +108,16 @@ private fun sameChatChrome(a: LagoonState, b: LagoonState): Boolean {
 }
 
 @Composable
-fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> Unit, onOpenChild: (String) -> Unit, onModal: (Boolean) -> Unit, interactive: Boolean = true) {
+fun ChatScreen(
+  state: LagoonState,
+  controller: LagoonController,
+  onBack: () -> Unit,
+  onOpenChild: (String) -> Unit,
+  onModal: (Boolean) -> Unit,
+  interactive: Boolean = true,
+  onOpenDevice: (String) -> Unit = {},
+  onSshAction: (deviceId: String, failure: SshFailure) -> Unit = { deviceId, _ -> onOpenDevice(deviceId) }
+) {
   val chromeState = rememberChatChromeState(state)
   val session = chromeState.session
   var sheet by remember { mutableStateOf<ChatSheet?>(null) }
@@ -155,7 +164,7 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
     Column(Modifier.fillMaxSize().padding(24.dp), verticalArrangement = Arrangement.Center) { Text("会话尚未加载或已关闭"); HyperButton(text = "返回列表", onClick = onBack) }
     return
   }
-  // 原生操作按服务声明的能力显示，与 Direct/SSH/Remote carrier 无关。
+  // 原生操作按服务声明的能力显示。
   // 消息回退在具体人类消息处确认，恢复入口只在存在暂存边界时显示；DSH 不冒充支持回退。
   val menuSections = listOf(
     MenuSection(buildList {
@@ -163,7 +172,7 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
       if (state.capabilities.diff) add(MenuAction("改动（${state.changes.size}）", MiuixIcons.Merge) { sheet = ChatSheet.CHANGES })
       if (state.capabilities.fileBrowser) add(MenuAction("文件", MiuixIcons.Folder) { sheet = ChatSheet.FILES; controller.listFiles() })
       if (state.capabilities.terminal) add(MenuAction("文本终端", MiuixIcons.Info) { sheet = ChatSheet.TERMINAL })
-      if (state.server?.kind == ServerKind.DSH || state.server?.kind == ServerKind.DSH_REMOTE) {
+      if (state.server?.protocol == HarnessProtocol.DSH) {
         add(MenuAction("定时任务", MiuixIcons.Info) { sheet = ChatSheet.SCHEDULES; controller.loadSchedules() })
         // DSH 允许用新目标替换已完成的目标；进行中/暂停中必须先继续或清除。
         if (state.goal == null || state.goal.complete) {
@@ -202,7 +211,7 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
             MenuPopup(menu, { menu = false }, menuSections)
           }
         }
-        ConnectionStrip(chromeState, controller)
+        ConnectionStrip(chromeState, controller, onOpenDevice = onOpenDevice, onSshAction = onSshAction)
         val transcriptStatus = chromeState.resource("messages")
         if (transcriptStatus.state == ResourceState.STALE || transcriptStatus.state == ResourceState.ERROR) {
           Text(
@@ -225,12 +234,12 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
             }, onForkMessage = { id -> state.forkTarget(id)?.let { forkTarget = it } })
         }
         if (session.parentId != null) ChildSessionBar(chromeState, session, onBack,
-          onContinue = if ((chromeState.server?.kind == ServerKind.DSH || chromeState.server?.kind == ServerKind.DSH_REMOTE) &&
+          onContinue = if (chromeState.server?.protocol == HarnessProtocol.DSH &&
             session.subagentMode == "continuable") {
             { childContinue = true }
           } else null)
         else {
-          val goalSupported = chromeState.server?.kind == ServerKind.DSH || chromeState.server?.kind == ServerKind.DSH_REMOTE
+          val goalSupported = chromeState.server?.protocol == HarnessProtocol.DSH
           LaunchedEffect(chromeState.sessionId, chromeState.connected, goalSupported) {
             if (chromeState.connected && goalSupported) controller.loadGoal()
           }
@@ -274,7 +283,7 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
       Column(Modifier.fillMaxWidth().fillMaxHeight(0.72f).padding(vertical = 8.dp)) {
         when (which) {
           ChatSheet.CHANGES -> {
-            if (state.server?.kind in setOf(ServerKind.DSH, ServerKind.DSH_REMOTE))
+            if (state.server?.protocol == HarnessProtocol.DSH)
               Text("当前历史窗口中最近 8 条改动记录；最多合并 60 个文件。过期或超限会明确报错，不代表无改动。", style = MiuixTheme.textStyles.footnote2)
             ResourceHint(state.resource("changes"), "暂无记录", retry = { controller.loadAncillary() })
             // Server lists may repeat an entry; LazyColumn crashes on a duplicate key, so keys never come from data alone.
@@ -336,7 +345,7 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
     val pending = state.pending("goal")
     val cap = parseGoalRoundCap(goalCapText)
     val sameTarget = goalCreateSession == state.sessionId && goalCreateProfile?.let { captured ->
-      state.server?.let { current -> captured.id == current.id && ConnectionRouteAdmission.sameLeafRoute(captured, current) }
+      state.server?.let { current -> captured.sameRoute(current) }
     } == true
     SuperDialog(title = "设定长期目标", show = true, onDismissRequest = { if (!pending) goalDialog = false }) {
       Column(Modifier.heightIn(max = 520.dp).verticalScroll(rememberScrollState()).padding(top = 8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -365,14 +374,15 @@ fun ChatScreen(state: LagoonState, controller: LagoonController, onBack: () -> U
     val pending = state.pending("fork")
     val sameTarget = captured.matches(state)
     val uncertain = state.uncertainForks.any { it.sameSource(state) }
-    val sourceHost = captured.profile.remoteHostId ?: android.net.Uri.parse(captured.profile.url).host ?: captured.profile.id
+    val sourceHost = captured.profile.deviceName?.takeIf(String::isNotBlank)
+      ?: captured.profile.url.removePrefix("ssh://").ifBlank { captured.profile.id }
     val boundaryText = when (val boundary = captured.boundary) {
       is ForkBoundary.DshEvent -> "复制截至此原生事件（序号 ${boundary.sequence}）的历史，包含这条用户输入；后续回复不包含。截点由 Host 写入必要的结束记录。新会话不会自动发送任务。"
       is ForkBoundary.OpenCodeBefore -> "复制此消息之前的投影历史，不包含本条消息和后续内容。不会回退或删除原会话。"
-      null -> when (captured.profile.kind) {
-        ServerKind.DSH, ServerKind.DSH_REMOTE -> "复制最新已完成轮次前缀。"
-        ServerKind.OPENCODE -> "复制当前完整历史。"
-        ServerKind.CODEX -> "复制当前会话历史。"
+      null -> when (captured.profile.protocol) {
+        HarnessProtocol.DSH -> "复制最新已完成轮次前缀。"
+        HarnessProtocol.OPENCODE_NATIVE, HarnessProtocol.OPENCODE_ACP -> "复制当前完整历史。"
+        HarnessProtocol.CODEX, HarnessProtocol.ANTIGRAVITY_ACP -> "复制当前会话历史。"
       }
     }
     SuperDialog(title = "确认分叉？", show = true, onDismissRequest = { if (!pending) forkTarget = null }) {

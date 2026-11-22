@@ -12,7 +12,6 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -23,7 +22,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import com.igng.opencode.lagoon.core.ConnectionGraph
 import com.igng.opencode.lagoon.core.DeviceView
 import com.igng.opencode.lagoon.core.LagoonController
 import com.igng.opencode.lagoon.core.LagoonState
@@ -33,8 +31,8 @@ import top.yukonga.miuix.kmp.basic.TextField
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 
 /**
- * 创建或编辑一个设备组。**成员按设备选**：一台设备加进来，它上面的 Harness 就都属于这个组，
- * 之后新加的 Harness 也会自动加入。分组只影响本机展示与首页范围，不上传、不改认证或路由。
+ * 创建或编辑一个设备组。**成员按 SSH 设备选**：一台设备加进来，它上面的全部 Harness 就都属于这个组，
+ * 之后新加或移除 Harness 时分组自动生效，且删掉最后一条 Harness 也不会销毁设备组。
  */
 @Composable
 internal fun DeviceGroupsSheet(
@@ -45,19 +43,12 @@ internal fun DeviceGroupsSheet(
 ) {
   val editingId = initialGroupId?.takeIf { it.isNotBlank() }.orEmpty()
   val editing = state.deviceGroups.firstOrNull { it.id == editingId }
-  val graph by controller.connectionGraph.collectAsState()
-  val devices = remember(graph, state.profiles, state.sshHosts, state.discoveryRevision) {
-    controller.deviceViews(graph, state.profiles, savedSshHosts = state.sshHosts)
+  val devices = remember(state.devices, state.discoveryRevision, state.harnessLinkStatuses) {
+    controller.deviceViews(state.devices, linkStatuses = state.harnessLinkStatuses)
   }
   var name by rememberSaveable(initialGroupId) { mutableStateOf(editing?.name.orEmpty()) }
-  // 旧分组只有 leaf id：用"成员里有这台设备的任一 Harness"回填勾选，保存后升级为按设备。
-  var selected by remember(initialGroupId, devices) {
-    mutableStateOf(
-      editing?.deviceIds?.takeIf { it.isNotEmpty() }?.toSet()
-        ?: editing?.memberIds?.let { members ->
-          devices.filter { device -> device.harnesses.any { it.leafId?.value in members } }.map { it.id.value }.toSet()
-        }.orEmpty()
-    )
+  var selected by remember(initialGroupId, editing?.deviceIds) {
+    mutableStateOf(editing?.deviceIds.orEmpty().toSet())
   }
   var confirmingDelete by remember { mutableStateOf(false) }
 
@@ -73,14 +64,14 @@ internal fun DeviceGroupsSheet(
     ) {
       item {
         Text(
-          "把需要一起使用的设备放进一个组。首页范围面板会列出这些分组；分组只影响本机展示，已停用的设备仍留在组里，重新启用后自动恢复。",
+          "把需要一起使用的 SSH 设备放进一个组。首页范围面板会列出这些分组；分组只影响本机展示，已停用的设备仍留在组里，重新启用后自动恢复。",
           style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary)
         )
       }
       item { TextField(value = name, onValueChange = { name = it }, label = "分组名称", modifier = Modifier.fillMaxWidth()) }
-      item { HyperGroupTitle("设备") }
+      item { HyperGroupTitle("SSH 设备") }
       if (devices.isEmpty()) item {
-        Text("还没有设备。先添加一台设备，再把它放进分组。",
+        Text("还没有 SSH 设备。先添加一台设备，再把它放进分组。",
           style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary))
       }
       items(devices, key = { "device:${it.id.value}" }) { device ->
@@ -145,7 +136,7 @@ private fun DeviceMemberRow(device: DeviceView, checked: Boolean, onToggle: () -
         Text(device.name, maxLines = 1, overflow = TextOverflow.Ellipsis,
           style = MiuixTheme.textStyles.body1.copy(fontWeight = FontWeight.Medium))
         Text(
-          "${device.access.label} · ${device.attachedCount} 个 Harness" + if (device.effectiveEnabled) "" else " · 已停用",
+          "${device.endpoint} · ${device.attachedCount} 个 Harness" + if (device.effectiveEnabled) "" else " · 已停用",
           maxLines = 1,
           overflow = TextOverflow.Ellipsis,
           style = MiuixTheme.textStyles.footnote2.copy(color = HyperTheme.colors.textSecondary)

@@ -56,17 +56,42 @@ internal fun DraftDestinationSheet(
   }
   val registered = workspaces.filter { it.registered }
   val serverOnly = workspaces.filterNot { it.registered }
+  val groupedServers = remember(servers) {
+    val byDevice = LinkedHashMap<String, MutableList<DraftServer>>()
+    servers.forEach { item ->
+      val key = item.profile.deviceId ?: item.profile.id
+      byDevice.getOrPut(key) { mutableListOf() } += item
+    }
+    byDevice.values.toList()
+  }
   val muted = HyperTheme.colors.textSecondary
   HyperBottomSheet(title = "服务器与工作区", show = true, onDismissRequest = onDismiss) {
     LazyColumn(Modifier.fillMaxWidth().heightIn(max = 680.dp), contentPadding = PaddingValues(bottom = 16.dp)) {
-      item { HyperGroupTitle("服务器") }
-      items(servers, key = { "server:${it.id}" }) { server ->
-        HyperCard(
-          Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 3.dp),
-          insidePadding = PaddingValues(0.dp),
-          borderColor = if (server.id == currentId) HyperTheme.colors.primary.copy(alpha = 0.45f) else HyperTheme.colors.cardBorder
-        ) {
-          DraftServerRow(server, current = server.id == currentId) { onSwitchServer(server.profile) }
+      if (groupedServers.size <= 1) {
+        item { HyperGroupTitle(groupedServers.firstOrNull()?.firstOrNull()?.profile?.deviceName ?: "Harness") }
+        items(servers, key = { "server:${it.id}" }) { server ->
+          HyperCard(
+            Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 3.dp),
+            insidePadding = PaddingValues(0.dp),
+            borderColor = if (server.id == currentId) HyperTheme.colors.primary.copy(alpha = 0.45f) else HyperTheme.colors.cardBorder
+          ) {
+            DraftServerRow(server, current = server.id == currentId) { onSwitchServer(server.profile) }
+          }
+        }
+      } else {
+        groupedServers.forEach { deviceServers ->
+          val deviceTitle = deviceServers.first().profile.deviceName?.takeIf(String::isNotBlank) ?: "SSH 设备"
+          val groupKey = deviceServers.first().profile.deviceId ?: deviceTitle
+          item(key = "device-group:$groupKey") { HyperGroupTitle(deviceTitle) }
+          items(deviceServers, key = { "server:${it.id}" }) { server ->
+            HyperCard(
+              Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 3.dp),
+              insidePadding = PaddingValues(0.dp),
+              borderColor = if (server.id == currentId) HyperTheme.colors.primary.copy(alpha = 0.45f) else HyperTheme.colors.cardBorder
+            ) {
+              DraftServerRow(server, current = server.id == currentId) { onSwitchServer(server.profile) }
+            }
+          }
         }
       }
       item {
@@ -100,7 +125,6 @@ internal fun DraftDestinationSheet(
             insidePadding = PaddingValues(0.dp)
           ) {
             ChoiceRow("浏览服务器目录…", "添加为本机工作区", false) { controller.openDirectoryBrowser() }
-            CodexProjectRegistrationRow(state, controller)
             AgyProjectRegistrationRow(state, controller)
           }
         }
