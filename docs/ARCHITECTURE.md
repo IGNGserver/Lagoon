@@ -1,36 +1,21 @@
 # 实现结构与验收
 
-- `core/OpenCodeApi.kt`: OpenCode 2.x（`anomalyco/opencode` `packages/protocol`）REST、Basic Auth、`location[directory]` 位置上下文、`/api/event` 全局 SSE。各 2.0.x 版本间变化的路由由 `core/ApiCapabilities.kt` 从实例 `/openapi.json` 解析。所有请求绑定固定 origin，禁止跨源重定向转发凭据；SSE 溢出会转成流错误以触发重连对账。会话归档走 `PATCH /api/session/{id}` 的顶层 `archived` 布尔（2.1.0 起才有，`false` 即取消归档，不传 `time`）；排队消息的插话/撤回走 `PATCH|DELETE /api/session/{id}/inbox/{inboxID}`，编辑折算为「撤回 + 用原附件重新入队」；`Session.location.directory` 本身就是工作目录，`subpath` 只是它相对项目根的标签，绝不能再拼进路径。本 App 依赖的这几处形状由 `app/src/test/resources/opencode-2.2.6-contract.json`（上游 v2.2.6 原样摘录）做回归固定。
-- `core/HarnessClient.kt`: harness 抽象层。`ServerKind`（`opencode` / `dsh` / `dsh-remote`）随服务器资料持久化；`dsh` 带 `sshHostId` 时由 App 注入的 SSH factory 创建 `SshDshClient`，否则走直连 `DshApi`；控制器、总览与通知层只依赖 `HarnessClient` 接口，不感知具体协议。
-- `core/SshHostStore.kt` + `core/ssh/*`: SSH 主机配置/密钥、JSch 传输、远端 `dsh web` bootstrap、稳定本地转发、Host Key TOFU 和断线/进程重启恢复，详见 `docs/SSH_HOSTS.md`。设备管理与分组 v2 见 `docs/DEVICE_MANAGEMENT.md`。
-- `core/DshApi.kt`: DeepSeek Harness 适配（`dsh web` 的 Typert RPC Gateway，完整契约见 `docs/dsh-protocol.md`）。启动令牌先走浏览器式根路径交换（长寿命 Cookie，跨进程重启有效，换到后加密落盘复用并滑动续期），根路径不交付 Cookie 时才退回 `GET /connect?token=…&interactions=answer` 的 API Peer；签名密钥模式在本机签发 Cookie（`core/DshAuth.kt`）；一元调用 `POST /api/<namespace>/<method>`（payload 只含一个 `args` 对象，字段是方法形参名），流式数据走 `/api/remote.mux`（`open`/`item`/`end` 帧）：`session/follow` 给出快照、增量事件与实时 assistant 流，`workspace/follow` 维护项目清单与归档集合，`$events` 给出会话增删、运行状态与审批/问答 waterfall（回应走 `$events/result`，其他客户端结算的 `cancel` 帧撤回本地待办）。文件浏览走 `workspaceFiles`，改动列表走 `workspace/changes` 摘要与认证栅栏内的 `/api/changes.summary|diff` 路由，后台作业走 `job/list`，手动压缩走 `/compact` 命令。会话事件按 `turn/step/tool` 翻译成控制器认识的事件契约；DSH 没有删除会话与消息级回退，分别折算为归档与「分叉」提示。
-- `core/HttpOrigin.kt`: scheme+host+port 的凭据目标标识与回环明文白名单。
-- `core/LagoonController.kt`: 所有页面共享的服务端状态、任务归一化和操作入口；异步写操作通过不可变 `OperationContext`（serverId + generation + client + selection revision + snapshot）绑定起点，切换后不再回写。
-- `core/Models.kt`: 数据模型、`Session.Message.Info` 解析（user / assistant / shell / 通知类记录 / 隐藏记录）与 `TaskReducer` 任务阶段归约。
-- `core/TranscriptProjection.kt`: 打开的会话的实时事件投影，对应官方 `packages/client/src/solid/data.ts` 的事件归约（`session.step.*`、`session.text.*`、`session.tool.*`、inbox、revert、compaction 等）。
-- `core/TranscriptRows.kt`: 时间线行投影，对应官方 `packages/session-ui/src/timeline/projection.ts`（轮次分组、shell 独立成轮、通知行、中断分隔、只显示最后一条错误、撤销边界隐藏）。
-- `core/TaskSummary.kt`: 全服务器范围的任务计数（运行中 / 未读已完成 / 待回复 / 失败）与统一显示文案，供系统实时更新通知与 App 内任务状态共用。`core/SessionActivity.kt` 把“根会话自己的执行”和“后台 shell / 子会话活动”分开：子会话运行不会计入 `running`，只产生列表低调标记与会话内面板；子会话等待权限/回答仍汇总为根会话的待处理。
-- `core/ShellOutput.kt` + `core/HarnessClient.kt`: 后台 shell 的状态与输出读取（OpenCode `GET /api/shell/{id}` / `{id}/output`），按绝对字节游标只保留最近 64KB；不支持该路由的 harness 返回空并由 UI 隐藏入口。
-- `core/ServerStore.kt`: 服务器资料与 Keystore AES-GCM 凭据。
-- `core/OfflineCache.kt`: 加密离线缓存（会话列表，以及 DSH 的消息快照）。
-- `core/TranscriptStore.kt` / `core/TranscriptSync.kt`: OpenCode 会话缓存。SQLite 保存服务器原始 JSON（只存已结束的消息、连续一段），打开会话先显示本机内容，再只读最新一页并与缓存核对后追加，对不上即重建；历史先从本机翻页。设计与正确性保证见 `docs/TRANSCRIPT_CACHE.md`。
-- `core/KeystoreCipher.kt`: `ServerStore`/`OfflineCache` 共用的 AndroidKeyStore AES-GCM 加解密。
-- `core/PairLink.kt`: 官方 `opencode pair` 链接解析（强制 HTTPS）。
-- `core/Http.kt` / `core/Diagnostics.kt`: 进程级 OkHttp 连接池/调度器；轻量日志。
-- `core/LoadingCaches.kt` / `core/LoadMetrics.kt`: 会话窗口缓存、Choices TTL、按 key 可取消加载与请求计数；加载/刷新预算见 [`LOADING.md`](LOADING.md)。
-- `ui/`: 小米 HyperOS / MIUIX 组件页面与不同消息 Part 的渲染；信息架构主线为 Server → Project/Directory → Session → Conversation，结构对齐 Qoder：没有底部 Dock，「会话」首页是唯一根页面（范围标题打开统一的设备/分组/项目/工作区面板、当前服务器任务概览、按日期 / 项目 / 状态分组的列表、悬浮新建按钮）；任务概览展示运行中、未读完成、待回复、失败计数及最需关注的任务，状态不新鲜时明确提示；设置等低频页面从首页 ⋯ 整页推入；Chat 是会话主界面（工具调用为可展开的紧凑轨迹；输入框上方有安静的后台活动胶囊，⋯ 内有「子会话与后台」一项，打开的是与「代码改动 / 文件 / 定时任务」同款的半屏抽屉，可看后台命令输出、运行中/历史子会话；抽屉里的子会话整页打开、后台命令换成自己的输出抽屉；子会话只读并带状态栏与返回父会话）。DSH 的会话级目标与 todo 清单在上方以一行胶囊呈现（目标＝阶段 + 截断目标，todo＝已完成/总数），完整内容与操作点开面板查看；已完成目标不占位，自动续跑轮次不展示。`MainActivity` 负责页面栈、预见式返回（露出真实的上一页）与深链。
-- `system/`: 通知 Channel、Android Live Updates 请求、任务前台服务与通知操作。全服务器任务总览沿用统一口径（`core/TaskSummary.kt`）：`TaskNotifications.buildSummary` 生成单条 ongoing 的 Live Update 通知（`setRequestPromotedOngoing` + `setShortCriticalText`），并由 `LagoonController` 在状态变化时统一发布；`system/LiveUpdateSupport.kt` 只探测标准实时更新的可用状态，供设置页展示（不写任何厂商私有 extras，详见 `docs/LIVE_UPDATES.md`）。
-- `core/AppUpdate.kt` / `system/AppUpdater.kt`: GitHub Releases 检查与 APK 自更新。SemVer（含 rc）比较、预发布通道筛选、ETag 缓存、流式下载、大小 / SHA-256 / 包名 / versionCode / 签名证书校验；只有通过校验且位于 `cache/updates/` 的 APK 会通过 FileProvider 交给系统安装器，详见 `docs/APP_UPDATE.md`。
-- `docs/task-event-contract.json`: Android `TaskReducer` 遵守的任务阶段归约契约。
+- `shared/.../core/DeviceModel.kt`: 纯 SSH 两层设备模型真源（`SshDevice`、`DeviceHarness`、`HarnessProtocol`、`HarnessConfig`、`DeviceProjection`）及运行态只读视图 `ServerProfile`，契约见 [`DEVICE_MODEL.md`](DEVICE_MODEL.md)。
+- `app/.../core/DeviceStore.kt` + `LegacyToSshMigration.kt`: 单一真源设备存储（SP `devices` + 加密 `ssh-secrets`）与从 `v5.3.x`（SSH + 退场 Remote/直连）平滑升级的幂等迁移。
+- `app/.../core/SshKeyStore.kt` + `BiometricKeyVault.kt` + `core/ssh/*`: 全局 SSH 密钥库（软件 Ed25519 / 硬件 Keystore ECDSA / 证书）、JSch 连接池（`SshTransportPool`）、统一 5 种 Harness 运行时（`SshHostManager` / `SshHostLink` / `SshDshBootstrap` / `SshStdioRpcTransport` / `SshVerifiedTunnel` / `SshForwarder`），详见 [`SSH_HOSTS.md`](SSH_HOSTS.md)。
+- `shared/.../core/OpenCodeApi.kt`: OpenCode 2.x 原生 REST / SSE / WebSocket（经 `NativeOkHttpTransport` + SSH loopback 转发访问），版本差异由 `ApiCapabilities.kt` 从 `/openapi.json` 解析，契约由 `app/src/test/resources/opencode-2.2.6-contract.json` 回归固定。
+- `shared/.../core/DshApi.kt`: DeepSeek Harness Typert RPC Gateway 客户端（经 SSH loopback 转发访问 `dsh web`，含根路径启动令牌换 Cookie、`/api/remote.mux` 多路复用流、`$events` 审批/问答瀑布、目标/调度/插件/工作区/正文搜索/终端），完整契约见 [`dsh-protocol.md`](dsh-protocol.md)。
+- `shared/.../core/CodexApi.kt` & `AgyApi.kt`: Codex App Server 与 ACP（Antigravity ACP / OpenCode ACP）协议适配器，经 SSH exec stdio 通信。
+- `shared/.../core/HarnessClient.kt`: 协议无关的统一 Harness 接口，控制器、总览与通知层只依赖该接口。
+- `app/.../core/DeviceCoordinator.kt` + `SshKeyCoordinator.kt` + `LagoonController.kt`: 设备/发现/分组/密钥管理与对话/总览/通知状态协调；异步写操作经不可变 `OperationContext` 防串写。
+- `app/.../core/ServerStore.kt` + `OfflineCache.kt` + `TranscriptStore.kt`: 按稳定 `HarnessId` 隔离的运行态持久化（本地项目、草稿、文件引用、任务账本、未读通知、模型偏好、加密离线缓存与 OpenCode SQLite 原文缓存）。
+- `ui/`: 小米 HyperOS / MIUIX 界面，信息架构为 `设备 → Harness → 项目/工作区 → 会话 → 对话`；整页路由与预测式返回由 `AppBackStack.kt` 与 `MainActivity.kt` 驱动。
+- `system/`: 任务前台监控（`TaskMonitorService`）、Android 16 Live Updates 与普通通知（`TaskNotifications`）、通知动作（`NotificationActionReceiver`）、15 分钟后台同步（`BackgroundSyncWorker`）与 GitHub Releases 自更新（`AppUpdater`）。
 
 ## 必须在真实环境检查
 
-1. 设置 OpenCode Server Basic Auth，使用 HTTPS URL 添加服务器；确认认证失败不会保存资料。
-2. 从手机发送任务，检查消息、工具折叠、停止、SSE 重连后状态一致；确认系统实时更新显示「运行中 / 未读已完成 / 待回复 / 失败」计数，且打开会话后已完成计数下降。
-3. 触发 permission 和 question；分别从 App 与系统通知操作，检查服务器继续执行。
-4. 检查子会话、Diff、文件浏览；测试新建、运行中继续发送、斜杠命令、重命名、删除等会话操作。让 AI 完成后仍有后台 shell / 子会话运行：首页应显示蓝点 + 低调小圆环，灵动岛不保持“运行中”；打开「子会话与后台」半屏抽屉能看命令输出与子会话实时状态（含历史），点子会话整页打开、返回父会话，点后台命令弹出该命令的输出抽屉，子会话页面无输入框且可返回父会话。
-5. 在 Android 16 设备检查实时更新提升与设置页「任务通知」状态；Android 15 及以下确认普通通知照常显示，首页概览中的计数、优先任务和过期状态提示正确；关闭通知权限后仍可在应用首页查看任务概览。
-6. 添加 DeepSeek Harness（`dsh web --host <本机 IP> --no-open`）：粘贴整条启动链接，确认地址与令牌自动拆开、令牌错误不保存资料；强杀 App 并重启 dsh 后仍能直接连上（落盘 Cookie 复用，不需要新令牌）；用签名密钥模式添加同一实例，确认无需启动链接即可连接、改错一个字符会提示重新配对；连接后断网/切换 Wi-Fi 再恢复，事件流与打开的会话自动续上、断线期间被别处回答的审批自动消失；发送任务后检查实时流式文本、工具轨迹、停止（`session/cancel`）、审批与问答回应；检查文件浏览、文件搜索、在没有会话的目录添加项目、图片与文本附件、Agent 预设切换、改动列表、后台任务状态与 `/compact` 命令；确认会话菜单显示「分叉 / 归档」而没有「删除」，审批卡片没有「始终允许」。
-7. 设置 → 版本与更新：检查更新、切换预发布通道、下载进度与取消、首次安装的“安装未知应用”授权、系统安装器覆盖安装；断网、签名不一致、`versionCode` 不升时确认会明确拒绝。
-
-契约来源：`anomalyco/opencode` 2.x 源码（`packages/protocol`、`packages/schema`）与官方客户端（`packages/client`、`packages/session-ui`）。接入目标实例时可核对该实例 `/openapi.json`。
+1. 添加一台 SSH 设备（密码与密钥两种方式），核对 `SHA256:` 指纹后进入设备详情自动完成只读发现，确认发现不启动远端服务。
+2. 同设备同时启用 DSH、OpenCode Native、Codex、Antigravity、OpenCode ACP 中的多项：确认共享一条 SSH 连接，停用/移除一项不影响兄弟 Harness，修改 DSH 启动命令不打断 OpenCode/Codex。
+3. 在手机发送任务、触发权限审批与问答、切换 Wi-Fi / 蜂窝网络恢复、检查系统实时更新与通知点击深链（`lagoon://server/...`）。
+4. 从 `v5.3.0-rc.16` 覆盖安装升级：确认既有 SSH 设备、密钥、停用开关、草稿、OpenCode SQLite 缓存完整保留，历史 Remote / 直连资料平滑退场并提示。
+5. 设置 → 版本与更新：检查更新、下载校验与覆盖安装。
