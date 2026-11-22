@@ -5,9 +5,9 @@
 const NS = "http://www.w3.org/2000/svg";
 const PHONE = { x: 400, y: 452 };
 const SERVERS = [
-  { id: "mine", name: "我的 OpenCode", meta: "https://oc.example.com", x: 150, y: 120 },
-  { id: "ws", name: "工作站", meta: "opencode pair 配对链接", x: 400, y: 66 },
-  { id: "nas", name: "家用 NAS", meta: "http://192.168.1.100:4096", x: 650, y: 132 },
+  { id: "mine", name: "linux-dev", meta: "ssh://dev@10.0.0.12 · DSH + OpenCode", x: 150, y: 120 },
+  { id: "ws", name: "工作站", meta: "ssh://dev@workstation · Codex", x: 400, y: 66 },
+  { id: "nas", name: "macOS 开发机", meta: "ssh://dev@mac-mini:2222 · Antigravity", x: 650, y: 132 },
 ];
 
 const el = (tag, attrs = {}, parent) => {
