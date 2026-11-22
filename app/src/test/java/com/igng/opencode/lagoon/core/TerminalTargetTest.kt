@@ -18,18 +18,17 @@ class TerminalTargetTest {
   }
 
   @Test fun scopeSeparatesDshSessionsEvenWhenTheirDirectoriesMatch() {
-    val dsh = profile.copy(kind = ServerKind.DSH)
+    val dsh = profile.copy(protocol = HarnessProtocol.DSH)
     val first = TerminalTarget(dsh, "first", "/repo")
     val second = TerminalTarget(dsh, "second", "/repo")
     assertEquals(TerminalScope.Session("first", "/repo"), first.scope)
     assertEquals(TerminalScope.Session("second", "/repo"), second.scope)
     assertNotEquals(first.scope, second.scope)
-    assertEquals(TerminalScope.Session("first", "/repo"), first.copy(profile = dsh.copy(kind = ServerKind.DSH_REMOTE)).scope)
     assertEquals(TerminalScope.Location("/repo"), first.copy(profile = profile).scope)
   }
 
   @Test fun sameDirectoryCannotMakeDshTargetMatchAnotherConversation() {
-    val dsh = profile.copy(kind = ServerKind.DSH)
+    val dsh = profile.copy(protocol = HarnessProtocol.DSH)
     val live = state().copy(profiles = listOf(dsh), sessionId = "first",
       sessions = listOf(Session("first", "/repo", "First", 1), Session("second", "/repo", "Second", 1)))
     val first = TerminalTarget(dsh, "first", "/repo")
@@ -44,7 +43,7 @@ class TerminalTargetTest {
     assertFalse(live.copy(capabilities = ApiCapabilities()).canUseNativeTerminal())
     assertFalse(live.copy(connected = false).canUseNativeTerminal())
     assertFalse(live.copy(cached = true).canUseNativeTerminal())
-    assertFalse(live.copy(profiles = listOf(profile.copy(parentEnabled = false))).canUseNativeTerminal())
+    assertFalse(live.copy(profiles = listOf(profile.copy(deviceEnabled = false))).canUseNativeTerminal())
     assertFalse(live.copy(sessionId = null).canUseNativeTerminal())
   }
 }

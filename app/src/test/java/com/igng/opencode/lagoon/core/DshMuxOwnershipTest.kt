@@ -328,7 +328,7 @@ class DshMuxOwnershipTest {
       }
       server.start()
       api = DshApi(
-        ServerProfile("mux", "DSH", server.url("/").toString(), kind = ServerKind.DSH, allowCleartext = true),
+        ServerProfile("mux", "DSH", server.url("/").toString(), protocol = HarnessProtocol.DSH, allowCleartext = true),
         ServerCredentials("dsh", "token")
       )
     }

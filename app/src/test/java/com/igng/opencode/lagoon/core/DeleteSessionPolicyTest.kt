@@ -4,7 +4,7 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class DeleteSessionPolicyTest {
-  private val profile = ServerProfile("host", "Host", "ssh://alice@host.example:22", username = "alice", kind = ServerKind.CODEX, sshHostId = "ssh-host")
+  private val profile = ServerProfile("host", "Host", "ssh://alice@host.example:22", username = "alice", protocol = HarnessProtocol.CODEX, deviceId = "ssh-host")
   private fun state() = LagoonState(profiles = listOf(profile), serverId = profile.id, connected = true,
     sessionId = "parent", sessions = listOf(Session("parent", "/repo", "Parent", 1)),
     capabilities = ApiCapabilities(deleteSession = true))
@@ -26,6 +26,6 @@ class DeleteSessionPolicyTest {
     assertTrue(warning.contains("子代理"))
     assertTrue(warning.contains("永久删除"))
     assertTrue(warning.contains("分叉可能阻止"))
-    assertFalse(DeleteSessionTarget(profile.copy(kind = ServerKind.OPENCODE), "parent", "Parent").warning().contains("子代理"))
+    assertFalse(DeleteSessionTarget(profile.copy(protocol = HarnessProtocol.OPENCODE_NATIVE), "parent", "Parent").warning().contains("子代理"))
   }
 }

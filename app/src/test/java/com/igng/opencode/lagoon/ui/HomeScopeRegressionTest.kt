@@ -25,7 +25,7 @@ class HomeScopeRegressionTest {
   @Test fun theTitleSheetOwnsDevicesGroupsAndTheProjectOrWorkspaceFilter() {
     val sheets = uiSource("ProjectSheets.kt")
     assertTrue(sheets.contains("fun HomeScopeSheet("))
-    for (label in listOf("全部设备", "设备分组", "单台连接", "全部会话", "设备与分组管理")) {
+    for (label in listOf("全部设备", "设备分组", "按 SSH 设备", "单个 Harness", "全部会话", "设备与分组管理")) {
       assertTrue("范围面板缺少「$label」", sheets.contains(label))
     }
     assertTrue("分组仍可从范围面板编辑", sheets.contains("编辑分组"))

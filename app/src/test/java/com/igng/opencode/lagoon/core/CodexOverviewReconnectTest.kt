@@ -19,7 +19,7 @@ import org.junit.Test
 
 class CodexOverviewReconnectTest {
   private val profile = ServerProfile("ssh-codex", "Codex", "ssh://alice@dev.example:22",
-    username = "alice", kind = ServerKind.CODEX, sshHostId = "host")
+    username = "alice", protocol = HarnessProtocol.CODEX, deviceId = "host")
 
   @Test fun failedOwnerIsReplacedAndResumesMonitoring() = runBlocking {
     val fixture = Fixture(this)
@@ -87,14 +87,15 @@ class CodexOverviewReconnectTest {
   private class Fixture(parent: CoroutineScope, private val events: Channel<ServerEvent> = Channel(Channel.UNLIMITED)) {
     val transports = CopyOnWriteArrayList<Pair<String, FakeTransport>>()
     val opens = AtomicInteger()
-    val store = ServerStore(memoryPreferences(), memoryPreferences(), { it }, { it })
+    @Volatile private var activeProfiles: List<ServerProfile> = emptyList()
+    val store = ServerStore(memoryPreferences(), memoryPreferences(), { it }, { it }) { activeProfiles }
     private val scope = CoroutineScope(parent.coroutineContext + SupervisorJob())
     val overview = AllServersOverview(store, OfflineCache(memoryPreferences(), { it }, { it }), scope,
       {}, onEvent = { _, event -> events.trySend(event) }, onConnected = { opens.incrementAndGet() }, sshClientFactory = { configured, _ ->
         CodexApi(FakeTransport().also { transports.add(configured.id to it) })
       })
     fun start(profiles: List<ServerProfile> = listOf(profileForFixture())) {
-      profiles.forEach { store.save(it, null) }
+      activeProfiles = profiles
       overview.start(profiles)
     }
     @Suppress("UNCHECKED_CAST")
@@ -108,7 +109,7 @@ class CodexOverviewReconnectTest {
     fun pendingRetries(): Map<String, Long> = AllServersOverview::class.java.getDeclaredField("codexRetryDelays")
       .apply { isAccessible = true }.get(overview) as Map<String, Long>
     private fun profileForFixture() = ServerProfile("ssh-codex", "Codex", "ssh://alice@dev.example:22",
-      username = "alice", kind = ServerKind.CODEX, sshHostId = "host")
+      username = "alice", protocol = HarnessProtocol.CODEX, deviceId = "host")
   }
 
   private class FakeTransport : CodexTransport {

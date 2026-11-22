@@ -202,9 +202,8 @@ class OverviewReconciliationTest {
           return base.dispatch(request)
         }
       }
-      val store = ServerStore(memoryPreferences(), memoryPreferences(), { it }, { it })
       val profile = ServerProfile("a", "A", server.url("/").toString(), allowCleartext = true)
-      store.save(profile, password = "secret")
+      val store = ServerStore(memoryPreferences(), memoryPreferences(), { it }, { it }) { listOf(profile) }
       val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
       val snapshots = java.util.concurrent.ConcurrentHashMap<String, ServerOverviewSnapshot>()
       val overview = AllServersOverview(store, OfflineCache(memoryPreferences(), { it }, { it }), scope, { snapshots[it.serverId] = it })
@@ -237,9 +236,8 @@ class OverviewReconciliationTest {
           return base.dispatch(request)
         }
       }
-      val store = ServerStore(memoryPreferences(), memoryPreferences(), { it }, { it })
       val profile = ServerProfile("a", "A", server.url("/").toString(), allowCleartext = true)
-      store.save(profile, password = "secret")
+      val store = ServerStore(memoryPreferences(), memoryPreferences(), { it }, { it }) { listOf(profile) }
       val scope = CoroutineScope(coroutineContext + SupervisorJob())
       val snapshots = java.util.concurrent.ConcurrentHashMap<String, ServerOverviewSnapshot>()
       val overview = AllServersOverview(store, OfflineCache(memoryPreferences(), { it }, { it }), scope, { snapshots[it.serverId] = it })
@@ -270,9 +268,8 @@ class OverviewReconciliationTest {
           return base.dispatch(request)
         }
       }
-      val store = ServerStore(memoryPreferences(), memoryPreferences(), { it }, { it })
       val profile = ServerProfile("a", "A", server.url("/").toString(), allowCleartext = true)
-      store.save(profile, password = "secret")
+      val store = ServerStore(memoryPreferences(), memoryPreferences(), { it }, { it }) { listOf(profile) }
       val scope = CoroutineScope(coroutineContext + SupervisorJob())
       val overview = AllServersOverview(store, OfflineCache(memoryPreferences(), { it }, { it }), scope, {})
       try {
@@ -292,9 +289,9 @@ class OverviewReconciliationTest {
   }
 
   @Test fun staleCollectorCleanupCannotUnregisterTheReplacementMonitor() = runBlocking {
-    val store = ServerStore(memoryPreferences(), memoryPreferences(), { it }, { it })
-    val profile = ServerProfile("a", "A", "http://127.0.0.1", allowCleartext = true, kind = ServerKind.DSH, sshHostId = "ssh")
-    store.save(profile, password = "secret")
+    val profile = ServerProfile("a", "A", "http://127.0.0.1", allowCleartext = true, protocol = HarnessProtocol.DSH, deviceId = "ssh")
+    val currentProfiles = java.util.concurrent.atomic.AtomicReference(listOf(profile))
+    val store = ServerStore(memoryPreferences(), memoryPreferences(), { it }, { it }) { currentProfiles.get() }
     val firstStarted = CompletableDeferred<Unit>()
     val firstCleaning = CompletableDeferred<Unit>()
     val releaseFirst = CompletableDeferred<Unit>()
@@ -343,7 +340,7 @@ class OverviewReconciliationTest {
       overview.start(listOf(profile))
       withTimeout(5_000) { firstStarted.await() }
       val replacement = profile.copy(url = "http://127.0.0.2")
-      store.save(replacement, password = "secret")
+      currentProfiles.set(listOf(replacement))
       overview.start(listOf(replacement))
       withTimeout(5_000) { secondStarted.await(); firstCleaning.await() }
       releaseFirst.complete(Unit)

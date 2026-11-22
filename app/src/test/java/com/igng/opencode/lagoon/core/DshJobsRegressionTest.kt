@@ -51,7 +51,7 @@ class DshJobsRegressionTest {
         }
       }
       server.start()
-      val profile = ServerProfile("s", "DSH", server.url("/").toString(), kind = ServerKind.DSH, allowCleartext = true)
+      val profile = ServerProfile("s", "DSH", server.url("/").toString(), protocol = HarnessProtocol.DSH, allowCleartext = true)
       val api = DshApi(profile, ServerCredentials("dsh", "token"), clock = { now })
       try {
         api.rootSessionsPage("/repo")
@@ -127,7 +127,7 @@ class DshJobsRegressionTest {
         }
       }
       server.start()
-      val api = DshApi(ServerProfile("s", "DSH", server.url("/").toString(), kind = ServerKind.DSH, allowCleartext = true), ServerCredentials("dsh", "token"))
+      val api = DshApi(ServerProfile("s", "DSH", server.url("/").toString(), protocol = HarnessProtocol.DSH, allowCleartext = true), ServerCredentials("dsh", "token"))
       try {
         val updates = mutableListOf<Triple<String, Boolean, Boolean>>()
         val result = runCatching { api.followJobOutput("owner", "job") { text, running, done -> updates += Triple(text, running, done) } }

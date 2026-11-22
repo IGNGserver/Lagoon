@@ -69,7 +69,7 @@ class DshWorkspaceManagementTest {
       }
       server.start()
       val profile = ServerProfile("srv", "DSH", server.url("/").toString().trimEnd('/'),
-        username = "dsh", allowCleartext = true, kind = ServerKind.DSH)
+        username = "dsh", allowCleartext = true, protocol = HarnessProtocol.DSH)
       client = DshApi(profile, ServerCredentials("dsh", "token"))
     }
     override fun close() { client.close(); server.shutdown() }

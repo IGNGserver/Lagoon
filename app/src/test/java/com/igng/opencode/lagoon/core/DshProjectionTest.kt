@@ -12,7 +12,7 @@ class DshProjectionTest {
   /** Projection is suspend now (it may fetch image attachments), so the tests bridge with runBlocking. */
   private fun translate(api: DshApi, event: JSONObject) = runBlocking { api.translate(session, event) }
   private fun toMessages(api: DshApi, records: List<JSONObject>) = runBlocking { api.recordsToMessages(session, records) }
-  private fun client() = DshApi(ServerProfile("srv", "DSH", "http://127.0.0.1:1", kind = ServerKind.DSH, allowCleartext = true), ServerCredentials("dsh", ""))
+  private fun client() = DshApi(ServerProfile("srv", "DSH", "http://127.0.0.1:1", protocol = HarnessProtocol.DSH, allowCleartext = true), ServerCredentials("dsh", ""))
   private fun record(type: String, seq: Int, data: String) = JSONObject().put("type", "event").put("event",
     JSONObject().put("type", type).put("seq", seq).put("time", 1000L + seq).put("data", JSONObject(data)))
 
@@ -142,10 +142,10 @@ class DshProjectionTest {
         """{"todos":[{"content":"写测试","status":"completed"},{"content":"改 UI","status":"in_progress"}]}""").obj("event")).single()
       assertEquals("session.todos.changed", todos.type)
       assertEquals(session.id, todos.properties.str("sessionID"))
-      assertEquals(listOf("写测试", "改 UI"), todos.properties.arr("todos").toRemoteTodos().map { it.content })
+      assertEquals(listOf("写测试", "改 UI"), todos.properties.arr("todos").toDshTodos().map { it.content })
       // 整值替换：空数组同样是一次权威更新，界面据此隐藏胶囊。
       val cleared = translate(api, record("todo/write", 10, """{"todos":[]}""").obj("event")).single()
-      assertEquals(emptyList<RemoteTodo>(), cleared.properties.arr("todos").toRemoteTodos())
+      assertEquals(emptyList<DshTodo>(), cleared.properties.arr("todos").toDshTodos())
       val goal = translate(api, record("goal/change", 11,
         """{"kind":"goal/change","operation":"complete","goal":{"id":"g1","revision":2,"objective":"收尾","phase":"complete"}}""").obj("event")).single()
       assertEquals("session.goal.changed", goal.type)

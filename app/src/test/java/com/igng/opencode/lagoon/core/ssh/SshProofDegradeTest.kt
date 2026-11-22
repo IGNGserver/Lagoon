@@ -60,7 +60,7 @@ class SshProofDegradeTest {
     override val isClosed: Boolean = false
     override fun exec(script: String, timeoutMillis: Long): RemoteExecResult = error("unused")
     override fun openExecChannel(script: String): SshExecChannel {
-      val process = ProcessBuilder("/bin/sh", "-lc", script).apply {
+      val process = ProcessBuilder("/bin/sh", "-c", script).apply {
         environment()["HOME"] = home.absolutePath
         environment()["PATH"] = path
       }.start()

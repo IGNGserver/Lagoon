@@ -23,16 +23,16 @@ class DeviceGroupStoreTest {
     assertTrue(second.state.groups.isEmpty())
   }
 
-  @Test fun versionTwoRoundTripsAndSelectionMustExist() {
+  @Test fun currentVersionRoundTripsAndSelectionMustExist() {
     val prefs = FakeSharedPreferences()
     val store = DeviceGroupStore(prefs)
-    store.save(DeviceGroupState(listOf(DeviceGroup("g", "MacBook", listOf("p1"))), "g"))
+    store.save(DeviceGroupState(listOf(DeviceGroup("g", "MacBook", deviceIds = listOf("d1"))), "g"))
     val loaded = store.load()
     assertFalse(loaded.resetLegacy)
     assertEquals("g", loaded.state.selectedGroupId)
-    assertEquals(listOf("p1"), loaded.state.groups.single().memberIds)
+    assertEquals(listOf("d1"), loaded.state.groups.single().deviceIds)
 
-    store.save(DeviceGroupState(listOf(DeviceGroup("g", "MacBook", listOf("p1"))), "missing"))
+    store.save(DeviceGroupState(listOf(DeviceGroup("g", "MacBook", deviceIds = listOf("d1"))), "missing"))
     assertNull(store.load().state.selectedGroupId)
   }
 

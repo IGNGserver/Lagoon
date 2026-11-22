@@ -18,7 +18,7 @@ import org.junit.Test
 class GoalEditApiTest {
   private fun client(server: MockWebServer) = DshApi(
     ServerProfile("goal-test", "DSH", server.url("/").toString().trimEnd('/'),
-      allowCleartext = true, kind = ServerKind.DSH),
+      allowCleartext = true, protocol = HarnessProtocol.DSH),
     ServerCredentials("dsh", cookie = "dsh-auth-goal=test")
   )
 
@@ -325,7 +325,7 @@ class GoalEditApiTest {
       .goalProjection()!!
     assertNull(missing.maxGoalRounds)
     assertNull(missing.roundsStarted)
-    assertEquals("reason", RemoteGoal("g1", 1, "x", "blocked", "disarmed", "reason").blockedReason)
+    assertEquals("reason", DshGoal("g1", 1, "x", "blocked", "disarmed", "reason").blockedReason)
     val invalid = projection(view()).obj("values").apply {
       obj("goal").put("roundsStarted", 1.5).obj("goal").put("maxGoalRounds", MAX_GOAL_ROUNDS + 1)
     }.goalProjection()!!

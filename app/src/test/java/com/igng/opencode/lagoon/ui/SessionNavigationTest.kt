@@ -1,7 +1,5 @@
 package com.igng.opencode.lagoon.ui
 
-import com.igng.opencode.lagoon.core.ServerKind
-import com.igng.opencode.lagoon.core.ServerProfile
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
@@ -18,15 +16,18 @@ class SessionNavigationTest {
     assertFalse(SessionNavigation().canGoBack)
     assertEquals(NavRoute(RootPage.HOME, null, 0), SessionNavigation().route)
   }
+
   @Test fun pushedPagesReturnHome() {
     val settings = SessionNavigation().push(RootPage.SETTINGS)
     assertTrue(settings.canGoBack)
     assertEquals(SessionNavigation(), settings.back())
     assertEquals(SessionNavigation(), SessionNavigation().push(RootPage.DEVICES).back())
   }
+
   @Test fun pushingAPageLeavesAnyOpenChat() {
     assertEquals(SessionNavigation(RootPage.SETTINGS), SessionNavigation().open("s1").push(RootPage.SETTINGS))
   }
+
   @Test fun childBackRestoresItsParentBeforeTheOriginatingPage() {
     val nav = SessionNavigation(RootPage.DEVICES).open("parent").open("child", child = true).open("grandchild", child = true)
     assertEquals(listOf("parent", "child"), nav.back().sessions)
@@ -35,21 +36,25 @@ class SessionNavigationTest {
     assertEquals(SessionNavigation(), nav.back().back().back().back())
     assertFalse(nav.back().back().back().back().canGoBack)
   }
+
   @Test fun leavingTheOutermostSessionReturnsToItsOriginPage() {
     val chat = SessionNavigation(RootPage.DEVICES).open("session")
     assertTrue(leavesSession(chat, chat.back()))
     assertFalse(leavesSession(chat.open("child", child = true), chat))
     assertFalse(leavesSession(SessionNavigation(RootPage.DEVICES), SessionNavigation()))
   }
+
   @Test fun unrelatedSessionDoesNotInheritAnotherSessionsBackChain() {
     val nav = SessionNavigation().open("parent").open("child", true).open("other")
     assertEquals(listOf("other"), nav.sessions)
     assertTrue(nav.back().sessions.isEmpty())
   }
+
   @Test fun reopeningAnAncestorDoesNotDuplicateOrCycleTheStack() {
     val nav = SessionNavigation().open("parent").open("child", true).open("parent", true)
     assertEquals(listOf("parent"), nav.sessions)
   }
+
   @Test fun authoritativeLineageKeepsSiblingsAtTheSameDepth() {
     val nav = SessionNavigation().openLineage(listOf("root", "child", "grandchild"))
     assertEquals(listOf("root", "child", "grandchild"), nav.sessions)
@@ -62,47 +67,35 @@ class SessionNavigationTest {
     assertEquals(3, SessionNavigation(RootPage.DEVICES).open("p").open("c", true).route.depth)
   }
 
-  /* ---------------- 设备详情与整页编辑器：每一级都是路由上的一层 ---------------- */
-
   @Test fun deviceDetailIsOneLevelAboveTheDeviceList() {
     val list = SessionNavigation(RootPage.DEVICES)
-    val detail = list.openDevice("dev-1")
+    val detail = list.openDevice("ssh-1")
     assertTrue(detail.canGoBack)
-    assertEquals("dev-1", detail.route.device)
+    assertEquals("ssh-1", detail.route.device)
     assertTrue("详情比列表深一层，过渡方向才能判对", detail.route.depth > list.route.depth)
     assertEquals(list, detail.back())
-    // 再退一层就是会话首页，下一次返回交给系统。
     assertEquals(SessionNavigation(), list.back())
   }
 
   @Test fun editorIsPushedOverDetailAndPopsOneLevelAtATime() {
-    val detail = SessionNavigation(RootPage.DEVICES).openDevice("dev-1")
-    val profileEditor = detail.openEditor(DeviceEditorRoute(mode = DeviceEditorMode.DIRECT_PROFILE, profileId = "dev-1"))
-    val sshEditor = profileEditor.openEditor(DeviceEditorRoute(mode = DeviceEditorMode.SSH_HOST, access = AddDeviceAccess.SSH, sshHostId = ""))
-    assertEquals(2, sshEditor.editors.size)
-    assertEquals("最上层才是屏幕上那一页", "", sshEditor.route.editor?.sshHostId)
-    assertTrue(sshEditor.route.depth > profileEditor.route.depth)
+    val detail = SessionNavigation(RootPage.DEVICES).openDevice("ssh-1")
+    val editDevice = detail.openEditor(DeviceEditorRoute(deviceId = "ssh-1"))
+    val newDevice = editDevice.openEditor(DeviceEditorRoute())
+    assertEquals(2, newDevice.editors.size)
+    assertTrue(newDevice.route.editor!!.isNew)
+    assertTrue(newDevice.route.depth > editDevice.route.depth)
 
-    // 从 SSH 表单返回落回 SSH 设备表单，而不是直接跳回设备详情。
-    assertEquals(profileEditor, sshEditor.back())
-    assertEquals(detail, profileEditor.back())
+    assertEquals(editDevice, newDevice.back())
+    assertEquals(detail, editDevice.back())
     assertEquals(SessionNavigation(RootPage.DEVICES), detail.back())
   }
 
-  @Test fun harnessEditorTargetsItsSshDeviceOrDirectProfile() {
-    val ssh = ServerProfile(id = "codex-leaf", name = "Codex", url = "ssh://user@host:22",
-      kind = ServerKind.CODEX, sshHostId = "ssh-host")
-    val direct = ServerProfile(id = "direct-leaf", name = "OpenCode", url = "https://example.invalid")
-    val detail = SessionNavigation(RootPage.DEVICES).openDevice("device").openHarness(ssh.id)
-    val sshEditor = detail.openEditor(editorForHarness(ssh))
-    assertEquals(DeviceEditorMode.SSH_HOST, sshEditor.route.editor?.mode)
-    assertEquals("ssh-host", sshEditor.route.editor?.sshHostId)
-    assertNull(sshEditor.route.editor?.profileId)
-    assertEquals(detail, sshEditor.back())
-    val directEditor = editorForHarness(direct)
-    assertEquals(DeviceEditorMode.DIRECT_PROFILE, directEditor.mode)
-    assertEquals("direct-leaf", directEditor.profileId)
-    assertNull(directEditor.sshHostId)
+  @Test fun harnessDetailPopsBackToDeviceDetail() {
+    val detail = SessionNavigation(RootPage.DEVICES).openDevice("ssh-1")
+    val harness = detail.openHarness("leaf-codex")
+    assertEquals("leaf-codex", harness.route.harness)
+    assertTrue(harness.route.depth > detail.route.depth)
+    assertEquals(detail, harness.back())
   }
 
   @Test fun editorOpenedWithoutADeviceReturnsToThePageItCameFrom() {
@@ -114,9 +107,9 @@ class SessionNavigationTest {
   }
 
   @Test fun openingADeviceDropsAnEditorLeftOpenAndAViceVersa() {
-    val stale = SessionNavigation(RootPage.DEVICES).openEditor(DeviceEditorRoute()).openDevice("dev-1")
+    val stale = SessionNavigation(RootPage.DEVICES).openEditor(DeviceEditorRoute()).openDevice("ssh-1")
     assertTrue("进入设备详情不应该把编辑器叠在下面", stale.editors.isEmpty())
-    val chat = SessionNavigation(RootPage.DEVICES).openDevice("dev-1").open("s1")
+    val chat = SessionNavigation(RootPage.DEVICES).openDevice("ssh-1").open("s1")
     assertNull("打开会话后设备层不再存在于栈上", chat.device)
     assertEquals(SessionNavigation(RootPage.DEVICES).open("s1"), chat)
   }
@@ -124,16 +117,14 @@ class SessionNavigationTest {
   @Test fun editorLevelsSurviveARotationThroughTheirEncodedForm() {
     val editors = listOf(
       DeviceEditorRoute(),
-      DeviceEditorRoute(mode = DeviceEditorMode.SSH_HOST, access = AddDeviceAccess.SSH, sshHostId = "")
+      DeviceEditorRoute(deviceId = "ssh-host-1")
     )
     assertEquals(editors, decodeDeviceEditors(encodeDeviceEditors(editors)))
-    val editing = listOf(DeviceEditorRoute(mode = DeviceEditorMode.SSH_HOST, access = AddDeviceAccess.SSH, sshHostId = "host-1"))
-    assertEquals(editing, decodeDeviceEditors(encodeDeviceEditors(editing)))
     assertTrue("坏行不能把整页重建弄崩", decodeDeviceEditors(listOf("nonsense")).isEmpty())
   }
 
   @Test fun everyEditorOpeningGetsItsOwnSaveableScope() {
-    val base = DeviceEditorRoute(mode = DeviceEditorMode.SSH_HOST, access = AddDeviceAccess.SSH)
+    val base = DeviceEditorRoute()
     val first = base.freshInstance()
     val second = base.freshInstance()
     assertTrue(first.instance.isNotBlank())
@@ -142,9 +133,11 @@ class SessionNavigationTest {
     assertEquals(first, decodeDeviceEditors(encodeDeviceEditors(listOf(first))).single())
   }
 
-  @Test fun editorLinesFromOlderBuildsWithoutAnInstanceStillDecode() {
+  @Test fun editorLinesFromOlderBuildsStillDecodeGracefully() {
     val legacy = decodeDeviceEditors(listOf("SSH_HOST|SSH||ssh:host-1")).single()
-    assertEquals("host-1", legacy.sshHostId)
+    assertEquals("host-1", legacy.deviceId)
     assertTrue(legacy.instance.isEmpty())
+    val legacyDirect = decodeDeviceEditors(listOf("DIRECT_PROFILE|HUB|p1|"))
+    assertTrue("已下线的直连编辑器路由应安全丢弃", legacyDirect.isEmpty())
   }
 }

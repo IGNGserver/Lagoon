@@ -28,7 +28,7 @@ class NewSessionDefaultsTest {
     val preferences = FakeSharedPreferences()
     val store = ServerStore(preferences, FakeSharedPreferences(), { "enc:$it" }, { it.removePrefix("enc:") })
     store.rememberNewSessionDefaults("srv", NewSessionDefaults("standard", ModelChoice("deepseek", "flash", "Flash")))
-    store.delete("srv")
+    store.cleanupRetiredHarness("srv")
     assertNull(store.newSessionDefaults("srv").agent)
     assertNull(store.newSessionDefaults("srv").model)
   }

@@ -16,9 +16,10 @@ class OpenCodeManagementControllerTest {
     val state = MutableStateFlow(LagoonState(profiles = listOf(profile), serverId = profile.id, connected = true,
       capabilities = ApiCapabilities(openCodeProjectManagement = true, openCodeWorktreeManagement = true)))
     val plain = FakeSharedPreferences(); val secrets = FakeSharedPreferences()
-    val store = ServerStore(plain, secrets, { it }, { it })
+    @Volatile var currentProfiles = listOf(profile)
+    val store = ServerStore(plain, secrets, { it }, { it }) { currentProfiles }
     init {
-      store.save(profile, "password", "cookie"); store.rememberDraft(profile.id, "session", "unsent")
+      store.rememberDraft(profile.id, "session", "unsent")
       fun set(name: String, value: Any?) { LagoonController::class.java.getDeclaredField(name).apply { isAccessible = true }.set(controller, value) }
       set("mutable", state); set("state", state); set("store", store); set("api", client); set("generation", 1)
       set("openCodeManagementGate", OpenCodeManagementGate())
@@ -33,7 +34,7 @@ class OpenCodeManagementControllerTest {
       override suspend fun removeOpenCodeWorktree(expected: OpenCodeProjectInfo, worktree: OpenCodeWorktree, force: Boolean): Boolean { calls++; return true }
     }
     val f = Fixture(client, profile); val target = OpenCodeManagementTarget(profile)
-    f.store.save(profile.copy(url = "https://replacement.example/"), "new", "")
+    f.currentProfiles = listOf(profile.copy(url = "https://replacement.example/"))
     assertTrue(runCatching { f.controller.openCodeProjects(target) }.isFailure)
     assertTrue(runCatching { f.controller.removeOpenCodeWorktree(target, project, worktree, false) }.isFailure)
     assertEquals(0, calls); assertEquals("unsent", f.store.draft(profile.id, "session")); client.close()
@@ -78,7 +79,7 @@ class OpenCodeManagementControllerTest {
     }
     val f = Fixture(client, profile); val before = f.state.value
     val job = async { runCatching { f.controller.openCodeWorktrees(OpenCodeManagementTarget(profile), project) } }
-    entered.await(); f.store.save(profile.copy(url = "https://replacement.example/"), "new", ""); release.complete(Unit)
+    entered.await(); f.currentProfiles = listOf(profile.copy(url = "https://replacement.example/")); release.complete(Unit)
     assertTrue(job.await().isFailure); assertEquals(before, f.state.value); client.close()
   }
 }

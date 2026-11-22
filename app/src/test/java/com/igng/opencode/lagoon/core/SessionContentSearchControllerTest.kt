@@ -6,7 +6,7 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class SessionContentSearchControllerTest {
-  private val profile = ServerProfile("host", "Host", "https://host.example/", kind = ServerKind.DSH)
+  private val profile = ServerProfile("host", "Host", "https://host.example/", protocol = HarnessProtocol.DSH)
   private fun result(query: String = "needle") = SessionContentSearchResult(query, listOf(SessionContentHit("hit", "server snippet")), false)
   private fun base(): HarnessClient = OpenCodeApi(profile, "fixture")
   private class Fixture(client: HarnessClient, profile: ServerProfile) {
@@ -16,9 +16,10 @@ class SessionContentSearchControllerTest {
     val state = MutableStateFlow(LagoonState(profiles = listOf(profile), serverId = profile.id, connected = true,
       capabilities = ApiCapabilities(sessionContentSearch = true)))
     val plain = FakeSharedPreferences(); val secrets = FakeSharedPreferences()
-    val store = ServerStore(plain, secrets, { it }, { it })
+    @Volatile var currentProfiles = listOf(profile)
+    val store = ServerStore(plain, secrets, { it }, { it }) { currentProfiles }
     init {
-      store.save(profile, "saved-password", "saved-cookie"); store.rememberDraft(profile.id, "old", "unsent")
+      store.rememberDraft(profile.id, "old", "unsent")
       fun set(name: String, value: Any?) { LagoonController::class.java.getDeclaredField(name).apply { isAccessible = true }.set(controller, value) }
       set("mutable", state); set("state", state); set("store", store); set("generation", 1); set("api", client)
     }
@@ -51,7 +52,7 @@ class SessionContentSearchControllerTest {
     }
     val f = Fixture(client, profile); val expected = SessionContentSearchTarget(profile)
     val page = f.controller.searchSessionContent(expected, "needle")
-    f.store.save(profile.copy(url = "https://replacement.example/"), "new-password", "")
+    f.currentProfiles = listOf(profile.copy(url = "https://replacement.example/"))
     assertTrue(runCatching { f.controller.searchSessionContent(expected, "later") }.isFailure)
     assertTrue(runCatching { f.controller.openSearchHit(page, "hit") { fail("retargeted") } }.isFailure)
     assertEquals(1, searches); assertEquals(0, lookups)
@@ -94,7 +95,7 @@ class SessionContentSearchControllerTest {
     assertTrue(runCatching { f.controller.openSearchHit(page, "hit") { fail("missing") } }.isFailure)
     mode = "wrong"; assertTrue(runCatching { f.controller.openSearchHit(page, "hit") { fail("wrong") } }.isFailure)
     mode = "late"; val opening = async { runCatching { f.controller.openSearchHit(page, "hit") { fail("late") } } }; entered.await()
-    f.store.save(profile.copy(url = "https://replacement.example/"), "new-password", ""); release.complete(Unit)
+    f.currentProfiles = listOf(profile.copy(url = "https://replacement.example/")); release.complete(Unit)
     assertTrue(opening.await().isFailure); assertTrue(f.state.value.sessions.isEmpty())
     client.close()
   }

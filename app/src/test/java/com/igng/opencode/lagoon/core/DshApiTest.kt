@@ -36,7 +36,7 @@ import java.util.concurrent.TimeUnit
  */
 class DshApiTest {
   private fun profile(server: MockWebServer) =
-    ServerProfile("srv", "DSH", server.url("/").toString().trimEnd('/'), username = "dsh", allowCleartext = true, kind = ServerKind.DSH)
+    ServerProfile("srv", "DSH", server.url("/").toString().trimEnd('/'), username = "dsh", allowCleartext = true, protocol = HarnessProtocol.DSH)
 
   private fun api(server: MockWebServer, token: String = "tok") =
     DshApi(profile(server), ServerCredentials("dsh", token))
@@ -1371,18 +1371,24 @@ class DshApiTest {
     val server = MockWebServer()
     val client = createHarnessClient(profile(server), ServerCredentials("dsh", "tok"))
     assertTrue(client is DshApi)
-    val opencode = createHarnessClient(profile(server).copy(kind = ServerKind.OPENCODE), ServerCredentials("opencode", "pw"))
+    val opencode = createHarnessClient(profile(server).copy(protocol = HarnessProtocol.OPENCODE_NATIVE), ServerCredentials("opencode", "pw"))
     assertTrue(opencode is OpenCodeApi)
     assertFalse(client === opencode)
   }
 
   // ---------------------------------------------------------------- 登录持久化（P0）
 
-  private val signingSecret = ByteArray(32) { (it * 7).toByte() }
-
-  /** 一张由 [signingSecret] 签发、绑定 MockWebServer authority 的浏览器 Cookie（v1）。 */
-  private fun browserCookie(server: MockWebServer, now: Long = System.currentTimeMillis()) =
-    DshCookie.mint(signingSecret, server.url("/"), now)
+  /** 构造一张测试用浏览器 Cookie（v1），仅用于验证客户端有效期判断与续期逻辑。 */
+  private fun browserCookie(server: MockWebServer, now: Long = System.currentTimeMillis()): String {
+    val payload = JSONObject()
+      .put("version", 1)
+      .put("authority", server.url("/").host + ":" + server.port)
+      .put("issuedAt", now - 60_000L)
+      .put("expiresAt", now + 23 * 60 * 60_000L)
+      .toString()
+    val encoded = java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(payload.toByteArray(Charsets.UTF_8))
+    return "dsh-auth-test=v1.$encoded.sig"
+  }
 
   private fun rootWith(pair: String) = MockResponse().setResponseCode(303)
     .addHeader("Set-Cookie", "$pair; Max-Age=2592000; Path=/; HttpOnly; SameSite=Strict")
@@ -1448,7 +1454,7 @@ class DshApiTest {
         DshApi(profile(server), ServerCredentials("dsh", "old-token", browserCookie(server))).rootSessionsPage()
       }.exceptionOrNull()
       assertTrue(failure!!.isAuthFailure)
-      assertTrue(failure.message!!.contains("重新配对"))
+      assertTrue(failure.message!!.contains("重新连接"))
     }
   }
 
@@ -1466,7 +1472,7 @@ class DshApiTest {
     MockWebServer().use { server ->
       val now = System.currentTimeMillis()
       // 签发于 13 小时前：仍然有效，但超过续期阈值。
-      val old = DshCookie.mint(signingSecret, server.url("/"), now - 13 * 60 * 60_000L + DshCookie.CLOCK_SKEW_MILLIS)
+      val old = browserCookie(server, now - 13 * 60 * 60_000L + 60_000L)
       val renewed = browserCookie(server)
       server.dispatcher = object : Dispatcher() {
         override fun dispatch(request: RecordedRequest): MockResponse = when {
@@ -1487,36 +1493,11 @@ class DshApiTest {
     }
   }
 
-  @Test fun secretModeSignsItsOwnCookieWithoutExchange() = runBlocking {
-    MockWebServer().use { server ->
-      server.enqueue(envelope("""{"items":[]}"""))
-      val secret = java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(signingSecret)
-      val persisted = mutableListOf<String>()
-      DshApi(profile(server).copy(dshAuth = DshAuthMode.SECRET), ServerCredentials("dsh", secret), onCookie = { persisted += it }).rootSessionsPage()
-      val list = server.takeRequest()
-      assertEquals("/api/session/list", list.requestUrl!!.encodedPath)
-      val cookie = list.getHeader("Cookie")!!
-      assertTrue(cookie.startsWith(DshCookie.name(DshCookie.authority(server.url("/"))) + "=v1."))
-      assertEquals(1, server.requestCount)
-      assertTrue(persisted.isEmpty())
-    }
-  }
-
-  @Test fun malformedSecretFailsAsAuthProblem() = runBlocking {
-    MockWebServer().use { server ->
-      val failure = runCatching {
-        DshApi(profile(server).copy(dshAuth = DshAuthMode.SECRET), ServerCredentials("dsh", "not-a-secret")).rootSessionsPage()
-      }.exceptionOrNull()
-      assertTrue(failure!!.isAuthFailure)
-      assertEquals(0, server.requestCount)
-    }
-  }
-
   @Test fun untrustedHostIsExplained() = runBlocking {
     MockWebServer().use { server ->
       server.enqueue(MockResponse().setResponseCode(403))
       val failure = runCatching { api(server).rootSessionsPage() }.exceptionOrNull()
-      assertTrue(failure!!.message!!.contains("--trusted-host"))
+      assertTrue(failure!!.message!!.contains("Host 头"))
     }
   }
 
@@ -1847,7 +1828,7 @@ class DshApiTest {
 
   /** 断线缺口只在有限范围内自动补；过大或还没有基线时不补，交给快照校正。 */
   @Test fun gapRepairWindowCoversOnlyBoundedForwardGaps() {
-    val api = DshApi(ServerProfile("srv", "DSH", "http://127.0.0.1:1", username = "dsh", allowCleartext = true, kind = ServerKind.DSH),
+    val api = DshApi(ServerProfile("srv", "DSH", "http://127.0.0.1:1", username = "dsh", allowCleartext = true, protocol = HarnessProtocol.DSH),
       ServerCredentials("dsh", "tok"))
     assertEquals(5L..8L, api.gapRepairWindow(4, 9))
     assertNull("还没有基线时不补", api.gapRepairWindow(0, 9))
@@ -2205,40 +2186,5 @@ class DshApiTest {
       // ……但 Host 可能夹取或丢弃它，所以随后仍要完成 prompt。
       assertEquals("/api/session/prompt", promptPath)
     }
-  }
-
-  @Test fun everyRemoteEndpointDshApiUsesIsAllowlisted() {
-    // DshApi 在远程模式会打到的端点。新增调用时把它加进来，测试就会替你挡住白名单漂移。
-    val used = listOf(
-      "\$events", "\$events/result",
-      "agentPresets/list", "agentPresets/select",
-      "commands/execute", "commands/list",
-      "credentials/describe", "credentials/set", "credentials/unset",
-      "directoryPicker/list", "fileReferences/list",
-      "goals/clear", "goals/complete", "goals/create", "goals/pause", "goals/resume",
-      "job/follow", "job/list",
-      "officeToPdf/render",
-      "permissionPresets/catalog",
-      "pluginManager/listBundles", "pluginManager/listPlugins",
-      "pluginManager/setBundleEnabled", "pluginManager/setPluginEnabled",
-      "schedule/list",
-      "session/cancel", "session/create", "session/follow", "session/fork",
-      "session/list", "session/modelCatalog", "session/page", "session/projections",
-      "session/prompt", "session/rename", "session/selectModel", "session/updateQueue",
-      "settings/describe", "settings/mutate",
-      "subagents/interruptByParent", "subagents/prompt",
-      "userQuestions/answer", "userQuestions/attachWait",
-      "workspace/archiveSession", "workspace/follow", "workspace/unarchiveSession",
-      "workspaceFiles/list", "workspaceFiles/read", "workspaceFiles/readBytes", "workspaceFiles/stat"
-    )
-    val missing = used.filterNot { DshEndpointContract.isRemoteEndpoint(it) }
-    assertEquals("这些端点不在远程白名单里，远程模式会被 METHOD_NOT_ALLOWED 拒绝", emptyList<String>(), missing)
-  }
-
-  @Test fun consumedEventsAreForwarded() {
-    // 只在"确实会被转发"的事件上写处理器；反过来，别为不会被转发的事件写死代码。
-    assertTrue(DshEndpointContract.FORWARDED_EVENTS.containsAll(DshEndpointContract.CONSUMED_EVENTS))
-    assertTrue(DshEndpointContract.CONSUMED_EVENTS.contains("goal/activation-changed"))
-    assertTrue(DshEndpointContract.IGNORED_EVENTS.none { it in DshEndpointContract.CONSUMED_EVENTS })
   }
 }

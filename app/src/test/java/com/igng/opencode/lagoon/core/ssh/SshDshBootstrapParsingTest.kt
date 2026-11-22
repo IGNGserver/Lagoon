@@ -1,16 +1,16 @@
 package com.igng.opencode.lagoon.core.ssh
 
-import com.igng.opencode.lagoon.core.RemoteDshEndpoint
+import com.igng.opencode.lagoon.core.SshDshEndpoint
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
 
-class RemoteDshBootstrapParsingTest {
+class SshDshBootstrapParsingTest {
   @Test fun acceptsOnlyHttpLoopbackWithExplicitValidPort() {
-    val parsed = RemoteDshBootstrap.parseLaunchLine("dsh web: http://127.0.0.1:45678/?token=abc")
-    assertEquals(RemoteDshEndpoint(45678, "abc"), parsed)
-    assertEquals(RemoteDshEndpoint(45679, "abc"),
-      RemoteDshBootstrap.parseLaunchLine("http://localhost:45679/?token=abc"))
+    val parsed = SshDshBootstrap.parseLaunchLine("dsh web: http://127.0.0.1:45678/?token=abc")
+    assertEquals(SshDshEndpoint(45678, "abc"), parsed)
+    assertEquals(SshDshEndpoint(45679, "abc"),
+      SshDshBootstrap.parseLaunchLine("http://localhost:45679/?token=abc"))
   }
 
   @Test fun rejectsPublicHostHttpsDefaultAndInvalidPorts() {
@@ -27,6 +27,6 @@ class RemoteDshBootstrapParsingTest {
       "http://127.0.0.1:45678/?x=y&token=abc",
       "http://127.0.0.1:45678/?token=abc%26x=y",
       "http://127.0.0.1:45678/?token=abc#fragment"
-    ).forEach { assertNull(it, RemoteDshBootstrap.parseLaunchLine(it)) }
+    ).forEach { assertNull(it, SshDshBootstrap.parseLaunchLine(it)) }
   }
 }

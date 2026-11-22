@@ -4,11 +4,13 @@ import android.app.NotificationManager
 import android.content.Context
 import android.content.ContextWrapper
 import android.content.SharedPreferences
+import com.igng.opencode.lagoon.core.ssh.HardwareSshSigner
 import com.igng.opencode.lagoon.core.ssh.SshHostKeyVerifier
 import com.igng.opencode.lagoon.core.ssh.SshHostManager
 import com.igng.opencode.lagoon.core.ssh.SshTransport
 import com.igng.opencode.lagoon.core.ssh.SshTransportFactory
 import com.igng.opencode.lagoon.system.TaskNotifications
+import com.jcraft.jsch.Identity
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -17,126 +19,136 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import org.junit.Assert.*
 import org.junit.Test
 
-/** Exercises the real controller deletion entry points, not just the store's delete implementation. */
+/** Exercises the real controller Harness & Device deletion entry points with pure-SSH DeviceStore. */
 class SshSourceLifecycleTest {
-  @Test fun deletingTheLastHarnessPreservesExactSourceConfigAndEncryptedSecretBytes() {
+  @Test fun deletingTheLastHarnessPreservesDeviceConfigEncryptedSecretsAndDeviceGroup() {
     SshAuthMethod.entries.forEach { auth -> Fixture(auth, leafCount = 1).use { fixture ->
-      val configBytes = fixture.sshPreferences.all.toMap()
       val secretBytes = fixture.sshSecretPreferences.all.toMap()
-      val source = fixture.graphStore.requireGraph().sources.single { it.sshHostConfigId == fixture.host.id }
-      val sibling = fixture.store.readProfiles().single { it.id == "outside" }
       val siblingSecrets = fixture.serverSecretPreferences.all.toMap()
         .filterKeys { !it.startsWith("draft:leaf-0:") }
 
-      fixture.controller.deleteServer("leaf-0")
+      fixture.controller.deleteHarness("leaf-0")
 
-      assertEquals("removing a leaf must not rewrite shared SSH configuration", configBytes, fixture.sshPreferences.all)
-      assertEquals("even the last leaf does not own SSH credentials", secretBytes, fixture.sshSecretPreferences.all)
-      assertEquals(fixture.host, fixture.sshStore.load().single { it.id == fixture.host.id })
-      assertEquals(fixture.hostSecrets, fixture.sshStore.secrets(fixture.host.id))
-      assertEquals(listOf(sibling), fixture.store.readProfiles())
+      assertEquals("even the last harness does not own SSH secrets", secretBytes, fixture.sshSecretPreferences.all)
+      val remainingDevice = fixture.deviceStore.findDevice(fixture.device.id)
+      assertNotNull("empty SSH device must stay manageable", remainingDevice)
+      assertTrue(remainingDevice!!.harnesses.isEmpty())
+      assertEquals(fixture.hostSecrets, fixture.deviceStore.secrets(fixture.device.id))
+      assertEquals(listOf("outside"), fixture.deviceStore.profiles().map { it.id })
       assertEquals(siblingSecrets, fixture.serverSecretPreferences.all)
       assertEquals("outside draft", fixture.store.draft("outside", "session"))
-      assertTrue(fixture.state.value.sshHosts.any { it.id == fixture.host.id })
-      val graph = fixture.graphStore.requireGraph()
-      assertTrue("empty saved sources remain manageable", graph.sources.any { it.id == source.id })
-      assertTrue(graph.hosts.any { it.sourceId == source.id })
-      assertFalse(graph.bindings.any { it.id == "leaf-0" })
-      assertEquals(graph, fixture.controller.connectionGraph.value)
+      assertTrue("device group survives last harness deletion", fixture.groupStore.load().state.groups.any { it.id == "g-target" })
+      assertTrue(fixture.state.value.devices.any { it.id == fixture.device.id })
       assertEquals(0, fixture.transportCalls)
     } }
   }
 
-  @Test fun deletingOneHarnessLeavesItsSiblingPreferencesAndSharedSourceUntouched() {
+  @Test fun deletingOneHarnessLeavesItsSiblingPreferencesAndSharedDeviceUntouched() {
     Fixture(SshAuthMethod.PRIVATE_KEY, leafCount = 2).use { fixture ->
-      val sibling = fixture.store.readProfiles().single { it.id == "leaf-1" }
-      val siblingCredentials = fixture.store.credentials(sibling.id)
-      val configBytes = fixture.sshPreferences.all.toMap()
       val secretBytes = fixture.sshSecretPreferences.all.toMap()
-      val siblingBinding = fixture.graphStore.requireGraph().bindings.single { it.id == sibling.id }
 
-      fixture.controller.deleteServer("leaf-0")
+      fixture.controller.deleteHarness("leaf-0")
 
-      assertEquals(sibling, fixture.store.readProfiles().single { it.id == sibling.id })
-      assertEquals(siblingCredentials, fixture.store.credentials(sibling.id))
-      assertEquals("draft leaf-1", fixture.store.draft(sibling.id, "session"))
-      assertEquals(siblingBinding, fixture.graphStore.requireGraph().bindings.single { it.id == sibling.id })
-      assertEquals(configBytes, fixture.sshPreferences.all)
+      val remaining = fixture.deviceStore.findDevice(fixture.device.id)!!.harnesses.single()
+      assertEquals("leaf-1", remaining.id)
+      assertEquals("draft leaf-1", fixture.store.draft("leaf-1", "session"))
       assertEquals(secretBytes, fixture.sshSecretPreferences.all)
       assertFalse(fixture.state.value.profiles.any { it.id == "leaf-0" })
-      assertTrue(fixture.state.value.profiles.any { it.id == sibling.id })
+      assertTrue(fixture.state.value.profiles.any { it.id == "leaf-1" })
       assertEquals(0, fixture.transportCalls)
     }
   }
 
-  @Test fun explicitlyDeletingAnSshSourceRemovesAllItsLeavesAndSecretsIncludingAnAlreadyEmptySource() {
+  @Test fun explicitlyDeletingAnSshDeviceRemovesAllItsHarnessesAndSecretsIncludingEmptyDevice() {
     SshAuthMethod.entries.forEach { auth -> listOf(0, 2).forEach { leafCount ->
       Fixture(auth, leafCount).use { fixture ->
-        val before = fixture.graphStore.requireGraph()
-        val sourceId = before.sources.single { it.sshHostConfigId == fixture.host.id }.id
-        val outsideProfile = fixture.store.readProfiles().single { it.id == "outside" }
-        val outsideSource = before.sources.single { it.sshHostConfigId == fixture.outsideHost.id }
-        val outsideBinding = before.bindings.single { it.id == "outside" }
         val outsideSecretBytes = fixture.sshSecretPreferences.all.toMap()
-          .filterKeys { it.startsWith("ssh:${fixture.outsideHost.id}:") }
+          .filterKeys { it.startsWith("ssh:${fixture.outsideDevice.id}:") }
         val outsideServerSecretBytes = fixture.serverSecretPreferences.all.toMap()
           .filterKeys { it.startsWith("draft:outside:") }
 
-        fixture.controller.deleteSshHost(fixture.host.id)
+        fixture.controller.deleteDevice(fixture.device.id)
 
-        assertEquals(listOf(fixture.outsideHost), fixture.sshStore.load())
-        assertEquals(SshSecrets(), fixture.sshStore.secrets(fixture.host.id))
-        assertFalse(fixture.sshSecretPreferences.all.keys.any { it.startsWith("ssh:${fixture.host.id}:") })
+        assertEquals(listOf(fixture.outsideDevice.id), fixture.deviceStore.load().map { it.id })
+        assertEquals(SshSecrets(), fixture.deviceStore.secrets(fixture.device.id))
+        assertFalse(fixture.sshSecretPreferences.all.keys.any { it.startsWith("ssh:${fixture.device.id}:") })
         assertEquals(outsideSecretBytes, fixture.sshSecretPreferences.all)
-        assertEquals(listOf(outsideProfile), fixture.store.readProfiles())
+        assertEquals(listOf("outside"), fixture.deviceStore.profiles().map { it.id })
         assertEquals(outsideServerSecretBytes, fixture.serverSecretPreferences.all)
         assertEquals("outside draft", fixture.store.draft("outside", "session"))
-        val graph = fixture.graphStore.requireGraph()
-        assertFalse("explicit deletion must not leave a ghost saved source", graph.sources.any { it.id == sourceId })
-        assertFalse(graph.hosts.any { it.sourceId == sourceId })
-        assertEquals(listOf(outsideBinding), graph.bindings)
-        assertEquals(outsideSource, graph.sources.single())
-        assertEquals(graph, fixture.controller.connectionGraph.value)
-        assertEquals(listOf(fixture.outsideHost), fixture.state.value.sshHosts)
-        assertEquals(listOf(outsideProfile), fixture.state.value.profiles)
+        assertFalse("device group with only deleted device is cleaned up",
+          fixture.groupStore.load().state.groups.any { it.id == "g-target" })
+        assertEquals(listOf(fixture.outsideDevice.id), fixture.state.value.devices.map { it.id })
+        assertEquals(listOf("outside"), fixture.state.value.profiles.map { it.id })
         assertEquals(0, fixture.transportCalls)
       }
     } }
   }
 
   private class Fixture(auth: SshAuthMethod, leafCount: Int) : AutoCloseable {
-    val sshPreferences = FakeSharedPreferences()
+    val devicePreferences = FakeSharedPreferences()
     val sshSecretPreferences = FakeSharedPreferences()
     val serverSecretPreferences = FakeSharedPreferences()
-    private val profilePreferences = FakeSharedPreferences()
-    private val graphPreferences = FakeSharedPreferences()
+    private val serverPreferences = FakeSharedPreferences()
+    private val discoveryPreferences = FakeSharedPreferences()
     private val groupPreferences = FakeSharedPreferences()
+    private val keyPreferences = FakeSharedPreferences()
+    private val keySecretPreferences = FakeSharedPreferences()
     private val otherPreferences = mutableMapOf<String, SharedPreferences>()
     private val scope = CoroutineScope(Job().apply { cancel() } + Dispatchers.Unconfined)
     private val context = object : ContextWrapper(null) {
       override fun getApplicationContext(): Context = this
       override fun getSharedPreferences(name: String, mode: Int): SharedPreferences = when (name) {
-        "servers" -> profilePreferences
+        "servers" -> serverPreferences
         "secrets" -> serverSecretPreferences
-        "ssh-hosts" -> sshPreferences
+        "devices" -> devicePreferences
         "ssh-secrets" -> sshSecretPreferences
-        "connection-graph" -> graphPreferences
         "device-groups" -> groupPreferences
+        "device-discovery" -> discoveryPreferences
         else -> otherPreferences.getOrPut(name) { FakeSharedPreferences() }
       }
     }
-    val host = SshHostConfig("ssh-target", "Saved source", "target.invalid", user = "alice", auth = auth,
-      hostKeyType = "ssh-ed25519", hostKeyFingerprint = "SHA256:fixture-target")
-    val outsideHost = SshHostConfig("ssh-outside", "Other source", "outside.invalid", user = "bob")
+    val harnesses = (0 until leafCount).map { index ->
+      DeviceHarness(
+        id = "leaf-$index",
+        deviceId = "ssh-target",
+        protocol = if (index == 0) HarnessProtocol.DSH else HarnessProtocol.OPENCODE_NATIVE,
+        label = "Harness $index",
+        enabled = index == 0,
+        notifications = index == 0,
+        config = if (index == 0) HarnessConfig.Dsh() else HarnessConfig.OpenCodeNative("/home/alice/service.json")
+      )
+    }
+    val device = SshDevice(
+      id = "ssh-target", name = "Saved device", host = "target.invalid", user = "alice", auth = auth,
+      hostKeyType = "ssh-ed25519", hostKeyFingerprint = "SHA256:fixture-target",
+      harnesses = harnesses
+    )
+    val outsideDevice = SshDevice(
+      id = "ssh-outside", name = "Other device", host = "outside.invalid", user = "bob",
+      harnesses = listOf(DeviceHarness("outside", "ssh-outside", HarnessProtocol.DSH, label = "Unrelated Harness"))
+    )
     val hostSecrets = if (auth == SshAuthMethod.PASSWORD) SshSecrets(password = "fixture password") else
       SshSecrets(privateKey = "fixture private key", passphrase = "fixture passphrase")
-    val sshStore = SshHostStore(sshPreferences, sshSecretPreferences, { "encrypted:$it" }, { it.removePrefix("encrypted:") })
-    val store = ServerStore(profilePreferences, serverSecretPreferences, { "encrypted:$it" },
-      { it.removePrefix("encrypted:") }, context)
-    val graphStore = ConnectionGraphStore(graphPreferences, { store.readProfiles() })
+    val deviceStore = DeviceStore(devicePreferences, sshSecretPreferences, { "encrypted:$it" }, { it.removePrefix("encrypted:") })
+    val groupStore = DeviceGroupStore(groupPreferences)
+    val discoveryStore = DeviceDiscoveryStore(discoveryPreferences)
+    val coordinator: DeviceCoordinator
+    val keyStore = SshKeyStore(keyPreferences, keySecretPreferences, { "encrypted:$it" }, { it.removePrefix("encrypted:") })
+    val keyCoordinator = SshKeyCoordinator(
+      keyStore,
+      object : HardwareSshSigner {
+        override fun generateKey(keyId: String, name: String, requireBiometric: Boolean): SshKeyProfile = error("unused")
+        override fun createIdentity(profile: SshKeyProfile): Identity = error("unused")
+        override fun deleteKey(keyId: String) = Unit
+      },
+      scope
+    )
+    val store = ServerStore(serverPreferences, serverSecretPreferences, { "encrypted:$it" },
+      { it.removePrefix("encrypted:") }, readProfiles = { deviceStore.profiles() })
     var transportCalls = 0
       private set
-    private val manager = SshHostManager(sshStore, object : SshTransportFactory {
+    private val manager = SshHostManager(deviceStore, object : SshTransportFactory {
       override fun connect(config: SshHostConfig, secrets: SshSecrets, verifier: SshHostKeyVerifier): SshTransport {
         transportCalls++
         error("A deletion must not dial SSH")
@@ -152,40 +164,34 @@ class SshSourceLifecycleTest {
     val controller: LagoonController
 
     init {
-      sshStore.save(host, hostSecrets)
-      sshStore.save(outsideHost, SshSecrets(password = "unrelated password"))
-      repeat(leafCount) { index ->
-        store.save(ServerProfile("leaf-$index", "Harness $index", host.profileUrl(), host.user,
-          kind = if (index == 0) ServerKind.DSH else ServerKind.OPENCODE,
-          sshHostId = host.id, sshServicePath = if (index == 0) null else "/home/alice/service.json",
-          enabled = index == 0, notifications = index == 0), null)
-        store.rememberDraft("leaf-$index", "session", "draft leaf-$index")
-      }
-      store.save(ServerProfile("outside", "Unrelated Harness", outsideHost.profileUrl(), outsideHost.user,
-        kind = ServerKind.DSH, sshHostId = outsideHost.id), null)
+      deviceStore.saveDevice(device, hostSecrets)
+      deviceStore.saveDevice(outsideDevice, SshSecrets(password = "unrelated password"))
+      harnesses.forEach { store.rememberDraft(it.id, "session", "draft ${it.id}") }
       store.rememberDraft("outside", "session", "outside draft")
-      val graph = ConnectionCatalogProjection.merge(MigrationProjection.fromProfiles(store.readProfiles()),
-        null, sshStore.load(), emptyList())
-      graphStore.save(graph)
-      state = MutableStateFlow(LagoonState(profiles = store.profiles(), sshHosts = sshStore.load(), allServers = true))
+      groupStore.save(DeviceGroupState(listOf(DeviceGroup("g-target", "Target Group", deviceIds = listOf(device.id)))))
+      coordinator = DeviceCoordinator(deviceStore, discoveryStore, groupStore)
+      state = MutableStateFlow(LagoonState(
+        devices = coordinator.devices(),
+        profiles = coordinator.profiles(),
+        deviceGroups = coordinator.state.value.deviceGroups,
+        allServers = true
+      ))
       controller = allocate(LagoonController::class.java)
       put(controller, "appContext", context)
       put(controller, "store", store)
-      put(controller, "sshHostStore", sshStore)
+      put(controller, "deviceCoordinator", coordinator)
+      put(controller, "sshKeyCoordinator", keyCoordinator)
       put(controller, "sshHostManager", manager)
-      put(controller, "deviceGroupStore", DeviceGroupStore(groupPreferences))
-      put(controller, "connectionGraphStore", graphStore)
-      put(controller, "connectionGraphMutable", MutableStateFlow<ConnectionGraph?>(graph))
-      put(controller, "connectionGraph", field(controller, "connectionGraphMutable"))
-      put(controller, "connectionGraphWritable", true)
       put(controller, "mutable", state)
       put(controller, "state", state)
       put(controller, "scope", scope)
       put(controller, "allOverview", overview)
-      put(controller, "allSnapshots", linkedMapOf<String, ServerOverviewSnapshot>())
+      put(controller, "allSnapshots", java.util.concurrent.ConcurrentHashMap<String, ServerOverviewSnapshot>())
       put(controller, "transcriptMemory", TranscriptMemory())
+      put(controller, "sessionViewsStorage", SessionViewCache())
+      put(controller, "conversationPoolStorage", ConversationStorePool())
+      put(controller, "choicesCacheStorage", ChoicesCache())
       put(controller, "cache", OfflineCache(FakeSharedPreferences(), { it }, { it }, scope))
-      // Android stubs safely accept cancel(); bypass only notification channel initialization.
       val notifications = allocate(TaskNotifications::class.java)
       put(notifications, "manager", allocate(NotificationManager::class.java))
       put(controller, "notifications", notifications)

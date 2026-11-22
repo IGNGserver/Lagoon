@@ -12,7 +12,7 @@ import org.junit.Test
 class ScheduleApiTest {
   private fun client(server: MockWebServer) = DshApi(
     ServerProfile("schedule-test", "DSH", server.url("/").toString().trimEnd('/'),
-      allowCleartext = true, kind = ServerKind.DSH),
+      allowCleartext = true, protocol = HarnessProtocol.DSH),
     ServerCredentials("dsh", cookie = "dsh-auth-schedule=test")
   )
 

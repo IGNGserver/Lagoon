@@ -81,11 +81,11 @@ class SshKeyStoreTest {
     )
   }
 
-  @Test fun sshHostStorePreservesBothKeyAndPasswordInFallbackMode() {
+  @Test fun deviceStorePreservesBothKeyAndPasswordInFallbackMode() {
     val prefs = MapPreferences()
     val secretsPrefs = MapPreferences()
-    val store = SshHostStore(prefs, secretsPrefs, { "enc:$it" }, { it.removePrefix("enc:") })
-    val host = SshHostConfig(
+    val store = DeviceStore(prefs, secretsPrefs, { "enc:$it" }, { it.removePrefix("enc:") })
+    val device = SshDevice(
       id = "h-fb",
       name = "fb",
       host = "host",
@@ -99,11 +99,11 @@ class SshKeyStoreTest {
       passphrase = "pass",
       certificate = "ssh-ed25519-cert-v01@openssh.com AAAA test"
     )
-    store.save(host, secrets)
+    store.saveDevice(device, secrets)
     assertEquals(secrets, store.secrets("h-fb"))
 
     // Switching to PASSWORD removes private key, passphrase and certificate.
-    store.save(host.copyWith(auth = SshAuthMethod.PASSWORD, clearKeyId = true), SshSecrets(password = "pw2"))
+    store.saveDevice(device.copyEndpoint(auth = SshAuthMethod.PASSWORD, clearKeyId = true), SshSecrets(password = "pw2"))
     val afterPw = store.secrets("h-fb")
     assertEquals("pw2", afterPw.password)
     assertNull(afterPw.privateKey)

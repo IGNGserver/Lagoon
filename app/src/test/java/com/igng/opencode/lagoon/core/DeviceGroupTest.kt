@@ -6,49 +6,47 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class DeviceGroupTest {
-  private fun profile(id: String, name: String = id, kind: ServerKind = ServerKind.OPENCODE) =
-    ServerProfile(id, name, "https://example.test", kind = kind)
+  private fun profile(id: String, deviceId: String, protocol: HarnessProtocol = HarnessProtocol.OPENCODE_NATIVE) =
+    ServerProfile(id, id, "ssh://me@$deviceId:22", username = "me", protocol = protocol, deviceId = deviceId)
+
+  private fun device(id: String) = SshDevice(id, id, "$id.test", user = "me")
 
   @Test fun codecRoundTripsGroupsAndSelection() {
     val state = DeviceGroupState(
-      groups = listOf(DeviceGroup("g1", "MacBook", listOf("p1", "p2"), updatedAt = 42), DeviceGroup("g2", "Studio", listOf("p3"))),
+      groups = listOf(
+        DeviceGroup("g1", "MacBook", deviceIds = listOf("d1", "d2"), updatedAt = 42),
+        DeviceGroup("g2", "Studio", deviceIds = listOf("d3"))
+      ),
       selectedGroupId = "g2"
     )
     val decoded = DeviceGroupCodec.decode(DeviceGroupCodec.encode(state))
     assertEquals(state, decoded)
   }
 
-  @Test fun codecKeepsDeviceMembershipSoNewHarnessesJoinLater() {
-    val state = DeviceGroupState(
-      groups = listOf(DeviceGroup("g1", "MacBook", listOf("leaf-1"), deviceIds = listOf("host-1")))
-    )
-    val decoded = DeviceGroupCodec.decode(DeviceGroupCodec.encode(state))
-    assertEquals(listOf("host-1"), decoded.groups.single().deviceIds)
-    assertEquals(listOf("leaf-1"), decoded.groups.single().memberIds)
-  }
-
-  @Test fun v2GroupsWithoutDeviceIdsStillDecode() {
+  @Test fun v2GroupsWithoutDeviceIdsDecodeIntoLegacyMemberIdsForMigration() {
     val legacy = """{"version":2,"selected":null,"groups":[{"id":"g1","name":"Old","members":["p1"],"updatedAt":1}]}"""
     val decoded = DeviceGroupCodec.decode(legacy)
-    assertEquals(listOf("p1"), decoded.groups.single().memberIds)
+    assertEquals(listOf("p1"), decoded.groups.single().legacyMemberIds)
     assertTrue(decoded.groups.single().deviceIds.isEmpty())
   }
 
   @Test fun aDeviceGroupSurvivesWhileItsDeviceHasNoAttachedHarness() {
-    val group = DeviceGroup("g1", "Just adopted", memberIds = emptyList(), deviceIds = listOf("host-1"))
+    val group = DeviceGroup("g1", "Just added", deviceIds = listOf("ssh-1"))
     val state = DeviceGroupState(listOf(group), "g1")
-
-    val clean = state.sanitized(profileIds = emptySet(), deviceIds = setOf("host-1"))
+    val clean = state.sanitized(validDeviceIds = setOf("ssh-1"))
     assertEquals(listOf("g1"), clean.groups.map { it.id })
-    assertEquals(listOf("host-1"), clean.groups.single().deviceIds)
+    assertEquals(listOf("ssh-1"), clean.groups.single().deviceIds)
     assertEquals("g1", clean.selectedGroupId)
+    assertTrue(group.memberHarnessIds(emptyList<ServerProfile>()).isEmpty())
+  }
 
-    // 删除这台设备上最后一条 Harness 时，分组本身不能跟着被删掉。
-    val withoutLastLeaf = DeviceGroupState(
-      listOf(group.copy(memberIds = listOf("leaf-1"))), "g1"
-    ).withoutProfile("leaf-1")
-    assertEquals(listOf("g1"), withoutLastLeaf.groups.map { it.id })
-    assertTrue(withoutLastLeaf.groups.single().memberIds.isEmpty())
+  @Test fun groupDynamicallyExpandsWhenHarnessesAreAddedOrRemovedOnMemberDevice() {
+    val group = DeviceGroup("g1", "Dev", deviceIds = listOf("ssh-1"))
+    val p1 = profile("h1", "ssh-1", HarnessProtocol.DSH)
+    val p2 = profile("h2", "ssh-1", HarnessProtocol.CODEX)
+    val other = profile("h3", "ssh-2", HarnessProtocol.DSH)
+    assertEquals(listOf("h1", "h2"), group.memberHarnessIds(listOf(p1, p2, other)))
+    assertEquals(listOf("h1"), group.memberHarnessIds(listOf(p1, other)))
   }
 
   @Test fun corruptCodecFailsWithoutThrowingJson() {
@@ -61,56 +59,46 @@ class DeviceGroupTest {
   @Test fun sanitizeDropsUnknownDuplicatesAndEmptyGroups() {
     val state = DeviceGroupState(
       groups = listOf(
-        DeviceGroup("g1", "A", listOf("p1", "missing", "p1", "p2")),
-        DeviceGroup("g1", "duplicate id", listOf("p3")),
-        DeviceGroup("g2", "empty", listOf("missing")),
-        DeviceGroup("g3", "  B  ", listOf("p2", "p3", "p2"))
+        DeviceGroup("g1", "A", deviceIds = listOf("d1", "missing", "d1", "d2")),
+        DeviceGroup("g1", "duplicate id", deviceIds = listOf("d3")),
+        DeviceGroup("g2", "empty", deviceIds = listOf("missing")),
+        DeviceGroup("g3", "  B  ", deviceIds = listOf("d2", "d3", "d2"))
       ),
       selectedGroupId = "g2"
     )
-    val clean = state.sanitized(setOf("p1", "p2", "p3"))
+    val clean = state.sanitized(setOf("d1", "d2", "d3"))
     assertEquals(listOf("g1", "g3"), clean.groups.map { it.id })
-    assertEquals(listOf("p1", "p2"), clean.groups[0].memberIds)
-    assertEquals(listOf("p2", "p3"), clean.groups[1].memberIds)
+    assertEquals(listOf("d1", "d2"), clean.groups[0].deviceIds)
+    assertEquals(listOf("d2", "d3"), clean.groups[1].deviceIds)
     assertEquals("B", clean.groups[1].name)
     assertNull(clean.selectedGroupId)
   }
 
-  @Test fun tabsOnlyContainExplicitGroups() {
-    val state = DeviceGroupState(listOf(DeviceGroup("g1", "MacBook", listOf("p1", "p2"))))
-    val tabs = state.tabs(listOf(profile("p1"), profile("p2"), profile("p3")))
+  @Test fun tabsOnlyContainExplicitGroupsAndUngroupedDevicesStaySeparate() {
+    val state = DeviceGroupState(listOf(DeviceGroup("g1", "MacBook", deviceIds = listOf("d1", "d2"))))
+    val profiles = listOf(profile("p1", "d1"), profile("p2", "d2"), profile("p3", "d3"))
+    val tabs = state.tabs(profiles)
     assertEquals(listOf("group:g1"), tabs.map { it.id })
     assertEquals(listOf("p1", "p2"), tabs[0].profiles.map { it.id })
     assertTrue(tabs[0].isGroup)
-    assertEquals(listOf("p3"), state.ungrouped(listOf(profile("p1"), profile("p2"), profile("p3"))).map { it.id })
+    assertEquals(listOf("d3"), state.ungroupedDevices(listOf(device("d1"), device("d2"), device("d3"))).map { it.id })
   }
 
-  @Test fun deviceRoleDistinguishesHostsFromHarnesses() {
-    val ssh = profile("ssh").copy(sshHostId = "ssh-1", kind = ServerKind.DSH)
-    val remote = profile("remote", kind = ServerKind.DSH_REMOTE)
-    val opencode = profile("oc")
-    val legacy = profile("legacy", kind = ServerKind.DSH)
-    assertEquals(DeviceMemberRole.DEVICE, ssh.deviceMemberRole)
-    assertEquals(DeviceMemberRole.DEVICE, remote.deviceMemberRole)
-    assertEquals(DeviceMemberRole.HARNESS, opencode.deviceMemberRole)
-    assertEquals(DeviceMemberRole.HARNESS, legacy.deviceMemberRole)
-  }
+  @Test fun connectionTypeLabelsAndSummariesAreUnifiedForAllFiveProtocols() {
+    val dsh = profile("dsh", "ssh-1", HarnessProtocol.DSH).copy(url = "ssh://me@server:22")
+    val oc = profile("oc", "ssh-1", HarnessProtocol.OPENCODE_NATIVE).copy(url = "ssh://me@server:22")
+    val acp = profile("acp", "ssh-1", HarnessProtocol.OPENCODE_ACP).copy(url = "ssh://me@server:22")
+    val codex = profile("codex", "ssh-1", HarnessProtocol.CODEX).copy(url = "ssh://me@server:22")
+    val agy = profile("agy", "ssh-1", HarnessProtocol.ANTIGRAVITY_ACP).copy(url = "ssh://me@server:22")
 
-  @Test fun connectionTypeLabelsAndSummariesAreUnified() {
-    val ssh = profile("ssh").copy(sshHostId = "ssh-1", kind = ServerKind.DSH, url = "ssh://me@server:22")
-    val remote = profile("remote").copy(kind = ServerKind.DSH_REMOTE, remoteHostId = "host-12345678-abcd", url = "https://hub.example.com")
-    val opencode = profile("oc").copy(url = "https://opencode.example.com")
-    val legacy = profile("legacy").copy(kind = ServerKind.DSH, url = "http://localhost:3000")
+    assertEquals("DeepSeek Harness · SSH", dsh.connectionTypeLabel)
+    assertEquals("OpenCode · SSH", oc.connectionTypeLabel)
+    assertEquals("OpenCode ACP · SSH", acp.connectionTypeLabel)
+    assertEquals("Codex · SSH", codex.connectionTypeLabel)
+    assertEquals("Antigravity · SSH", agy.connectionTypeLabel)
 
-    assertEquals("DSH SSH 直连", ssh.connectionTypeLabel)
-    assertEquals("DSH 远程中枢", remote.connectionTypeLabel)
-    assertEquals("OpenCode 直连", opencode.connectionTypeLabel)
-    assertEquals("旧版直连 DSH", legacy.connectionTypeLabel)
-
-    assertEquals("DSH SSH 直连 · me@server:22", ssh.endpointSummary)
-    assertEquals("DSH 远程中枢 · host-123", remote.endpointSummary)
-    assertEquals("OpenCode 直连 · https://opencode.example.com", opencode.endpointSummary)
-    assertEquals("旧版直连 DSH · http://localhost:3000", legacy.endpointSummary)
+    assertEquals("DeepSeek Harness · me@server:22", dsh.endpointSummary)
+    assertEquals("Codex · me@server:22", codex.endpointSummary)
   }
 
   @Test fun codecRejectsVersionOne() {
@@ -156,5 +144,4 @@ class DeviceGroupTest {
     val b = deviceWorkspaces(listOf(session), listOf(p), "g2").single().key
     assertTrue(a != b)
   }
-
 }

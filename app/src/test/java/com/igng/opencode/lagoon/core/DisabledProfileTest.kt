@@ -14,6 +14,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -25,28 +26,21 @@ class DisabledProfileTest {
   private fun store() = ServerStore(FakeSharedPreferences(), FakeSharedPreferences(), { "enc:$it" }, { it.removePrefix("enc:") })
   private fun cache() = OfflineCache(FakeSharedPreferences(), { it }, { it })
 
-  @Test fun enabledDefaultsToTrueForLegacyDocumentsAndRoundTrips() {
+  @Test fun enabledDefaultsToTrueAndTogglesOnDeviceHarnessWithoutLosingSecrets() {
     val prefs = FakeSharedPreferences()
     val secrets = FakeSharedPreferences()
-    val store = ServerStore(prefs, secrets, { "enc:$it" }, { it.removePrefix("enc:") })
-    val legacy = JSONObject()
-      .put("id", "legacy").put("name", "Legacy").put("url", "https://legacy.example")
-      .put("username", "opencode").put("autoConnect", true).put("notifications", true)
-      .put("allowCleartext", false).put("kind", "opencode")
-    prefs.edit().putString("profiles", JSONArray().put(legacy).toString()).commit()
-    assertTrue(store.profiles().single().enabled)
+    val deviceStore = DeviceStore(prefs, secrets, { "enc:$it" }, { it.removePrefix("enc:") })
+    val harness = DeviceHarness("a", "d1", HarnessProtocol.OPENCODE_NATIVE)
+    val device = SshDevice("d1", "A", "a.example", user = "dev", harnesses = listOf(harness))
+    deviceStore.saveDevice(device, SshSecrets(password = "secret"))
+    assertTrue(deviceStore.profiles().single().enabled)
 
-    val profile = ServerProfile("a", "A", "https://a.example")
-    store.save(profile, password = "secret")
-    assertTrue(store.setProfileEnabled("a", false))
-    assertFalse(store.profiles().first { it.id == "a" }.enabled)
-    assertEquals("secret", store.credentials("a").password)
-    assertEquals(false, JSONArray(prefs.getString("profiles", "[]")).let { array ->
-      (0 until array.length()).map { array.getJSONObject(it) }.first { it.getString("id") == "a" }.getBoolean("enabled")
-    })
-    assertTrue(store.setProfileEnabled("a", true))
-    assertTrue(store.profiles().first { it.id == "a" }.enabled)
-    assertFalse(store.setProfileEnabled("missing", false))
+    assertNotNull(deviceStore.setHarnessEnabled("a", false))
+    assertFalse(deviceStore.profiles().first { it.id == "a" }.enabled)
+    assertEquals("secret", deviceStore.secrets("d1").password)
+    assertNotNull(deviceStore.setHarnessEnabled("a", true))
+    assertTrue(deviceStore.profiles().first { it.id == "a" }.enabled)
+    assertNull(deviceStore.setHarnessEnabled("missing", false))
   }
 
   @Test fun disabledSnapshotIsExcludedFromTheHomeAndGlobalSummary() {
@@ -108,9 +102,9 @@ class DisabledProfileTest {
   }
 
   @Test fun groupTabsAndProjectionOnlyUseEnabledMembers() {
-    val disabled = ServerProfile("a", "A", "https://a.example", enabled = false)
-    val enabled = ServerProfile("b", "B", "https://b.example")
-    val group = DeviceGroup("g", "Group", listOf("a", "b"))
+    val disabled = ServerProfile("a", "A", "https://a.example", deviceId = "d-a", enabled = false)
+    val enabled = ServerProfile("b", "B", "https://b.example", deviceId = "d-b")
+    val group = DeviceGroup("g", "Group", deviceIds = listOf("d-a", "d-b"))
     val state = LagoonState(
       profiles = listOf(disabled, enabled), deviceGroups = listOf(group), homeGroupId = "g", allServers = false,
       serverId = "a", allServerSnapshots = mapOf(
@@ -142,20 +136,19 @@ class DisabledProfileTest {
           }
         }
       }
-      val store = store()
-      val profile = ServerProfile("a", "A", server.url("/").toString(), allowCleartext = true, enabled = false)
-      store.save(profile, null)
+      var currentProfiles = listOf(ServerProfile("a", "A", server.url("/").toString(), allowCleartext = true, enabled = false))
+      val store = ServerStore(FakeSharedPreferences(), FakeSharedPreferences(), { "enc:$it" }, { it.removePrefix("enc:") }) { currentProfiles }
       val scope = CoroutineScope(coroutineContext + SupervisorJob())
       val snapshots = ConcurrentHashMap<String, ServerOverviewSnapshot>()
       val manager = AllServersOverview(store, cache(), scope, { snapshots[it.serverId] = it })
       try {
-        manager.start(store.profiles(), include = setOf("a"))
+        manager.start(currentProfiles, include = setOf("a"))
         delay(350)
         assertEquals("禁用连接不应发出任何请求", 0, requests.get())
         assertNull(snapshots["a"])
 
-        assertTrue(store.setProfileEnabled("a", true))
-        manager.start(store.profiles(), include = setOf("a"))
+        currentProfiles = listOf(currentProfiles.single().copy(enabled = true))
+        manager.start(currentProfiles, include = setOf("a"))
         // Polls a strict condition, so the timeout only bounds patience; 8 s turned runner load into a
         // false failure in the release job (see PersistentConnectionsTest.awaitCondition).
         withTimeout(25_000) { while (snapshots["a"]?.connected != true) delay(20) }

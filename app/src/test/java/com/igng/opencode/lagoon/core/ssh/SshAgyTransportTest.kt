@@ -70,11 +70,16 @@ class SshAgyTransportTest {
   @Test fun hostManagerRoutesTheAgyLeafToAgyRatherThanCodex() = runBlocking {
     val wire = FakeChannel()
     val ssh = FakeSsh(wire)
-    val store = SshHostStore(FakeSharedPreferences(), FakeSharedPreferences(), { it }, { it })
-    store.save(config, SshSecrets(password = "secret"))
+    val store = DeviceStore(FakeSharedPreferences(), FakeSharedPreferences(), { it }, { it })
+    val harness = DeviceHarness("agy-leaf", config.id, HarnessProtocol.ANTIGRAVITY_ACP, label = "AGY")
+    val device = SshDevice(
+      id = config.id, name = config.name, host = config.host, port = config.port, user = config.user,
+      auth = config.auth, hostKeyType = config.hostKeyType, hostKeyFingerprint = config.hostKeyFingerprint,
+      harnesses = listOf(harness)
+    )
+    store.saveDevice(device, SshSecrets(password = "secret"))
     val manager = SshHostManager(store, FakeFactory(ssh))
-    val profile = ServerProfile("agy-leaf", "AGY", config.profileUrl(), username = config.user,
-      kind = ServerKind.CODEX, sshHostId = config.id, protocolId = HarnessProtocolId.ANTIGRAVITY_ACP)
+    val profile = harness.toProfile(device)
     val client = manager.client(profile)
     try {
       val health = async(Dispatchers.IO) { client.health() }

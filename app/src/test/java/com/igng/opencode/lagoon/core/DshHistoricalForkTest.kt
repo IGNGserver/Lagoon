@@ -13,7 +13,7 @@ class DshHistoricalForkTest {
   private fun response(id: Any) = MockResponse().setBody(JSONObject().put("type", "server-response")
     .put("result", JSONObject().put("ok", true).put("value", JSONObject().put("sessionId", id))).toString())
   private fun client(server: MockWebServer) = DshApi(ServerProfile("host", "Host", server.url("/").toString(),
-    allowCleartext = true, kind = ServerKind.DSH), ServerCredentials("dsh", "token"))
+    allowCleartext = true, protocol = HarnessProtocol.DSH), ServerCredentials("dsh", "token"))
   private val session = Session("source", "/repo", "Source", 1, parentId = "parent", archived = true)
 
   @Test fun exactInclusiveNativeSequenceAndDefaultPrefixHaveDistinctOfficialRequests() = runBlocking {
@@ -60,7 +60,7 @@ class DshHistoricalForkTest {
   }
 
   @Test fun onlyExactNumericDurableSequencesCanBecomeHistoricalPositions() = runBlocking {
-    val api = DshApi(ServerProfile("host", "Host", "https://fixture.invalid", kind = ServerKind.DSH), "")
+    val api = DshApi(ServerProfile("host", "Host", "https://fixture.invalid", protocol = HarnessProtocol.DSH), "")
     try {
       for (raw in listOf<Any>("7", 7.5, -1, 0, 9_007_199_254_740_992L)) {
         val event = JSONObject().put("type", "user/message").put("seq", raw).put("time", 1)

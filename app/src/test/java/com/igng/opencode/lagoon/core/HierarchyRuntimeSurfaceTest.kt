@@ -16,23 +16,36 @@ import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
-/** Parent gates affect runtime surfaces, never the saved leaf preference, group IDs or cache. */
+/** Device gates affect runtime surfaces, never the saved Harness preference, group IDs or cache. */
 class HierarchyRuntimeSurfaceTest {
-  private val allowed = ServerProfile("allowed", "Allowed", "https://allowed.example")
-  private val denied = ServerProfile("denied", "Denied", "https://denied.example", parentEnabled = false)
+  private val allowed = ServerProfile(
+    "allowed", "Allowed", "ssh://me@allowed.example:22",
+    protocol = HarnessProtocol.DSH, deviceId = "dev-allowed", deviceEnabled = true
+  )
+  private val denied = ServerProfile(
+    "denied", "Denied", "ssh://me@denied.example:22",
+    protocol = HarnessProtocol.DSH, deviceId = "dev-denied", deviceEnabled = false
+  )
 
-  @Test fun overviewNeverDialsDisabledParentEvenWhenSelectedAndIncluded() = runBlocking {
-    val store = ServerStore(memoryPreferences(), memoryPreferences(), { it }, { it })
-    val profile = denied.copy(kind = ServerKind.DSH, sshHostId = "ssh-source")
-    store.save(profile, password = null)
+  @Test fun overviewNeverDialsDisabledDeviceEvenWhenSelectedAndIncluded() = runBlocking {
+    val deviceStore = DeviceStore(memoryPreferences(), memoryPreferences(), { it }, { it })
+    val dev = SshDevice(
+      id = "dev-denied", name = "Denied", host = "denied.example", user = "me", enabled = false,
+      harnesses = listOf(DeviceHarness("denied", "dev-denied", HarnessProtocol.DSH, enabled = true))
+    )
+    deviceStore.saveDevice(dev, SshSecrets(password = "pw"))
+    val store = ServerStore(memoryPreferences(), memoryPreferences(), { it }, { it }, readProfiles = { deviceStore.profiles() })
+    val profile = deviceStore.profiles().single()
     val cache = OfflineCache(memoryPreferences(), { it }, { it })
     var created = 0
     var closed = 0
     val scope = CoroutineScope(coroutineContext + SupervisorJob())
     val snapshots = mutableMapOf<String, ServerOverviewSnapshot>()
-    val overview = AllServersOverview(store, cache, scope, { snapshots[it.serverId] = it },
+    val overview = AllServersOverview(
+      store, cache, scope, { snapshots[it.serverId] = it },
       selectedServer = { profile.id }, onSnapshotRemoved = { snapshots.remove(it) },
-      sshClientFactory = { _, _ -> created++; fakeClient { closed++ } })
+      sshClientFactory = { _, _ -> created++; fakeClient { closed++ } }
+    )
     try {
       overview.start(listOf(profile), include = setOf(profile.id))
       yield()
@@ -40,35 +53,39 @@ class HierarchyRuntimeSurfaceTest {
       assertTrue(snapshots.isEmpty())
       assertTrue(runCatching { overview.client(profile.id) }.isFailure)
 
-      // Enabling only the parent starts the existing leaf, without rewriting its local preference.
-      overview.start(listOf(profile.copy(parentEnabled = true)), include = setOf(profile.id))
+      deviceStore.setDeviceEnabled(dev.id, true)
+      overview.start(deviceStore.profiles(), include = setOf(profile.id))
       withTimeout(5_000) { while (snapshots[profile.id]?.connected != true) yield() }
       assertEquals(1, created)
       val client = overview.client(profile.id)
       assertSame(client, overview.client(profile.id))
 
-      overview.start(listOf(profile), include = setOf(profile.id))
+      deviceStore.setDeviceEnabled(dev.id, false)
+      overview.start(deviceStore.profiles(), include = setOf(profile.id))
       yield()
       assertEquals(1, created)
       assertEquals(1, closed)
       assertTrue(snapshots.isEmpty())
       assertTrue(runCatching { overview.client(profile.id) }.isFailure)
-      assertTrue(store.profiles().single().enabled)
+      assertTrue(deviceStore.profiles().single().enabled)
     } finally {
       overview.stop()
       scope.cancel()
     }
   }
 
-  @Test fun groupAndAllHomeExcludeDeniedParentsEvenWithOldEnabledSnapshots() {
-    val group = DeviceGroup("stable-group", "Group", listOf(denied.id, allowed.id))
-    val state = LagoonState(profiles = listOf(denied, allowed), deviceGroups = listOf(group), homeGroupId = group.id,
+  @Test fun groupAndAllHomeExcludeDeniedDevicesEvenWithOldEnabledSnapshots() {
+    val group = DeviceGroup("stable-group", "Group", deviceIds = listOf("dev-denied", "dev-allowed"))
+    val state = LagoonState(
+      profiles = listOf(denied, allowed), deviceGroups = listOf(group), homeGroupId = group.id,
       serverId = denied.id, homeServerId = denied.id, connected = true,
       sessions = snapshot(denied, TaskPhase.THINKING).sessions,
       tasks = snapshot(denied, TaskPhase.THINKING).tasks, summary = TaskSummary(running = 1),
-      // A persisted snapshot can still carry yesterday's enabled profile; today's parents win.
-      allServerSnapshots = mapOf(denied.id to snapshot(denied.copy(parentEnabled = true), TaskPhase.THINKING),
-        allowed.id to snapshot(allowed, TaskPhase.WAITING_QUESTION)))
+      allServerSnapshots = mapOf(
+        denied.id to snapshot(denied.copy(deviceEnabled = true), TaskPhase.THINKING),
+        allowed.id to snapshot(allowed, TaskPhase.WAITING_QUESTION)
+      )
+    )
 
     assertTrue(denied.enabled)
     assertFalse(denied.effectiveEnabled)
@@ -85,7 +102,7 @@ class HierarchyRuntimeSurfaceTest {
 
     val home = state.homeProjection()
     assertEquals(group.id, home.homeGroupId)
-    assertEquals(group.memberIds, home.deviceGroups.single().memberIds)
+    assertEquals(group.deviceIds, home.deviceGroups.single().deviceIds)
     assertEquals(allowed.id, home.serverId)
     assertEquals(listOf(allowed.id), home.sessions.map { it.serverId })
     assertEquals(setOf(scopedKey(allowed.id, "same")), home.allSessionStatuses.keys)
@@ -94,7 +111,6 @@ class HierarchyRuntimeSurfaceTest {
     assertEquals(1, home.summary.waiting)
     assertEquals(1, home.summary.completed)
     assertSame(home, state.homeProjection())
-    // Projection neither deletes nor replaces the hidden server's cached snapshot.
     assertEquals(setOf(denied.id, allowed.id), state.allServerSnapshots.keys)
 
     val all = state.copy(homeGroupId = null, allServers = true).homeProjection()
@@ -105,16 +121,19 @@ class HierarchyRuntimeSurfaceTest {
   }
 
   @Test fun allDeniedGroupKeepsItsIdentityAndDoesNotFallBackToAnOutsideConnection() {
-    val group = DeviceGroup("stable-group", "Group", listOf(denied.id))
-    val state = LagoonState(profiles = listOf(denied, allowed), deviceGroups = listOf(group), homeGroupId = group.id,
+    val group = DeviceGroup("stable-group", "Group", deviceIds = listOf("dev-denied"))
+    val state = LagoonState(
+      profiles = listOf(denied, allowed), deviceGroups = listOf(group), homeGroupId = group.id,
       serverId = denied.id, homeServerId = allowed.id, connected = true,
       sessions = snapshot(denied, TaskPhase.THINKING).sessions, tasks = snapshot(denied, TaskPhase.THINKING).tasks,
       summary = TaskSummary(running = 1), allServerSnapshots = mapOf(
-        denied.id to snapshot(denied, TaskPhase.THINKING), allowed.id to snapshot(allowed, TaskPhase.THINKING)))
+        denied.id to snapshot(denied, TaskPhase.THINKING), allowed.id to snapshot(allowed, TaskPhase.THINKING)
+      )
+    )
 
     val home = state.homeProjection()
     assertEquals(group.id, home.homeGroupId)
-    assertEquals(group.memberIds, home.deviceGroups.single().memberIds)
+    assertEquals(group.deviceIds, home.deviceGroups.single().deviceIds)
     assertFalse(home.allServers)
     assertNull(home.serverId)
     assertNull(home.homeServerId)
@@ -130,10 +149,12 @@ class HierarchyRuntimeSurfaceTest {
   }
 
   @Test fun singleHomeFallsBackToAllowedProfileWithoutLeakingDeniedSummary() {
-    val state = LagoonState(profiles = listOf(denied, allowed), serverId = denied.id, homeServerId = denied.id,
+    val state = LagoonState(
+      profiles = listOf(denied, allowed), serverId = denied.id, homeServerId = denied.id,
       sessions = snapshot(denied, TaskPhase.THINKING).sessions, tasks = snapshot(denied, TaskPhase.THINKING).tasks,
       backgroundRunning = setOf("background"), summary = TaskSummary(running = 1),
-      allServerSnapshots = mapOf(denied.id to snapshot(denied, TaskPhase.THINKING)))
+      allServerSnapshots = mapOf(denied.id to snapshot(denied, TaskPhase.THINKING))
+    )
 
     assertTrue(state.globalSummary.isEmpty)
     assertNull(state.globalSummaryTarget)
@@ -147,10 +168,12 @@ class HierarchyRuntimeSurfaceTest {
     assertTrue(home.backgroundRunning.isEmpty())
   }
 
-  @Test fun allParentsDeniedProducesEmptyHomeAndNoSystemSummary() {
-    val state = LagoonState(profiles = listOf(denied), serverId = denied.id, homeServerId = denied.id, connected = true,
+  @Test fun allDevicesDeniedProducesEmptyHomeAndNoSystemSummary() {
+    val state = LagoonState(
+      profiles = listOf(denied), serverId = denied.id, homeServerId = denied.id, connected = true,
       sessions = snapshot(denied, TaskPhase.THINKING).sessions, tasks = snapshot(denied, TaskPhase.THINKING).tasks,
-      summary = TaskSummary(running = 1), allServerSnapshots = mapOf(denied.id to snapshot(denied, TaskPhase.THINKING)))
+      summary = TaskSummary(running = 1), allServerSnapshots = mapOf(denied.id to snapshot(denied, TaskPhase.THINKING))
+    )
 
     assertTrue(state.globalSummary.isEmpty)
     assertTrue(state.copy(allServerSnapshots = emptyMap()).globalSummary.isEmpty)
@@ -167,9 +190,9 @@ class HierarchyRuntimeSurfaceTest {
     profile.id, profile, connected = true, loading = false,
     sessions = listOf(Session("same", "/repo", profile.name, 1, serverId = profile.id)),
     tasks = mapOf("same" to TaskState("same", phase)),
-    notices = listOf(SessionNotice("notice", "result", 1, false)), backgroundRunning = setOf("background"))
+    notices = listOf(SessionNotice("notice", "result", 1, false)), backgroundRunning = setOf("background")
+  )
 
-  /** Same minimal proxy pattern as OverviewReconciliationTest; no HTTP, SSH or Android calls. */
   private fun fakeClient(onClose: () -> Unit): HarnessClient {
     var closed = false
     return Proxy.newProxyInstance(javaClass.classLoader, arrayOf(HarnessClient::class.java)) { proxy, method, args ->

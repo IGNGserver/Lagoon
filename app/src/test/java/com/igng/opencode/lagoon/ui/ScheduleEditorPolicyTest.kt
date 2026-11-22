@@ -5,13 +5,13 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class ScheduleEditorPolicyTest {
-  private val profile = ServerProfile("server", "Host", "https://host.example", kind = ServerKind.DSH)
+  private val profile = ServerProfile("server", "Host", "ssh://user@host:22", protocol = HarnessProtocol.DSH)
   private val record = ScheduleRecord("schedule", "daily", "Original", "Original\nfull prompt", "2026-11-12T09:00:00+08:00", time = "09:00:00", timeZone = "Asia/Shanghai")
   private val target = ScheduleMutationTarget(profile, "session", record.id, record)
   private val draft = ScheduleTimingDraft.from(record)
   private fun state() = LagoonState(profiles = listOf(profile), serverId = profile.id, connected = true,
     sessions = listOf(Session("session", "/repo", "Session", 1)), sessionId = "session",
-    schedules = listOf(RemoteSchedule(record.id, record.kind, record.title, record.prompt, record.scheduledAt, "daily",
+    schedules = listOf(DshSchedule(record.id, record.kind, record.title, record.prompt, record.scheduledAt, "daily",
       sessionId = "session", status = "active", record = record)))
   private fun canSave(state: LagoonState = state(), title: String = "Retained draft", prompt: String = "Full\nretained prompt") =
     scheduleEditorCanSave(state, target, title, prompt, false, draft)
@@ -108,7 +108,7 @@ class ScheduleEditorPolicyTest {
     assertFalse(canSave(initial.copy(schedulesLoading = true)))
     assertFalse(canSave(initial.copy(connected = false)))
     assertFalse(canSave(initial.copy(cached = true)))
-    assertFalse(canSave(initial.copy(profiles = listOf(profile.copy(parentEnabled = false)))))
+    assertFalse(canSave(initial.copy(profiles = listOf(profile.copy(deviceEnabled = false)))))
     assertFalse(canSave(title = " ", prompt = "prompt"))
     assertFalse(canSave(title = "x".repeat(121)))
     assertTrue(canSave(title = " x "))

@@ -53,9 +53,9 @@ class ControllerRegressionTest {
     put(c,"mutable", mutable); put(c,"state",mutable); put(c,"generation",1); put(c,"api",api)
     put(c,"operationScope",CoroutineScope(SupervisorJob()+Dispatchers.Unconfined))
     put(c,"scope",CoroutineScope(Job().apply { cancel() }+Dispatchers.Default))
-    val savedStore = ServerStore(preferences(), preferences(), { it }, { it })
-    val savedProfiles = initial.profiles.ifEmpty { listOfNotNull(initial.serverId?.let { ServerProfile(it, it, "https://fixture.invalid") }) }
-    savedProfiles.forEach { savedStore.save(it, null) }
+    val savedStore = ServerStore(preferences(), preferences(), { it }, { it }) {
+      mutable.value.profiles.ifEmpty { listOfNotNull(mutable.value.serverId?.let { ServerProfile(it, it, "https://fixture.invalid") }) }
+    }
     put(c,"store",savedStore);put(c,"cache",OfflineCache(context.getSharedPreferences("cache",0),{it},{it}));put(c,"sendMutex",kotlinx.coroutines.sync.Mutex()); put(c,"referenceMutex",kotlinx.coroutines.sync.Mutex()); put(c,"monitorRequested",mutableSetOf<String>()); put(c,"draftWrites",mutableMapOf<String,Job>()); put(c,"attentionJobs",mutableMapOf<String,Job>()); put(c,"waitingEventSeqAt",mutableMapOf<String,Long>())
     put(c, "resolvedPermissions", linkedSetOf<String>()); put(c,"directoryHealth",DirectoryHealth())
     put(c, "connectTrace", ConnectTrace()); put(c, "openTrace", ConnectTrace()); put(c, "transcriptMemory", TranscriptMemory()); put(c, "queuedSends", mutableListOf<Any>())
@@ -683,8 +683,7 @@ class ControllerRegressionTest {
       val attachment = controller.attachTerminal(TerminalTarget(profile, "session", "/repo"), "pty_1")
       assertTrue(attachment.sendText("first\r"))
       val replacement = profile.copy(url = "https://other-terminal.example/")
-      val store = LagoonController::class.java.getDeclaredField("store").apply { isAccessible = true }.get(controller) as ServerStore
-      store.save(replacement, null); state.value = state.value.copy(profiles = listOf(replacement))
+      state.value = state.value.copy(profiles = listOf(replacement))
       assertFalse(attachment.sendText("must not send\r"))
       assertEquals(1, sent); assertTrue(detached > 0); assertEquals(0, terminated)
     }
@@ -763,7 +762,7 @@ class ControllerRegressionTest {
         }
         override suspend fun createTerminal(scope: TerminalScope): NativeTerminal = terminals(scope).single()
       }
-      val profile = ServerProfile("server", "DSH", "https://terminal.example/", kind = ServerKind.DSH)
+      val profile = ServerProfile("server", "DSH", "https://terminal.example/", protocol = HarnessProtocol.DSH)
       val (controller, state) = controller(client, LagoonState(profiles = listOf(profile), serverId = profile.id, connected = true,
         sessionId = "first", sessions = listOf(Session("first", "/repo", "First", 1), Session("second", "/repo", "Second", 1)),
         capabilities = ApiCapabilities(terminal = true)))
@@ -793,7 +792,7 @@ class ControllerRegressionTest {
         }
         override suspend fun closeTerminal(scope: TerminalScope, id: String) { terminated++ }
       }
-      val profile = ServerProfile("server", "DSH", "https://terminal.example/", kind = ServerKind.DSH)
+      val profile = ServerProfile("server", "DSH", "https://terminal.example/", protocol = HarnessProtocol.DSH)
       val (controller, state) = controller(client, LagoonState(profiles = listOf(profile), serverId = profile.id, connected = true,
         sessionId = "first", sessions = listOf(Session("first", "/repo", "First", 1), Session("second", "/repo", "Second", 1)),
         capabilities = ApiCapabilities(terminal = true)))
@@ -809,14 +808,14 @@ class ControllerRegressionTest {
   private fun scheduleState(profile: ServerProfile, record: ScheduleRecord = scheduleRecord()) = LagoonState(
     profiles = listOf(profile), serverId = profile.id, connected = true, sessionId = "owner",
     sessions = listOf(Session("owner", "/repo", "Owner", 1), Session("other", "/repo", "Other", 1)),
-    schedules = listOf(record.toRemoteSchedule("owner", "active")))
+    schedules = listOf(record.toDshSchedule("owner", "active")))
 
   @Test fun scheduleCatalogKeepsOnlyOriginalOwnerIncludingInactiveTasks() = runBlocking {
     MockWebServer().use { server ->
       val record = scheduleRecord()
-      val rows = listOf(record.toRemoteSchedule("owner", "inactive"), record.copy(id = "foreign").toRemoteSchedule("other", "active"))
-      val client = object : HarnessClient by api(server) { override suspend fun scheduleCatalog(): List<RemoteSchedule> = rows }
-      val profile = ServerProfile("server", "DSH", "https://schedule.example/", kind = ServerKind.DSH)
+      val rows = listOf(record.toDshSchedule("owner", "inactive"), record.copy(id = "foreign").toDshSchedule("other", "active"))
+      val client = object : HarnessClient by api(server) { override suspend fun scheduleCatalog(): List<DshSchedule> = rows }
+      val profile = ServerProfile("server", "DSH", "https://schedule.example/", protocol = HarnessProtocol.DSH)
       val (controller, state) = controller(client, scheduleState(profile).copy(schedules = emptyList()))
       controller.loadSchedules().join()
       assertEquals(listOf("task"), state.value.schedules.map { it.id })
@@ -827,14 +826,14 @@ class ControllerRegressionTest {
 
   @Test fun oldCatalogReadCannotRestoreTaskAfterDeletionAndForcedReconciliation() = runBlocking {
     MockWebServer().use { server ->
-      val record = scheduleRecord(); val old = record.toRemoteSchedule("owner", "active")
-      val delayed = CompletableDeferred<List<RemoteSchedule>>()
+      val record = scheduleRecord(); val old = record.toDshSchedule("owner", "active")
+      val delayed = CompletableDeferred<List<DshSchedule>>()
       var reads = 0; var writes = 0
       val client = object : HarnessClient by api(server) {
-        override suspend fun scheduleCatalog(): List<RemoteSchedule> = if (++reads == 1) delayed.await() else emptyList()
+        override suspend fun scheduleCatalog(): List<DshSchedule> = if (++reads == 1) delayed.await() else emptyList()
         override suspend fun deleteSchedule(sessionId: String, id: String): ScheduleDeleteResult { writes++; return ScheduleDeleteResult(id, true) }
       }
-      val profile = ServerProfile("server", "DSH", "https://schedule.example/", kind = ServerKind.DSH)
+      val profile = ServerProfile("server", "DSH", "https://schedule.example/", protocol = HarnessProtocol.DSH)
       val (controller, state) = controller(client, scheduleState(profile))
       val reading = controller.loadSchedules()
       controller.deleteSchedule(ScheduleMutationTarget(profile, "owner", record.id, record)).join()
@@ -852,9 +851,9 @@ class ControllerRegressionTest {
           updates++; assertEquals(record, expected); assertNull(change)
           return ScheduleUpdateResult(id, false, record)
         }
-        override suspend fun scheduleCatalog(): List<RemoteSchedule> = listOf(record.toRemoteSchedule("owner", "active"))
+        override suspend fun scheduleCatalog(): List<DshSchedule> = listOf(record.toDshSchedule("owner", "active"))
       }
-      val profile = ServerProfile("server", "DSH", "https://schedule.example/", kind = ServerKind.DSH)
+      val profile = ServerProfile("server", "DSH", "https://schedule.example/", protocol = HarnessProtocol.DSH)
       val (controller, state) = controller(client, scheduleState(profile))
       var acknowledged = false
       controller.updateSchedule(ScheduleMutationTarget(profile, "owner", record.id, record), null, null) { acknowledged = true }.join()
@@ -870,9 +869,9 @@ class ControllerRegressionTest {
         override suspend fun deleteSchedule(sessionId: String, id: String): ScheduleDeleteResult {
           calls += "delete:$sessionId:$id"; return ScheduleDeleteResult(id, true)
         }
-        override suspend fun scheduleCatalog(): List<RemoteSchedule> { calls += "catalog"; return emptyList() }
+        override suspend fun scheduleCatalog(): List<DshSchedule> { calls += "catalog"; return emptyList() }
       }
-      val profile = ServerProfile("server", "DSH", "https://schedule.example/", kind = ServerKind.DSH)
+      val profile = ServerProfile("server", "DSH", "https://schedule.example/", protocol = HarnessProtocol.DSH)
       val (controller, state) = controller(client, scheduleState(profile))
       var acknowledged = false
       controller.deleteSchedule(ScheduleMutationTarget(profile, "owner", record.id, record)) { acknowledged = true }.join()
@@ -890,9 +889,9 @@ class ControllerRegressionTest {
           calls += "update"; assertEquals(record, expected); assertNull(change)
           return ScheduleUpdateResult(id, false, code = "schedule_conflict")
         }
-        override suspend fun scheduleCatalog(): List<RemoteSchedule> { calls += "catalog"; return listOf(newest.toRemoteSchedule("owner", "active")) }
+        override suspend fun scheduleCatalog(): List<DshSchedule> { calls += "catalog"; return listOf(newest.toDshSchedule("owner", "active")) }
       }
-      val profile = ServerProfile("server", "DSH", "https://schedule.example/", kind = ServerKind.DSH)
+      val profile = ServerProfile("server", "DSH", "https://schedule.example/", protocol = HarnessProtocol.DSH)
       val (controller, state) = controller(client, scheduleState(profile))
       val expected = ScheduleMutationTarget(profile, "owner", record.id, record)
       var acknowledged = false
@@ -911,13 +910,13 @@ class ControllerRegressionTest {
         override suspend fun deleteSchedule(sessionId: String, id: String): ScheduleDeleteResult? { mutations++; return null }
         override suspend fun updateSchedule(sessionId: String, id: String, expected: ScheduleRecord, title: String?, prompt: String?, change: ScheduleTimingChange?): ScheduleUpdateResult? { mutations++; return null }
       }
-      val profile = ServerProfile("server", "DSH", "https://schedule.example/", kind = ServerKind.DSH)
+      val profile = ServerProfile("server", "DSH", "https://schedule.example/", protocol = HarnessProtocol.DSH)
       val record = scheduleRecord(); val (controller, state) = controller(client, scheduleState(profile))
       val target = ScheduleMutationTarget(profile, "owner", record.id, record)
       controller.deleteSchedule(target.copy(sessionId = "other")).join()
       controller.deleteSchedule(target.copy(profile = profile.copy(url = "https://old.example/"))).join()
       controller.updateSchedule(target.copy(record = record.copy(scheduledAt = "changed")), "Title", null).join()
-      state.value = state.value.copy(schedules = listOf(record.toRemoteSchedule("owner", "inactive")))
+      state.value = state.value.copy(schedules = listOf(record.toDshSchedule("owner", "inactive")))
       controller.updateSchedule(target, "Title", null).join()
       assertEquals(0, mutations)
     }
@@ -926,20 +925,20 @@ class ControllerRegressionTest {
   @Test fun oldMutationAckCannotStrandNewOwnerCatalogInLoadingState() = runBlocking {
     MockWebServer().use { server ->
       val mutation = CompletableDeferred<ScheduleDeleteResult>()
-      val catalog = CompletableDeferred<List<RemoteSchedule>>()
+      val catalog = CompletableDeferred<List<DshSchedule>>()
       val started = CompletableDeferred<Unit>()
       val record = scheduleRecord()
       val client = object : HarnessClient by api(server) {
         override suspend fun deleteSchedule(sessionId: String, id: String): ScheduleDeleteResult = mutation.await()
-        override suspend fun scheduleCatalog(): List<RemoteSchedule> { started.complete(Unit); return catalog.await() }
+        override suspend fun scheduleCatalog(): List<DshSchedule> { started.complete(Unit); return catalog.await() }
       }
-      val profile = ServerProfile("server", "DSH", "https://schedule.example/", kind = ServerKind.DSH)
+      val profile = ServerProfile("server", "DSH", "https://schedule.example/", protocol = HarnessProtocol.DSH)
       val (controller, state) = controller(client, scheduleState(profile))
       val deletion = controller.deleteSchedule(ScheduleMutationTarget(profile, "owner", record.id, record))
       state.value = state.value.copy(sessionId = "other", schedules = emptyList())
       val reading = controller.loadSchedules(); started.await()
       mutation.complete(ScheduleDeleteResult(record.id, true)); deletion.join()
-      val other = record.copy(id = "other-task").toRemoteSchedule("other", "active")
+      val other = record.copy(id = "other-task").toDshSchedule("other", "active")
       catalog.complete(listOf(other)); reading.join()
       assertEquals(listOf(other), state.value.schedules); assertFalse(state.value.schedulesLoading)
     }
@@ -950,13 +949,13 @@ class ControllerRegressionTest {
       val result = CompletableDeferred<ScheduleDeleteResult>(); var mutations = 0; var reads = 0
       val client = object : HarnessClient by api(server) {
         override suspend fun deleteSchedule(sessionId: String, id: String): ScheduleDeleteResult { mutations++; return result.await() }
-        override suspend fun scheduleCatalog(): List<RemoteSchedule> { reads++; return emptyList() }
+        override suspend fun scheduleCatalog(): List<DshSchedule> { reads++; return emptyList() }
       }
-      val profile = ServerProfile("server", "DSH", "https://schedule.example/", kind = ServerKind.DSH)
+      val profile = ServerProfile("server", "DSH", "https://schedule.example/", protocol = HarnessProtocol.DSH)
       val record = scheduleRecord(); val (controller, state) = controller(client, scheduleState(profile))
       var acknowledged = false
       val deletion = controller.deleteSchedule(ScheduleMutationTarget(profile, "owner", record.id, record)) { acknowledged = true }
-      val other = record.copy(id = "other-task").toRemoteSchedule("other", "active")
+      val other = record.copy(id = "other-task").toDshSchedule("other", "active")
       state.value = state.value.copy(sessionId = "other", schedules = listOf(other))
       result.complete(ScheduleDeleteResult(record.id, true)); deletion.join()
       assertFalse(acknowledged); assertEquals(listOf(other), state.value.schedules)
@@ -969,9 +968,9 @@ class ControllerRegressionTest {
       val calls = mutableListOf<String>()
       val client = object : HarnessClient by api(server) {
         override suspend fun deleteSchedule(sessionId: String, id: String): ScheduleDeleteResult? { calls += "delete"; throw java.io.IOException("lost after write") }
-        override suspend fun scheduleCatalog(): List<RemoteSchedule> { calls += "catalog"; return emptyList() }
+        override suspend fun scheduleCatalog(): List<DshSchedule> { calls += "catalog"; return emptyList() }
       }
-      val profile = ServerProfile("server", "DSH", "https://schedule.example/", kind = ServerKind.DSH)
+      val profile = ServerProfile("server", "DSH", "https://schedule.example/", protocol = HarnessProtocol.DSH)
       val record = scheduleRecord(); val (controller, state) = controller(client, scheduleState(profile))
       controller.deleteSchedule(ScheduleMutationTarget(profile, "owner", record.id, record)).join()
       assertEquals(listOf("delete", "catalog"), calls); assertTrue(state.value.schedules.isEmpty())
@@ -987,7 +986,7 @@ class ControllerRegressionTest {
           assertEquals("owner", sessionId); assertEquals("task", id); return response.await()
         }
       }
-      val profile = ServerProfile("server", "DSH", "https://schedule.example/", kind = ServerKind.DSH)
+      val profile = ServerProfile("server", "DSH", "https://schedule.example/", protocol = HarnessProtocol.DSH)
       val record = scheduleRecord(); val (controller, state) = controller(client, scheduleState(profile))
       val reading = async { runCatching { controller.scheduleHistory(ScheduleMutationTarget(profile, "owner", record.id, record)) } }
       yield(); state.value = state.value.copy(sessionId = "other")
@@ -998,7 +997,7 @@ class ControllerRegressionTest {
 
   @Test fun lateComposerProjectionCannotResurrectGoalClearedDuringTranscriptRead() = runBlocking {
     MockWebServer().use { server ->
-      val goal = RemoteGoal("g", 2, "Old", "paused", "disarmed")
+      val goal = DshGoal("g", 2, "Old", "paused", "disarmed")
       val release = CompletableDeferred<Unit>()
       val contextRead = CompletableDeferred<Unit>()
       val target = Session("session", "/repo", "Task", 1)
@@ -1009,9 +1008,9 @@ class ControllerRegressionTest {
         }
         override suspend fun composerContext(id: String): ComposerContext { contextRead.complete(Unit); return ComposerContext(goal = goal) }
         override suspend fun goalAction(sessionId: String, id: String, revision: Int, action: String): Boolean = true
-        override suspend fun goal(sessionId: String): RemoteGoal? = null
+        override suspend fun goal(sessionId: String): DshGoal? = null
       }
-      val profile = ServerProfile("server", "DSH", "https://goal.example/", kind = ServerKind.DSH)
+      val profile = ServerProfile("server", "DSH", "https://goal.example/", protocol = HarnessProtocol.DSH)
       val (controller, state) = controller(client, LagoonState(profiles = listOf(profile), serverId = profile.id, connected = true,
         sessionId = target.id, sessions = listOf(target), goal = goal, messages = listOf(Message("human", "user", 1, emptyList()))))
       val reading = async { readTranscript(controller, client, target) }
@@ -1029,13 +1028,13 @@ class ControllerRegressionTest {
       val client = object : HarnessClient by api(server) {
         override suspend fun createGoalWithLimit(sessionId: String, objective: String, maxRounds: Long?): Boolean { calls++; return true }
       }
-      val profile = ServerProfile("server", "DSH", "https://goal.example/", kind = ServerKind.DSH)
+      val profile = ServerProfile("server", "DSH", "https://goal.example/", protocol = HarnessProtocol.DSH)
       val base = LagoonState(profiles = listOf(profile), serverId = profile.id, connected = true,
         sessionId = "session", sessions = listOf(Session("session", "/repo", "Task", 1)))
       val (controller, state) = controller(client, base)
       controller.createGoal("new", expectedProfile = profile.copy(url = "https://old.example/"), expectedSession = "session").join()
       controller.createGoal("new", expectedProfile = profile, expectedSession = "other").join()
-      state.value = base.copy(goal = RemoteGoal("g", 2, "Active", "active"))
+      state.value = base.copy(goal = DshGoal("g", 2, "Active", "active"))
       controller.createGoal("new", expectedProfile = profile, expectedSession = "session").join()
       assertEquals(0, calls)
     }
@@ -1043,19 +1042,19 @@ class ControllerRegressionTest {
 
   @Test fun goalEditCommitsReturnedRevisionAndActivationWithoutResumeOrStaleReload() = runBlocking {
     MockWebServer().use { server ->
-      val original = RemoteGoal("g", 2, "Old", "paused", "disarmed", maxGoalRounds = 20L, roundsStarted = 4L)
+      val original = DshGoal("g", 2, "Old", "paused", "disarmed", maxGoalRounds = 20L, roundsStarted = 4L)
       val edited = original.copy(revision = 3, objective = "Edited", maxGoalRounds = 40L)
       val calls = mutableListOf<String>()
       val client = object : HarnessClient by api(server) {
-        override suspend fun editGoal(sessionId: String, id: String, revision: Int, objective: String?, maxRounds: Long?): RemoteGoal {
+        override suspend fun editGoal(sessionId: String, id: String, revision: Int, objective: String?, maxRounds: Long?): DshGoal {
           calls += "edit"; assertEquals("session", sessionId); assertEquals("g", id); assertEquals(2, revision)
           assertEquals("Edited", objective); assertEquals(40L, maxRounds)
           return edited
         }
-        override suspend fun goal(sessionId: String): RemoteGoal? { calls += "get"; return original }
+        override suspend fun goal(sessionId: String): DshGoal? { calls += "get"; return original }
         override suspend fun goalAction(sessionId: String, id: String, revision: Int, action: String): Boolean { calls += action; return true }
       }
-      val profile = ServerProfile("server", "DSH", "https://goal.example/", kind = ServerKind.DSH)
+      val profile = ServerProfile("server", "DSH", "https://goal.example/", protocol = HarnessProtocol.DSH)
       val (controller, state) = controller(client, LagoonState(profiles = listOf(profile), serverId = profile.id, connected = true,
         sessionId = "session", sessions = listOf(Session("session", "/repo", "Task", 1)), goal = original))
       var acknowledged = false
@@ -1069,10 +1068,10 @@ class ControllerRegressionTest {
     MockWebServer().use { server ->
       var edits = 0
       val client = object : HarnessClient by api(server) {
-        override suspend fun editGoal(sessionId: String, id: String, revision: Int, objective: String?, maxRounds: Long?): RemoteGoal? { edits++; return null }
+        override suspend fun editGoal(sessionId: String, id: String, revision: Int, objective: String?, maxRounds: Long?): DshGoal? { edits++; return null }
       }
-      val profile = ServerProfile("server", "DSH", "https://goal.example/", kind = ServerKind.DSH)
-      val goal = RemoteGoal("g", 2, "Old", "active")
+      val profile = ServerProfile("server", "DSH", "https://goal.example/", protocol = HarnessProtocol.DSH)
+      val goal = DshGoal("g", 2, "Old", "active")
       val initial = LagoonState(profiles = listOf(profile), serverId = profile.id, connected = true,
         sessionId = "session", sessions = listOf(Session("session", "/repo", "Task", 1)), goal = goal)
       val (controller, state) = controller(client, initial)
@@ -1081,7 +1080,7 @@ class ControllerRegressionTest {
       controller.editGoal(GoalMutationTarget(profile, "session", "g", 2), " ", null).join()
       controller.editGoal(GoalMutationTarget(profile, "session", "g", 2), null, 0).join()
       controller.editGoal(GoalMutationTarget(profile, "session", "g", 2), null, MAX_GOAL_ROUNDS + 1).join()
-      state.value = initial.copy(profiles = listOf(profile.copy(parentEnabled = false)))
+      state.value = initial.copy(profiles = listOf(profile.copy(deviceEnabled = false)))
       controller.editGoal(GoalMutationTarget(profile, "session", "g", 2), "New", null).join()
       assertEquals(0, edits); assertEquals(goal, state.value.goal)
     }
@@ -1089,13 +1088,13 @@ class ControllerRegressionTest {
 
   @Test fun goalEditIsSingleFlightAndLateResultCannotMutateAnotherSelection() = runBlocking {
     MockWebServer().use { server ->
-      val response = CompletableDeferred<RemoteGoal>()
+      val response = CompletableDeferred<DshGoal>()
       var calls = 0
       val client = object : HarnessClient by api(server) {
-        override suspend fun editGoal(sessionId: String, id: String, revision: Int, objective: String?, maxRounds: Long?): RemoteGoal { calls++; return response.await() }
+        override suspend fun editGoal(sessionId: String, id: String, revision: Int, objective: String?, maxRounds: Long?): DshGoal { calls++; return response.await() }
       }
-      val profile = ServerProfile("server", "DSH", "https://goal.example/", kind = ServerKind.DSH)
-      val goal = RemoteGoal("g", 2, "Old", "paused", "disarmed")
+      val profile = ServerProfile("server", "DSH", "https://goal.example/", protocol = HarnessProtocol.DSH)
+      val goal = DshGoal("g", 2, "Old", "paused", "disarmed")
       val (controller, state) = controller(client, LagoonState(profiles = listOf(profile), serverId = profile.id, connected = true,
         sessionId = "session", sessions = listOf(Session("session", "/repo", "Task", 1), Session("other", "/repo", "Other", 1)), goal = goal))
       val expected = GoalMutationTarget(profile, "session", "g", 2)
@@ -1112,14 +1111,14 @@ class ControllerRegressionTest {
 
   @Test fun goalReadStartedBeforeEditCannotRollbackTheAcknowledgedRevision() = runBlocking {
     MockWebServer().use { server ->
-      val delayedRead = CompletableDeferred<RemoteGoal?>()
-      val goal = RemoteGoal("g", 2, "Old", "paused", "disarmed")
+      val delayedRead = CompletableDeferred<DshGoal?>()
+      val goal = DshGoal("g", 2, "Old", "paused", "disarmed")
       val edited = goal.copy(revision = 3, objective = "New")
       val client = object : HarnessClient by api(server) {
-        override suspend fun goal(sessionId: String): RemoteGoal? = delayedRead.await()
-        override suspend fun editGoal(sessionId: String, id: String, revision: Int, objective: String?, maxRounds: Long?): RemoteGoal = edited
+        override suspend fun goal(sessionId: String): DshGoal? = delayedRead.await()
+        override suspend fun editGoal(sessionId: String, id: String, revision: Int, objective: String?, maxRounds: Long?): DshGoal = edited
       }
-      val profile = ServerProfile("server", "DSH", "https://goal.example/", kind = ServerKind.DSH)
+      val profile = ServerProfile("server", "DSH", "https://goal.example/", protocol = HarnessProtocol.DSH)
       val (controller, state) = controller(client, LagoonState(profiles = listOf(profile), serverId = profile.id, connected = true,
         sessionId = "session", sessions = listOf(Session("session", "/repo", "Task", 1)), goal = goal))
       val reading = controller.loadGoal()
@@ -1131,17 +1130,17 @@ class ControllerRegressionTest {
 
   @Test fun staleGoalRevisionRefreshesMetadataButNeverRetriesOrRearms() = runBlocking {
     MockWebServer().use { server ->
-      val old = RemoteGoal("g", 2, "Old", "paused", "disarmed")
+      val old = DshGoal("g", 2, "Old", "paused", "disarmed")
       val newer = old.copy(revision = 4, objective = "Edited elsewhere")
       val calls = mutableListOf<String>()
       val client = object : HarnessClient by api(server) {
-        override suspend fun editGoal(sessionId: String, id: String, revision: Int, objective: String?, maxRounds: Long?): RemoteGoal? {
+        override suspend fun editGoal(sessionId: String, id: String, revision: Int, objective: String?, maxRounds: Long?): DshGoal? {
           calls += "edit"; throw ApiException(409, "Goal changed", "GOAL_STALE_REVISION")
         }
-        override suspend fun goal(sessionId: String): RemoteGoal? { calls += "get"; return newer }
+        override suspend fun goal(sessionId: String): DshGoal? { calls += "get"; return newer }
         override suspend fun goalAction(sessionId: String, id: String, revision: Int, action: String): Boolean { calls += action; return true }
       }
-      val profile = ServerProfile("server", "DSH", "https://goal.example/", kind = ServerKind.DSH)
+      val profile = ServerProfile("server", "DSH", "https://goal.example/", protocol = HarnessProtocol.DSH)
       val (controller, state) = controller(client, LagoonState(profiles = listOf(profile), serverId = profile.id, connected = true,
         sessionId = "session", sessions = listOf(Session("session", "/repo", "Task", 1)), goal = old))
       controller.editGoal(GoalMutationTarget(profile, "session", "g", 2), "My draft", null).join()
@@ -1152,7 +1151,7 @@ class ControllerRegressionTest {
 
   @Test fun hostSettingsRejectStaleSameIdDialogBeforeResolvingOrDialingAnotherClient() = runBlocking {
     MockWebServer().use { server ->
-      val saved = ServerProfile("server", "Host", server.url("/").toString(), allowCleartext = true, kind = ServerKind.DSH)
+      val saved = ServerProfile("server", "Host", server.url("/").toString(), allowCleartext = true, protocol = HarnessProtocol.DSH)
       val (controller, _) = controller(api(server), LagoonState(profiles = listOf(saved), serverId = saved.id, connected = true))
       val old = saved.copy(url = "https://previous-host.example/")
       val failures = listOf(
@@ -1165,7 +1164,7 @@ class ControllerRegressionTest {
         runCatching { controller.clearCredential(old, "API_KEY") }.exceptionOrNull(),
         runCatching { controller.createProviderRoute(old, "route", "Route", "openai-completions",
           "https://models.example/", "API_KEY", "model", "fixture-never-sent") }.exceptionOrNull())
-      assertTrue(failures.all { it is StaleConnectionRouteException })
+      assertTrue(failures.all { it is IllegalStateException })
       assertEquals(0, server.requestCount)
     }
   }
@@ -1173,11 +1172,10 @@ class ControllerRegressionTest {
   @Test fun hostSettingsRejectUnsupportedProtocolAndDisabledProfileBeforeClientLookup() = runBlocking {
     MockWebServer().use { server ->
       val profile = ServerProfile("server", "Native", server.url("/").toString(), allowCleartext = true)
-      val (controller, _) = controller(api(server), LagoonState(profiles = listOf(profile), serverId = profile.id, connected = true))
+      val (controller, state) = controller(api(server), LagoonState(profiles = listOf(profile), serverId = profile.id, connected = true))
       assertTrue(runCatching { controller.setCredential(profile, "API_KEY", "fixture-never-sent") }.isFailure)
-      val store = LagoonController::class.java.getDeclaredField("store").apply { isAccessible = true }.get(controller) as ServerStore
-      val disabled = profile.copy(kind = ServerKind.DSH, enabled = false)
-      store.save(disabled, null)
+      val disabled = profile.copy(protocol = HarnessProtocol.DSH, enabled = false)
+      state.value = state.value.copy(profiles = listOf(disabled))
       assertTrue(runCatching { controller.pluginBundles(disabled) }.isFailure)
       assertEquals(0, server.requestCount)
     }
@@ -1257,8 +1255,6 @@ class ControllerRegressionTest {
       val job = controller.revert(message.id, onReverted = { callbacks++ })
       assertNotNull(server.takeRequest(2, TimeUnit.SECONDS))
       val replacement = profile.copy(url = "https://replacement.example/")
-      val store = LagoonController::class.java.getDeclaredField("store").apply { isAccessible = true }.get(controller) as ServerStore
-      store.save(replacement, null)
       state.value = state.value.copy(profiles = listOf(replacement))
       job.join()
       assertNull(state.value.session?.revertMessageId); assertEquals(0, callbacks)
@@ -1902,8 +1898,7 @@ class ControllerRegressionTest {
     val profileA = ServerProfile("srv-a", "A", "https://a.example")
     val project1 = Project("p1", "/repo-1", "Repo 1", serverId = "srv-a")
     val project2 = Project("p2", "/repo-2", "Repo 2", serverId = "srv-a")
-    val store = ServerStore(memoryPreferences(), memoryPreferences(), { it }, { it })
-    store.save(profileA, password = "pw")
+    val store = ServerStore(memoryPreferences(), memoryPreferences(), { it }, { it }) { listOf(profileA) }
     val (controller, state) = controller(api(MockWebServer()), LagoonState(
       profiles = listOf(profileA),
       serverId = "srv-a",
@@ -1936,8 +1931,8 @@ class ControllerRegressionTest {
         }
       }
       val client = api(server); client.health()
-      val store = ServerStore(memoryPreferences(), memoryPreferences(), { it }, { it })
-      store.save(ServerProfile("server", "Server", server.url("/").toString(), allowCleartext = true), null)
+      val savedProfile = ServerProfile("server", "Server", server.url("/").toString(), allowCleartext = true)
+      val store = ServerStore(memoryPreferences(), memoryPreferences(), { it }, { it }) { listOf(savedProfile) }
       val (controller, state) = controller(client, LagoonState(
         serverId = "server",
         connected = true,
@@ -2044,7 +2039,6 @@ class ControllerRegressionTest {
     val job = controller.addProject("/old")
     entered.await()
     val replacement = profile.copy(url = "https://replacement.example")
-    store.save(replacement, null)
     state.value = state.value.copy(profiles = listOf(replacement)) // same ID and controller generation
     release.complete(Unit)
     job.join()
@@ -2080,7 +2074,6 @@ class ControllerRegressionTest {
     val job = controller.deleteSession()
     entered.await()
     val replacement = profile.copy(url = "https://replacement.example")
-    store.save(replacement, null)
     state.value = state.value.copy(profiles = listOf(replacement))
     release.complete(Unit)
     job.join()
@@ -2091,8 +2084,8 @@ class ControllerRegressionTest {
     assertNull(state.value.error)
   }
 
-  @Test fun jobOutputCapabilityWorksForDirectRemoteAndSshProfiles() {
-    for ((kind, ssh) in listOf(ServerKind.DSH to null, ServerKind.DSH_REMOTE to null, ServerKind.DSH to "ssh-host")) {
+  @Test fun jobOutputCapabilityWorksForLoopbackAndSshProfiles() {
+    for (deviceId in listOf(null, "ssh-host")) {
       var called = false
       val client = Proxy.newProxyInstance(javaClass.classLoader, arrayOf(HarnessClient::class.java)) { _, method, args ->
         when (method.name) {
@@ -2109,7 +2102,7 @@ class ControllerRegressionTest {
           else -> error("unexpected ${method.name}")
         }
       } as HarnessClient
-      val profile = ServerProfile("server", "DSH", "https://fixture", kind = kind, sshHostId = ssh)
+      val profile = ServerProfile("server", "DSH", "https://fixture", protocol = HarnessProtocol.DSH, deviceId = deviceId)
       val (controller, state) = controller(client, LagoonState(serverId = "server", profiles = listOf(profile)))
       val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
       put(controller, "scope", scope)

@@ -15,7 +15,7 @@ import org.junit.Test
 /** Focused rc.5 contract regressions; keep separate from the legacy DshApiTest fixture. */
 class DshApiContractRegressionTest {
   private fun profile(server: MockWebServer) =
-    ServerProfile("srv", "DSH", server.url("/").toString().trimEnd('/'), username = "dsh", allowCleartext = true, kind = ServerKind.DSH)
+    ServerProfile("srv", "DSH", server.url("/").toString().trimEnd('/'), username = "dsh", allowCleartext = true, protocol = HarnessProtocol.DSH)
 
   private fun rootOk() = MockResponse().setResponseCode(303)
     .addHeader("Set-Cookie", "dsh-auth-contract=cookie; Path=/")
@@ -57,7 +57,7 @@ class DshApiContractRegressionTest {
   }
 
   @Test fun modelSelectionEventUsesFlatSelectionData() = runBlocking {
-    val api = DshApi(ServerProfile("srv", "DSH", "http://127.0.0.1:1", allowCleartext = true, kind = ServerKind.DSH), ServerCredentials("dsh", "tok"))
+    val api = DshApi(ServerProfile("srv", "DSH", "http://127.0.0.1:1", allowCleartext = true, protocol = HarnessProtocol.DSH), ServerCredentials("dsh", "tok"))
     try {
       val session = Session("s1", "/repo", "T", 1, model = ModelChoice("old", "old", "old"))
       val known = DshApi::class.java.getDeclaredField("known").apply { isAccessible = true }.get(api)
@@ -92,7 +92,7 @@ class DshApiContractRegressionTest {
   }
 
   @Test fun externalUnarchiveClearsPreviouslyKnownArchive() = runBlocking {
-    val api = DshApi(ServerProfile("srv", "DSH", "http://127.0.0.1:1", allowCleartext = true, kind = ServerKind.DSH), ServerCredentials("dsh", "tok"))
+    val api = DshApi(ServerProfile("srv", "DSH", "http://127.0.0.1:1", allowCleartext = true, protocol = HarnessProtocol.DSH), ServerCredentials("dsh", "tok"))
     try {
       val field = DshApi::class.java.getDeclaredField("known").apply { isAccessible = true }
       @Suppress("UNCHECKED_CAST")
@@ -199,7 +199,7 @@ class DshApiContractRegressionTest {
   }
 
   @Test fun commandReferenceIsRejectedRatherThanSilentlyDropped() = runBlocking {
-    val api = DshApi(ServerProfile("srv", "DSH", "http://127.0.0.1:1", allowCleartext = true, kind = ServerKind.DSH), ServerCredentials("dsh", "tok"))
+    val api = DshApi(ServerProfile("srv", "DSH", "http://127.0.0.1:1", allowCleartext = true, protocol = HarnessProtocol.DSH), ServerCredentials("dsh", "tok"))
     try {
       val error = runCatching {
         api.command(Session("s1", "/repo", "T", 1), "test", "", references = listOf(FileReference("src/a.kt")))
